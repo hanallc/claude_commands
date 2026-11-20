@@ -28,13 +28,38 @@ def send_message(recipient: str, sender: str, message: str) -> None:
     raise RuntimeError(error)
 
 
-def message_outcome(recipient: str, sender: str, message: str, *options: str, timeout: float | None = None
+class SenderNotStarted(OSError):
+    """The sender process did not start."""
+
+
+def message_outcome(recipient: str, sender: str, message: str, *options: str, timeout: float | None = None,
+                    claim_fd: int | None = None, started: Callable[[], None] | None = None
                     ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
     """Return the confirmed transport result and its diagnostic."""
-    result = subprocess.run(session_send.send_argv("--to", recipient, "--from", sender, "--text", message, *options),
-                            capture_output=True, text=True, check=False, timeout=timeout)
-    return (send_result.send_outcome(result.returncode, result.stdout),
-            (result.stderr or result.stdout).strip() or "message delivery failed")
+    argv = session_send.send_argv("--to", recipient, "--from", sender, "--text", message, *options)
+    if started is None and claim_fd is None:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)
+        return sender_outcome(result.returncode, result.stdout, result.stderr)
+    try:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   pass_fds=() if claim_fd is None else (claim_fd,))
+    except OSError as error:
+        raise SenderNotStarted(str(error)) from error
+    with process:
+        try:
+            if started is not None:
+                started()
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            process.kill()
+            raise
+    assert process.returncode is not None
+    return sender_outcome(process.returncode, stdout, stderr)
+
+
+def sender_outcome(code: int, stdout: str, stderr: str
+                   ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
+    return send_result.send_outcome(code, stdout), (stderr or stdout).strip() or "message delivery failed"
 
 
 def notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...], *,

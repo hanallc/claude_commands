@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
 
-from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
+from scripts.production import change_review, change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from scripts.production import record_store
@@ -2311,13 +2311,20 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
     """Answer the exact record under its owner's lock and keep the answer in its log."""
     if not text.strip():
         raise RegistrationFailure("reply", "the reply is empty")
+    root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
     scope = question_scope(record.owner, identities.record)
-    with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
+    with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner), change_review.review_delivery_lock(root):
         current = current_open_question(record, "reply")
-        delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+        delivery = change_routing.delivery_path(root, current.path, current.path.stem)
         if "review_submission" in current.item:
             raise RegistrationFailure("reply", "Use the scoped reply from the Review item.")
         exchange = change_routing.delivery_slots(delivery).question
+        pending = current.item.get("followup")
+        if (not question_id and isinstance(exchange, delivery_state.OpenQuestion)
+                and pending is not None and pending["text"] == exchange.text
+                and delivery_state.has_legacy_followup(delivery)):
+            question_id = exchange.question_id
         if question_id or isinstance(exchange, delivery_state.OpenQuestion):
             _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
         if "followup" not in current.item:
@@ -2327,6 +2334,8 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
         event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, 'Answer: '+text)
         current.item["review_log"] = review_events.encode(review_events.append(events, event))
         _ = _publish_question(current)
+        if question_id:
+            delivery_state.complete_review_reply(delivery, question_id, text.strip())
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
 
 

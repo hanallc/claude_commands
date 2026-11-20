@@ -37,7 +37,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
-from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
+from scripts.review_links.test_page_question import FakeQuestionTransport, confirmed_schema_two, question_outcome, saved_progress
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
@@ -2429,8 +2429,9 @@ document.body.append(result);
             outcome = question_outcome("refused", "Producer offline") if number == 19 else question_outcome()
             with (patch.object(change_page, "send_question", return_value=outcome),
                   patch.object(change_page, "alert_delivery_failures")):
-                list_page.deliver(list_page.submit(root, urlencode(
-                    self.fields(item, "question", words="Which check passed?")), status))
+                delivery = list_page.submit(root, urlencode(
+                    self.fields(item, "question", words="Which check passed?")), status)
+                list_page.deliver(delivery)
             if number in (18, 19):
                 _ = the_list.update(MORTY.id, item.id, {"latest_status": "A new check passed."}, source="morty")
             if number == 20:
@@ -4007,34 +4008,22 @@ observer.observe(original.parentNode,{childList:true});
                     self.assertEqual(markup.count("Question not delivered."), 1)
                     self.assertNotIn('value="resend-', markup)
 
-    def test_recorded_question_failure_takes_priority_when_the_intent_clear_fails(self) -> None:
+    def test_failed_question_uses_its_own_saved_delivery_state(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("Keep the failed question available")
         asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
         assert isinstance(asked, list_page.ListQuestionDelivery)
-        delivery = asked.delivery
-        assert isinstance(delivery, change_page.PageQuestionSend)
-        assert isinstance(delivery.job, change_page.QuestionJob)
-        _ = delivery.job.release()
-        failure = change_page.FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, "Producer offline")
-        saved: change_page.StoredReviewMessage = {"saved": True, "source": str(delivery.page.review_list),
-            "owner": MORTY.id, "message": delivery.message, "row": delivery.row}
-        intent = change_page.DeliveryIntent(delivery.attempt, "verdict", recipients=(MORTY.id,))
-        page = change_page.ReviewMessagePage(delivery.page.review_list, delivery.page.production,
-                                             delivery.page.rows, "", saved)
-        with status.locked():
-            status.write_slots(page, delivery.row, change_page.DeliverySlots(change_page.NoDelivery(), intent))
-            status.record_result_locked(delivery, failure)
-        reopened = change_page.DeliveryStatus(root)
-        self.assertEqual(reopened.slots(page, delivery.row).verdict, intent)
-        self.assertEqual(reopened.failed_delivery(page, delivery.row), failure)
+        with patch.object(change_page, "send_question", return_value=question_outcome("refused")):
+            list_page.deliver(asked)
+        path = status.path(asked.delivery.page, asked.delivery.row)
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.FAILED)
         markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
         self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
         self.assertIn("Question not delivered.", markup)
         self.assertNotIn('value="resend-', markup)
 
-    def test_startup_reuses_the_list_question_key_after_a_result_write_failure(self) -> None:
+    def test_startup_preserves_the_uncertain_result_after_a_result_write_failure(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("Check the repair")
@@ -4052,17 +4041,17 @@ observer.observe(original.parentNode,{childList:true});
             publish(path, record)
 
         with patch.object(change_page, "send_question", side_effect=transport.send):
-            with (patch.object(change_page, "publish_question_attempt", side_effect=lose_result),
-                  self.assertRaisesRegex(OSError, "Cannot save the result")):
+            with patch.object(change_page, "publish_question_attempt", side_effect=lose_result):
                 list_page.deliver(asked)
+            self.assertTrue(status.has_deferred_questions())
             sending = change_page.read_question_attempt(path)
             self.assertEqual(sending.state, delivery_state.QuestionSendState.SENDING)
             for _ in range(2):
                 change_page.recover_review_messages(change_page.DeliveryStatus(root))
-        self.assertEqual(transport.calls, [sending.message_id] * 2)
+        self.assertEqual(transport.calls, [sending.message_id])
         self.assertEqual(len(transport.receipts), 1)
         saved = change_page.read_question_attempt(path)
-        self.assertEqual(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(change_page.page_progress(saved).state, change_page.QuestionDeliveryState.UNKNOWN)
         self.assertEqual(saved.attempt_id, sending.attempt_id)
 
     def test_ask_sends_to_the_keeper_when_another_producer_has_the_item(self) -> None:
@@ -4084,33 +4073,89 @@ observer.observe(original.parentNode,{childList:true});
         self.assertIs(record.state, delivery_state.QuestionSendState.SENT)
         send.assert_called_once_with(MORTY.id, record.message, record.message_id)
 
-    def test_question_start_error_records_a_failure_and_logs_one_line(self) -> None:
+    def test_question_source_read_error_keeps_recovery_without_failure(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
-        item = self.add("Keep the failed question")
+        item = self.add("Keep the saved question")
         submission = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
         assert isinstance(submission, list_page.ListQuestionDelivery)
-        with (patch.object(change_page, "_authorize_question_send", side_effect=RuntimeError("Cannot verify\nsource")),
+        with (patch.object(change_page, "_open_list_question", side_effect=OSError("Cannot verify\nsource")),
               patch.object(change_page, "send_question") as send, redirect_stderr(io.StringIO()) as output):
             list_page.deliver(submission)
         send.assert_not_called()
         path = status.path(submission.delivery.page, submission.delivery.row)
-        record = change_page.read_question_attempt(path)
-        self.assertIs(record.state, delivery_state.QuestionSendState.FAILED)
-        self.assertIsInstance(record.owner, delivery_state.NoQuestionSendOwner)
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.NOT_STARTED)
+        self.assertTrue(status.has_deferred_questions())
         self.assertEqual(output.getvalue().splitlines(), [f"review-links question {submission.delivery.row}: Cannot verify source"])
 
-    def test_a_failed_list_question_alerts_the_item_showrunner(self) -> None:
+    def test_startup_scans_list_questions_after_a_delivery_write_failure(self) -> None:
         root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Ask about the repair")
+        body = urlencode(self.fields(item, "question", words="Which check passed?"))
+        with (patch.object(change_page, "publish_question_attempt", side_effect=OSError("Cannot save delivery.")),
+              self.assertRaisesRegex(OSError, "Cannot save delivery")):
+            _ = list_page.submit(root, body, status)
+        question, = the_list.load(MORTY.id, item.id).questions
+        self.assertEqual(question.words, "Which check passed?")
+        self.assertEqual(list(root.glob(change_page.DELIVERY_PREFIX + "*")), [])
+
+        transport = FakeQuestionTransport()
+        restarted = change_page.DeliveryStatus(root)
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            change_page.recover_pending(restarted)
+            change_page.recover_pending(restarted)
+        path, = root.glob(change_page.DELIVERY_PREFIX + "*")
+        self.assertEqual(saved_progress(path).question_id, question.question_id)
+        self.assertEqual(transport.calls, [change_page.read_question_attempt(path).message_id])
+
+    def test_migration_uses_the_list_answer_over_the_old_receipt(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Check the repair")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        _ = delivery.job.release()
+        path = status.path(delivery.page, delivery.row)
+        old = change_page.read_question_attempt(path)
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+        _ = path.write_text(json.dumps(confirmed_schema_two(old)))
+        with patch.object(change_page, "send_question") as send:
+            change_page.migrate_delivery_file(status, path)
+            self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.ANSWERED)
+            change_page.recover_review_messages(status)
+        send.assert_not_called()
+        self.assertEqual(change_page.read_question_attempt(path).message_id, old.message_id)
+
+    def test_a_refused_list_question_queues_the_item_showrunner_alert_at_once(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
         item = self.add("Ask about the repair", owner=OTHER.id)
-        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")))
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
         refused = question_outcome("refused", "List keeper is offline.")
         with (patch.object(change_page, "send_question", return_value=refused) as send,
-              patch.object(change_page, "send_to_staff") as alert,
-              patch.object(change_page, "review_alert_showrunners") as fallback,
-              patch.object(time, "sleep")):
-            list_page.deliver(asked)
-        self.assertEqual(send.call_count, conf.read("review_links").whole("delivery_tries"))
+              patch.object(change_page, "send_to_staff", return_value=None) as alert,
+              patch.object(change_page, "review_alert_showrunners") as fallback):
+            with patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("Cannot read staff.")):
+                list_page.deliver(asked)
+            path = status.path(asked.delivery.page, asked.delivery.row)
+            progress = saved_progress(path)
+            self.assertEqual(progress.state, change_page.QuestionDeliveryState.FAILED)
+            self.assertIn("Question not delivered.", list_page.render(root, include_counts=False, status=status).decode())
+            self.assertTrue(status.has_deferred_questions())
+            self.assertFalse(status.has_deferred_alerts())
+            change_page.recover_deferred_questions(status)
+            self.assertTrue(status.has_deferred_alerts())
+            pending, = status.closeout_fields(asked.delivery.page, asked.delivery.row).get("pending_alerts", [])
+            self.assertEqual(pending.get("deadline"), progress.deadline)
+            status.recover_deferred_alerts()
+        send.assert_called_once()
         self.assertTrue(all(call.args[0] == MORTY.id for call in send.call_args_list))
         alert.assert_called_once()
         self.assertEqual(alert.call_args.args[0], OTHER.id)
@@ -4997,8 +5042,9 @@ window.fetch=async(_url,options)=>{
 
     def add_item_with_failed_question(self) -> the_list.ListItem:
         root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
         item = self.add("Keep the row with a failed question", number=1)
-        delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check failed?")))
+        delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check failed?")), status)
         with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
               patch.object(change_page, "alert_delivery_failures")):
             list_page.deliver(delivery)
@@ -5526,11 +5572,11 @@ const change=async path=>{
   check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
    'the waiting question shows the asked time in the user zone');
   await change('/answer');
-  await open('working','','1');
+  await open('needs-me','','1');
   const unreadQuestion=row().querySelector('.list-panel [data-question="Q1"]');
   check(!row().hidden && hasDot() && unreadQuestion?.textContent.includes('Which check passed?') &&
    unreadQuestion.textContent.includes('The gate passed.') && !row().querySelector('[data-open-question-note]'),
-   'Working with Unread only shows the answer in the panel and clears the question note.');
+   'Needs me with Unread only shows the answer in the panel and clears the question note.');
   check(unreadQuestion?.querySelectorAll('time[datetime]').length===2 &&
    unreadQuestion.querySelector('.question-unread')?.textContent==='Unread',
    'the unread answer shows both times and the Unread mark');
@@ -5560,7 +5606,7 @@ const change=async path=>{
   check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
    'a direct link shows both the waiting question and the first answer in the log');
   const {loggedAt}=await change('/second-answer');
-  await open('working','','1');
+  await open('all','','1');
   const original=row(), doc=frame.contentDocument;
   const panelQuestion=original.querySelector('[data-question="Q2"]');
   const askedAt=Date.parse(panelQuestion.querySelector('time').dateTime);
@@ -5588,11 +5634,11 @@ const change=async path=>{
   const chip=(filter,value)=>doc.querySelector('[data-filter-row="'+filter+'"] [data-filter-value="'+value+'"]');
   const count=(filter,value)=>Number(chip(filter,value).dataset.filterCount);
   const shown=()=>doc.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])').length;
-  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','working')===2,
-   'The Owner, Producer, and Working counts include the row kept open after the read.');
+  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','all')===2,
+   'The Owner, Producer, and Show All counts include the row kept open after the read.');
   check(doc.querySelector('[data-list-count]').textContent.startsWith('2 of 2 items shown'),
    'The total includes the row kept open after the read.');
-  check(count('show','all')===1,'The Show All count reflects the end of the exception when Show changes.');
+  check(count('show','working')===1,'The Working count excludes the read row when Show changes.');
   chip('owner','staff:'+doc.querySelector('[data-number="2"]').dataset.owner).click();
   const allOwners=count('owner','all');
   chip('owner','all').click();
@@ -5973,7 +6019,7 @@ window.fetch=async(_path,options={})=>{
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
 
-    def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
+    def test_feedback_recovers_after_restart_and_alerts_after_refusal(self) -> None:
         root = self.root / "reviews"
         item = self.add("Recover the message")
         _ = list_page.submit(root, urlencode(self.fields(item, "tell", words="Ask sdlc for an ETA.")))
@@ -5988,21 +6034,21 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id)),
                          {key: replace(value, state="sent") for key, value in the_list.feedback_requests(saved).items()})
         delivery = list_page.submit(root, urlencode(self.fields(item, "remove")))
-        def fail_message(recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+        def fail_message(recipient: staff.StaffId, _sender: str, _message: str, *, key: str, question: bool) -> None:
             self.assertTrue(key.startswith("review:"))
+            self.assertTrue(question)
             if recipient == MORTY.id:
-                raise RuntimeError("fixture offline")
+                raise change_page.QuestionSendStopped("fixture offline")
         with (patch.object(change_page, "send_to_staff", side_effect=fail_message) as send,
-              patch.object(time, "sleep"), redirect_stderr(io.StringIO())):
+              redirect_stderr(io.StringIO())):
             list_page.deliver(delivery)
-            tries = conf.read("review_links").whole("delivery_tries")
-            self.assertEqual(send.call_count, tries + 1)
+            self.assertEqual(send.call_count, 2)
             self.assertIn("List feedback needs attention", cast(str, send.call_args.args[2]))
             self.assertIn("nate removed item 1", cast(str, send.call_args.args[2]))
             self.assertEqual(send.call_args.args[0], OWNER.id)
             list_page.recover_pending()
             list_page.deliver(delivery)
-            self.assertEqual(send.call_count, tries + 1)
+            self.assertEqual(send.call_count, 2)
             alerted = the_list.load(MORTY.id, item.id)
             latest = tuple(the_list.feedback_requests(alerted).values())[-1]
             self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
@@ -6011,31 +6057,71 @@ window.fetch=async(_path,options={})=>{
             self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
         self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
 
-    def test_failed_alert_keeps_feedback_pending_for_post_and_startup_retries(self) -> None:
+    def test_failed_list_feedback_defers_its_alert_on_the_live_status(self) -> None:
         root = self.root / "reviews"
-        item = self.add("Retry when the alert fails")
-        fields = self.fields(item, "tell", words="Keep trying until someone receives this.")
-        delivery = list_page.submit(root, urlencode(fields))
-        pending = the_list.load(MORTY.id, item.id)
-        with (patch.object(change_page, "send_to_staff", side_effect=RuntimeError("all sends fail")) as send,
-              patch.object(time, "sleep"), redirect_stderr(io.StringIO())):
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Report a failed send")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        attempts: list[tuple[staff.StaffId, str]] = []
+
+        def send(recipient: staff.StaffId, _sender: str, _message: str, *, key: str, question: bool) -> None:
+            self.assertTrue(question)
+            attempts.append((recipient, key))
+            if recipient == MORTY.id:
+                raise change_page.QuestionSendStopped("The recipient refused the message.")
+            if len(attempts) == 2:
+                raise change_page.QuestionNotStarted("The alert route is unavailable.")
+
+        with patch.object(change_page, "send_to_staff", side_effect=send):
+            list_page.deliver(list_page.submit(root, urlencode(fields), status))
+            self.assertTrue(status.has_deferred_alerts())
+            status.recover_deferred_alerts()
+            self.assertFalse(status.has_deferred_alerts())
+            list_page.recover_pending(status)
+        self.assertEqual([recipient for recipient, _ in attempts], [MORTY.id, OWNER.id, OWNER.id])
+        self.assertEqual(attempts[1], attempts[2])
+        saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
+        self.assertEqual((saved.state, saved.alerted_to), ("alerted", "sdlc"))
+
+    def test_list_feedback_retries_a_temporary_failure_without_a_new_submission(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Retry List feedback")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        delivery = list_page.submit(root, urlencode(fields), status)
+
+        def saved_state() -> str:
+            return the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]].state
+
+        with patch.object(change_page, "send_to_staff",
+                          side_effect=[change_page.QuestionNotStarted("The route is unavailable."), None]) as send:
             list_page.deliver(delivery)
-            tries = conf.read("review_links").whole("delivery_tries")
-            self.assertEqual(send.call_count, tries + 1)
-            self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]].state, "pending")
-            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
-            list_page.deliver(list_page.submit(root, urlencode(fields)))
-            self.assertEqual(send.call_count, 2 * (tries + 1))
-            list_page.recover_pending()
-            self.assertEqual(send.call_count, 3 * (tries + 1))
-            self.assertEqual(the_list.load(MORTY.id, item.id), pending)
-        with patch.object(change_page, "send_to_staff") as send:
-            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            self.assertEqual(saved_state(), "pending")
+            self.assertTrue(status.has_deferred_questions())
             send.assert_called_once()
+            change_page.recover_deferred_questions(status)
+            self.assertEqual(saved_state(), "sent")
+            self.assertFalse(status.has_deferred_questions())
+            change_page.recover_deferred_questions(status)
+        source = the_list.folder(MORTY.id) / f"{item.id}.md"
+        key = change_page.review_delivery_key(source, item.id, fields["request"])
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[0], send.call_args_list[1])
+        self.assertEqual(send.call_args.kwargs["key"], key)
+
+    def test_unconfirmed_feedback_does_not_send_again_on_post_or_startup(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Keep unconfirmed feedback pending")
+        fields = self.fields(item, "tell", words="Keep the saved feedback.")
+        delivery = list_page.submit(root, urlencode(fields))
+        before = the_list.load(MORTY.id, item.id)
+        with patch.object(change_page, "send_to_staff", return_value="pending") as send:
+            list_page.deliver(delivery)
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
             list_page.recover_pending()
-            send.assert_called_once()
-        saved = the_list.load(MORTY.id, item.id)
-        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
+        send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), before)
+        self.assertEqual(the_list.feedback_requests(before)[fields["request"]].state, "pending")
 
     def test_feedback_save_failures_leave_recoverable_requests_only(self) -> None:
         root = self.root / "reviews"
@@ -6073,7 +6159,8 @@ window.fetch=async(_path,options={})=>{
         other = self.add("Mark this item read")
         delivery = list_page.submit(root, urlencode(self.fields(item, "tell", words="Keep these words.")))
         entered, release = threading.Event(), threading.Event()
-        def send(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str, question: bool) -> None:
+            self.assertTrue(question)
             self.assertTrue(key.startswith("review:"))
             entered.set()
             if not release.wait(TEST_HANG_GUARD_SECS):

@@ -10,7 +10,7 @@ import secrets
 import shutil
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,7 +79,7 @@ def shown_files(record: image_store.ImageRecord) -> tuple[tuple[str, str], ...]:
     return ("", record["file"]),
 
 
-def records(root: Path) -> list[image_store.ImageRecord]:
+def records(root: Path, *, on_error: Callable[[Path, Exception], None] | None = None) -> list[image_store.ImageRecord]:
     """Read every registered image, oldest first; an unreadable record prints one line and stays out."""
     folder = images_root(root)
     found: list[image_store.ImageRecord] = []
@@ -93,7 +93,10 @@ def records(root: Path) -> list[image_store.ImageRecord]:
         try:
             found.append(image_store.read_record(entry))
         except (OSError, ValueError) as error:
-            print(f"review-links images: {error}", file=sys.stderr)
+            if on_error is None:
+                print(f"review-links images: {error}", file=sys.stderr)
+            else:
+                on_error(entry, error)
     # A new image goes to the end, so the cards above it keep their places.
     return sorted(found, key=lambda record: record["registered_at"])
 
@@ -287,6 +290,15 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     return change_page.NoMessageDelivery()
 
 
+def recover_questions(status: change_page.DeliveryStatus) -> None:
+    """Read each image for questions without a delivery record."""
+    for record in records(status.root, on_error=status.defer_source):
+        if saved := record.get("questions"):
+            path = images_root(status.root) / record["id"] / image_store.RECORD
+            target = change_page.image_question_target(path, record)
+            page_question.recover_source(status, target, tuple(question_record.read(question) for question in saved))
+
+
 def ask_question(root: Path, identity: str, words: str, status: change_page.DeliveryStatus
                  ) -> change_page.MessageDelivery:
     store = image_store.ImageQuestionStore(images_root(root))
@@ -300,8 +312,12 @@ def answer_question(root: Path, identity: str, question_id: str, text: str) -> N
     store = image_store.ImageQuestionStore(images_root(root))
     with change_page.question_answer_lock(store.folder(identity) / image_store.RECORD, question_id):
         result = page_question.answer(store, identity, question_id, text)
-    if isinstance(result, page_question.AnswerRefused):
-        raise question_record.AnswerRefused(result.reason)
+        if isinstance(result, page_question.AnswerRefused):
+            raise question_record.AnswerRefused(result.reason)
+        folder = store.folder(identity)
+        record = image_store.read_record(folder)
+        target = change_page.image_question_target(folder / image_store.RECORD, record)
+        change_page.record_page_question_answer(change_page.DeliveryStatus(root), target, result.question)
 
 
 def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) -> str:
@@ -353,13 +369,11 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
         else:
             # A prior attempt can leave the file visible after a failed directory sync.
             atomic_file.sync_folder(folder)
-    settings = conf.read("review_links")
     owner = staff.StaffId(record["owner"])
-    failures = change_page.send_with_retries(SENDER, (owner,),
-                                             answer_message(record, answer, feedback), settings.whole("delivery_tries"),
-                                             settings.number("delivery_pause_seconds"), key=key)
-    if failures:
-        raise AnswerNotSent(failures[-1].error)
+    progress = change_page.deliver_page_feedback(snapshot.with_suffix(".json"), key, owner,
+                                                answer_message(record, answer, feedback), sender=SENDER)
+    if progress.state is not change_page.QuestionDeliveryState.CONFIRMED:
+        raise AnswerNotSent(progress.error or "The sender did not confirm delivery.")
     with file_lock.exclusive(lock):
         try:
             current = image_store.read_record(folder)

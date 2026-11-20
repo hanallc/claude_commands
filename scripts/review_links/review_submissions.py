@@ -21,7 +21,7 @@ from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
+from scripts.production import change_review, change_routing, delivery_state, investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
 from scripts.review_links import image_store, new_item_dialog, page_frame, review_events, review_link
@@ -1237,20 +1237,29 @@ def sent_question_path(scoped: ScopedSubmissionKey, members: staff.StaffSnapshot
         yield located.destination.path
 
 
-def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapshot | None = None) -> bool:
-    """Apply the scoped reply to the native record."""
+def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapshot | None = None,
+           root: Path | None = None) -> bool:
+    """Apply the scoped reply to the native record and its delivery."""
     scoped = read_submission_key(key)
     words = read_words(words.strip(), "Answer")
+    root = review_link.review_root() if root is None else root
+    root.mkdir(parents=True, exist_ok=True)
     try:
         with scoped_submission(scoped, members=members) as located:
             path = located.destination.path
             owner = located.destination.owner
+            row = path.stem
             match scoped.kind:
                 case SubmissionKind.QUESTION:
-                    return update_registration.reply_to_submission(path, scoped, words, reply_token, owner=owner)
+                    changed = update_registration.reply_to_submission(path, scoped, words, reply_token, owner=owner)
                 case SubmissionKind.PROPOSAL:
-                    return proposal_issue.reply_to_submission(path, scoped, words, reply_token, owner=owner)
+                    changed = proposal_issue.reply_to_submission(path, scoped, words, reply_token, owner=owner)
                 case SubmissionKind.BUG | SubmissionKind.INVESTIGATION:
-                    return investigation.answer_submission(path, scoped, words, reply_token, owner=owner)
+                    changed = investigation.answer_submission(path, scoped, words, reply_token, owner=owner)
+                    row = scoped.item_id
+            delivery = change_routing.delivery_path(root, path, row)
+            with change_review.review_delivery_lock(root):
+                delivery_state.complete_review_reply(delivery, reply_token, words)
+            return changed
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure) as error:
         raise SubmissionError(str(error)) from error

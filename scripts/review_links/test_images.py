@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
-from itertools import permutations
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest.mock import call, patch
@@ -27,7 +26,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.production import delivery_state, staff, unrouted_alert
-from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
+from scripts.review_links.test_page_question import FakeQuestionTransport, confirmed_schema_two, expire_saved_question, question_outcome, saved_progress
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
@@ -77,6 +76,7 @@ class ImagesFixture(unittest.TestCase):
 
     def capture_question(self, recipient: staff.StaffId, message: str, _message_id: str
                          ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+        change_page.mark_sender_started()
         owner = staff.snapshot().by_id(recipient)
         assert owner is not None
         self.capture(f"session:{owner.current_session}", change_page.SENDER, message)
@@ -672,7 +672,7 @@ class ImageQuestionTests(ImagesFixture):
         self.sent.clear()
         keys: list[str] = []
 
-        def send(recipient: str, sender: str, message: str, *options: str
+        def send(recipient: str, sender: str, message: str, *options: str, **_transport: object
                  ) -> tuple[send_result.ConfirmedSendOutcome, str]:
             self.assertEqual(options[options.index("--recipient-key") + 1], self.owner_id())
             key = options[options.index("--key") + 1]
@@ -689,32 +689,28 @@ class ImageQuestionTests(ImagesFixture):
             self.submit(body)
             images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
             self.submit(body)
-        self.assertEqual(len(keys), 2)
-        self.assertEqual(keys[0], keys[1])
+        self.assertEqual(len(keys), 1)
         self.assertEqual(len(self.sent), 1)
         saved = image_store.read_record(images.images_root(self.root) / record["id"])
         self.assertNotIn("feedback_at", saved)
         self.assertIn("The gate passed.", images.render(self.status).decode())
 
-    def test_repeated_feedback_keeps_a_new_answer_for_each_send_order(self) -> None:
-        outcomes: tuple[send_result.Outcome, ...] = ("pending", "sent", "skipped")
-        for order in permutations(outcomes):
-            with self.subTest(order=order):
-                record = self.register()
-                self.ask(record)
-                body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
-                                  "token": images.request_token(images.console_token(self.root), record["id"])})
-                with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
-                      patch.object(unrouted_alert, "message_outcome",
-                                   side_effect=[question_outcome(outcome) for outcome in order]) as send):
-                    self.submit(body)
-                    images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
-                    for _ in order[1:]:
-                        self.submit(body)
-                        saved = image_store.read_record(images.images_root(self.root) / record["id"])
-                        self.assertNotIn("feedback_at", saved)
-                        self.assertIn(f'data-image="{record["id"]}"', images.render(self.status).decode())
-                self.assertEqual(send.call_count, len(order))
+    def test_unconfirmed_feedback_does_not_send_again_or_hide_a_new_answer(self) -> None:
+        record = self.register()
+        self.ask(record)
+        body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
+              patch.object(unrouted_alert, "message_outcome", return_value=question_outcome("pending")) as send):
+            with self.assertRaises(images.AnswerNotSent):
+                self.submit(body)
+            images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
+            with self.assertRaises(images.AnswerNotSent):
+                self.submit(body)
+            send.assert_called_once()
+        saved = image_store.read_record(images.images_root(self.root) / record["id"])
+        self.assertNotIn("feedback_at", saved)
+        self.assertIn("The gate passed.", images.render(self.status).decode())
 
     def test_new_approval_sends_once_after_an_answer_reopens_the_image(self) -> None:
         record = self.register()
@@ -731,7 +727,7 @@ class ImageQuestionTests(ImagesFixture):
             fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', card))
             return urlencode({**fields, "action": "approved"})
 
-        def send(recipient: str, sender: str, message: str, *options: str
+        def send(recipient: str, sender: str, message: str, *options: str, **_transport: object
                  ) -> tuple[send_result.ConfirmedSendOutcome, str]:
             key = options[options.index("--key") + 1]
             first = key not in keys
@@ -755,13 +751,11 @@ class ImageQuestionTests(ImagesFixture):
             self.assertNotIn(identity, images.render(self.status).decode())
             self.submit(fresh_post)
 
-        self.assertEqual(len(keys), 4)
-        self.assertEqual(keys[0], keys[1])
-        self.assertEqual(keys[2], keys[3])
-        self.assertNotEqual(keys[0], keys[2])
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
         self.assertEqual(len(self.sent), 2)
 
-    def test_skipped_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
+    def test_saved_receipt_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()
         self.ask(record)
         images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
@@ -770,22 +764,26 @@ class ImageQuestionTests(ImagesFixture):
         folder = images.images_root(self.root) / record["id"]
         with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
               patch.object(unrouted_alert, "message_outcome",
-                           side_effect=[question_outcome("sent"), question_outcome("skipped")]) as send):
+                           return_value=question_outcome("sent")) as send):
             with (patch.object(image_store, "write_record", side_effect=OSError("The feedback write failed.")),
                   self.assertRaisesRegex(OSError, "The feedback write failed.")):
                 self.submit(body)
             self.assertNotIn("feedback_at", image_store.read_record(folder))
             self.assertIn("The gate passed.", images.render(self.status).decode())
             self.submit(body)
-        self.assertEqual(send.call_count, 2)
+        send.assert_called_once()
         self.assertIn("feedback_at", image_store.read_record(folder))
         self.assertNotIn(record["id"], images.render(self.status).decode())
 
-    def test_startup_resumes_an_image_question_after_the_sender_stops(self) -> None:
+    def test_startup_keeps_an_interrupted_image_send_uncertain(self) -> None:
         record = self.register()
         delivery = images.ask_question(self.root, record["id"], "Which check passed?", self.status)
         path = self.status.path(delivery.page, delivery.row)
-        with (patch.object(change_page, "send_question", side_effect=SystemExit),
+        def interrupt(*_args: object) -> None:
+            change_page.mark_sender_started()
+            raise SystemExit
+
+        with (patch.object(change_page, "send_question", side_effect=interrupt),
               self.assertRaises(SystemExit)):
             change_page.deliver(delivery, self.status)
         sending = change_page.read_question_attempt(path)
@@ -794,9 +792,9 @@ class ImageQuestionTests(ImagesFixture):
         with patch.object(change_page, "send_question", side_effect=transport.send):
             for _ in range(2):
                 change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
-        self.assertEqual(transport.calls, [sending.message_id])
+        self.assertEqual(transport.calls, [])
         restored = change_page.read_question_attempt(path)
-        self.assertEqual(restored.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(change_page.page_progress(restored).state, change_page.QuestionDeliveryState.UNKNOWN)
         self.assertEqual(restored.attempt_id, sending.attempt_id)
 
     def test_feedback_started_after_an_answer_still_hides_the_image(self) -> None:
@@ -884,34 +882,70 @@ class ImageQuestionTests(ImagesFixture):
         self.assertIn('<h3>Answer</h3><p>Second answer</p>', source)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id']+':Q10',)))
 
-    def test_a_failed_question_send_keeps_the_record_and_retries_the_same_question(self) -> None:
+    def test_a_refused_question_fails_at_once_and_cannot_send_again(self) -> None:
         record = self.register()
-        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as send,
-              patch.object(change_page, "alert_delivery_failures")):
+        with patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as send:
             self.ask(record)
-        self.assertEqual(send.call_count, 3)
+            path, = self.root.glob(change_page.DELIVERY_PREFIX + "*")
+            self.assertIn("Question not delivered.", images.render(self.status).decode())
+            self.ask(record)
+        send.assert_called_once()
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.FAILED)
+        self.assertEqual(saved_progress(path).error, "owner offline")
         content = images.render(self.status).decode()
         self.assertIn('Question not delivered.', content)
         self.assertIn(f'data-image="{record["id"]}"', content)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id'],)))
-        paths = list(self.root.glob(change_page.DELIVERY_PREFIX+'*'))
-        self.assertEqual(len(paths), 1)
-        saved = change_page.read_question_attempt(paths[0])
-        self.assertEqual(saved.state, delivery_state.QuestionSendState.FAILED)
-        self.assertEqual(saved.error, 'owner offline')
-        self.status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
-        pending = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        content = images.render(self.status).decode()
-        self.assertNotIn(f'data-image="{record["id"]}"', content)
-        self.assertIn(f'data-waiting-images="{record["id"]}"', content)
-        change_page.deliver(pending, self.status)
-        self.assertEqual(change_page.read_question_attempt(paths[0]).state, delivery_state.QuestionSendState.SENT)
-        self.ask(record)
-        self.assertEqual(len(self.sent), 1)
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
-        self.assertEqual(len(questions), 1)
-        self.assertEqual(questions[0].question_id, 'Q1')
-        self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset())
+        self.assertEqual([question.question_id for question in questions], ['Q1'])
+
+    def test_unreadable_image_without_delivery_stays_scheduled_after_restart(self) -> None:
+        record = self.register()
+        words = "Which check passed?"
+        with (patch.object(change_page, "publish_question_attempt", side_effect=OSError("Cannot save delivery.")),
+              self.assertRaisesRegex(OSError, "Cannot save delivery")):
+            _ = images.ask_question(self.root, record["id"], words, self.status)
+        question, = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record["id"])
+        self.assertEqual(question.words, words)
+        self.assertEqual(list(self.root.glob(change_page.DELIVERY_PREFIX + "*")), [])
+
+        transport = FakeQuestionTransport()
+        restarted = change_page.DeliveryStatus(self.root)
+        with (patch.object(change_page, "send_question", side_effect=transport.send),
+              redirect_stderr(StringIO()) as errors):
+            with patch.object(image_store, "read_record", side_effect=OSError("Cannot read the image.")):
+                change_page.recover_pending(restarted)
+                self.assertTrue(restarted.has_deferred_questions())
+                change_page.recover_deferred_questions(restarted)
+                self.assertTrue(restarted.has_deferred_questions())
+                self.assertEqual(transport.calls, [])
+            self.assertEqual(errors.getvalue().count("Cannot read the image."), 2)
+            change_page.recover_deferred_questions(restarted)
+            change_page.recover_deferred_questions(restarted)
+        path, = self.root.glob(change_page.DELIVERY_PREFIX + "*")
+        self.assertEqual(saved_progress(path).question_id, question.question_id)
+        self.assertEqual(transport.calls, [change_page.read_question_attempt(path).message_id])
+
+    def test_an_alert_write_error_keeps_the_expired_question_failure_visible(self) -> None:
+        record = self.register()
+        with patch.object(change_page, 'send_question', return_value=question_outcome('pending')) as send:
+            self.ask(record)
+        send.assert_called_once()
+        path, = self.root.glob(change_page.DELIVERY_PREFIX + '*')
+        deadline = saved_progress(path).deadline
+        with patch.object(change_page, 'review_alert_showrunners', return_value=(staff.StaffId('fixture-alert'),)):
+            with patch.object(self.status, 'store_pending_alerts', side_effect=OSError('Cannot save the alert.')):
+                expire_saved_question(self.status, path)
+            self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.FAILED)
+            self.assertIn('Question not delivered.', images.render(self.status).decode())
+            with patch.object(change_page, 'send_question') as send:
+                change_page.recover_deferred_questions(self.status)
+            send.assert_not_called()
+        self.assertTrue(self.status.has_deferred_alerts())
+        fields = delivery_state.read_fields(change_page.question_closeout_path(path))
+        alerts = cast(list[change_page.PendingDeliveryAlert], fields['pending_alerts'])
+        alert, = alerts
+        self.assertEqual(alert.get('deadline'), deadline)
 
     def test_startup_waits_for_the_sender_lock_before_recovery(self) -> None:
         record = self.register()
@@ -924,10 +958,10 @@ class ImageQuestionTests(ImagesFixture):
             publish(path, attempt)
 
         with patch.object(change_page, 'publish_question_attempt', side_effect=interrupt_after_send):
-            with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
-                change_page.deliver(delivery, self.status)
+            change_page.deliver(delivery, self.status)
+        self.assertTrue(self.status.has_deferred_questions())
 
-        self.status = change_page.DeliveryStatus(self.root)
+        self.status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         assert isinstance(delivery, change_page.PageQuestionSend)
         assert isinstance(delivery.job, change_page.QuestionJob)
         with file_lock.exclusive(Path(cast(str, delivery.job.lock.name))):
@@ -941,7 +975,7 @@ class ImageQuestionTests(ImagesFixture):
         self.assertNotIn('Question not delivered.', content)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id'],)))
         change_page.recover_review_messages(self.status)
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])), 1)
 
     def test_recovery_refusals_keep_the_first_send_result_unknown(self) -> None:
@@ -955,37 +989,36 @@ class ImageQuestionTests(ImagesFixture):
             publish(path, attempt)
 
         with patch.object(change_page, 'publish_question_attempt', side_effect=fail_confirmation):
-            with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
-                change_page.deliver(delivery, self.status)
+            change_page.deliver(delivery, self.status)
+        self.assertTrue(self.status.has_deferred_questions())
 
         self.status = change_page.DeliveryStatus(self.root)
         with patch.object(change_page, "send_question",
                           return_value=question_outcome("refused", "owner offline")) as send:
             change_page.recover_review_messages(self.status)
-            self.assertEqual(send.call_count, 3)
+            send.assert_not_called()
             self.ask(record)
-            self.assertEqual(send.call_count, 3)
+            send.assert_not_called()
         path = self.status.path(delivery.page, delivery.row)
         saved = change_page.read_question_attempt(path)
-        self.assertEqual(saved.state, delivery_state.QuestionSendState.UNKNOWN)
-        self.assertTrue(saved.earlier_unconfirmed)
+        self.assertEqual(change_page.page_progress(saved).state, change_page.QuestionDeliveryState.UNKNOWN)
         self.assertTrue(self.status.has_deferred_questions())
         self.assertNotIn("Question not delivered.", images.render(self.status).decode())
         with patch.object(change_page, "send_question", return_value=question_outcome("skipped")) as recover:
             change_page.recover_deferred_questions(self.status)
             change_page.recover_deferred_questions(self.status)
-        recover.assert_called_once_with(saved.recipient_id, saved.message, saved.message_id)
-        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+        recover.assert_not_called()
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.UNKNOWN)
         self.assertEqual(len(self.sent), 1)
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
         self.assertEqual([question.question_id for question in questions], ['Q1'])
 
-    def test_ready_write_failure_keeps_the_saved_question_and_shows_a_notice(self) -> None:
+    def test_claim_write_failure_keeps_the_saved_question_without_a_notice(self) -> None:
         record = self.register()
         publish = change_page.publish_question_attempt
 
         def fail_intent_update(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
-            if attempt.state is delivery_state.QuestionSendState.READY:
+            if attempt.state is delivery_state.QuestionSendState.CLAIMED:
                 raise OSError('Cannot update the send intent.')
             publish(path, attempt)
 
@@ -994,14 +1027,13 @@ class ImageQuestionTests(ImagesFixture):
 
         path, = self.root.glob(change_page.DELIVERY_PREFIX + '*')
         failed = change_page.read_question_attempt(path)
-        self.assertEqual(failed.state, delivery_state.QuestionSendState.FAILED)
-        self.assertEqual(failed.error, 'Cannot update the send intent.')
+        self.assertEqual(failed.state, delivery_state.QuestionSendState.READY)
         self.assertEqual(self.sent, [])
-        self.assertIn('Question not delivered.', images.render(self.status).decode())
+        self.assertNotIn('Question not delivered.', images.render(self.status).decode())
 
         self.status = change_page.DeliveryStatus(self.root)
         change_page.recover_review_messages(self.status)
-        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.sent), 1)
         self.ask(record)
         self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
         self.assertEqual(len(self.sent), 1)
@@ -1010,35 +1042,23 @@ class ImageQuestionTests(ImagesFixture):
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
         self.assertEqual([question.question_id for question in questions], ['Q1'])
 
-    def test_ready_sync_failure_accepts_the_published_revision(self) -> None:
+    def test_claim_sync_failure_keeps_the_saved_question(self) -> None:
         record = self.register()
         sync = atomic_file.sync_folder
-        read = change_page.read_question_attempt
-        fail_readback = False
 
-        def sync_ready(folder: Path) -> None:
-            nonlocal fail_readback
-            if folder == self.root and any(read(path).state is delivery_state.QuestionSendState.READY
+        def sync_claim(folder: Path) -> None:
+            if folder == self.root and any(saved_progress(path).state is change_page.QuestionDeliveryState.NOT_STARTED
+                                           and change_page.read_question_attempt(path).state is delivery_state.QuestionSendState.CLAIMED
                                            for path in folder.glob(change_page.DELIVERY_PREFIX + '*')):
-                fail_readback = True
-                raise OSError('Cannot sync the READY record.')
+                raise OSError("Cannot sync the claim.")
             sync(folder)
 
-        def read_attempt(path: Path) -> delivery_state.QuestionAttempt:
-            nonlocal fail_readback
-            if fail_readback:
-                fail_readback = False
-                raise OSError('Cannot verify the READY record.')
-            return read(path)
-
-        with (patch.object(atomic_file, 'sync_folder', side_effect=sync_ready),
-              patch.object(change_page, 'read_question_attempt', side_effect=read_attempt)):
+        with patch.object(atomic_file, "sync_folder", side_effect=sync_claim):
             self.ask(record)
-
         path, = self.root.glob(change_page.DELIVERY_PREFIX + '*')
-        self.assertEqual(read(path).state, delivery_state.QuestionSendState.FAILED)
-        self.assertEqual(self.sent, [])
-        self.assertIn('Question not delivered.', images.render(self.status).decode())
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.CONFIRMED)
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn('Question not delivered.', images.render(self.status).decode())
 
     def test_startup_retries_an_unreadable_delivery_record(self) -> None:
         record = self.register()
@@ -1062,22 +1082,22 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
         self.assertFalse(restarted.has_deferred_questions())
 
-    def test_pending_send_retries_with_the_saved_message_id(self) -> None:
+    def test_pending_send_keeps_the_saved_message_id_without_a_retry(self) -> None:
         record = self.register()
         with patch.object(change_page, 'send_question', return_value=question_outcome('pending')) as send:
             self.ask(record)
         path, = self.root.glob(change_page.DELIVERY_PREFIX + '*')
         attempt = change_page.read_question_attempt(path)
         self.assertEqual(attempt.state, delivery_state.QuestionSendState.UNKNOWN)
-        self.assertEqual(send.call_args_list, [call(self.owner_id(), attempt.message, attempt.message_id)] * 3)
+        self.assertEqual(send.call_args_list, [call(self.owner_id(), attempt.message, attempt.message_id)])
         self.assertTrue(self.status.has_deferred_questions())
 
         self.status = change_page.DeliveryStatus(self.root)
         with patch.object(change_page, 'send_question', return_value=question_outcome('skipped')) as recover:
             change_page.recover_review_messages(self.status)
             change_page.recover_review_messages(self.status)
-        recover.assert_called_once_with(self.owner_id(), attempt.message, attempt.message_id)
-        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+        recover.assert_not_called()
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.UNKNOWN)
 
     def test_malformed_question_delivery_metadata_renders_as_unknown(self) -> None:
         record = self.register()
@@ -1115,49 +1135,26 @@ class ImageQuestionTests(ImagesFixture):
         change_page.recover_review_messages(self.status)
         self.assertEqual(len(self.sent), 1)
 
-    def test_a_failed_send_mark_records_failure_before_transport_runs(self) -> None:
-        record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        with (patch.object(atomic_file, 'sync_folder', side_effect=OSError('Cannot sync the send mark.')),
-              redirect_stderr(StringIO()) as output):
-            change_page.deliver(delivery, self.status)
-        path = self.status.path(delivery.page, delivery.row)
-        self.assertIs(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.FAILED)
-        self.assertIn("Cannot sync the send mark.", output.getvalue())
-        change_page.recover_review_messages(self.status)
-        self.assertEqual(self.sent, [])
-        self.assertIn("Question not delivered.", images.render(self.status).decode())
-
-    def test_startup_recovers_after_a_failed_failure_receipt(self) -> None:
+    def test_a_failed_preflight_write_blocks_transport_until_recovery(self) -> None:
         record = self.register()
         delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
         publish = change_page.publish_question_attempt
 
-        def fail_result(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
-            if attempt.state is delivery_state.QuestionSendState.FAILED:
-                raise OSError("Cannot write the failure.")
+        def fail_mark(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
+            if attempt.state is delivery_state.QuestionSendState.CLAIMED:
+                raise OSError("Cannot save the delivery deadline.")
             publish(path, attempt)
 
-        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as send,
-              patch.object(change_page, "publish_question_attempt", side_effect=fail_result),
-              redirect_stderr(StringIO()) as errors):
+        with (patch.object(change_page, "publish_question_attempt", side_effect=fail_mark),
+              redirect_stderr(StringIO()) as output):
             change_page.deliver(delivery, self.status)
-        self.assertEqual(send.call_count, 3)
-        self.assertTrue(self.status.has_deferred_questions())
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn("Cannot write the failure.", errors.getvalue())
-        self.status = change_page.DeliveryStatus(self.root)
-        assert isinstance(delivery, change_page.PageQuestionSend)
-        assert isinstance(delivery.job, change_page.QuestionJob)
-        with file_lock.exclusive(Path(cast(str, delivery.job.lock.name))):
-            change_page.recover_review_messages(self.status)
+        path = self.status.path(delivery.page, delivery.row)
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.NOT_STARTED)
+        self.assertIn("Cannot save the delivery deadline.", output.getvalue())
         self.assertEqual(self.sent, [])
-
         change_page.recover_review_messages(self.status)
-        questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
-        self.assertEqual([question.question_id for question in questions], ['Q1'])
         self.assertEqual(len(self.sent), 1)
-        self.assertIn('--question Q1', self.sent[0][2])
+        self.assertNotIn("Question not delivered.", images.render(self.status).decode())
 
     def test_empty_questions_and_unknown_or_answered_ids_preserve_the_image(self) -> None:
         record = self.register()
@@ -1174,6 +1171,48 @@ class ImageQuestionTests(ImagesFixture):
             images.answer_question(self.root, record['id'], 'Q1', 'Changed answer')
         self.assertEqual(images.records(self.root), before)
         self.assertTrue((images.images_root(self.root) / record['id'] / record['file']).is_file())
+
+    def test_migration_delivers_an_old_pending_image_with_its_saved_key(self) -> None:
+        image = self.register()
+        delivery = images.ask_question(self.root, image["id"], "Which check passed?", self.status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        delivery.job.release()
+        path = self.status.path(delivery.page, delivery.row)
+        recipient = delivery.recipients[0]
+        attempt = "old-image-attempt"
+        old = {"review_message": {"source": str(delivery.page.review_list), "row": delivery.row,
+                                  "saved": True, "owner": recipient, "message": delivery.message},
+               "verdict": {"attempt": attempt, "state": "pending", "recipients": [recipient]}}
+        _ = path.write_text(json.dumps(old))
+        restarted = change_page.DeliveryStatus(self.root)
+        change_page.migrate_question_deliveries(restarted)
+        progress = saved_progress(path)
+        self.assertEqual(progress.state, change_page.QuestionDeliveryState.NOT_STARTED)
+        self.assertEqual((progress.attempt, progress.recipients), (attempt, (recipient,)))
+        transport = FakeQuestionTransport()
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            change_page.recover_review_messages(restarted)
+            change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
+        self.assertEqual(transport.calls, [change_page.review_delivery_key(delivery.page.review_list, delivery.row, attempt)])
+        self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.CONFIRMED)
+
+    def test_migration_uses_the_image_answer_over_the_old_receipt(self) -> None:
+        image = self.register()
+        delivery = images.ask_question(self.root, image["id"], "Which check passed?", self.status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        _ = delivery.job.release()
+        path = self.status.path(delivery.page, delivery.row)
+        old = change_page.read_question_attempt(path)
+        images.answer_question(self.root, image["id"], "Q1", "The gate passed.")
+        _ = path.write_text(json.dumps(confirmed_schema_two(old)))
+        with patch.object(change_page, "send_question") as send:
+            change_page.migrate_delivery_file(self.status, path)
+            self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.ANSWERED)
+            change_page.recover_review_messages(self.status)
+        send.assert_not_called()
+        self.assertEqual(change_page.read_question_attempt(path).message_id, old.message_id)
 
     def test_an_older_record_needs_no_question_field_or_migration(self) -> None:
         record = self.register()
@@ -1266,18 +1305,16 @@ async (find, whenPageShows, check) => {
        'Question not delivered.', 'The card shows the delivery failure.');
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());
- await whenPageShows('the card removed after resend', () => !card());
- check((await postFixture('/fixture-resend')).ok, 'The fixture records the successful resend.');
+ check((await postFixture('/fixture-repeat')).ok, 'The fixture processes the repeated Ask.');
  await refresh();
- check(!card() && count() === '1', 'The successful resend keeps the card out of the count.');
+ check(card() && count() === '2', 'The failed question stays visible after a repeated Ask.');
 }'''
         requests = self.run_question_browser(self.question_probe(probe))
         self.assertEqual([(request['action'], request['feedback']) for request in requests],
                          [(['question'], ['Which check passed?']), (['question'], ['Which check failed?']),
                           (['question'], ['Which check failed?'])])
-        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(len(self.sent), 2)
         self.assertIn('Change review delivery needs attention', self.sent[1][2])
-        self.assertIn('--question Q2', self.sent[2][2])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
     def test_browser_removes_a_saved_question_after_an_incomplete_success_body(self) -> None:
@@ -1535,9 +1572,9 @@ async (find, whenPageShows, check, controlRefresh) => {
                     if not second_delivery_done.wait(5):
                         self.send_error(504, 'The fixture delivery did not finish.')
                         return
-                elif self.path == '/fixture-resend':
+                elif self.path == '/fixture-repeat':
                     if not resend_done.wait(5):
-                        self.send_error(504, 'The fixture resend did not finish.')
+                        self.send_error(504, 'The repeated Ask did not finish.')
                         return
                 else:
                     requests.append(parse_qs(payload))
@@ -1564,6 +1601,7 @@ async (find, whenPageShows, check, controlRefresh) => {
                         with patch.object(change_page, "send_question",
                                           return_value=question_outcome("refused", "The owner is unavailable.")):
                             change_page.deliver(delivery, delivery_status)
+                        delivery_status.recover_deferred_alerts()
                         second_delivery_done.set()
                     else:
                         change_page.deliver(delivery, delivery_status)

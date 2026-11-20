@@ -7,14 +7,13 @@ import html
 import json
 import re
 import secrets
-import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
@@ -673,7 +672,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
     return delivery, answer
 
 
-def question_message(outcome: change_page.QuestionOutcome, production: str, text: str, unit: str, words: str,
+def question_message(outcome: change_page.QuestionOutcome, text: str, unit: str, words: str,
                      key: str = "") -> str:
     """The message the asker gets for an answer, a follow-up or a skip."""
     lead = {"answer": "From the user (via the review page): ",
@@ -684,13 +683,9 @@ def question_message(outcome: change_page.QuestionOutcome, production: str, text
     message = lead + text + (f"\nFor: {unit}" if unit else "")
     if outcome in ("answer", "feedback"):
         return message + "\n" + words
-    if outcome == "question":
+    if outcome in ("question", "followup"):
         return (message + "\n" + words.strip() + "\nAnswer with this command:\n"
                 + change_page.reply_command(key))
-    if outcome == "followup":
-        return (message + "\n" + words.strip() + "\nReply with this command; the question then returns to the user with your reply:\n"
-                + f"~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py reply --production {shlex.quote(production)} "
-                + f"--item {shlex.quote(text)} --text '<your reply>'")
     return message
 
 
@@ -719,14 +714,13 @@ def submit_review_change(item: review_items.ReviewItem, browser: ReviewBrowser, 
     return delivery
 
 
-def save_outcome(production: update_registration.QuestionScope, question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
+def save_outcome(production: update_registration.QuestionScope, question: WaitingQuestion,
+                 outcome: Literal["answer", "feedback", "skip"],
                  identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
-    """Answer, send a follow-up or move the question to the end of its queue; return whom the message goes to."""
+    """Save an answer or move the question to the end of its queue."""
     text = question.record.item["text"]
     if outcome in ("answer", "feedback"):
         return update_registration.answer(production, text, identities=identities, only_open=True)
-    if outcome in ("followup", "question"):
-        return update_registration.followup(production, text, words, identities=identities)
     urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
                         datetime.now(production.zone).replace(tzinfo=None))
     return update_registration.answer_relay(production, production.name, update_registration.question_asker(
@@ -798,19 +792,23 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         return send(
             current, question.record, production, "question" if outcome == "followup" else outcome, words, status,
             verify_revision=verify_revision)
+    if outcome in ("followup", "question"):
+        ask = cast(Callable[..., tuple[change_page.MessageDelivery, str]],
+                   import_module("scripts.review_links.review_actions").ask_user_question)
+        return ask(production, question, outcome, words, identities, status, verify_revision=verify_revision)
     relay = update_registration.answer_relay(production, production.name,
         update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
     recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-    if outcome in ('feedback','question'):
+    if outcome == 'feedback':
         recipient = question.owner
-    message = question_message(outcome, production.name, item["text"], relay.unit, words, question.key)
+    message = question_message(outcome, item["text"], relay.unit, words, question.key)
     answer = words if outcome == "answer" else ""
     document = production.doc if isinstance(production, Production) else question.record.path.parent
     saved: change_page.StoredUserAnswer = {"saved": False, "source": str(question.record.path), "production": str(document),
         "owner": question.owner, "question": item["text"], "answer": answer, "message": message, "kind": outcome}
     page = change_page.UserQuestionPage(question.record.path, document, (question.record.path.stem,), "", saved)
-    # The delivery lock prevents startup recovery from reading an answer during its save.
-    with status.locked():
+    with (status.native_action(page, page.rows[0]),
+          update_registration.outstanding_lock(update_registration.outstanding_path(production)), status.locked()):
         if not exact_record and frontmatter(question.record.path).get("status") != ["open"]:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
         previous_page = status.metadata_page(page)
@@ -824,7 +822,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
             if exact_record:
                 save_question_record(production, question, outcome, words, verify_revision)
             else:
-                relay = save_outcome(production, question, outcome, words, identities)
+                relay = save_outcome(production, question, outcome, identities)
         except BaseException as error:
             try:
                 if exact_record:
@@ -836,7 +834,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
             if isinstance(error, update_registration.RegistrationFailure):
                 raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
             raise
-        if outcome not in ('feedback', 'question'):
+        if outcome != 'feedback':
             recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
         intent = replace(intent, recipients=(recipient,))
         page = replace(page, saved={**saved, "saved": True})

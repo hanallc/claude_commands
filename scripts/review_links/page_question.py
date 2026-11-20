@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import html
-import secrets
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.production.delivery_state import QuestionAttempt, QuestionSendState
 from scripts.review_links import change_page, question_record
 
@@ -46,47 +46,80 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
         if question is None:
             number = max((int(question.question_id[1:]) for question in questions), default=0) + 1
             question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words)
+            try:
+                try:
+                    store.add(item, question)
+                except AtomicDurabilityUnconfirmed:
+                    if question not in store.questions(item):
+                        raise
+                if question not in store.questions(item):
+                    raise question_record.AnswerRefused("The saved question does not match this delivery.")
+            except Exception:
+                status.question_sources_pending.set()
+                raise
         saved = target.saved(question)
+        record = save_attempt(status, saved, question, replace_orphan=new_question)
         page = saved.page()
         path = status.path(page, saved.source.row)
-        prepared = QuestionAttempt(saved.source, saved.recipient, saved.message, 1, QuestionSendState.PREPARED,
-                                   secrets.token_hex(32))
-        view = change_page.question_delivery_view(status, saved)
-        previous = view.attempt
-        record = previous if isinstance(previous, QuestionAttempt) else prepared
-        if isinstance(view, change_page.QuestionDeliveryFailed):
+        if record is None:
+            return change_page.question_envelope(page, new_attempt(saved, question))
+        if not saved.matches(record):
+            status.defer_question(path)
             return change_page.question_envelope(page, record)
-        if isinstance(view, change_page.ResendBlocked):
-            if view.state is QuestionSendState.UNKNOWN and new_question:
-                raise question_record.AnswerRefused(view.reason)
-            if isinstance(previous, QuestionAttempt):
-                status.defer_question(path)
-            return change_page.question_envelope(page, record)
-        if isinstance(view, change_page.QuestionDeliveryAccepted):
-            return change_page.question_envelope(page, record)
-        if not new_question and view.state is QuestionSendState.UNKNOWN:
-            return change_page.question_envelope(page, record)
-        if isinstance(previous, QuestionAttempt):
-            unsaved_draft = (new_question and previous.state is QuestionSendState.PREPARED
-                             and not previous.earlier_unconfirmed and previous.message_id == prepared.message_id)
-            if new_question and not unsaved_draft and not saved.matches(previous):
-                raise question_record.AnswerRefused("The question does not match its delivery record.")
-            if unsaved_draft or view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN):
-                retry = replace(prepared, revision=record.revision + 1,
-                                earlier_unconfirmed=record.earlier_unconfirmed or (
-                                    not unsaved_draft and view.state is QuestionSendState.UNKNOWN))
-                _ = status.question_recovery_remaining(path, retry.attempt_id, saved.source.question_id)
-                change_page.advance_question_attempt(path, record, retry)
-                record = retry
-        else:
-            record = replace(prepared, earlier_unconfirmed=not new_question and view.state is QuestionSendState.UNKNOWN)
-            _ = status.question_recovery_remaining(path, record.attempt_id, saved.source.question_id)
-            change_page.publish_question_attempt(path, record)
-        if new_question:
-            store.add(item, question)
-            if question not in store.questions(item):
-                raise question_record.AnswerRefused("The saved question does not match this delivery.")
-        return change_page.ready_and_claim_question(status, path, record, saved)
+        if change_page.page_progress(record).state.pending:
+            status.defer_question(path)
+        return change_page.ready_and_claim_question(status, record, saved)
+
+
+def save_attempt(status: change_page.DeliveryStatus, saved: change_page.SavedQuestionDelivery,
+                 question: question_record.Question, *, replace_orphan: bool = False) -> QuestionAttempt | None:
+    """Write the first delivery record from the source under the delivery lock."""
+    path = status.path(saved.page(), saved.source.row)
+    if not replace_orphan:
+        try:
+            record = change_page.read_question_attempt(path)
+            if saved.matches(record) or change_page.page_progress(record).saved_at >= (
+                    datetime.fromisoformat(question.asked_at).timestamp()):
+                return record
+        except FileNotFoundError:
+            pass
+        except change_page.QuestionAttemptMissing:
+            status.question_sources_pending.set()
+            status.defer_question(path, change_page.UnreadableDeliveryRecord())
+            return None
+    record = new_attempt(saved, question)
+    try:
+        change_page.publish_question_attempt(path, record)
+    except (OSError, ValueError):
+        status.question_sources_pending.set()
+        raise
+    status.defer_question(path)
+    return record
+
+
+def new_attempt(saved: change_page.SavedQuestionDelivery, question: question_record.Question) -> QuestionAttempt:
+    source = saved.source
+    attempt = change_page.source_question_key(source.path, source.row, question.asked_at, question.words)
+    progress = change_page.QuestionProgress(attempt, question.question_id,
+                                            datetime.fromisoformat(question.asked_at).timestamp())
+    return change_page.PageAttempt(source, saved.recipient, saved.message, 1, QuestionSendState.READY,
+                                   attempt, progress=progress)
+
+
+def recover_source(status: change_page.DeliveryStatus, target: change_page.QuestionDeliveryTarget,
+                   questions: tuple[question_record.Question, ...]) -> None:
+    for question in questions:
+        saved = target.saved(question)
+        if status.migration_pending(status.path(saved.page(), saved.source.row)):
+            continue
+        if question.answer is not None:
+            change_page.record_page_question_answer(status, target, question)
+            continue
+        try:
+            with status.locked():
+                _ = save_attempt(status, saved, question)
+        except (OSError, ValueError) as error:
+            status.defer_source(status.path(saved.page(), saved.source.row), error)
 
 
 def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answered | AnswerRefused:

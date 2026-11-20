@@ -43,8 +43,9 @@ def source_stamp(path: Path) -> record_store.FileStamp:
 
 class ReviewSourceStamps(list[Path]):
     """Record each source and its parent before a snapshot reads them."""
-    def __init__(self) -> None:
+    def __init__(self, on_error: Callable[[Path, Exception], None] | None = None) -> None:
         super().__init__()
+        self.on_error: Callable[[Path, Exception], None] | None = on_error
         self.before_read: dict[Path, record_store.FileStamp] = {}
         self.notices: dict[tuple[Path, str], str] = {}
         self.folder_entries: dict[Path, tuple[Path, ...]] = {}
@@ -70,7 +71,10 @@ class ReviewSourceStamps(list[Path]):
     def skipped(self, path: Path, entry: str, error: Exception) -> None:
         label = f'{path} ({entry})' if entry else str(path)
         self.notices[path, entry] = utf8_display(f'Could not load {label}.')
-        logging.getLogger(__name__).warning('Review source %s: %s', label, error)
+        if self.on_error is None:
+            logging.getLogger(__name__).warning('Review source %s: %s', label, error)
+        else:
+            self.on_error(path, error)
 
     @override
     def append(self, path: Path, /) -> None:
@@ -97,7 +101,8 @@ def guard_source(path: Path, sources: list[Path] | None, *,
         source = error.path if isinstance(error, change_routing.ProductionPathUnreadable) else path
         if isinstance(sources, ReviewSourceStamps):
             sources.skipped(source, entry, error)
-        elif isinstance(error, skip) or sources is None and isinstance(error, (OSError, UnicodeError)):
+        elif isinstance(error, FileNotFoundError) and FileNotFoundError in skip or (
+                sources is None and isinstance(error, (*skip, OSError, UnicodeError))):
             label = f'{source} ({entry})' if entry else str(source)
             logging.getLogger(__name__).warning('Review source %s: %s', label, error)
         else:
@@ -1042,11 +1047,15 @@ EFFICIENCY_LEDGER_FIELD = 'Efficiency ledger'
 EFFICIENCY_LINE = re.compile(r'^- \d{4}-\d\d-\d\d (?P<head>.*?) — (?P<status>.*)$')
 
 
-def efficiency_ledger(doc: Path) -> Path | NoEfficiencyLedger:
+def efficiency_ledger(doc: Path, *, strict: bool = False) -> Path | NoEfficiencyLedger:
     """Read the ledger path or name its absence."""
     try:
         return Path(production_field(doc.read_text(encoding='utf-8').splitlines(), EFFICIENCY_LEDGER_FIELD)).expanduser()
-    except (Refusal, OSError, UnicodeError):
+    except Refusal:
+        return NoEfficiencyLedger()
+    except (OSError, UnicodeError):
+        if strict:
+            raise
         return NoEfficiencyLedger()
 
 
@@ -1066,7 +1075,7 @@ def production_efficiency_ledgers(members: staff.StaffSnapshot, documents: tuple
     for doc in documents:
         path: Path | NoEfficiencyLedger = NoEfficiencyLedger()
         with guard_source(doc, sources, skip=(FileNotFoundError,)):
-            path = efficiency_ledger(doc)
+            path = efficiency_ledger(doc, strict=sources is not None)
         if isinstance(path, NoEfficiencyLedger) or path in seen:
             continue
         seen.add(path)

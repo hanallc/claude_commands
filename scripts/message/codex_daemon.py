@@ -79,7 +79,17 @@ class QueueUnconfirmed:
     reason: str
 
 
-QueueResult = Queued | QueueFailed | QueueTimedOut | QueueUnconfirmed
+@dataclass(frozen=True)
+class QueueNotStarted:
+    reason: str
+
+
+@dataclass(frozen=True)
+class QueueRejected:
+    reason: str
+
+
+QueueResult = Queued | QueueFailed | QueueTimedOut | QueueUnconfirmed | QueueNotStarted | QueueRejected
 
 
 @dataclass(frozen=True)
@@ -187,8 +197,9 @@ class _WebSocket:
 
     def _send_bytes(self, payload: bytes) -> None:
         self._prepare_operation()
-        self._socket.sendall(payload)
+        # A write error can leave part of the frame on the socket.
         self.writes += 1
+        self._socket.sendall(payload)
         _ = self._deadline.remaining_seconds()
 
     def _receive_exact(self, size: int) -> bytes:
@@ -380,13 +391,17 @@ def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float,
         return Queued()
     except (OSError, ValueError) as error:
         submitted = before_queue is not None and client is not None and client.writes > before_queue
-        if isinstance(error, TimeoutError):
-            if message_id and submitted:
-                return QueueUnconfirmed(f"Codex queue acceptance is unconfirmed after {timeout:g} s")
-            return QueueTimedOut(timeout)
         reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
-        if message_id and submitted and not isinstance(error, _RequestRejected):
+        if message_id:
+            if not submitted:
+                return QueueNotStarted(reason)
+            if isinstance(error, _RequestRejected):
+                return QueueRejected(reason)
+            if isinstance(error, TimeoutError):
+                return QueueUnconfirmed(f"Codex queue acceptance is unconfirmed after {timeout:g} s")
             return QueueUnconfirmed(reason)
+        if isinstance(error, TimeoutError):
+            return QueueTimedOut(timeout)
         return QueueFailed(reason)
     finally:
         if client is not None:

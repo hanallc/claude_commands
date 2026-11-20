@@ -794,14 +794,20 @@ class NumberedRecords:
         write_text(self.path(identity) if path is None else path, f"---\n{header}\n---\n\n{body}")
 
     def records[T](self, load: Callable[[str], T], *, sources: list[Path] | None = None,
-                   states: tuple[str, ...] = ()) -> list[T]:
+                   states: tuple[str, ...] = (), on_error: Callable[[Path, Exception], None] | None = None) -> list[T]:
         items: list[T] = []
-        for path in source_paths(self.folder(), f"{self.prefix}*.md", sources=sources):
+        for path in source_paths(self.folder(), f"{self.prefix}*.md",
+                                 sources=[] if sources is None and on_error is not None else sources):
             if sources is not None:
                 sources.append(path)
             try:
                 if not states or self.field(path.stem, "state") in states:
                     items.append(load(path.stem))
-            except self.error_type as error:
+            except (self.error_type, OSError) as error:
+                if on_error is not None:
+                    on_error(path, error)
+                    continue
+                if isinstance(error, OSError):
+                    raise
                 print(f"{self.noun}: {path}: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return items

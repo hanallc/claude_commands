@@ -1,25 +1,54 @@
 """Test shared page questions with private records and a fake sender."""
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
+from io import StringIO
 import threading
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 from scripts.lib import atomic_file, conf, process_start
-from scripts.message import send_result
-from scripts.production import delivery_state, staff
+from scripts.message import send_budget, send_result
+from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.review_links import change_page, image_store, page_question, question_record
 
+
+SEND_QUESTION = change_page.send_question
 
 def question_outcome(outcome: send_result.Outcome = "sent", detail: str = "fixture receipt"
                      ) -> tuple[send_result.ConfirmedSendOutcome, str]:
     return send_result.ConfirmedSendOutcome(send_result.OutcomeHeader(outcome, detail, "")), detail
+
+
+def confirmed_schema_two(record: delivery_state.QuestionAttempt) -> dict[str, object]:
+    return {"question_attempt": {
+        "schema": 2, "source": asdict(record.source), "state": "sent", "attempt_id": record.attempt_id,
+        "message_id": record.message_id, "message": record.message, "recipient_id": record.recipient_id,
+        "revision": record.revision, "owner": None, "receipt": {"outcome": "sent", "detail": ""}, "error": "",
+    }}
+
+
+def saved_progress(path: Path) -> change_page.QuestionProgress:
+    fields = delivery_state.read_fields(path)
+    if "question_attempt" in fields:
+        return change_page.page_progress(change_page.decode_page_attempt(fields))
+    return change_page.read_question_progress(fields["question_delivery"])
+
+
+def expire_saved_question(status: change_page.DeliveryStatus, path: Path) -> None:
+    progress = saved_progress(path)
+    deadline = progress.deadline if progress.deadline is not None else progress.saved_at + 86400
+    with patch.object(time, "time", return_value=deadline):
+        _ = change_page.expire_saved_questions(status, (path,))
 
 
 class FakeQuestionTransport:
@@ -29,6 +58,7 @@ class FakeQuestionTransport:
 
     def send(self, _recipient: staff.StaffId, _message: str, message_id: str
              ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+        change_page.mark_sender_started()
         self.calls.append(message_id)
         self.receipts.add(message_id)
         return question_outcome()
@@ -75,6 +105,7 @@ class PageQuestionTests(unittest.TestCase):
 
     def capture(self, recipient: staff.StaffId, message: str, message_id: str
                 ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+        change_page.mark_sender_started()
         self.sent.append((recipient, message_id, message))
         return question_outcome()
 
@@ -96,7 +127,7 @@ class PageQuestionTests(unittest.TestCase):
         def capture(recipient: staff.StaffId, message: str, message_id: str
                     ) -> tuple[send_result.ConfirmedSendOutcome, str]:
             self.assertEqual(self.store.questions("image-1")[0].words, "Which check passed?")
-            self.assertEqual(self.attempt(delivery).state, delivery_state.QuestionSendState.SENDING)
+            self.assertEqual(self.attempt(delivery).state, delivery_state.QuestionSendState.CLAIMED)
             return self.capture(recipient, message, message_id)
 
         with patch.object(change_page, "send_question", side_effect=capture):
@@ -124,37 +155,72 @@ class PageQuestionTests(unittest.TestCase):
         assert isinstance(delivery.job, change_page.QuestionJob)
         return delivery.job
 
-    def test_failed_delivery_keeps_the_question_for_a_retry(self) -> None:
-        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as sender,
-              patch.object(change_page, "alert_delivery_failures")):
+    def test_schema_two_migration_keeps_the_key_deadline_and_final_result(self) -> None:
+        states = (
+            (delivery_state.QuestionSendState.PREPARED, "", change_page.QuestionDeliveryState.NOT_STARTED),
+            (delivery_state.QuestionSendState.UNKNOWN, "", change_page.QuestionDeliveryState.NOT_STARTED),
+            (delivery_state.QuestionSendState.UNKNOWN, "The saved send refused.", change_page.QuestionDeliveryState.FAILED),
+            (delivery_state.QuestionSendState.FAILED, "", change_page.QuestionDeliveryState.FAILED),
+            (delivery_state.QuestionSendState.SENT, "", change_page.QuestionDeliveryState.CONFIRMED),
+        )
+        for index, (state, error, expected) in enumerate(states):
+            with self.subTest(state=state, error=error):
+                delivery = self.ask(item=f"image-{index}")
+                job = self.job(delivery)
+                job.release()
+                old = job.record
+                path = self.status.path(delivery.page, delivery.row)
+                receipt = {"outcome": "sent", "detail": "Saved receipt"} if state is delivery_state.QuestionSendState.SENT else None
+                reason = "The owner refused." if state is delivery_state.QuestionSendState.FAILED else ""
+                data = {"schema": 2, "source": asdict(old.source), "state": state, "attempt_id": old.attempt_id,
+                        "message_id": old.message_id, "message": old.message, "recipient_id": old.recipient_id,
+                        "revision": old.revision, "owner": None, "receipt": receipt, "error": reason,
+                        "earlier_unconfirmed": state is delivery_state.QuestionSendState.UNKNOWN}
+                _ = path.write_text(json.dumps({"question_attempt": data}))
+                deadline = time.time() + 150
+                recovery = path.with_name(
+                    change_page.QUESTION_RECOVERY_PREFIX + path.name.removeprefix(change_page.DELIVERY_PREFIX))
+                _ = recovery.write_text(json.dumps({"attempt": old.attempt_id, "question_id": old.source.question_id,
+                                                    "deadline": deadline, "error": error}))
+                change_page.migrate_delivery_file(self.status, path)
+                migrated = self.attempt(delivery)
+                progress = change_page.page_progress(migrated)
+                self.assertEqual((migrated.message_id, migrated.recipient_id), (old.message_id, old.recipient_id))
+                self.assertEqual(progress.attempt, old.attempt_id)
+                self.assertEqual(progress.deadline, deadline)
+                self.assertEqual(progress.state, expected)
+                self.assertEqual(progress.error, error or reason)
+
+    def test_only_a_proven_non_start_can_send_again(self) -> None:
+        detail = "The owner has no route."
+        non_start = send_result.ConfirmedSendOutcome(
+            send_result.OutcomeHeader("retry", detail, change_page.QUESTION_NOT_STARTED))
+        with patch.object(change_page, "send_question", return_value=(non_start, detail)) as send:
             delivery = self.ask()
             change_page.deliver(delivery, self.status)
-        self.assertEqual(sender.call_count, 2)
-        self.assertEqual(len(self.store.questions("image-1")), 1)
-        self.assertIsNone(self.store.questions("image-1")[0].answer)
-        self.assertFalse(self.status.question_jobs)
+        send.assert_called_once()
+        first = self.attempt(delivery)
+        self.assertEqual(change_page.page_progress(first).state, change_page.QuestionDeliveryState.NOT_STARTED)
         self.status = change_page.DeliveryStatus(self.status.root)
-        failed = self.attempt(delivery)
-        self.assertEqual((failed.state, failed.attempt_id, failed.error),
-                         (delivery_state.QuestionSendState.FAILED, delivery.attempt, "owner offline"))
         retry = self.ask()
-        self.assertNotEqual(retry.attempt, delivery.attempt)
-        self.assertEqual(self.attempt(retry).message_id, failed.message_id)
+        self.assertEqual(retry.attempt, delivery.attempt)
         change_page.deliver(retry, self.status)
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual([call[1] for call in self.sent], [first.message_id])
         self.assertEqual(len(self.store.questions("image-1")), 1)
-        self.assertEqual(self.status.slots(delivery.page, delivery.row).intents(), ())
         self.assertEqual(self.attempt(retry).state, delivery_state.QuestionSendState.SENT)
 
     def test_a_live_claim_prevents_a_second_sender(self) -> None:
         started, release = threading.Event(), threading.Event()
         transport = FakeQuestionTransport()
 
-        def capture(recipient: staff.StaffId, message: str, message_id: str
+        def capture(_recipient: staff.StaffId, _message: str, message_id: str
                     ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            change_page.mark_sender_started()
             started.set()
             self.assertTrue(release.wait(5))
-            return transport.send(recipient, message, message_id)
+            transport.calls.append(message_id)
+            transport.receipts.add(message_id)
+            return question_outcome()
 
         first = self.ask()
         status = self.status
@@ -183,38 +249,55 @@ class PageQuestionTests(unittest.TestCase):
                 _ = self.ask()
         self.assertEqual(self.sent, [])
         self.assertEqual(len(self.store.questions('image-1')), 1)
+        self.assertEqual(list(self.status.root.glob(change_page.DELIVERY_PREFIX + '*')), [])
         self.status = change_page.DeliveryStatus(self.status.root)
         change_page.deliver(self.ask(), self.status)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.store.questions('image-1')), 1)
 
-    def test_retry_sends_the_saved_question_after_the_intent_update_fails(self) -> None:
+    def test_an_old_attempt_without_a_saved_question_allows_a_new_ask(self) -> None:
+        text = 'Which check passed?'
+        orphan = self.ask(words=text)
+        _ = self.job(orphan).release()
+        self.store.items.clear()
+
+        replacement = self.ask(words='Which repair passed?')
+        self.assertNotEqual(replacement.attempt, orphan.attempt)
+        self.assertEqual([question.question_id for question in self.store.questions('image-1')], ['Q1'])
+        self.assertEqual(self.attempt(replacement).source.words, 'Which repair passed?')
+        change_page.deliver(replacement, self.status)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_first_delivery_write_failure_preserves_the_source(self) -> None:
+        with (patch.object(change_page, 'publish_question_attempt', side_effect=OSError('Cannot save delivery.')),
+              self.assertRaisesRegex(OSError, 'Cannot save delivery')):
+            _ = self.ask()
+        self.assertEqual([question.question_id for question in self.store.questions('image-1')], ['Q1'])
+        self.assertEqual(self.sent, [])
+        change_page.deliver(self.ask(), self.status)
+        self.assertEqual(len(self.store.questions('image-1')), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_claim_write_failure_keeps_the_saved_question(self) -> None:
         publish = change_page.publish_question_attempt
 
-        def fail_after_question_save(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
-            if attempt.state is delivery_state.QuestionSendState.READY:
-                raise OSError("Cannot update the delivery intent.")
+        def fail_claim(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
+            if attempt.state is delivery_state.QuestionSendState.CLAIMED:
+                raise OSError("Cannot save the delivery claim.")
             publish(path, attempt)
 
-        with patch.object(change_page, "publish_question_attempt", side_effect=fail_after_question_save):
+        with patch.object(change_page, "publish_question_attempt", side_effect=fail_claim):
             refused = self.ask()
         assert isinstance(refused, change_page.PageQuestionSend)
         self.assertIsInstance(refused.job, change_page.NoQuestionJob)
-        failed = self.attempt(refused)
-        self.assertEqual(failed.state, delivery_state.QuestionSendState.FAILED)
-        self.assertEqual(failed.error, "Cannot update the delivery intent.")
-        self.assertIsInstance(failed.owner, delivery_state.NoQuestionSendOwner)
-        self.assertEqual(len(self.store.questions('image-1')), 1)
-        change_page.deliver(refused, self.status)
-        self.status = change_page.DeliveryStatus(self.status.root)
-        change_page.recover_review_messages(self.status)
+        saved = self.attempt(refused)
+        self.assertEqual(saved.state, delivery_state.QuestionSendState.READY)
+        self.assertIsInstance(saved.owner, delivery_state.NoQuestionSendOwner)
+        self.assertEqual(len(self.store.questions("image-1")), 1)
         self.assertEqual(self.sent, [])
-
-        change_page.deliver(self.ask(), self.status)
         change_page.deliver(self.ask(), self.status)
         self.assertEqual(len(self.sent), 1)
-        self.assertIn('--question Q1', self.sent[0][2])
-        self.assertEqual([question.question_id for question in self.store.questions('image-1')], ['Q1'])
+        self.assertEqual(self.attempt(refused).message_id, saved.message_id)
 
     def test_a_held_lock_blocks_resend_for_an_unverified_claim(self) -> None:
         first = self.ask()
@@ -233,7 +316,7 @@ class PageQuestionTests(unittest.TestCase):
         change_page.deliver(retry, self.status)
         self.assertEqual(len(self.sent), 1)
 
-    def test_recovery_reuses_the_send_marker_with_or_without_a_receipt(self) -> None:
+    def test_recovery_never_reuses_the_send_marker(self) -> None:
         store = image_store.ImageQuestionStore(self.status.root / image_store.IMAGES_FOLDER)
         for number, accepted in enumerate((False, True)):
             with self.subTest(accepted=accepted):
@@ -257,12 +340,11 @@ class PageQuestionTests(unittest.TestCase):
                 with patch.object(change_page, "send_question", return_value=outcome) as send:
                     change_page.recover_review_messages(self.status)
                     change_page.recover_review_messages(self.status)
-                send.assert_called_once_with(attempt.recipient_id, attempt.message, attempt.message_id)
+                send.assert_not_called()
                 recovered = self.attempt(first)
-                self.assertEqual(recovered.state, delivery_state.QuestionSendState.SENT)
+                self.assertEqual(change_page.page_progress(recovered).state, change_page.QuestionDeliveryState.UNKNOWN)
                 self.assertEqual(recovered.attempt_id, attempt.attempt_id)
-                self.assertEqual(recovered.receipt, delivery_state.QuestionSendReceipt("kept" if accepted else "sent",
-                                                                                       "fixture receipt"))
+                self.assertIsInstance(recovered.receipt, delivery_state.NoQuestionSendReceipt)
                 self.assertEqual([question.question_id for question in store.questions(item)], ["Q1"])
 
     def test_stale_job_cannot_replace_the_new_result(self) -> None:
@@ -276,6 +358,48 @@ class PageQuestionTests(unittest.TestCase):
             change_page.advance_question_attempt(self.status.path(first.page, first.row), old,
                                                  replace(old, state=delivery_state.QuestionSendState.FAILED))
         self.assertEqual(self.attempt(second), sent)
+
+    def test_sender_spawn_failure_keeps_the_saved_key_ready(self) -> None:
+        member = staff.StaffRow(staff.StaffId("fixture-owner"), "showrunner", "fixture", staff.StaffRoot(),
+                                current_session=staff.StaffId("fixture-owner-session"))
+        first = self.ask()
+        path = self.status.path(first.page, first.row)
+        key = self.attempt(first).message_id
+        before: list[change_page.QuestionDeliveryState] = []
+
+        def fail_spawn(*_args: object, **_options: object) -> None:
+            before.append(saved_progress(path).state)
+            raise BlockingIOError(11, "The sender could not start.")
+
+        with (patch.object(change_page, "send_question", new=SEND_QUESTION),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))),
+              patch.object(send_budget, "seconds", return_value=10),
+              patch.object(subprocess, "Popen", side_effect=fail_spawn)):
+            change_page.deliver(first, self.status)
+        self.assertEqual(before, [change_page.QuestionDeliveryState.NOT_STARTED])
+        saved = self.attempt(first)
+        self.assertEqual(change_page.page_progress(saved).state, change_page.QuestionDeliveryState.NOT_STARTED)
+        self.assertEqual(saved.message_id, key)
+        self.assertTrue(self.status.has_deferred_questions())
+        change_page.recover_deferred_questions(self.status)
+        self.assertEqual([key for _, key, _ in self.sent], [saved.message_id])
+
+    def test_sync_failure_after_spawn_keeps_the_confirmation(self) -> None:
+        first = self.ask()
+        sync = atomic_file.sync_folder
+        marked: list[change_page.QuestionDeliveryState] = []
+
+        def fail_after_marker(folder: Path) -> None:
+            if self.attempt(first).state is delivery_state.QuestionSendState.SENDING:
+                marked.append(change_page.page_progress(self.attempt(first)).state)
+                raise OSError("Cannot sync the send marker.")
+            sync(folder)
+
+        with patch.object(atomic_file, "sync_folder", side_effect=fail_after_marker):
+            change_page.deliver(first, self.status)
+        self.assertEqual(marked, [change_page.QuestionDeliveryState.UNKNOWN])
+        self.assertEqual(self.effective(first), delivery_state.QuestionSendState.SENT)
+        self.assertEqual(len(self.sent), 1)
 
     def test_result_publication_after_rename_keeps_acceptance(self) -> None:
         first = self.ask()
@@ -313,8 +437,8 @@ class PageQuestionTests(unittest.TestCase):
 
         with (patch.object(change_page, "send_question", side_effect=transport.send),
               patch.object(os, "replace", side_effect=fail_result_rename)):
-            with self.assertRaises(atomic_file.AtomicPublicationFailed):
-                change_page.deliver(first, self.status)
+            change_page.deliver(first, self.status)
+        self.assertTrue(self.status.has_deferred_questions())
         self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENDING)
         self.assertEqual(self.effective(first), delivery_state.QuestionSendState.UNKNOWN)
         with patch.object(change_page, "send_question", side_effect=transport.send):
@@ -327,8 +451,8 @@ class PageQuestionTests(unittest.TestCase):
         state = delivery_state.QuestionSendState
         cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
             ("sent", state.SENT), ("kept", state.UNKNOWN), ("queued", state.UNKNOWN),
-            ("failed", state.FAILED), ("refused", state.FAILED), ("skipped", state.SENT),
-            ("replaced", state.FAILED), ("held", state.UNKNOWN), ("pending", state.UNKNOWN),
+            ("failed", state.UNKNOWN), ("refused", state.FAILED), ("skipped", state.SENT),
+            ("replaced", state.UNKNOWN), ("held", state.UNKNOWN), ("pending", state.UNKNOWN),
             ("retry", state.UNKNOWN),
         )
         for outcome, expected in cases:
@@ -338,117 +462,151 @@ class PageQuestionTests(unittest.TestCase):
                 change_page.deliver(delivery, self.status)
                 result = self.attempt(delivery)
                 self.assertEqual(result.state, expected)
-                tries = 2 if expected in (state.FAILED, state.UNKNOWN) else 1
-                self.assertEqual(send.call_args_list, [call(result.recipient_id, result.message, result.message_id)] * tries)
+                send.assert_called_once_with(result.recipient_id, result.message, result.message_id)
                 path = self.status.path(delivery.page, delivery.row)
                 self.assertNotIn('"resend_requests"', path.read_text())
                 self.assertEqual(set(self.status.take_deferred_questions()), {path} if expected is state.UNKNOWN else set())
                 if outcome == "skipped":
                     self.assertEqual(result.receipt, delivery_state.QuestionSendReceipt("kept", "fixture receipt"))
 
-    def test_unreadable_pending_attempt_expires_without_another_send(self) -> None:
+    def test_unreadable_attempt_stays_pending_until_the_record_can_be_read(self) -> None:
         delivery = self.ask()
         path = self.status.path(delivery.page, delivery.row)
         with patch.object(change_page, "send_question", return_value=question_outcome("pending")):
             change_page.deliver(delivery, self.status)
         pending = path.read_bytes()
-        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.UNKNOWN)
-        recovery = change_page.read_question_recovery(path)
-        assert recovery is not None
-
+        deadline = saved_progress(path).deadline
+        assert deadline is not None
         _ = path.write_bytes(b"{")
         restarted = change_page.DeliveryStatus(self.status.root)
-        with (patch.object(change_page.time, "time", return_value=recovery.deadline),
-              patch.object(change_page, "send_question") as transport):
+
+        with (patch.object(time, "time", return_value=deadline),
+              patch.object(change_page, "send_question") as transport, redirect_stderr(StringIO()) as errors):
             change_page.recover_review_messages(restarted)
             change_page.recover_deferred_questions(restarted)
-            self.assertFalse(restarted.has_deferred_questions())
+            self.assertTrue(restarted.has_deferred_questions())
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
             self.status = restarted
-            self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+            self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.UNKNOWN)
             _ = path.write_bytes(pending)
-            change_page.recover_review_messages(restarted)
-            change_page.deliver(self.ask(), restarted)
+            change_page.recover_deferred_questions(restarted)
         transport.assert_not_called()
         self.assertFalse(restarted.has_deferred_questions())
         self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
 
-    def test_unreadable_attempt_expires_before_the_first_send(self) -> None:
-        delivery = self.ask()
-        path = self.status.path(delivery.page, delivery.row)
-        _ = self.job(delivery).release()
-        recovery = change_page.read_question_recovery(path)
-        assert recovery is not None
-        self.assertEqual(recovery.question_id, self.store.questions("image-1")[0].question_id)
-        _ = path.write_bytes(b"{")
-        self.status = change_page.DeliveryStatus(self.status.root)
-
-        with (patch.object(change_page.time, "time", return_value=recovery.deadline),
-              patch.object(change_page, "send_question") as transport):
-            change_page.recover_review_messages(self.status)
-            change_page.recover_deferred_questions(self.status)
+    def test_an_unusable_setting_leaves_the_question_saved_with_a_failure(self) -> None:
+        _ = conf.path("review_links").write_text("question_recovery_seconds=invalid\n")
+        with patch.object(change_page, "send_question") as transport:
+            delivery = self.ask()
+            change_page.deliver(delivery, self.status)
         transport.assert_not_called()
-        self.assertFalse(self.status.has_deferred_questions())
+        self.assertEqual(self.store.questions("image-1")[0].question_id, "Q1")
         self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+        self.assertFalse(self.status.has_deferred_questions())
+        _ = conf.path("review_links").write_text("question_recovery_seconds=1800\n")
+        change_page.deliver(self.ask(), self.status)
+        self.assertEqual(self.sent, [])
 
-    def test_question_does_not_send_when_the_marker_write_crosses_the_deadline(self) -> None:
-        delivery = self.ask()
-        path = self.status.path(delivery.page, delivery.row)
-        recovery = change_page.read_question_recovery(path)
-        assert recovery is not None
-        now = recovery.deadline - 1
-        publish = change_page.publish_question_attempt
-
-        def cross_deadline(target: Path, attempt: delivery_state.QuestionAttempt) -> None:
-            nonlocal now
-            publish(target, attempt)
-            if target == path and attempt.state is delivery_state.QuestionSendState.SENDING:
-                now = recovery.deadline
-
-        with (patch.object(change_page.time, "time", side_effect=lambda: now),
-              patch.object(change_page, "publish_question_attempt", side_effect=cross_deadline),
-              patch.object(change_page, "send_question") as transport):
+    def test_a_missing_staff_row_fails_without_transport(self) -> None:
+        with (patch.object(change_page, "send_question", new=SEND_QUESTION),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(change_page, "question_transport") as transport):
+            delivery = self.ask()
             change_page.deliver(delivery, self.status)
         transport.assert_not_called()
         self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+        self.assertEqual(self.attempt(delivery).error, "No staff record for fixture-owner.")
+        self.assertFalse(self.status.has_deferred_questions())
 
-    def test_unreadable_job_lock_blocks_send_and_allows_expiry(self) -> None:
+    def test_an_unusable_transport_setting_fails_before_transport(self) -> None:
+        member = staff.StaffRow(staff.StaffId("fixture-owner"), "showrunner", "fixture", staff.StaffRoot(),
+                                current_session=staff.StaffId("fixture-owner-session"))
+        with (patch.object(change_page, "send_question", new=SEND_QUESTION),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))),
+              patch.object(send_budget, "seconds", side_effect=conf.Unusable("Invalid delivery timeout.")),
+              patch.object(unrouted_alert, "message_outcome") as transport):
+            delivery = self.ask()
+            change_page.deliver(delivery, self.status)
+        transport.assert_not_called()
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+        self.assertEqual(self.attempt(delivery).error, "Invalid delivery timeout.")
+        self.assertFalse(self.status.has_deferred_questions())
+
+    def test_page_and_review_questions_share_staff_preflight(self) -> None:
+        recipient = staff.StaffId("fixture-owner")
+        progress = change_page.QuestionProgress("attempt", "Q1", 0)
+        with (patch.object(staff, "snapshot", side_effect=OSError("Cannot read staff.")) as staff_read,
+              patch.object(change_page, "send_question", new=SEND_QUESTION),
+              patch.object(change_page, "question_transport") as transport):
+            page, _ = change_page.attempt_question_send(progress, lambda: change_page.question_send_result(
+                *change_page.send_question(recipient, "Which check passed?", "page-key")))
+            review, _ = change_page.attempt_question_send(progress, lambda: change_page.send_review_question(
+                recipient, "Which check passed?", "review-key"))
+        self.assertEqual(staff_read.call_count, 2)
+        transport.assert_not_called()
+        self.assertEqual(page, review)
+        self.assertEqual(page.state, change_page.QuestionDeliveryState.NOT_STARTED)
+        self.assertEqual(page.error, "Cannot read staff.")
+
+    def test_the_deadline_check_follows_the_staff_lookup(self) -> None:
         delivery = self.ask()
         path = self.status.path(delivery.page, delivery.row)
-        recovery = change_page.read_question_recovery(path)
-        assert recovery is not None
+        state = saved_progress(path)
+        deadline = state.saved_at + change_page.QUESTION_RECOVERY_DEFAULT_SECONDS
+        now = deadline - 1
+        member = staff.StaffRow(staff.StaffId("fixture-owner"), "showrunner", "fixture", staff.StaffRoot(),
+                                current_session=staff.StaffId("fixture-owner-session"))
+
+        def lookup() -> staff.StaffSnapshot:
+            nonlocal now
+            now = deadline
+            return staff.StaffSnapshot((member,))
+
+        with (patch.object(time, "time", side_effect=lambda: now),
+              patch.object(staff, "snapshot", side_effect=lookup),
+              patch.object(change_page, "send_question", new=SEND_QUESTION),
+              patch.object(send_budget, "seconds", return_value=10),
+              patch.object(unrouted_alert, "message_outcome") as transport):
+            change_page.deliver(delivery, self.status)
+            self.assertFalse(self.effective(delivery).waits)
+            change_page.recover_deferred_questions(self.status)
+        transport.assert_not_called()
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+
+    def test_unreadable_job_lock_blocks_send_and_expiry_until_readable(self) -> None:
+        delivery = self.ask()
+        path = self.status.path(delivery.page, delivery.row)
+        progress = saved_progress(path)
+        deadline = progress.saved_at + change_page.QUESTION_RECOVERY_DEFAULT_SECONDS
         _ = self.job(delivery).release()
         self.status = change_page.DeliveryStatus(self.status.root)
 
-        with (patch.object(change_page, "_question_lock_state", return_value="unreadable"),
+        with (patch.object(change_page, "_question_lock_state", return_value="unreadable") as lock_state,
               patch.object(change_page, "send_question") as transport):
-            with patch.object(change_page.time, "time", return_value=recovery.deadline - 1):
+            with patch.object(time, "time", return_value=deadline - 1):
                 change_page.recover_review_messages(self.status)
                 self.assertTrue(self.status.has_deferred_questions())
-            with patch.object(change_page.time, "time", return_value=recovery.deadline):
+            with patch.object(time, "time", return_value=deadline):
+                change_page.recover_deferred_questions(self.status)
+                self.assertTrue(self.status.has_deferred_questions())
+                self.assertEqual(saved_progress(path), progress)
+                lock_state.return_value = "released"
                 change_page.recover_deferred_questions(self.status)
             self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
         transport.assert_not_called()
         self.assertFalse(self.status.has_deferred_questions())
 
-    def test_retry_pause_ends_at_the_question_deadline(self) -> None:
+    def test_uncertain_delivery_does_not_pause_or_send_again(self) -> None:
         delivery = self.ask()
         path = self.status.path(delivery.page, delivery.row)
-        recovery = change_page.read_question_recovery(path)
-        assert recovery is not None
-        _ = conf.path("review_links").write_text("delivery_tries=2\ndelivery_pause_seconds=300\n")
-        now = recovery.deadline - 1
-
-        def elapse(seconds: float) -> None:
-            nonlocal now
-            now += seconds
-
-        with (patch.object(change_page.time, "time", side_effect=lambda: now),
-              patch.object(change_page.time, "sleep", side_effect=elapse) as pause,
+        with (patch.object(time, "sleep") as pause,
               patch.object(change_page, "send_question", return_value=question_outcome("pending")) as transport):
             change_page.deliver(delivery, self.status)
+            change_page.recover_deferred_questions(self.status)
         transport.assert_called_once()
-        pause.assert_called_once_with(1)
-        self.assertFalse(self.status.has_deferred_questions())
+        pause.assert_not_called()
+        self.assertTrue(self.status.has_deferred_questions())
+        expire_saved_question(self.status, path)
         self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
 
     def test_an_empty_question_does_not_write_or_claim(self) -> None:

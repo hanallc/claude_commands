@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import secrets
 import shlex
+import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -15,7 +16,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, update_registration
 from scripts.production.production_doc import Production
-from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
+from scripts.review_links import change_browser, change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_record
 from scripts.review_links import review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
@@ -106,30 +107,37 @@ def clear_wait(item: review_items.ReviewItem, status: change_page.DeliveryStatus
         status.write_slots(empty, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery()))
 
 
-def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
-                   status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
-    """Use the shared question ID for non-change exchanges and recovered messages."""
-    with status.locked():
-        slots = status.slots(delivery.page, delivery.row)
-        question = slots.question
-        if isinstance(delivery.page, change_page.UserQuestionPage) and delivery.page.saved.get('question_id'):
-            return delivery
-        assert isinstance(question, change_page.OpenQuestion)
-        identity = question.question_id
-        message = delivery.message.replace(change_page.reply_command(key), change_page.reply_command(key, identity))
-        original = delivery.page
-        assert isinstance(original, (change_page.UserQuestionPage, change_page.ReviewMessagePage))
-        page = replace(original, saved={**original.saved, 'message': message})
-        updated = replace(slots, question=replace(question, text=words))
-        if page != original or updated != slots:
-            status.write_slots(page, delivery.row, updated)
-        return replace(delivery, page=page, message=message)
+def user_question_page(record: update_registration.QuestionRecord, key: str,
+                       scope: update_registration.QuestionScope, words: str, identity: str, unit: str = "",
+                       action: change_page.QuestionOutcome = "question",
+                       ) -> change_page.UserQuestionPage:
+    message = change_browser.question_message(action, record.item["text"], unit, words, key)
+    document = scope.doc if isinstance(scope, Production) else record.path.parent
+    saved: change_page.StoredUserAnswer = {
+        "saved": False, "source": str(record.path), "production": str(document), "owner": record.owner,
+        "question": record.item["text"], "answer": "", "message": message, "kind": "question",
+        "question_id": identity, "question_text": review_events.require_waiting_why(words),
+    }
+    return change_page.UserQuestionPage(record.path, document, (record.path.stem,), "", saved)
+
+
+def ask_user_question(scope: update_registration.QuestionScope, question: change_browser.WaitingQuestion,
+                      action: change_page.QuestionOutcome, words: str, identities: update_registration.QuestionStaff,
+                      status: change_page.DeliveryStatus, *, verify_revision: Callable[[], object] | None = None,
+                      ) -> tuple[change_page.MessageDelivery, str]:
+    asker = update_registration.question_asker(question.record.item, update_registration.OpenItemWithoutAsker(), identities)
+    relay = update_registration.answer_relay(scope, scope.name, asker, identities)
+    recipient = relay.recipient if action == "followup" and isinstance(relay.recipient, str) else question.owner
+    page = user_question_page(question.record, question.key, scope, words, "", relay.unit, action)
+    delivery = save_delivery(page, recipient, lambda: change_browser.save_question_record(
+        scope, question, action, words, verify_revision), status, change_page.NoQuestion())
+    return delivery, "question sent"
 
 
 def question_action(item: review_items.ReviewItem, action: change_page.QuestionOutcome, words: str,
-                    status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+                    status: change_page.DeliveryStatus, *,
+                    verify_revision: Callable[[], object] | None = None) -> tuple[change_page.MessageDelivery, str]:
     """Replace an open follow-up before the normal question action saves."""
-    from scripts.review_links import change_browser
     source = item.source
     assert isinstance(source, review_items.QuestionSource)
     if not words.strip():
@@ -137,8 +145,13 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     identities = update_registration.QuestionStaff.read()
     if 'review_submission' in source.record.item:
         scope = review_submissions.sent_question_scope(item.owner, identities.record)
-        return sent_question_action(item, source.record, scope, action, words, status)
+        return sent_question_action(item, source.record, scope, action, words, status, verify_revision=verify_revision)
     scope = update_registration.question_scope(item.owner, identities.record)
+    if action == "question":
+        record = source.record
+        question = change_browser.WaitingQuestion(item.key, review_items.name(item.owner, identities.record), record,
+            update_registration.question_source(scope), item.owner, review_items.name(record.asker, identities.record))
+        return ask_user_question(scope, question, action, words, identities, status, verify_revision=verify_revision)
     with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
         current = update_registration.current_open_question(source.record, 'followup')
         pending = current.item.pop('followup', None)
@@ -158,8 +171,6 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
                          scope: update_registration.QuestionScope, action: change_page.QuestionOutcome, words: str,
                          status: change_page.DeliveryStatus, *,
                          verify_revision: Callable[[], object] | None = None) -> tuple[change_page.MessageDelivery, str]:
-    from scripts.review_links.change_browser import question_message
-
     if action not in ('answer', 'feedback', 'question'):
         raise question_record.AnswerRefused('Choose an action on this card.')
     ask = action == 'question'
@@ -170,7 +181,7 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
         raise question_record.AnswerRefused('The sent question has no Review ID.')
     scoped = ScopedWait(review_submissions.submission_key(new_item_dialog.SubmissionKind.QUESTION, record.owner,
                             identity, new_item_dialog.read_submission(record.item.get('review_submission')).request_id)) if ask else NO_SCOPED_WAIT
-    message = question_message(action, scope.name, item.title, '', words, item.key)
+    message = change_browser.question_message(action, item.title, '', words, item.key)
     document = scope.doc if isinstance(scope, Production) else record.path.parent
     saved: change_page.StoredUserAnswer = {'saved':False,'source':str(record.path),'production':str(document),
         'owner':record.owner,'question':item.title,'answer':words if action == 'answer' else '',
@@ -241,7 +252,7 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
     """Save the action and its message under one delivery claim, then deliver it to the owner."""
     question: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
     if question_text:
-        identity = scoped.token if isinstance(scoped, ScopedWait) else secrets.token_hex(4)
+        identity = scoped.token if isinstance(scoped, ScopedWait) else ""
         key = scoped.key if isinstance(scoped, ScopedWait) else item.key
         question = change_page.OpenQuestion(identity, question_text, change_page.NoDelivery())
         message = message.replace(change_page.reply_command(item.key), change_page.reply_command(key, identity))
@@ -269,7 +280,8 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
         slots = status.slots(page, row)
         if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
             page = stored
-            if page.saved.get('submission_delivered'):
+            if (page.saved.get('submission_delivered')
+                    or isinstance(status.failed_delivery(page, row), change_page.FailedDelivery)):
                 return change_page.NoMessageDelivery()
         intent = slots.verdict
         if isinstance(intent, change_page.DeliveryIntent):
@@ -288,22 +300,188 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
                   save: Callable[[], object], status: change_page.DeliveryStatus,
                   question: change_page.NoQuestion | change_page.OpenQuestion) -> change_page.MessageDelivery:
     row = page.rows[0]
-    with status.locked():
-        previous_page = status.metadata_page(page)
-        previous_slots = status.slots(page, row)
+    with status.native_action(page, row):
+        path = status.path(page, row)
+        if (isinstance(question, change_page.OpenQuestion)
+                or isinstance(page, change_page.UserQuestionPage) and page.saved.get('kind') == 'question'):
+            try:
+                try:
+                    _ = save()
+                except atomic_file.AtomicDurabilityUnconfirmed as error:
+                    status.question_sources_pending.set()
+                    print(f"review-links question source {row}: {error}", file=sys.stderr)
+                with status.locked():
+                    event = change_page.native_question_event(page, row)
+                    if event is None:
+                        raise OSError("The saved Review question is unavailable.")
+                    return save_native_question(page, owner, question, event, status)
+            except Exception:
+                status.question_sources_pending.set()
+                raise
         attempt = secrets.token_hex()
-        intent = change_page.DeliveryIntent(attempt,'verdict',recipients=(owner,))
-        slots = change_page.DeliverySlots(change_page.NoDelivery(),intent,question)
-        status.write_slots(page,row,slots)
-        status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
+        intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(owner,))
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
+        with status.locked():
+            try:
+                previous = path.read_bytes()
+            except FileNotFoundError:
+                previous = None
+            status.write_slots(page, row, slots)
+            status.request_attempts[attempt] = change_page.AttemptOwnership(path, "claimed")
         try:
             _ = save()
         except BaseException:
-            status.write_slots(previous_page, row, previous_slots)
+            with status.locked():
+                try:
+                    if status.slots(page, row).verdict == intent:
+                        if previous is None:
+                            path.unlink(missing_ok=True)
+                            status.forget_deferred_question(path)
+                        else:
+                            atomic_file.write_bytes_atomic(path, previous, mode=0o600)
+                finally:
+                    _ = status.request_attempts.pop(attempt, None)
             raise
-        page = replace(page,saved={**page.saved,'saved':True})
-        status.mark_review_saved(page, row, slots, intent)
-    return change_page.MessageDelivery(page,row,(owner,),page.saved['message'],attempt,(owner,))
+        page = replace(page, saved={**page.saved, 'saved': True})
+        with status.locked():
+            if status.slots(page, row).verdict == intent:
+                status.mark_review_saved(page, row, slots, intent)
+            else:
+                _ = status.request_attempts.pop(attempt, None)
+        return change_page.MessageDelivery(page, row, (owner,), page.saved['message'], attempt, (owner,))
+
+
+def save_native_question(page: change_page.ReviewMessagePage | change_page.UserQuestionPage,
+                         recipient: staff.StaffId, question: change_page.NoQuestion | change_page.OpenQuestion,
+                         event: review_events.ReviewLog, status: change_page.DeliveryStatus, *, claim: bool = True,
+                         ) -> change_page.MessageDelivery:
+    """Build the first delivery from a saved Ask while the delivery lock is held."""
+    row = page.rows[0]
+    identity = page.saved.get("question_id", "") if isinstance(page, change_page.UserQuestionPage) else (
+        question.question_id if isinstance(question, change_page.OpenQuestion) else "")
+    proof = change_page.source_question_progress(page.review_list, row, event, identity)
+    text = page.saved.get("question_text", "") if isinstance(page, change_page.UserQuestionPage) else (
+        question.text if isinstance(question, change_page.OpenQuestion) else "")
+    words = change_page.question_words(event)
+    if review_events.require_waiting_why(text) != review_events.require_waiting_why(words):
+        raise ValueError("The saved Review question does not match the submitted question.")
+    message = page.saved["message"]
+    if not identity:
+        prefix, separator, command = message.rpartition("\nAnswer with this command:\n")
+        if separator:
+            command, text_flag, argument = command.rpartition(" --text ")
+            message = prefix + separator + command + " --question " + proof.question_id + text_flag + argument
+    if isinstance(page, change_page.UserQuestionPage):
+        page = replace(page, saved={**page.saved, "saved": True, "message": message,
+                                    "question_id": proof.question_id, "question_source_key": proof.attempt})
+    else:
+        page = replace(page, saved={**page.saved, "saved": True, "message": message,
+                                    "question_source_key": proof.attempt})
+    path = status.path(page, row)
+    try:
+        fields = change_page.checked_delivery_fields(path)
+    except FileNotFoundError:
+        fields = {}
+    intent = change_page.DeliveryIntent(proof.attempt, "verdict", recipients=(recipient,))
+    if change_page.needs_source_question(fields, proof, text):
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), intent,
+            change_page.OpenQuestion(proof.question_id, text, change_page.NoDelivery()))
+        status.write_slots(page, row, slots, question_progress=proof)
+        if claim:
+            track_question(status, path, intent)
+        else:
+            status.defer_question(path, change_page.UnreadableDeliveryRecord())
+    return change_page.MessageDelivery(page, row, (recipient,), message, intent.attempt, (staff.StaffId(page.saved["owner"]),))
+
+
+def track_question(status: change_page.DeliveryStatus, path: Path, intent: change_page.DeliveryIntent) -> None:
+    """Assign the saved delivery to the current request."""
+    status.request_attempts[intent.attempt] = change_page.AttemptOwnership(path, "claimed")
+
+
+def review_question_page(item: review_items.ReviewItem, words: str, members: staff.StaffSnapshot,
+                         event: review_events.ReviewLog,
+                         ) -> tuple[change_page.ReviewMessagePage | change_page.UserQuestionPage,
+                                    staff.StaffId, change_page.OpenQuestion]:
+    """Rebuild the delivery message from the native record and its current Ask event."""
+    source = item.source
+    origin = review_items.submission_origin(item)
+    identity = origin.reply_token if isinstance(origin, new_item_dialog.ReviewSubmission) else ""
+    recipient = item.owner
+    if isinstance(source, review_items.QuestionSource):
+        record = source.record
+        if isinstance(origin, new_item_dialog.ReviewSubmission):
+            scope = review_submissions.sent_question_scope(item.owner, members)
+            key = review_submissions.submission_key(new_item_dialog.SubmissionKind.QUESTION, record.owner,
+                record.item.get("review_id", ""), origin.request_id)
+            page = user_question_page(record, key, scope, words, identity)
+            page = replace(page, saved={**page.saved, "question_text": words,
+                "message": page.saved["message"].replace(change_page.reply_command(key), change_page.reply_command(key, identity))})
+        else:
+            scope = update_registration.question_scope(item.owner, members)
+            identities = update_registration.QuestionStaff.for_record(members)
+            asker = update_registration.question_asker(record.item, update_registration.OpenItemWithoutAsker(), identities)
+            relay = update_registration.answer_relay(scope, scope.name, asker, identities)
+            action = "followup" if event.words.startswith("followup: ") else "question"
+            if action == "followup" and isinstance(relay.recipient, str):
+                recipient = relay.recipient
+            page = user_question_page(record, item.key, scope, words, "", relay.unit, action)
+        return page, recipient, change_page.OpenQuestion(identity, page.saved.get("question_text", ""),
+                                                        change_page.NoDelivery())
+
+    key = item.key
+    if isinstance(source, review_items.InvestigationSource):
+        path, row = source.path, source.record.id
+        message = f"Review {item.id}: Ask question\n{words}\nAnswer with this command:\n"
+        if isinstance(origin, new_item_dialog.ReviewSubmission):
+            key = review_submissions.submission_key(new_item_dialog.SubmissionKind(source.record.kind.value),
+                                                   source.record.owner, row, origin.request_id)
+        message += change_page.reply_command(key, identity)
+    elif isinstance(source, review_items.ProposalSource):
+        path, row = source.record.path, source.record.path.stem
+        if isinstance(origin, new_item_dialog.ReviewSubmission):
+            key = review_submissions.submission_key(new_item_dialog.SubmissionKind.PROPOSAL,
+                staff.StaffId(source.record.value("proposed_by")), source.record.value("proposal_id"), origin.request_id)
+        message = message_text(item, "question", words).replace(change_page.reply_command(item.key),
+                                                                change_page.reply_command(key, identity))
+    else:
+        assert isinstance(source, review_items.EfficiencySource)
+        path, row = efficiency_reviews.path(source.path), decision_store.efficiency_identity(item)
+        message = message_text(item, "question", words)
+    saved: change_page.StoredReviewMessage = {
+        "saved": True, "source": str(path), "owner": item.owner, "row": row, "message": message,
+    }
+    return (change_page.ReviewMessagePage(path, path.parent, (row,), "", saved), recipient,
+            change_page.OpenQuestion(identity, words, change_page.NoDelivery()))
+
+
+def recover_questions(status: change_page.DeliveryStatus) -> None:
+    """Restore delivery records for the current Ask in each native Review source."""
+    members = staff.snapshot()
+    kinds = tuple(kind for kind in review_items.REVIEW_TYPES if kind is not review_items.ReviewType.CHANGE)
+    sources = review_items.ReviewSourceStamps(on_error=status.defer_source)
+    waiting = review_items.read(status.root, members=members, kinds=kinds,
+                                show=review_items.ReviewState.WAITING.value, assign_ids=False, sources=sources)
+    for item in waiting:
+        if not isinstance(item.source, (review_items.QuestionSource, review_items.InvestigationSource,
+                                        review_items.ProposalSource, review_items.EfficiencySource)):
+            continue
+        event = change_page.latest_question_event(item.log)
+        if event is None:
+            continue
+        try:
+            page, recipient, question = review_question_page(item, change_page.question_words(event), members, event)
+            if status.migration_pending(status.path(page, page.rows[0])):
+                continue
+            with status.locked():
+                current = change_page.native_question_event(page, page.rows[0])
+                if current == event:
+                    _ = save_native_question(page, recipient, question, event, status, claim=False)
+        except (OSError, ValueError, KeyError, TypeError, update_registration.InputError,
+                update_registration.RegistrationFailure) as error:
+            source = item.source
+            path = source.record.path if isinstance(source, (review_items.QuestionSource, review_items.ProposalSource)) else source.path
+            status.defer_source(path, error)
 
 
 def message_text(item: review_items.ReviewItem, action: str, words: str) -> str:

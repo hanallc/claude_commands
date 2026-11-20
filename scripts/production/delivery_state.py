@@ -4,12 +4,12 @@ from __future__ import annotations
 import json
 import hashlib
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, cast
 
+from scripts.lib import atomic_file
 from scripts.production import staff
 from scripts.review_links import question_record
 from scripts.review_links.review_events import require_waiting_why as require_waiting_why
@@ -167,54 +167,6 @@ def decode_question_attempt(fields: dict[str, object]) -> QuestionAttempt:
     return record
 
 
-def legacy_question_state(fields: dict[str, object], failure_fields: dict[str, object] | None,
-                          owns_attempt: Callable[[str], bool],
-                          source: QuestionSource, recipient: staff.StaffId,
-                          matches_message: Callable[[str], bool]) -> QuestionSendState:
-    """Read the earlier question format without inferring a safe automatic retry."""
-    try:
-        saved = _object(fields.get("review_message"))
-        if (str(Path(_text(saved, "source")).resolve()) != source.path or saved.get("owner") != recipient
-                or saved.get("row") != source.row or saved.get("saved") is not True
-                or not matches_message(_text(saved, "message"))):
-            return QuestionSendState.UNKNOWN
-        verdict = fields.get("verdict")
-        intent = decode_slot(verdict, "verdict")
-        if "verdict" in fields and not isinstance(intent, DeliveryIntent):
-            return QuestionSendState.UNKNOWN
-        if isinstance(intent, DeliveryIntent) and intent.recipients and intent.recipients != (recipient,):
-            return QuestionSendState.UNKNOWN
-        dispatch = _object(saved["image_question_dispatch"]) if "image_question_dispatch" in saved else {}
-        dispatch_attempt = dispatch.get("attempt")
-        dispatch_state = dispatch.get("state")
-        if "image_question_dispatch" in saved and (not isinstance(dispatch_attempt, str) or not dispatch_attempt
-                or dispatch_state not in ("started", "started_after_unconfirmed", "accepted")):
-            return QuestionSendState.UNKNOWN
-        if dispatch_state == "accepted":
-            if isinstance(intent, DeliveryIntent) and intent.attempt != dispatch_attempt:
-                return QuestionSendState.UNKNOWN
-            return QuestionSendState.SENT
-        if failure_fields is None:
-            return QuestionSendState.UNKNOWN
-        if "failed_delivery" in failure_fields:
-            failure = _object(failure_fields["failed_delivery"])
-            attempt = _text(failure, "attempt")
-            if failure.get("row") != source.row or failure.get("review_list") != source.path:
-                return QuestionSendState.UNKNOWN
-            if (isinstance(intent, DeliveryIntent) and intent.attempt == attempt
-                    or dispatch_state == "started" and dispatch_attempt == attempt
-                    or not dispatch and verdict is None):
-                return QuestionSendState.FAILED
-            if verdict is None and not dispatch:
-                return QuestionSendState.UNKNOWN
-        if verdict is not None or dispatch:
-            attempt = intent.attempt if isinstance(intent, DeliveryIntent) else dispatch_attempt
-            return QuestionSendState.CLAIMED if isinstance(attempt, str) and owns_attempt(attempt) else QuestionSendState.UNKNOWN
-        return QuestionSendState.SENT
-    except ValueError:
-        return QuestionSendState.UNKNOWN
-
-
 @dataclass(frozen=True)
 class NoDelivery:
     """This delivery kind has no message that needs recovery."""
@@ -355,21 +307,53 @@ def decode(content: str) -> DeliverySlots:
 def decode_value(value: object, *, require_verdict_attempt: bool = False) -> DeliverySlots:
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     reason = waiting_why(fields.get("waiting_why"))
-    if "validation" in fields or "verdict" in fields or "question" in fields:
-        return DeliverySlots(decode_validation(fields.get("validation")),
-                             decode_slot(fields.get("verdict"), "verdict", require_attempt=require_verdict_attempt),
-                             decode_question(fields.get("question")), reason)
-    # Older records contain one intent.
-    kind = fields.get("kind")
-    if kind == "validation":
-        return DeliverySlots(decode_validation(fields), NoDelivery(), waiting_why=reason)
-    if kind == "verdict":
-        return DeliverySlots(NoDelivery(), decode_slot(fields, "verdict", require_attempt=require_verdict_attempt),
-                             waiting_why=reason)
-    feedback = fields.get("feedback")
-    if isinstance(feedback, str):
-        return DeliverySlots(ValidationRequested("", feedback), NoDelivery(), waiting_why=reason)
-    return DeliverySlots(NoDelivery(), NoDelivery(), waiting_why=reason)
+    validation = decode_validation(fields.get("validation"))
+    if not {"validation", "verdict", "question"}.intersection(fields):
+        kind, state, feedback = fields.get("kind"), fields.get("state"), fields.get("feedback")
+        # The validation command can run before the server migrates these records.
+        if kind == "validation" and state in ("sent", "failed"):
+            validation = decode_validation(fields)
+        elif kind is None and isinstance(feedback, str):
+            validation = ValidationRequested("", feedback)
+    return DeliverySlots(validation, decode_slot(fields.get("verdict"), "verdict", require_attempt=require_verdict_attempt),
+                         decode_question(fields.get("question")), reason)
+
+
+def has_legacy_followup(path: Path) -> bool:
+    saved = read_fields(path).get("user_answer")
+    return isinstance(saved, dict) and cast(dict[str, object], saved).get("legacy_followup") is True
+
+
+def complete_review_reply(path: Path, question_id: str, text: str) -> None:
+    """Mark the matching delivery answered while the caller holds the delivery lock."""
+    try:
+        fields = read_fields(path)
+    except FileNotFoundError:
+        return
+    if apply_review_reply(fields, question_id, text):
+        atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
+
+
+def apply_review_reply(fields: dict[str, object], question_id: str, text: str) -> bool:
+    """Set the answer and clear the matching pending send."""
+    raw = fields.get("question")
+    question = decode_question(raw)
+    if not isinstance(question, OpenQuestion) or question.question_id != question_id:
+        return False
+    assert isinstance(raw, dict)
+    exchange = cast(dict[str, object], raw)
+    exchange["answer"] = text
+    _ = exchange.pop("delivery", None)
+    progress = fields.get("question_delivery")
+    if isinstance(progress, dict):
+        saved = cast(dict[str, object], progress)
+        if saved.get("question_id") == question_id:
+            saved["state"] = "answered"
+            saved["error"] = ""
+            verdict = fields.get("verdict")
+            if isinstance(verdict, dict) and cast(dict[str, object], verdict).get("attempt") == saved.get("attempt"):
+                _ = fields.pop("verdict")
+    return True
 
 
 def read_list_questions(text: str) -> tuple[question_record.Question, ...]:

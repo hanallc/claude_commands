@@ -260,15 +260,14 @@ def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: c
                      review_items.ProposalSource, review_items.EfficiencySource)):
         page = review_actions.delivery_page(item, status)
         row = page.rows[0]
-        path = status.path(page, row)
-        sources.append(path)
-        question = status.slots(page, row).question
+        question = None
     else:
         return
+    sources.extend((status.closeout_path(page, row), status.path(page, row)))
+    if question is None:
+        question = status.slots(page, row).question
     if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
         return
-    sources.append(status.closeout_path(page, row))
-    sources.append(change_page.question_recovery_path(status.path(page, row)))
     if change_page.review_question_failed(status, page, row, question):
         assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
 
@@ -393,7 +392,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     started, read_at = time.perf_counter(), time.time()
     folder = root / change_page.CONSOLE_FOLDER
     sources = ReviewSourceStamps()
-    sources.extend((folder/change_browser.MANIFEST, staff.record_path(), state_root(),
+    sources.extend((root, folder/change_browser.MANIFEST, staff.record_path(), state_root(),
                     change_review.lists_directory(), urgency.state_dir(), conf.path('review_links'), conf.path('production'), conf.path('statusline'),
                     Path(USER_ZONE_CONF)))
     zone = user_zone()
@@ -524,9 +523,23 @@ class ReviewSnapshotCache:
                     lambda: not isinstance(self._snapshot, SnapshotUnavailable) or
                     (not self._busy and not self._wake.is_set()), timeout=15)
             current = self._snapshot
+            if isinstance(current, ReviewSnapshot) and self.delivery_changed(current):
+                with self.staff_scope():
+                    current = build_snapshot(self.root)
+                self._snapshot = current
+                self._condition.notify_all()
         if isinstance(current,SnapshotUnavailable):
             raise ValueError('The Review snapshot is not available.')
         return current
+
+    def delivery_changed(self, snapshot: ReviewSnapshot) -> bool:
+        # Delivery writes replace or remove files in the Review directory.
+        root_stamp = snapshot.source_stamps.get(self.root)
+        if root_stamp is None or source_stamp(self.root) == root_stamp:
+            return False
+        return any(source_stamp(path) != stamp for path, stamp in snapshot.source_stamps.items()
+                   if path.parent == self.root and path.name.startswith(
+                       (change_page.DELIVERY_PREFIX, change_page.CLOSEOUT_PREFIX)))
 
     def invalidate(self) -> None:
         with self._condition:
@@ -787,7 +800,8 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         labels.update(read='Got it', question='Ask a follow-up')
     elif validator:
         labels['question'] = 'Ask a question'
-    for index, action in enumerate(item.actions):
+    actions = ('question',) if item.state == ReviewState.VALIDATING else item.actions
+    for index, action in enumerate(actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 and not validator else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
          else closes).append(button)
@@ -1061,14 +1075,14 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if outcome == 'later':
         return change_page.NoMessageDelivery(), review_actions.later(
             item, fields.get('later', [''])[0], words, verify_revision=validate, root=root)
-    if outcome not in item.actions:
+    if outcome not in item.actions and not (item.state == ReviewState.VALIDATING and outcome == 'question'):
         raise question_record.AnswerRefused('choose an action on this card')
     source = item.source
     if isinstance(source, review_items.ChangeSource):
         with change_review.checked_review_write(source.path, root, validate) as current:
             action = change_page.VALIDATION_QUESTION if current.state == ReviewState.VALIDATING else outcome
             delivery = change_browser.submit_review_change(current, snapshot.browser, action, words, status)
-        if isinstance(delivery, change_page.MessageDelivery) and outcome not in ('validate', 'feedback'):
+        if isinstance(delivery, change_page.MessageDelivery) and outcome not in ('validate', 'feedback', 'question'):
             label = outcome
             with review_items.after_store_write(item.key):
                 change_review.record_review_log(delivery.page.review_list, delivery.row,
@@ -1084,6 +1098,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             delivery, answer = review_actions.sent_question_action(
                 item, source.record, scope, cast(change_page.QuestionOutcome, outcome), words, status,
                 verify_revision=validate)
+        elif outcome == 'question':
+            delivery, answer = review_actions.question_action(item, outcome, words, status, verify_revision=validate)
         else:
             scope = update_registration.question_scope(item.owner, members)
             question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
@@ -1095,10 +1111,6 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
     else:
         delivery, answer = review_actions.decision_action(item, outcome, words, status, verify_revision=validate)
-    if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
-        with review_items.after_store_write(item.key):
-            delivery = review_actions.track_question(delivery, key, words, status)
-        answer = 'question sent'
     return delivery, 'feedback sent' if outcome == 'feedback' else answer
 
 
@@ -1144,22 +1156,19 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
                             if isinstance(item.source, review_items.InvestigationSource) else
                             review_actions.decision_action(item,outcome,words,status))
-        if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
-            delivery = review_actions.track_question(delivery, key, words, status)
         return delivery, answer
     _ = fields.pop('later',None)
     _ = fields.pop('revision',None)
     item = question_item
-    if item is not None and item.state == ReviewState.WAITING:
+    if item is not None and isinstance(item.source, review_items.QuestionSource) and (
+            item.state == ReviewState.WAITING or outcome == 'question'):
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = review_actions.question_action(item, cast(change_page.QuestionOutcome, outcome), words, status)
     else:
         delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status)
-    if key.startswith('question/') and outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
-        delivery = review_actions.track_question(delivery, key, words, status)
     if isinstance(delivery, change_page.MessageDelivery) and not isinstance(delivery.page, change_page.UserQuestionPage):
-        if outcome not in ('validate', 'feedback'):
+        if outcome not in ('validate', 'feedback', 'question'):
             words = fields['feedback'][0]
             log = outcome + (': ' + words if words else '')
             change_review.record_review_log(delivery.page.review_list, delivery.row, log, delivery.page.production)

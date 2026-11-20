@@ -10,10 +10,11 @@ import secrets
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
@@ -119,15 +120,25 @@ def add_submission(created: review_page.PublishedSubmission) -> ListRecord:
         return ListRecord(keeper, item)
 
 
-def records(*, include_closed: bool = False) -> list[ListRecord]:
+def records(*, include_closed: bool = False, on_error: Callable[[Path, Exception], None] | None = None) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
     try:
         owners = sorted(record_store.state_root().iterdir())
     except FileNotFoundError:
         return []
-    found = [ListRecord(staff.StaffId(owner.name), item) for owner in owners
-             if owner.is_dir() and not owner.is_symlink()
-             for item in the_list.records(staff.StaffId(owner.name), include_closed=include_closed)]
+    found: list[ListRecord] = []
+    for owner in owners:
+        try:
+            if owner.is_symlink() or not owner.is_dir():
+                continue
+            keeper = staff.StaffId(owner.name)
+            items = the_list.records(keeper, include_closed=include_closed, on_error=on_error)
+        except (OSError, ValueError) as error:
+            if on_error is None:
+                raise
+            on_error(owner, error)
+            continue
+        found.extend(ListRecord(keeper, item) for item in items)
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
@@ -674,6 +685,7 @@ class ListFeedbackDelivery:
     keeper: staff.StaffId
     identity: str
     request: str
+    status: change_page.DeliveryStatus
 
 
 @dataclass(frozen=True)
@@ -800,8 +812,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
     item = the_list.load(morty.id, identity)
+    status = change_page.DeliveryStatus(root) if status is None else status
     if action == "question":
-        status = change_page.DeliveryStatus(root) if status is None else status
         question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
         if isinstance(question, change_page.MessageDelivery):
             _mark_seen_update_read(morty.id, item, prefix.seen_update)
@@ -825,11 +837,11 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         saved = the_list.save_feedback(morty.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
         _mark_seen_update_read(morty.id, item, saved.read_update)
-        return ListFeedbackDelivery(morty.id, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
+        return ListFeedbackDelivery(morty.id, identity, request, status) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
         raise question_record.AnswerRefused("enter words for morty")
     saved_notice = the_list.feedback_requests(changed).get(request)
-    delivery = (ListFeedbackDelivery(morty.id, identity, request)
+    delivery = (ListFeedbackDelivery(morty.id, identity, request, status)
                 if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
@@ -844,40 +856,71 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
 
 
 def deliver(submission: ListActionSubmission) -> None:
-    """Send saved List words with the shared retry and alert helpers."""
+    """Send saved List words and retain the delivery result."""
     delivery = submission.delivery if isinstance(submission, ListUnparkSubmission) else submission
     if isinstance(delivery, change_page.NoMessageDelivery):
         return
     if isinstance(delivery, ListQuestionDelivery):
         change_page.deliver(delivery.delivery, delivery.status)
         return
+    retry_paths: list[Path] = []
+    source = the_list.folder(delivery.keeper) / f"{delivery.identity}.md"
+    key = change_page.review_delivery_key(source, delivery.identity, delivery.request)
+    path = source.with_name(".review-link-feedback-" + key.removeprefix("review:") + ".json")
+
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
-        settings = conf.read("review_links")
-        tries = settings.whole("delivery_tries")
         message = (f"List page: nate's words for item {item.number}\n{feedback.words}"
                    if feedback.action == "tell" else feedback.words)
-        source = the_list.folder(delivery.keeper) / f"{item.id}.md"
-        key = change_page.review_delivery_key(source, item.id, feedback.request)
-        failures = change_page.send_with_retries(change_page.SENDER, (delivery.keeper,), message,
-                                                 tries, settings.number("delivery_pause_seconds"), key=key)
-        if not failures:
+        progress = change_page.deliver_page_feedback(path, key, delivery.keeper, message)
+        if progress.state is change_page.QuestionDeliveryState.CONFIRMED:
             return replace(feedback, state="sent")
+        if progress.state.pending:
+            retry_paths.append(path)
+            return feedback
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != delivery.keeper)
-        reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
+        failure = change_page.DeliveryFailure(delivery.keeper, progress.error)
+        reached = change_page.alert_delivery_failures([failure], 1, status=delivery.status,
+            source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
-    the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+    try:
+        the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+    except (OSError, ValueError) as error:
+        retry_paths.append(path)
+        delivery.status.report_recovery_error(path, error, f"List feedback {delivery.identity}")
+    for retry in retry_paths:
+        delivery.status.defer_question(retry, change_page.ListFeedbackRetry(partial(deliver, delivery)))
 
 
-def recover_pending() -> None:
-    """Retry each pending request once at server start."""
-    for entry in records(include_closed=True):
+def recover_questions(status: change_page.DeliveryStatus) -> None:
+    """Read each open List item for questions without a delivery record."""
+    from scripts.review_links import page_question
+
+    for keeper, item in records(on_error=status.defer_source):
+        if item.questions:
+            path = the_list.folder(keeper) / f"{item.id}.md"
+            target = change_page.list_question_target(path, item.id, item.number, item.title, keeper)
+            page_question.recover_source(status, target, item.questions)
+
+
+def recover_pending(status: change_page.DeliveryStatus | None = None) -> None:
+    """Retry each saved request and schedule another read after a source error."""
+    status = change_page.DeliveryStatus(review_link.review_root()) if status is None else status
+    retry = change_page.ListFeedbackRetry(partial(recover_pending, status))
+
+    def defer_scan(path: Path, error: Exception) -> None:
+        status.report_recovery_error(path, error, f"List feedback source {path}")
+        status.defer_question(status.root / ".list-feedback-recovery", retry)
+
+    try:
+        entries = records(include_closed=True, on_error=defer_scan)
+    except OSError as error:
+        defer_scan(record_store.state_root(), error)
+        return
+    for entry in entries:
         for feedback in the_list.feedback_requests(entry.item).values():
             if feedback.state == "pending":
-                try:
-                    deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
-                except (OSError, ValueError) as error:
-                    print(f"List feedback recovery {entry.key}: {error}", file=sys.stderr)
+                deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request, status))
 
 
 def change_counts() -> dict[str, int]:

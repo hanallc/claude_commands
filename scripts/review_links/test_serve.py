@@ -43,7 +43,7 @@ from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
 from scripts.message import send_result
-from scripts.review_links.test_page_question import question_outcome
+from scripts.review_links.test_page_question import question_outcome, saved_progress
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, update_registration,
@@ -1806,6 +1806,42 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertIn(b'data-review-index', reply.body)
 
+    def test_startup_isolates_a_malformed_delivery_record(self) -> None:
+        root = self.root.parent / "migration"
+        root.mkdir()
+        broken = root / (change_page.DELIVERY_PREFIX + "broken")
+        valid = root / (change_page.DELIVERY_PREFIX + "valid")
+        malformed = b'{"review_message": []}\n'
+        legacy = '{"kind": "verdict", "attempt": "saved", "state": "pending"}'
+        _ = broken.write_bytes(malformed)
+        _ = valid.write_text(legacy)
+        startup_done = threading.Event()
+
+        def finish_startup(_status: change_page.DeliveryStatus) -> None:
+            startup_done.set()
+
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_question_sources"),
+              patch.object(change_page, "recovery_listings", return_value=()),
+              patch.object(list_page, "recover_pending", side_effect=finish_startup),
+              patch.object(change_page, "send_to_staff") as send,
+              redirect_stderr(StringIO()) as errors):
+            server = self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), root))
+            self.assertTrue(startup_done.wait(TEST_HANG_GUARD_SECS))
+            status = server.delivery_status
+            self.assertIn("change_delivery", delivery_state.read_fields(valid))
+            self.assertTrue(status.has_deferred_questions())
+            change_page.recover_deferred_questions(status)
+            self.assertEqual(broken.read_bytes(), malformed)
+            self.assertTrue(status.has_deferred_questions())
+            self.assertEqual(errors.getvalue().count(broken.name), 1)
+
+            _ = broken.write_text(legacy)
+            change_page.recover_deferred_questions(status)
+            self.assertIn("change_delivery", delivery_state.read_fields(broken))
+            self.assertFalse(status.has_deferred_questions())
+            send.assert_not_called()
+
     def test_review_index_omits_an_unknown_handoff_time(self) -> None:
         case = self.review_fixture(changes=2)
         saved = '2026-11-16T12:49:08-05:00'
@@ -2172,7 +2208,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         intent = change_review.PendingVerdictCleanup.for_row(case.root, page.review_list, 'C1')
         self.assertTrue(intent.intent.exists())
         # Recreate a legacy record with an interrupted verdict and an open question.
-        asked = case.status.ask(page, 'C1', 'What changed?')
+        asked = case.status.ask(page, 'C1', 'What changed?', recipients=(case.fixture.showrunner_id,))
         assert isinstance(asked, change_page.QuestionDelivery)
         self.assertIsInstance(case.status.slots(page, 'C1').verdict, change_page.DeliveryIntent)
         recovered = change_page.DeliveryStatus(case.root)
@@ -2901,13 +2937,20 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(key=key):
                 saved = cache.save(case.card_body(cache.get(), key, 'question', 'Which checks passed?'), case.status)
                 assert isinstance(saved.delivery, change_page.MessageDelivery)
-                with patch.object(change_page, 'send_to_staff', side_effect=ValueError('The fixture owner is offline.')):
+                with patch.object(change_page, 'send_to_staff',
+                                  side_effect=change_page.QuestionSendStopped('The fixture owner refused.')):
                     change_page.deliver(saved.delivery, case.status)
                 current = review_page.build_snapshot(case.root)
                 self.assertIn('Question not delivered.', current.assets['question-delivery:'+key])
-        _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.')
-        current = review_page.build_snapshot(case.root)
-        self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+                if key == investigation_key:
+                    question = case.status.slots(saved.delivery.page, saved.delivery.row).question
+                    assert isinstance(question, change_page.OpenQuestion)
+                    _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
+                                             question_id=question.question_id)
+                    current = review_page.build_snapshot(case.root)
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+                elif key in (proposal, efficiency):
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
 
     def test_review_returns_conflict_for_a_deleted_investigation(self) -> None:
         case = self.review_fixture()
@@ -3434,9 +3477,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             sent.clear()
             recovered = threading.Event()
             recover = list_page.recover_pending
-            def recover_and_finish() -> None:
+            def recover_and_finish(status: change_page.DeliveryStatus) -> None:
                 try:
-                    recover()
+                    recover(status)
                 finally:
                     recovered.set()
             with patch.object(list_page, "recover_pending", side_effect=recover_and_finish):
@@ -3505,7 +3548,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(json.loads(response)["unpark_outcome"], "cleared")
                 self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
                 deliver.assert_called_with(list_page.ListUnparkSubmission(list_page.UnparkOutcome.CLEARED,
-                    list_page.ListFeedbackDelivery(morty.id, item.id, fresh)))
+                    list_page.ListFeedbackDelivery(morty.id, item.id, fresh, self.server.delivery_status)))
                 delivered.clear()
                 code, response = self.post(list_page.PAGE_PATH, unpark_body(uuid4().hex))
                 self.assertEqual(code, 200)
@@ -3567,7 +3610,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(body)["item_state"], "Closed")
             self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
-            deliver.assert_called_once_with(list_page.ListFeedbackDelivery(morty.id, item.id, request))
+            deliver.assert_called_once_with(list_page.ListFeedbackDelivery(morty.id, item.id, request, self.server.delivery_status))
 
     def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
         expired = self.root / "aaaaaa"
@@ -3643,11 +3686,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         claim_question = change_page.claim_question
 
         def claim(status: change_page.DeliveryStatus,
-                  delivery: change_page.VerifiedQuestionAttempt, *, recovering: bool = False) -> change_page.PageQuestionSend:
+                  delivery: change_page.VerifiedQuestionAttempt) -> change_page.PageQuestionSend:
             claiming.set()
             if not resume_claim.wait(TEST_HANG_GUARD_SECS):
                 raise TimeoutError("The test did not resume the send claim.")
-            return claim_question(status, delivery, recovering=recovering)
+            return claim_question(status, delivery)
         deliveries: list[tuple[staff.StaffId, str]] = []
         saved_at_send: list[the_list.ListItem] = []
 
@@ -3814,6 +3857,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     key = recipient, message_id
                     if key in accepted:
                         return question_outcome("skipped", "The transport has a receipt.")
+                    change_page.mark_sender_started()
                     result = send(recipient, message, message_id)
                     accepted.add(key)
                     return result
@@ -3837,10 +3881,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn("The result lock is unavailable.", errors.getvalue())
                 self.assertEqual(transport.call_args_list, [
                     call(morty.id, interrupted.message, interrupted.message_id),
-                    call(morty.id, interrupted.message, interrupted.message_id),
                 ])
                 self.assertEqual(len(deliveries), 1)
-                self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+                self.assertEqual(saved_progress(path).state, change_page.QuestionDeliveryState.UNKNOWN)
                 self.assertEqual(status.request_attempts, {})
 
     def test_list_question_claim_failure_and_deferred_recovery(self) -> None:
@@ -3856,11 +3899,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(refused, change_page.PageQuestionSend)
         path = status.path(refused.page, refused.row)
         failed = change_page.read_question_attempt(path)
-        self.assertEqual(failed.state, delivery_state.QuestionSendState.FAILED)
+        self.assertEqual(failed.state, delivery_state.QuestionSendState.READY)
         self.assertIsInstance(failed.owner, delivery_state.NoQuestionSendOwner)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
-        # A new Ask can try the same saved question after a confirmed refusal.
+        # The claim failed before the sender started.
         request = the_list.PageRequest(uuid4().hex, "question", words)
         pending = the_list.ask_question(keeper, item.id, request, status)
         assert isinstance(pending, change_page.PageQuestionSend)
@@ -3879,7 +3922,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
         self.assertFalse(restarted.has_deferred_questions())
 
-    def test_list_question_recovers_when_the_failure_cannot_be_recorded(self) -> None:
+    def test_list_question_recovers_when_the_send_marker_cannot_be_recorded(self) -> None:
         keeper = staff.StaffId("fixture-morty")
         for fault in ("read", "write"):
             with self.subTest(fault=fault):
@@ -3895,7 +3938,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 writer = change_page.publish_question_attempt
 
                 def write_attempt(path: Path, record: delivery_state.QuestionAttempt) -> None:
-                    if record.state is delivery_state.QuestionSendState.FAILED:
+                    if record.state is delivery_state.QuestionSendState.CLAIMED:
                         raise failure
                     writer(path, record)
 
@@ -3909,8 +3952,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(str(failure), errors.getvalue())
                 self.assertTrue(status.has_deferred_questions())
                 self.assertFalse(status.question_jobs)
-                if fault == "read":
-                    send.assert_not_called()
+                send.assert_not_called()
 
                 with patch.object(change_page, "send_question", return_value=question_outcome()) as recover:
                     change_page.recover_deferred_questions(status)
@@ -3918,7 +3960,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 recover.assert_called_once_with(keeper, attempt.message, attempt.message_id)
                 self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
 
-    def test_list_question_shows_a_failed_saved_message_mismatch(self) -> None:
+    def test_list_question_keeps_a_saved_message_mismatch_pending(self) -> None:
         keeper = staff.StaffId("fixture-morty")
         item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
         status = change_page.DeliveryStatus(self.root)
@@ -3937,7 +3979,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         saved = the_list.load(keeper, item.id)
         view = the_list.question_visibility(keeper, saved, status)
-        self.assertEqual(view, the_list.QuestionAttention(frozenset({"Q1"})))
+        self.assertEqual(view, the_list.QuestionAttention())
+        self.assertTrue(status.has_deferred_questions())
 
     def test_list_ask_preserves_unicode_separators(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
@@ -3969,7 +4012,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
 
-    def test_exhausted_list_question_reports_failure_after_automatic_retries(self) -> None:
+    def test_list_question_reports_a_refusal_on_the_next_refresh(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
         item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
@@ -3979,13 +4022,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         finished = threading.Event()
         real_deliver = change_page.deliver
         messages: list[str] = []
-        tries = conf.read("review_links").whole("delivery_tries")
+        delivery_paths: list[Path] = []
 
         def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
                     status: change_page.DeliveryStatus) -> None:
             try:
                 if isinstance(message, change_page.MessageDelivery):
                     messages.append(message.message)
+                    delivery_paths.append(status.path(message.page, message.row))
                 real_deliver(message, status)
             finally:
                 finished.set()
@@ -3995,8 +4039,8 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(change_page, "deliver", side_effect=deliver),
               patch.object(change_page, "alert_delivery_failures"),
-              patch.object(change_page, "send_question", side_effect=[
-                  *([question_outcome("refused", "Producer offline")] * tries)]) as send):
+              patch.object(change_page, "send_question",
+                           return_value=question_outcome("refused", "Producer offline")) as send):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
@@ -4004,6 +4048,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
             saved = the_list.load(morty.id, item.id)
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
+            self.assertEqual(saved_progress(delivery_paths[0]).state, change_page.QuestionDeliveryState.FAILED)
             opened = self.request(list_page.PAGE_PATH)
             self.assertEqual(opened.status, 200)
             markup = opened.body.decode().split('<script>', 1)[0]
@@ -4015,7 +4060,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             code, _ = self.post(list_page.PAGE_PATH, urlencode({**fields, "action": "resend-Q1"}))
             self.assertEqual(code, 400)
             self.assertEqual(the_list.load(morty.id, item.id), saved)
-            self.assertEqual(send.call_count, tries)
+            send.assert_called_once()
             self.assertEqual(len(messages), 1)
             self.assertIn(f"\n{words}\n", messages[0])
             self.assertIn("answer L1 --question Q1", messages[0])

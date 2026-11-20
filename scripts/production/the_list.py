@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib import file_lock
+from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
@@ -1098,8 +1098,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
 
 
 def records(keeper: staff.StaffId, *, include_closed: bool = False,
-            sources: list[Path] | None = None) -> list[ListItem]:
-    items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
+            sources: list[Path] | None = None, on_error: Callable[[Path, Exception], None] | None = None) -> list[ListItem]:
+    items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources, on_error=on_error)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
 
 
@@ -1812,6 +1812,16 @@ class _ListQuestionStore:
                 if load(self.keeper, item) != changed:
                     raise
 
+            from scripts.review_links import review_link
+            try:
+                root = review_link.review_root()
+            except (OSError, ValueError, conf.Unusable) as error:
+                print(f"list question delivery {item}/{question_id}: {error}", file=sys.stderr)
+            else:
+                change_page.record_page_question_answer(change_page.DeliveryStatus(root),
+                                                        _list_question_target(self.keeper, changed),
+                                                        replace(question, answer=answer))
+
 
 def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
                  status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
@@ -1844,9 +1854,7 @@ def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
 
 
 def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
-    owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
-    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
-                                           keeper, alert_owner=owner)
+    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title, keeper)
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:

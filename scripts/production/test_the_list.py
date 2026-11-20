@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, conf
+from scripts.lib import atomic_file
 from scripts.message import send_result
 from scripts.production import change_review, delivery_state, investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
@@ -1137,7 +1137,7 @@ class TheListTests(unittest.TestCase):
             change_page.deliver(claimed, status)
             path = status.path(claimed.page, claimed.row)
             closed_attempt = change_page.read_question_attempt(path)
-            self.assertIs(closed_attempt.state, delivery_state.QuestionSendState.UNKNOWN)
+            self.assertIs(change_page.page_progress(closed_attempt).state, change_page.QuestionDeliveryState.CLOSED)
             self.assertIsInstance(closed_attempt.owner, delivery_state.NoQuestionSendOwner)
             self.assertEqual(closed_attempt.error, "")
             change_page.recover_page_question(status, path, closed_attempt)
@@ -1165,9 +1165,7 @@ class TheListTests(unittest.TestCase):
                     _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
                     return send_result.ConfirmedSendOutcome(header), header.detail
 
-                settings = Mock(whole=Mock(return_value=2), number=Mock(return_value=0))
-                with (patch.object(conf, "read", return_value=settings),
-                      patch.object(change_page, "send_question", side_effect=close_during_send) as send,
+                with (patch.object(change_page, "send_question", side_effect=close_during_send) as send,
                       patch.object(change_page, "alert_delivery_failures") as alert):
                     change_page.deliver(delivery, status)
                 send.assert_called_once()
@@ -1177,13 +1175,19 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(saved.state, expected)
                 self.assertIsInstance(saved.owner, delivery_state.NoQuestionSendOwner)
                 self.assertFalse(saved.earlier_unconfirmed)
-                self.assertEqual(saved.error, "")
-                self.assertFalse(status.has_deferred_questions())
+                if outcome == "sent":
+                    self.assertEqual(saved.error, "")
+                    self.assertFalse(status.has_deferred_questions())
+                else:
+                    self.assertEqual(saved.error, header.detail)
+                    self.assertTrue(status.has_deferred_questions())
+                    change_page.recover_deferred_questions(status)
+                    self.assertEqual(change_page.page_progress(change_page.read_question_attempt(path)).state,
+                                     change_page.QuestionDeliveryState.CLOSED)
 
-    def test_retry_read_error_preserves_the_confirmed_failure(self) -> None:
+    def test_recovery_read_error_preserves_an_uncertain_send(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")
         header = send_result.OutcomeHeader("failed", "The transport refused delivery.", "")
-        settings = Mock(whole=Mock(return_value=2), number=Mock(return_value=0))
         for error in (PermissionError("The List file cannot be read."), ValueError("Invalid List record.")):
             with self.subTest(error=type(error).__name__):
                 item = self.add()
@@ -1192,15 +1196,15 @@ class TheListTests(unittest.TestCase):
                 assert isinstance(delivery, change_page.PageQuestionSend)
                 listing = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", ValueError)
                 fields = listing.read(item.id)
-                with (patch.object(conf, "read", return_value=settings),
-                      patch.object(record_store.NumberedRecords, "read", side_effect=[fields, error]),
+                with (patch.object(record_store.NumberedRecords, "read", side_effect=[fields, error]),
                       patch.object(change_page, "send_question",
                                    return_value=(send_result.ConfirmedSendOutcome(header), header.detail)) as send,
                       patch.object(change_page, "alert_delivery_failures") as alert,
                       redirect_stderr(io.StringIO()) as log):
                     change_page.deliver(delivery, status)
+                    change_page.recover_deferred_questions(status)
                 saved = change_page.read_question_attempt(status.path(delivery.page, delivery.row))
-                self.assertEqual(saved.state, delivery_state.QuestionSendState.FAILED)
+                self.assertEqual(change_page.page_progress(saved).state, change_page.QuestionDeliveryState.UNKNOWN)
                 self.assertEqual(saved.error, header.detail)
                 self.assertIn(str(error), log.getvalue())
                 send.assert_called_once()

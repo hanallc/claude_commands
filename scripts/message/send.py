@@ -556,7 +556,7 @@ class FixedStaffLookup:
         for row in staff.active(membership, self.kind):
             if row.id == self.to and not isinstance(row.retirement, staff.RetiredProducer):
                 return row
-        return RecipientLookupFailed(f"staff ID {self.to} has no current {self.kind} row")
+        return RecipientStaffMissing(f"staff ID {self.to} has no current {self.kind} row")
 
 
 @dataclass(frozen=True)
@@ -914,6 +914,11 @@ class RecipientLookupFailed:
 @dataclass(frozen=True)
 class RecipientRoutePending(RecipientLookupFailed):
     """The fixed recipient has no verified route yet."""
+
+
+@dataclass(frozen=True)
+class RecipientStaffMissing(RecipientLookupFailed):
+    """The fixed recipient has no active staff row."""
 
 
 class RecipientNameMissing(SystemExit):
@@ -4213,12 +4218,22 @@ def deliver_codex(
     if isinstance(selection, FixedStaffLookup):
         current = _current_staff_session(selection, ExpectedStaffSession(recipient.thread_id))
         if isinstance(current, RecipientLookupFailed):
+            if message.review_delivery:
+                if isinstance(current, RecipientStaffMissing):
+                    return QuestionRecipientGone("refused", current.reason)
+                return SendNotStarted("retry", current.reason)
             return Result("failed", current.reason)
     if isinstance(recipient, CodexPaneRecipient):
+        from scripts.herdr.herdr import HerdrCommandNotStarted
+
         try:
             _prompt_pane(recipient.place, text, target=recipient.thread_id, timeout=timeout)
             return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
         except (herdr_types.HerdrFailure, OSError) as error:
+            if message.review_delivery:
+                if isinstance(error, (herdr_types.HerdrMissing, HerdrCommandNotStarted)):
+                    return SendNotStarted("retry", str(error))
+                return UncertainRelayDelivery("failed", str(error))
             return Result("failed", str(error))
     if message.review_delivery and message.key is not None:
         digest = hashlib.sha256(json.dumps((message.key, review_recipient)).encode()).hexdigest()
@@ -4228,10 +4243,17 @@ def deliver_codex(
         queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout)
     if isinstance(queued, codex_daemon.QueueUnconfirmed):
         return UncertainRelayDelivery("failed", queued.reason)
+    if isinstance(queued, codex_daemon.QueueNotStarted):
+        return SendNotStarted("retry", queued.reason)
+    if isinstance(queued, codex_daemon.QueueRejected):
+        return QuestionRecipientGone("refused", queued.reason)
     if isinstance(queued, codex_daemon.Queued):
         return Result("sent", f"queued on Codex session {recipient.name}")
     if isinstance(queued, codex_daemon.QueueTimedOut):
-        return Result("failed", f"timed out after {queued.seconds:g} s")
+        reason = f"timed out after {queued.seconds:g} s"
+        if message.review_delivery and message.key is not None:
+            return SendNotStarted("retry", reason)
+        return Result("failed", reason)
     return Result("failed", queued.reason)
 
 
@@ -4458,7 +4480,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     outcome = send_outcome(code, out)
     if isinstance(outcome, UnconfirmedSendOutcome):
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
-        if isinstance(selection, FixedStaffLookup) and options.review_delivery:
+        if options.review_delivery:
             return UncertainRelayDelivery("failed", f"ssh {host}: {why}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
     parsed = outcome.header
@@ -5010,8 +5032,14 @@ def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -
     """Submit text and require the selected pane to start a turn."""
     from scripts.herdr import herdr
 
-    herdr.Herdr(place.session).prompt(
-        place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
+    submission = herdr.TrackedPromptSubmission(lambda: None)
+    try:
+        herdr.Herdr(place.session).prompt(
+            place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=submission)
+    except herdr_types.HerdrFailure as error:
+        if submission.may_have_submitted or isinstance(error, (herdr_types.HerdrMissing, herdr.HerdrCommandNotStarted)):
+            raise
+        raise herdr.HerdrCommandNotStarted(str(error)) from error
 
 
 @dataclass(frozen=True)

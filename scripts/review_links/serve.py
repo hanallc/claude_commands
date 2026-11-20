@@ -1541,6 +1541,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.question_recovery: threading.Thread | None = None
+        self.alert_recovery: threading.Thread | None = None
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
         if mode is ServerMode.LIVE:
@@ -1551,13 +1552,14 @@ class ReviewLinksServer(ThreadingHTTPServer):
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         self.delivery_status.startup_recovery_pending.set()
+        change_page.migrate_question_deliveries(self.delivery_status)
 
         def recover_pending() -> None:
             try:
                 recover_changes(self.delivery_status)
             finally:
                 self.delivery_status.startup_recovery_pending.clear()
-            recover_list()
+            recover_list(self.delivery_status)
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
 
@@ -1737,6 +1739,11 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 self.question_recovery = threading.Thread(
                     target=change_page.recover_deferred_questions, args=(self.delivery_status,), daemon=True)
                 self.question_recovery.start()
+            if (self.delivery_status.has_deferred_alerts()
+                    and (self.alert_recovery is None or not self.alert_recovery.is_alive())):
+                self.alert_recovery = threading.Thread(
+                    target=self.delivery_status.recover_deferred_alerts, daemon=True)
+                self.alert_recovery.start()
 
 
 def main(arguments: list[str]) -> int:

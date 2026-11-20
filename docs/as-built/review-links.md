@@ -1027,32 +1027,46 @@ The row shows a waiting note when each unanswered question has a live sender or 
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
 The console updates its unread indicator on its own news refresh.
-The page shows “Question not delivered.” after a confirmed failure.
-List, Images, and Review use the same text.
-All attempts for one question use the same sender lock.
-List, Images, and Review question sends use the same retry loop.
-Each recipient keeps the same message ID through retries and recovery.
-A refusal after an unconfirmed send preserves the unconfirmed result for that recipient.
-The transport can confirm acceptance on a later retry.
-Review saves each recipient's result so recovery can skip confirmed recipients.
-The server retries unresolved attempts until the deadline.
-The server stores the question ID and deadline when it saves the delivery attempt.
+The next refresh shows “Question not delivered.” once for a failed question.
+List, Images, and Review use the same text and delivery states.
+The saved delivery record holds the question ID, deadline, and state.
+The states are `not_started`, `unknown`, `confirmed`, `answered`, `closed`, and `failed`.
+The server saves the question before it reads the delivery settings.
+The server saves the source first, then the delivery state, then the alert.
+Recovery scans open List, Images, and Review questions for missing delivery records.
+A saved answer takes priority over delivery evidence.
+A question with no delivery record starts in `not_started`.
+Recovery derives the same delivery key from its saved source.
+The legacy Questions form uses the same save and delivery path.
+The server migrates old delivery records before it starts recovery.
+Migration keeps confirmed deliveries, saved failures and answers.
+This includes old verdicts and validations in single and nested slots.
+Each Change recipient has a separate result.
+Other old pending deliveries start again with their saved keys and recipients.
+Migration keeps saved deadlines and starts new deadlines at migration.
+An old send with no confirmation can reach its recipient once more at deployment.
+A missing Change recipients field permits the showrunner lookup.
+An unreadable recipients field leaves the delivery uncertain.
+An unreadable source stays scheduled even if its delivery record is missing.
+A marker sync error restores the prior record before the server can start transport.
+Review checks the delivery files before it serves a cached snapshot.
+An alert write failure keeps the saved question result available for the next refresh.
 The `question_recovery_seconds` setting defaults to 1800 seconds.
-A finished Review delivery takes precedence over the deadline.
-The server checks the deadline after it writes the send marker.
-Each retry pause lasts at most as long as the time left before the deadline.
-A route that stops before transport can fail as soon as the staff recipient is gone.
-An unusable setting stops a send that could not start and names the setting in the log.
-An unreadable delivery record or missing save proof can expire without another send.
-An unreadable job lock blocks sends and permits expiry.
-An expired attempt shows “Question not delivered.” and cannot start a send.
-If startup cannot read a delivery record, the server schedules another read.
-If recovery cannot locate or read the Change lists, the server keeps the questions for the next attempt.
-The fixed staff route defers a send while the recipient's messaging socket is unavailable.
-The server checks the saved question before each retry.
-If a native Review question has an answer, recovery retires its pending delivery.
-If publishing READY reports an error, the server checks both the old and new revisions.
-If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
+A refusal or a missing recipient causes an immediate failure.
+An unusable setting also causes an immediate failure when all earlier sends have known results and none succeeded.
+The sender saves `unknown` before it starts transport.
+The sender checks the deadline after it looks up the staff recipient.
+Only a proven non-start permits another send with the same key.
+An uncertain transport result keeps `unknown` until the deadline and prevents another send.
+Recovery checks the saved deadlines before it starts the pending sends.
+A confirmed send prevents the delivery failure notice.
+Recovery logs an unreadable record and schedules another read.
+An unreadable sender lock prevents a send.
+The alert sender holds a file lock until the transport process exits.
+An alert retains its key and uses its question's deadline.
+The first alert and each retry must start before the saved deadline.
+An uncertain alert expires with one log line. Recovery never sends that alert again.
+Recovery schedules another read after a staff or alert record read error.
 The question reader checks the saved question words and answer command.
 A List title edit preserves the delivery state.
 Recovery sends the prepared message with its original title.
@@ -1077,10 +1091,10 @@ Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save a
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
 The entry keeps the question ID, words, and time.
-The question no longer accepts answers or retries.
+The closed question accepts no further answers or sends.
 Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
-The send loop holds the answer lock from the source check through each transport call.
+The sender holds the answer lock from the source check through transport.
 List, Images, and Change use a lock for the specific question.
 Other Review types use the lock for their answer writer.
 Each question transport call uses the configured sender budget.
@@ -1122,18 +1136,11 @@ The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
 The command refuses an unknown ID, a second answer, and empty text.
 
-List and Images questions share one delivery record for each question and recipient.
-The record stores the source, stable message ID, revision, attempt ID, job owner, transport receipt, and error.
-The delivery lock protects every atomic update.
-A job holds the question's sender lock from claim through result publication.
-The sender publishes `sending` before it calls the transport.
-The question transport can confirm delivery or failure.
-A queued result or a missing confirmation leaves the outcome `unknown`.
-Startup recovery verifies the saved question and claims work when the sender lock is free.
-If a sender stopped after it wrote the send marker, recovery reuses the same message ID.
-A closed item or a question that has an answer requires no send.
-The server clears that claim without a failure notice.
-If the server cannot start the send for another reason, it clears the claim and logs the error.
+List and Images use one delivery record for each question.
+The record stores the source, stable message ID, claim, and transport result.
+The job holds the sender lock through the write of the result.
+Recovery verifies the saved question before it claims a new send.
+An answered question or a closed item ends recovery.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the row above the four-line text box.
 **Unpark** and **Park until** sit at the right edge of the row.
@@ -1352,7 +1359,6 @@ The page also hides an image while the server recovers its verified delivery on 
 A failed or uncertain delivery returns the card with a delivery notice.
 When the owner answers the last open question, the card returns and the console shows a new update.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
-It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
 A `Feedback:` line follows when the user wrote text.
 Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
@@ -1613,7 +1619,7 @@ These stored IDs stay valid when the displayed ID names another responsible show
 A landing answer calls `land_review`, which lands the proposal with the verb that the proposal records (`add` or `supersede`).
 A returning answer calls `drop_review` with the saved verdict.
 An operation failure keeps the row open and sends the showrunner the row ID and the `FeatureLogError.diagnostic` text.
-The server sends one alert per list, row, and error text.
+The server saves each alert by list, row, and error text. The alert uses the shared delivery claim and deadline.
 It saves sent alerts under `.review-link-closeout-alert-*.json` in the snapshot root.
 The delivery lock serializes the alert check, send, and record write.
 Repeated saves and server restarts retain this record.
@@ -1684,44 +1690,46 @@ The server reads the owner and its production document at use through `StaffRout
 `ValidationRequested` keeps validation ownership and feedback after delivery or an alert.
 Only a showrunner answer returns an open question to the user.
 The page shows **Saved: <answer>**, **The showrunner will validate this**, or **The showrunner will answer this**.
-The page shows “Question not delivered.” after a confirmed delivery failure.
+The page shows “Question not delivered.” after proven non-acceptance or expiry without a confirmed send.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
 Each page render reads `feedback_rows` once to set every feedback box's height.
-`delivery_tries` starts at 3; `delivery_pause_seconds` starts at 5.
-Tests use a zero pause.
-Each round sends once to every recipient that has not succeeded.
-The server pauses once between rounds.
-For questions, it retries failed or unconfirmed sends.
-The showrunner receives its first attempt before any recipient receives a second attempt.
+Review sends retry only after a proven non-start.
+The server records an unknown result after the sender process starts.
+If the server stops before it writes that marker, recovery uses the same key.
 Review uses the record and saved attempt to identify each message.
 Retries and recovery use the same key for each staff recipient.
 List feedback uses its saved request ID.
 Image feedback uses the image registration, action, and feedback to identify the attempt.
 The server saves the answered question IDs before the first send.
 A retry hides the image only if no new question answer has arrived.
-A skipped send can save the feedback mark after a failed write.
-`QUEUED` and `KEPT` count as kept for feedback and verdict delivery.
+A saved receipt can complete an Images action after a failed write.
 `SKIPPED` confirms that the sender already accepted the key.
-For a Review send, `PENDING` means the message may have arrived.
+A Review send stays unknown if the sender reports `PENDING`, `QUEUED`, or another unconfirmed result.
 Codex queue retries reuse the same client message ID.
-A timeout before the queue request reaches the socket is a definite failure.
-The server stops delivery for that recipient.
-After all tries fail, the server alerts the showrunner who owns the item's tab.
+A Codex failure before queue submission or pane input permits a retry with the same key.
+A timeout after the queue request starts keeps the result uncertain.
+After feedback or verdict delivery fails, the server alerts the showrunner who owns the tab.
+Question delivery alerts use the saved failure result.
 For a Review producer tab without a showrunner, the server uses the configured routing alert showrunner.
 For a List question, the item owner determines the alert route.
 If the showrunner is the failed recipient, the server records the failure without sending an alert.
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
 Each saved alert has its own key.
-Recovery uses that key again if the server cannot clear an alert after sending it.
+Recovery reuses the alert key after a proven non-start.
+An unconfirmed alert stays uncertain until its deadline.
+The server sends saved alerts outside the delivery lock.
+It takes the lock to clear an alert after confirmed acceptance or final failure.
 The user receives no delivery alert.
 
-At startup, the server delivers pending records with the same retry and alert rules.
+At startup, the server migrates older records before it processes pending deliveries.
 Recovery preserves attempts that a live request owns.
-It resumes a List or Images question if the saved sender released its lock during delivery.
+It resumes a List or Images question if the record proves that the send did not start.
 It reuses the question's message ID.
-Recovery scans each review list once and finds each record through `change_routing.delivery_path`.
+Recovery uses `change_routing.delivery_path` to find each delivery record.
+An older Change record with no saved recipient field uses the showrunner route.
+An explicit empty recipient list records a missing route.
 It ignores the `page` field in legacy records.
 The browser and recovery use `StaffRouting.owner_and_production` for the same owner and production document.
 The `Production:` line names the showrunner in live and recovered messages.
@@ -1731,8 +1739,8 @@ A legacy failed validation keeps validation ownership without a message attempt.
 The server retains the attempt if both the Change question and its alert fail.
 It records acceptance of the question or its alert before it clears the attempt.
 Recovery clears an accepted attempt without sending again.
-Recovery retries a started Change question without an acceptance record.
-A stop between acceptance and the receipt write can cause a second send.
+Recovery keeps an uncertain Change question until its deadline.
+A stop between acceptance and the receipt write leaves the question uncertain.
 Review confirms that the question was saved before it sends the message.
 A validation keeps its ownership slot and recipient IDs with state `sent`.
 An open question keeps its question ID and text; an answered question keeps its answer.
@@ -1939,7 +1947,6 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_retention_seconds` controls snapshot age.
 `snapshot_sweep_seconds` and `tailscale_check_seconds` control the server checks.
 `snapshot_allocation_tries` limits folder allocation attempts.
-`delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
 The `later_*` keys set the Review page Later presets; each render reads them.
