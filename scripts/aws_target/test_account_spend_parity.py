@@ -14,7 +14,7 @@ from unittest import mock
 
 from scripts.aws_target import aws_page, aws_target, config, ledger, spend
 from scripts.aws_target.aws_cli import AwsCli
-from scripts.aws_target.ledger_test_support import CostFixture, instant
+from scripts.aws_target.ledger_test_support import SpendReferenceFixture, instant
 
 
 HOUR = 3600
@@ -101,6 +101,7 @@ REFERENCE: dict[str, SpendReference] = {
     '86': (('2', '4'), ('2', '4'), ('2', '4')),
     '86 zero marker': (('2', '6'), ('0', '4'), ('2', '6')),
     '87': (('11', '12'), ('11', '12'), ('11', '12')),
+    '87 tax carry': (('1', '12'), ('1', '12'), ('1', '12')),
     '88 zero': (('3', '—'), ('3', '3'), ('3', '3')),
     '88 negative': (('3', '—'), ('3', '3'), ('3', '3')),
     '88 legacy': (('3', '—'), ('3', '3'), ('3', '3')),
@@ -215,7 +216,7 @@ def storage_bill(usd: str) -> ledger.UsageTypeCost:
     return ledger.UsageTypeCost('USE1-EBS:VolumeUsage.gp3', Decimal(usd))
 
 
-class AccountSpendParityTests(CostFixture):
+class AccountSpendParityTests(SpendReferenceFixture):
     book: ledger.CostLedger = ledger.CostLedger(Path())
     now: int = 0
     original_settings: str = ''
@@ -322,10 +323,18 @@ class AccountSpendParityTests(CostFixture):
                     next((exact_amount(row.cost) for row in guard_month.days if row.day.isoformat() == day_key), ABSENT),
                     exact_amount(guard_month.limit_count) if month_key == local.isoformat()[:7] else ABSENT,
                 )
+            with self.decision_book(self.book) as live:
+                self.assert_guard_decisions(live, guard_day.limit_count, guard_month.limit_count)
             try:
                 projection = self.project()
             except (OSError, ValueError, ArithmeticError) as error:
                 admission_values = (str(error), str(error))
+                with self.decision_book(self.book) as live:
+                    before = live.read_snapshot().gate_reservations
+                    with self.assertRaises(type(error)) as refusal:
+                        _ = live.reserve_gate(self.settings, self.proposal())
+                    self.assertEqual(str(refusal.exception), str(error))
+                    self.assertEqual(live.read_snapshot().gate_reservations, before)
             else:
                 day = next((exact_amount(row.usd) for row in projection.day
                             if (row.start, row.end) == day_bounds), ABSENT)
@@ -334,7 +343,50 @@ class AccountSpendParityTests(CostFixture):
                 if day == ABSENT and day_key < local.isoformat() and month != ABSENT:
                     day = exact_amount(projection.contribution(*day_bounds))
                 admission_values = (day, month)
+                with self.decision_book(self.book) as live:
+                    self.assert_gate_decisions(live, projection)
             self.assert_baseline(key, (page_values, guard_values, admission_values))
+
+    def assert_guard_decisions(self, book: ledger.CostLedger, day: Decimal | ledger.CostEvidenceUnavailable,
+                               month: Decimal | ledger.CostEvidenceUnavailable) -> None:
+        def guard() -> ledger.SpendingDecision:
+            return book.guard(self.settings, 'admission', self.now, lambda _notice: True, clock=lambda: self.now)
+
+        if isinstance(day, ledger.CostEvidenceUnavailable):
+            decision = guard()
+            self.assertIsInstance(decision, ledger.SpendingUnavailable)
+            assert isinstance(decision, ledger.SpendingUnavailable)
+            self.assertEqual(decision.reason, day.reason)
+            return
+        assert isinstance(month, Decimal)
+        self.costs({'daily_limit_usd': '10000', 'monthly_limit_usd': '10000'})
+        for period, amount in (('daily', day), ('monthly', month)):
+            cap = f'{period}_limit_usd'
+            self.replace(cap, str(amount))
+            decision = guard()
+            self.assertIsInstance(decision, ledger.SpendingRefused)
+            assert isinstance(decision, ledger.SpendingRefused)
+            self.assertEqual(decision.reason, f'{period}_limit')
+            self.replace(cap, str(amount.next_plus()))
+            self.assertIsInstance(guard(), ledger.SpendingAllowed)
+            self.replace(cap, '10000')
+
+    def assert_gate_decisions(self, book: ledger.CostLedger, projection: AdmissionCounts) -> None:
+        request = replace(self.proposal(), attempt='fixture-cap-probe')
+        before = book.read_snapshot().gate_reservations
+        self.costs({'daily_limit_usd': '10000', 'monthly_limit_usd': '10000'})
+        for period, periods in (('daily', projection.day), ('monthly', projection.month)):
+            if periods:
+                amount = max(row.usd for row in periods)
+                cap = f'{period}_limit_usd'
+                self.replace(cap, str(amount))
+                self.assertEqual(book.reserve_gate(self.settings, request), ledger.GateCapReached(f'{period}_limit'))
+                self.assertEqual(book.read_snapshot().gate_reservations, before)
+                self.replace(cap, '10000')
+        for period, periods in (('daily', projection.day), ('monthly', projection.month)):
+            if periods:
+                self.replace(f'{period}_limit_usd', str(max(row.usd for row in periods).next_plus()))
+        self.assertIsInstance(book.reserve_gate(self.settings, request), ledger.GateReserved)
 
     def assert_baseline(self, key: str, measured: SpendReference) -> None:
         self.assertEqual(measured, REFERENCE[key], 'Page, guard, and admission amounts')
@@ -391,10 +443,6 @@ class AccountSpendParityTests(CostFixture):
             self.write_bill(JAN1, bill, usage)
             self.record(row)
 
-        self.scene('35', now=JAN2 + 20 * HOUR, fixed='93')
-        self.write_bill(JAN1, '2', storage_bill('2'))
-        self.record('35')
-
         self.scene('36')
         self.write_bill(JAN1, '2')
         self.record('36')
@@ -430,6 +478,17 @@ class AccountSpendParityTests(CostFixture):
                 JAN1 + 12 * HOUR, Decimal(180), ledger.HanaExposureClosed(self.now)))
         self.record('N10')
 
+    def test_row_35_guard_counts_monthly_fixed_reserves(self) -> None:
+        self.scene('35', now=JAN2 + 20 * HOUR, fixed='93')
+        self.write_bill(JAN1, '2', storage_bill('2'))
+        self.replace('monthly_limit_usd', '10')
+        decision = self.guard()
+        self.assertIsInstance(decision, ledger.SpendingRefused)
+        assert isinstance(decision, ledger.SpendingRefused)
+        self.assertEqual(decision.reason, 'monthly_limit')
+        self.replace('monthly_limit_usd', '10000')
+        self.record('35')
+
     def test_gate_compute_allowance_and_future_periods(self) -> None:
         self.scene('38', now=JAN2 + HOUR)
         self.write_bill(JAN1, '2', spot_bill('2', '2'), settled=False)
@@ -461,6 +520,16 @@ class AccountSpendParityTests(CostFixture):
         self.record('44', page_day=utc_day(FEB1), cap_day=utc_day(FEB1))
         future_day, = [period for period in self.project().day if period.start == FEB1]
         self.assertEqual(future_day, AdmissionPeriod(FEB1, FEB1 + DAY, Decimal(2)))
+
+    def test_row_44_crossing_proposal_refuses_at_the_future_daily_cap(self) -> None:
+        self.scene('44 crossing', now=FEB1 - HOUR // 2)
+        self.write_bill(FEB1 - 2 * DAY, '2', spot_bill('2', '2'))
+        request = replace(self.proposal(), expires=FEB1 + 2 * HOUR, usd_per_hour=Decimal(1))
+        self.replace('daily_limit_usd', '2')
+        self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+        self.replace('daily_limit_usd', str(Decimal(2).next_plus()))
+        self.assertIsInstance(self.book.reserve_gate(self.settings, request), ledger.GateReserved)
 
     def test_hana_saved_exposures_and_account_proposals(self) -> None:
         for row, bill_rate, saved_rate in (('45 high', '2', '1'), ('45 low', '1', '2')):
@@ -733,6 +802,7 @@ class AccountSpendParityTests(CostFixture):
         self.assertEqual(bill.actual_usd, Decimal(11))
         self.write_bill(JAN1, '11', *bill.usage_types)
         self.record('87', page_day=utc_day(JAN1), cap_day=utc_day(JAN1))
+        self.record('87 tax carry')
 
     def test_saved_query_across_lookback_rollover(self) -> None:
         self.scene('90', now=JAN3 - 1)

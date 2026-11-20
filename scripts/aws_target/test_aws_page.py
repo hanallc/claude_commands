@@ -71,12 +71,9 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
                 self.assertEqual(aws_page.quota_request_age(request, now), 'age unknown')
 
 
-class PageCostFixture(ledger_test_support.CostFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.costs({'spend_pace_days': '3', 'run_cost_days': '5', 'billed_hours_gap_max_ratio': '0.2'})
-        self.configure_gate("""
+def configure_page_costs(fixture: ledger_test_support.CostFixture) -> None:
+    fixture.costs({'spend_pace_days': '3', 'run_cost_days': '5', 'billed_hours_gap_max_ratio': '0.2'})
+    fixture.configure_gate("""
 regions=us-east-1
 spot_candidate_regions=us-east-1
 instance_types=m7a.8xlarge
@@ -90,6 +87,13 @@ lifetime_minutes=30
 # whole: 1..
 gpu_spot_quota_request_vcpus=32
 """)
+
+
+class PageCostFixture(ledger_test_support.CostFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        configure_page_costs(self)
 
 
 class AwsGpuQuotaSummaryTests(PageCostFixture):
@@ -292,7 +296,7 @@ class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
         ])
 
 
-class AwsPageSpendReferenceTests(PageCostFixture):
+class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
     """Record the existing spend and publication behavior for Phase 1."""
 
     midnight: int = ledger_test_support.instant('2026-01-15T00:00:00Z')
@@ -302,12 +306,14 @@ class AwsPageSpendReferenceTests(PageCostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        configure_page_costs(self)
         self.costs({'fallback_usd_per_hour': '1', 'limit_reserve_usd': '0',
                     'cost_explorer_interval_seconds': '60'})
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(self.midnight - 86400, (), 'fixture inventory',
                                                             builder_removed=True))
         self.book.observe(ledger.InstanceObservation(self.midnight - 86400, 'terminated', 'fixture observation'))
+        _ = self.enterContext(mock.patch.object(ledger, 'send_settled_changes', return_value=True))
         self.folder = self.root / 'page'
 
     def refresh(self, now: int, amount: str) -> None:
@@ -334,14 +340,24 @@ class AwsPageSpendReferenceTests(PageCostFixture):
         self.assertEqual([tile['usd'] for tile in data['spend']['tiles']], [today, yesterday, month])
 
     def assert_month_admission(self, now: int, amount: Decimal) -> None:
-        state = self.book.read_snapshot()
-        decision = self.book.spending_decision(state, self.settings, now)
-        assert isinstance(decision, ledger.SpendingAllowed)
-        costs, policy = decision.evidence.costs, decision.evidence.policy
-        assert isinstance(costs, ledger.CostEstimate) and isinstance(policy, aws_config.SpendingSettings)
-        for cap, reason in ((amount, 'monthly_limit'), (amount.next_plus(), '')):
-            self.assertEqual(self.book.reservation_cap(state, replace(policy, monthly_limit_usd=cap), now, costs),
-                             reason)
+        with self.decision_book(self.book) as live:
+            request = ledger.GateReservation('fixture-month-check', now, now + 3600, Decimal(0), Decimal(0),
+                                             instance_type='m7a.8xlarge', region='us-east-1')
+            self.replace('monthly_limit_usd', str(amount))
+            self.assertEqual(live.reserve_gate(self.settings, request), ledger.GateCapReached('monthly_limit'))
+            self.replace('monthly_limit_usd', str(amount.next_plus()))
+            self.assertIsInstance(live.reserve_gate(self.settings, request), ledger.GateReserved)
+
+    def assert_month_guard(self, now: int, amount: Decimal) -> None:
+        with self.decision_book(self.book) as live:
+            self.replace('monthly_limit_usd', str(amount))
+            refused = live.guard(self.settings, 'admission', now, lambda _event: True, clock=lambda: now)
+            self.assertIsInstance(refused, ledger.SpendingRefused)
+            assert isinstance(refused, ledger.SpendingRefused)
+            self.assertEqual(refused.reason, 'monthly_limit')
+            self.replace('monthly_limit_usd', str(amount.next_plus()))
+            allowed = live.guard(self.settings, 'admission', now, lambda _event: True, clock=lambda: now)
+            self.assertIsInstance(allowed, ledger.SpendingAllowed)
 
     def test_row_57_formats_the_month_after_summing_the_bills(self) -> None:
         checked = self.midnight + 7200
@@ -364,12 +380,16 @@ class AwsPageSpendReferenceTests(PageCostFixture):
         published = self.publish(checked)
         self.assert_spend_tiles(published, '$0.00', '$1.00', '$2.01')
         self.assertEqual(published['settled_notes'], ['Settled AWS amounts: 2 of 2 did not change after they settled (checked Jan 15).'])
+        self.assert_month_guard(checked, Decimal('2.008'))
+        self.assert_month_admission(checked, Decimal('2.008'))
 
     def test_row_64_page_and_guard_use_their_evaluation_times(self) -> None:
         self.refresh(self.midnight, '2')
         self.book.observe(ledger.InstanceObservation(self.midnight, 'running', 'fixture builder'))
         earlier = self.publish(self.midnight + 3600)
         self.assert_spend_tiles(earlier, '$1.00', '$2.00', '$3.00')
+        self.assert_month_guard(self.midnight + 3600, Decimal(3))
+        self.assert_month_admission(self.midnight + 3600, Decimal(3))
         now = self.midnight + 7200
         decision = self.book.guard(self.settings, 'admission', now, lambda _event: True, clock=lambda: 0)
         assert isinstance(decision, ledger.SpendingAllowed)
@@ -377,10 +397,14 @@ class AwsPageSpendReferenceTests(PageCostFixture):
         assert isinstance(costs, ledger.CostEstimate)
         self.assertEqual((costs.at, costs.daily.usd, costs.monthly.usd), (now, Decimal(2), Decimal(4)))
         self.assert_spend_tiles(self.publish(now), '$2.00', '$2.00', '$4.00')
+        self.assert_month_guard(now, Decimal(4))
+        self.assert_month_admission(now, Decimal(4))
 
     def test_row_65_page_and_guard_can_use_different_saved_bills(self) -> None:
         self.refresh(self.midnight, '2')
         self.assert_spend_tiles(self.publish(self.midnight), '$0.00', '$2.00', '$2.00')
+        self.assert_month_guard(self.midnight, Decimal(2))
+        self.assert_month_admission(self.midnight, Decimal(2))
         path = self.folder / aws_page.PAGE_NAME
         earlier = path.read_bytes()
         now = self.midnight + 60
@@ -391,12 +415,16 @@ class AwsPageSpendReferenceTests(PageCostFixture):
         assert isinstance(costs, ledger.CostEstimate)
         self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(0), Decimal(5)))
         self.assertEqual(path.read_bytes(), earlier)
+        self.assert_month_admission(now, Decimal(5))
         self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
+        self.assert_month_guard(now, Decimal(5))
 
     def test_row_n03_page_reads_the_new_bill_before_reconciliation(self) -> None:
         self.refresh(self.midnight, '2')
         self.assert_spend_tiles(self.publish(self.midnight), '$0.00', '$2.00', '$2.00')
         now = self.midnight + 60
+        self.assert_month_guard(self.midnight, Decimal(2))
+        self.assert_month_admission(self.midnight, Decimal(2))
         reconcile = self.book._reconcile_charge  # pyright: ignore[reportPrivateUsage]
         seen: list[Decimal] = []
 
@@ -404,7 +432,7 @@ class AwsPageSpendReferenceTests(PageCostFixture):
             if bill.actual_usd == 5:
                 saved, = self.book.read_snapshot().reconciliations
                 self.assertEqual(saved.usd, Decimal(2))
-                self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal(2))
+                self.assert_month_guard(now, Decimal(2))
                 self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
                 self.assert_month_admission(now, Decimal(5))
                 seen.append(bill.actual_usd)
@@ -415,8 +443,8 @@ class AwsPageSpendReferenceTests(PageCostFixture):
         self.assertEqual(seen, [Decimal(5)])
         saved, = self.book.read_snapshot().reconciliations
         self.assertEqual(saved.usd, Decimal(5))
-        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal(5))
         self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
+        self.assert_month_guard(now, Decimal(5))
         self.assert_month_admission(now, Decimal(5))
 
     def test_row_n04_page_can_read_a_launch_after_measuring_spend(self) -> None:
@@ -451,11 +479,14 @@ class AwsPageSpendReferenceTests(PageCostFixture):
         priced = replace(proposal, attempt='fixture-priced', region='us-east-2')
         self.assertIsInstance(self.book.reserve_gate(self.settings, priced), ledger.GateReserved)
         self.assertEqual(self.book.accrued_cost(self.settings, now, window='day').limit_count, Decimal(0))
+        self.assert_month_guard(now, Decimal(2))
+        self.assert_month_admission(now, Decimal(2))
         cloud_gate.append_launch(self.state, {'attempt': priced.attempt, 'time': now, 'result': 'launched',
             'instance_type': 'm7a.4xlarge', 'region': 'us-east-2', 'mode': 'merge-gate'},
             gate_job=GATE_JOB_NOT_RECORDED)
         self.assertEqual(tuple(self.book.accrued_cost(self.settings, now, window=window).limit_count
                                for window in ('day', 'month')), (Decimal(1), Decimal(3)))
+        self.assert_month_guard(now, Decimal(3))
         self.assert_month_admission(now, Decimal(3))
         self.costs({'daily_limit_usd': '1'})
         self.assertEqual(self.book.reserve_gate(self.settings, replace(proposal, attempt='fixture-cap-probe')),
@@ -467,6 +498,8 @@ class AwsPageSpendReferenceTests(PageCostFixture):
                 now = self.midnight + seconds * 10 + 120
                 self.refresh(now - 60, '2')
                 self.assert_spend_tiles(self.publish(now - 60), '$0.00', '$2.00', '$2.00')
+                self.assert_month_guard(now - 60, Decimal(2))
+                self.assert_month_admission(now - 60, Decimal(2))
                 publications: list[Path] = []
 
                 def publish_newer_first(path: Path, source: str, *, new_file_mode: int | None = None) -> None:
@@ -476,6 +509,8 @@ class AwsPageSpendReferenceTests(PageCostFixture):
                         newer = self.publish(now + seconds)
                         self.assert_spend_tiles(newer, '$0.00', '$5.00', '$5.00')
                         self.assertEqual(newer['read_at'], now + seconds)
+                        self.assert_month_guard(now + seconds, Decimal(5))
+                        self.assert_month_admission(now + seconds, Decimal(5))
                     write_text_atomic(path, source, new_file_mode=new_file_mode)
 
                 with mock.patch.object(aws_page, 'write_text_atomic', side_effect=publish_newer_first):
@@ -483,8 +518,7 @@ class AwsPageSpendReferenceTests(PageCostFixture):
                 self.assertEqual(publications, [self.folder / aws_page.PAGE_NAME])
                 self.assert_spend_tiles(overwritten, '$0.00', '$2.00', '$2.00')
                 self.assertEqual(overwritten['read_at'], now)
-                self.assertEqual(self.book.accrued_cost(self.settings, now + seconds, window='month').limit_count,
-                                 Decimal(5))
+                self.assert_month_guard(now + seconds, Decimal(5))
                 self.assert_month_admission(now + seconds, Decimal(5))
 
 
