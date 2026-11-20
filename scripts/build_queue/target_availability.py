@@ -248,7 +248,7 @@ class MacRoutes:
             self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
         scope = self.scopes[folder]
         return tuple(targets.running_job(claim) for claim in mac.claims
-                     if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
+                     if mac_test.run_holds_work(claim.record) and same_repository(claim.scope, scope))
 
     def owner(self, state: targets.Held) -> str:
         """The unit that holds a target, else its session, with the showrunner when known."""

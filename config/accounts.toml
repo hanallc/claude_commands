@@ -1,2 +1,3 @@
 [trust]
+# Folders to trust in Claude homes. List absolute path strings or paths that expand from a leading ~.
 folders = ["~/worktrees"]

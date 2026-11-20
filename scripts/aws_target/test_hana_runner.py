@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import select
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ import tarfile
 import tempfile
 import termios
 import time
+from types import SimpleNamespace
 from typing import BinaryIO, NamedTuple, cast, override
 import unittest
 from unittest import mock
@@ -413,10 +415,26 @@ sys.stdin.buffer.read(1)
                             readable, _, _ = select.select([ready], [], [], TEST_HANG_GUARD_SECS)
                             self.assertTrue(readable, 'The command did not signal readiness')
                             self.assertEqual(ready.read(1), b'r')
-                            with (mock.patch.object(subprocess, 'Popen', return_value=child),
-                                  self.assertRaisesRegex(linux_runner.LeasedCommandLost, 'execution deadline')):
-                                _ = linux_runner.capture_leased_command(command, execution, os.environ,
-                                    1024, timeout_s=0.1)
+                            started = time.monotonic()
+                            with selectors.DefaultSelector() as streams:
+                                def monotonic() -> float:
+                                    count = len(streams.get_map())
+                                    if not count:
+                                        return 0.0
+                                    if close_output and count > 1:
+                                        self.assertLess(time.monotonic() - started, TEST_HANG_GUARD_SECS,
+                                                        'The runner did not observe both closed output streams')
+                                        return 0.0
+                                    return 1.0
+
+                                clock = SimpleNamespace(time=time.time, monotonic=monotonic)
+                                selector = SimpleNamespace(DefaultSelector=lambda: streams, EVENT_READ=selectors.EVENT_READ)
+                                with (mock.patch.object(subprocess, 'Popen', return_value=child),
+                                      mock.patch.object(linux_runner, 'time', clock),
+                                      mock.patch.object(linux_runner, 'selectors', selector),
+                                      self.assertRaisesRegex(linux_runner.LeasedCommandLost, 'execution deadline')):
+                                    _ = linux_runner.capture_leased_command(command, execution, os.environ,
+                                        1024, timeout_s=1)
                             self.assertIsNone(child.poll())
                         finally:
                             child.stdin.close()

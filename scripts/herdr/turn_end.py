@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, cast
 
 from scripts.agents import detached_runs, shutdown_record, worker_lifecycle
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.herdr import herdr, worker_panes
@@ -675,9 +675,13 @@ class WorkerByThread(Enum):
 
 def handle(event: WorkerEvent, *, owner: staff.StaffId | WorkerByThread = WorkerByThread.LOOKUP) -> TurnOutcome:
     """Send the decided notice after releasing the worker lock."""
-    decision = _handle_locked(event, owner)
-    if isinstance(decision, TurnDecision):
-        return decision.send_notice() or decision.outcome
+    try:
+        decision = _handle_locked(event, owner)
+        if isinstance(decision, TurnDecision):
+            return decision.send_notice() or decision.outcome
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return TurnOutcome.UNCERTAIN
     return decision
 
 

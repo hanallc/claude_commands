@@ -13,7 +13,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.mac_test import eligibility, offload
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
@@ -22,7 +22,7 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.config["leftover_timeout_s"] = "10"
         self.sync_config()
         _ = write_config_fixture(self.root / "transport-mac.conf", self.config_path.read_text(), template="mac_test")
-        _ = write_config_fixture(self.root / "build_targets.conf", "settings.mac=transport-mac.conf\n")
+        write_mac_target_registry(self.root, "transport-mac.conf")
         settings = self.root / "cleanup-settings.conf"
         configuration = self.config_path.read_text()
         _ = settings.write_text(configuration)

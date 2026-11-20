@@ -88,11 +88,11 @@ class StylePlanTests(StylePlanFixture):
         rename = ledger.hold(values, self.sources[0], 1, "rename item", "rename",
                              "Outcome::Old", "Outcome::New", original.rule_blob, "18001")
         ledger.file_held(rename.finding_id, foreign)
+        self.finish_judging()
         ledger.ticket_add("12001", ticket_owner_id("values"), "proposal", "values", "crates/alpha",
                           [self.sources[0]], [values], proposal=str(foreign),
                           finding_ids=(original.finding_id, rename.finding_id))
         ledger.ticket_assign("12001", "style/main")
-        self.widen_for_pipeline("12001", self.sources[1])
         for path in self.sources:
             self.record(names, path, self.tip)
         own = self.borrowing_decision(names, "names", self.sources[1])
@@ -101,6 +101,7 @@ class StylePlanTests(StylePlanFixture):
                             "u32", "u64", finding.rule_blob, "18001")
         ledger.file_held(extra.finding_id, own)
         self.finish_judging()
+        self.widen_for_pipeline("12001", self.sources[1])
         busy = style_plan.busy_files(self.repo, self.doc, ledger, ticket_owner_id("names"), self.board())
         for path in self.sources[:3]:
             self.assertTrue(busy.contains(path), path)

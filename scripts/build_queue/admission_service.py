@@ -1146,6 +1146,13 @@ class ParkedPlacement:
     connection: Connection
 
 
+@dataclass(frozen=True)
+class AdmissionPassInputs:
+    """Keep the local inputs and the queue order that includes held CI waiters."""
+    local: records.QueueInputs
+    queue_order: list[tuple[Path, records.RankedWaiter]]
+
+
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
 
 
@@ -1853,6 +1860,8 @@ class AdmissionServer:
             "repository_name": profile.repo,
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
+        if isinstance(identity.verify, records.VerifyCall):
+            row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
             row["job"] = identity.job
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
@@ -1904,7 +1913,7 @@ class AdmissionServer:
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
     def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int,
-                sweep_seconds: float) -> records.QueueInputs:
+                sweep_seconds: float) -> AdmissionPassInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -1992,8 +2001,9 @@ class AdmissionServer:
             self.progress_history.prune(now - step_estimator.HISTORY_DAYS * 86400, sweep_seconds,
                 rank=profile_rank, share_percent=profile_share)
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
-        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
-                                     config.policy, profile_rank, profile_share)
+        local = self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
+                                      config.policy, profile_rank, profile_share)
+        return AdmissionPassInputs(local, ordered)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -2086,6 +2096,9 @@ class AdmissionServer:
                 running.append(step)
                 continue
             row, step, use = next(attributed)
+            waiter = row.get("queue_waiter")
+            if waiter is not None and "verify" in waiter:
+                step = replace(step, verify=waiter["verify"])
             if row["step"] not in gate.PROGRESS_STEPS:
                 running.append(step)
                 continue
@@ -2261,11 +2274,12 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
-        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
-                              self.configuration.progress_profile_sweep_seconds)
+        captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
+                                self.configuration.progress_profile_sweep_seconds)
+        inputs = captured.local
         ci_holds = self._ci_hold_reasons()
-        if ci_holds:
-            held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
+        held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
+        if held_owners:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
         inputs = self._placement_pass(inputs, policy, remote_start_hold_seconds)
@@ -2336,10 +2350,15 @@ class AdmissionServer:
         self.next_pass = self.clock.monotonic() + interval
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
+        remaining = {owner for owner, episode in by_owner.items() if episode in self.waiters}
+        local_rows = ((path, gate.rank_waiter(row, inputs.waiter_orders[owner])) for path, row in inputs.ordered
+                      if (owner := records.waiter_owner(row)) in remaining)
+        held_rows = ((path, row) for path, row in captured.queue_order
+                     if (owner := records.waiter_owner(row)) in held_owners and owner in remaining)
+        ordered = list(heapq.merge(local_rows, held_rows, key=lambda item: gate.waiter_order(item[1])))
         try:
-            ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority,
+                replace(inputs, ordered=ordered, spacing=self.spacing,
                         slots=tuple(slot for slot in inputs.slots
                             if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
         except OSError:
@@ -2471,7 +2490,8 @@ class AdmissionServer:
             assert isinstance(place, wire.CloudPlace)
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
-                record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job)
+                record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job,
+                verify=waiter.get("verify", records.NotVerifyCall()))
             sidecar = Path(record.sidecar)
             started_at = step_estimator.epoch(record.admitted_at)
             current = cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress()
@@ -2589,7 +2609,9 @@ class AdmissionServer:
                 identity.folder or request.profile.worktree, 0, records.RemoteMemoryUnavailable("remote memory is unavailable"),
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
-                assignment_host=assignment.destination.host))
+                assignment_host=assignment.destination.host, verify=identity.verify,
+                mac_placement=f"{assignment.episode}/{assignment.attempt}"
+                    if assignment.destination.provider == "mac" else ""))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -2605,11 +2627,15 @@ class AdmissionServer:
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
+                        for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
+        reading = replace(reading, view=replace(reading.view, waiting=waiting))
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
-                row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED))
+                row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED),
+                verify=row.get("verify", records.NotVerifyCall()))
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -3071,7 +3097,7 @@ class AdmissionServer:
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
             if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_is_live(claim.record)):
+                    and mac_test.run_holds_work(claim.record)):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
                 if session_id and session_id != claim_state.session_id(key.session):
