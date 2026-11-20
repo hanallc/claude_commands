@@ -1,20 +1,18 @@
 # AWS per-run gates and trials: runbook
 
 AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
-Normal build jobs use `mac` and `natedev`.
-AWS has no permanent builder or build offload route.
+The configured build target order is `hana-aws,mac,natedev`.
+Eligible Hana check and clippy steps can run on the retained Hana Spot box.
+The former permanent `aws-build` target is absent.
 Resource changes in this runbook belong to the user at a terminal.
 Local fake tests do not prove live quota, capacity, or deployment state.
 
-## Removed builder: 2026-11-04
+## Removed builder: 2026-11-10
 
-`builder-removal.json` records the removal on 2026-11-04.
+`builder-removal.json` records the removal. Commit `1b1fa1842` removed the target on 2026-11-10.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
-The registry contains `targets=mac,natedev`.
-The builder configuration and offload route have been removed.
-Builder slots, warm mirrors, idle stop, and controller activation are historical features.
-Only historical cost, ownership, and teardown compatibility remain.
+The ledger and teardown retain historical records for the former builder.
 Use `up --workload merge-gates` for gate deployment.
 The default `up` command now selects gate deployment.
 
@@ -58,8 +56,7 @@ Boxes receive signed URLs and no scaler credential file.
 
 ## Regions, prices, and quotas
 
-The gate regions in `regions` are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1` and `eu-south-1`.
-The price reads in `spot_candidate_regions` add `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
+`regions` and `spot_candidate_regions` in `cloud_gate.conf` list the same 19 regions.
 `us-east-2` is the home region for shared artifacts.
 Before deployment:
 
@@ -93,10 +90,10 @@ Old snapshots show a stale mark after `price_max_age_seconds`.
 A regional read failure keeps that region's previous values and age.
 
 The existing enabled `buildlog.timer` runs `buildlog hourly` on natedev every hour.
-The hourly job calls `aws_target.snapshot` after the existing jobs.
+The hourly job calls `aws_target.hourly` to refresh prices, quotas, and placement scores and check billed hours.
 A job failure does not stop the other jobs.
 No new timer, systemd change, or NixOS rebuild is required.
-The old `aws-target.service` stays disabled.
+`aws-target.service` runs `aws_target.py serve` for the separate Hana lifecycle and account refresh ticks.
 The reader uses `credentials_profile` from `aws_target.conf` and `credential_file` from `cloud_gate.conf`.
 It uses no administrator passphrase.
 It reads every candidate region and all configured Standard and GPU types.
@@ -121,14 +118,15 @@ It does not use Cost Explorer or create resources.
 
 `prices` reads deployed-region configuration and candidate-region configuration without duplicates.
 It prints current Spot prices and applied Standard and G and VT quotas.
-It includes the GPU types from `gpu_instance_types`.
+The `prices` command includes the GPU types from `gpu_instance_types`.
+The hourly snapshot includes both `gpu_instance_types` and `hana_gpu_instance_types`.
 It prints no resource identities.
 
 `quota-request` requests Standard Spot quota in each configured gate region.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 It requests G and VT Spot quota in each configured gate region.
-A region with only a price read gets no quota request.
 It uses `gpu_spot_quota_request_vcpus` from the same file.
+A region listed only in `spot_candidate_regions` receives no quota request.
 It skips sufficient quotas and existing open requests.
 A regional failure prints its error code and permits other regions to continue.
 Any regional failure makes the command exit with status 1.
@@ -158,13 +156,15 @@ When every applied quota is too small, the summary says `no region has enough ap
 An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
 An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
 
-Example from the test fake:
+This example assumes one gate region, `us-east-1`, with `spot_quota_request_vcpus=136` and `gpu_spot_quota_request_vcpus=32`.
+The largest configured GPU trial type in the example is `g6.8xlarge`, with 32 vCPUs.
+The applied quotas and request history are example values.
 
 ```text
 us-east-1
-  Standard Spot: 120 vCPUs applied, 128 vCPUs needed
+  Standard Spot: 120 vCPUs applied, 136 vCPUs needed
     Newest request: CASE_OPENED for 129 vCPUs (3h old).
-  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed
+  G and VT Spot: 32 vCPUs applied, 32 vCPUs needed
     No requests.
 
 Summary: GPU trial needs 32 vCPUs; quota fits: us-east-1; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED)
@@ -193,7 +193,7 @@ Update the existing gate foundation at your terminal:
 python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
 ```
 
-This path updates gate resources and preserves the foundation's existing builder parameters.
+This path updates gate resources. The current foundation has no builder parameters.
 It requires the saved foundation ownership record.
 It does not activate the removed builder route.
 The home stack supplies the bucket, role, instance profile, and home launch resources.
@@ -233,13 +233,16 @@ For a home-only change, regional time goes to network and image preparation and 
 ## Foundation maintenance
 
 `prepare` validates the retained deployment inputs and records the foundation plan.
-`apply --approve-resources` creates or updates the Budget and scaler foundation with compute disabled.
+`apply --approve-resources` creates or updates the Budget and scaler foundation.
 It also confirms the scaler credential file.
 These commands do not create a permanent builder.
 Gate deployment requires the saved foundation ownership record.
 The removed `price`, `bootstrap`, and `setup-start` commands are unavailable.
-The removed builder service commands `start`, `stop`, and `serve` are unavailable.
-Use `aws_target.py tick` for account bill and regional price refresh.
+The removed builder service commands `start` and `stop` are unavailable.
+Use `aws_target.py tick` for Hana lifecycle recovery and account bill refresh.
+`aws_target.py serve` runs each tick in a separate process with the `controller_tick_timeout_s` limit.
+It pauses for `tick_interval_s` after each tick attempt.
+Use `aws_target.py snapshot` for regional prices, quotas, placement scores, and the billed hours check.
 
 ## Merge gates and ranking
 
@@ -254,13 +257,14 @@ Before ranking, the worker reads live Spot prices from all deployed regions in p
 `spot_price_live_read_timeout_s` bounds the complete read.
 Failed regional reads retain applicable hourly prices from `spot-prices.json`.
 `buildlog hourly` refreshes cached prices and quotas through the scaler profile.
-`aws_target.py tick` reads account bills only.
+`aws_target.py tick` does not refresh Spot prices.
 A gate's live read does not change the hourly file.
 
-The worker places variants under a capacity cooldown last.
-Within each group, it prefers the lowest expected USD per run across types, regions and zones.
+The worker ranks alternatives by recent quota refusals, estimated live quota use, and recent zone refusals.
+Within each capacity group, priced variants come first in order of expected USD per run.
 Expected cost includes compute for the median box time by type and region, remote transfer, the configured regional delay cost and the expected refusal wait.
-Equal costs preserve the `instance_types` order.
+If any variant has a current price, equal costs and unpriced variants follow the `instance_types` order, then input order.
+If every variant lacks a current price, the worker preserves input order within each capacity group.
 The worker saves its ranking and price evidence before launch.
 A resumed launch keeps that ranking and its client tokens.
 Capacity refusals select the next variant.
@@ -443,13 +447,13 @@ Missing measurements mean `incomplete`.
 Only the user runs these commands.
 Hana setup does not change the merge-gates stack.
 The setup command needs no active target or slot capacity.
-`enabled=off` remains unchanged.
+`enabled=on` in `hana_aws.conf` enables placement.
 
 1. Build the reviewed image: `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
 2. Run `scripts/aws_target/deploy.py hana-image --image RESULT` to read the local image plan.
 3. Run `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
 4. Run `scripts/aws_target/deploy.py prepare --workload hana`.
-5. Run `scripts/aws_target/deploy.py hana-setup` to read the local resource plan.
+5. Run `scripts/aws_target/deploy.py hana-setup` to read the local resource summary.
 6. Run `scripts/aws_target/deploy.py hana-setup --approve-resources` after resource approval.
 7. Confirm that the command reports a stopped box.
 
@@ -479,7 +483,8 @@ It refuses multiple matching snapshots or a snapshot in state `error` and report
 It uploads a new snapshot only when no snapshot matches.
 A wait failure or registration failure keeps the pending record for the next run.
 
-The local plan makes no AWS call.
+The local resource summary makes no AWS call.
+`hana-setup --plan` uses the read-only plan identity to check root replacement for an existing box.
 Approved setup uses the existing encrypted admin session and progress display.
 It reserves compute and storage costs before requesting resources.
 Setup permission does not enable command permission.
@@ -515,7 +520,7 @@ If setup gives a `/tune` command:
 3. Run `deploy.py hana-setup --approve-resources`.
 
 The image must include the independent Hana guard, watchdog, data mount, and root receiver.
-The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.
+The NixOS build installs the guest files from `hana_render.py`.
 The image must start the guard and receiver on every boot.
 The receiver reads the current user data through IMDSv2 on every boot.
 Normal first-boot user-data execution does not provide this behavior.
