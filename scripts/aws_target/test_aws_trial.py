@@ -42,6 +42,7 @@ from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.boot_identity import boot_identity
 from scripts.lib.process_start import Gone
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
@@ -473,8 +474,6 @@ Path.write_text = fixture_write
 import os, sys
 from pathlib import Path
 command = sys.argv[sys.argv.index('--') + 1:]
-if command == ['true']:
-    raise SystemExit(0)
 unit, = (arg.removeprefix('--unit=') for arg in sys.argv if arg.startswith('--unit='))
 scope = Path({str(scopes)!r}) / unit
 scope.mkdir()
@@ -930,7 +929,6 @@ signal.pause()
                     record = records[0] if operation == 'push' else folder / trial.GIT_RECOVERY
                     saved = cloud_gate.read(record)
                     self.assertEqual(saved['unit'], unit)
-                    self.assertIs(saved['authorized'], True)
                     self.assertEqual(Path(record.with_suffix('.cgroup').read_text().strip()).name, unit)
                     owner = ledger.instant(saved, 'owner')
                     owner_exit = os.pidfd_open(owner)
@@ -969,12 +967,13 @@ signal.pause()
 
     def test_git_recovery_stops_only_the_published_scope(self) -> None:
         path = self.root / trial.GIT_RECOVERY
-        scope = Path('/sys/fs/cgroup/fixture/builds.slice/cloud-trial-git-test.scope')
+        unit = 'cloud-trial-git-' + 'a' * 32 + '.scope'
+        scope = Path('/sys/fs/cgroup/fixture/builds.slice') / unit
         owner = Owner(101, 'original')
         cloud_gate.save(path, {'boot': 'fixture', 'owner': owner.pid, 'owner_start': owner.start_time,
-                               'unit': scope.name})
+                               'unit': unit, 'deadline': 60.0})
         published = queue_place.ProgramStart(owner, Owner(102, 'original'), str(scope))
-        with (mock.patch.object(trial, 'git_boot_identity', return_value='fixture'),
+        with (mock.patch.object(trial, 'boot_identity', return_value='fixture'),
               mock.patch.object(trial, 'process_start', return_value=Gone()) as identity,
               mock.patch.object(queue_place, 'read_program_start', return_value=published) as read_start,
               mock.patch.object(queue_place, 'stop_scope') as stop,
@@ -996,7 +995,6 @@ from pathlib import Path
 record = Path(sys.argv[1])
 saved = json.loads(record.read_text())
 published = json.loads(record.with_suffix('.scope.json').read_text())
-assert saved['authorized'] is True
 assert saved['unit'] == os.environ['FIXTURE_GIT_SCOPE']
 assert published['ready'] is True
 assert Path(published['scope']).name == saved['unit']
@@ -1025,83 +1023,76 @@ print('Git read the published scope')
                     self.assertFalse(record.exists())
                     self.assertTrue(observed.is_file())
 
-    @unittest.skipUnless(sys.platform == 'linux', 'The probe supervisor adopts Linux children')
-    def test_term_stops_the_scope_probe_and_its_supervisor(self) -> None:
-        record = self.root / trial.GIT_RECOVERY
-        stop_seconds = 0.5
-        probe_timeout = 60
-        allowed_exit_seconds = 1.5
-        with short_socket_directory() as folder, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as ready:
-            marker = str(Path(folder) / 'probe-ready')
-            ready.bind(marker)
-            systemd_run = self.root / 'systemd-run'
-            _ = systemd_run.write_text(f'''#!{sys.executable}
-import os, signal, socket
-with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as ready:
-    ready.sendto(f'{{os.getpid()}} {{os.getppid()}}'.encode(), {marker!r})
-signal.pause()
-''')
-            systemd_run.chmod(0o700)
-            with ForkChildren() as children, ExitStack() as descriptors:
-                def supervise() -> int:
-                    _ = trial.supervised_git(['false'], record, time.monotonic() + probe_timeout, stop_seconds)
-                    return 0
-
-                controller = children.start(supervise)
-                self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
-                probe, worker = map(int, ready.recv(128).split())
-                supervisor = int(Path(f'/proc/{worker}/stat').read_text().rsplit(')', 1)[1].split()[1])
-                exits = tuple(os.pidfd_open(pid) for pid in (probe, worker, supervisor))
-                for descriptor in exits:
-                    _ = descriptors.callback(os.close, descriptor)
-                try:
-                    saved = cloud_gate.read(record)
-                    self.assertIs(saved['authorized'], False)
-                    deadline = time.monotonic() + allowed_exit_seconds
-                    self.assertGreater(float(str(saved['deadline'])) - stop_seconds, deadline)
-                    os.kill(controller.pid, signal.SIGTERM)
-                    for descriptor in exits:
-                        self.assertTrue(select.select([descriptor], [], [], max(0, deadline - time.monotonic()))[0])
-                    self.assertLessEqual(time.monotonic(), deadline)
-                    self.assertEqual(controller.result(timeout=max(0, deadline - time.monotonic())).returncode,
-                                     -signal.SIGTERM)
-                    self.assertFalse(record.exists())
-                finally:
-                    for descriptor in exits[:2]:
-                        try:
-                            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-
-    def test_git_recovery_clears_an_unauthorized_record_without_a_unit(self) -> None:
+    def test_git_recovery_keeps_records_without_a_valid_unit(self) -> None:
         path = self.root / trial.GIT_RECOVERY
-        for unit in ({}, {'unit': ''}):
-            cloud_gate.save(path, {'boot': trial.git_boot_identity(), 'owner': 101,
-                                   'owner_start': 'original', 'authorized': False, **unit})
-            with (mock.patch.object(trial, 'process_start', return_value=Gone()),
-                  mock.patch.object(trial, 'bounded_systemctl') as command,
-                  mock.patch.object(queue_place, 'stop_scope') as stop):
-                trial.recover_git(path, 1, 0.05)
-            command.assert_not_called()
-            stop.assert_not_called()
-            self.assertFalse(path.exists())
+        for unit in ({}, {'unit': ''}, {'unit': 5}, {'unit': 'unrelated.scope'}):
+            with self.subTest(unit=unit):
+                row: dict[str, object] = {'boot': 'earlier-boot', 'owner': 101, 'owner_start': 'original',
+                                          'deadline': 60.0, **unit}
+                cloud_gate.save(path, row)
+                with (mock.patch.object(trial, 'boot_identity') as boot,
+                      mock.patch.object(trial, 'bounded_systemctl') as command,
+                      mock.patch.object(queue_place, 'stop_scope') as stop,
+                      self.assertRaisesRegex(GateRefused, 'UNRESOLVED: invalid Git recovery record')):
+                    trial.recover_git(path, 1, 0.05)
+                boot.assert_not_called()
+                command.assert_not_called()
+                stop.assert_not_called()
+                self.assertEqual(cloud_gate.read(path), row)
 
-    def test_no_scope_leaves_a_record_and_refuses_the_trial(self) -> None:
+    @unittest.skipUnless(sys.platform == 'linux', 'The trial controller uses Linux scopes')
+    def test_scope_launch_refusal_uses_the_saved_unit_and_clears_after_absence(self) -> None:
+        record = self.root / trial.GIT_RECOVERY
+        launches = self.root / 'scope-launches'
         systemd_run = self.root / 'systemd-run'
-        _ = systemd_run.write_text('#!/bin/sh\nexit 1\n')
-        branches = self.remote_branches()
-        with (mock.patch.object(trial, 'paired_service') as paired,
-              redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
-            self.assertEqual(self.invoke_trial(), 1)
-        paired.assert_not_called()
-        self.assertEqual(self.remote_branches(), branches)
-        record, = (self.state / 'paired-trials').glob(f'*/{trial.GIT_RECOVERY}')
-        self.assertIs(cloud_gate.read(record)['authorized'], False)
-        self.assertIn('UNRESOLVED:', errors.getvalue())
-        self.assertEqual(json.loads(output.getvalue()),
-                         {'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': False})
+        _ = systemd_run.write_text(f'''#!{sys.executable}
+import json, sys
+from pathlib import Path
+with Path({str(launches)!r}).open('a') as trace:
+    trace.write(json.dumps(sys.argv[1:]) + '\\n')
+saved = json.loads(Path({str(record)!r}).read_text())
+assert '--unit=' + saved['unit'] in sys.argv
+assert '--scope-start' in sys.argv
+assert 'authorized' not in saved
+raise SystemExit(17)
+''')
+        systemctl = self.root / 'systemctl'
+        _ = systemctl.write_text(f'''#!{sys.executable}
+import json, sys
+from pathlib import Path
+saved = json.loads(Path({str(record)!r}).read_text())
+assert sys.argv[-1] == saved['unit']
+assert sys.argv[1:3] == ['--user', 'show']
+print('LoadState=not-found\\nActiveState=inactive\\nControlGroup=\\nJob=0')
+raise SystemExit(1)
+''')
+        systemctl.chmod(0o700)
 
-    def test_scope_absence_probe_does_not_wait_for_a_stuck_child(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError) as refused:
+            _ = trial.supervised_git(['false'], record, time.monotonic() + 60, 5)
+        self.assertEqual(refused.exception.returncode, 17)
+        self.assertEqual(len(launches.read_text().splitlines()), 1)
+        self.assertFalse(record.exists())
+
+    def test_git_recovery_stops_an_unpublished_scope_by_unit(self) -> None:
+        path = self.root / trial.GIT_RECOVERY
+        unit = 'cloud-trial-git-' + 'b' * 32 + '.scope'
+        group = '/fixture/builds.slice/' + unit
+        cloud_gate.save(path, {'boot': 'fixture', 'owner': 101, 'owner_start': 'original',
+                               'unit': unit, 'deadline': 60.0})
+        reply = 0, f'LoadState=loaded\nActiveState=active\nControlGroup={group}\nJob=0\n'
+        with (mock.patch.object(trial, 'boot_identity', return_value='fixture'),
+              mock.patch.object(trial, 'process_start', return_value=Gone()),
+              mock.patch.object(trial, 'bounded_systemctl', return_value=reply) as show,
+              mock.patch.object(queue_place, 'stop_scope') as stop,
+              mock.patch.object(time, 'monotonic', return_value=100)):
+            trial.recover_git(path, 1, 0.05)
+        show.assert_called_once_with(
+            ['show', '--all', '--property=LoadState,ActiveState,ControlGroup,Job', '--', unit], 101)
+        stop.assert_called_once_with(Path('/sys/fs/cgroup' + group), 101, 0.05)
+        self.assertFalse(path.exists())
+
+    def test_scope_query_does_not_wait_for_a_stuck_child(self) -> None:
         clock = 100.0
         killed: list[float] = []
 
@@ -1119,7 +1110,8 @@ signal.pause()
         with (mock.patch.object(time, 'monotonic', side_effect=lambda: clock),
               mock.patch.object(time, 'sleep', side_effect=pause),
               mock.patch.object(subprocess, 'Popen', return_value=StuckChild())):
-            self.assertFalse(trial.git_scope_absent('fixture.scope', 100.2))
+            with self.assertRaisesRegex(GateRefused, 'UNRESOLVED: cannot determine'):
+                _ = trial.query_git_scope('fixture.scope', 100.2)
         self.assertEqual(len(killed), 1)
         self.assertLess(killed[0], 100.2)
         self.assertEqual(clock, 100.2)
@@ -1127,7 +1119,7 @@ signal.pause()
     def test_direct_coordinator_reports_a_kept_git_record(self) -> None:
         folder = self.state / 'paired-trials' / 'failed'
         folder.mkdir(parents=True)
-        cloud_gate.save(folder / trial.GIT_RECOVERY, {'authorized': False})
+        cloud_gate.save(folder / trial.GIT_RECOVERY, {})
         current = folder.parent / 'current'
         current.mkdir()
         with (mock.patch.object(trial, 'sweep_trial_resources'),
@@ -1139,19 +1131,20 @@ signal.pause()
         summary = ledger.mapping(cast(object, json.loads(output.getvalue())))
         self.assertIs(summary['cleanup_complete'], False)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'The trial controller uses Linux scopes')
     def test_git_recovery_uses_scope_absence_and_allows_an_unrelated_trial(self) -> None:
-        boot = trial.git_boot_identity()
+        boot = boot_identity()
         trials = self.state / 'paired-trials'
         absent = trials / 'absent' / trial.GIT_RECOVERY
         unknown = trials / 'unknown' / trial.GIT_RECOVERY
-        for path in (absent, unknown):
+        for digit, path in (('a', absent), ('b', unknown)):
             path.parent.mkdir(parents=True)
             cloud_gate.save(path, {'boot': boot, 'owner': os.getpid(), 'owner_start': 'old',
-                'unit': f'cloud-trial-git-{path.parent.name}.scope', 'authorized': False})
+                'unit': 'cloud-trial-git-' + digit * 32 + '.scope', 'deadline': 60.0})
         systemctl = self.root / 'systemctl'
         _ = systemctl.write_text(r'''#!/bin/sh
 case "$*" in
-    *cloud-trial-git-absent.scope) printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=0\n' ;;
+    *cloud-trial-git-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope) printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=0\n' ;;
 esac
 exit 1
 ''')
@@ -1175,10 +1168,30 @@ exit 1
 
     def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
         for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):
-            with self.subTest(modules=modules), self.assertRaises((ValueError, subprocess.SubprocessError)):
+            with self.subTest(modules=modules), self.assertRaises((ValueError, GateRefused)):
                 _ = self.request(modules)
         with self.assertRaises(ValueError):
             _ = self.request(rounds=0)
+
+    def test_partial_clone_refuses_a_missing_module_without_fetching(self) -> None:
+        name = 'scripts/fixture/test_sample.py'
+        oid = trial.checked_git(self.repo, 'rev-parse', 'HEAD:' + name)
+        relative = Path('objects') / oid[:2] / oid[2:]
+        missing = self.repo / '.git' / relative
+        self.assertTrue((self.origin / relative).is_file())
+        missing.unlink()
+        _ = trial.checked_git(self.repo, 'config', 'core.repositoryformatversion', '1')
+        _ = trial.checked_git(self.repo, 'config', 'extensions.partialClone', 'origin')
+        _ = trial.checked_git(self.repo, 'config', 'remote.origin.url', str(self.origin))
+        _ = trial.checked_git(self.repo, 'config', 'remote.origin.promisor', 'true')
+        trace = self.root / 'git-trace'
+        with (mock.patch.dict(os.environ, {'GIT_NO_LAZY_FETCH': '0', 'GIT_TRACE': str(trace)}),
+              self.assertRaisesRegex(GateRefused, 'Local Git failed')):
+            _ = self.request()
+        calls = trace.read_text()
+        self.assertIn('built-in: git cat-file -t', calls)
+        self.assertNotIn(' fetch ', calls)
+        self.assertFalse(missing.exists())
 
     def test_paired_median_uses_pairs_and_keeps_partial_failures(self) -> None:
         runs = [self.sample(variant, number, cpu) for number, pair in enumerate(((1, 0), (10, 9), (100, 2)), 1)

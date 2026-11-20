@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from datetime import UTC, datetime
 import json
+from math import isfinite
 import multiprocessing
 import os
 import re
@@ -40,7 +41,6 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.lib.boot_identity import boot_identity
-from scripts.lib.descendants import adopt_descendants
 from scripts.lib.file_lock import LockResult, exclusive
 from scripts.build_queue import queue_place
 from scripts.build_queue.admission_jobs import StepJob
@@ -49,7 +49,6 @@ from scripts.lib.time_limit import TIMED_OUT
 from scripts.build_queue.admission_records import process_start_time
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.build_targets import target_config
-from scripts.lint.memory_admit import process_table
 from scripts.production.gate_modules import GateRefused
 
 
@@ -97,7 +96,14 @@ def checked_git(repo: Path, *arguments: str, recovery: Path | None = None) -> st
         if recovery is None:
             raise ValueError('Network Git requires a recovery record')
         return network_git(repo, *arguments, recovery=recovery)
-    return subprocess.check_output(['git', '-C', str(repo), *arguments], text=True, stderr=subprocess.PIPE).strip()
+    command = ['git', '-C', str(repo), *arguments]
+    try:
+        return subprocess.check_output(command, text=True, stderr=subprocess.PIPE,
+                                       env={**os.environ, 'GIT_NO_LAZY_FETCH': '1'}).strip()
+    except subprocess.CalledProcessError as error:
+        error_text = cast(object, error.stderr)
+        detail = error_text.strip() if isinstance(error_text, str) else str(error)
+        raise GateRefused(f'Local Git failed in {repo}: {detail}') from error
 
 
 GIT_RECOVERY = 'git-recovery.json'
@@ -168,22 +174,29 @@ def supervised_git(command: Sequence[str], recovery: Path, deadline: float, stop
     return result.strip()
 
 
-def git_boot_identity() -> str:
-    return boot_identity() if sys.platform == 'linux' else ''
+@dataclass(frozen=True)
+class GitRecovery:
+    boot: str
+    owner: int
+    owner_start: str
+    unit: str
+    deadline: float
 
-
-def stop_git_scope(path: Path, unit: str, deadline: float, sample_seconds: float) -> bool:
-    published = queue_place.read_program_start(path.with_suffix('.scope.json'))
-    if published is None:
-        return False
-    scope = Path(published.scope)
-    if scope.name != unit or '..' in scope.parts or not scope.is_relative_to('/sys/fs/cgroup'):
-        raise GateRefused(f'UNRESOLVED: cannot verify the Git scope in {path}')
-    try:
-        queue_place.stop_scope(scope, deadline, sample_seconds)
-    except queue_place.CleanupUnresolved as error:
-        raise GateRefused(str(error)) from error
-    return True
+    @classmethod
+    def read(cls, path: Path) -> GitRecovery:
+        try:
+            record = cloud_gate.read(path)
+            unit = ledger.text(record, 'unit')
+            owner = ledger.instant(record, 'owner')
+            deadline = record.get('deadline')
+            if (record.keys() != cls.__dataclass_fields__.keys()
+                    or not re.fullmatch(r'cloud-trial-git-[0-9a-f]{32}\.scope', unit)
+                    or not 0 < owner < 2 ** 31 or type(deadline) is not float
+                    or not isfinite(deadline) or deadline <= 0):
+                raise ValueError('invalid Git recovery fields')
+            return cls(ledger.text(record, 'boot'), owner, ledger.text(record, 'owner_start'), unit, deadline)
+        except (ValueError, RecursionError) as error:
+            raise GateRefused(f'UNRESOLVED: invalid Git recovery record {path}: {error}') from error
 
 
 def clear_git_record(path: Path) -> None:
@@ -213,19 +226,42 @@ def bounded_systemctl(arguments: Sequence[str], deadline: float) -> tuple[int, s
                 _ = poll_child(child, deadline)
 
 
-def git_scope_absent(unit: str, deadline: float) -> bool:
+def query_git_scope(unit: str, deadline: float) -> Path | None:
+    """Return the unit's cgroup or confirm that the unit is absent."""
     try:
         result = bounded_systemctl(['show', '--all',
                                     '--property=LoadState,ActiveState,ControlGroup,Job', '--', unit], deadline)
-    except (OSError, UnicodeError):
-        return False
-    if result is None:
-        return False
-    status, output = result
-    fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
-    return (status in (0, 1) and fields.get('LoadState') == 'not-found'
-            and fields.get('ActiveState') == 'inactive' and fields.get('ControlGroup') == ''
-            and fields.get('Job') in ('', '0'))
+    except (OSError, UnicodeError) as error:
+        raise GateRefused(f'UNRESOLVED: cannot read Git scope {unit}: {error}') from error
+    if result is not None:
+        status, output = result
+        fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        group = fields.get('ControlGroup', '')
+        if status == 0 and fields.get('LoadState') == 'loaded' and group.startswith('/'):
+            return Path('/sys/fs/cgroup') / group.lstrip('/')
+        if (status in (0, 1) and fields.get('LoadState') == 'not-found'
+                and fields.get('ActiveState') == 'inactive' and fields.get('ControlGroup') == ''
+                and fields.get('Job') in ('', '0')):
+            return None
+    raise GateRefused(f'UNRESOLVED: cannot determine the state of Git scope {unit}')
+
+
+def stop_git_scope(path: Path, record: GitRecovery, deadline: float, sample_seconds: float) -> None:
+    published = queue_place.read_program_start(path.with_suffix('.scope.json'))
+    if published is None:
+        scope = query_git_scope(record.unit, deadline)
+        if scope is None:
+            return
+    else:
+        if (published.holder.pid, published.holder.start_time) != (record.owner, record.owner_start):
+            raise GateRefused(f'UNRESOLVED: Git scope holder does not match {path}')
+        scope = Path(published.scope)
+    if scope.name != record.unit or '..' in scope.parts or not scope.is_relative_to('/sys/fs/cgroup'):
+        raise GateRefused(f'UNRESOLVED: cannot verify the Git scope in {path}')
+    try:
+        queue_place.stop_scope(scope, deadline, sample_seconds)
+    except queue_place.CleanupUnresolved as error:
+        raise GateRefused(str(error)) from error
 
 
 def recover_git(path: Path, stop_seconds: float, sample_seconds: float) -> None:
@@ -234,71 +270,17 @@ def recover_git(path: Path, stop_seconds: float, sample_seconds: float) -> None:
         if lock is LockResult.BUSY:
             return
         try:
-            record = cloud_gate.read(path)
+            record = GitRecovery.read(path)
         except FileNotFoundError:
             return
-        if record.get('boot') == git_boot_identity():
-            owner = process_start(ledger.instant(record, 'owner'))
+        if record.boot == boot_identity():
+            owner = process_start(record.owner)
             if isinstance(owner, Unreadable):
                 raise GateRefused(f'UNRESOLVED: cannot verify the Git supervisor in {path}')
-            if isinstance(owner, Started) and owner.start == ledger.text(record, 'owner_start'):
+            if isinstance(owner, Started) and owner.start == record.owner_start:
                 return
-            unit = record.get('unit', '')
-            if not isinstance(unit, str):
-                raise GateRefused(f'UNRESOLVED: invalid Git scope in {path}')
-            if unit:
-                deadline = time.monotonic() + stop_seconds
-                if not stop_git_scope(path, unit, deadline, sample_seconds) and not (
-                        record.get('authorized') is False and git_scope_absent(unit, deadline)):
-                    raise GateRefused(f'UNRESOLVED: no published Git scope for {path}')
+            stop_git_scope(path, record, time.monotonic() + stop_seconds, sample_seconds)
         clear_git_record(path)
-
-
-def finish_scope_probe(deadline: float) -> None:
-    """Stop and reap the probe and its adopted children."""
-    # The supervisor starts no Git process until this function returns.
-    while True:
-        try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if pid:
-            continue
-        for child, member in process_table().items():
-            if member.parent == os.getpid():
-                with suppress(ProcessLookupError):
-                    os.kill(child, signal.SIGKILL)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GateRefused('UNRESOLVED: the Git scope probe did not stop')
-        time.sleep(min(0.005, remaining))
-
-
-def probe_git_scope(lifeline: int, run_deadline: float, deadline: float, stop_seconds: float) -> list[str] | None:
-    """Isolate the queue probe and watch the controller pipe."""
-    if not adopt_descendants():
-        return []
-    with ExitStack() as resources:
-        reader, writer = os.pipe()
-        _ = resources.callback(os.close, reader)
-        with os.fdopen(writer, 'w') as output:
-            if os.fork() == 0:
-                try:
-                    os.close(reader)
-                    with redirect_stdout(sys.stderr):
-                        prefix = queue_place.probe_scope_prefix()
-                    json.dump(prefix, output)
-                    output.flush()
-                finally:
-                    os._exit(0)
-        try:
-            ready, _, _ = select.select([lifeline, reader], [], [], max(0, run_deadline - time.monotonic()))
-            if lifeline in ready:
-                return None
-            data = os.read(reader, 4096) if reader in ready else b''
-            return cast(list[str], json.loads(data)) if data else []
-        finally:
-            finish_scope_probe(min(deadline, time.monotonic() + stop_seconds))
 
 
 def supervise_git(lifeline: int, path: Path, deadline: float, stop_seconds: float, cwd: Path,
@@ -314,28 +296,17 @@ def supervise_git(lifeline: int, path: Path, deadline: float, stop_seconds: floa
         owner = process_start(os.getpid())
         if not isinstance(owner, Started):
             raise GateRefused('UNRESOLVED: Git supervisor has no process identity')
-        unit = f'cloud-trial-git-{uuid4().hex}.scope'
-        record: dict[str, object] = {'boot': git_boot_identity(), 'owner': os.getpid(), 'owner_start': owner.start,
-                                     'unit': unit, 'deadline': deadline, 'authorized': False}
-        cloud_gate.save(path, record)
-        # Reserve time for cleanup within the same deadline.
-        now = time.monotonic()
-        run_deadline = deadline - min(stop_seconds, max(0, deadline - now) / 2)
-        prefix = probe_git_scope(lifeline, run_deadline, deadline, stop_seconds)
-        if prefix is None or select.select([lifeline], [], [], 0)[0]:
-            clear_git_record(path)
-            return TIMED_OUT
-        if not prefix:
-            raise GateRefused(f'UNRESOLVED: cannot create the Git scope for {path}')
-        if time.monotonic() >= run_deadline:
-            raise GateRefused(f'UNRESOLVED: no time remains to start the Git scope for {path}')
-        return start_scoped_git(lifeline, path, record, unit, deadline, run_deadline, stop_seconds,
-                                sample_seconds, cwd, prefix, command)
+        record = GitRecovery(boot_identity(), os.getpid(), owner.start,
+                             f'cloud-trial-git-{uuid4().hex}.scope', deadline)
+        cloud_gate.save(path, asdict(record))
+        return start_scoped_git(lifeline, path, record, stop_seconds, sample_seconds, cwd, command)
 
 
-def start_scoped_git(lifeline: int, path: Path, record: dict[str, object], unit: str, deadline: float,
-                     run_deadline: float, stop_seconds: float, sample_seconds: float, cwd: Path,
-                     prefix: Sequence[str], command: Sequence[str]) -> int:
+def start_scoped_git(lifeline: int, path: Path, record: GitRecovery, stop_seconds: float,
+                     sample_seconds: float, cwd: Path, command: Sequence[str]) -> int:
+    # Reserve time for cleanup within the same deadline.
+    remaining = max(0, record.deadline - time.monotonic())
+    run_deadline = record.deadline - min(stop_seconds, remaining / 2)
     child: subprocess.Popen[bytes] | None = None
     status = None
     try:
@@ -344,28 +315,27 @@ def start_scoped_git(lifeline: int, path: Path, record: dict[str, object], unit:
             _ = barrier.callback(os.close, reader)
             _ = barrier.callback(os.close, writer)
             wrapper = Path(queue_place.__file__).resolve()
-            argv = [*prefix[:-1], '--unit=' + unit, prefix[-1], sys.executable, str(wrapper),
-                    '--scope-start', str(path.with_suffix('.cgroup')), str(os.getpid()),
-                    ledger.text(record, 'owner_start'), str(path.with_suffix('.scope.json')), str(reader),
+            argv = ['systemd-run', '--user', '--scope', '--quiet', '--collect',
+                    '--expand-environment=no', '--slice=builds.slice', '--unit=' + record.unit, '--',
+                    sys.executable, str(wrapper), '--scope-start', str(path.with_suffix('.cgroup')),
+                    str(record.owner), record.owner_start, str(path.with_suffix('.scope.json')), str(reader),
                     str(max(0, run_deadline - time.monotonic())), *command]
             child = subprocess.Popen(argv, cwd=cwd, pass_fds=(reader,), stdin=subprocess.DEVNULL)
             if time.monotonic() < run_deadline and not select.select([lifeline], [], [], 0)[0]:
-                record['authorized'] = True
-                cloud_gate.save(path, record)
-                _ = os.write(writer, b'1')
+                with suppress(BrokenPipeError):
+                    _ = os.write(writer, b'1')
         status = poll_child(child, run_deadline, lifeline)
     finally:
-        if child is not None:
-            stop_deadline = min(deadline, time.monotonic() + stop_seconds)
-            stopped = stop_git_scope(path, unit, stop_deadline, sample_seconds)
-            if status is None and not stopped:
-                child.kill()
+        stop_deadline = min(record.deadline, time.monotonic() + stop_seconds)
+        if child is not None and status is None and not path.with_suffix('.scope.json').exists():
+            # The launcher can still create the scope until it exits.
+            child.kill()
             if poll_child(child, stop_deadline) is None:
                 raise GateRefused(f'UNRESOLVED: Git scope launcher did not exit for {path}')
-            # The launcher can publish its scope while it receives the stop.
-            if not stopped and not stop_git_scope(path, unit, stop_deadline, sample_seconds):
-                raise GateRefused(f'UNRESOLVED: no published Git scope for {path}')
-            clear_git_record(path)
+        stop_git_scope(path, record, stop_deadline, sample_seconds)
+        if child is not None and status is None and poll_child(child, stop_deadline) is None:
+            raise GateRefused(f'UNRESOLVED: Git scope launcher did not exit for {path}')
+        clear_git_record(path)
     return status if status is not None else TIMED_OUT
 
 
