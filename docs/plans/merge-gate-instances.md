@@ -789,6 +789,9 @@ The route requests no local memory for a cloud gate.
 
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call appends its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Launch, refusal, fallback, and finish rows record the queue's tagged job record in `gate_job`.
+The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
+Older rows can omit the field.
 Capacity refusals first try the remaining zones and sizes.
 Every cloud setup or infrastructure failure permits local fallback.
 Only a real remote test failure remains red.

@@ -326,7 +326,7 @@ The installed account file supplies these settings:
 - Limits: `daily_limit_usd`, `monthly_limit_usd`, `limit_reserve_usd`, `limit_action`, and `accounting_zone`.
 - Estimates: `fallback_usd_per_hour`, `fixed_usd_per_month`, `retained_storage_usd_per_month`, `root_storage_usd_per_month`, and `ipv4_usd_per_month`.
 - Other estimates: `gp3_iops_usd_per_month`, `gp3_throughput_usd_per_month`, `instance_type`, `spot_max_usd_per_hour`, and `box_minimum_seconds`.
-- Evidence: `price_refresh_seconds`, `price_max_age_seconds`, `observation_max_age_seconds`, `cost_explorer_interval_seconds`, `cost_explorer_lookback_days`, and `cost_explorer_read_usd`.
+- Evidence: `price_refresh_seconds`, `price_max_age_seconds`, `observation_max_age_seconds`, `cost_explorer_interval_seconds`, `cost_explorer_lookback_days`, `cost_explorer_watch_days`, and `cost_explorer_read_usd`.
 - Notices: `notification_recipient`, `notification_timeout_s`, and `notification_retry_s`.
 - AWS access and tags: `credentials_profile`, `region`, `cost_explorer_tag_key`, and `cost_explorer_tag_value`.
 
@@ -360,9 +360,15 @@ Cloud gates still read account charges and enforce the spending caps.
 Gaps past this age incur running costs at the fallback price.
 Stale latest evidence refuses admission.
 `cost_explorer_interval_seconds=86400` schedules account billing reads.
-`cost_explorer_lookback_days=7` refreshes the last seven completed UTC days.
-This window captures delayed charges and later changes from AWS.
+`cost_explorer_watch_days=45` sets how many completed UTC days each scheduled billing read requests.
+`cost_explorer_lookback_days=7` sets how long the guard requires equal counted reads for a completed UTC day.
+The watch must cover at least the lookback.
 `cost_explorer_read_usd=0.01` prices each API page.
+The reader makes one scheduled query each day.
+AWS charges USD 0.01 for each page of the answer.
+The 45-day answer can take more than one page.
+The ledger records the actual fee for each read.
+`cost_explorer_change_recipient=bob` names the session that receives notices of changes to settled amounts.
 
 Both the controller and the gate worker use one Cost Explorer reader.
 It requests daily `UnblendedCost` and `UsageQuantity` for the account, grouped by `USAGE_TYPE`, and reads every page.
@@ -371,10 +377,15 @@ It uses no tag filter and needs no tag activation or deployment change.
 `cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
 The reader saves each day's account total, usage costs, usage quantities, units, provisional flag, and read time in `charges/<day>.json`.
 The saved `excludes_credits` mark identifies usage bills.
-A later scheduled read replaces those values, including zero amounts.
-An old saved format requires an immediate read, regardless of the previous schedule.
+A later scheduled read replaces the newest values, including zero amounts.
+The file keeps earlier read times and amounts.
+An old saved format without the account mark requires an immediate read.
 An empty daily reply is an error for both callers.
-The gate cap uses the account amount for each completed UTC day whose bill rounds to at least one cent.
+The guard and gate cap adjust the total for full UTC days that qualify for the account amount.
+The latest valid amount must be at least USD 0.01 before rounding.
+Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
+Reads less than `cost_explorer_interval_seconds` apart count once.
+Outside the lookback, use the latest valid amount.
 For an unbilled day, each box uses the newest positive billed Spot rate for its instance type.
 The rate equals the type's daily Spot cost divided by its daily Spot hours.
 The newest day for one type can differ from the newest day for another type.

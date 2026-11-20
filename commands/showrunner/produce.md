@@ -128,7 +128,8 @@ The question form for every question to the user is defined by this import:
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
     suggestion, not the user's unsent draft.
-- Send your coordination messages directly to the unit director with SendMessage. Start with the message body.
+- Send coordination messages to the unit director with `send.py`. Start with the message body.
+  See `commands/message.md` for review holds and `--urgent`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
 - **A message from morty is the user's** (user, 2026-11-02).
@@ -171,9 +172,12 @@ The question form for every question to the user is defined by this import:
   have a natural home under an L1".
   - **A child showrunner's branch** is merged only by hand-off. A
     same-repository child with `**Kind:** style` sends
-    `hand-off <checkpoint>`. Correctness-review
-    its diff against the branch point as for a unit checkpoint, then run
-    `merge_checkpoint.py --from-child <style showrunner name> --checkpoint <hash> --production <showrunner name> --started <time>`.
+    `hand-off <checkpoint>`. Check its diff against the branch point as for a unit checkpoint.
+    Start the handoff as a detached run:
+    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --session-dir "<STATE_DIR>"
+    --label "merge handoff <style showrunner name>" -- ~/.claude/scripts/lib/py
+    ~/.claude/scripts/production/merge_checkpoint.py --from-child <style showrunner name>
+    --checkpoint <hash> --production <showrunner name> --started <time>`.
     A locally merged hand-off is pushed before acknowledgment; a duplicate
     already on origin is acknowledged without another merge or push. A root
     uses `--root-self`, receives no acknowledgment and runs ledger `reconcile`
@@ -182,10 +186,9 @@ The question form for every question to the user is defined by this import:
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
     Send every production-wide unit message through `broadcast.py --production <your name> --units`; never use a remembered list.
-  - **The user's words for a production below you** go to your child that
-    holds it, by SendMessage, beginning `From the user (via <your name>): `.
-    That child relays them to its unit or to its own child. One level at a
-    time.
+  - Send the user's words to the child showrunner for that production with `send.py`.
+    Begin with `From the user (via <your name>): `.
+    The child showrunner relays the words to its unit or its child showrunner.
   - **An item for the user**, when you are not the root, is asked in your own
     reply as always and set in your own `open_for_user`: your own count and
     `/next` show it. Do not send it to the root, which shows only its own
@@ -491,7 +494,7 @@ once and passes 150K again within 12-20 minutes.)
 ---
 
 <Direct>
-Turns come from unit directors' messages and the user. Handle each message:
+Turns come from unit directors' messages and the user. Read held messages when an adhoc review ends. Handle each message:
 
 | Arrival | Action |
 | --- | --- |
@@ -570,15 +573,18 @@ notice to the unit director before any merge command runs:
 4. **Run the checkpoint.** Name the production whose repo holds the checkpoint as the destination.
    Give the order to a merge unit that serves the destination under `commands/unit/merge.md`.
    Use a merge unit under the destination's showrunner or one of its ancestors.
-   Without a merge unit, run this command in the background:
-   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
+   Without a merge unit, start a detached run:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --session-dir "<STATE_DIR>"
+   --label "merge <unit> phase <phase>" -- ~/.claude/scripts/lib/py
+   ~/.claude/scripts/production/merge_checkpoint.py --production
    <destination production> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
    --delivers "<one line of what the phase delivers>"`.
    Group pending notices by destination production.
    Use one batch file per destination. Keep its notices in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
-   Run `merge_checkpoint.py --production <destination production> --batch <file>` through the same Python launcher.
+   Use the same detached start for `merge_checkpoint.py --production <destination production> --batch <file>`.
+   Stop a detached merge with `detached_runs.py stop --reason "<why>" <record>`.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
