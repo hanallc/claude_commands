@@ -52,6 +52,8 @@ class PlacementFixture(AdmissionFixture):
     def __init__(self, *, fixture_defaults_only: bool = False) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         super().__init__(fixture_defaults_only=fixture_defaults_only)
+        if fixture_defaults_only:
+            _ = (self.root / "mac_test.conf").write_text("# range: 0.01..300\nprobe_timeout_s=5\n")
 
     @override
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -1713,10 +1715,10 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertNotEqual(fixture.server.host_evidence_key(request, destination), before)
             starting = placement.TemporaryExclusion("starting")
             fixture.server.placement_eligibility[request.episode] = (placement.CandidateEligibility(destination, starting),)
-            reply_to = cast(Callable[[wire.PlacementRequest, placement.ResourceHolder], wire.Reply],
-                            getattr(fixture.server, "_placement_reply"))
+            reply_to = cast(Callable[[wire.PlacementRequest, placement.PlacementConstraints,
+                                      placement.ResourceHolder], wire.Reply], getattr(fixture.server, "_placement_reply"))
 
-            reply = reply_to(request, placement.ResourceHolderUnknown())
+            reply = reply_to(request, request.constraints, placement.ResourceHolderUnknown())
 
             assert isinstance(reply, wire.PlacementWait)
             self.assertEqual([(notice.target, notice.reason) for notice in reply.retry_notices], [("fixture", "starting")])
