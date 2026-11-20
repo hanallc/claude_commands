@@ -204,6 +204,8 @@ class CostFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.state.mkdir()
         install_cost_settings(self.settings)
+        # The cost fixtures use one day unless a test needs a longer query.
+        self.replace('cost_explorer_watch_days', '1')
         write_gate_config(self.root / 'cloud_gate.conf')
         _ = write_hana_config(self.root / 'hana_aws.conf')
         environment = config_environment(self.root)

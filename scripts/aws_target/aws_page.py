@@ -93,6 +93,7 @@ class PageData(TypedDict):
     read_at: int
     render_seconds: float
     spend: SpendData
+    settled_notes: list[str]
     # Every region a table shows, for the region filter.
     regions: list[str]
     snapshot: list[SnapshotLine]
@@ -206,7 +207,8 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
 
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
-              placement_readings: Sequence[ledger.SpotPlacementReading] = ()) -> PageData:
+              placement_readings: Sequence[ledger.SpotPlacementReading] = (),
+              *, settled_notes: Sequence[str] = ()) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
@@ -214,6 +216,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         'read_at': now,
         'render_seconds': 0.0,
         'spend': spend,
+        'settled_notes': list(settled_notes),
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
         'prices': [table_rows_data(table) for table in tables.prices],
@@ -250,6 +253,24 @@ def quota_help() -> str:
     return '<ol>' + ''.join(steps) + '</ol>' + notes
 
 
+def settled_amount_notes(watched: Sequence[ledger.WatchedChargeDay]) -> tuple[str, ...]:
+    unchanged = 0
+    changes: list[str] = []
+    for day in watched:
+        settlement = day.settlement
+        if isinstance(settlement, ledger.SettledChargeUnchanged):
+            unchanged += 1
+        elif isinstance(settlement, ledger.SettledChargeChanged):
+            changes.append(settlement.display_line(day.day))
+    settled = unchanged + len(changes)
+    if not settled:
+        return ()
+    checked = datetime.fromtimestamp(max(day.checked_at for day in watched), UTC)
+    summary = (f'Settled AWS amounts: {unchanged} of {settled} did not change after they settled '
+               + f'(checked {checked:%b} {checked.day}).')
+    return (summary, *changes)
+
+
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     started = time.perf_counter()
@@ -258,11 +279,16 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
     spend = spend_data(read, now, configuration.whole('spend_pace_days'))
     try:
+        watched = ledger.CostLedger(directory).read_charge_watch(aws_config.read_settings(configuration), now)
+    except (OSError, ValueError):
+        watched = ()
+    try:
         placement = ledger.read_spot_placement_scores(directory)
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now, placement)
+    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now, placement,
+                     settled_notes=settled_amount_notes(watched))
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
     data['render_seconds'] = time.perf_counter() - started

@@ -1,6 +1,7 @@
 """Check the published AWS table and quota case instructions."""
 
 from dataclasses import replace
+from decimal import Decimal
 from html import unescape
 import json
 from pathlib import Path
@@ -38,6 +39,48 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
               mock.patch.object(console_help, 'PASSKEY_NOTE', 'Unlock the test manager.')):
             self.assertEqual(aws_page.quota_help(), '<ol><li>Open the test console.</li></ol>'
                              + '\n<p>Choose the test account.</p>\n<p>Unlock the test manager.</p>')
+
+
+class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
+    def test_spend_shows_the_settled_summary_and_changed_amounts(self) -> None:
+        self.text_setting('accounting_zone', 'America/Los_Angeles')
+        checked = ledger_test_support.instant('2026-11-19T00:15:00Z')
+        start = ledger_test_support.instant('2026-11-04T00:00:00Z')
+        end = start + 9 * 86400
+        charges = self.state / 'charges'
+        charges.mkdir()
+        settled = Decimal('7.73')
+        unsettled = ledger.ChargeRead('2026-11-13', checked, end, end + 86400, settled, Decimal(0), Decimal(0))
+        _ = (charges / '2026-11-13.json').write_text(json.dumps(ledger.charge_record(unsettled)))
+
+        def settled_notes() -> list[str]:
+            page = aws_page.publish(self.state, checked, self.root / 'page', settings_path=self.settings)
+            payload = page.read_text().split('<script id="aws-prices-data" type="application/json">', 1)[1]
+            data = cast(aws_page.PageData, json.loads(payload.split('</script>', 1)[0]))
+            return data['settled_notes']
+
+        self.assertEqual(settled_notes(), [])
+        reads = ledger_test_support.charge_readings(start, end, settled, Decimal(0))
+        for bill in reads:
+            record = ledger.charge_record(replace(bill, at=checked - 86400))
+            record['amount_reads'] = [
+                {'at': checked - 2 * 86400, 'actual_usd': '7.73'},
+                {'at': checked - 86400, 'actual_usd': '7.73'},
+            ]
+            _ = (charges / (bill.day + '.json')).write_text(json.dumps(record))
+        self.assertEqual(settled_notes(), [
+            'Settled AWS amounts: 9 of 9 did not change after they settled (checked Nov 19).',
+        ])
+
+        path = charges / '2026-11-12.json'
+        changed = ledger.mapping(cast(object, json.loads(path.read_text())))
+        changed.update(at=checked, actual_usd='7.81')
+        changed['amount_reads'] = [*ledger.rows(changed, 'amount_reads'), {'at': checked, 'actual_usd': '7.81'}]
+        _ = path.write_text(json.dumps(changed))
+        self.assertEqual(settled_notes(), [
+            'Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).',
+            '2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08).',
+        ])
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
@@ -163,11 +206,20 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
     check(innerWidth === 760 && scroller().scrollWidth > scroller().clientWidth, "Narrow scroll container");
     scroller().scrollLeft = 150;
     check(scroller().scrollLeft === 150, "Set scroll position before refresh");
-    const refreshed = JSON.stringify({...data, render_seconds: 12});
+    const settled = document.getElementById("settled-notes");
+    check(settled.children.length === 0, "No settled notes on the first render");
+    const notes = ["Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).",
+                   "2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08)."];
+    let refreshed = JSON.stringify({...data, render_seconds: 12, settled_notes: notes});
     window.fetch = async () => ({ok: true, text: async () =>
       `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"});
     const status = await loadAws();
     check(status.renderSeconds === 12 && scroller().scrollLeft === 150, "Refresh keeps scroll position");
+    check(settled.innerHTML === notes.map(note => '<p class="note">' + note + '</p>').join(""),
+          "Refresh renders the settled notes in Spend");
+    refreshed = JSON.stringify({...data, settled_notes: []});
+    await loadAws();
+    check(settled.children.length === 0, "Refresh removes obsolete settled notes");
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
           && params().get("runs") === "targeted-test", "Refresh keeps the filter URL");
     const pressed = id => [...document.querySelectorAll(`#${id} [aria-pressed='true']`)].map(chip => chip.textContent).join(",");

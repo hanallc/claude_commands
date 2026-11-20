@@ -19,7 +19,7 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import aws_trial, config, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant
+from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 
@@ -955,6 +955,7 @@ class LedgerTests(CostFixture):
 
     def test_bill_counts_when_its_day_leaves_the_lookback_at_utc_midnight(self) -> None:
         self.replace('cost_explorer_lookback_days', '2')
+        self.replace('cost_explorer_watch_days', '2')
         self.replace('observation_max_age_seconds', '345600')
         start = self.start
         end = start + 86400
@@ -1029,6 +1030,7 @@ class LedgerTests(CostFixture):
 
     def test_bill_settles_after_configured_equal_reads_and_a_change_restores_the_estimate(self) -> None:
         self.costs({'cost_explorer_unchanged_reads': '3', 'cost_explorer_lookback_days': '7',
+                    'cost_explorer_watch_days': '7',
                     'observation_max_age_seconds': '259200', 'monthly_limit_usd': '7',
                     'cost_explorer_interval_seconds': '3600'})
         start = self.start
@@ -1048,7 +1050,8 @@ class LedgerTests(CostFixture):
                                              (4, '3', 'estimate', '4'),
                                              (5, '3', 'billed_not_final', '3')):
             at = end + offset * 3600
-            with self.subTest(at=at), redirect_stderr(log):
+            with (self.subTest(at=at), redirect_stderr(log),
+                  mock.patch.object(ledger, 'send_settled_changes', return_value=True)):
                 _ = self.book.refresh_charges(self.settings, at, lambda _start, _end: (
                     replace(bill, at=at, actual_usd=Decimal(amount)),))
                 accrual = self.book.accrued_cost(self.settings, at, window='month')
@@ -1069,7 +1072,8 @@ class LedgerTests(CostFixture):
         ])
 
     def test_bill_history_keeps_earlier_full_day_reads(self) -> None:
-        self.costs({'cost_explorer_lookback_days': '2', 'cost_explorer_interval_seconds': '1'})
+        self.costs({'cost_explorer_lookback_days': '2', 'cost_explorer_watch_days': '2',
+                    'cost_explorer_interval_seconds': '1'})
         start = self.start
         end = start + 86400
         bill = ledger.ChargeRead('2026-01-15', end, start, end, Decimal(2), Decimal(0), Decimal(0))
@@ -1089,6 +1093,7 @@ class LedgerTests(CostFixture):
 
     def test_late_charge_read_keeps_the_newest_fields_and_same_time_counts_once(self) -> None:
         self.replace('cost_explorer_lookback_days', '2')
+        self.replace('cost_explorer_watch_days', '2')
         start = self.start
         end = start + 86400
         bill = ledger.ChargeRead('2026-01-15', end + 86400, start, end, Decimal(7), Decimal(3), Decimal(1),
@@ -1112,6 +1117,7 @@ class LedgerTests(CostFixture):
 
     def test_invalid_late_refresh_cannot_shorten_a_valid_charge_day(self) -> None:
         self.replace('cost_explorer_lookback_days', '2')
+        self.replace('cost_explorer_watch_days', '2')
         start = self.start
         end = start + 86400
         latest = ledger.ChargeRead('2026-01-15', end + 2, start, end, Decimal(7), Decimal(0), Decimal(0))
@@ -1125,7 +1131,8 @@ class LedgerTests(CostFixture):
         self.assertEqual(path.read_bytes(), original)
 
     def test_equal_read_count_requires_the_refresh_interval(self) -> None:
-        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_interval_seconds': '60'})
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '7',
+                    'cost_explorer_interval_seconds': '60'})
         start = self.start
         end = start + 86400
         bill = ledger.ChargeRead('2026-01-15', end + 1, start, end, Decimal(2), Decimal(0), Decimal(0))
@@ -1699,6 +1706,215 @@ class LedgerTests(CostFixture):
         self.assertTrue(published)
         self.assertTrue(all(cast(int, row["start"]) >= current for row in published))
         self.assertEqual(len(cast(list[object], json.loads(self.book.path.read_text())["observations"])), 2)
+
+
+class SettledChargeWatchTests(CostFixture):
+    def test_wider_watch_keeps_the_daily_query_interval_after_nine_days_of_reads(self) -> None:
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '7'})
+        book = ledger.CostLedger(self.state)
+        day = 86400
+        first = instant('2026-01-15T00:00:00Z')
+
+        def recent_reads(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
+            return charge_readings(max(start, end - 7 * day), end, Decimal(2), Decimal('0.01'))
+
+        for offset in range(9):
+            _ = book.refresh_charges(self.settings, first + offset * day, recent_reads)
+        last_read = first + 8 * day
+        self.replace('cost_explorer_watch_days', '45')
+        fetch = mock.Mock(side_effect=recent_reads)
+        for elapsed in range(5, 3 * day + 1, 5):
+            _ = book.refresh_charges(self.settings, last_read + elapsed, fetch)
+            self.assertEqual(fetch.call_count, elapsed // day, f'{elapsed} seconds after the last seven-day query')
+
+        self.assertEqual(fetch.call_args_list, [
+            mock.call(last_read + (offset - 45) * day, last_read + offset * day)
+            for offset in range(1, 4)
+        ])
+
+    def test_query_replaces_a_corrupt_older_watch_file_and_saves_the_other_days(self) -> None:
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '7'})
+        book = ledger.CostLedger(self.state)
+        day = 86400
+        end = instant('2026-01-15T00:00:00Z')
+        first = charge_readings(end - 7 * day, end, Decimal(2), Decimal('0.01'))
+        _ = book.refresh_charges(self.settings, end, lambda _start, _end: first)
+        older = self.state / 'charges' / '2026-01-07.json'
+        _ = older.write_text('{invalid JSON')
+        self.replace('cost_explorer_watch_days', '45')
+
+        end += day
+        readings = charge_readings(end - 10 * day, end, Decimal(2), Decimal('0.01'))
+        fetch = mock.Mock(return_value=readings)
+        self.assertEqual(book.refresh_charges(self.settings, end - day + 5, fetch), first[-1])
+        fetch.assert_not_called()
+        self.assertEqual(older.read_text(), '{invalid JSON')
+        self.assertEqual(book.refresh_charges(self.settings, end, fetch), readings[-1])
+        self.assertEqual(book.read_bills(), readings)
+
+    def test_unreadable_older_bill_does_not_repeat_a_paid_query(self) -> None:
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '7'})
+        book = ledger.CostLedger(self.state)
+        day = 86400
+        end = instant('2026-01-16T00:00:00Z')
+        first = charge_readings(end - 8 * day, end - day, Decimal(2), Decimal('0.01'))
+        _ = book.refresh_charges(self.settings, end - day, lambda _start, _end: first)
+        older = self.state / 'charges' / '2026-01-04.json'
+        older.mkdir()
+        with self.assertRaises(OSError) as unreadable:
+            _ = older.read_text()
+        self.replace('cost_explorer_watch_days', '45')
+
+        readings = charge_readings(end - 45 * day, end, Decimal(2), Decimal('0.01'))
+        fetch = mock.Mock(return_value=readings)
+        log = io.StringIO()
+        with redirect_stderr(log):
+            for elapsed in range(0, day, 5):
+                self.assertEqual(book.refresh_charges(self.settings, end + elapsed, fetch), readings[-1])
+                self.assertEqual(fetch.call_count, 1)
+        fetch.assert_called_once_with(end - 45 * day, end)
+        self.assertEqual(log.getvalue().splitlines(), [
+            f'aws_target: cannot save watched bill for 2026-01-04: {unreadable.exception!r}',
+        ])
+        self.assertTrue(older.is_dir())
+        self.assertEqual(tuple(ledger.read_charge(path) for path in book.bill_paths()[-7:]), readings[-7:])
+        following = self.state / 'charges' / '2026-01-05.json'
+        self.assertEqual(ledger.read_charge(following).at, end)
+
+    def test_watch_uses_the_first_settlement_including_after_a_change_back(self) -> None:
+        self.replace('cost_explorer_interval_seconds', '60')
+        book = ledger.CostLedger(self.state)
+        start = instant('2026-01-15T00:00:00Z')
+        end = start + 86400
+        settled = Decimal('7.73')
+        reading = ledger.ChargeRead('2026-01-15', end, start, end, settled, Decimal(0), Decimal(0))
+        path = self.state / 'charges' / '2026-01-15.json'
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps(ledger.charge_record(reading)))
+        settings = config.read_settings(self.settings)
+        self.assertEqual(book.read_bills(), (reading,))
+        self.assertEqual(book.read_charge_watch(settings, end), (
+            ledger.WatchedChargeDay(reading.day, end, ledger.ChargeNotSettled()),))
+
+        history: list[dict[str, object]] = [{'at': end, 'actual_usd': str(settled)}]
+        changed = ledger.SettledChargeChanged(settled, Decimal('7.81'))
+        self.assertEqual(changed.difference_usd, Decimal('0.08'))
+        for seconds, amount, expected in (
+            (1, '7.73', ledger.ChargeNotSettled()),
+            (60, '7.73', ledger.SettledChargeUnchanged(settled)),
+            (120, '7.81', changed),
+            (180, '7.81', changed),
+            (240, '7.73', ledger.SettledChargeUnchanged(settled)),
+        ):
+            at = end + seconds
+            history.append({'at': at, 'actual_usd': amount})
+            record = ledger.charge_record(replace(reading, at=at, actual_usd=Decimal(amount)))
+            record['amount_reads'] = history
+            _ = path.write_text(json.dumps(record))
+            with self.subTest(seconds=seconds):
+                self.assertEqual(book.read_charge_watch(settings, at), (
+                    ledger.WatchedChargeDay(reading.day, at, expected),))
+
+    def test_watch_does_not_extend_the_guard_lookback(self) -> None:
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '45'})
+        settings = config.read_settings(self.settings)
+        book = ledger.CostLedger(self.state)
+        start = instant('2026-01-15T00:00:00Z')
+        end = start + 86400
+        reading = ledger.ChargeRead('2026-01-15', end, start, end, Decimal(2), Decimal(0), Decimal(0))
+        path = self.state / 'charges' / '2026-01-15.json'
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps(ledger.charge_record(reading)))
+        self.assertEqual(book.read_complete_day_amounts(settings, end + 6 * 86400), ())
+        now = end + 7 * 86400
+        self.assertEqual(book.read_complete_day_amounts(settings, now), (
+            ledger.CompleteDayAmount(start, end, Decimal(2)),))
+        self.assertEqual(book.read_charge_watch(settings, now), (
+            ledger.WatchedChargeDay(reading.day, end, ledger.ChargeNotSettled()),))
+
+    def test_watch_refuses_a_short_window_and_a_user_recipient(self) -> None:
+        self.replace('cost_explorer_lookback_days', '7')
+        self.replace('cost_explorer_watch_days', '6')
+        with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'cost_explorer_watch_days'):
+            _ = config.read_settings(self.settings)
+        self.replace('cost_explorer_watch_days', '45')
+        self.replace('settled_change_recipient', 'user')
+        with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'settled_change_recipient'):
+            _ = config.read_settings(self.settings)
+
+    def test_notice_batches_unsent_changes_and_retries_the_full_message(self) -> None:
+        self.costs({'cost_explorer_interval_seconds': '60', 'cost_explorer_lookback_days': '2',
+                    'cost_explorer_watch_days': '2'})
+        start = instant('2026-01-15T00:00:00Z')
+        end = start + 2 * 86400
+        book = ledger.CostLedger(self.state)
+        readings = charge_readings(start, end, Decimal('7.73'), Decimal(0))
+        calls: list[list[str]] = []
+
+        def send(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            calls.append(list(arguments))
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(arguments, 1)
+            return subprocess.CompletedProcess(arguments, 0, 'SENT: fixture', '')
+
+        with mock.patch.object(subprocess, 'run', side_effect=send):
+            for tick, (first_amount, second_amount, expected_calls, sent_amounts) in enumerate((
+                ('7.73', '7.73', 0, ((), ())),
+                ('7.73', '7.73', 0, ((), ())),
+                ('7.81', '7.90', 1, ((), ())),
+                ('7.81', '7.90', 2, (('7.81',), ('7.90',))),
+                ('7.93', '7.900', 3, (('7.81', '7.93'), ('7.90',))),
+                ('7.81', '7.90', 3, (('7.81', '7.93'), ('7.90',))),
+            )):
+                at = end + tick * 60
+                fresh = tuple(replace(reading, at=at, actual_usd=Decimal(amount))
+                              for reading, amount in zip(readings, (first_amount, second_amount), strict=True))
+                with self.subTest(tick=tick):
+                    self.assertEqual(book.refresh_charges(self.settings, at, lambda _start, _end: fresh), fresh[-1])
+                    self.assertEqual(len(calls), expected_calls)
+                    for reading, amounts in zip(readings, sent_amounts, strict=True):
+                        path = self.state / 'charges' / (reading.day + '.json')
+                        record = ledger.mapping(cast(object, json.loads(path.read_text())))
+                        self.assertEqual(record.get('settled_change_notices_sent', []),
+                                         [{'actual_usd': amount} for amount in amounts])
+
+        first, retry, new = calls
+        self.assertEqual(first, retry)
+        for command in (first, new):
+            self.assertEqual(Path(command[1]).name, 'send.py')
+            self.assertEqual(command[command.index('--to') + 1], 'bob')
+        self.assertEqual(first[first.index('--text') + 1].splitlines(), [
+            '2026-01-15 changed from USD 7.73 to USD 7.81 (+0.08).',
+            '2026-01-16 changed from USD 7.73 to USD 7.90 (+0.17).',
+        ])
+        self.assertEqual(new[new.index('--text') + 1], '2026-01-15 changed from USD 7.73 to USD 7.93 (+0.20).')
+
+    def test_notice_retries_after_the_day_leaves_the_watch(self) -> None:
+        self.replace('cost_explorer_interval_seconds', '60')
+        book = ledger.CostLedger(self.state)
+        start = instant('2026-01-15T00:00:00Z')
+        end = start + 86400
+        reading = ledger.ChargeRead('2026-01-15', end, start, end, Decimal('7.73'), Decimal(0), Decimal(0))
+        change = ledger.SettledChargeChanged(reading.actual_usd, Decimal('7.81'))
+        with mock.patch.object(ledger, 'send_settled_changes', side_effect=(False, True)) as send:
+            for at, amount in ((end, reading.actual_usd), (end + 60, reading.actual_usd),
+                               (end + 120, change.newest_usd)):
+                fresh = replace(reading, at=at, actual_usd=amount)
+                _ = book.refresh_charges(self.settings, at, lambda _start, _end: (fresh,))
+            send.assert_called_once()
+
+            next_end = end + 86400
+            fresh_days = charge_readings(end, next_end, Decimal(2), Decimal('0.01'))
+            fetch = mock.Mock(return_value=fresh_days)
+            _ = book.refresh_charges(self.settings, next_end, fetch)
+            fetch.assert_called_once_with(end, next_end)
+            first, retry = send.call_args_list
+            self.assertEqual(first, retry)
+
+        path = self.state / 'charges' / (reading.day + '.json')
+        record = ledger.mapping(cast(object, json.loads(path.read_text())))
+        self.assertEqual(record['at'], end + 120)
+        self.assertEqual(record['settled_change_notices_sent'], [{'actual_usd': '7.81'}])
 
 
 class SpotPlacementEvidenceTests(CostFixture):

@@ -911,6 +911,28 @@ Reads less than `cost_explorer_interval_seconds` apart count once.
 A different amount starts a new count. The AWS service logs the day and both amounts when the day becomes unsettled.
 Outside the lookback, the latest valid amount qualifies.
 The adjustment preserves query fees and any open gate allowances or reservations already in the total.
+
+Each scheduled Cost Explorer read requests the last `cost_explorer_watch_days=45` completed UTC days.
+The watch must cover at least `cost_explorer_lookback_days=7`.
+The reader makes one scheduled query each day.
+It saves the lookback days before it saves the older days.
+It logs a save error for an older day and continues with the other days.
+The query groups costs and quantities by usage type.
+AWS charges USD 0.01 for each page of the answer.
+The 45-day answer can take more than one page.
+The ledger records the actual fee for each read.
+The watch derives the first settled amount from the first sequence of equal counted reads.
+The AWS page shows how many recorded days still match their first settled amount.
+It shows the date of the newest read in UTC and lists each day with a different current amount.
+The history keeps earlier differences when the newest read returns to the first settled amount.
+The watch sends one message for each read that finds changes that it has yet to report.
+The message goes to the session in `settled_change_recipient=bob`.
+It uses the page wording and includes one line for each changed day.
+It checks all saved days, including days outside the query range.
+After a successful send, each charge file records the reported amount.
+A write error after delivery can cause the next message to repeat that day's line.
+After a failed send, the next read collects and tries all pending changes again.
+
 The report's costs pane must call `CostLedger.accrued_cost` for the current day or month to date.
 The function returns `cost`, `limit_count`, and the cost and bill state for each UTC day in the window.
 `cost` is the ledger estimate plus the same complete-day adjustment that the guard uses.

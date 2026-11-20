@@ -105,6 +105,7 @@ __PAGE_TITLE__
   <h2>Spend <span class="unit">(USD)</span></h2>
   <div class="tiles" id="spend-tiles"></div>
   <p class="note" id="spend-note"></p>
+  <div id="settled-notes"></div>
 </section>
 <nav class="regions" aria-label="AWS table filters">
   <span class="regions-label" id="geographies-label">Geography</span>
@@ -318,6 +319,8 @@ function drawSpend() {
   });
   document.getElementById("spend-tiles").replaceChildren(...tiles);
   document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
+  const settled = (data.settled_notes ?? []).map(note => element("p", note, "note"));
+  document.getElementById("settled-notes").replaceChildren(...settled);
 }
 drawSpend();
 

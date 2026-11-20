@@ -9,6 +9,7 @@ from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
 from enum import Enum
 import fcntl
+from hashlib import sha256
 import json
 from math import ceil, inf
 from pathlib import Path
@@ -1230,6 +1231,76 @@ class _ChargeReadHistory:
     amounts: tuple[_ChargeAmountRead, ...]
 
 
+@dataclass(frozen=True)
+class ChargeNotSettled:
+    """No sequence of reads has established a settled amount."""
+
+
+@dataclass(frozen=True)
+class SettledChargeUnchanged:
+    settled_usd: Decimal
+
+
+@dataclass(frozen=True)
+class SettledChargeChanged:
+    settled_usd: Decimal
+    newest_usd: Decimal
+
+    @property
+    def difference_usd(self) -> Decimal:
+        return self.newest_usd - self.settled_usd
+
+    def display_line(self, day: str) -> str:
+        return (f'{day} changed from USD {self.settled_usd:.2f} to USD {self.newest_usd:.2f}'
+                + f' ({self.difference_usd:+.2f}).')
+
+
+ChargeSettlement = ChargeNotSettled | SettledChargeUnchanged | SettledChargeChanged
+
+
+@dataclass(frozen=True)
+class WatchedChargeDay:
+    day: str
+    checked_at: int
+    settlement: ChargeSettlement
+
+
+@dataclass(frozen=True)
+class _UnsentSettledChange:
+    day: str
+    change: SettledChargeChanged
+
+
+def _first_settled_read(history: _ChargeReadHistory, settings: SpendingSettings) -> _ChargeAmountRead | ChargeNotSettled:
+    """Find the first read that completes a sequence of equal counted amounts."""
+    amount = history.latest.actual_usd
+    count = 0
+    next_at = history.latest.period_end
+    for read in history.amounts:
+        if read.at < history.latest.period_end:
+            continue
+        if read.actual_usd != amount:
+            amount = read.actual_usd
+            count = 0
+            next_at = read.at
+        if read.at >= next_at:
+            count += 1
+            if count == settings.cost_explorer_unchanged_reads:
+                return read
+            next_at = read.at + settings.cost_explorer_interval_seconds
+    return ChargeNotSettled()
+
+
+def _charge_settlement(history: _ChargeReadHistory, settings: SpendingSettings) -> ChargeSettlement:
+    """Compare the newest amount with the first settled amount."""
+    settled = _first_settled_read(history, settings)
+    if isinstance(settled, ChargeNotSettled):
+        return settled
+    if history.latest.actual_usd == settled.actual_usd:
+        return SettledChargeUnchanged(settled.actual_usd)
+    return SettledChargeChanged(settled.actual_usd, history.latest.actual_usd)
+
+
 def _decode_charge_history(record: dict[str, object], latest: ChargeRead) -> _ChargeReadHistory:
     last = _ChargeAmountRead(latest.at, latest.actual_usd)
     amounts = tuple(_ChargeAmountRead(instant(item, 'at'), conf.decimal(text(item, 'actual_usd')))
@@ -1321,6 +1392,8 @@ def _save_charge_read(path: Path, reading: ChargeRead, settings: SpendingSetting
         else:
             log_change = (saved.actual_usd >= Decimal('.01') and saved.actual_usd != reading.actual_usd
                           and _bill_is_complete(previous, settings, reading.at))
+            if 'settled_change_notices_sent' in record:
+                document['settled_change_notices_sent'] = record['settled_change_notices_sent']
 
     amounts = tuple(sorted((*earlier, _ChargeAmountRead(reading.at, reading.actual_usd)), key=lambda amount: amount.at))
     document['amount_reads'] = [{'at': amount.at, 'actual_usd': str(amount.actual_usd)} for amount in amounts]
@@ -1330,6 +1403,28 @@ def _save_charge_read(path: Path, reading: ChargeRead, settings: SpendingSetting
         print(f'aws_target: {newest.day} UTC bill no longer settled: '
               + f'USD {amounts[-2].actual_usd} changed to USD {newest.actual_usd}', file=sys.stderr)
     return newest
+
+
+def _sent_settled_changes(record: dict[str, object]) -> set[Decimal]:
+    if 'settled_change_notices_sent' not in record:
+        return set()
+    return {conf.decimal(text(row, 'actual_usd')) for row in rows(record, 'settled_change_notices_sent')}
+
+
+def send_settled_changes(settings: SpendingSettings, changes: Sequence[_UnsentSettledChange]) -> bool:
+    """Send one keyed notice for the current changes."""
+    identities = tuple((notice.day, notice.change.newest_usd.as_integer_ratio()) for notice in changes)
+    key = 'aws-settled-changes:' + sha256(repr(identities).encode()).hexdigest()
+    repeat_minutes = (datetime.max - datetime.min) // timedelta(minutes=1) + 1
+    message = '\n'.join(notice.change.display_line(notice.day) for notice in changes)
+    try:
+        result = subprocess.run(session_send.send_argv(
+            '--to', settings.settled_change_recipient, '--from', 'aws-settled-watch',
+            '--key', key, '--repeat-minutes', str(repeat_minutes), '--text', message),
+            capture_output=True, text=True, timeout=settings.notification_timeout_s, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.startswith(('SENT:', 'SKIPPED:'))
 
 
 SPEND_GROUPS = ('gate compute at 32 CPU', 'compute at 16 CPU', 'storage', 'public IPv4', 'data transfer', 'other',
@@ -2009,6 +2104,19 @@ class CostLedger:
                      for history in _bill_day_reads(self._strict_charge_reads(), now)
                      if _bill_is_complete(history, settings, now))
 
+    def read_charge_watch(self, settings: SpendingSettings, now: int) -> tuple[WatchedChargeDay, ...]:
+        """Read the settlement status of every recorded account bill day."""
+        watched: list[WatchedChargeDay] = []
+        for name, history in self._strict_charge_reads():
+            latest = history.latest
+            try:
+                day = date.fromisoformat(latest.day)
+                if latest.account_bill and latest.at <= now and matches_utc_charge_day(name, latest, day):
+                    watched.append(WatchedChargeDay(latest.day, latest.at, _charge_settlement(history, settings)))
+            except (ValueError, ArithmeticError):
+                continue
+        return tuple(watched)
+
     def launches(self) -> tuple[dict[str, object], ...]:
         path = self.launch_history_path
         return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
@@ -2374,7 +2482,8 @@ class CostLedger:
         settings = read_settings(configuration)
         day = charge_period_day(now)
         start, end = period_bounds(day, ZoneInfo('UTC'))
-        start -= (settings.cost_explorer_lookback_days - 1) * 86400
+        lookback_day = (day - timedelta(days=settings.cost_explorer_lookback_days - 1)).isoformat()
+        start -= (settings.cost_explorer_watch_days - 1) * 86400
         with self._locked() as state:
             newest = max((self.directory / 'charges').glob('*.json'), default=None)
             if newest is not None:
@@ -2396,19 +2505,76 @@ class CostLedger:
                     if complete and now < previous.at + settings.cost_explorer_interval_seconds:
                         return previous
             readings = fetch(start, end)
-            saved: list[ChargeRead] = []
-            for reading in readings:
-                estimated = Decimal(0)
-                if state.inventories and any(inventory.at <= reading.period_end for inventory in state.inventories):
-                    costs = costs_from_evidence(state, settings, reading.period_end,
-                                                window=datetime.fromtimestamp(reading.period_start, settings.accounting_zone).date())
-                    estimated = period_cost(costs.intervals, reading.period_start, reading.period_end)
-                reading = replace(reading, at=now, estimated_usd=estimated)
-                path = self.directory / 'charges' / f'{reading.day}.json'
-                saved.append(_save_charge_read(path, reading, settings))
-            for reading in saved:
+            estimate_state = replace(state)
+            saved_recent = [self._save_account_charge(estimate_state, settings, now, reading)
+                            for reading in readings if reading.day >= lookback_day]
+            for reading in saved_recent:
                 self._reconcile_charge(state, reading)
-            return saved[-1]
+            saved_older: list[ChargeRead] = []
+            for reading in readings:
+                if reading.day >= lookback_day:
+                    continue
+                try:
+                    saved = self._save_account_charge(estimate_state, settings, now, reading)
+                    self._reconcile_charge(state, saved)
+                    saved_older.append(saved)
+                except (OSError, ValueError, ArithmeticError) as error:
+                    print(f'aws_target: cannot save watched bill for {reading.day}: {error!r}', file=sys.stderr)
+        self._notify_settled_changes(settings, now)
+        saved_days = saved_recent or saved_older
+        return saved_days[-1] if saved_days else MeasurementUnavailable('No account bills were saved')
+
+    def _save_account_charge(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
+                             reading: ChargeRead) -> ChargeRead:
+        estimated = Decimal(0)
+        if state.inventories and any(inventory.at <= reading.period_end for inventory in state.inventories):
+            costs = costs_from_evidence(state, settings, reading.period_end,
+                                        window=datetime.fromtimestamp(reading.period_start, settings.accounting_zone).date())
+            estimated = period_cost(costs.intervals, reading.period_start, reading.period_end)
+        path = self.directory / 'charges' / f'{reading.day}.json'
+        return _save_charge_read(path, replace(reading, at=now, estimated_usd=estimated), settings)
+
+    def _notify_settled_changes(self, settings: SpendingSettings, now: int) -> None:
+        """Send one notice for all unsent changes to current amounts."""
+        pending: list[_UnsentSettledChange] = []
+        for path in self.bill_paths():
+            try:
+                record = _strict_charge_record(path.read_text())
+                history = _decode_charge_history(record, _decode_charge(record))
+                latest = history.latest
+                if (not latest.account_bill or latest.at > now
+                        or not matches_utc_charge_day(path.name, latest, date.fromisoformat(latest.day))):
+                    continue
+                change = _charge_settlement(history, settings)
+                if isinstance(change, SettledChargeChanged) and change.newest_usd not in _sent_settled_changes(record):
+                    pending.append(_UnsentSettledChange(latest.day, change))
+            except (OSError, ValueError, ArithmeticError):
+                continue
+        if not pending:
+            return
+        if not send_settled_changes(settings, pending):
+            print('aws_target: settled amount notices remain pending for '
+                  + ', '.join(notice.day for notice in pending), file=sys.stderr)
+            return
+        try:
+            with self._locked():
+                for notice in pending:
+                    self._record_sent_settled_change(notice)
+        except (OSError, ValueError, ArithmeticError) as error:
+            print(f'aws_target: cannot record settled amount notices: {error!r}', file=sys.stderr)
+
+    def _record_sent_settled_change(self, notice: _UnsentSettledChange) -> None:
+        path = self.directory / 'charges' / f'{notice.day}.json'
+        try:
+            record = _strict_charge_record(path.read_text())
+            confirmed = _sent_settled_changes(record)
+            if notice.change.newest_usd in confirmed:
+                return
+            record['settled_change_notices_sent'] = [
+                {'actual_usd': str(value)} for value in sorted(confirmed | {notice.change.newest_usd})]
+            write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+        except (OSError, ValueError, ArithmeticError) as error:
+            print(f'aws_target: cannot record settled amount notice for {notice.day}: {error!r}', file=sys.stderr)
 
     def _save_estimate(self, state: LedgerEvidence, costs: CostEstimate) -> None:
         established = {r: r for r in costs.established_reconciliations}
