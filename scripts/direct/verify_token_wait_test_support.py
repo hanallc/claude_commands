@@ -406,13 +406,21 @@ esac
         self.assertIn(text, path.read_text(errors="replace"))
 
     def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
-        """A cargo whose metadata lists `targets` for sample and whose build makes each bin and example."""
-        metadata = json.dumps({"packages": [{"name": "sample", "targets": targets, "features": {}}],
+        """Report the sample targets and record each build command."""
+        package_id = "path+file:///fixture#sample@0.1.0"
+        metadata = json.dumps({"packages": [{"name": "sample", "id": package_id, "targets": targets, "features": {}}],
+                               "workspace_members": [package_id],
                                "target_directory": str(self.root / "target")})
         cargo = self.root / "stubs" / "cargo"
         _ = cargo.write_text("#!/bin/sh\n"
                              + 'if [ "$1" = metadata ]; then printf "%s\\n" "$TEST_METADATA"; exit 0; fi\n'
                              + 'printf "%s\\n" "$*" >> "$CARGO_CALLS"\n'
+                             + 'if [ "$1" = test ]; then\n'
+                             + '    [ -d "$PLAN_DELEGATE_BOARD_DIR/locks/cargo.d" ] || exit 96\n'
+                             + '    printf "%s\\n" "${TEST_CARGO_ARTIFACTS:-}"\n'
+                             + '    printf "%s\\n" "${TEST_CARGO_DIAGNOSTICS:-}" >&2\n'
+                             + '    exit "${TEST_CARGO_STATUS:-0}"\n'
+                             + 'fi\n'
                              + 'profile=debug; kind=""\n'
                              + 'for word in "$@"; do case "$word" in --release) profile=release ;; esac; done\n'
                              + 'for word in "$@"; do\n'
@@ -425,8 +433,8 @@ esac
         return {**self.environment, "TEST_METADATA": metadata,
                 "PLAN_DELEGATE_BOARD_DIR": str(self.root / "board"), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
 
-    def build(self, environment: dict[str, str], *words: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(VERIFY), "build", "sample", *words], cwd=self.root, env=environment,
+    def build(self, environment: dict[str, str], *words: str, package: str = "sample") -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(VERIFY), "build", *([package] if package else []), *words], cwd=self.root, env=environment,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:

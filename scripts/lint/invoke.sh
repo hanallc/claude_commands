@@ -351,10 +351,16 @@ without_progress_frames() {
     done
 }
 
+BUILD_TEST_ARTIFACTS_FILE=""
+
 buildlog_exec_with_progress() {
-    CARGO_TERM_PROGRESS_WHEN=always \
-        CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}} \
+    local -x CARGO_TERM_PROGRESS_WHEN=always
+    local -x CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}}
+    if [[ -n "$BUILD_TEST_ARTIFACTS_FILE" ]]; then
+        buildlog_exec "$@" > "$BUILD_TEST_ARTIFACTS_FILE"
+    else
         buildlog_exec "$@"
+    fi
 }
 
 cargo_seed_needed() {
@@ -1014,9 +1020,13 @@ parse_validation_step() {
     esac
 }
 
+validation_step_supported() {
+    parse_validation_step "$@" && [[ "${VALIDATION_EXPECTED_VERB:-$VALIDATION_VERB}" == "$VALIDATION_VERB" ]]
+}
+
 validation_cargo_step() {
     local VALIDATION_OPERATION VALIDATION_CARGO_TARGET VALIDATION_COPY_EDITS VALIDATION_KIND VALIDATION_VERB
-    if ! parse_validation_step "$@" || [[ "${VALIDATION_EXPECTED_VERB:-$VALIDATION_VERB}" != "$VALIDATION_VERB" ]]; then
+    if ! validation_step_supported "$@"; then
         printf 'lint: invalid validation operation: %s\n' "$*" >&2
         return 2
     fi

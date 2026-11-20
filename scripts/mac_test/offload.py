@@ -89,7 +89,8 @@ MAC_NEXTTEST_SETUP_FAILURE = "mac_nextest_setup=failed"
 MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
 
-MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
+MacCommandDeclineReason = NonBusyMacDeclineReason | Literal["command"]
+MacDeclineReason = MacCommandDeclineReason | Literal["busy"]
 
 
 class AllMirrors:
@@ -238,7 +239,7 @@ def _no_refusal_settings() -> records.NoRefusalSettings:
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
-    reason: NonBusyMacDeclineReason
+    reason: MacCommandDeclineReason
     seconds: float
     detail: str = ""
     refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(default_factory=_no_refusal_settings)
@@ -806,6 +807,12 @@ class CleanupUnconfirmed:
 CleanupOutcome = CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
 
 
+class ValidationPrelaunchRefusal(Enum):
+    NONE = ""
+    UNSUPPORTED = "command"
+    RUST_TARGET_MISSING = placement.RUST_TARGET_MISSING
+
+
 @dataclass(frozen=True)
 class ReportedMacStatus:
     """The test status printed by the remote command."""
@@ -813,7 +820,7 @@ class ReportedMacStatus:
     status: int
     cleanup: CleanupOutcome = CleanupUnconfirmed()
     build_target_directory: str = ""
-    rust_target_missing: bool = False
+    validation_refusal: ValidationPrelaunchRefusal = ValidationPrelaunchRefusal.NONE
 
 
 @dataclass(frozen=True)
@@ -1126,7 +1133,7 @@ class ProcessController:
         mismatch = ""
         mirror_refusal: MirrorBusyRefusal | NoMirrorBusyRefusal = NoMirrorBusyRefusal()
         build_target_directory = ""
-        rust_target_missing = False
+        validation_refusal = ValidationPrelaunchRefusal.NONE
         received_bytes = 0
         finished_output = False
         try:
@@ -1166,9 +1173,14 @@ class ProcessController:
                     held_status_line = ""
                     cleanup = CleanupUnconfirmed()
                     continue
-                if marker == "validation_refusal=" + placement.RUST_TARGET_MISSING:
-                    rust_target_missing = True
-                    continue
+                refusal_reason = marker.removeprefix("validation_refusal=")
+                if refusal_reason and refusal_reason != marker:
+                    try:
+                        validation_refusal = ValidationPrelaunchRefusal(refusal_reason)
+                    except ValueError:
+                        pass
+                    else:
+                        continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
                 if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
                     if held_status_line:
@@ -1220,7 +1232,8 @@ class ProcessController:
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory,
-                                     rust_target_missing and status.status == os.EX_PROTOCOL)
+                                     validation_refusal if status.status == os.EX_PROTOCOL
+                                     else ValidationPrelaunchRefusal.NONE)
         if isinstance(status, MacNextestSetupFailed):
             return MacNextestSetupFailed(cleanup)
         if isinstance(mirror_refusal, MirrorBusyRefusal):
@@ -1274,7 +1287,7 @@ def elapsed_seconds(started: float) -> float:
     return max(0.0, time.monotonic() - started)
 
 
-def declined(reason: NonBusyMacDeclineReason, started: float) -> DeclinedMacRun:
+def declined(reason: MacCommandDeclineReason, started: float) -> DeclinedMacRun:
     return DeclinedMacRun(reason, elapsed_seconds(started))
 
 
@@ -2069,6 +2082,21 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     )
 
 
+MAC_LINT_ENTRY = "~/.claude/scripts/lint/lint"
+
+
+def mac_validation_run(arguments: Sequence[str], run: str) -> str:
+    """Refuse before Cargo if the installed entry cannot run this operation."""
+    probe = shlex.join(("validation-support", *arguments))
+    return (
+        f'if validation_support=$({MAC_LINT_ENTRY} {probe} 2>/dev/null) '
+        f'&& [ "$validation_support" = validation_supported=1 ]; then {run}; '
+        "else echo 'lint: the Mac entry does not support this validation operation' >&2; "
+        f"echo validation_refusal={ValidationPrelaunchRefusal.UNSUPPORTED.value}; "
+        f"echo mac_exit={os.EX_PROTOCOL}; fi"
+    )
+
+
 def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
@@ -2097,7 +2125,8 @@ def remote_test_command(
     words = request.nextest_words
     if request.verb == "nextest" and not request.validation_step:
         words = nextest_words_with_skip(words, config.values.get(f"mac_skip.{repository.name}", ""))
-    invocation = shlex.join(linux_runner.lint_invocation(request.verb, words, validation_step=request.validation_step))
+    lint_arguments = linux_runner.lint_invocation(request.verb, words, validation_step=request.validation_step)
+    invocation = shlex.join(lint_arguments)
     sent_tree = (
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
@@ -2131,10 +2160,8 @@ def remote_test_command(
         # The writer reports the child status. A failed launch takes the setup path.
         report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
     runner = "run_nextest_logged " if capture else ""
-    return (
-        f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
-        f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
+    run = (
+        f'{environment}PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -2146,7 +2173,13 @@ def remote_test_command(
         f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"{runner}~/.claude/scripts/lint/lint {invocation}{report_status}; {cleanup_command}"
+        f"{runner}{MAC_LINT_ENTRY} {invocation}{report_status}"
+    )
+    if request.validation_step:
+        run = mac_validation_run(lint_arguments[1:], run)
+    return (
+        f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{run}; {cleanup_command}"
     )
 
 
@@ -2770,9 +2803,14 @@ def claimed_run(
             if not linux:
                 evidence.execution = execution_identity.ExecutionNotStarted()
             return declined("state", started)
-        if request.validation_step and request.verb == "clippy" and len(request.nextest_words) == 2 and remote_status.rust_target_missing:
-            evidence.execution = execution_identity.ExecutionNotStarted()
-            return declined("rust_target_missing", started)
+        if request.validation_step:
+            if not linux and remote_status.validation_refusal is ValidationPrelaunchRefusal.UNSUPPORTED:
+                evidence.execution = execution_identity.ExecutionNotStarted()
+                return declined("command", started)
+            if (request.verb == "clippy" and len(request.nextest_words) == 2
+                    and remote_status.validation_refusal is ValidationPrelaunchRefusal.RUST_TARGET_MISSING):
+                evidence.execution = execution_identity.ExecutionNotStarted()
+                return declined("rust_target_missing", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)
                      if eligibility.returns_copy_edits(request.verb) else FIX_NOT_RUN)

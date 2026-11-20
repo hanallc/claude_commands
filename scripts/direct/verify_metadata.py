@@ -76,9 +76,29 @@ def build_targets(meta: CargoMetadata, package_name: str, kind: str, name: str) 
     return "\n".join(lines)
 
 
+LIBRARY_KINDS = frozenset({"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"})
+
+
+def library_target(target: CargoTarget) -> bool:
+    return bool(LIBRARY_KINDS.intersection(target["kind"]))
+
+
 def package_has_library(package: CargoPackage) -> bool:
-    return any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
-               for target in package["targets"])
+    return any(library_target(target) for target in package["targets"])
+
+
+def harness_target(meta: CargoMetadata, package_name: str, kind: str, name: str) -> str:
+    package = require_package(meta, package_name)
+    targets = [target for target in package["targets"] if library_target(target)] if kind == "lib" else [
+        target for target in package["targets"] if "bin" in target["kind"] and target["name"] == name
+    ]
+    if len(targets) != 1:
+        selector = "--lib" if kind == "lib" else f"--bin {name}"
+        print(f"verify.sh: expected one target for {package_name} {selector}, found {len(targets)}",
+              file=sys.stderr)
+        raise SystemExit(2)
+    target, = targets
+    return "\n".join((target["name"], ",".join(target["kind"])))
 
 
 def check_targets(meta: CargoMetadata) -> str:
@@ -184,6 +204,8 @@ def answer(meta: CargoMetadata, request: str) -> str:
         return check_targets(meta)
     if name == "build-targets" and len(arguments) == 3:
         return build_targets(meta, arguments[0], arguments[1], arguments[2])
+    if name == "harness-target" and len(arguments) == 3:
+        return harness_target(meta, arguments[0], arguments[1], arguments[2])
     if name == "untested-examples" and len(arguments) == 1:
         return untested_examples(meta, arguments[0])
     if name == "workspace-root" and not arguments:

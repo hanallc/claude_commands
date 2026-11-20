@@ -140,12 +140,16 @@
 # Help build:
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
 #                     [--release] [--features <list>] [--attached]
+#        verify build <package> (--bin <name> | --lib)
+#                     --test-harness --release [--locked] [--attached]
 #
 # Build binaries on an eligible target. --target or --mac pins the step.
 # --local pins the step to natedev.
 # --bin selects one binary. --example selects one example.
 # Enable the example's required features when building an example.
 # --release selects the release profile.
+# --test-harness builds one release test executable on natedev.
+# --locked requires Cargo to use the current lockfile for the test harness.
 # Names without a slash in --features belong to the named package.
 # Without a package, pass feature names unchanged.
 # For a debug build, also add workspace.metadata.dev.features.
@@ -674,7 +678,8 @@ STEP_COPIES_SCRIPT="$VERIFY_START_DIR/../copies/copies.py"
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
     LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh"
-        "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
+        "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lint/cargo_artifacts.py"
+        "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 
@@ -1132,9 +1137,9 @@ set_gate_metadata() {
 METADATA_READY=0
 load_metadata() {
     [[ "$METADATA_READY" == 0 ]] || return 0
-    local values features="" kind="" name="" valid=1
+    local values features=""
     local requests=() words=("${ARGS[@]:1}")
-    local package="${ARGS[0]:-}" index word
+    local package="${ARGS[0]:-}" index
     if [[ "${CHECK_UNTESTED_EXAMPLES:-0}" == 1 ]]; then
         requests+=("untested-examples:$EXAMPLE_SCOPE")
     fi
@@ -1160,26 +1165,13 @@ load_metadata() {
             requests+=("test-targets:$package:$features")
             ;;
         build)
-            # Match take_build_args without emitting its usage error early:
-            # the existing member check still wins over malformed arguments.
-            while [[ ${#words[@]} -gt 0 ]]; do
-                word=${words[0]}
-                case "$word" in
-                    --bin|--example)
-                        if [[ -n "$kind" || -z "${words[1]:-}" || "${words[1]:-}" == --* ]]; then
-                            valid=0; break
-                        fi
-                        kind=${word#--}; name=${words[1]}; words=("${words[@]:2}")
-                        ;;
-                    --release) words=("${words[@]:1}") ;;
-                    --features)
-                        if [[ -z "${words[1]:-}" ]]; then valid=0; break; fi
-                        words=("${words[@]:2}")
-                        ;;
-                    *) valid=0; break ;;
-                esac
-            done
-            if [[ "$valid" == 1 ]]; then requests+=("build-targets:$package:$kind:$name"); fi
+            if [[ "$BUILD_OPTIONS_VALID" == 1 ]]; then
+                if [[ "$BUILD_TEST_HARNESS" == 1 ]]; then
+                    requests+=("harness-target:$package:$BUILD_SELECTOR:$BUILD_TARGET_NAME")
+                else
+                    requests+=("build-targets:$package:$BUILD_SELECTOR:$BUILD_TARGET_NAME")
+                fi
+            fi
             ;;
     esac
     if [[ -z "${GATE_METADATA:-}" ]]; then set_gate_metadata || exit 2; fi
@@ -1318,44 +1310,48 @@ take_features() {
     fi
 }
 
-# `build` arguments: at most one of --bin or --example, --release, and
-# --features in any order. An example's required features join the list.
 BUILD_ARGS=()
 BUILD_BINARIES=()
 BUILD_PROFILE_DIR=debug
 BUILD_TARGET_DIR=""
-take_build_args() {
-    local kind="" name="" features="" line words
+BUILD_SELECTOR="" BUILD_TARGET_NAME="" BUILD_FEATURES=""
+BUILD_OPTIONS_VALID=1 BUILD_TEST_HARNESS=0 BUILD_LOCKED=0
+
+parse_build_options() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --bin|--example)
-                if [[ -n "$kind" || -z "${2:-}" || "${2:-}" == --* ]]; then
-                    usage
-                    exit 2
-                fi
-                kind=${1#--}
-                name=$2
+                [[ -z "$BUILD_SELECTOR" && -n "${2:-}" && "$2" != --* ]] || return 2
+                BUILD_SELECTOR=${1#--}
+                BUILD_TARGET_NAME=$2
                 shift 2
                 ;;
-            --release)
-                BUILD_PROFILE_DIR=release
+            --lib)
+                [[ -z "$BUILD_SELECTOR" ]] || return 2
+                BUILD_SELECTOR=lib
                 shift
                 ;;
+            --test-harness) BUILD_TEST_HARNESS=1; shift ;;
+            --locked) BUILD_LOCKED=1; shift ;;
+            --release) BUILD_PROFILE_DIR=release; shift ;;
             --features)
-                if [[ -z "${2:-}" ]]; then
-                    usage
-                    exit 2
-                fi
-                features=$2
+                [[ -n "${2:-}" ]] || return 2
+                BUILD_FEATURES=$2
                 shift 2
                 ;;
-            *)
-                usage
-                exit 2
-                ;;
+            *) return 2 ;;
         esac
     done
-    words="$BUILD_TARGETS"
+    if [[ "$BUILD_TEST_HARNESS" == 1 ]]; then
+        [[ -n "$VERIFY_PACKAGE" && "$BUILD_PROFILE_DIR" == release && -z "$BUILD_FEATURES" &&
+            ( "$BUILD_SELECTOR" == bin || "$BUILD_SELECTOR" == lib ) ]]
+    else
+        [[ "$BUILD_SELECTOR" != lib && "$BUILD_LOCKED" == 0 ]]
+    fi
+}
+
+take_build_args() {
+    local features="$BUILD_FEATURES" line
     while IFS= read -r line; do
         case "$line" in
             "select "*) BUILD_ARGS+=("${line#select }") ;;
@@ -1363,7 +1359,7 @@ take_build_args() {
             "binary "*) BUILD_BINARIES+=("${line#binary }") ;;
             "target "*) BUILD_TARGET_DIR="${line#target }" ;;
         esac
-    done <<< "$words"
+    done <<< "$BUILD_TARGETS"
     if [[ "$BUILD_PROFILE_DIR" == release ]]; then
         BUILD_ARGS+=(--release)
     else
@@ -1374,20 +1370,38 @@ take_build_args() {
     fi
 }
 
-# One `binary: <path>` line per binary the build made, for the caller to launch.
+print_binary_path() {
+    printf 'binary: %s\n' "$1"
+}
+
+# Print one path for each executable.
 print_built_binaries() {
     local binary path
     for binary in "${BUILD_BINARIES[@]}"; do
         path="${BUILD_TARGET_DIR}/${BUILD_PROFILE_DIR}/${binary}"
         if [[ "$STEP_RAN_ON_MAC" == 1 ]]; then
-            printf 'binary: %s:%s/%s/%s\n' "$BUILDLOG_TARGET" "$REMOTE_BUILD_TARGET_DIR" "$BUILD_PROFILE_DIR" "$binary"
+            print_binary_path "$BUILDLOG_TARGET:$REMOTE_BUILD_TARGET_DIR/$BUILD_PROFILE_DIR/$binary"
         elif [[ -x "$path" ]]; then
-            echo "binary: $path"
+            print_binary_path "$path"
         else
             echo "verify.sh: cargo build passed but made no ${path}" >&2
             exit 1
         fi
     done
+}
+
+run_test_harness() {
+    local target_name target_kinds path BUILD_TEST_ARTIFACTS_FILE
+    local command=(cargo test --no-run --release -p "$PKG" "--$BUILD_SELECTOR")
+    if [[ "$BUILD_SELECTOR" == bin ]]; then command+=("$BUILD_TARGET_NAME"); fi
+    if [[ "$BUILD_LOCKED" == 1 ]]; then command+=(--locked); fi
+    command+=(--message-format=json-render-diagnostics)
+    { IFS= read -r target_name; IFS= read -r target_kinds; } <<< "$HARNESS_TARGET"
+    BUILD_TEST_ARTIFACTS_FILE="$(mktemp "$HOLD_WAIT_DIR/cargo-artifacts.XXXXXX")" || return $?
+    run "${command[@]}" >&2 || return $?
+    path="$(verify_helper "$BUILD_HELPER_ROOT/lint/cargo_artifacts.py" \
+        "$BUILD_TEST_ARTIFACTS_FILE" "$PKG" "$target_name" "$target_kinds")" || return $?
+    print_binary_path "$path"
 }
 
 NEXTEST_ARGS=()
@@ -1578,6 +1592,18 @@ if [[ "$CMD" == validation ]]; then
 else
     parse_routing_arguments "$@"
     parse_command_arguments "${ARGS[@]}"
+fi
+if [[ "$CMD" == build ]]; then
+    parse_build_options ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} || BUILD_OPTIONS_VALID=0
+    if [[ "$BUILD_TEST_HARNESS" == 1 ]]; then
+        [[ "$BUILD_OPTIONS_VALID" == 1 ]] || { command_help build >&2; exit 2; }
+        if [[ "$OSTYPE" == darwin* || "$MAC_ONLY" == 1 || ( -n "$PINNED_TARGET" && "$PINNED_TARGET" != natedev ) ]]; then
+            printf 'verify.sh: --test-harness requires natedev.\n' >&2
+            exit 2
+        fi
+        LOCAL_ONLY=1
+        LOCAL_REASON="${LOCAL_REASON:-the test harness runs on natedev}"
+    fi
 fi
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
 if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ONLY" == 0 && "$LOCAL_ONLY" == 0 ]]; then
@@ -2697,6 +2723,9 @@ route_compiling_step() {
     BUILDLOG_PLACEMENT_PREPARED=1
     if [[ "$CMD" == validation ]]; then
         MAC_VERB=$VALIDATION_VERB
+    elif [[ "$CMD" == build && "$BUILD_TEST_HARNESS" == 1 && "$LOCAL_ONLY" == 1 ]]; then
+        # The harness runs the placed command only on natedev.
+        :
     elif [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
         shift
         if [[ "$command" == env ]]; then
@@ -3170,6 +3199,10 @@ route_test() {
             continue
         fi
         (( placement_status == 0 )) || return "$placement_status"
+        if [[ "${BUILD_TEST_HARNESS:-0}" == 1 && "$PLACEMENT_PROVIDER" != local ]]; then
+            build_check_record_failure 'the test harness requires a local placement'
+            return 2
+        fi
         if [[ "$CMD" != validation && "$STEP_ASSIGNED_TARGET" != hana-gpu && "${PLACEMENT_COMMAND[0]:-}" == cargo
                 && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then
             require_nextest
@@ -4835,9 +4868,14 @@ case "$CMD" in
     build)
         PKG="$VERIFY_PACKAGE"
         require_member "$PKG"
-        take_build_args "$@"
-        run cargo build --workspace "${BUILD_ARGS[@]}"
-        print_built_binaries
+        [[ "$BUILD_OPTIONS_VALID" == 1 ]] || { usage; exit 2; }
+        if [[ "$BUILD_TEST_HARNESS" == 1 ]]; then
+            run_test_harness
+        else
+            take_build_args
+            run cargo build --workspace "${BUILD_ARGS[@]}"
+            print_built_binaries
+        fi
         ;;
     test)
         start_tree_watch

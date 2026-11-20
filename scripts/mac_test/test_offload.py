@@ -257,6 +257,53 @@ class LintVerbTests(unittest.TestCase):
 
 
 class RunnerCompletionTests(unittest.TestCase):
+    def test_mac_validation_requires_a_positive_capability_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            lint = home / ".claude/scripts/lint/lint"
+            lint.parent.mkdir(parents=True)
+            _ = lint.write_text(
+                '#!/bin/sh\n[ "$*" = "validation-support fmt fmt" ] || exit 99\n'
+                + 'printf "%s" "$TEST_PROBE_REPLY"\nexit "$TEST_PROBE_STATUS"\n')
+            lint.chmod(0o755)
+            command = offload.mac_validation_run(("fmt", "fmt"), "echo cargo-started; echo mac_exit=2")
+            for status, reply, supported in (
+                (2, "", False),
+                (1, "", False),
+                (127, "", False),
+                (0, "", False),
+                (0, "unknown\n", False),
+                (1, "validation_supported=1\n", False),
+                (0, "validation_supported=1\n", True),
+            ):
+                with self.subTest(status=status, reply=reply):
+                    with mock.patch.dict(os.environ, {
+                        "HOME": str(home), "TEST_PROBE_REPLY": reply, "TEST_PROBE_STATUS": str(status),
+                    }), redirect_stdout(io.StringIO()) as output:
+                        result = offload.ProcessController().stream_mac_run(
+                            ["bash", "-c", command + "; echo mac_cleanup=kept"])
+                    expected = (
+                        offload.ReportedMacStatus(2, offload.CleanupKept()) if supported
+                        else offload.ReportedMacStatus(
+                            os.EX_PROTOCOL, offload.CleanupKept(),
+                            validation_refusal=offload.ValidationPrelaunchRefusal.UNSUPPORTED)
+                    )
+                    self.assertEqual(result, expected)
+                    self.assertEqual("cargo-started" in output.getvalue(), supported)
+
+    def test_validation_stream_preserves_unknown_and_empty_refusal_messages(self) -> None:
+        refusal = offload.ValidationPrelaunchRefusal.RUST_TARGET_MISSING
+        diagnostics = "validation_refusal=unknown", "validation_refusal="
+        with redirect_stdout(io.StringIO()) as output:
+            result = offload.ProcessController().stream_mac_run([
+                "/bin/sh", "-c", 'printf "%s\\n" "$@"', "fixture",
+                f"validation_refusal={refusal.value}", *diagnostics,
+                f"mac_exit={os.EX_PROTOCOL}", "mac_cleanup=kept",
+            ])
+        self.assertEqual(result, offload.ReportedMacStatus(
+            os.EX_PROTOCOL, offload.CleanupKept(), validation_refusal=refusal))
+        self.assertEqual(output.getvalue().splitlines(), list(diagnostics))
+
     def test_missing_stdout_preserves_the_published_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -370,10 +417,18 @@ class CompletedRunSyncTests(unittest.TestCase):
                     with self.subTest(target=target, status=status, fails=fails), tempfile.TemporaryDirectory() as directory:
                         self.check_finished_run(Path(directory), target, status, fails)
 
-    def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
+    def test_unsupported_mac_validation_refuses_before_cargo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.check_finished_run(Path(directory), "mac", os.EX_PROTOCOL, False,
+                                    offload.ValidationPrelaunchRefusal.UNSUPPORTED)
+
+    def check_finished_run(self, root: Path, target: str, status: int, fails: bool,
+                           refusal: offload.ValidationPrelaunchRefusal = offload.ValidationPrelaunchRefusal.NONE) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "linux" else "macos", root / "target.conf")
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
-        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
+        validation = refusal is not offload.ValidationPrelaunchRefusal.NONE
+        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify",
+                                         target=target, holder_session="fixture-session", validation_step=validation)
         controller = offload.ProcessController()
         output = io.StringIO()
 
@@ -394,7 +449,8 @@ class CompletedRunSyncTests(unittest.TestCase):
             mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
             mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "linux-build")),
             mock.patch.object(offload, "remote_test_command", return_value="fixture step"),
-            mock.patch.object(controller, "stream_mac_run", return_value=offload.ReportedMacStatus(status, offload.CleanupKept())),
+            mock.patch.object(controller, "stream_mac_run", return_value=offload.ReportedMacStatus(
+                status, offload.CleanupKept(), validation_refusal=refusal)),
             mock.patch.object(offload, "release_claim", side_effect=release) as released,
             mock.patch.object(time, "monotonic", return_value=5),
             mock.patch.object(buildlog_store, "root", return_value=root),
@@ -410,6 +466,11 @@ class CompletedRunSyncTests(unittest.TestCase):
             redirect_stdout(output),
         ):
             result = offload.claimed_run(controller, config, request, eligibility.KnownRepository("hana"), 1)
+        if validation:
+            self.assertEqual(result, offload.DeclinedMacRun("command", 4))
+            self.assertIsInstance(controller.attempt_evidence.execution, execution_identity.ExecutionNotStarted)
+            released.assert_called_once_with(controller, target)
+            return
         expected = offload.PassedOnMac(4) if status == 0 else offload.FailedOnMac(status, 4)
         self.assertEqual(result, expected)
         released.assert_called_once_with(controller, target)
@@ -1483,8 +1544,9 @@ class OffloadCommandTests(OffloadCommandFixture):
                 validation_step=True)
             remote = offload.remote_test_command(config, request, HANA)
         sent, _ = split_mac_run_command(remote)
-        position = sent.index("~/.claude/scripts/lint/lint")
-        self.assertEqual(sent[position + 1:], ["validation", "nextest", "nextest"])
+        invocation = sent.index(offload.MAC_LINT_ENTRY)
+        self.assertIn(f"$({offload.MAC_LINT_ENTRY} validation-support nextest nextest ", remote)
+        self.assertEqual(sent[invocation + 1:], ["validation", "nextest", "nextest"])
         self.assertNotIn("skip-this", remote)
 
     def test_validation_clippy_sends_the_operation_to_the_ssh_linux_runner(self) -> None:

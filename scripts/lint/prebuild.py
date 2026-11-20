@@ -23,7 +23,6 @@ build exits with cargo's status, and the tests do not run.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -32,6 +31,11 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+if __package__ in ("", None):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lint.cargo_artifacts import ExecutablePath, compiler_artifacts, package_name as package_name
 
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PACKAGE_OPTIONS = ("-p", "--package")
@@ -183,41 +187,16 @@ def needed(prebuilds: tuple[Prebuild, ...], selection: Selection) -> tuple[Prebu
     return tuple(prebuild for prebuild in prebuilds if prebuild.for_packages & selection.names)
 
 
-def package_name(package_id: str) -> str:
-    """Read the package name from a cargo package id, in the old or the spec form."""
-    old_form = re.fullmatch(r"(\S+) \S+ \(.*\)", package_id)
-    if old_form is not None:
-        return old_form.group(1)
-    source, _, fragment = package_id.partition("#")
-    if "@" in fragment:
-        return fragment.rpartition("@")[0]
-    return source.partition("?")[0].rstrip("/").rpartition("/")[2]
-
-
 def find_artifact(prebuild: Prebuild, messages: str) -> Artifact:
     """Read cargo's JSON messages for the package's one linked artifact: a cdylib or a bin."""
     linked: list[str] = []
-    for line in messages.splitlines():
-        try:
-            message: object = json.loads(line)  # pyright: ignore[reportAny]
-        except json.JSONDecodeError:
+    for artifact in compiler_artifacts(messages.splitlines()):
+        if artifact.package != prebuild.package or not {"cdylib", "bin"} & artifact.kinds:
             continue
-        if not isinstance(message, dict):
-            continue
-        fields = cast(dict[str, object], message)
-        package_id, target = fields.get("package_id"), fields.get("target")
-        if (fields.get("reason") != "compiler-artifact" or not isinstance(package_id, str)
-                or package_name(package_id) != prebuild.package or not isinstance(target, dict)):
-            continue
-        kinds = cast(dict[str, object], target).get("kind")
-        if not isinstance(kinds, list) or not {"cdylib", "bin"} & set(cast(list[object], kinds)):
-            continue
-        executable, filenames = fields.get("executable"), fields.get("filenames")
-        if isinstance(executable, str):
-            linked.append(executable)
-        elif isinstance(filenames, list):
-            linked += [name for name in cast(list[object], filenames)
-                       if isinstance(name, str) and not name.endswith(LIBRARY_SUFFIXES)]
+        if isinstance(artifact.executable, ExecutablePath):
+            linked.append(artifact.executable.path)
+        else:
+            linked.extend(name for name in artifact.filenames if not name.endswith(LIBRARY_SUFFIXES))
     if len(linked) == 1:
         return ArtifactFound(linked[0])
     if not linked:

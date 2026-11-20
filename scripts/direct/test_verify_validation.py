@@ -65,6 +65,14 @@ sent_key = offload.read_tree_key(source)
 verb = arguments[arguments.index("--verb") + 1] if "--verb" in arguments else "nextest"
 assert "--validation-step" in arguments
 words = tuple(arguments[arguments.index("--") + 1:])
+if legacy_home := os.environ.get("TEST_VALIDATION_LEGACY_HOME"):
+    run = offload.mac_validation_run((verb, *words), "exit 99")
+    controller = offload.ProcessController()
+    reply = controller.stream_mac_run(["env", "HOME=" + legacy_home, "bash", "-c", run + "; echo mac_cleanup=kept"])
+    assert isinstance(reply, offload.ReportedMacStatus), reply
+    assert reply.validation_refusal is offload.ValidationPrelaunchRefusal.UNSUPPORTED, reply
+    decline(reply.validation_refusal.value, "0")
+    raise SystemExit(75)
 lint = Path.home() / ".claude/scripts/lint/lint"
 status = subprocess.run(
     ["bash", str(lint), *linux_runner.lint_invocation(verb, words, validation_step=True)],
@@ -285,6 +293,23 @@ printf '%s\n' '---' >> .git/amended-source
         self.assertEqual(self.cargo_commands(self.repo), [command])
         event, = self.fixture.runner_events()
         self.assertEqual(self.placed_command(event["args"]), ["cargo", *command])
+
+    def test_old_mac_lint_entry_refuses_validation_before_the_step_runs_locally(self) -> None:
+        holder = self.hold_natedev()
+        legacy_home = self.fixture.root / "legacy-home"
+        lint = legacy_home / ".claude/scripts/lint/lint"
+        lint.parent.mkdir(parents=True)
+        _ = lint.write_text("#!/bin/sh\nprintf 'Usage: lint build [args...]\\n' >&2\nexit 2\n")
+        lint.chmod(0o755)
+        self.fixture.environment["TEST_VALIDATION_LEGACY_HOME"] = str(legacy_home)
+        process = self.start_step(self.fixture.verify_script, "validation", "fmt")
+        self.release_natedev_after_refusal(process, holder)
+        result = self.fixture.finish_verify(process)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.cargo_commands(self.mirror), [])
+        self.assertEqual(self.cargo_commands(self.repo), [["+nightly", "fmt", "--all"]])
+        event, = self.fixture.runner_events()
+        self.assertEqual(self.placed_command(event["args"]), ["cargo", "+nightly", "fmt", "--all"])
 
     def test_self_built_mend_uses_the_mac_checkout_binary(self) -> None:
         _ = self.hold_natedev()
