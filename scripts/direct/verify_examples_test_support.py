@@ -374,22 +374,17 @@ if Path(sys.argv[0]).name == "tree_watch.py" and not sys.argv[1].startswith("--"
         helper = control / "wait-for-step-exit.py"
         _ = helper.write_text(f'''
 import os
-import select
 import sys
 
 leader = os.environ.get("TEST_SCOPE_STEP_LEADER")
 if not leader:
     os.execv(sys.executable, [sys.executable, {self.environment["TEST_EDIT_WAIT"]!r}, sys.argv[1]])
-try:
-    descriptor = os.pidfd_open(int(leader))
-except ProcessLookupError:
-    raise SystemExit(0)
-try:
-    ready, _, _ = select.select([descriptor], [], [], {TEST_HANG_GUARD_SECS})
-    if not ready:
-        raise TimeoutError("Verify did not stop the fixture step")
-finally:
-    os.close(descriptor)
+
+sys.path.insert(0, {str(VERIFY.resolve().parents[2])!r})
+from scripts.lib.process_exit_test_support import exit_watch
+
+with exit_watch(int(leader)) as wait:
+    wait()
 ''')
         self.environment["TEST_EDIT_WAIT"] = str(helper)
 

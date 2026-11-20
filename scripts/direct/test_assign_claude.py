@@ -1,16 +1,14 @@
 """Test Claude launcher validation and artifact placement."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 import json
 import os
-import select
 import shlex
 import signal
 import socket
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, suppress
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
@@ -19,6 +17,7 @@ from typing import ClassVar, cast
 from scripts.direct import assign_claude_test_support as support
 from scripts.lib.test_models_registry import RegistryReadProbe
 from scripts.lib import models_registry, process_group, process_start, unit_runs
+from scripts.lib.process_exit_test_support import exit_watch
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.direct import worker_state
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -45,43 +44,6 @@ with socket.socket(socket.AF_UNIX) as connection:
     connection.sendall((json.dumps([os.getpid(), os.getpgrp(), 'stop']) + '\\n').encode())
     connection.recv(1)
 """
-
-
-@contextmanager
-def exit_watch(pid: int) -> Generator[Callable[[], None]]:
-    """Watch pid from before the stop; the wait returns after the kernel ends the process.
-
-    The peer socket closes before the process is a zombie, so its end of file does not prove the exit.
-    """
-    if sys.platform == "darwin":
-        queue = select.kqueue()
-        try:
-            try:
-                _ = queue.control([select.kevent(pid, select.KQ_FILTER_PROC,
-                    select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 0)
-            except ProcessLookupError:
-                yield lambda: None
-                return
-
-            def wait_mac() -> None:
-                assert queue.control(None, 1, TEST_HANG_GUARD_SECS), f"process {pid} did not exit"
-
-            yield wait_mac
-        finally:
-            queue.close()
-        return
-    try:
-        descriptor = os.pidfd_open(pid)
-    except ProcessLookupError:
-        yield lambda: None
-        return
-    try:
-        def wait_linux() -> None:
-            assert select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0], f"process {pid} did not exit"
-
-        yield wait_linux
-    finally:
-        os.close(descriptor)
 
 
 def stop_assignment(command: list[str], environment: dict[str, str], number: int, *, private_worker: bool = False) -> tuple[subprocess.CompletedProcess[str], int]:

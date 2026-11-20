@@ -1121,6 +1121,7 @@ run_step() {
             if [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 echo 'verify.sh: natedev hold stopped this step; choosing its target again.' >&2
             fi
+            local STEP_REROUTES_AFTER_HOLD=1
             status=0
             run "$@" || status=$?
             rm -f "$step_log"
@@ -3230,8 +3231,10 @@ placement_once() {
     PLACEMENT_OUTCOME=""
     # Use the queue's first pass to give routed work a remote placement probe.
     # The next pass permits local admission. Neither pass takes a board token.
+    # After a hold stops a step, use target order and the current hold state.
     PLACEMENT_REMOTE_PROBE=0
-    if [[ "${STEP_RUNS_ON:-natedev_only}" == any_target && "${LOCAL_ONLY:-0}" == 0 \
+    if [[ "${STEP_REROUTES_AFTER_HOLD:-0}" == 0 \
+            && "${STEP_RUNS_ON:-natedev_only}" == any_target && "${LOCAL_ONLY:-0}" == 0 \
             && -z "${PINNED_TARGET:-}" && "${MAC_ONLY:-0}" == 0 \
             && "${STEP_FORCE_MAC:-0}" == 0 && -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         prerequisite=after-grant
@@ -4376,6 +4379,8 @@ run_lint_sequence() {
         exit "$lint_status"
     fi
     if (( CHECK_LINT )); then
+        # Give placement and Taplo the same workspace metadata.
+        load_metadata
         # Judge all three tools even when an earlier one reports findings.
         # Report mode never enters the rewrite paths of the package gate.
         lint_status=0
@@ -4399,7 +4404,6 @@ run_lint_sequence() {
         else
             lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
         fi
-        load_metadata
         if ! workspace_taplo --check; then
             lint_status=1
         fi

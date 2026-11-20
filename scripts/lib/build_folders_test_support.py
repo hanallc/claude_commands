@@ -8,6 +8,10 @@ from typing import cast
 from scripts.lib import build_folders
 
 
+def _lease_path(folder: Path) -> Path:
+    return folder.with_name(folder.name + ".lease.json")
+
+
 def make_idle_folder_lease(folder: Path) -> Path:
     """Create a folder and return its lease record after release."""
     spec = build_folders.BuildFolderSpec(
@@ -15,7 +19,7 @@ def make_idle_folder_lease(folder: Path) -> Path:
     )
     with build_folders.leased_build_folder(spec) as path:
         assert path == folder
-    return path.with_name(path.name + ".lease.json")
+    return _lease_path(path)
 
 
 def _tool_name(name: str, tool: str) -> bool:
@@ -26,7 +30,7 @@ def _tool_name(name: str, tool: str) -> bool:
 
 def _lease_pid(folder: Path) -> object:
     try:
-        record = cast(object, json.loads(folder.with_name(folder.name + ".lease.json").read_text()))
+        record = cast(object, json.loads(_lease_path(folder).read_text()))
     except (OSError, ValueError):
         return None
     return cast(dict[str, object], record).get("pid") if isinstance(record, dict) else None
