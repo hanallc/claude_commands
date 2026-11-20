@@ -49,7 +49,7 @@ class VerifyTokenDetachTests(VerifyTokenWaitFixture):
 
 
 class VerifyTokenDetachInsideDetachedRunTests(VerifyTokenDetachTests):
-    """The same calls from a suite that a detached run started, as a merge gate does."""
+    """The same calls from a suite that a detached run started, as a gate does."""
 
     outer_record: ClassVar[Path]
 

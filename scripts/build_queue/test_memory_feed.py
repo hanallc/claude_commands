@@ -367,7 +367,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
+            + "names.merge-gate=gate\nnames.targeted-test=targeted test\n"
             + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
             + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
             + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")

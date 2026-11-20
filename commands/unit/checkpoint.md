@@ -174,7 +174,7 @@ Loop/verbose only:
    Add ` | image <id>` last, after ` | after <step>` when present.
    Use a change image id or an Images page id. A pair supplies its after image.
    The commit hook refuses a visible line without an image.
-   Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time.
+   The integrate job requires the image for commits dated at or after 2026-11-16 00:00 EST. It uses the Git committer time.
    Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart | image <id>`.
    The session that completes the step runs the printed `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>` command.
    A change the user can check outside the app counts as visible too: a

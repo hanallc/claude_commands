@@ -2235,7 +2235,7 @@ def command_tail(command: list[str]) -> list[str]:
 
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
-    """Give commands a private source snapshot and retain the merge gate's slot."""
+    """Give commands a private source snapshot and retain the gate's slot."""
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     with ExitStack() as scope:

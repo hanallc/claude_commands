@@ -521,9 +521,10 @@ def trend(connection: sqlite3.Connection, days: int) -> None:
         groups[row.place, row.selection].append(row)
     if not groups:
         print("no gate runs recorded yet")
+        return
     for (place, selection), daily_rows in sorted(
             groups.items(), key=lambda item: (item[0][0], item[0][1] != "full")):
-        label = "targeted tests" if selection == "affected" else "merge gates"
+        label = "targeted tests" if selection == "affected" else "full suite runs"
         print(f"{place} {label}")
         headers = TREND_HEADERS + (["median modules run"] if selection == "affected" else [])
         rendered: list[tuple[str, ...]] = []
@@ -571,7 +572,8 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     _ = top_parser.add_argument("--limit", type=positive, default=20)
     _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
     _ = top_parser.add_argument("--host", default=store.host_name())
-    trend_parser = subcommands.add_parser("trend", help="show daily CPU, wall time and cost for targeted tests and merge gates")
+    trend_parser = subcommands.add_parser("trend",
+        help="show daily CPU, wall time and cost for targeted tests and full suite runs")
     _ = trend_parser.add_argument("--days", type=positive, default=conf.read("test_times").whole("TREND_DAYS"))
     suites_parser = subcommands.add_parser("suites", help="show gate runs")
     _ = suites_parser.add_argument("--days", type=positive, default=7)

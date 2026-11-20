@@ -57,7 +57,7 @@ class StepNames:
 
 @dataclass(frozen=True)
 class OtherCommand:
-    """The command is not a merge gate, a targeted test or verify.sh."""
+    """A command outside the gate, targeted test, and verify.sh routes."""
 
 
 OTHER_COMMAND = OtherCommand()
@@ -260,7 +260,7 @@ def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> 
 
 
 def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
-    """A merge gate tests every module; a targeted test tests the affected modules unless --full."""
+    """A gate test runs all modules by default. Targeted tests select affected modules unless --full is set."""
     modules = _count(arguments, "--module")
     if modules:
         return StepJob("test-modules", modules=modules)
@@ -268,7 +268,7 @@ def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
 
 
 def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
-    """Name the job of a merge gate, targeted test or verify.sh command."""
+    """Name the job of a gate, targeted test or verify.sh command."""
     program = _program(argv)
     if isinstance(program, OtherCommand):
         return program

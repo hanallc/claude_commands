@@ -288,7 +288,7 @@ The sweep also reads old six-character shell suffixes until 2026-12-03.
 `ExplicitBuildParent` retains an explicit parent.
 `SystemTemporaryParent` uses the short system parent for socket and index folders.
 `UnitRunParent` reads the current root from `unit_runs.run_roots()`.
-The merge gate checks `/dev/shm` before allocation and uses an explicit parent without a disk fallback.
+The gate checks `/dev/shm` before allocation and uses an explicit parent without a disk fallback.
 
 Shell callers use these forms:
 
@@ -618,7 +618,7 @@ The existing unreachable limit still applies until a valid reply arrives.
 
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
-The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+The gate reads `program_first_peak_gib.merge-gate` when it starts. Its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
@@ -1022,7 +1022,7 @@ It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the s
 The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
 The head must wait at least that long. At least one step must hold memory.
 The last admission or step start with a memory need above zero must also be at least that old.
-Merge gates and targeted tests start with a memory need of zero.
+Gates and targeted tests start with a memory need of zero.
 The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
 
 The watch sends one alert per stall to each of the `builds` and `bob` sessions.
@@ -1382,7 +1382,7 @@ With a call id, the record decides.
 Verify routes eligible steps to the Mac and waits for other steps.
 Their running natedev test and type-check children still stop.
 They write stopped rows with the PID and start time.
-The merge gate reads those rows and reruns the stopped modules after release.
+The gate reads those rows and reruns the stopped modules after release.
 No run pauses: cargo must release `/dev/steve` slots and locks, and wall-clock limits continue.
 
 `clear` starts the user unit `build-hold-enforcer` with absolute paths, or keeps an active unit.
@@ -1411,7 +1411,7 @@ Runs shorter than one pass can finish first, so call guards refuse those starts.
 The Bash front reads stdin once.
 It starts no Python when the hold directory has no entry.
 It also starts no Python when the input has none of `cargo`, `merge_gate`, or `targeted_test`.
- An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and merge gates must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
+ An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and gates must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
 The cargo verbs include `mend` and `miri`; the guard does not match `verify.sh` step names or options.
 The guard also refuses `merge_gate.py` and `targeted_test.py` in every mode under the same hold decision.
 This applies to direct calls and calls through Python or `lib/py`.
@@ -1787,7 +1787,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
 - Only a phone-floor crossing reaches the phone, with current text approval; diagnostics go to natedev.
 - Tests never read the real cgroup tree, `/proc/meminfo`, `/proc/pressure/memory`, journal or transcripts, and never write `~/.local/state/buildlog`, `build-hold`, `build-hold-release`, `notify` or the agent notes: they take `BUILDLOG_MEMINFO` and `BUILDLOG_MEMORY_PRESSURE` from `scripts/lint/memory_test_support.py`, set `BUILDLOG_*_CGROUP`, `BUILDLOG_TRANSCRIPTS`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `HOME`, and stub `journalctl`, `zramctl`, cargo and git on `PATH`. Tests set the hold variables for a checkout's scripts; installed scripts refuse to run with them set.
-- When `BUILDLOG_LIVE_MEMORY_TRIPWIRE` names a record file, the shell gate and Python checker refuse a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` before reading it, append a JSON record, and name the fake readings the test must set. The merge gate sets this variable for every test module and fails any module with a recorded live reading. The default-path test removes the tripwire but supplies fake pressure text. A failed record write still refuses the reading but leaves no record, so the gate detects only recorded readings.
+- When `BUILDLOG_LIVE_MEMORY_TRIPWIRE` names a record file, the shell gate and Python checker refuse a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` before reading it, append a JSON record, and name the fake readings the test must set. The gate sets this variable for every test module and fails any module with a recorded live reading. The default-path test removes the tripwire but supplies fake pressure text. A failed record write still refuses the reading but leaves no record, so the gate detects only recorded readings.
 - A verify.sh routing test follows `scripts/direct/test_verify_untested_examples.py`: cargo passes `metadata` to real cargo and logs every other call, git is stubbed, and the environment drops `UNIT_RUN_DIR`/`UNIT_TEAM_ROLE` and sets `BUILDLOG_OFF=1`, `BUILDLOG_SCOPE=0`, `BUILDLOG_MEMINFO`, `BUILD_HOLD_DIR` and `CARGO_TARGET_DIR`. Tests set `BUILD_HOLD_DIR` for a checkout's scripts; installed scripts refuse to run with it set.
 - Times shown are in the user's zone through `user_zone()`; stored instants are UTC. An `HH:MM` release ETA names the zone in which it was supplied.
 
@@ -2049,7 +2049,7 @@ The wait ends at the next line, which reports the tokens taken.
 `NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
 The admission reading stores it in the running step's `measured.counter`.
 A row without a counter shows `—`.
-Local builds, merge gates, and cloud rows use their recorded counters.
+Local builds, gates, and cloud rows use their recorded counters.
 hana CI currently has no admission counter.
 The Running table shows hana CI only when a recorded runner has a busy job.
 Idle or unreadable runners have no separate Running row.
@@ -2123,11 +2123,11 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 
 ### Progress memory profiles
 
-Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
+Gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
 Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need.
 
-Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.
+Cargo build, check, clippy, mend, nextest, and gates record attributed swap-backed use in five-percent phase bins.
 Progress bins and program peaks use one ranked selection rule.
 For count `n`, the rule selects the Nth-highest value, with `N = min(n, max(floor, n * share // 100 + 1))`.
 `peak_history_share_percent=10` sets the share in `config/build_admission.conf`; its whole-percent range is 0 through 50.
@@ -2139,7 +2139,7 @@ It rebuilds merged profiles when the rank or share changes.
 The service applies each step's recorded headroom rule to the highest selected bin within its look-ahead window.
 `progress_lookahead_percent` is read at use; its initial value is 20.
 The window crosses Cargo phase boundaries, including repeated build phases.
-The merge gate window stops at the end of `suites:1`, even when history contains rerun phases.
+The gate window stops at the end of `suites:1`, even when history contains rerun phases.
 Reruns without a measured window retain the full need. Each step has its own history key.
 Missing counters, profiles, or anonymous readings retain the full need.
 Each saved record names its peak reading source with `ScopeReading` or `ProcessTreeReading`.
@@ -2289,7 +2289,7 @@ It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
 Rows without a key cannot prove a fresh build.
 The broader `BUILDLOG_TREE` field cannot replace this key.
 
-The merge gate and style lint own private folders through `build_folders.temporary_build_folder`.
+The gate and style lint own private folders through `build_folders.temporary_build_folder`.
 The contexts remove these folders after success or an exception.
 Style review keeps its input folder for the review worker and finish command.
 Session TMPDIRs and unit session folders remain for later session commands.

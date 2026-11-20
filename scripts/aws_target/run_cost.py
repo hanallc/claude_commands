@@ -16,9 +16,10 @@ from scripts.aws_target import hana_spend, ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
+from scripts.lib.build_steps import read_step_names
 
-KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
-EVERY_KIND = tuple(mode for mode, _label in KINDS)
+KINDS = ('merge-gate', 'targeted-test')
+EVERY_KIND = KINDS
 _MODE_ALIASES = {'gate': 'merge-gate', 'test-affected': 'targeted-test'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
@@ -72,16 +73,26 @@ def read_deployed_gate_variants(directory: Path, types: tuple[str, ...], home: s
 class RunScope:
     """The run kinds that one cost table counts."""
     name: str
-    # The filter label on the AWS page.
-    label: str
-    # One run of this scope, as the table headers and sentences name it.
-    noun: str
     modes: tuple[str, ...]
 
+    @property
+    def noun(self) -> str:
+        """Name one run in table headings and sentences."""
+        return 'run' if self.name == 'both' else read_step_names().shown(self.name)
 
-SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
-          RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
-          RunScope('both', 'Both', 'run', EVERY_KIND))
+    @property
+    def label(self) -> str:
+        """Name the filter on the AWS page."""
+        if self.name == 'both':
+            return 'Both'
+        if self.name == 'targeted-test':
+            return 'Targeted runs'
+        return f'{self.noun}s'.capitalize()
+
+
+SCOPES = (RunScope('merge-gate', ('merge-gate',)),
+          RunScope('targeted-test', ('targeted-test',)),
+          RunScope('both', EVERY_KIND))
 
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
@@ -601,7 +612,7 @@ def gate_variant_eligibility(
 def merge_gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,
                            policy: conf.ConfigRead, *, gate_pricing: GatePricingInputs | None = None,
                            ) -> tuple[GateTimeComparison, ...]:
-    """Compare the cheapest priced 16-vCPU and 32-vCPU merge gates in each region."""
+    """Compare the lowest prices for 16-vCPU and 32-vCPU gates in each region."""
     regions = tuple(dict.fromkeys(values.words('regions')))
     home = policy.text('region')
     missing = NoPricedGateVariant()

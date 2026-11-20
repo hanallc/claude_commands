@@ -21,7 +21,7 @@ class TargetedTestTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # The fixture's main branch has no merge gate pass.
+        # The fixture's main branch has no gate pass.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf",
                                  "landing_branches=fixture-landing\nscan_roots=\n")
 

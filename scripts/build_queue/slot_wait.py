@@ -18,7 +18,8 @@ from threading import Thread
 from scripts.lib import conf
 from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
-                                     command_script, is_recorded_step, queue_identifier, script_file, verify_command)
+                                     command_script, is_recorded_step, queue_identifier, read_step_names, script_file,
+                                     verify_command)
 from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
                                                 GateJobNotRecorded, NotVerifyCall, VerifyCall, VerifyStep)
@@ -37,9 +38,9 @@ def public_queue_text(text: str) -> str:
 
 
 class QueueKind(Enum):
-    """A fixed name for queue work without a verify or script name."""
+    """A kind of queue work without a verify or script name."""
 
-    MERGE_GATE = "merge gate"
+    MERGE_GATE = "merge-gate"
     CI = "hana CI"
     COMPILER_CACHE = "compiler cache"
     MAC = "Mac builds"
@@ -54,7 +55,8 @@ class QueueRowName(str):
 
     @classmethod
     def fixed(cls, kind: QueueKind) -> QueueRowName:
-        return str.__new__(cls, kind.value)
+        name = read_step_names().shown(kind.value) if kind is QueueKind.MERGE_GATE else kind.value
+        return str.__new__(cls, name)
 
     @classmethod
     def owner_only(cls, owner: str) -> QueueRowName:

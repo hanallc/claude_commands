@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Contracts for the gate suites."""
 
 from __future__ import annotations
 from scripts.build_queue import admission_records

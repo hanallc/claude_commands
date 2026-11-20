@@ -131,9 +131,9 @@ def failed_tests(output: str) -> frozenset[str]:
     return frozenset(NEXTEST_FAIL.findall(output))
 
 
-# A red module in the merge gate output: `--- accounts/test_accounts.py exit=1 ---`.
+# A red module in the gate output: `--- accounts/test_accounts.py exit=1 ---`.
 GATE_RED = re.compile(r"^--- (\S+) (?:rerun alone )?exit=(-?\d+) ---$", re.MULTILINE)
-# A module that the merge gate passed when it ran the module again alone.
+# A module that the gate passed when it ran the module again alone.
 GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit=", re.MULTILINE)
 
 
@@ -142,7 +142,7 @@ def runs_merge_gate(command: Sequence[str]) -> bool:
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
-    """Return the red gate modules of a merge gate command, or the red nextest tests of another command."""
+    """Return the failed modules for a gate command or the failed nextest tests for another command."""
     if not runs_merge_gate(command):
         return failed_tests(output)
     green = frozenset(GATE_GREEN_ALONE.findall(output))

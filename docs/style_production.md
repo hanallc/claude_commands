@@ -264,7 +264,7 @@ Reconciliation processes predecessors first.
 The ledger repeats the disjoint-footprint proof inside the assignment transaction.
 Widening, finding follow or replace, base or tip changes, and checkpoint writes revalidate the footprints under the same write lock.
 A conflict or unreadable footprint cancels the write. Resume and the gate recheck before publishing
-work. Merge checks again, including after the predecessor has merged. These
+work. The ledger checks again at merge time, including after the predecessor merges. These
 checks include both bases and checkpoints, the live unit and style tips, and
 the tickets' actual committed paths, so later references and unplanned edits
 cannot bypass the original check. An existing overlapping pair waits for
@@ -307,7 +307,7 @@ contains main nor is its ancestor, a rename or copy anywhere in the range, or
 an unknown crate for a selected file holds refill closed. The pushed tip is `origin/<branch point>`, or the
 local branch when the repository has no `origin`. The checkouts share one
 repository, so the local branch can hold a parent merge whose gate is still
-running. Reconcile and the hand-off merge check read the same pushed tip.
+running. Reconcile and handoff verification read the same pushed tip.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before

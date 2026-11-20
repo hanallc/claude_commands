@@ -12,6 +12,7 @@ import sys
 from scripts.build_targets import build_targets
 from scripts.build_hold import build_hold
 from scripts.build_targets.targets import Held, StateUnreadable, target_state
+from scripts.lib.build_steps import read_step_names
 
 
 class HoldStateReadError(ValueError):
@@ -34,9 +35,10 @@ def hold_applies() -> str:
         if not isinstance(state, Held):
             raise HoldStateReadError("holder file exists; target state disagrees")
         names = "; ".join(build_hold.holder_text(holder) for holder in holds.in_force)
+        step = read_step_names().shown("merge-gate")
         return (f"natedev builds are held by {names}. Keep working, writes included. "
-                "Use verify.sh: eligible steps go to the Mac; other steps wait. "
-                "Raw cargo and merge gates must wait for the hold to end.")
+                + "Use verify.sh: eligible steps go to the Mac; other steps wait. "
+                + f"Raw cargo and {step}s must wait for the hold to end.")
     except (OSError, UnicodeError, ValueError) as error:
         raise HoldStateReadError(str(error)) from error
 

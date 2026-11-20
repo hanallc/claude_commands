@@ -33,8 +33,8 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     """Read step labels from the queue fixture."""
     _ = (fixture.root / "build_steps.conf").write_text(
         "names.targeted-test=targeted test\n"
-        + "names.merge-gate=merge gate\n"
-        + "prose.merge-gate=merge gate\n"
+        + "names.merge-gate=gate\n"
+        + "prose.merge-gate=the gate\n"
         + "owned.targeted-test={unit} targeted\n"
         + "owned.merge-gate={unit} merge\n"
         + "owned.showrunner-merge-gate=showrunner merge\n"
@@ -575,9 +575,9 @@ class CloudQueueViewTests(unittest.TestCase):
             ("targeted-test", director, "panes targeted"),
             ("merge-gate", director, "panes merge"),
             ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
+            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "gate"),
             ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "gate"),
             ("build", director, "panes build"),
             ("literal{step}", director, "panes literal{step}"),
         ):
@@ -591,7 +591,7 @@ class CloudQueueViewTests(unittest.TestCase):
         configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
         self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
         self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
-        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
+        self.assertEqual(configured.names.prose("merge-gate"), "the gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

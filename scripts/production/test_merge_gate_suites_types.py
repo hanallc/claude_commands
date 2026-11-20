@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Contracts for the gate suites."""
 
 from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture

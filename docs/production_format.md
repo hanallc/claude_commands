@@ -265,7 +265,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
    When several small changes are coming, hold their notices and send them together.
-   The merge gate lands them in one batch run.
+   The integrate job lands them in one batch.
 
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.

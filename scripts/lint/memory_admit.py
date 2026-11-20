@@ -199,7 +199,7 @@ def merge_gate_shape(argv: Sequence[str]) -> str:
 
 
 PROC = Path("/proc")
-# These cargo subcommands compile; arbitrary programs and merge gates run.
+# These cargo subcommands compile. Arbitrary programs and gates run.
 
 
 HEADROOM_FACTOR_CLASSES: dict[str, type[ReleaseHeadroom | LegacyDevMultiplierHeadroom | DevSizeHeadroom]] = {

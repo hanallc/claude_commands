@@ -24,6 +24,7 @@ from typing import Literal, NotRequired, TypedDict
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_steps import read_step_names
 from scripts.review_links import console_theme, page_frame, review_link
 
 PAGE_NAME = 'aws_prices.html'
@@ -368,7 +369,8 @@ def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) ->
                '32 vCPU break-even (USD/min)')
     rows = tuple((row.region, *cells(row.small), *cells(row.large), break_even(row))
                  for row in sorted(comparisons, key=lambda row: region_filter_key(row.region)))
-    return spot_table.Table('32-vCPU merge gate break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
+    step = read_step_names().shown('merge-gate')
+    return spot_table.Table(f'32-vCPU {step} break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
 
 
 def without_prices(table: spot_table.Table) -> spot_table.Table:

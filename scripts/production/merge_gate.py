@@ -12,7 +12,7 @@ After the parallel pass, up to eight failed test modules run once more, alone.
 Time-limited jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without changing git refs or files.
-Clean trees reuse full passes on the same host. Merge gates run all modules.
+Clean trees reuse full passes on the same host. Full test runs use all modules.
 Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
 SharedMachine is the default. WholeMachine uses one job per CPU without shared admission or failure reruns.
 Merge and tests-only runs omit type checks.
@@ -1417,7 +1417,7 @@ def module_runner(repo: Path) -> Path:
 
 
 def gate_test_parent(tmpfs: Path) -> Path:
-    """The tmpfs parent that holds only the leased folders of merge gate test classes.
+    """The tmpfs parent that holds only the leased folders of gate test classes.
 
     tmpfs (/dev/shm) is shared with other programs, so the sweep runs only on this parent.
     """
@@ -2505,7 +2505,7 @@ def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
     owner = nightly_owner_name(GateArguments(merge_branch=result.branch))
     minutes = int((now - datetime.fromisoformat(result.finished)).total_seconds() // 60)
     outcome = showrunners.tell(owner, f"merge-gate-nightly-unassigned:{result.id}",
-        f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
+        f"The test nightly result {result.id} has no assigned fix after {minutes} minutes. "
         + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
         + f"The user gets the result push only after assignment: merge_gate.py nightly-assigned --result {result.id} --unit UNIT.")
     print(f"Nightly assignment alert: {outcome}", flush=True)
@@ -2727,7 +2727,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
     requires_full = bool(failed) or not type_failures
     try:
         detail = (f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
-                  + "Every merge gate now requires the full suite until a merge gate passes."
+                  + "Every gate run requires the full suite until one passes."
                   if requires_full else "Tests passed. A type failure does not require full test runs.")
         if type_failures:
             lines = [line for job in type_failures for line in job.output.splitlines()]
@@ -2744,7 +2744,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)
         outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
-                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
+                                   f"The test nightly job failed on {args.merge_branch} at tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
         if outcome == f"told {owner}":
             return NightlyNoticeReceived(datetime.now(UTC).isoformat())
@@ -2986,7 +2986,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
-    _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
+    _ = parser.add_argument("--body", default="The integrate job verified this checkpoint.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production staff name (default: the calling showrunner's)")

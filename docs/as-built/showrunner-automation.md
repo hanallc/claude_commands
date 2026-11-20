@@ -310,10 +310,10 @@ Each local Promote checkout must exist before the command pushes.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
      Otherwise, restore the tip before the checkpoint merge while origin still has its old tip.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
-     A red names its failed nextest tests, or the red modules of a merge gate command (`--- <suite>/<module> exit=<rc> ---`).
+     A failure names the failed nextest tests or the failed gate modules (`--- <suite>/<module> exit=<rc> ---`).
      A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
   8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
-     The run is limited to its red names, with `--filter`, `-E test(=<name>)` or the merge gate's `--module <suite>/<module>`.
+     Limit the run to failed names with `--filter`, `-E test(=<name>)`, or the gate's `--module <suite>/<module>`.
      The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
      A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
      The unit gets a repair line only for its own red names.
@@ -360,12 +360,12 @@ Each local Promote checkout must exist before the command pushes.
   An invisible change uses `Change-Review: none — <why>`.
   `problem` reads both visible forms through the shared parser.
   A merge message can carry only invisible lines.
-  The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
+  The hook and the integrate job reject visible lines and `Change-Review-Covers` lines on merge commits.
   A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
   A malformed line holds any unit commit, whatever its subject, unless a later plain commit covers it.
   Other commits need no line.
   `Change-Review-Covers: <hash>` names each covered commit.
-  The merge gates retain their staff reads before publication.
+  The integrate job retains its staff reads before publication.
 
   Merge callers use `list_ready` after promotion succeeds or the Mac pull enters the shared pending queue.
   A failed required step adds no rows.

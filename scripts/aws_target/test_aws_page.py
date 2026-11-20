@@ -860,7 +860,7 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
             with self.subTest(region=region):
                 self.assertEqual(prices_by_region[region], row[4])
                 self.assertEqual(prices_by_region[region], f'{pricing.expected_usd(Decimal("0.6"), size, region):.4f}')
-                self.assertIn({'region': region, 'summary': f'Cheapest merge gate: {size} in {region}, {row[4]} USD (estimate)'},
+                self.assertIn({'region': region, 'summary': f'Cheapest gate: {size} in {region}, {row[4]} USD (estimate)'},
                               merge_gates['estimates'])
         spot_prices = page['prices'][0]
         for region, instance_type, spot, gate in (

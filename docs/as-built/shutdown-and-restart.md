@@ -840,7 +840,7 @@ A stopped worker's result goes to its parent. A stopped parent's result waits in
 A bare call from a Claude director stays attached.
 `assign.sh` does not detach the commands that its worker starts later.
 
-A merge gate in a Claude background shell has no proved survival.
+Survival of a gate run in a Claude background shell is unproved.
 `copies.py run` starts the gate attached, and `merge_gate.py` stops its module groups on TERM or HUP.
 Before another run, check for a complete saved gate result.
 Put a gate that must survive a restart in a detached run.
