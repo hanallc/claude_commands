@@ -3231,6 +3231,17 @@ Tests: one row in the existing bare copy removal test, failing first.
 
 Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
 
+### Phase 44dt — Base red on main: copies slot and memory queue tests pass under load  · status: todo
+**From builds, 2026-11-20 00:39 EST (base red on main 861d6408c; sdlc phase 86 and admin-console gates each failed twice, and once on a main rerun at load 49).** Ahead of the other unstarted work. Fast phase. Base: main 3d49d35e9. Logs: /tmp/claude/unit/29fc6964-2d74-4547-8edd-8764df425c44/phases/86/gate.log, rerun.log, main_rerun.log.
+
+1. `copies/test_slot_order.py` `test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time`: the first recorded field is `""`, not `"4242"`.
+2. `copies/test_copies.py` `test_run_uses_tree_cwd_substitution_and_command_exit_status`, cases `touched-slot-file` and `retained-slot-file`: exit 1 with `copies: publish: target/debug/x not built`.
+3. `lint/test_memory_admit.py` `test_detached_verify_cargo_and_lint_steps_ask_the_private_queue` (check and lint get `NoRun()`), and `test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width` (`1` for `0`).
+
+Fix: reproduce each on main 3d49d35e9, under load if needed. Find the cause: a product race or a test that depends on timing. Fix the cause where it lives. Do not add retries, sleeps or longer timeouts to hide a race.
+
+Tests: the three modules pass 20 times in a row under load, and each fix has a row that fails first on main where a row can show it.
+
 ### Phase 44ds — A busy Linux reservation gets no second assignment from old evidence  · status: todo
 **From builds, 2026-11-19 22:55 EST (found by natest phase 396).** Ahead of the other unstarted work. Base: main 14c8b1f60.
 
