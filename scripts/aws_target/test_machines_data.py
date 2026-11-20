@@ -37,13 +37,13 @@ class MachinesDataTests(unittest.TestCase):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         page_path = self.directory / 'aws_page.conf'
         _ = page_path.write_text("""# whole: 1..
-machines_window_days=7
+machines.window_days=7
 # whole: 1..
-machines_small_sample_checks=2
+machines.small_sample_checks=2
 # range: 1..10
-machines_ratio_max=1.75
+machines.ratio_max=1.75
 # range: 0.01..1
-machines_ratio_step=0.25
+machines.ratio_step=0.25
 """)
         gate_path = self.directory / 'cloud_gate.conf'
         _ = gate_path.write_text("""instance_types=c7a.4xlarge c7a.8xlarge m7a.8xlarge

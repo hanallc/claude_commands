@@ -295,7 +295,7 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
     run_mode = 'targeted-test' if mode == 'test-affected' else mode
     concurrency = _concurrent_starts(intervals)
     quota_assumption = Decimal(gate.whole('spot_quota_request_vcpus'))
-    small_sample_checks = configuration.page.whole('machines_small_sample_checks')
+    small_sample_checks = configuration.page.whole('machines.small_sample_checks')
     samples: dict[ledger.GateRateCandidate, list[Decimal]] = defaultdict(list)
     runs: list[run_cost.FinishedGateRun] = []
     for interval in intervals:
@@ -381,12 +381,12 @@ def read_machines_data(directory: Path, now: int,
         configuration = MachinesConfiguration(conf.read_or_repository('aws_page'), cloud_gate.settings(),
                                                conf.read_or_repository('aws_target'))
     page = configuration.page
-    days = page.whole('machines_window_days')
-    ratio_max = page.value('machines_ratio_max', conf.decimal)
-    ratio_step = page.value('machines_ratio_step', conf.decimal)
+    days = page.whole('machines.window_days')
+    ratio_max = page.value('machines.ratio_max', conf.decimal)
+    ratio_step = page.value('machines.ratio_step', conf.decimal)
     intervals, remainder = divmod(ratio_max - _RULE_OFF, ratio_step)
     if remainder:
-        raise conf.Unusable('machines_ratio_max must lie on a slider step from 1.00')
+        raise conf.Unusable('machines.ratio_max must lie on a slider step from 1.00')
     ratios = tuple(_RULE_OFF + step * ratio_step for step in range(int(intervals) + 1))
     end = datetime.combine(datetime.fromtimestamp(now, UTC).date(), time.min, UTC)
     start = end - timedelta(days=days)
