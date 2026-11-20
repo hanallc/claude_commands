@@ -1835,12 +1835,19 @@ class AdmissionServer:
         rows = self._ordered_waiters()
         if isinstance(self.priority, records.NoQueuePriority):
             return rows, self.priority
-        ci_waiters = {path: row for path, row in rows if row.get("ci_runner")}
-        sessions = [row.get("session_id", "") for path, row in rows if path not in ci_waiters and not row.get("unit")]
-        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
         # Match CI priority by runner. Keep the runner out of the published unit field.
-        ranking_rows: list[tuple[Path, records.Waiter]] = [
-            (path, {**row, "unit": row["ci_runner"]} if path in ci_waiters else row) for path, row in rows]
+        ci_waiters: dict[Path, records.RankedWaiter] = {}
+        sessions: list[str] = []
+        ranking_rows: list[tuple[Path, records.Waiter]] = []
+        for path, row in rows:
+            if runner := row.get("ci_runner"):
+                ci_waiters[path] = row
+                row = row.copy()
+                row["unit"] = runner
+            elif not row.get("unit"):
+                sessions.append(row.get("session_id", ""))
+            ranking_rows.append((path, row))
+        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
         ranked, priority = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(self.priority, labels))
         return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
                  if path in ci_waiters else row) for path, row in ranked], priority
