@@ -118,12 +118,14 @@ import subprocess
 import sys
 import time
 from contextlib import redirect_stdout
+from signal import SIGTERM
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import eligibility, offload, mac_test, claim_state
-from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
+from scripts.build_queue import admission_client, admission_protocol as queue_wire, execution_identity, placement
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -141,11 +143,12 @@ reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_o
 same_path = False
 remote_output = ""
 remote_status = 0
-check_start_fence = mode in ("start-fence-confirmed", "start-fence-unconfirmed")
+check_start_fence = mode in ("start-fence-confirmed", "start-fence-unconfirmed",
+                             "start-fence-interrupted", "start-release-unconfirmed")
 
 def run_start_fence(command):
     settled = real_run(["bash", "-c", command], capture_output=True,
-                       text=True, check=False, timeout=5)
+                       text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
     assert settled.returncode == 0, settled.stderr
     return settled.stdout
 
@@ -172,6 +175,8 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if len(arguments) > 2 and arguments[2] == "release":
         parsed = mac_test.parser().parse_args(arguments[2:], namespace=mac_test.CliArguments())
         actions.append("release")
+        if mode == "start-release-unconfirmed":
+            return offload.CommandOutput(1, "", "release was not confirmed")
         return offload.CommandOutput(mac_test.command_release(parsed, mac_test.state_paths(parsed.target)), "", "")
     versions = {("rustc", "-V"): "rustc fixture",
                 ("cargo", "nextest", "--version"): "nextest fixture",
@@ -262,8 +267,13 @@ def commands(arguments, **options):
         identity = controller.claim_identity
         if check_start_fence and isinstance(identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(identity, request.target, settle=True, scope_key=controller.claim_scope_key)
-            assert arguments[-1].startswith(command + " || exit 1\n")
-            if mode == "start-fence-confirmed":
+            settles_fence = arguments[-1].startswith(command + " || exit 1\n")
+            if mode == "start-fence-interrupted":
+                if settles_fence:
+                    actions.append("settle-start")
+            else:
+                assert settles_fence
+            if mode in ("start-fence-confirmed", "start-release-unconfirmed"):
                 fence = run_start_fence(command)
         elif not unresolved and count == 0 and isinstance(identity, claim_state.ClaimIdentity):
             fence = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
@@ -271,15 +281,37 @@ def commands(arguments, **options):
             "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
     return real_run(arguments, **options)
 
+real_consume_permission = admission_client.consume_permission
+read_authorization_line = admission_client._line
+
+def interrupt_on_closed_authorization(connection, pending, deadline):
+    try:
+        return read_authorization_line(connection, pending, deadline)
+    except admission_client.TransportUnavailable:
+        raise offload.OffloadInterrupted(SIGTERM) from None
+
+def consume_permission(permission):
+    if mode != "start-fence-interrupted":
+        return real_consume_permission(permission)
+    # Inject the interrupt at EOF, before the client can reconnect for status.
+    with mock.patch.object(admission_client, "_line", side_effect=interrupt_on_closed_authorization):
+        return real_consume_permission(permission)
+
 started = time.monotonic()
+interrupted_status = 0
 with mock.patch.object(controller, "complete_claim", side_effect=complete), \
      mock.patch.object(controller, "capture", side_effect=capture), \
      mock.patch.object(controller, "stream_mac_run", side_effect=stream), \
      mock.patch.object(offload, "copy_tracked_scripts", side_effect=copy_scripts), \
      mock.patch.object(offload, "copy_tree_with_key", side_effect=copy_source), \
      mock.patch.object(offload, "trusted_linux_source", return_value=True), \
+     mock.patch.object(admission_client, "consume_permission", side_effect=consume_permission), \
      mock.patch.object(subprocess, "run", side_effect=commands):
-    result = offload.run_offload(controller, config, request, started)
+    try:
+        result = offload.run_offload(controller, config, request, started)
+    except offload.OffloadInterrupted as interrupted:
+        interrupted_status = 128 + interrupted.signal_number
+        result = offload.LostMacRun(offload.elapsed_seconds(started), "interrupted during authorization")
 
 configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
 if not configured_mode.endswith("-once"):
@@ -312,8 +344,8 @@ event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.
 with (root / "ssh-events.jsonl").open("a") as output:
     output.write(json.dumps(event) + "\n")
 try:
-    status = offload.write_result(result, request.result, request.last_decline, request.verb,
-                                  request.target, controller.attempt_evidence)
+    status = interrupted_status or offload.write_result(result, request.result, request.last_decline, request.verb,
+                                                        request.target, controller.attempt_evidence)
 finally:
     try:
         offload.report_placement_result(controller, request, result)

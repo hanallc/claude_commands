@@ -405,6 +405,11 @@ class PendingClaimOperation:
 
 
 @dataclass(frozen=True)
+class PreparedStartOperation:
+    """The start fence needs settlement if the runner does not send the command."""
+
+
+@dataclass(frozen=True)
 class PendingStartOperation:
     """The remote start has no acknowledgement and can still arrive."""
 
@@ -900,7 +905,10 @@ class ProcessController:
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
         self.placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
-        self.pending: SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | AcknowledgedStartOperation | PendingHanaOperation = SettledDispatchOperations()
+        self.pending: (
+            SettledDispatchOperations | PendingClaimOperation | PreparedStartOperation | PendingStartOperation
+            | AcknowledgedStartOperation | PendingHanaOperation | ClaimReleaseUnconfirmed
+        ) = SettledDispatchOperations()
         self.hana_output: HanaCommandOutput = HanaCommandOutput()
         self.hana_record_writes: list[OffloadRecordWrite] = []
         self.hana_settlement: hana_execution.HanaSettled | NoHanaSettlement = NoHanaSettlement()
@@ -917,19 +925,15 @@ class ProcessController:
         if not isinstance(active, RunningProcess):
             return
         process = active.process
-        if process.poll() is not None:
-            self.active = IDLE_PROCESS
-            if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
-                self.pending = SettledDispatchOperations()
-            return
-        process.terminate()
-        try:
-            _ = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            _ = process.wait()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                _ = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _ = process.wait()
         self.active = IDLE_PROCESS
-        if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
+        if isinstance(self.pending, AcknowledgedStartOperation):
             self.pending = SettledDispatchOperations()
 
     def defer_claim_interrupt(self, signal_number: int) -> bool:
@@ -2538,6 +2542,36 @@ def authorize_ssh_start(controller: ProcessController, assignment: placement.Pla
         time.sleep(records.read_memory_config().waiting_pass_seconds)
 
 
+def finish_claimed_run(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
+                       repository: KnownRepository, *, release_allowed: bool, sync_after_release: bool) -> None:
+    """Settle a prepared start before releasing its exact claim."""
+    evidence = controller.attempt_evidence
+    if isinstance(controller.pending, PreparedStartOperation):
+        settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
+        release_allowed = isinstance(settlement, StartSettled)
+        observe_cleanup(evidence, settlement.leftovers)
+        report_leftover_check(settlement.leftovers, request)
+    evidence.cleanup = "confirmed" if release_allowed else "unconfirmed"
+    evidence.evidence_at = time.time()
+    if not release_allowed or not isinstance(controller.pending, SettledDispatchOperations):
+        return
+
+    evidence.unresolved_count = 0
+    released: ClaimReleaseConfirmed | ClaimReleaseUnconfirmed = ClaimReleaseUnconfirmed(
+        "release ended without confirmation")
+    try:
+        released = release_claim(controller, request.target)
+    finally:
+        if isinstance(released, ClaimReleaseUnconfirmed):
+            controller.pending = released
+            evidence.cleanup = "unconfirmed"
+    if sync_after_release:
+        from scripts.buildlog import sync as buildlog_sync
+
+        with transfer_bytes.measure_transfers(evidence.traffic):
+            buildlog_sync.sync_target(request.target)
+
+
 def claimed_run(
     controller: ProcessController,
     config: OffloadConfig | hana_placement.HanaControlTransport,
@@ -2634,13 +2668,8 @@ def claimed_run(
                     not isinstance(copied.tree_key, KnownTreeKey) or copied.tree_key.value != source.key):
                 release_allowed = True
                 return DeclinedMacRun("source_changed", elapsed_seconds(started), "the copied source differs from the assignment")
+            controller.pending = PreparedStartOperation()
             if not authorize_ssh_start(controller, assignment):
-                controller.pending = PendingStartOperation()
-                settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
-                release_allowed = isinstance(settlement, StartSettled)
-                evidence.execution = execution_identity.ExecutionNotStarted()
-                observe_cleanup(evidence, settlement.leftovers)
-                report_leftover_check(settlement.leftovers, request)
                 return declined("state", started)
             evidence.launch_authorized = True
         release_allowed = False
@@ -2728,17 +2757,8 @@ def claimed_run(
             report_leftover_check(checked, request)
         raise
     finally:
-        evidence.cleanup = "confirmed" if release_allowed else "unconfirmed"
-        evidence.evidence_at = time.time()
-        if release_allowed:
-            evidence.unresolved_count = 0
-        if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            _ = release_claim(controller, request.target)
-            if sync_after_release:
-                from scripts.buildlog import sync as buildlog_sync
-
-                with transfer_bytes.measure_transfers(evidence.traffic):
-                    buildlog_sync.sync_target(request.target)
+        finish_claimed_run(controller, config, request, repository,
+                           release_allowed=release_allowed, sync_after_release=sync_after_release)
 
 
 def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:
@@ -3530,8 +3550,10 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
         outcome = placement.AttemptDeclined(result.reason)
     else:
         outcome = placement.AttemptOutcomeUnavailable("the provider has unresolved execution or cleanup")
-    path = (placement.DispatchPathSettled() if isinstance(controller.pending, SettledDispatchOperations)
-            else placement.DispatchPathPending("a claim or start child remains active"))
+    pending = controller.pending
+    path = (placement.DispatchPathSettled() if isinstance(pending, SettledDispatchOperations)
+            else placement.DispatchPathPending(pending.reason if isinstance(pending, ClaimReleaseUnconfirmed)
+                                               else "a claim or start child remains active"))
     _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
                                                                evidence.execution, outcome, path))
 

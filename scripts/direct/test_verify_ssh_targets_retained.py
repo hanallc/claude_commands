@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 
 from scripts.build_queue import execution_identity
@@ -32,12 +32,22 @@ mac_test = eligibility_support.mac_test
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_lost_authorization_releases_the_exact_settled_start(self) -> None:
-        self.check_lost_authorization(confirmed=True)
+        self.check_lost_authorization("start-fence-confirmed")
 
     def test_lost_authorization_keeps_the_exact_unsettled_start(self) -> None:
-        self.check_lost_authorization(confirmed=False)
+        self.check_lost_authorization("start-fence-unconfirmed")
 
-    def check_lost_authorization(self, *, confirmed: bool) -> None:
+    def test_interrupted_authorization_keeps_the_exact_unsettled_start(self) -> None:
+        self.check_lost_authorization("start-fence-interrupted")
+
+    def test_unconfirmed_release_after_start_settlement_reports_pending(self) -> None:
+        self.check_lost_authorization("start-release-unconfirmed")
+
+    def check_lost_authorization(self, mode: Literal[
+            "start-fence-confirmed", "start-fence-unconfirmed", "start-fence-interrupted",
+            "start-release-unconfirmed"]) -> None:
+        confirmed = mode == "start-fence-confirmed"
+        fence_settled = mode in ("start-fence-confirmed", "start-release-unconfirmed")
         self.configure("natedev,linux")
         _ = self.hold_memory()
         server = self.admission.server
@@ -59,7 +69,11 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         arguments = ["test", "sample", "--no-cache"]
         if not confirmed:
             arguments.extend(("--target", "linux"))
-        mode = "start-fence-confirmed" if confirmed else "start-fence-unconfirmed"
+        expected_actions = ["cleanup"]
+        if fence_settled:
+            expected_actions.append("release")
+        elif mode == "start-fence-interrupted":
+            expected_actions.append("settle-start")
         with mock.patch.object(server, "_send", side_effect=drop_first_authorization):
             process = self.start_verify(*arguments, extra={"TEST_SSH_MODES": json.dumps({"linux": mode})})
             self.addCleanup(self.stop_verify, process)
@@ -67,7 +81,6 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.wait_until(lambda: events_path.exists() and events_path.read_text().endswith("\n"),
                             str(events_path), (process,), directory=self.runner_state)
             first = self.ssh_events()[0]
-            expected_actions = ["cleanup", "release"] if confirmed else ["cleanup"]
             self.assertEqual(first["actions"][-len(expected_actions):], expected_actions, first)
             self.assertNotIn("run", first["actions"])
             result = self.finish_verify(process)
@@ -86,7 +99,11 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
                    and request.assignment == lost.assignment]
         self.assertEqual(report.claim, claim)
         self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
-        self.assertEqual(report.outcome, placement.PrelaunchRefused("state"))
+        if mode == "start-fence-interrupted":
+            self.assertEqual(first["result_type"], "LostMacRun")
+            self.assertIsInstance(report.outcome, placement.AttemptOutcomeUnavailable)
+        else:
+            self.assertEqual(report.outcome, placement.PrelaunchRefused("state"))
         self.assertEqual(self.local_runs(), [])
         if confirmed:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -107,9 +124,10 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.assertEqual(self.ssh_events(), [first])
             held, = caller_provider_controls(self, self.admission).claims("linux")
             self.assertEqual(claim_state.claim_identity(held.record), identity)
-            self.assertTrue(journal.exists())
+            self.assertEqual(journal.exists(), not fence_settled)
             fence = offload.start_fence_relative(identity, "linux", scope_key=held.path.stem)
-            self.assertTrue((self.home / fence.with_suffix(".lock")).exists())
+            self.assertEqual((self.home / fence.with_suffix(".lock")).exists(), not fence_settled)
+            self.assertTrue((self.runner_state / "provider-outcome-linux.json").exists())
 
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()

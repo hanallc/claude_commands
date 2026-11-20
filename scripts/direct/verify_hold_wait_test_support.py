@@ -306,12 +306,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         super().addCleanup(recorded_cleanup)
 
     @override
-    def stop_verify(self, process: subprocess.Popen[str]) -> None:
+    def stop_verify(self, process: subprocess.Popen[str]) -> tuple[str, str]:
         # Stop owned processes before draining pipes that a descendant can hold open.
         if process.poll() is None or any(
             stream is not None and not stream.closed for stream in (process.stdout, process.stderr)
         ):
-            super().stop_verify(process)
+            return super().stop_verify(process)
+        return "", ""
 
 
 class VerifyHoldWaitFixture(unittest.TestCase):
@@ -411,7 +412,7 @@ exit "$status"
         return process
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
-        self.fixture.stop_verify(process)
+        _ = self.fixture.stop_verify(process)
 
     def start_memory_queued_lint(self) -> subprocess.Popen[str]:
         """Keep the real admission client waiting behind a private memory limit."""
