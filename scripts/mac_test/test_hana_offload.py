@@ -33,7 +33,7 @@ from scripts.buildlog import record, store, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import conf, process_start
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import eligibility, offload
 
 
@@ -59,11 +59,11 @@ class HanaOffloadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.hana-aws=on\n")
         self.transport = hana.HanaControlTransport(self.root / 'hana.conf', 'fixture-host')
         _ = self.transport.settings.write_text("""\
 execution_transport=hana-control
 host=fixture-host
-enabled=on
 repository_identity=https://github.com/natepiano/hana
 kinds=check
 # whole: 1..
