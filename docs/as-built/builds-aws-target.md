@@ -63,6 +63,7 @@ When every configured stack is complete, recovery can create `deployment.json` a
 `prepare` can create a provisional `deployment.json` after a wipe.
 If a record differs, review the reported fields and run `deploy.py recover --write` to accept the replacement.
 When the preparation bundle has a different deployment ID, `recover --write` rebuilds it with the deployment ID from the stack.
+Recovery runs the same preparation checks as `prepare` and records the current time and spending decision.
 
 Restore the cost ledger, launch history, charges, timing history, and Hana lifecycle and setup records from the separate backup.
 

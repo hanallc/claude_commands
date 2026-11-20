@@ -13,7 +13,8 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import aws_trial, cloud_gate, deploy, ledger, plan_identity, remote
-from scripts.aws_target.config import deployment_record, save_deployment_record
+from scripts.aws_target.config import deployment_record, read_budget_notification_address, save_deployment_record
+from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import install_cost_settings, override_fixture_settings
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -49,6 +50,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.missing: set[str] = set()
         self.statuses: dict[str, str] = {}
         self.regional_deployment: str = DEPLOYMENT
+        self.clock: TestClock = TestClock()
 
     @override
     def setUp(self) -> None:
@@ -71,7 +73,8 @@ class DeploymentRecoveryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value=REVISION))
 
     def deployment(self) -> deploy.Deployment:
-        return deploy.Deployment(self.settings, self.state, self.output, execute=self.execute)
+        return deploy.Deployment(self.settings, self.state, self.output, execute=self.execute, clock=self.clock,
+                                 notify=lambda _event: False)
 
     def configure_preparation(self) -> None:
         root = self.state.parent
@@ -221,6 +224,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         files = (self.foundation, self.output / 'template.json', self.output / 'parameters.json',
                  self.output / 'preflight.json')
         original = [path.read_bytes() for path in files]
+        self.clock.advance(1)
 
         status, output = self.recover()
         self.assertEqual(status, 1, output)
@@ -252,7 +256,8 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.assertEqual(recovered['deployment_id'], DEPLOYMENT)
         self.assertEqual(recovered['fingerprint'], preflight['fingerprint'])
         self.assertNotEqual(recovered['fingerprint'], prepared.fingerprint)
-        self.assertEqual(preflight['at'], prepared.at)
+        self.assertEqual(preflight['at'], self.clock.now)
+        self.assertGreater(ledger.instant(preflight, 'at'), prepared.at)
 
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue')
                    for row in ledger.rows(self.stack(HOME, STACK), 'Outputs')}
@@ -262,6 +267,56 @@ class DeploymentRecoveryTests(unittest.TestCase):
               mock.patch.object(subject, 'scaler_key')):
             self.assertEqual(subject.apply(approve_resources=True), outputs)
         self.assertEqual([path.read_bytes() for path in files], recovered_files)
+
+    def test_recovery_matches_fresh_preparation_after_the_monthly_limit_changes(self) -> None:
+        self.configure_preparation()
+        subject = self.deployment()
+        provisioned = subject.prepare()
+        self.assertNotEqual(provisioned.parameters['DeploymentId'], DEPLOYMENT)
+        notification = read_budget_notification_address(self.settings)
+        load = subject._load  # pyright: ignore[reportPrivateUsage]
+        override_fixture_settings(self.settings, 'monthly_limit_usd=250\n')
+        self.clock.advance(1)
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'preparation expired or its inputs changed'):
+            _ = load(notification)
+
+        status, output = self.recover('--write')
+        self.assertEqual(status, 0, output)
+        recovered = load(notification)
+        self.assertEqual(recovered[1]['MonthlyLimitUsd'], '250')
+        self.assertEqual(recovered[1]['DeploymentId'], DEPLOYMENT)
+        paths = tuple(self.output / name for name in ('template.json', 'parameters.json', 'preflight.json'))
+        recovered_files = [path.read_bytes() for path in paths]
+        preflight = remote.read_record(self.output / 'preflight.json')
+        decision = ledger.mapping(preflight['decision'])
+        self.assertEqual(decision['monthly_limit_usd'], '250')
+        self.assertEqual(decision['at'], self.clock.now)
+        self.assertEqual(preflight['at'], self.clock.now)
+
+        fresh = subject.prepare()
+        self.assertEqual(fresh.parameters['DeploymentId'], DEPLOYMENT)
+        self.assertEqual([path.read_bytes() for path in paths], recovered_files)
+        self.assertEqual(load(notification), recovered)
+
+    def test_recovery_refuses_the_same_monthly_limit_as_fresh_preparation(self) -> None:
+        self.configure_preparation()
+        subject = self.deployment()
+        _ = subject.prepare()
+        files = (self.foundation, *(self.output / name for name in ('template.json', 'parameters.json', 'preflight.json')))
+        original = [path.read_bytes() for path in files]
+        override_fixture_settings(self.settings, 'monthly_limit_usd=0\n')
+        self.clock.advance(1)
+
+        status, output = self.recover('--write')
+        self.assertEqual(status, 1, output)
+        self.assertIn('monthly_limit', output)
+        self.assertEqual([path.read_bytes() for path in files], original)
+        self.assertFalse(self.manifest.exists())
+
+        save_deployment_record(self.state, {**deployment_record(self.state), 'deployment_id': DEPLOYMENT})
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'monthly_limit'):
+            _ = subject.prepare()
+        self.assertEqual([path.read_bytes() for path in files[1:]], original[1:])
 
     def test_missing_preparation_refuses_before_aws_or_record_publication(self) -> None:
         (self.output / 'preflight.json').unlink()

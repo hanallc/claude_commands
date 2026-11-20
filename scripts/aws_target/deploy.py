@@ -493,6 +493,11 @@ class PreparedDeploymentBundle:
     prepared: PreparedDeployment
     files: dict[Path, str]
 
+    def save(self) -> PreparedDeployment:
+        for path, content in self.files.items():
+            write_text_atomic(path, content)
+        return self.prepared
+
 
 @dataclass(frozen=True)
 class HanaSpotCandidate:
@@ -791,7 +796,7 @@ class Deployment:
             self._refuse_hana_replacement()
             settings, parameters, template = self._hana_inputs()
             decision = self._guard()
-            prepared = self._hana_output()._write_preparation(settings, parameters, template, decision)
+            prepared = self._hana_output()._preparation_bundle(settings, parameters, template, decision).save()
             path = self.directory / 'hana' / 'setup.json'
             if not path.exists():
                 _save_hana_setup(path, {'version': HANA_SETUP_VERSION, 'deployment': parameters['DeploymentId'],
@@ -2091,44 +2096,44 @@ class Deployment:
         child.admin = self.admin
         return child
 
-    def _write_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
-                           decision: ledger.SpendingAllowed, resources: tuple[ledger.PricedResource, ...] = ()) -> PreparedDeployment:
-        bundle = self._preparation_bundle(settings, parameters, template, {
-            'at': int(self.clock()),
-            'decision': ledger.decision_record(decision),
-            'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)} for resource in resources],
-        })
-        for path, content in bundle.files.items():
-            write_text_atomic(path, content)
-        return bundle.prepared
-
     def _preparation_bundle(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
-                            preflight: dict[str, object]) -> PreparedDeploymentBundle:
-        prepared = PreparedDeployment(ledger.instant(preflight, 'at'), fingerprint(settings, parameters, template),
-                                      parameters)
+                            decision: ledger.SpendingAllowed,
+                            resources: tuple[ledger.PricedResource, ...] = ()) -> PreparedDeploymentBundle:
+        prepared = PreparedDeployment(int(self.clock()), fingerprint(settings, parameters, template), parameters)
         return PreparedDeploymentBundle(prepared, {
             self.output / 'template.json': template.decode(),
             self.output / 'parameters.json': json.dumps([
                 {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
             ], sort_keys=True) + '\n',
-            self.output / 'preflight.json': remote.record_text({**preflight, 'fingerprint': prepared.fingerprint}),
+            self.output / 'preflight.json': remote.record_text({
+                'at': prepared.at, 'fingerprint': prepared.fingerprint,
+                'decision': ledger.decision_record(decision),
+                'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)}
+                              for resource in resources],
+            }),
         })
 
-    def prepare(self) -> PreparedDeployment:
+    @contextmanager
+    def _prepare_foundation(self, command: str,
+                            parameters_for: Callable[[DeploymentSettings, BudgetNotificationAddress], dict[str, str]]
+                            ) -> Generator[PreparedDeploymentBundle]:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with self._require_account_stack('prepare'), self._require_hana_control('prepare'):
+        with self._require_hana_control(command):
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
-            parameters = self._parameters(settings, notification)
+            parameters = parameters_for(settings, notification)
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
             resources = state.inventories[-1].resources if state.inventories else ()
             if not state.inventories:
                 book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
             decision = self._guard()
-            template = TEMPLATE.read_bytes()
-            return self._write_preparation(settings, parameters, template, decision, resources)
+            yield self._preparation_bundle(settings, parameters, TEMPLATE.read_bytes(), decision, resources)
+
+    def prepare(self) -> PreparedDeployment:
+        with self._require_account_stack('prepare'), self._prepare_foundation('prepare', self._parameters) as bundle:
+            return bundle.save()
 
     def _stack(self, settings: DeploymentSettings, *, require_outputs: bool = False) -> dict[str, str]:
         try:
@@ -3128,22 +3133,21 @@ class Deployment:
             revision = aws_trial.host_nixpkgs_revision()
             print(f'nixpkgs revision from host lock {aws_trial.NIXOS_LOCK} is {revision}.')
             manifest = gate_launch_manifest(deployment, revision, types, gpu_types, outputs, launch_regions)
-            preparation_files: dict[Path, str] = {}
-            digest = ledger.text(preflight, 'fingerprint')
-            if prepared_deployment_id != deployment:
-                print('The preparation bundle has a different deployment ID.')
-                if not write:
-                    print('Run deploy.py recover --write to replace the preparation bundle and deployment records.')
-                    return False
-                current = read_deployment_settings(self.settings_path)
-                notification = read_budget_notification_address(self.settings_path)
-                parameters = self._foundation_parameters(current, notification, deployment, foundation)
-                # Keep the original preparation time and spending evidence.
-                bundle = self._preparation_bundle(current, parameters, TEMPLATE.read_bytes(), preflight)
-                preparation_files = bundle.files
-                digest = bundle.prepared.fingerprint
-            foundation = prepared_foundation_record(foundation, outputs, digest)
-            return save_recovered_deployment(self.directory, foundation, manifest, preparation_files, write=write)
+            if prepared_deployment_id == deployment:
+                record = prepared_foundation_record(foundation, outputs, ledger.text(preflight, 'fingerprint'))
+                return save_recovered_deployment(self.directory, record, manifest, {}, write=write)
+
+            print('The preparation bundle has a different deployment ID.')
+            if not write:
+                print('Run deploy.py recover --write to replace the preparation bundle and deployment records.')
+                return False
+
+            def parameters_for(settings: DeploymentSettings, notification: BudgetNotificationAddress) -> dict[str, str]:
+                return self._foundation_parameters(settings, notification, deployment, foundation)
+
+            with self._prepare_foundation('recover', parameters_for) as bundle:
+                record = prepared_foundation_record(foundation, outputs, bundle.prepared.fingerprint)
+                return save_recovered_deployment(self.directory, record, manifest, bundle.files, write=write)
 
     def _gate_scaler_api(self, settings: DeploymentSettings, timeout: float) -> AwsCli:
         # Use the GPU worker's profile and credential file without inherited admin credentials.
