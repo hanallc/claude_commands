@@ -889,7 +889,7 @@ class HanaSetupTests(CostFixture):
 
     @contextmanager
     def prepared_stop_setup(self, fake: FakeAws, calls: list[str]) -> Generator[tuple[deploy.Deployment, StringIO]]:
-        self.save_image()
+        _ = self.register_fixture_image()
         subject = self.subject(fake)
         ceiling = hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour
         api_call = self.setup_api(fake, calls, lambda: ceiling, stop_state='stopping')
@@ -907,7 +907,6 @@ class HanaSetupTests(CostFixture):
         fake = FakeAws(self.clock, state='running')
         calls: list[str] = []
         pauses: list[float] = []
-        _ = self.register_fixture_image()
 
         def pause(seconds: float) -> None:
             pauses.append(seconds)
