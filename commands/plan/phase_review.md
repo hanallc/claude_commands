@@ -421,12 +421,10 @@ Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve
 **Applies to every turn this command shows the user** — inline decisions,
 `/adhoc_review` items, the Step 6 final update.
 
-**Read `~/.claude/docs/user_facing_explanation.md` and follow it.** It owns the
-principle the presentation rules here derive from — you do the reconstruction,
-not the user — plus the build order, naming, banned vocabulary, the
-comprehension gate, which decisions are worth the user's attention, and the
-choice-line format. `/unit:direct` and `/adhoc_review` share the same file, so
-the three cannot drift.
+**Read `~/.claude/docs/user_facing_explanation.md` and follow it.**
+Explain how the parts relate so the user can assess each item.
+Follow its build order, naming rules, comprehension gate, decision criteria, and choice-line format.
+`/unit:direct` and `/adhoc_review` use the same guide.
 </UserFacingText>
 
 <ExplainOnDemand>

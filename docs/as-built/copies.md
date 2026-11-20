@@ -120,7 +120,6 @@ The check inspects these entries without following symbolic links.
 `copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
 The nightly slot sweep removes old free slots.
 `gates_root()` reads the configured machine slot root without creating it.
-The configuration no longer includes the `copies.root` key.
 
 `RemoteMirror` records the owner, repository, host, mirror path, and holder session.
 The `remote_registry` key in `config/copies.conf` selects the remote registry.

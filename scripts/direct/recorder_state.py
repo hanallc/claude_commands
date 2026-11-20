@@ -10,12 +10,12 @@ OPEN_PHASES_KEY = "open_phases"
 
 
 class OldRecorderState(RuntimeError):
-    """The recorder state requires conversion before use."""
+    """The recorder cannot read the old state shape."""
 
     def __init__(self, path: Path) -> None:
         super().__init__(
-            f"Recorder state {path} has the old shape. Run the conversion: "
-            + "/tmp/claude/unit/bd19678b-c7b1-4e24-be9e-133ecfe24c7a/phases/parallelphases/deploy/run_conversion.sh"
+            f"Recorder state {path} has the old shape from before the 11-19 conversion and cannot be read. "
+            + "No converter remains."
         )
 
 

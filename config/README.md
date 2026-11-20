@@ -17,6 +17,7 @@ A comment directly above a key sets its limits: `# whole: A..B`,
 The reader resolves a missing or invalid key when the caller uses it.
 An absent default file or key can use the repository value when `CONF_DIR` is unset.
 Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
+Recovery prefers a value that also passes the current setting's limit.
 With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
@@ -67,11 +68,11 @@ five minutes, and when a source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
 
-`[claude.context]` is the fourth layer: `default=<window>` plus one
-`<family>=<first version>:<window>` row per Claude family (`opus=4.7:1m`). The
-context-usage hooks read it to calculate the auto-compaction trigger.
-The per-call message uses `context_usage.conf`. A new family, or a family
-whose first 1M release changes, is a row here.
+`[claude.context]` sets the windows for the auto-compaction trigger.
+It contains `default=<window>` and one `<family>=<first version>:<window>` row per Claude family.
+For example, `opus=4.7:1m` sets a window of one million tokens for Opus 4.7 and later.
+Use a finite positive window in tokens. The hook skips windows that it cannot parse.
+The per-call message uses `context_usage.conf`.
 
 ## codex_daemon.conf
 
@@ -610,6 +611,7 @@ round's gating count (0.5, so 8 findings buy 4 rounds); `RUNAWAY_ROUNDS` is the
 hard ceiling (5). The rest bound the other patterns worth reporting:
 `MAX_FIX_ATTEMPTS`, `MAX_REOPENS`, `STALLED_ROUNDS`,
 `MAX_CONSECUTIVE_SAME_KIND_PASSES`, `MAX_REVIEW_CANCELLATIONS`.
+Set `STALLED_ROUNDS` to at least 2. The stall check uses the last two charged rounds.
 
 **None of these stops a phase.** `findings.py gate` answers `converged` or
 `dispatch` and nothing else; a limit that trips names itself in the verdict's
@@ -763,12 +765,13 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 | --- | --- | --- |
 | `mac_run_hold_seconds` | `60` | Default time for the main Hana run. |
 | `mac_run_host` | `natemccoy@mac` | SSH destination for the Mac run. |
-| `mac_run_port` | `15710` | BRP port for the Mac run. |
+| `mac_run_port` | `15710` | BRP port for the Mac run, from 1 through 65535. |
+| `unit_port_first` | `15720` | First BRP port for Hana units, from 1 through 65535. It must be at most `unit_port_last`. |
+| `unit_port_last` | `15789` | Last BRP port for Hana units, from 1 through 65535. |
 | `mac_run_log` | `/tmp/mac_run_hana.log` | Remote log for the main Hana run. |
 | `mac_run_launch` | `/tmp/mac_run_hana.command` | Remote Terminal command for the Mac run. |
 | `mac_run_status` | `/tmp/mac_run_hana.status` | Remote exit record for the Mac run. |
 | `mac_run_example_seconds` | `20` | Time for each demo example. |
-| `mac_run_claim_seconds` | `600` | Maximum time to wait for the Mac claim. |
 | `mac_run_deployment_target` | `14.0` | Minimum macOS version for the test build. |
 | `mac_run_status_grace_seconds` | `60` | Extra time to wait for the exit record. |
 | `mac_run_poll_seconds` | `1` | Delay between exit record checks. |
@@ -778,7 +781,7 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 | `mac_run_example_log_prefix` | `/tmp/mac_run_` | Remote log prefix for each demo example. |
 | `mac_run_source` | `~/rust/hana` | Remote repository for the scratch clone. |
 | `mac_run_examples` | `hana_diegetic typography;hana_diegetic units;hana_diegetic widgets;hana_diegetic diegetic_text_stress;hana_conduit playground;hana_lagrange showcase fit_overlay;hana_liminal all_modes;hana_valence staggered_unfold;hana_mimesis_tools show_beam` | Demo examples separated by semicolons. Each entry names a crate, example, and optional feature. |
-| `smoke_port` | `15790` | Default BRP port for a smoke launch. |
+| `smoke_port` | `15790` | Default BRP port for a smoke launch, from 1 through 65535. |
 | `smoke_ready_seconds` | `300` | Maximum time for BRP readiness. |
 | `smoke_exit_seconds` | `30` | Maximum time for a graceful exit. |
 | `smoke_connect_seconds` | `1` | Maximum time to connect to BRP. |
@@ -842,6 +845,7 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
+`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.
