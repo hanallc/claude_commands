@@ -435,8 +435,8 @@ class UnitPhasesTests(unittest.TestCase):
             "phase_last_percent": None,
             "phase": {"id": "legacy", "instance_id": "legacy-instance", "status": "active"},
         }
-        location = "/tmp/claude/unit/bd19678b-c7b1-4e24-be9e-133ecfe24c7a/phases/parallelphases/deploy/run_conversion.sh"
-        refusal = f"Recorder state {state} has the old shape. Run the conversion: {location}\n"
+        refusal = (f"Recorder state {state} has the old shape from before the 11-19 conversion and cannot be read. "
+                   + "No converter remains.\n")
         environment = {**os.environ, "HOME": str(self.root), "UNIT_NOW_EPOCH": "200",
                        "PHASE_TABLE_VAULT": str(self.root / "absent-vault")}
         session_args = ["--session-dir", str(run)]

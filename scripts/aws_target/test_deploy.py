@@ -26,7 +26,7 @@ from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
@@ -2027,7 +2027,6 @@ class DeploymentTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
-        _ = write_config_fixture(self.settings)
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
@@ -2040,14 +2039,6 @@ class DeploymentTests(CostFixture):
         _ = (modules / 'tailscale.nix').write_text(
             '# The module enables Tailscale SSH.\n{ services.tailscale = {\n' +
             '  enable = true;\n  extraSetFlags = [ "--ssh" ];\n  openFirewall = true;\n}; }\n')
-        bootstrap_template = hosts / 'bootstrap.sh.in'
-        _ = bootstrap_template.write_text('\n'.join((
-            '#!/usr/bin/env bash', '# services.amazon-ssm-agent.enable = true',
-            'systemd-run --unit=aws-build-first-boot-stop --on-active=@IDLE_STOP_SECONDS@s systemctl poweroff',
-            '# udevadm wait --timeout=@DATA_VOLUME_WAIT_SECONDS@',
-            '# @SCRIPTS_SOURCE_URL_JSON@ @SCRIPTS_SOURCE_SHA256_JSON@ @SCRIPTS_SOURCE_COMMIT_JSON@',
-            '# @REMOTE_SETTINGS_JSON@ @EXISTING_DATA_VOLUME_JSON@', '# @INPUT@', '',
-        )))
         _ = (hosts / 'aws-build-base.nix').write_text(
             '# The base shares the transport module.\n{ ... }: { imports = [ ../modules/linux/tailscale.nix ]; }')
         self.notification_file = self.root / 'notification-email'
@@ -2059,14 +2050,9 @@ class DeploymentTests(CostFixture):
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
-            'bootstrap_template_path': str(bootstrap_template),
-            'scripts_source_url': 'https://example.invalid/public/commit.tar.gz',
-            'scripts_source_sha256': 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'scripts_source_commit': 'a' * 40,
         }
         values.update({
-            'root_volume_gib': '32', 'data_volume_gib': '500', 'data_volume_iops': '6000',
-            'data_volume_throughput': '500', 'spot_max_usd_per_hour': '0.5',
+            'spot_max_usd_per_hour': '0.5',
             'budget_notice_low_percent': '50', 'budget_notice_high_percent': '80', 'budget_stop_percent': '100',
             'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
@@ -2077,7 +2063,7 @@ class DeploymentTests(CostFixture):
         for key, value in values.items():
             self.replace(key, value)
         gates = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(gates,
+        self.configure_gate(
             "regions=us-east-1\nroot_gib=40\nspot_max_usd_per_hour=0.8\nshared_usd_per_month=1\n")
         # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
         _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
@@ -2546,7 +2532,7 @@ sys.exit(7)
                      ) -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
-        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n'
+        self.configure_gate('instance_types=m7a.8xlarge m7a.4xlarge\n'
             + 'hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
             + 'spot_candidate_regions=us-east-2\n'
             + 'gpu_setup_dry_run_retry_timeout_s=1\ngpu_setup_dry_run_retry_interval_s=1')
@@ -2734,7 +2720,8 @@ sys.exit(7)
             if code:
                 action = ''.join(word.title() for word in operation.split('-'))
                 return subprocess.CompletedProcess(args, 1, '',
-                    f'An error occurred ({code}) when calling the {action} operation: private diagnostic')
+                    f'An error occurred ({code}) when calling the {action} operation: private diagnostic '
+                    + 'https://fixture-bucket.example/fixture-key arn:aws:ec2:us-east-2:fixture-account:instance/i-fixture')
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
 
         subject.execute = scaler
@@ -3080,7 +3067,6 @@ sys.exit(7)
         subject = self.deployment()
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
-        _ = write_config_fixture(self.root / 'cloud_gate.conf')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
         gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
@@ -3516,7 +3502,8 @@ sys.exit(7)
             else:
                 self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
                 reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': 'CASE_CLOSED', 'CaseId': 'case-private',
-                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120}]}
+                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120,
+                    'LastUpdated': 'invalid date'}]}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
         subject.execute = execute
@@ -3666,8 +3653,11 @@ sys.exit(7)
                     elif operation == get_quota:
                         reply = {'Quota': {'Value': quota}}
                     elif operation == history:
-                        reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 256.0,
-                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []}
+                        rows = [{'Status': history_status, 'DesiredValue': 256.0,
+                                 'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []
+                        if history_status == 'CASE_CLOSED':
+                            del rows[0]['DesiredValue']
+                        reply = {'RequestedQuotas': rows}
                     else:
                         self.assertEqual(operation, request)
                         reply = {'RequestedQuota': {'Status': request_status, 'DesiredValue': 128.0,
@@ -4192,7 +4182,7 @@ sys.exit(7)
 
     def test_gate_setup_grants_and_records_the_sorted_union_of_gpu_trial_types(self) -> None:
         subject, commands = self.gate_fixture()
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2\nhana_gpu_instance_types=g6.2xlarge g4dn.2xlarge\n' +
             'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98,"g4dn.xlarge":0.5}')
         self.assertTrue(subject.gate_up(approve_resources=True))
@@ -4203,11 +4193,28 @@ sys.exit(7)
         self.assertEqual(applied, ','.join(expected))
         self.assertEqual(remote.read_record(self.state / 'gate-deployment.json')['gpu_instance_types'], expected)
 
+    def test_interrupted_gate_setup_removes_the_previous_pass_before_regional_preparation(self) -> None:
+        subject, _commands = self.gate_fixture()
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        self.assertIsInstance(gate_probe.read_record(self.state), gate_probe.GateProbeRecord)
+        self.configure_gate('regions=us-east-2 us-west-2')
+
+        def interrupt(*_args: object) -> deploy.RegionalNetwork:
+            self.assertFalse((self.state / gate_probe.FILE_NAME).exists())
+            raise KeyboardInterrupt
+
+        with (mock.patch.object(subject, 'regional_network', side_effect=interrupt),
+              redirect_stdout(StringIO()), self.assertRaises(KeyboardInterrupt)):
+            _ = subject.gate_up(approve_resources=True)
+        self.assertIs(gate_probe.read_record(self.state), gate_probe.ProbeRecordUnavailable.ABSENT)
+
     def test_gate_setup_proves_each_saved_gpu_type_and_the_result_transfer(self) -> None:
         subject, commands = self.gate_fixture()
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2\nhana_gpu_instance_types=g4dn.2xlarge\n' +
             'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98}')
+        subject.clock = lambda: self.now + 3 if any('abort-multipart-upload' in args for args in commands) else self.now
         with (mock.patch.dict(os.environ, {'AWS_ACCESS_KEY_ID': 'fixture-admin', 'AWS_PROFILE': 'build-admin'}),
               redirect_stdout(StringIO()) as output):
             self.assertTrue(subject.gate_up(approve_resources=True))
@@ -4226,6 +4233,18 @@ sys.exit(7)
         ])
         self.assertLess(output.getvalue().index('cloud-gate: deployed'), output.getvalue().index('gate-setup probe: '))
         saved = remote.read_record(self.state / 'gate-deployment.json')
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        self.assertEqual(recorded.deployment_id, saved['deployment_id'])
+        self.assertEqual(recorded.ended_at, datetime.fromtimestamp(self.now + 3, UTC))
+        self.assertEqual([check.report() for check in recorded.checks], reports)
+        self.assertEqual([row for row in recorded.checks if isinstance(row.check, gate_probe.GpuLaunchCheck)], [
+            gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', 'g4dn.2xlarge'),
+                                  gate_probe.ProbeVerdict.PASS, gate_probe.ProbeReason.DRY_RUN),
+            gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', 'g6.2xlarge'),
+                                  gate_probe.ProbeVerdict.PASS, gate_probe.ProbeReason.DRY_RUN),
+        ])
+        self.assertEqual((self.state / gate_probe.FILE_NAME).stat().st_mode & 0o777, 0o600)
         launches = self.gpu_probe_launches(commands)
         self.assertEqual([launch['InstanceType'] for launch in launches], saved['gpu_instance_types'])
         for launch in launches:
@@ -4270,9 +4289,27 @@ sys.exit(7)
         return result
 
     def test_gate_setup_fails_on_one_refused_gpu_type_and_finishes_the_other_probes(self) -> None:
+        path = self.state / gate_probe.FILE_NAME
+        _ = path.write_text('previous record')
+        path.chmod(0o644)
         output = self.failed_gpu_probe_output('run-instances g4dn.2xlarge', 'UnauthorizedOperation')
         self.assertIn('gate-setup probe: run-instances g6.2xlarge: pass (DryRunOperation)', output)
         self.assertIn('gate-setup probe: get-object: pass (OK)', output)
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        failures = [check for check in recorded.checks if check.verdict is gate_probe.ProbeVerdict.FAIL]
+        self.assertEqual(failures, [
+            gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', 'g4dn.2xlarge'),
+                                  gate_probe.ProbeVerdict.FAIL, gate_probe.ProbeReason.CHECK_FAILED),
+        ])
+        self.assertIs(recorded.checks[-1].check.name, gate_probe.RegionalCheckName.MULTIPART_INPUT)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        raw = path.read_text()
+        for private in ('previous record', 'UnauthorizedOperation', 'private diagnostic', 'https://', 'arn:',
+                        'fixture-account', 'fixture-bucket', 'fixture-template', 'fixture-group',
+                        'fixture-upload', 'ami-fixture', 'i-fixture'):
+            with self.subTest(private=private):
+                self.assertNotIn(private, raw)
 
     def test_gate_setup_fails_on_an_s3_403(self) -> None:
         output = self.failed_gpu_probe_output('list-objects-v2', '403')
@@ -4309,6 +4346,10 @@ sys.exit(7)
         launches = self.gpu_probe_launches(commands)
         self.assertTrue(launches)
         self.assertTrue(all(launch['InstanceType'] != size for launch in launches))
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        self.assertIn(gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', size),
+                     gate_probe.ProbeVerdict.UNVERIFIED, gate_probe.ProbeReason.NO_OFFERED_SUBNET), recorded.checks)
 
     def test_gate_setup_retries_denied_launch_within_the_configured_deadline(self) -> None:
         self.check_gpu_launch_retries(('UnauthorizedOperation', 'DryRunOperation'), [2], success=True)
@@ -4319,7 +4360,7 @@ sys.exit(7)
     def check_gpu_launch_retries(self, codes: tuple[str, ...], expected_waits: list[float], *, success: bool) -> None:
         operation = 'run-instances g4dn.2xlarge'
         subject, commands = self.gate_fixture(probe_faults={operation: codes})
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'gpu_setup_dry_run_retry_timeout_s=5\ngpu_setup_dry_run_retry_interval_s=2')
         clock = 0.0
         waits: list[float] = []
@@ -4377,10 +4418,16 @@ sys.exit(7)
         ])
         self.assertNotIn('fixture-other-principal', output.getvalue())
         self.assertFalse(any('simulate-principal-policy' in args for args in commands))
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        self.assertEqual(recorded.checks, (
+            gate_probe.ProbeCheck(gate_probe.AccountCheck(gate_probe.AccountCheckName.CALLER_IDENTITY),
+                                  gate_probe.ProbeVerdict.FAIL, gate_probe.ProbeReason.SCALER_IDENTITY_MISMATCH),
+        ))
 
     def test_gate_setup_reports_simulator_access_denial_once_across_regions(self) -> None:
         subject, commands = self.gate_fixture(has_gpu_target=False, probe_faults={'simulate-principal-policy': 'AccessDenied'})
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2 us-west-2\nspot_candidate_regions=us-east-2 us-west-2')
         network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'ami-fixture')
         stack = {'region': 'us-west-2', 'subnets': [{'id': 'fixture-other-subnet', 'zone': 'us-west-2a'}]}
@@ -4421,7 +4468,7 @@ sys.exit(7)
 
     def test_gate_setup_simulates_each_saved_spot_candidate_and_fails_on_a_regional_denial(self) -> None:
         subject, commands = self.gate_fixture(denied_region='us-west-2')
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2 us-west-2 eu-west-1 eu-west-2\n'
             + 'spot_candidate_regions=us-east-2 us-west-2 eu-west-2 us-east-1')
 
@@ -5385,10 +5432,7 @@ else: raise AssertionError(args)
 
     def install_reviewed_template(self) -> None:
         hosts = self.root / 'nixos/hosts'
-        template = hosts / 'reviewed-bootstrap.sh.in'
-        _ = template.write_text(self.patch_source('hosts/aws-bootstrap.sh.in'))
         _ = (hosts / 'aws-build-base.nix').write_text(self.patch_source('hosts/aws-build-base.nix'))
-        self.replace('bootstrap_template_path', str(template))
 
     def reviewed_bundle(self) -> str:
         self.install_reviewed_template()

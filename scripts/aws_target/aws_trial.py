@@ -42,7 +42,7 @@ from scripts.aws_target.config import read_settings, account_settings_path, gate
 from scripts.lib import conf
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.file_lock import LockResult, exclusive
-from scripts.build_queue import program_start, queue_place
+from scripts.build_queue import program_start, queue_place, snapshot_codec
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.time_limit import TIMED_OUT
@@ -416,7 +416,8 @@ def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires
             'commit': trial.changed.commit, 'tree': trial.changed.tree, 'head': trial.changed.commit,
             'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'targeted-test',
             'module': module, 'modules': ['scripts/' + module], 'rounds': trial.rounds, 'source_key': '',
-            'expires': expires, 'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
+            'expires': expires, 'gate_job': snapshot_codec.snapshot_value(PAIRED_TRIAL_JOB),
+            'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
             'delivery_s': cloud_gate.cleanup_timeout_s()}
 
 

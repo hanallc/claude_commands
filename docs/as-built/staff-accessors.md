@@ -106,6 +106,10 @@ Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) pub
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
 The comparison includes the machine and path when present.
 A row lock protects one member during a worker change.
+The process that takes the lock records its PID and command in the lock file.
+The process clears its record before it releases the lock.
+A joined child leaves that record intact.
+The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
 Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
@@ -148,6 +152,7 @@ The shared pane launch builder uses `set_home`.
 | `docs/as-built/session-notifier.md` | write | staff.py clear-run (documented shell command) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/move_test_support.py` | read | StaffId (fixture type) |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
@@ -334,6 +339,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
+| `scripts/agents/set_model.py` | read | initial_snapshot and active select members by role. by_id checks each member's current conversation on the peer. |
 | `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
 | `scripts/agents/shutdown_record.py` | read | snapshot |
 | `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
@@ -363,7 +369,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-192 accessor rows: 40 write, 151 read, 1 owner.
+222 accessor rows: 41 write, 180 read, 1 owner.
 
 ## Approved copies
 

@@ -33,7 +33,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, override_fixture_settings, text_setting
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress, program_start, queue_place
@@ -72,18 +72,23 @@ def assert_term_during_cleanup(test: unittest.TestCase, action: Callable[[Callab
         test.assertEqual(reply.returncode, -signal.SIGTERM, reply.stderr)
 
 
+def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
+    override_fixture_settings(root / 'cloud_gate.conf',
+        'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
+        + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
+    _ = (root / 'test_times.conf').write_text(
+        f'# range: 0..\nSLOW_TEST_S={slow_test_s}\n'
+        + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
+        + '# whole: 1..\nTOP_RUNS=5\n')
+
+
 @final
 class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
-        _ = (root / 'cloud_gate.conf').write_text(
-            'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
-            + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux\n')
-        _ = (root / 'test_times.conf').write_text(
-            '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
-            + '# whole: 1..\nTOP_RUNS=5\n')
+        install_aws_fixture_settings(root)
+        write_guest_config(root)
         _ = (root / 'gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
         _ = (root / 'buildlog.conf').write_text(
             '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
@@ -97,6 +102,7 @@ class GuestTests(unittest.TestCase):
             + 'patterns.tool={purpose}{suffix}\n'
             + '# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n'
             + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
 
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
@@ -129,6 +135,9 @@ class GuestTests(unittest.TestCase):
             tool = root / 'fixture-tool'
             _ = tool.write_text('#!/bin/sh\nexit 0\n')
             tool.chmod(0o700)
+            bwrap = root / 'bwrap'
+            _ = bwrap.write_text('#!/bin/sh\nexit 0\n')
+            bwrap.chmod(0o700)
             basedpyright = root / 'basedpyright'
             _ = basedpyright.write_text('#!/bin/sh\necho basedpyright fixture-version\n')
             basedpyright.chmod(0o700)
@@ -436,17 +445,11 @@ class Sample(unittest.TestCase):
         self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
         self.origin = self.root / 'origin.git'
         _ = subprocess.run(['git', 'clone', '--bare', str(self.repo), str(self.origin)], check=True, capture_output=True)
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            f'clone_url={self.origin}\n'
-            + f'credential_file={self.root / "credentials"}\n'
-            + 'regions=us-east-2 us-west-2\n'
-            + 'trial_branch_prefix=gate-trial\n'
-            + '# whole: 1..9\nslots=9\n'
-            + '# whole: 1..60\nlifetime_minutes=20\n'
-            + '# range: 0.01..300\ngit_network_timeout_s=60\n'
-            + '# range: 1..3600\nmodule_time_limit_s=1800\n'
-            + '# range: 1..600\ntermination_timeout_s=120\n'
-            + '# range: 1..120\napi_timeout_s=30\n')
+        gate_settings = self.root / 'cloud_gate.conf'
+        text_setting(gate_settings, 'clone_url', str(self.origin))
+        text_setting(gate_settings, 'credential_file', str(self.root / 'credentials'))
+        text_setting(gate_settings, 'regions', 'us-east-2 us-west-2')
+        text_setting(gate_settings, 'trial_branch_prefix', 'gate-trial')
         _ = write_config_fixture(self.root / 'build_admission.conf',
                                  'program_stop_seconds=1\nprogram_sample_seconds=0.05\n')
 
@@ -597,7 +600,10 @@ os.execvp(command[0], command)
             folder = next((self.state / 'paired-trials').iterdir())
             expires = 1700000000 + cloud_gate.settings().whole('lifetime_minutes') * 60
             request_path = next(folder.glob('*/request.json'))
-            self.assertEqual(cloud_gate.read(request_path)['expires'], expires)
+            saved = cloud_gate.read(request_path)
+            self.assertEqual(saved['expires'], expires)
+            self.assertEqual(saved['gate_job'], {'kind': 'StepJob', 'step': 'test-modules',
+                                                'unit': '', 'branch': '', 'modules': 1})
             self.assertEqual(self.remote_branches(), {**branches,
                 f'refs/heads/gate-trial-{expires}-{folder.name}-base': self.base,
                 f'refs/heads/gate-trial-{expires}-{folder.name}-changed': self.changed})
@@ -1487,7 +1493,8 @@ print('200', end='')
     def test_paired_worker_leaves_launch_progress_to_the_box_request(self) -> None:
         folder = self.root / 'trial' / 'module'
         folder.mkdir(parents=True)
-        request: dict[str, object] = {'attempt': 'module'}
+        request: dict[str, object] = {'attempt': 'module', 'gate_job': {
+            'kind': 'StepJob', 'step': 'test-modules', 'unit': 'saved-unit', 'branch': '', 'modules': 1}}
         cloud_gate.save(folder / 'request.json', request)
         cloud_gate.save(folder / 'deployment.json', {})
         sidecar = folder / 'reservation.cgroup'

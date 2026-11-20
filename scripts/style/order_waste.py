@@ -48,7 +48,7 @@ VALUES_RULES = (
 NAMES_RULES = (
     "spell-out-names", "dont-repeat-enum-domain-in-variant-names", "prefer-type-named-fields-and-bindings",
     "dont-repeat-type-name-in-fields", "avoid-repeated-field-affixes", "name-bindings-to-match-parameters",
-    "comments-name-code-constructs", "forbidden-words",
+    "comments-name-code-constructs",
 )
 MODULES_RULES = (
     "types-live-with-their-behavior", "when-to-split-a-module", "split-by-type-ownership", "module-roots-as-table-of-contents",
@@ -68,15 +68,14 @@ TIER_A_RULES = (
     "omit-return-in-expression-position", "one-use-per-line", "use-usizefrombool-for-bool-to-integer-conversion",
 )
 CONTENT_RULES = (*TYPES_RULES, *VALUES_RULES, *NAMES_RULES)
-NAMES_BEFORE_COMMENTS = tuple(rule for rule in NAMES_RULES if rule not in ("comments-name-code-constructs", "forbidden-words"))
-NAMES_BEFORE_WORDS = tuple(rule for rule in NAMES_RULES if rule != "forbidden-words")
+NAMES_BEFORE_COMMENTS = tuple(rule for rule in NAMES_RULES if rule != "comments-name-code-constructs")
 FAMILY_RULES: Mapping[str, tuple[str, ...]] = {
     "types": TYPES_RULES, "values": VALUES_RULES, "names": NAMES_RULES, "modules": MODULES_RULES,
 }
 GROUP_NAMES: Mapping[tuple[str, ...], str] = {
     TYPES_RULES: "every types rule", NAMES_RULES: "every names rule", MODULE_MOVES: "every module move",
     MEND_FIXES: "mend fixes", TIER_A_RULES: "tier A", CONTENT_RULES: "every content change",
-    NAMES_BEFORE_COMMENTS: "every other names rule", NAMES_BEFORE_WORDS: "every other names rule",
+    NAMES_BEFORE_COMMENTS: "every other names rule",
 }
 
 # The proposed order's layers 1 to 6 (rule_order_analysis.md, phase 81), each in its listed order. Tier A runs around
@@ -93,7 +92,7 @@ ANALYSIS_LAYERS: tuple[tuple[str, ...], ...] = (
      "import-constants-at-the-top", "prefer-functional-patterns", "test-module-allow-boilerplate", "agent-must-review-allows"),
     ("spell-out-names", "dont-repeat-enum-domain-in-variant-names", "name-submodules-after-anchor-types",
      "prefer-type-named-fields-and-bindings", "dont-repeat-type-name-in-fields", "avoid-repeated-field-affixes",
-     "name-bindings-to-match-parameters", "comments-name-code-constructs", "forbidden-words"),
+     "name-bindings-to-match-parameters", "comments-name-code-constructs"),
     ("constants-file-organization", "module-structure"),
 )
 POSITION: Mapping[str, int] = {rule: index for index, rule in enumerate(rule for layer in ANALYSIS_LAYERS for rule in layer)}
@@ -134,7 +133,7 @@ ANALYSIS_EDGES: tuple[AnalysisEdge, ...] = (
     _edge("use-bevy_kana-in-all-bevy-crates", "agent-must-review-allows"),
     _edge(_NEW_ENUM_RULES, "dont-repeat-enum-domain-in-variant-names"),
     _edge(("enums-over-bool-for-owned-booleans", "enums-over-option-when-none-has-meaning"), "prefer-type-named-fields-and-bindings"),
-    _edge("no-magic-values", ("spell-out-names", "forbidden-words")),
+    _edge("no-magic-values", "spell-out-names"),
     _edge("system-params-carry-their-behavior", "prefer-type-named-fields-and-bindings"),
     _edge(TYPES_RULES, "comments-name-code-constructs"),
     # Contradicts the family rank.
@@ -142,7 +141,7 @@ ANALYSIS_EDGES: tuple[AnalysisEdge, ...] = (
     _edge("prefer-observers-over-polling", "bevy-plugin-ownership"),
     _edge("never-prefix-unused-fields-or-variables-with",
           ("enums-over-option-when-none-has-meaning", "enums-over-bool-for-owned-booleans", "make-invalid-states-unrepresentable")),
-    _edge(("spell-out-names", "forbidden-words"), "constants-file-organization"),
+    _edge("spell-out-names", "constants-file-organization"),
     # Same family.
     _edge("tests-live-with-the-type-under-test", "derive-test-values-from-production-constants"),
     _edge("tests-live-with-the-type-under-test", "no-magic-values"),
@@ -168,7 +167,6 @@ ANALYSIS_EDGES: tuple[AnalysisEdge, ...] = (
     _edge("dont-repeat-type-name-in-fields", "avoid-repeated-field-affixes"),
     _edge(("prefer-type-named-fields-and-bindings", "spell-out-names"), "name-bindings-to-match-parameters"),
     _edge(NAMES_BEFORE_COMMENTS, "comments-name-code-constructs"),
-    _edge(NAMES_BEFORE_WORDS, "forbidden-words"),
     # Modules.
     _edge((*_NEW_ENUM_RULES, "dont-create-traits-for-single-implementations"), "types-live-with-their-behavior"),
     _edge("types-live-with-their-behavior", "when-to-split-a-module"),

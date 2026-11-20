@@ -75,7 +75,7 @@ class ServiceGateFixture(GateSuitesFixture):
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
     @gate_suites("lib", "hooks")
-    def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:
+    def test_suite_progress_counts_test_modules_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
         counters: list[progress.ProgressCounter] = []
         sidecars: list[Path] = []
@@ -103,7 +103,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(gate, "start_gate_job", side_effect=start_job):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        initial_total = self.module_count + 1
+        initial_total = self.module_count
         self.assertEqual([counter for counter in counters if counter.phase == "suites:1"],
             [progress.ProgressCounter("suites:1", done, initial_total) for done in range(initial_total + 1)])
         self.assertEqual([counter for counter in counters if counter.phase != "suites:1"], [])
@@ -481,8 +481,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_all_modules_started()
-        self.assertEqual(kinds.count(gate.GateJobKind.TEST_MODULE), len(self.module_events()) // 2)
-        self.assertEqual(kinds.count(gate.GateJobKind.TYPE_CHECK), 1)
+        self.assertEqual(kinds, [gate.GateJobKind.TEST_MODULE] * (len(self.module_events()) // 2))
         self.assertEqual(len(paths), len(kinds) + 1)
         self.assertEqual(len(set(paths)), 1)
         self.assert_gate_released()

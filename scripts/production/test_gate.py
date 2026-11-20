@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
+from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
 
 import unittest
 import fcntl
 
-import json
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -189,6 +190,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
                             0, 0, tests_reused=True)
 
                     def merge(arguments: gate.GateArguments) -> int:
+                        self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
                             return checkpoint(arguments)
                         finally:
@@ -294,9 +296,9 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
                 with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
                     if fails:
                         with self.assertRaisesRegex(RuntimeError, "module preparation failed"):
-                            _ = self.run_gate("--tests-only", "--full", type_dirs=())
+                            _ = self.run_gate("--tests-only", "--full")
                     else:
-                        result = self.run_gate("--tests-only", "--full", type_dirs=())
+                        result = self.run_gate("--tests-only", "--full")
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
@@ -357,11 +359,10 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.checkout / "docs" / "plans" / "build-followups-log.md").read_text(), "log\n")
 
-    def test_missing_type_dir_is_refused_before_any_suite_runs(self) -> None:
-        result = self.run_gate("--type-dirs", "accounts")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("type dirs not found", result.stderr)
-        self.assertIn("accounts", result.stderr)
+    def test_merge_refuses_type_check_options_before_any_suite_runs(self) -> None:
+        result = self.run_gate("--type-dirs", "scripts")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("unrecognized arguments: --type-dirs scripts", result.stderr)
         self.assertEqual(self.module_events(), [])
         self.assert_not_pushed()
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
@@ -548,19 +549,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
-        self.write(self.state / "types-barrier", "overlap")
-        self.write(self.state / "types-hold", "hold")
-        memory = gate.process_memory_mib
-
-        def sample_and_release(roots: set[int]) -> dict[int, float]:
-            measured = memory(roots)
-            for call in self.calls():
-                if call["tool"] == "basedpyright" and measured.get(call["pid"], 0) > 0:
-                    (self.state / "types-sampled").touch()
-            return measured
-
-        with mock.patch.object(gate, "process_memory_mib", side_effect=sample_and_release):
-            result = self.run_gate()
+        result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
@@ -578,14 +567,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
         self.assertEqual(len({row["pid"] for row in starts}), self.module_count)
         self.assertEqual(len({row["tmpdir"] for row in starts}), self.module_count)
         self.assertTrue(all(not Path(row["tmpdir"]).exists() for row in starts))
-        type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
-        self.assertEqual(len(type_calls), 1)
-        venv = self.state / "runner" / "typecheck-venv"
-        self.assertEqual(type_calls[0]["args"], ["--pythonpath", str(venv / "bin" / "python"), "scripts/production"])
-        peaks = cast(dict[str, float], json.loads((self.state / "runner" / "types_peak_mib.json").read_text()))
-        self.assertEqual(list(peaks), ["scripts/production"])
-        self.assertGreater(peaks["scripts/production"], 0)
-        self.assertEqual(type_calls[0]["cwd"], str(self.checkout))
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
         for suite in self.suites:
             self.assertRegex(result.stdout, rf"(?m)^{suite}: OK \d+\.\d+s$")
         peak = re.search(r"peak memory: ([\d.]+) GiB", result.stdout)
@@ -631,7 +613,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
         arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
                      "--previous-checkpoint", self.base, "--unit", "fixture", "--phase", "phase-2",
-                     "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+                     "--body", "Fixture checkpoint gate.",
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()

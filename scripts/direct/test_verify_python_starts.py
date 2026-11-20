@@ -12,6 +12,7 @@ import subprocess
 import sys
 from typing import override
 import unittest
+from unittest import mock
 
 from scripts.lib.shell_test_support import shell_function
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
@@ -22,6 +23,12 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyPythonStartsTests(VerifyLintCacheFixture):
+    @override
+    def build_fixture(self) -> None:
+        # Model a parent that calls the tests from copies.py run.
+        with mock.patch.dict(os.environ, COPIES_RUN_PID=str(os.getpid())):
+            super().build_fixture()
+
     def test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper(self) -> None:
         _ = self.enable_cache()
         trace = self.root / "python-starts.tsv"
@@ -39,6 +46,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
+        self.assertNotIn("copies.py", counts, rows)
         # The trace counts interpreter starts, not calls inside the helper.
         self.assertEqual(counts["tree_watch.py"], 2, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)

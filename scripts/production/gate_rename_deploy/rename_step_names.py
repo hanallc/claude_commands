@@ -400,13 +400,16 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
     for directory in roots.buildlog.iterdir():
         if directory.is_dir() and not directory.is_symlink() and directory.name not in ("admission", "pending-steps"):
             paths.update((path, frozenset({"step"})) for path in directory.iterdir() if MONTH.fullmatch(path.name))
-    for name in ("cloud-gate-launches.jsonl", "cost-ledger.json"):
-        if os.path.lexists(roots.aws / name):
-            paths[roots.aws / name] = frozenset({"mode"})
+    cloud_fields = frozenset({"mode", "step"})
+    launches = roots.aws / "cloud-gate-launches.jsonl"
+    if os.path.lexists(launches):
+        paths[launches] = cloud_fields
+    costs = roots.aws / "cost-ledger.json"
+    if os.path.lexists(costs):
+        paths[costs] = frozenset({"mode"})
     for directory in roots.buildlog.iterdir():
         if directory.is_dir() and not directory.is_symlink():
             paths.update((path, frozenset({"step"})) for path in directory.glob("results/????-??/*.json.gz"))
-    cloud_fields = frozenset({"mode", "step"})
     for root in (*roots.cloud_roots, roots.aws / "paired-trials"):
         if not root.exists():
             continue

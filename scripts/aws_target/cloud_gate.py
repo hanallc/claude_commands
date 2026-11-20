@@ -11,7 +11,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
@@ -32,13 +32,13 @@ from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib.file_lock import LockResult, exclusive
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
@@ -59,6 +59,7 @@ class CloudAttempt:
     mode: gate.SuiteMode
     identifier: str = ''
     interruptions: int = 0
+    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     completed: CloudCompleted | None = None
     reservation: CloudReservation | None = None
     worker_cleanup_deadline: float | None = None
@@ -111,8 +112,28 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     return RetryableCloudFailure.NONE
 
 
+class CloudGateSwitch(StrEnum):
+    ON = 'on'
+    OFF = 'off'
+
+
+@dataclass(frozen=True)
+class InvalidCloudGateSwitch:
+    reason: str
+
+
+type CloudGateSetting = CloudGateSwitch | InvalidCloudGateSwitch
+
+
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
+
+
+def launch_switch(configuration: conf.ConfigRead) -> CloudGateSetting:
+    try:
+        return configuration.value('enabled', CloudGateSwitch, recover_invalid=False)
+    except conf.Unusable as error:
+        return InvalidCloudGateSwitch(str(error))
 
 
 def read(path: Path) -> dict[str, object]:
@@ -123,10 +144,20 @@ def save(path: Path, row: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps(row, sort_keys=True) + '\n')
 
 
-def append_launch(directory: Path, row: dict[str, object], *, deadline: float | None = None) -> None:
-    """Append one event with the existing launch record lock and format."""
+def _saved_gate_job(record: dict[str, object]) -> StepJob | GateJobNotRecorded:
+    """Read the saved job for an attempt."""
+    try:
+        return cast(StepJob | GateJobNotRecorded,
+            snapshot_codec.parse_snapshot_value(record.get('gate_job'), StepJob | GateJobNotRecorded))
+    except (ValueError, OverflowError):
+        return GATE_JOB_NOT_RECORDED
+
+
+def append_launch(directory: Path, row: dict[str, object], *, gate_job: StepJob | GateJobNotRecorded,
+                  deadline: float | None = None) -> None:
+    """Append one launch event with the queue's job record."""
     with store.locked_append(directory / 'cloud-gate-launches.jsonl', deadline=deadline) as handle:
-        store.append_locked(handle, row)
+        store.append_locked(handle, {**row, 'gate_job': snapshot_codec.snapshot_value(gate_job)})
 
 
 def capacity_error(reason: str) -> bool:
@@ -351,6 +382,7 @@ class CloudReservation:
 
 @contextmanager
 def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob, *,
+                      gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
                       group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
@@ -359,7 +391,7 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
         raise GateRefused('The cloud route has no live process identity')
     owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
     step = work.step if isinstance(work, StepJob) else work.value
-    job = work if isinstance(work, StepJob) else GATE_JOB_NOT_RECORDED
+    job = work if isinstance(work, StepJob) else gate_job
     profile = admission_records.ProgramProfile(step, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
         admission_records.HistoryPeakSizing(0, admission_records.FirstProgramPeak(0), 0.0))
     def refresh() -> wire.AdmitRequest:
@@ -595,7 +627,7 @@ class GateWorker:
             row['gate_s'] = gate_s
         else:
             row.update({'availability_zone': zone, 'error_code': error_code, 'reason': reason})
-        append_launch(self.book.directory, row)
+        append_launch(self.book.directory, row, gate_job=_saved_gate_job(request))
         if result == 'refused':
             if error_code in run_cost.QUOTA_REFUSALS:
                 pool = ledger.SpotQuotaPool(self.box_region, ledger.spot_quota_class(size))
@@ -661,15 +693,13 @@ class GateWorker:
         now = self.clock()
         max_age = policy.whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
-        days = policy.whole('run_cost_days')
-        recent = run_cost.gate_launch_history(self.book.directory, now, max(max_age, cooldown, days * 86400))
-        refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
+        history = run_cost.read_placement_run_history(self.book.directory, now, values, policy, self.api.region)
+        refused = [row for row in history.launch_rows
+                   if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
         zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
                  for row in refused if row.get('error_code') in run_cost.ZONE_REFUSALS}
-        moment = datetime.fromtimestamp(now, UTC)
-        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
         cap = values.whole('max_gate_minutes')
-        eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, evidence, mode,
+        eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, history.evidence, mode,
             now=now, max_age=max_age, max_gate_minutes=cap, live_prices=live_prices)
         for (size, region), box in sorted(eligibility.slow_box_seconds.items()):
             print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
@@ -694,7 +724,7 @@ class GateWorker:
             return pool in marked, full, key in zones
         if not eligibility.prices:
             return sorted(eligibility.variants, key=capacity_order)
-        pricing = run_cost.GateRunPricing.from_config(values, evidence, self.api.region, (mode,))
+        pricing = run_cost.GateRunPricing.from_config(values, history.evidence, self.api.region, (mode,))
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[tuple[bool, bool, bool], bool, Decimal, int, int]:
             position, variant = item
             price = eligibility.prices.get(variant)
@@ -1195,7 +1225,8 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
 
 
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
-            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
+            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+            gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = working_tree(repo)
     if isinstance(selected, gate.TreeSelection) and tree != selected.tree:
@@ -1228,6 +1259,8 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
         'mode': mode.wire, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
+    if isinstance(gate_job, StepJob):
+        request['gate_job'] = snapshot_codec.snapshot_value(gate_job)
     save(folder / 'request.json', request)
     return request
 
@@ -1258,9 +1291,10 @@ def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
 
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+        gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
     # Record the final fallback here so worker replies and service errors produce one row.
-    attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode)
+    attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode, gate_job=gate_job)
     deadline: float | None = None
     try:
         outcome = run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
@@ -1286,7 +1320,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
             append_launch(attempt.directory, {'time': time.time(), 'attempt': attempt.identifier,
                 'instance_type': '', 'vcpus': 0, 'result': 'fallback', 'mode': attempt.mode.value, 'region': '',
                 'availability_zone': '', 'error_code': launch_error_code(outcome.reason), 'reason': outcome.reason},
-                deadline=log_deadline)
+                gate_job=attempt.gate_job, deadline=log_deadline)
         except store.AppendLockTimeout:
             pass
         except OSError as error:
@@ -1298,7 +1332,13 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
+    switch = launch_switch(settings())
+    if isinstance(switch, InvalidCloudGateSwitch):
+        return LocalFallback(switch.reason)
+    if switch is CloudGateSwitch.OFF:
+        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
     directory = attempt.directory
+    command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
@@ -1327,7 +1367,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 pass
             else:
                 attempt.identifier = folder.name
-                with cloud_reservation(repo, folder / 'reservation.cgroup', mode) as reservation:
+                attempt.gate_job = _saved_gate_job(previous)
+                with cloud_reservation(repo, folder / 'reservation.cgroup', mode, gate_job=command_job) as reservation:
                     attempt.reservation = reservation
                     outcome = _complete_outcome(repo, folder, request, row, cleanup=str(saved_result.get('cleanup', '')))
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
@@ -1350,6 +1391,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             for row in book.read_snapshot().gate_reservations)
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
             folder = root / uuid4().hex
+        elif same_request:
+            attempt.gate_job = _saved_gate_job(previous)
         attempt.identifier = folder.name
         folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
@@ -1365,11 +1408,12 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if retrying:
             retry_limit = min(retry_limit, int(str(previous.get('spot_retry_limit', retry_limit))))
             box_retry_limit = min(box_retry_limit, int(str(previous.get('box_retry_limit', box_retry_limit))))
-        with cloud_reservation(repo, sidecar, mode) as reservation:
+        with cloud_reservation(repo, sidecar, mode, gate_job=command_job) as reservation:
             attempt.reservation = reservation
             while True:
                 attempt.worker_cleanup_deadline = None
                 state: dict[str, object] = {'attempt': folder.name, **identity,
+                    'gate_job': snapshot_codec.snapshot_value(attempt.gate_job),
                     'spot_interruptions': attempt.interruptions, 'counted_interruption': counted_interruption,
                     'retry_launch': retry_launch, 'spot_retry_limit': retry_limit,
                     'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
@@ -1392,12 +1436,15 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
                          '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
                     request = (read(folder / 'request.json') if (folder / 'request.json').exists()
-                               else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
+                               else prepare(repo, folder, mode, module_time_limit_s,
+                                            selected=selected, gate_job=attempt.gate_job))
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
                         reservation.status = 0
                         return LocalFallback(f'The tested commit does not read SuiteMode value {mode.wire!r}')
+                    if _saved_gate_job(request) != attempt.gate_job:
+                        request['gate_job'] = state['gate_job']
                     request['full'] = full
                     if retry_launch:
                         request['retry_launch'] = retry_launch
@@ -1443,6 +1490,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     return LocalFallback('No cloud capacity choice remains')
                 folder = root / uuid4().hex
                 attempt.identifier = folder.name
+                attempt.gate_job = command_job
                 folder.mkdir()
 
 
@@ -1539,9 +1587,11 @@ def main() -> int:
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
-          selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> gate.GateRun | str:
+          selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+          gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> gate.GateRun | str:
     """Return a completed gate or the reason for local fallback."""
-    outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
+    outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                  selected=selected, gate_job=gate_job)
     return outcome.reason if isinstance(outcome, LocalFallback) else outcome.run
 
 

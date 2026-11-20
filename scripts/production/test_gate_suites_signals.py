@@ -602,7 +602,7 @@ def interrupt_after_start(*arguments, **options):
 gate.SharedCPUSlot.release = release_after_stop
 gate.start_gate_job = interrupt_after_start
 """
-        result = self.run_gate("--tests-only", own_process=True, preamble=preamble, type_dirs=())
+        result = self.run_gate("--tests-only", own_process=True, preamble=preamble)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assert_process_stopped(int(launched.read_text()))
         self.assertEqual(self.jobserver_tokens(), b"Q")
@@ -738,17 +738,17 @@ Path({str(descendant)!r}).write_text(str(child.pid))
                 self.environment["TMPDIR"] = str(parent)
                 # The supported whole-machine path has no queue-owned handlers.
                 preamble = """signal.signal(signal.SIGINT, signal.SIG_DFL)
-def whole_gate(repo, type_dirs, module_time_limit_s, **options):
+def whole_gate(repo, module_time_limit_s, **options):
     with gate.shared_cpu_pool() as pool:
         pool.try_acquire()
-        return gate.run_suites(repo, type_dirs, module_time_limit_s, machine=gate.WholeMachine())
+        return gate.run_suites(repo, module_time_limit_s=module_time_limit_s, machine=gate.WholeMachine())
 gate.run_gate_suites = whole_gate
 """
                 process = subprocess.Popen(
                     [*self.gate_command(preamble=preamble), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
                      "--unit", "fixture", "--phase", "repair",
-                     "--production", "quiet", "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
+                     "--production", "quiet"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     wait_until(lambda: (self.state / "module-held").exists() or process.poll() is not None,
