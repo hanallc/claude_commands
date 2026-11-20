@@ -750,15 +750,12 @@ class AccountSpendParityTests(SpendReferenceFixture):
         self.record('65 later', page_day=utc_day(JAN1), cap_day=utc_day(JAN1))
 
         self.scene('66')
-        other = self.root / 'report-settings.conf'
-        _ = other.write_bytes(self.settings.read_bytes())
         self.replace('fallback_usd_per_hour', '2')
         self.run_builder(self.now - HOUR, self.now)
+        other = self.root / 'report-settings.conf'
+        _ = other.write_text(self.original_settings)
         self.record('66')
-        report = spend.read_spend(other, self.book.directory, self.now, utc_day(self.now))
-        assert isinstance(report, spend.Spend)
-        day, = (row for row in report.days if row.day == utc_day(self.now))
-        self.assertEqual(day.usd, Decimal(1))
+        self.assertEqual(spend.read_spend(other, self.book.directory, self.now, utc_day(self.now)), self.page())
         evidence = ledger.capture_spend_evidence(self.book.directory, self.now)
         assert isinstance(evidence, ledger.SpendEvidenceAt)
         account = ledger.utc_account_spend(evidence)
