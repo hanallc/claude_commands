@@ -6,6 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+from scripts.build_targets import machine_switch
 
 from scripts.aws_target.hana_placement import (
     ExecutionTransport, HanaControlTransport, HanaHostGeneration,
@@ -518,7 +519,7 @@ def gpu_setup(transport: HanaGpuNextestTransport, *, configuration: conf.ConfigR
 
     try:
         settings = conf.read(transport.settings) if configuration is None else configuration
-        if settings.text('hana_gpu_route_enabled') != 'on':
+        if machine_switch.read(machine_switch.Machine.HANA_GPU) is machine_switch.MachineSwitch.OFF:
             return HanaStepRefused(GPU_SETUP_REQUIRED)
         sizes = tuple(settings.words('hana_gpu_instance_types'))
         record = claim_state.read_json_object(ssh_target_state_directory('aws') / 'gate-deployment.json')

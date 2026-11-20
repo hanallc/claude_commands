@@ -1779,7 +1779,9 @@ Run `deploy.py probe-status` to read the saved verdicts and record age without c
 The command shows verdicts only for a readable record that matches the current deployment.
 It checks the recorded regions and instance types against `gate-deployment.json`.
 
-After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
+After the GPU setup probe passes, set `enabled.hana-gpu=on` in `config/build_targets.conf`.
+The switch controls new placed GPU work. Running GPU work and status reads continue.
+Manual GPU commands do not read the switch.
 The route checks the deployment record for every type in `hana_gpu_instance_types`.
 
 Run the pilot from the Hana checkout.

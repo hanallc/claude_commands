@@ -639,7 +639,7 @@ class HanaGpuPlacementTests(CostFixture):
         self.trials = self.root / 'trials'
         gpu_target = target_config.SshTarget('hana-gpu', 'linux', self.gpu_settings)
         _ = self.gpu_settings.write_text(
-            'execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+            'execution_transport=hana-gpu\n'
             + f'hana_gpu_repository={KEY}\nhana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
             + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
         self.account_dir.mkdir(parents=True)
@@ -648,7 +648,7 @@ class HanaGpuPlacementTests(CostFixture):
         _ = (self.root / 'build_targets.conf').write_text(
             'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
             + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
-            + f'settings.hana-gpu={gpu_target.settings}\n')
+            + f'settings.hana-gpu={gpu_target.settings}\nenabled.hana-gpu=on\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(self.root)})))
         _ = self.enterContext(mock.patch.object(eligibility, 'repository_identity',
             return_value=eligibility.KnownRepository('hana', KEY)))
@@ -685,8 +685,12 @@ class HanaGpuPlacementTests(CostFixture):
         _ = self.grants.write_text(json.dumps({'gpu_instance_types': ['g6.2xlarge']}))
         self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
         _ = self.grants.write_text(grants)
-        _ = self.gpu_settings.write_text(self.gpu_settings.read_text().replace('enabled=on', 'enabled=off'))
-        self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
+        registry = self.root / 'build_targets.conf'
+        configured = registry.read_text()
+        for value in ('off', 'invalid', ''):
+            with self.subTest(value=value):
+                _ = registry.write_text(configured.replace('enabled.hana-gpu=on', f'enabled.hana-gpu={value}'))
+                self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
 
     def run_fake_gpu(self, code: int | str, *, confirm_cleanup: bool = True, refuse_start: bool = False,
                      report_unavailable: bool = False, refuse_release: bool = False

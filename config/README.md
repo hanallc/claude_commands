@@ -266,6 +266,8 @@ Mac host and SSH settings remain in `mac_test.conf`.
 
 ## mac_test.conf
 
+The `enabled.mac` key in `build_targets.conf` controls placed work on the Mac.
+
 Controls Mac test offload and the `/build:mac` block command. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
 sets the default and maximum block lifetime; and sets the expiry-warning
@@ -856,7 +858,8 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
+`enabled.aws-gate=off` in `build_targets.conf` sends new merge gates and targeted tests to natedev.
+`enabled.hana-gpu=off` in that file refuses new placed Hana GPU tests.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.

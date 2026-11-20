@@ -33,6 +33,7 @@ from scripts.aws_target import cloud_gate, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import AwsExecutor, aws_error_code, execute_command
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus, spot_quota
 from scripts.aws_target.config import SpendingSettings, gate_deployment, read_settings
+from scripts.build_targets import machine_switch
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
 from scripts.production import merge_gate
@@ -1934,6 +1935,8 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
         def service(command: Sequence[str]) -> int:
             if isinstance(launch, AssignedHanaGpuLaunch):
                 launch.before_service()
+                if machine_switch.read(machine_switch.Machine.HANA_GPU) is machine_switch.MachineSwitch.OFF:
+                    raise ValueError('Hana GPU placement is off (build_targets.conf enabled.hana-gpu=off)')
             return subprocess.run(command, stdout=sys.stderr).returncode
 
         directory = ssh_target_state_directory('aws')
