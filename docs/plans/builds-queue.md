@@ -3264,6 +3264,8 @@ Evidence: two hana Mac runs (`offload.py` through `copy_watch.py`) held 27.7 GiB
 
 Tests: each replay fails on main and passes with the fix. The admission, offload and copy_watch modules pass.
 
+**Trace, 2026-11-20 09:30:** the 27.7 GiB were two local natedev nextest grants (pid 350420, Mac refusal linux_only, 06:07-08:19; pid 2365962, Mac busy, 06:18-07:25), not Mac handoffs. 44dx keeps two real fixes: a Mac-only wait takes no place in the natedev line, and Mac launch authorization releases the continuation slot at once. The long local holds go to item 78 (phase 44dc): a replay of both records against 44dc decides whether more work is needed.
+
 ### Phase 44du — Slot-order test cleanup reads only its own processes  · status: todo
 **Follow-up from the 44dt closure review and the group review (G6), 2026-11-20.** Not a regression: main has the same reads, and the tests pass under load. Starts after the group merges.
 
