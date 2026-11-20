@@ -2349,20 +2349,30 @@ print(scratch.target('gate:proof', 'tree', False))
             self.assertEqual(scratch.end("gate:borrower"), [borrower])
             self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
-        with self.subTest(borrower="bare objects link"), tempfile.TemporaryDirectory(dir=source.parent) as directory:
-            borrower = Path(directory)
-            self.git(borrower, "init", "-q", "--bare")
-            scratch.atomic_record(borrower / copy_record.RECORD, {"task": "gate:borrower"})
-            self.assertEqual(scratch.checkout_storage(borrower), ())
-            objects = borrower / "objects"
-            shutil.rmtree(objects)
-            store = source / ".git/objects"
-            objects.symlink_to(os.path.relpath(store, borrower), target_is_directory=True)
-            self.assertEqual(scratch.checkout_storage(borrower), (store,))
-            self.assertEqual(scratch.record_lifetime(source, time.time()),
-                             scratch.Live(f"borrowed: {borrower} still uses its git objects"))
-            objects.unlink()
-            self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
+        store = source / ".git/objects"
+        intermediate = self.copy("intermediate", task="until:2000-01-01T0000Z")
+        link = intermediate / "objects"
+        link.symlink_to(store, target_is_directory=True)
+        for name, stores in (("bare objects link", (store,)), ("bare objects link chain", (link, store))):
+            with (self.subTest(borrower=name),
+                  tempfile.TemporaryDirectory(prefix="z-borrower-", dir=source.parent) as directory):
+                borrower = Path(directory)
+                self.git(borrower, "init", "-q", "--bare")
+                self.register(borrower, "gate:borrower")
+                self.assertEqual(scratch.checkout_storage(borrower), ())
+                objects = borrower / "objects"
+                shutil.rmtree(objects)
+                objects.symlink_to(os.path.relpath(stores[0], borrower), target_is_directory=True)
+                if link in stores:
+                    self.assertEqual(scratch.record_lifetime(intermediate, time.time()),
+                                     scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+                    self.assertEqual([workspace[0] for workspace in copies.owned_workspaces("maker")],
+                                     [borrower, intermediate, source])
+                self.assertEqual(scratch.checkout_storage(borrower), stores)
+                self.assertEqual(scratch.record_lifetime(source, time.time()),
+                                 scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+                objects.unlink()
+                self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
         with tempfile.TemporaryDirectory(dir=source.parent) as directory:
             borrower = Path(directory)

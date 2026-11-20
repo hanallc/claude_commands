@@ -1027,6 +1027,7 @@ _ALTERNATE_ESCAPES = {
     b"f": b"\f", b"r": b"\r", b"\\": b"\\", b'"': b'"',
 }
 _ALTERNATE_OCTAL = re.compile(rb"[0-3][0-7]{2}")
+_OBJECT_LINK_LIMIT = 40
 
 
 def _unquote_alternate(entry: bytes, alternates: Path) -> bytes:
@@ -1081,8 +1082,40 @@ def object_alternates(objects: Path) -> Iterator[Path]:
             yield objects / os.fsdecode(entry)
 
 
+def _object_link_chain(objects: Path) -> Iterator[Path]:
+    """Yield the intermediate links and the final object store path."""
+    current = objects.parent.resolve()
+    remaining = [objects.name]
+    followed = 0
+    while remaining:
+        part = remaining.pop()
+        if part == "..":
+            current = current.parent
+            continue
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if not stat.S_ISLNK(mode):
+            continue
+        if followed == _OBJECT_LINK_LIMIT:
+            raise ValueError(f"{objects}: object store path exceeds {_OBJECT_LINK_LIMIT} symbolic links")
+        if followed:
+            yield current
+        followed += 1
+        target = current.readlink()
+        if target.is_absolute():
+            current = Path("/")
+            remaining.extend(reversed(target.parts[1:]))
+        else:
+            current = current.parent
+            remaining.extend(reversed(target.parts))
+    yield current
+
+
 def checkout_storage(checkout: Path) -> tuple[Path, ...]:
-    """Read the Git directories and direct alternates that the checkout uses."""
+    """Read the Git directories, object store links and direct alternates that the checkout uses."""
     if (checkout / ".git").is_symlink():
         raise ValueError(f"{checkout / '.git'}: symbolic link")
     try:
@@ -1091,7 +1124,7 @@ def checkout_storage(checkout: Path) -> tuple[Path, ...]:
         objects = checkout / "objects"
         if (checkout / "HEAD").is_file():
             if objects.is_symlink():
-                return (objects.resolve(), *object_alternates(objects))
+                return (*_object_link_chain(objects), *object_alternates(objects))
             if objects.is_dir():
                 return tuple(object_alternates(objects))
         return ()
