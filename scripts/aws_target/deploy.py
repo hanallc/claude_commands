@@ -38,7 +38,7 @@ from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
-from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
+from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, SpendingSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.lib import conf
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
@@ -614,9 +614,8 @@ def _hana_wait_status(registration: dict[str, object], lock_busy: bool) -> str:
     return status + (', controller lock busy' if lock_busy else '')
 
 
-def deployment_parameters(path: Path, settings: DeploymentSettings,
+def deployment_parameters(spending: SpendingSettings, settings: DeploymentSettings,
                           notification: BudgetNotificationAddress, deployment_id: str, vpc: str) -> dict[str, str]:
-    spending = read_settings(path)
     return {
         'VpcId': vpc, 'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
         'MonthlyLimitUsd': str(spending.monthly_limit_usd),
@@ -657,8 +656,7 @@ class Deployment:
         self.mode = mode
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
-    def _deployment_id(self) -> str:
-        settings = read_deployment_settings(self.settings_path)
+    def _deployment_id(self, settings: DeploymentSettings) -> str:
         saved = deployment_record(self.directory)
         if saved.get('stack') and saved['stack'] != settings.stack_name:
             if not saved.get('replacement_deployment_id'):
@@ -674,10 +672,10 @@ class Deployment:
         return ledger.text(saved, 'deployment_id')
 
     def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress,
-                    vpc: str) -> dict[str, str]:
-        deployment_id = self._deployment_id()
+                    vpc: str, spending: SpendingSettings) -> dict[str, str]:
+        deployment_id = self._deployment_id(settings)
         saved = deployment_record(self.directory)
-        parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id, vpc)
+        parameters = deployment_parameters(spending, settings, notification, deployment_id, vpc)
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
@@ -807,7 +805,7 @@ class Deployment:
               ) -> tuple[DeploymentSettings, dict[str, str]]:
         settings = read_deployment_settings(self.settings_path)
         vpc = ledger.text(prepared_parameters(self.output), 'VpcId')
-        parameters = self._parameters(settings, notification, vpc)
+        parameters = self._parameters(settings, notification, vpc, read_settings(self.settings_path))
         self._before_request(settings, parameters)
         network = self._deployment_network(settings, self._api(settings))
         if network.vpc != vpc:
@@ -2266,6 +2264,7 @@ class Deployment:
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
+            spending = read_settings(self.settings_path)
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
             resources = state.inventories[-1].resources if state.inventories else ()
@@ -2274,7 +2273,7 @@ class Deployment:
             decision = self._guard()
             network = self._deployment_network(settings, self._api(settings))
             _ = network.subnet_in(settings.availability_zone)
-            parameters = self._parameters(settings, notification, network.vpc)
+            parameters = self._parameters(settings, notification, network.vpc, spending)
             template = TEMPLATE.read_bytes()
             return self._write_preparation(settings, parameters, template, decision, resources)
 
@@ -2479,7 +2478,7 @@ class Deployment:
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
         current = read_deployment_settings(self.settings_path)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
-        current_parameters = self._parameters(current, notification, parameters['VpcId'])
+        current_parameters = self._parameters(current, notification, parameters['VpcId'], read_settings(self.settings_path))
         self.confirm_preparation_evidence(settings, parameters, TEMPLATE.read_bytes(), renew=renew,
             current_fingerprint=fingerprint(current, current_parameters, TEMPLATE.read_bytes()))
 
