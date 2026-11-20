@@ -59,6 +59,8 @@ DWIGHT = staff.StaffRow(staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"), "
                         current_session=staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"))
 NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 FIREFOX_MIN_SHARED_WIDTH = 500
+CHROME = shutil.which("google-chrome")
+LIST_BROWSER = CHROME or shutil.which("firefox")
 
 
 def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bool) -> tuple[list[str], dict[str, str]]:
@@ -115,7 +117,8 @@ class _Chrome(_Browser):
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.pending: bytearray = bytearray()
-        self.loaded: set[tuple[str, str]] = set()
+        self.loaded: set[tuple[str, str, str]] = set()
+        self.frame_loaders: dict[str, str] = {}
         self.sequence: int = 0
         with (root / "chrome.log").open("wb") as log:
             process = subprocess.Popen(
@@ -136,6 +139,7 @@ class _Chrome(_Browser):
                 {"targetId": target["targetId"], "flatten": True})["sessionId"])
             _ = self.command("Page.enable", {}, self.session)
             _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+            _ = self.command("Page.bringToFront", {}, self.session)
 
     def read(self, deadline: float) -> dict[str, object]:
         reader = self.process.stdout
@@ -150,8 +154,12 @@ class _Chrome(_Browser):
                 del self.pending[:end + 1]
                 if reply.get("method") == "Page.lifecycleEvent":
                     parameters = cast(dict[str, str], reply["params"])
-                    if parameters["name"] == "DOMContentLoaded":
-                        self.loaded.add((cast(str, reply["sessionId"]), parameters["loaderId"]))
+                    if parameters["name"] in ("DOMContentLoaded", "load"):
+                        self.loaded.add((cast(str, reply["sessionId"]), parameters["loaderId"], parameters["name"]))
+                elif reply.get("method") == "Page.frameNavigated":
+                    frame = cast(dict[str, dict[str, str]], reply["params"])["frame"]
+                    if "parentId" not in frame:
+                        self.frame_loaders[frame["id"]] = frame["loaderId"]
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Chrome did not answer")
                 return reply
@@ -187,17 +195,21 @@ class _Chrome(_Browser):
                     raise RuntimeError(f"{method}: {reply['error']}")
                 return cast(dict[str, object], reply["result"])
 
-    def navigate(self, destination: str) -> None:
+    def navigate(self, destination: str, ready: str = "DOMContentLoaded") -> None:
+        self.frame_loaders.clear()
         navigation = self.command("Page.navigate", {"url": destination}, self.session)
         if "errorText" in navigation:
             raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
-        load = (self.session, cast(str, navigation["loaderId"]))
+        frame = cast(str, navigation["frameId"])
+        loader = cast(str, navigation["loaderId"])
         deadline = time.monotonic() + 20
-        while load not in self.loaded:
+        while (self.session, self.frame_loaders.get(frame, loader) if ready == "load" else loader,
+               ready) not in self.loaded:
             _ = self.read(deadline)
 
-    def dom(self, page: Path, marker: str, *, reduced_motion: bool,
-            window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
+    @contextmanager
+    def page(self, destination: str, *, reduced_motion: bool = False, dark: bool = False,
+             window_size: tuple[int, int] | None = None, ready: str = "DOMContentLoaded") -> Generator[None]:
         with self.stop_on_error():
             session = self.session
             if window_size is not None:
@@ -206,10 +218,25 @@ class _Chrome(_Browser):
                     {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
             else:
                 _ = self.command("Emulation.clearDeviceMetricsOverride", {}, session)
-            features = [{"name": "prefers-reduced-motion", "value": "reduce"}] if reduced_motion else []
+            features = [{"name": "prefers-color-scheme", "value": "dark"}] if dark else []
+            if reduced_motion:
+                features.append({"name": "prefers-reduced-motion", "value": "reduce"})
             _ = self.command("Emulation.setEmulatedMedia", {"features": features}, session)
+            self.navigate(destination, ready)
+            yield
+            self.navigate("about:blank")
+            _ = self.command("Page.resetNavigationHistory", {}, session)
+            self.loaded.clear()
+
+    def screenshot(self, path: Path) -> None:
+        result = self.command("Page.captureScreenshot", {"captureBeyondViewport": False}, self.session)
+        _ = path.write_bytes(base64.b64decode(cast(str, result["data"])))
+
+    def probe(self, page: Path, marker: str, *, reduced_motion: bool = False,
+              window_size: tuple[int, int] | None = None) -> str:
+        with self.stop_on_error():
+            session = self.session
             destination = page.as_uri()
-            # Evaluate the promise in the new document, after the navigation.
             marker_literal = json.dumps(marker)
             script = (
                 "try { sessionStorage.clear(); localStorage.clear(); }"
@@ -217,24 +244,21 @@ class _Chrome(_Browser):
                 "globalThis.fixtureDOM = new Promise(resolve => {"
                 "const observer = new MutationObserver(() => {"
                 f"const result = document.getElementById({marker_literal});"
-                "if (result) { observer.disconnect(); resolve(document.documentElement.outerHTML); }"
+                "if (result) { observer.disconnect(); resolve(result.textContent); }"
                 "});"
                 "observer.observe(document, {childList: true, subtree: true});"
                 "});"
             )
             hook = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
-            self.navigate(destination)
-            try:
-                response = self.command("Runtime.evaluate",
-                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
-            except TimeoutError as error:
-                raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
+            with self.page(destination, reduced_motion=reduced_motion, window_size=window_size):
+                _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
+                try:
+                    response = self.command("Runtime.evaluate",
+                        {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+                except TimeoutError as error:
+                    raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
-            _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
-            self.navigate("about:blank")
-            _ = self.command("Page.resetNavigationHistory", {}, session)
-            self.loaded.clear()
-            return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
+            return str(result.get("value", ""))
 
 
 class _Firefox(_Browser):
@@ -245,26 +269,40 @@ class _Firefox(_Browser):
         profile.mkdir()
         _ = (profile / "user.js").write_text(
             'user_pref("marionette.port", 0);\n'
+            + 'user_pref("remote.log.level", "Info");\n'
             + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n')
-        with (root / "firefox.log").open("wb") as log:
-            process = subprocess.Popen(
-                ["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                 "--marionette", "--remote-allow-system-access", "about:blank"],
-                stdout=log, stderr=log, start_new_session=True)
+        process = subprocess.Popen(
+            ["firefox", "--headless", "--no-remote", "--profile", str(profile),
+             "--marionette", "--remote-allow-system-access", "about:blank"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         super().__init__(process)
         with self.stop_on_error():
-            port_file = profile / "MarionetteActivePort"
-            deadline = time.monotonic() + 30
-            while not port_file.exists():
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError((root / "firefox.log").read_text(errors="replace"))
-                time.sleep(0.02)
-            address = ("127.0.0.1", int(port_file.read_text()))
+            ready = threading.Event()
+            ports: list[int] = []
+            log_path = root / "firefox.log"
+            assert process.stdout is not None
+            output = cast(BinaryIO, process.stdout)
+
+            def read_output() -> None:
+                try:
+                    with log_path.open("wb") as log:
+                        while line := output.readline():
+                            _ = log.write(line)
+                            if found := re.search(rb"Marionette\s+INFO\s+Listening on port (\d+)", line):
+                                ports.append(int(found[1]))
+                                ready.set()
+                finally:
+                    ready.set()
+
+            threading.Thread(target=read_output, daemon=True).start()
+            if not ready.wait(30) or not ports:
+                raise RuntimeError(log_path.read_text(errors="replace"))
+            address = ("127.0.0.1", ports[0])
             self.connection: socket.socket = self.resources.enter_context(socket.create_connection(address, timeout=45))
             self.stream: BinaryIO = self.resources.enter_context(self.connection.makefile("rb"))
             _ = self.read()
             self.sequence: int = 0
-            _ = self.command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "none"}}})
+            _ = self.command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "normal"}}})
             initial = cast(dict[str, str], self.command("WebDriver:GetWindowHandle"))
             self.initial: str = initial["value"]
 
@@ -321,24 +359,12 @@ Services.clearData.deleteData(
         result = cast(dict[str, str], self.command("WebDriver:TakeScreenshot", {"full": False}))
         _ = path.write_bytes(base64.b64decode(result["value"]))
 
-    def wait_for_load(self, destination: str) -> None:
-        deadline = time.monotonic() + 45
-        while time.monotonic() < deadline:
-            if self.script("""
-// The console can change the query with history.replaceState.
-const navigation = performance.getEntriesByType('navigation')[0];
-return navigation?.name.split('#', 1)[0] === arguments[0] && document.readyState === 'complete';
-""", [destination.partition("#")[0]]) is True:
-                return
-            time.sleep(0.02)
-        raise TimeoutError(f"Firefox did not load {destination}")
-
-
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
     browser_root: ClassVar[Path]
     _chrome: ClassVar[_Chrome | None] = None
     _firefox: ClassVar[_Firefox | None] = None
+    _http_server: ClassVar[ThreadingHTTPServer | None] = None
 
     @classmethod
     @override
@@ -346,6 +372,7 @@ class ListPageTests(unittest.TestCase):
         cls.browser_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="list-page-class-")))
         cls._chrome = None
         cls._firefox = None
+        cls._http_server = None
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
@@ -402,22 +429,50 @@ class ListPageTests(unittest.TestCase):
         cls.addClassCleanup(cls._firefox.close)
         return cls._firefox
 
-    def firefox_view(self, destination: str, path: Path | None, width: int, height: int,
+    @classmethod
+    @contextmanager
+    def probe_server(cls, handler: type[BaseHTTPRequestHandler]) -> Generator[ThreadingHTTPServer]:
+        server = cls._http_server
+        if server is None:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            cls._http_server = server
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cls.addClassCleanup(server.server_close)
+            cls.addClassCleanup(thread.join, TEST_HANG_GUARD_SECS)
+            cls.addClassCleanup(server.shutdown)
+        with patch.object(server, "RequestHandlerClass", handler):
+            yield server
+
+    def browser_view(self, destination: str, path: Path | None, width: int, height: int,
                      complete: threading.Event | None = None, *, dark: bool = False
                      ) -> subprocess.CompletedProcess[str]:
+        if CHROME:
+            browser = self.chrome()
+            ready = "load" if complete is None else "DOMContentLoaded"
+            with browser.page(destination, window_size=(width, height), ready=ready, dark=dark):
+                if complete is not None and not complete.wait(45):
+                    raise TimeoutError("Chrome did not report the page result")
+                if path is not None:
+                    browser.screenshot(path)
+            return subprocess.CompletedProcess(destination, 0, "", "")
         if width < FIREFOX_MIN_SHARED_WIDTH:
             with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
-                screenshot = path if path is not None else root / "page.png"
-                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
-                                      capture_output=True, text=True, timeout=45, env=environment)
+                assert complete is not None and path is None
+                process = subprocess.Popen([*command, destination], stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, env=environment, start_new_session=True)
+                try:
+                    if not complete.wait(45):
+                        raise TimeoutError("Firefox did not report the page result")
+                finally:
+                    _stop_browser(process)
+                return subprocess.CompletedProcess(destination, 0, "", "")
         try:
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
-                if complete is None:
-                    browser.wait_for_load(destination)
-                elif not complete.wait(45):
+                if complete is not None and not complete.wait(45):
                     raise TimeoutError("Firefox did not report the page result")
                 if path is not None:
                     browser.screenshot(path)
@@ -646,7 +701,7 @@ window.fetch=async (path,options={})=>{
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
                     "status": status, "body": body})))
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_list_title_actions_fit_at_320_pixels(self) -> None:
         owner = replace(MORTY, name="cargo-liner")
         markup = page_frame.with_owner(list_page.render(self.root / "reviews", include_counts=False),
@@ -778,7 +833,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 </script>'''
         self.browser_actions(markup, "", probe)
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
         root = self.root / "reviews"
         doc = self.root / "sdlc.md"
@@ -1180,21 +1235,10 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                         url = f"http://127.0.0.1:{server.server_port}" + route
                         if size == "screenshot":
                             assert proof is not None
-                            result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
-                            self.assertEqual(result.returncode, 0, result.stderr)
-                        elif size == "430,900":
-                            command, environment = _private_firefox_command(
-                                self.root / f"overlay-profile-{size}", width, height, dark=True)
-                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL, env=environment) as browser:
-                                try:
-                                    self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
-                                finally:
-                                    browser.terminate()
-                                    _ = browser.wait(timeout=10)
+                            result = self.browser_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                         else:
-                            with self.firefox().page(url, width, height, dark=True):
-                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
+                            result = self.browser_view(url, None, width, height, complete, dark=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
                     finally:
                         complete.set()
                         server.shutdown()
@@ -1204,7 +1248,7 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                     reviewed = {row["#"]: row["Verdict"] for row in change_review.review_snapshot(listing).reviewed}
                     self.assertIn("works", reviewed["C1"].casefold())
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_list_links_show_the_target_inside_the_console(self) -> None:
         source = self.add("Follow the linked items", number=1)
         for number in range(2, 29):
@@ -1287,7 +1331,7 @@ frame.addEventListener('load',async()=>{
   const originalPlace=original.href;
   const debounced=pendingWords ? new Promise(done=>search.addEventListener('filterchange',done,{once:true})) : null;
   const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.list'),location.href).href;
-  const updated=new Promise(resolve=>{
+  const updated=new Promise((resolve,reject)=>{
    const done=()=>{
     clearTimeout(timeout);removeEventListener('message',record);resolve();
    };
@@ -1296,7 +1340,9 @@ frame.addEventListener('load',async()=>{
        consolePlace()===win.location.href) done();
    };
    addEventListener('message',record);
-   const timeout=setTimeout(done,1500);
+   const timeout=setTimeout(()=>{
+    removeEventListener('message',record);reject(new Error('The console did not record the List place.'));
+   },8000);
   });
   win.postMessage({clickListLink:number,pendingWords},location.origin);await updated;await frames(win);
   if(debounced){
@@ -1431,9 +1477,7 @@ frame.addEventListener('load',async()=>{
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+        with self.probe_server(Probe) as server:
             try:
                 proof = os.environ.get("LIST_JUMP_PROOF")
                 cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
@@ -1453,17 +1497,12 @@ frame.addEventListener('load',async()=>{
                         place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
-                        if case == "proof" and proof:
-                            result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
-                            self.assertEqual(result.returncode, 0, result.stderr)
-                        else:
-                            with self.firefox().page(destination, 1440, 1100, dark=True):
-                                self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
+                        screenshot = Path(proof) if case == "proof" and proof else None
+                        result = self.browser_view(destination, screenshot, 1440, 1100, complete, dark=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(results, [[]])
             finally:
                 complete.set()
-                server.shutdown()
-                thread.join(5)
 
     def test_staff_owner_and_producer_names_have_role_colors_but_nate_stays_plain(self) -> None:
         _ = self.add("Staff names")
@@ -2987,7 +3026,7 @@ window.fetch=async(_path,options={})=>{
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(resolve));
  const row=number=>document.querySelector('[data-number="'+number+'"]');
  const visible=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>!item.hidden).map(item=>item.dataset.number).sort().join(',');
  const choose=(show,query)=>new Promise(done=>{
@@ -3184,14 +3223,21 @@ window.fetch=async(_path,options={})=>{
  const time=form.querySelector('[data-later-time]');
  show('working');
  time.focus();
+ const blurred=new Promise(resolve=>time.addEventListener('blur',resolve,{once:true}));
  time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
  check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
+ if(document.activeElement===time) await blurred;
  finishPost({reason:'The fixture refuses Park'});
  await flush();
- for(const animation of document.getAnimations()) animation.finish();
+ const animations=document.getAnimations();
+ const finished=Promise.allSettled(animations.map(animation=>animation.finished));
+ for(const animation of animations) animation.finish();
+ await finished;
  await flush();
  check(!row.hidden && !toggle.disabled && document.activeElement===toggle,
-  'The restored row returns focus to Park until');
+  'The restored row returns focus to Park until. '+JSON.stringify({
+   hidden:row.hidden,disabled:toggle.disabled,focus:document.activeElement?.outerHTML.slice(0,200),
+  }));
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3274,7 +3320,7 @@ window.fetch=async(_path,options={})=>{
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   return requests.at(-1).get('request');
  };
- const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(resolve));
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
  try{
   check(labels().join() === 'Parked until Nov 18 13:00 EST','The row starts with one saved time label');
@@ -3766,14 +3812,14 @@ observer.observe(original.parentNode,{childList:true});
  check(status.hidden,'opening the latest failed row hides the notice above the table');
 ''')
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_clears_the_list_save_notice(self) -> None:
         for number in range(1, 9):
             _ = self.add(f"List item {number}", number=number)
         with patch.object(list_page, "counts_strip", return_value=""):
             page = list_page.render(self.root / "reviews")
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            return self.firefox_view(arguments[-1], None, 1366, 768)
+            return self.browser_view(arguments[-1], None, 1366, 768)
 
         with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
@@ -4331,15 +4377,15 @@ observer.observe(original.parentNode,{childList:true});
  for(const view of ['needs-me','blocked','parked','working']){
   show(view);check(row.hidden,view+' hides the saved row');
  }
- location.hash=new URLSearchParams({show:'working',item:row.dataset.key}).toString();
- await flush();
+ await navigate({show:'working',item:row.dataset.key});
  check(!row.hidden && row.closest('[data-linked-item]:not([hidden])') && !row.querySelector('[data-detail]').hidden &&
   row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
   !row.querySelector('[value="question"]'),'A direct link opens only the waiting row without Ask');
  check(count.textContent.startsWith('1 of 2'),'The linked row counts in All and stays outside Working.');
  show('morty-answering');
+ const filtered=new Promise(resolve=>input.addEventListener('filterchange',resolve,{once:true}));
  input.value='Only this row';input.dispatchEvent(new Event('input'));
- await new Promise(resolve=>setTimeout(resolve,150));
+ await filtered;
  check(!row.hidden && count.textContent.startsWith('1 of 2'),'Search finds the waiting row in Morty answering.');
 """, reduced_motion=True, add_item=False)
 
@@ -4377,8 +4423,7 @@ observer.observe(original.parentNode,{childList:true});
  check(document.activeElement===chip,'The Parked filter receives focus.');
  check(!status.hidden && status.textContent==='Item #1 unparked.',
   'Show keeps the Unpark confirmation for the waiting item.');
- location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
- await flush();
+ await navigate({show:'parked',item:row.dataset.key});
  check(!row.hidden && !row.querySelector('[data-detail]').hidden &&
   row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
   !row.querySelector('form'),'The direct link opens the item with only the waiting line.');
@@ -4462,8 +4507,7 @@ observer.observe(original.parentNode,{childList:true});
             for saved in (False, True):
                 with self.subTest(action=action, park_request_saved=saved):
                     self.browser_action_sequence('''
- location.hash=new URLSearchParams({show:'parked',unread:'1',item:row.dataset.key}).toString();
- await flush();
+ await navigate({show:'parked',unread:'1',item:row.dataset.key});
  const linked=document.querySelector('[data-linked-item]');
  const isLinked=()=>!linked.hidden && linked.contains(row) && !row.querySelector('[data-detail]').hidden;
  check(isLinked(),'The read item starts linked under Parked with Unread only on.');
@@ -4569,11 +4613,6 @@ observer.observe(original.parentNode,{childList:true});
  const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
  const selected=()=>document.querySelector('[data-filter-row="show"] [aria-pressed="true"]');
  const count=()=>document.querySelector('[data-list-count]').textContent;
- const navigate=async params=>{
-  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  location.hash=new URLSearchParams(params);
-  await changed;
- };
  check(!chip('closed'),'Show has no Closed chip.');
  check(chip('morty-answering').dataset.filterCount==='0','The closed question does not count.');
  check(count()==='1 of 1 items shown · 0 need you · 1 unread','The totals count the open item.');
@@ -4701,11 +4740,7 @@ observer.observe(original.parentNode,{childList:true});
             with self.subTest(actions=actions):
                 self.browser_action_sequence("const actions=" + json.dumps(actions) + r""";
  const linked=document.querySelector('[data-linked-item]');
- const follow=async()=>{
-  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  location.hash=new URLSearchParams({show:'all',unread:'1',item:row.dataset.key});
-  await changed;
- };
+ const follow=()=>navigate({show:'all',unread:'1',item:row.dataset.key});
  onlyUnread();
  await follow();
  for(const action of actions){
@@ -4836,8 +4871,7 @@ observer.observe(original.parentNode,{childList:true});
  const section=document.querySelector('[data-linked-item]');
  const count=document.querySelector('[data-list-count]');
  const unread=document.getElementById('list-unread');
- location.hash=new URLSearchParams({show:'all',unread:'1',item:target.dataset.key}).toString();
- await flush();
+ await navigate({show:'all',unread:'1',item:target.dataset.key});
  check(unread.checked && results.querySelectorAll('[data-list-item]:not([hidden])').length===1 &&
   count.textContent.startsWith('1 of 2'),'Unread only keeps one row in the results.');
  check(!section.hidden && section.contains(target) && !target.hidden && !target.querySelector('[data-detail]').hidden,
@@ -4847,7 +4881,7 @@ observer.observe(original.parentNode,{childList:true});
   'The read item rejoins the results when Unread only is off.');
 """, add_item=False, reduced_motion=True)
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_refresh_keeps_a_linked_delivered_item_after_its_answer(self) -> None:
         root = self.root / "reviews"
         source = self.add("Follow the delivered item", number=1)
@@ -5146,7 +5180,7 @@ window.fetch=async(_url,options)=>{
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         return item, markup
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_direct_answer_link_waits_for_visibility(self) -> None:
         item, markup = self.render_unread_answer()
         fragment = urlencode({"show": "unread", "item": f"{MORTY.id}/{item.id}"})
@@ -5198,16 +5232,19 @@ window.fetch=async(_url,options)=>{
                         .replace('CLOSE_ROW', str(close_row).lower()))
                 self.browser_answer_visibility(markup, setup, case)
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_direct_answer_link_waits_until_the_answer_scrolls_into_view(self) -> None:
         item, markup = self.render_unread_answer(latest_status="\n\n".join(f"Check {n} passed." for n in range(55)))
         fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
         setup = """<script>
 history.replaceState(null,'','#FRAGMENT');
 const reads=[];
+let readStarted;
+const readRequested=new Promise(resolve=>{readStarted=resolve;});
 window.fetch=async(_url,options)=>{
  if(options?.method!=='POST') return new Response('',{status:503});
  reads.push(new URLSearchParams(options.body));
+ readStarted();
  return new Response(JSON.stringify({unread:'true'}));
 };
 </script>""".replace('FRAGMENT', fragment)
@@ -5229,6 +5266,7 @@ window.fetch=async(_url,options)=>{
   check(!reads.length && panel.querySelector('.question-unread'),'The answer below the viewport stays unread');
   answer.scrollIntoView({block:'center',behavior:'instant'});
   check((await sample()).isIntersecting,'Scrolling brings the answer into the viewport');
+  await readRequested;
   check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
    'The answer sends one signed read when it enters the viewport');
@@ -5238,7 +5276,7 @@ window.fetch=async(_url,options)=>{
 </script>"""
         self.browser_answer_visibility(markup, setup, probe)
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_direct_answer_link_reads_once_in_a_720_pixel_viewport(self) -> None:
         with patch.object(list_page, "counts_strip", return_value=""):
             item, markup = self.render_unread_answer()
@@ -5249,9 +5287,12 @@ window.fetch=async(_url,options)=>{
         setup = """<script>
 history.replaceState(null,'','#FRAGMENT');
 const reads=[];
+let readStarted;
+const readRequested=new Promise(resolve=>{readStarted=resolve;});
 window.fetch=async(_url,options)=>{
  if(options?.method!=='POST') return new Response('',{status:503});
  reads.push(new URLSearchParams(options.body));
+ readStarted();
  return new Response(JSON.stringify({unread:'false'}));
 };
 </script>""".replace('FRAGMENT', fragment)
@@ -5271,7 +5312,9 @@ window.fetch=async(_url,options)=>{
    'Expected a 720 pixel viewport and answer at 1,800 pixels. Got '+innerHeight+' and '+answer.getBoundingClientRect().top+'.');
   check(!(await sample()).isIntersecting && reads.length===0,'The offscreen answer sends no read.');
   answer.scrollIntoView({block:'center',behavior:'instant'});
-  check((await sample()).intersectionRect.height>0 && reads.length===1 &&
+  const visible=await sample();
+  await readRequested;
+  check(visible.intersectionRect.height>0 && reads.length===1 &&
    reads[0].get('action')==='read' && reads[0].get('token')===panel.dataset.openReadToken,
    'Scrolling to the answer sends one signed read.');
   scrollTo({top:0,behavior:'instant'});
@@ -5285,7 +5328,7 @@ window.fetch=async(_url,options)=>{
 </script>"""
         self.browser_answer_visibility(markup, setup, probe, viewport_height=720)
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_item_link_waits_for_every_unread_answer(self) -> None:
         item, markup = self.render_unread_answer(questions_and_answers=(
             ("Which checks passed?", "\n".join(f"Check {number} passed." for number in range(65))),
@@ -5383,8 +5426,6 @@ window.fetch=async(_url,options)=>{
                                   viewport_height: int | None = None, reload_markup: str = "",
                                   reload_console: bool = False, console_fragment: str = "",
                                   viewport_width: int | None = None) -> None:
-        if viewport_width is not None:
-            probe = '<img hidden src="/complete">' + probe
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         loaded = threading.Event()
@@ -5398,11 +5439,9 @@ window.fetch=async(_url,options)=>{
             console_shell = console.render((listing,), console.UnavailablePage())
             place = frame_path + (console_fragment or "#show=working")
             frame_url = "/console/?" + urlencode({"page": "list", "at.list": place})
-            if console_fragment:
-                console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
                      + 'iframe[hidden]{display:block;visibility:hidden}</style>'
-                     + f'<iframe data-src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">'
+                     + f'<iframe data-src="{html.escape(frame_url)}"></iframe>'
                      + """<script>
 // Set the frame size before the List starts its observers.
 const frame=document.querySelector('iframe');
@@ -5414,10 +5453,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
         class Probe(serve.ReviewLinksHandler):
             @override
             def send_head(self) -> BinaryIO | None:
-                if self.path == '/complete':
-                    _ = complete.wait(TEST_HANG_GUARD_SECS)
-                    self.json_response(200, {})
-                elif self.path == frame_path:
+                if self.path == frame_path:
                     self.html_response(200, reloaded if reloaded and loaded.is_set() else page)
                     loaded.set()
                 elif console_shell and urlsplit(self.path).path == "/console/":
@@ -5451,7 +5487,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
             try:
                 window_height = max(900, (viewport_height or 0) + 32)
                 destination = frame_url if console_fragment or viewport_width is not None else "/"
-                browser = self.firefox_view(f"http://127.0.0.1:{server.server_port}{destination}",
+                browser = self.browser_view(f"http://127.0.0.1:{server.server_port}{destination}",
                                            None, viewport_width or 1280, window_height, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
@@ -5460,7 +5496,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
                 server.shutdown()
                 thread.join()
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
         item = self.add("Check the current result")
         _ = self.add("Check the other unread result", owner=OTHER.id)
@@ -5647,7 +5683,7 @@ const change=async path=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof',
+                browser = self.browser_view(f'http://127.0.0.1:{server.server_port}/proof',
                                             None, 1440, 900, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
@@ -5699,7 +5735,11 @@ window.fetch=async(path,options={})=>{
  };
  const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
  const onlyUnread=(on=true)=>{const control=document.getElementById('list-unread');if(control.checked!==on) control.click();};
- const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const navigate=params=>new Promise(resolve=>{
+  addEventListener('hashchange',resolve,{once:true});
+  location.hash=new URLSearchParams(params);
+ });
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(resolve));
  const finishRowMotion=async()=>{
   const motions=document.querySelectorAll('[data-record-motion]');
   for(const motion of motions) for(const animation of motion.getAnimations({subtree:true})) animation.finish();
@@ -5732,11 +5772,9 @@ window.fetch=async(path,options={})=>{
             page = self.root / 'actions-console.html'
             _ = page.write_text('<!doctype html><button id="console-nav">Console navigation</button>'
                                 + '<iframe title="The List" src="actions.html"></iframe>')
-        result = self.chrome().dom(page, "probe-results", reduced_motion=reduced_motion, window_size=window_size)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        marker = '<p id="probe-results">'
-        self.assertIn(marker, result.stdout[-3000:], 'The browser must complete the item action checks.')
-        failures = cast(list[str], json.loads(html.unescape(result.stdout.split(marker, 1)[1].split('</p>', 1)[0])))
+        result = self.chrome().probe(page, "probe-results", reduced_motion=reduced_motion, window_size=window_size)
+        self.assertTrue(result, "The browser must complete the item action checks.")
+        failures = cast(list[str], json.loads(result))
         self.assertEqual(failures, [])
 
     def test_delivery_notices_color_staff_names_and_keep_the_recorded_words(self) -> None:
@@ -5950,7 +5988,7 @@ window.fetch=async(_path,options={})=>{
  const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
  form.requestSubmit(form.querySelector('[value="ACTION"]'));
- await new Promise(resolve=>setTimeout(resolve,0));
+ await new Promise(resolve=>requestAnimationFrame(resolve));
  const cleared=row.dataset.unread==='false' && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]') && row.hidden;
  const retained=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  const after=EXPECTED_UNREAD ? retained : cleared;
@@ -5966,10 +6004,9 @@ window.fetch=async(_path,options={})=>{
                 page = self.root / f"{action}-{unread}.html"
                 _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
                     probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
-                result = self.chrome().dom(page, "probe-result", reduced_motion=False, window_size=None)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
-                                f"The {action} action must show the saved unread state and apply the Unread filter.")
+                result = self.chrome().probe(page, "probe-result")
+                self.assertEqual(result, "PASS",
+                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
 
     def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
         root = self.root / "reviews"
@@ -6096,22 +6133,15 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(tuple(the_list.feedback_requests(current).values())[-1].state, "sent")
         self.assertIs(the_list.sent_to_morty(current), the_list.NoTimestamp.UNSET)
 
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the shared status layout check")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
         _ = self.fixture_items()
+        assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
-        def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            path = Path(arguments[arguments.index("--screenshot") + 1])
-            width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
-            return self.firefox_view(arguments[-1], path, int(width), int(height))
-
-        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
-            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
-
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
         _ = self.fixture_items()
-        self.browser(list_page.render(self.root / "reviews").decode())
+        self.browser()
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_staff_chip_rows_wrap_and_fit(self) -> None:
@@ -6234,9 +6264,9 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 </script>"""
         self.browser_actions(markup, "", probe)
 
-    def browser(self, markup: str) -> None:
+    def browser(self) -> None:
         setup = r'''<script>
-const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[],posts=[];
+const nativeFetch=fetch, errors=[], reads=[],posts=[];
 let original=MARKUP,holdPost=false,finishPost,failRefresh=false,realFeedback=false,loseResponse=false;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 window.fetch=async(_path,options={})=>{
@@ -6268,7 +6298,17 @@ addEventListener('unhandledrejection',event=>errors.push(String(event.reason)));
         probe = r'''<script>
 (async()=>{
 const failed=[],check=(ok,text)=>{if(!ok) failed.push(text);};
-const flush=()=>new Promise(resolve=>nativeTimeout(resolve,50));
+const changed=(element,ready)=>new Promise(resolve=>{
+ const observer=new MutationObserver(complete);
+ function complete(){if(ready()){observer.disconnect();resolve();}}
+ observer.observe(element,{attributes:true,childList:true,subtree:true});
+ complete();
+});
+const navigate=async params=>{
+ const completed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ location.hash=new URLSearchParams(params);
+ await completed;
+};
 const submitted=(form,button)=>new Promise((resolve,reject)=>{
  if(form.dataset.sending){reject(new Error('The test submission did not start.'));return;}
  const observer=new MutationObserver(()=>{
@@ -6278,20 +6318,13 @@ const submitted=(form,button)=>new Promise((resolve,reject)=>{
  form.requestSubmit(button);
  if(!form.dataset.sending){observer.disconnect();reject(new Error('The test submission did not start.'));}
 });
-const until=async (ready,label)=>{
- const deadline=performance.now()+8000;
- while(!ready()){
-  if(performance.now()>deadline) throw new Error('Timed out: '+label);
-  await flush();
- }
-};
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
 const shownNumbers=()=>visible().map(row=>row.dataset.number).join(',');
 const refreshOrder=async label=>{
  const first=visible()[0],order=shownNumbers();
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await until(()=>!first.isConnected,'the table refresh');
+ await changed(document.body,()=>!first.isConnected);
  check(shownNumbers()===order,label);
 };
 const filterRow=name=>document.querySelector('[data-filter-row="'+name+'"]');
@@ -6315,7 +6348,7 @@ const search=value=>new Promise(done=>{
  field.addEventListener('filterchange',done,{once:true});field.value=value;field.dispatchEvent(new Event('input'));
 });
 try{
- await flush();
+ if(document.readyState==='loading') await new Promise(resolve=>document.addEventListener('DOMContentLoaded',resolve,{once:true}));
  const reloadKey='list-filter-clear-reload',saved=sessionStorage.getItem(reloadKey);
  if(saved===null){
   const emptyBorder=border();
@@ -6344,8 +6377,15 @@ try{
  failed.push(...failures);
  check(searchField().value==='console' && query()==='console' && visible().length===2 &&
   border()!==emptyBorder && clearFilter().getClientRects().length===1,'Reload restores the filter from the address.');
+ const restoredWords=new Promise(resolve=>{
+  const setWords=filterControl.setWords;
+  filterControl.setWords=function(field,value){
+   setWords.call(this,field,value);
+   if(field===searchField()){this.setWords=setWords;resolve();}
+  };
+ });
  searchField().value='auto';
- dispatchEvent(new Event('pageshow'));await flush();
+ dispatchEvent(new Event('pageshow'));await restoredWords;
  check(searchField().value==='console' && query()==='console','Silent browser restoration cannot change the address filter.');
  clearFilter().click();
  check(!searchField().value && !query() && visible().length===5 && document.activeElement===searchField() &&
@@ -6368,7 +6408,7 @@ try{
  check(shown.left>=0 && shown.right<=innerWidth && document.documentElement.scrollWidth<=innerWidth,
        'The count fits without horizontal overflow.');
  if(innerWidth>=960){
-  check(bounds(document.querySelector('main')).width===Math.min(1124,document.documentElement.clientWidth),
+  check(bounds(document.querySelector('main')).width===Math.min(1124,bounds(document.body).width),
         'The desktop uses the available width up to the shared limit.');
   for(const header of document.querySelectorAll('[data-sort]')){
    const label=document.createRange();label.selectNodeContents(header.firstChild);
@@ -6511,7 +6551,8 @@ try{
  words.value='Keep my draft';words.dispatchEvent(new Event('input'));
  const field=document.querySelector('#list-search');field.focus();field.setSelectionRange(1,3);
  document.body.style.minHeight='2400px';scrollTo(0,100);
- dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await changed(document.body,()=>!selected.isConnected);
  const refreshed=rows().find(row=>row.dataset.number==='106');
  check(reads.length===3,'Each shared status event requests a fresh page.');
  check(document.querySelector('#list-search').value==='console','refresh keeps the query');
@@ -6545,7 +6586,7 @@ try{
  const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await flush();await flush();
+ await changed(document.body,()=>!retryForm.isConnected);
  retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
@@ -6563,11 +6604,12 @@ try{
   requestIds.push(form.elements.request.value);
   holdPost=action==='tell';
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
-  if(holdPost){await until(()=>typeof finishPost==='function','the held response');
+  if(holdPost){
+   if(typeof finishPost!=='function') throw new Error('The held response did not start.');
    form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
    check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
   check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
-  await until(()=>!form.dataset.sending,'the '+action+' response');
+  await changed(form,()=>!form.dataset.sending);
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
@@ -6595,16 +6637,16 @@ try{
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await replaced;
  realFeedback=false;failRefresh=true;
- location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
+ await navigate({show:'closed',sort:'#',dir:'desc'});
  check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58,41' && selectedShow()==='all',
   'An old Closed address opens All in the requested sort order.');
- location.hash=new URLSearchParams({show:'done'});await flush();
+ await navigate({show:'done'});
  check(selectedShow()==='all' && visible().map(row=>row.dataset.number).sort().join()==='105,106,41,58,63',
   'An old Done address opens All.');
- location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
+ await navigate({show:'all',producer:DWIGHT});
  check(selectedFilter('producer')==='staff:'+DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105,41',
    'an address restores the producer filter');
- location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
+ await navigate({show:'all',producer:'missing'});
  check(selectedFilter('producer')==='all' && visible().length===5,'An unknown producer clears the Producer filter.');
  const restoredOldAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
  location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});
@@ -6613,14 +6655,14 @@ try{
   visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 
  for(const target of rows().filter(row=>row.dataset.state==='Done' || row.dataset.parked==='true')){
-  location.hash=new URLSearchParams({item:target.dataset.key});await flush();
+  await navigate({item:target.dataset.key});
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
   check(selectedShow()==='all' &&
     selectedFilter('owner')==='all' && !unread().checked && selectedFilter('producer')==='all' &&
     document.getElementById('list-search').value==='','An item link selects Show and clears the other filters.');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
- location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});await flush();
+ await navigate({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});
  check(selectedFilter('owner')==='staff:'+retained.dataset.owner && selectedShow()==='working' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
@@ -6687,19 +6729,16 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                     def log_message(self, format: str, *args: object) -> None:
                         pass
 
-                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-                    thread = threading.Thread(target=server.serve_forever, daemon=True)
-                    thread.start()
+                with self.probe_server(Probe) as server:
                     try:
                         with patch.object(change_page, "send_to_staff") as sends:
-                            done = self.firefox_view(f'http://127.0.0.1:{server.server_port}/',
+                            done = self.browser_view(f'http://127.0.0.1:{server.server_port}/',
                                                      None, width, 900, complete)
                             self.assertEqual(done.returncode, 0, done.stderr)
                             self.assertEqual(results, [[]])
                             sends.assert_called_once()
                     finally:
-                        server.shutdown()
-                        thread.join(5)
+                        complete.set()
 
 
 if __name__ == '__main__':
