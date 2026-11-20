@@ -46,7 +46,6 @@ from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
-from scripts.buildlog import record as buildlog_record
 
 
 @dataclass(frozen=True)
@@ -1120,6 +1119,9 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
+    # start time: loaded only to record a completed cloud gate
+    from scripts.buildlog import record as buildlog_record
+
     imported: dict[str, object] = {'id': record_id}
     try:
         # The result leaves the checkout: a gate copy is a reused slot.

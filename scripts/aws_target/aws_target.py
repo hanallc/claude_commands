@@ -30,8 +30,6 @@ from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
-from scripts.aws_target.hana_box import HanaController, read_settings as lifecycle_settings
-from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
 from scripts.message import send_budget, send_result
@@ -600,6 +598,10 @@ class AccountRefresh:
 def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *,
                     lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None) -> int:
     """Recover lifecycle state before an independent account refresh attempt."""
+    # start time: loaded only by the controller tick
+    from scripts.aws_target.hana_box import HanaController
+    from scripts.aws_target.hana_provider import AwsHanaProvider
+
     status = 0
     controller = HanaController(directory, settings_path, workload_path,
         AwsHanaProvider.from_settings(settings_path, directory, workload_path))
@@ -618,6 +620,9 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
           run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
           pause: Callable[[float], None] = time.sleep, keep_running: Callable[[], bool] = lambda: True) -> int:
     """Bound each tick in a child process and release all tick locks between attempts."""
+    # start time: loaded only by serve
+    from scripts.aws_target.hana_box import read_settings as lifecycle_settings
+
     while keep_running():
         settings = lifecycle_settings(conf.read(workload_path))
         try:
