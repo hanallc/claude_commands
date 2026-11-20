@@ -2271,7 +2271,7 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
         if pending is not None:
             events = review_events.append(events, review_events.ReviewLog(now, "nate", "Superseded followup: " + pending["text"]))
         if action == "question":
-            current.item["followup"] = PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"))
+            current.item["followup"] = PendingFollowup(text=words, sent=now.strftime("%Y-%m-%dT%H:%M"))
             current.item["waiting_why"] = review_events.require_waiting_why(words)
             current.item["review_submission"] = new_item_dialog.stored_submission(replace(details, reply_token=token))
         else:
