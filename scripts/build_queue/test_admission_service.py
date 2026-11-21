@@ -66,6 +66,40 @@ def setUpModule() -> None:
     forbid_real_sender()
 
 
+def read_landing_gate_wait(fixture: AdmissionFixture, job: StepJob | GateJobNotRecorded
+                           ) -> tuple[wire.Wait, wire.ViewReply, staff.StaffSnapshot]:
+    """Record one live gate and read the wait behind it."""
+    from scripts.build_queue.test_landing_admission import COMMIT, request_behind_gate, running_gate_request
+    from scripts.build_targets import target_config
+    from scripts.production import land_runs
+    from scripts.production.staff_test_support import fixture_runtime_id
+
+    builds = staff.StaffId(fixture_runtime_id("builds"))
+    natemerge = staff.StaffId(fixture_runtime_id("natemerge"))
+    queue = staff.StaffId(fixture_runtime_id("queue"))
+    members = staff.StaffSnapshot((
+        staff.StaffRow(builds, "showrunner", "builds", staff.StaffRoot(), current_session=builds),
+        staff.StaffRow(natemerge, "unit", "natemerge", staff.ReportsTo(builds), current_session=natemerge),
+        staff.StaffRow(queue, "unit", "queue", staff.ReportsTo(builds), current_session=queue),
+    ))
+    with (mock.patch.object(staff, "local_snapshot", return_value=members),
+          mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": natemerge, "CODEX_THREAD_ID": "",
+                                       records.BUILDLOG_UNIT: "builds"}),
+          land_runs.landing([COMMIT], ["builds bb15"])):
+        with client.local_gate_job(job):
+            running = running_gate_request(fixture)
+        running = replace(running, sidecar=str(fixture.scope(running.owner)))
+        _ = only_admitted(fixture.connect(running).replies())
+        waiting = request_behind_gate(fixture)
+        waiting = replace(waiting, identity=replace(waiting.identity, session_id=queue, name="queue"),
+                          route=target_config.PinnedTarget("natedev"))
+        reply, = fixture.connect(waiting).replies()
+        view, = fixture.connect(wire.ViewRequest()).replies()
+        assert isinstance(reply, wire.Wait), reply
+        assert isinstance(view, wire.ViewReply), view
+        return reply, view, members
+
+
 class PlacementStatusTests(unittest.TestCase):
     def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
@@ -2833,6 +2867,24 @@ class WaitHolderServiceTests(unittest.TestCase):
                 self.assertEqual(hold.identity.step, expected)
                 self.assertEqual(hold.identity.job, expected_job)
                 self.assertEqual(wire.parse_record(wire.encode_record(hold), records.BetweenStepsSlot), hold)
+
+    def test_landing_wait_uses_the_recorded_job_or_the_generic_reason(self) -> None:
+        for job, reason in (
+            (StepJob("count-sparks"), records.WaitsForLandingTest("natemerge count sparks")),
+            (StepJob("weigh moons"), records.WaitsForLandingTest("natemerge weigh moons")),
+            (StepJob(""), records.WaitsForLandingTest()),
+            (GateJobNotRecorded(), records.WaitsForLandingTest()),
+        ):
+            with self.subTest(job=job), AdmissionFixture(skip_idle_spacing=True) as fixture:
+                _ = (fixture.root / "build_steps.conf").write_text(
+                    "names.count-sparks=count sparks\n" + "owned.default={unit} gate\n",
+                    encoding="utf-8",
+                )
+                reply, view, _ = read_landing_gate_wait(fixture, job)
+                self.assertEqual(reply.reason, reason)
+                self.assertEqual(reply.text, records.reason_phrase(reason, ()))
+                waiting, = view.reading.view.waiting
+                self.assertEqual(waiting.reason, reason)
 
     def test_a_released_unit_steps_held_slot_keeps_its_unit_without_a_session(self) -> None:
         with AdmissionFixture() as fixture:

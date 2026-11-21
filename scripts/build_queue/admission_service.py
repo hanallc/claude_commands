@@ -58,7 +58,6 @@ from scripts.buildlog import store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process, read_step_names
-from scripts.message.owner_role import OwnerRole
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -2395,26 +2394,27 @@ class AdmissionServer:
             if self._waits_for_landing(protected, request))
 
     def _landing_wait_reason(self, protected: landing_test_gate.LandingTests) -> records.WaitsForLandingTest:
-        """Name the active gate job that holds landing precedence."""
-        if isinstance(protected, landing_test_gate.RunningLandingTests):
-            for record in self.reservations.values():
-                job = record.gate_job
-                session = record.queue_waiter.get("session_id", "")
-                if (isinstance(record.landing_test, land_runs.LandingTestReference)
-                        and record.landing_test in protected.references and isinstance(job, StepJob) and session):
-                    members = records.queue_staff()
-                    owner = members.owner_of(session) if isinstance(members, staff.StaffSnapshot) else None
-                    if owner is None:
-                        continue
-                    try:
-                        names = read_step_names()
-                    except conf.Unusable:
-                        break
-                    if owner.kind == "unit":
-                        name = names.for_owner(job.step, owner.name, OwnerRole.UNIT)
-                    else:
-                        name = f"{owner.name} {names.shown(job.step)}"
-                    return records.WaitsForLandingTest(name)
+        """Read the job name from the live landing reservation."""
+        if not isinstance(protected, landing_test_gate.RunningLandingTests):
+            return records.WaitsForLandingTest()
+        for record in self.reservations.values():
+            job = record.gate_job
+            session = record.queue_waiter.get("session_id", "")
+            if (record.landing_test not in protected.references or not isinstance(job, StepJob)
+                    or not session or not codec.public_queue_text(job.step)
+                    or not isinstance(record.ending, NotEnding)
+                    or isinstance(self._lifetime(record), gate.EndedStep)):
+                continue
+            members = records.queue_staff()
+            owner = members.owner_of(session) if isinstance(members, staff.StaffSnapshot) else None
+            if owner is None or not (owner_name := codec.public_queue_text(owner.name)):
+                continue
+            try:
+                name = codec.public_queue_text(read_step_names().shown(job.step))
+            except conf.Unusable:
+                break
+            if name:
+                return records.WaitsForLandingTest(f"{owner_name} {name}")
         return records.WaitsForLandingTest()
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration

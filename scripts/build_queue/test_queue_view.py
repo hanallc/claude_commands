@@ -9,6 +9,7 @@ from scripts.lint.memory_test_support import write_pressure_reading
 from dataclasses import replace
 import json
 import os
+from pathlib import Path
 import shlex
 import struct
 import subprocess
@@ -27,6 +28,38 @@ from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config
+
+
+def write_running_gate_fixture(folder: Path) -> None:
+    """Render the recorded gate wait for the browser proof."""
+    from scripts.build_queue import admission_client, memory_feed
+    from scripts.build_queue.admission_jobs import StepJob
+    from scripts.build_queue.test_admission_service import read_landing_gate_wait
+    from scripts.build_queue.test_memory_feed import MemoryFeedTests
+    from scripts.lib.build_slots_test_support import write_private_slot_roots
+    from scripts.production import staff
+    from scripts.review_links import staff_names
+
+    with AdmissionFixture(skip_idle_spacing=True) as admission:
+        _ = (admission.root / "build_steps.conf").write_text("names.test-all=test all\n", encoding="utf-8")
+        job = StepJob("test-all")
+        _, view, members = read_landing_gate_wait(admission, job)
+        gate_step, = (step for step in view.reading.view.running if step.job == job)
+        fixture = MemoryFeedTests()
+        try:
+            fixture.setUp()
+            write_private_slot_roots(fixture.root / "build_folders.conf", fixture.root, "natedev")
+            with (staff.supplied_snapshot(members),
+                  mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+                  mock.patch.object(admission_client, "view", return_value=view.reading)):
+                page = memory_feed.reading()
+            running, = [row for row in page["walk"] if row["pid"] == gate_step.pid]
+            running["name"] = memory_feed.QueueRowName.owner_only("builds bb15")
+            running["name_parts"] = staff_names.text_parts(running["name"])
+            page["walk"] = [running]
+            _ = (folder / "landing_wait.json").write_text(memory_feed.page_json(page), encoding="utf-8")
+        finally:
+            fixture.doCleanups()
 
 
 def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:

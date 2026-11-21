@@ -63,7 +63,7 @@ try {
   await mkdir(folder, {recursive:true});
   const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
     'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))'
-      + (landingWaitProof ? '; from scripts.build_queue.test_memory_feed import write_landing_wait_fixture; write_landing_wait_fixture(Path(sys.argv[1]))' : '')
+      + (landingWaitProof ? '; from scripts.build_queue.test_queue_view import write_running_gate_fixture; write_running_gate_fixture(Path(sys.argv[1]))' : '')
       + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
@@ -265,7 +265,7 @@ try {
         };
         if (landingWaitProof) {
           const reading = JSON.parse(await readFile(join(folder,'landing_wait.json'),'utf8'));
-          const reason = 'waits for natemerge integrate';
+          const reason = 'waits for natemerge test all';
           servedReading = reading;
           await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1000,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
@@ -316,7 +316,7 @@ try {
           const y = Math.min(top,tooltip.top);
           const clip = {x,y,width,height:Math.max(bottom,tooltip.bottom)-y,scale:1};
           const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-          await writeFile(join(folder,'builds-waits-for-natemerge-integrate-dark-2.png'),Buffer.from(shot.data,'base64'));
+          await writeFile(join(folder,'builds-waits-for-natemerge-test-all-dark.png'),Buffer.from(shot.data,'base64'));
 
           const longReason = 'waits for the build in the same Cargo folder '.repeat(12).trim();
           servedReading = {...structuredClone(base),waiters:[{...base.waiters[0],
@@ -2801,10 +2801,10 @@ try {
         const gateReading=structuredClone(base);
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
-        const gateAbout='Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc';
+        const gateAbout='Runs every test module';
         const gateRow=gateReading.walk[gateIndex];
-        Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
-          about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
+        Object.assign(gateRow,{name:'natemerge test all',unit:'natemerge',title:{unit:'natemerge',step:'test all'},
+          about:gateAbout,changes:'no branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
           started_at:gateReading.read_at-600});
         delete gateRow.caller;
         // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
@@ -2812,9 +2812,9 @@ try {
         await show(gateReading);
         await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
         const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
-        assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
+        assert.ok(gateTip[0].startsWith('natemerge · test all'),'The gate tooltip title: '+gateTip[0]);
         assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
-        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'sdlc branch');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'no branch');
         assert.equal(gateTip[gateTip.indexOf('Uses')+1],'6.2 GiB');
         const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
