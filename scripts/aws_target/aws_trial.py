@@ -391,17 +391,14 @@ def trial_cost(book: ledger.CostLedger, attempts: set[str], settings_path: Path,
     total = Decimal(0)
     complete = True
     state = book.priced_snapshot(now)
-    settled_starts = {day.start for day in book.read_complete_day_amounts(policy, now)}
-    intervals = ledger.gate_compute_intervals(state, now, policy.box_minimum_seconds,
-                                              reserve=True, settled_starts=settled_starts)
+    intervals = ledger.gate_compute_intervals(state, now, policy.box_minimum_seconds, reserve=True)
     for reservation in state.gate_reservations:
         if reservation.attempt not in attempts or isinstance(reservation.state, ledger.GateAbsent):
             continue
         confirmed = isinstance(reservation.state, ledger.GateTerminated)
         complete = complete and confirmed
         total += sum((row.usd for row in intervals if row.source == 'gate:' + reservation.attempt), Decimal(0))
-        total += ledger.gate_allowance(reservation, reserve=True,
-            day_is_settled=reservation.at - reservation.at % 86400 in settled_starts).usd
+        total += ledger.gate_allowance(reservation).usd
     return total, complete
 
 

@@ -2542,7 +2542,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             state=ledger.GateLaunchPending(tuple(ledger.GateRateCandidate(row.instance_type, row.region)
                                                  for row in (variant, large)))))
         assert isinstance(booked, ledger.GateReserved)
-        self.assertEqual(booked.reservation.booked_compute_rates[0][1].usd_per_hour, Decimal('.80'))
+        self.assertEqual(booked.reservation.rate.usd_per_hour, Decimal('.80'))
         cloud_gate.save(folder / 'launch.json', {'variant': 0, 'region': variant.region, 'zone': variant.zone,
             'arguments': {'InstanceType': variant.instance_type, 'ClientToken': 'token-' + attempt}})
 
@@ -2574,8 +2574,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                                                                       accounting=accounting)
                 saved, amount = self.priced_launch_reserve('attempt')
                 self.assertEqual(saved.state, ledger.GateRunning('i-fixture'))
-                self.assertEqual(saved.rate.usd_per_hour, Decimal('.12'))
-                self.assertEqual(saved.booked_compute_rates[0][1].usd_per_hour, Decimal('.80'))
+                self.assertEqual(saved.rate.usd_per_hour, Decimal('.80'))
                 self.assertEqual(amount, before)
                 self.assertEqual(result, 'launched')
                 record(request, size, zone, 'launched', lock_timeout_s=lock_timeout_s, event_at=event_at)
@@ -2629,8 +2628,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                     logged = step in ('append', 'repricing')
                     self.assertEqual(any(row['attempt'] == step for row in self.book.launches()), logged)
                     saved, amount = self.priced_launch_reserve(step)
-                    current_rate = Decimal('.80') if isinstance(saved.state, ledger.GateLaunchPending) else Decimal('.12')
-                    self.assertEqual(saved.rate.usd_per_hour, current_rate)
+                    self.assertEqual(saved.rate.usd_per_hour, Decimal('.12') if logged else Decimal('.80'))
                     if not logged:
                         self.assertEqual(amount, before)
 
@@ -2743,7 +2741,6 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         document = cloud_gate.read(self.book.path)
         first = ledger.rows(document, 'gate_reservations')[0]
         del ledger.mapping(first['state'])['booked_day_rates']
-        del first['booked_compute_rates']
         cloud_gate.save(self.book.path, document)
         cloud_gate.save(self.folder / 'launch.json', {'variant': 0, 'variants': [asdict(large)]})
         bill = replace(initial_bill, actual_usd=small_rate + large_rate, usage_types=(
@@ -2753,8 +2750,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.book.resolve_gate('other', ledger.GateAbsent(now))
         self.book = ledger.CostLedger(self.state)
         saved = self.book.read_snapshot().gate_reservations[0]
-        self.assertEqual(saved.rate.usd_per_hour, small_rate)
-        self.assertEqual(saved.booked_compute_rates[0][1].usd_per_hour, Decimal('.12'))
+        self.assertEqual(saved.rate.usd_per_hour, Decimal('.12'))
         return large
 
     def test_restart_rejects_a_higher_bill_rate_after_repricing_a_legacy_reservation(self) -> None:
@@ -2839,12 +2835,10 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             self.assertIsInstance(saved.state, ledger.GateLaunchPending)
             assert isinstance(saved.state, ledger.GateLaunchPending)
             self.assertEqual(saved.state.rate_candidates, pending.rate_candidates)
-            self.assertEqual(saved.state.booked_day_rates, saved.booked_compute_rates)
-            self.assertEqual(saved.rate.usd_per_hour, Decimal('.80'))
+            self.assertEqual(saved.state.booked_day_rates, saved.day_rates)
+            self.assertEqual(saved.rate.usd_per_hour, Decimal('.8'))
             self.book.resolve_gate('attempt', ledger.GateRunning('i-fixture'), instance_type='m7a.4xlarge')
-            running = self.book.read_snapshot().gate_reservations[0]
-            self.assertEqual(running.rate.usd_per_hour, Decimal('.12'))
-            self.assertEqual(running.booked_compute_rates[0][1].usd_per_hour, Decimal('.80'))
+            self.assertEqual(self.book.read_snapshot().gate_reservations[0].rate.usd_per_hour, Decimal('.80'))
             _ = self.book.launch_history_path.write_text(json.dumps({
                 'attempt': 'attempt', 'time': self.now, 'instance_type': 'm7a.4xlarge',
                 'region': 'us-east-2', 'result': 'launched'}) + '\n')
