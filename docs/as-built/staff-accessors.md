@@ -337,6 +337,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
+| `scripts/agents/status_entry.py` | read | is_owner, peer_status_authority, decode_peer_status_authority, status_authority, PeerStatusAuthority, ReadStatusAuthority, StaffNotFound, StaffRefused; the staff owner supplies staff and roles to the peer status read |
 | `scripts/agents/set_model.py` | read | initial_snapshot and active select members by role. by_id checks each member's current conversation on the peer. |
 | `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
 | `scripts/agents/shutdown_record.py` | read | snapshot |
