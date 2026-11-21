@@ -386,11 +386,12 @@ class PairedTrialTests(CostFixture):
             _ = trial.checked_git(self.repo, *args)
         copy_test_runner(self.repo)
         for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
-                         'scripts/aws_target/__init__.py'):
+                         'scripts/aws_target/__init__.py', 'scripts/build_queue/admission_jobs.py',
+                         'scripts/production/gate_routes.py', 'scripts/test_times/gate_record.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
-        (self.repo / 'scripts/production').mkdir()
+        (self.repo / 'scripts/production').mkdir(exist_ok=True)
         _ = (self.repo / 'scripts/production/merge_gate.py').write_text(
             "def test_module_environment(root, environment):\n"
             + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"

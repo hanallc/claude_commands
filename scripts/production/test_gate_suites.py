@@ -24,7 +24,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import discover_test_modules, test_module_name
-from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
+from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 
 
@@ -376,6 +376,37 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertTrue(run.jobs[0].killed_for)
         self.assertIn("seconds=", output.getvalue())
         self.assertIn("stopped", output.getvalue())
+
+    @gate_suites("hooks")
+    def test_runner_reaps_a_module_when_journal_publication_fails(self) -> None:
+        self.write(self.state / "hold-module", "held")
+        save = gate.GateRecovery.save
+        launched: list[int] = []
+
+        def fail_publication(recovery: gate.GateRecovery) -> None:
+            if recovery.groups:
+                launched.extend(recovery.groups)
+                wait_for_file(self.state / "module-held")
+                raise OSError("fixture journal write failed")
+            save(recovery)
+
+        try:
+            with (mock.patch.dict(os.environ, self.environment),
+                  mock.patch.object(gate.GateRecovery, "save", new=fail_publication),
+                  contextlib.redirect_stdout(io.StringIO())):
+                with self.assertRaisesRegex(OSError, "fixture journal write failed"):
+                    _ = gate.run_suites(
+                        self.checkout, machine=gate.WholeMachine(),
+                        time_limit=gate_record.NoGateTimeLimit("fixture"))
+            self.assertEqual(len(launched), 1)
+            with self.assertRaises(ChildProcessError):
+                _ = os.waitpid(launched[0], os.WNOHANG)
+        finally:
+            for pid in launched:
+                with contextlib.suppress(ChildProcessError):
+                    if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        process_group.send_process_group(pid, signal.SIGKILL)
+                        _ = os.waitpid(pid, 0)
 
     def test_modules_run_the_checkout_runner_and_import_from_the_checkout(self) -> None:
         runner = install_test_runner(self.checkout)

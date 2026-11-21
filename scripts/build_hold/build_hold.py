@@ -26,7 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TextIO, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
@@ -41,6 +41,7 @@ from scripts.build_hold.shared_state_defaults import (
 from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
 from scripts.message import session_send
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -53,7 +54,8 @@ LOOKUP_RETRY_S = 1.0
 RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
                   "their memory gate orders them. No answer is needed.")
 
-DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
+DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "WorkerClosed", "DeliveryFailed"]
+DELIVERY_OUTCOMES = frozenset(cast(tuple[object, ...], get_args(DeliveryOutcome)))
 
 
 class ReleaseEntry(TypedDict):
@@ -165,6 +167,11 @@ class ReleaseDelivered:
 @dataclass(frozen=True)
 class ReleaseQueued:
     pass
+
+
+@dataclass(frozen=True)
+class ReleaseWorkerClosed:
+    """The sender found a closed or stopped worker with no route."""
 
 
 @dataclass(frozen=True)
@@ -1197,7 +1204,7 @@ def read_hold_cycle(path: Path) -> HoldCycle:
                 delivery = (old_delivery.get("outcome", "NotAttempted")
                             if old_delivery.get("generation") == cycle.get("holder_generation", 1)
                             else "NotAttempted")
-            if delivery not in {"NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"}:
+            if delivery not in DELIVERY_OUTCOMES:
                 raise ValueError(f"invalid delivery for entry {index}")
             normalized.append({"session_id": session_id, "name": name, "delivery": cast(DeliveryOutcome, delivery)})
         cycle["entries"] = normalized
@@ -1322,11 +1329,16 @@ def pending_release_paths() -> list[Path]:
             *sorted((release_directory() / "releases").glob("*/pending-release.json"))]
 
 
-def release_entries(cycle: HoldCycle, recipients: Mapping[str, str]) -> list[ReleaseEntry]:
-    """Use the first recorded entry for each session, as the sender has always done."""
+def first_release_entries(cycle: HoldCycle) -> dict[str, ReleaseEntry]:
+    """Use the first recorded entry for each session."""
     first: dict[str, ReleaseEntry] = {}
     for entry in cycle["entries"]:
         _ = first.setdefault(entry["session_id"], entry)
+    return first
+
+
+def release_entries(cycle: HoldCycle, recipients: Mapping[str, str]) -> list[ReleaseEntry]:
+    first = first_release_entries(cycle)
     return [first[session_id] if session_id in first else new_entry(session_id, name)
             for session_id, name in recipients.items()]
 
@@ -1491,8 +1503,11 @@ def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> s
         notices = intent["notices"]
         assert notices["kind"] == "cycle"
         changed = False
+        # A gone entry outside the cycle's recipients marks a quiet skip.
+        first = first_release_entries(cycle)
         for session_id, name in notices["recipients"].items():
-            if session_id not in cycle["recipients"]:
+            entry = first.get(session_id)
+            if session_id not in cycle["recipients"] and (entry is None or entry["delivery"] != "RecipientGone"):
                 cycle["recipients"][session_id] = name
                 changed = True
         for key, instants in cycle["holders"].items():
@@ -1616,22 +1631,31 @@ def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
     return RELEASE_NOTICE + " Released holds: " + "; ".join(descriptions) + "."
 
 
-def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+ReleaseNoticeResult = ReleaseDelivered | ReleaseQueued | ReleaseWorkerClosed | RecipientGone | ReleaseSendFailed
+
+
+def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseNoticeResult:
     """Tell a recipient to start its builds; the memory gate orders them."""
     return send_release_to(entry, f"uds:{socket}", notice)
 
 
-def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNoticeResult:
     """Send the same release text to a session socket or a Codex thread."""
     notice = f"{notice} Session {entry['session_id']}."
     try:
-        result = subprocess.run(session_send.send_argv("--to", address, "--text", notice), capture_output=True, text=True)
+        options = ("--skip-closed",) if address.startswith("codex:") else ()
+        result = subprocess.run(session_send.send_argv("--to", address, "--text", notice, *options),
+                                capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:
         return ReleaseDelivered()
     if result.returncode == 1:
         return ReleaseQueued()
+    if options and result.returncode == SEND_CLOSED_EXIT:
+        return ReleaseWorkerClosed()
+    if options and result.returncode == SEND_ABSENT_EXIT:
+        return RecipientGone()
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
@@ -1654,7 +1678,7 @@ def cycle_status_lines(cycle: HoldCycle) -> list[str]:
 def not_reached_detail(cycle: HoldCycle) -> str:
     outcomes = {"RecipientGone": "session gone", "DeliveryFailed": "send failed",
                 "QueuedUnconfirmed": "queued, delivery unconfirmed"}
-    missing = [f"{entry['name']} ({outcomes[entry['delivery']]})" for entry in cycle["entries"]
+    missing = [f"{entry['name']} ({outcomes[entry['delivery']]})" for entry in first_release_entries(cycle).values()
                if entry["session_id"] in cycle["recipients"] and entry["delivery"] in outcomes]
     return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
 
@@ -1675,9 +1699,23 @@ def notify_released_cycle(cycle: HoldCycle) -> str:
 
 
 def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str:
+    from scripts.production import staff
+
     # The release lock prevents a same-session re-hold between this check and a send.
     if has_holder_file(holder_directory()):
         return ""
+    if not entries:
+        return not_reached_detail(cycle)
+
+    without_staff: set[str] = set()
+    try:
+        membership = staff.initial_snapshot()
+    except staff.StaffUnreadable:
+        # An unreadable snapshot cannot prove that a staff row is absent.
+        pass
+    else:
+        without_staff = {entry["session_id"] for entry in entries
+                         if membership.by_member_reference(entry["session_id"].removeprefix("codex:")) is None}
     for entry in entries:
         if has_holder_file(holder_directory()):
             break
@@ -1687,20 +1725,29 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         # Save the pending entry before sending, and the outcome only after return.
         # A stop at any point between these saves may cause a harmless second notice.
         save_cycle(cycle)
-        codex = entry["session_id"].startswith("codex:")
+        session_id = entry["session_id"]
+        codex = session_id.startswith("codex:")
+        result: ReleaseNoticeResult
         if codex:
-            result = send_release_to(entry, entry["session_id"], release_notice(cycle["holders"]))
+            result = send_release_to(entry, session_id, release_notice(cycle["holders"]))
         else:
-            recipient = socket_for(entry["session_id"])
-            if not isinstance(recipient, RecipientLive):
-                entry["delivery"] = "RecipientGone" if isinstance(recipient, RecipientGone) else "DeliveryFailed"
-                save_cycle(cycle)
-                continue
-            result = send_release(entry, recipient.socket, release_notice(cycle["holders"]))
+            recipient = socket_for(session_id)
+            if isinstance(recipient, RecipientLive):
+                result = send_release(entry, recipient.socket, release_notice(cycle["holders"]))
+            elif isinstance(recipient, RecipientGone):
+                result = recipient
+            else:
+                result = ReleaseSendFailed(recipient.reason)
         if isinstance(result, ReleaseDelivered):
             entry["delivery"] = "Delivered"
         elif isinstance(result, ReleaseQueued):
             entry["delivery"] = "QueuedUnconfirmed"
+        elif isinstance(result, ReleaseWorkerClosed):
+            entry["delivery"] = "WorkerClosed"
+        elif isinstance(result, RecipientGone):
+            entry["delivery"] = "RecipientGone"
+            if session_id in without_staff:
+                _ = cycle["recipients"].pop(session_id, None)
         else:
             entry["delivery"] = "DeliveryFailed"
             if codex:

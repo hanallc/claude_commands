@@ -440,7 +440,11 @@ def _stable_folder(spec: BuildFolderSpec) -> bool:
     return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable", "slot")
 
 
-def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:
+FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
+
+
+def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest, *,
+                        on_create: FolderCreationNotice = "untracked") -> Path:
     """Allocate a unique folder or retain an owner's folder."""
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     spec = _request_spec(original)
@@ -448,11 +452,12 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
         descriptors: tuple[int, ...] = ()
         if isinstance(original, LinkedEditableRepository):
             descriptors = source_locks.enter_context(_linked_source_locks(original.source))
-        return _create_build_folder(request, spec, descriptors)
+        return _create_build_folder(request, spec, descriptors, on_create)
 
 
 def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest,
-                         spec: BuildFolderSpec, source_descriptors: tuple[int, ...]) -> Path:
+                         spec: BuildFolderSpec, source_descriptors: tuple[int, ...],
+                         on_create: FolderCreationNotice) -> Path:
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, ExistingWorktreeBranch):
         import subprocess
@@ -584,6 +589,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             if isinstance(detail, bytes):
                                 detail = detail.decode(errors="replace")
                             raise OSError(errno.EIO, f"git repository creation failed: {detail.strip()}", str(path)) from error
+                        if made_inode is not None and callable(on_create):
+                            on_create(path, made_inode)
                         return path
                     if new_folder and isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
@@ -594,6 +601,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                             pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                            timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
+                    if made_inode is not None and callable(on_create):
+                        on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
@@ -679,6 +688,15 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             os.unlink(path.name + suffix, dir_fd=directory)
         except FileNotFoundError:
             pass
+
+
+def temporary_allocation_entries(folder: Path) -> tuple[Path, ...]:
+    """List the folder and its lease files that are still present."""
+    try:
+        return tuple(sorted(entry for entry in folder.parent.iterdir() if entry == folder or (
+            (metadata := _METADATA.fullmatch(entry.name)) is not None and metadata[1] == folder.name)))
+    except FileNotFoundError:
+        return ()
 
 
 def _parent_has_symlink(parent: Path) -> bool:
@@ -835,9 +853,10 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder) -> Generator[Path]:
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder, *,
+                        on_create: FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
-    path = create_build_folder(spec)
+    path = create_build_folder(spec, on_create=on_create)
     try:
         yield path
     finally:
@@ -874,8 +893,13 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
                 return False
             if not build_folder_lock.lock_current(path, directory, descriptor):
                 return False
-            if cleanup() is False:
-                return False
+            try:
+                if cleanup() is False:
+                    return False
+            except FileNotFoundError:
+                if temporary and not _folder_exists(path, directory):
+                    _unlink_metadata(path, directory)
+                raise
             if _folder_exists(path, directory):
                 return False
             if temporary:
@@ -1104,8 +1128,9 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
     with temporary_build_folder(spec) as path:
         pid = os.getpid()
         start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-        marker = {"owner": owner, "pid": pid, "start_time": start_time,
-                  "boot_id": boot_identity()}
+        information = path.stat()
+        marker = {"owner": owner, "pid": pid, "start_time": start_time, "boot_id": boot_identity(),
+                  "copy_path": str(path.resolve()), "copy_device": information.st_dev, "copy_inode": information.st_ino}
         _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
         descriptor = build_folder_lock_fd(path)
         return run_build_command(command, path=path,

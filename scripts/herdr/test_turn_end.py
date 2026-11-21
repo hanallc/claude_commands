@@ -15,12 +15,13 @@ import sys
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from threading import Event, current_thread
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import cast, final, override
 from unittest.mock import patch
 
@@ -29,7 +30,7 @@ from scripts.agents import detached_runs, restart, shutdown_record, worker_lifec
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
-from scripts.lib import atomic_file, process_start, scratch
+from scripts.lib import atomic_file, copy_record, process_start, scratch
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
@@ -144,7 +145,7 @@ class TurnEndTests(unittest.TestCase):
                     with patch.dict(os.environ, {"CODEX_THREAD_ID": str(peer.current_session)}):
                         kept = scratch.new_worker()
                         atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
-                        kept_folders.append(kept)
+                        kept_folders.extend((folder, kept))
                     runs = self.case.run_dir / "detached_runs"
                     runs.mkdir(exist_ok=True)
                     for run_id, owner, owner_id in (("own", name, str(row.id)), ("director", "director", "")):
@@ -191,6 +192,21 @@ class TurnEndTests(unittest.TestCase):
                                 _ = pending.result(timeout=0.05)
                         self.assertEqual(pending.result(timeout=LauncherHangGuard("queued DONE hook").remaining()),
                                          turn_end.TurnOutcome.DONE)
+                elif close == "scratch":
+                    with io.BytesIO() as pipe:
+                        child = SimpleNamespace(stdin=nullcontext(pipe))
+                        with (patch.object(subprocess, "Popen", return_value=child) as start,
+                              patch.object(sys, "stdin", io.StringIO(json.dumps(payload)))):
+                            self.assertEqual(turn_end.main([]), 0)
+                        start.assert_called_once_with(
+                            [sys.executable, str(Path(turn_end.__file__).resolve()), "--handle-hook"],
+                            start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+                        handler_input = io.StringIO(pipe.getvalue().decode())
+                    # Use the fixture's pane and delivery stubs in the hook handler.
+                    with (handler_input, patch.object(sys, "stdin", handler_input),
+                          open(os.devnull, "w") as discard, redirect_stderr(discard), redirect_stdout(discard)):
+                        self.assertEqual(turn_end.main(["--handle-hook"]), 0)
                 else:
                     with ExitStack() as sends:
                         if close == "send-unlocked":
@@ -223,8 +239,21 @@ class TurnEndTests(unittest.TestCase):
                 self.assertIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
                 self.assertNotIn(pane, self.case.fixture.world.locations)
                 if close == "scratch":
-                    self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
-                    self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
+                    self.assertCountEqual(Path(os.environ["TMPDIR"]).iterdir(), kept_folders)
+                    own_folder, peer_folder = kept_folders
+                    self.assertEqual((own_folder / "trial.txt").read_text(), "worker output")
+                    self.assertEqual((peer_folder / "peer.txt").read_text(), "peer output")
+                    task = scratch.worker_task(row.id)
+                    own_record = scratch.task_of(own_folder, intent=scratch.RemovalIntentAccess.READ_ONLY)
+                    peer_record = scratch.task_of(peer_folder, intent=scratch.RemovalIntentAccess.READ_ONLY)
+                    assert isinstance(own_record, copy_record.Registered)
+                    assert isinstance(peer_record, copy_record.Registered)
+                    self.assertEqual(own_record.task, task)
+                    self.assertTrue(scratch.task_has_end_evidence(own_record))
+                    self.assertFalse(scratch.task_has_end_evidence(peer_record))
+                    self.assertEqual([line for line in messages[0].splitlines()
+                                      if line.startswith("kept for a manual removal list:")],
+                                     [f"kept for a manual removal list: {own_folder} (scratch, task {task} ended)"])
                     # The pass end deletes the worker's finished runs; a director keeps its newest run.
                     runs = self.case.run_dir / "detached_runs"
                     self.assertEqual(sorted(path.name for path in runs.iterdir() if not path.name.startswith(".")),

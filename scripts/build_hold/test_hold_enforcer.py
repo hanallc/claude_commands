@@ -294,11 +294,12 @@ class HoldEnforcerTests(unittest.TestCase):
     def table(self) -> dict[int, build_hold.AuditProcess]:
         return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
 
-    def write_detached_run(self, path: Path, *, command_started: bool) -> None:
+    def write_detached_run(self, path: Path, *, command_started: bool, command: list[str] | None = None) -> None:
         record: detached_runs.RunRecord = {
             "run_id": path.stem, "status": "running", "session_dir": str(self.root),
             "worker": "gate-owner", "staff_id": "", "label": "fixture gate",
-            "command": ["bash", "verify.sh", "check"], "log": str(path.with_suffix(".log")),
+            "command": command if command is not None else ["bash", "verify.sh", "check"],
+            "log": str(path.with_suffix(".log")),
             "started_at": 100.0, "pid": 100, "director_dir": "", "done_message_file": "",
         }
         if command_started:
@@ -872,6 +873,46 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertEqual(worker_signals, [(10, signal.SIGTERM)])
                 if label == "lone Codex":
                     self.assertEqual(self.rows()[-1]["session"], "t1")
+
+    def test_hold_stop_records_the_exit_for_a_scoped_detached_run(self) -> None:
+        runs = self.root / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir()
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        gate = ["bash", "verify.sh", "check"]
+        scoped_command = ["systemd-run", "--user", "--scope", "--", *gate]
+        _ = self.process(10, "bash", parent=100, argv=tuple(gate), session="gate-owner")
+        for exit_code in (143, 0):
+            with self.subTest(exit_code=exit_code):
+                record = runs / f"scoped-run-{exit_code}.json"
+                self.write_detached_run(record, command_started=True, command=scoped_command)
+                _ = self.process(100, "python3", start=10_000,
+                                 argv=("python3", "detached_runs.py", "supervise", str(record)))
+                table = self.table()
+
+                def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
+                    self.assertEqual(command, scoped_command)
+                    signals: list[tuple[int, int]] = []
+                    waiting = hold_enforcer.WaitingRun(table[10], OwningSession("gate-owner"))
+                    stop = hold_enforcer.stop_waiting_run(
+                        waiting, holder, table, self.proc,
+                        signal_group=lambda pid, signum: signals.append((pid, signum)),
+                        signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                    )
+                    self.assertIsInstance(stop, hold_enforcer.StoppedRun)
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    return exit_code
+
+                with (isolated_staff_file(self.root / "staff.json", {}),
+                      mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+                      mock.patch.object(detached_runs, "_run", side_effect=run),
+                      mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
+                    self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
+
+                saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+                self.assertEqual((saved["status"], saved.get("exit_code")), ("finished", exit_code))
+                self.assertEqual(saved.get("stop_reason"), "stopped for timed test; run again after the release")
+                result = detached_runs.result_text(saved, detached_runs.command_result(saved))
+                self.assertIn(f"Result: STOPPED (exit {exit_code})", result)
 
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")

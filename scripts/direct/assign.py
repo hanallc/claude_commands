@@ -50,6 +50,7 @@ Rules for this dispatch:
 Run only commands that finish within one call. Never poll, sleep, call wait,
 loop on a status file, or make an empty write_stdin poll. Run long commands
 through detached_runs.py start; then end your turn and receive the result message.
+For Python test runs, pass --kind python-tests before --.
 We believe in three gods, Simple, Fast and Beautiful, with correctness as the floor beneath them.
 """
 

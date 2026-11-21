@@ -56,10 +56,6 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #price-table .measures th:first-child { position: static; padding-left: 18px; box-shadow: none; }
 #price-table .region-quota { width: 1%; color: var(--ink); font-weight: 600;
   background: color-mix(in srgb, var(--accent) 12%, var(--card)); }
-#price-table .quota-request { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-2); }
-@media (max-width: 600px) {
-  #price-table .quota-request { min-width: 18ch; white-space: normal; }
-}
 #price-table .spot-status { margin-left: 6px; color: var(--ink-3); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
 .swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
@@ -99,8 +95,8 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 .tile-usd { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .tile-note { color: var(--ink-3); font-size: 0.82rem; }
 #spend .note { margin-top: 12px; }
-#quota-help { margin-top: 10px; font-size: 0.86rem; }
-#quota-help summary { font-weight: 600; cursor: pointer; }
+#quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
+#quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
 #quota-help li + li { margin-top: 4px; }
 #quota-help a { color: var(--ink); overflow-wrap: anywhere; }
 #quota-help p { margin: 0; color: var(--ink-2); }
@@ -221,14 +217,13 @@ function remember(key, value) {
   try { localStorage.setItem(key, value); } catch (error) { /* The choice is kept only for this view. */ }
 }
 
-// The columns and rows of a table in the chosen regions; the first column always shows.
+// Select the columns and rows for the chosen regions.
 function visible(table) {
   const columns = table.headers.map((_header, index) => index)
     .filter(index => index === 0 || table.region_axis !== "columns" || shown.has(table.headers[index]));
+  const regionColumn = table.region_axis === "type-region-rows" ? 1 : 0;
   const rows = table.rows.map((_row, index) => index)
-    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]))
-    .filter(index => !table.active_regions_by_size
-      || table.active_regions_by_size[table.rows[index][0]].some(region => shown.has(region)));
+    .filter(index => table.region_axis === "columns" || shown.has(table.rows[index][regionColumn]));
   return { columns, rows };
 }
 
@@ -435,7 +430,7 @@ function pricesAndQuotas(quota, spot, sources, rows, requests) {
   const wrap = element("div", undefined, "scroll");
   const grid = element("table");
   const typeHeaders = sources.length ? quota.headers.slice(2) : [];
-  grid.appendChild(element("colgroup")).span = 2;
+  grid.appendChild(element("colgroup")).span = 5;
   for (const _type of typeHeaders) grid.appendChild(element("colgroup")).span = sources.length;
   const head = grid.createTHead();
   const top = head.insertRow();
@@ -444,6 +439,9 @@ function pricesAndQuotas(quota, spot, sources, rows, requests) {
   if (grouped) detail.className = "measures";
   priceHeader(top, "region", "", "").rowSpan = grouped ? 2 : 1;
   priceHeader(top, quota.headers[1], "vCPUs", "n edge region-quota").rowSpan = grouped ? 2 : 1;
+  priceHeader(top, "wanted", "", "n").rowSpan = grouped ? 2 : 1;
+  priceHeader(top, "request", "", "").rowSpan = grouped ? 2 : 1;
+  priceHeader(top, "request age", "", "n").rowSpan = grouped ? 2 : 1;
   for (const header of typeHeaders) {
     const [name, vcpus] = header.split(" (");
     if (grouped) {
@@ -462,8 +460,11 @@ function pricesAndQuotas(quota, spot, sources, rows, requests) {
     if (status && measures.has("spot") && spot.values[index].some(value => typeof value === "number")) {
       name.appendChild(element("small", status, "spot-status"));
     }
-    const applied = priceCell(row, quota, index, 1, "n edge region-quota");
-    if (requests[region]) applied.appendChild(element("small", requests[region].text, "quota-request"));
+    priceCell(row, quota, index, 1, "n edge region-quota");
+    const request = requests[region];
+    const state = element("td", request?.request ?? "not measured", "quota-request");
+    if (request?.detail) state.title = request.detail;
+    row.append(element("td", request?.wanted ?? "—", "n"), state, element("td", request?.age ?? "—", "n"));
     for (let type = 2; type < quota.headers.length; type++) {
       sources.forEach(({table, marks}, position) => {
         priceCell(row, table, index, table === quota ? type : type - 1, position ? "n" : "n edge", marks);
@@ -560,19 +561,75 @@ function drawScope() {
   fill(document.getElementById("launched"), costs.launched);
 }
 
+function hoursTable(rows) {
+  const headers = ["type", "region", "AWS billed", "our records", "difference"];
+  const hasReserved = rows.some(row => row.cells[5] !== "—");
+  if (hasReserved) headers.push("Hana reserved");
+  const table = tableElement([{
+    headers, right: headers.map((_header, index) => index).slice(2),
+    rows: rows.map(row => row.cells), region_axis: "type-region-rows",
+  }], false);
+  if (hasReserved) {
+    table.querySelector("thead th:last-child").title =
+      "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.";
+  }
+  return table;
+}
+
+function hoursAnswer(compared, higherBills, limitPercent) {
+  const difference = rows => {
+    const tenths = Math.abs(rows.reduce((total, row) => total + row.difference_tenths, 0));
+    return tenths ? `${(tenths / 10).toFixed(1)} hours` : "less than 0.1 hours";
+  };
+  const rowCount = rows => `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  if (higherBills.length) {
+    return `Yes. AWS billed ${difference(higherBills)} more than our records, in ${rowCount(higherBills)}.`;
+  }
+  const lowerBills = compared.filter(row => row.limit_result === "lower_bill");
+  const total = key => compared.reduce((hours, row) => hours + row[key], 0).toFixed(1);
+  const billed = total("billed");
+  const recorded = total("recorded");
+  const answer = lowerBills.length
+    ? `No. AWS billed ${difference(lowerBills)} less than our records, in ${rowCount(lowerBills)}.`
+    : `No. AWS billed ${billed} hours and our records show ${recorded} hours.`;
+  if (Number(billed) > Number(recorded)) {
+    return answer + ` No row is more than ${limitPercent} above the sum of its recorded hours and the hours reserved for Hana.`;
+  }
+  return answer;
+}
+
+function drawHours() {
+  const section = document.getElementById("hours");
+  const wasOpen = section.querySelector("details")?.open ?? false;
+  section.replaceChildren(heading("Did AWS bill more machine hours than we used?"));
+  if (data.hours.kind === "unavailable") {
+    section.appendChild(element("p", data.hours.reason, "answer"));
+    return;
+  }
+  const rows = data.hours.rows.filter(row => shown.has(row.region));
+  const compared = rows.filter(row => row.kind === "compared");
+  if (!rows.length) {
+    section.appendChild(element("p", "There are no machine hours to compare in the selected regions.", "answer"));
+    return;
+  }
+  const higherBills = compared.filter(row => row.limit_result === "higher_bill");
+  const answer = compared.length ? hoursAnswer(compared, higherBills, data.hours.limit_percent)
+    : "No AWS bill is available yet for the recorded hours.";
+  section.appendChild(element("p", answer, "answer"));
+  if (higherBills.length) section.appendChild(hoursTable(higherBills));
+  const details = element("details");
+  details.open = wasOpen;
+  details.addEventListener("toggle", markOverflow);
+  details.append(element("summary", `All rows (${rows.length})`), hoursTable(rows));
+  section.appendChild(details);
+}
+
 function draw() {
   drawPrices();
   drawPlacementScores();
   fill(document.getElementById("gate-time-price"), data.gateTimePrice,
     "Compare the lowest estimated run cost for each box size. Box times include boot and can use runs from other regions.");
-  const hours = document.getElementById("hours");
-  fill(hours, data.hours, data.hours_note);
-  for (const region of data.hours.headers.slice(1)) {
-    const reserved = data.hours_reserved_by_region?.[region];
-    if (reserved && shown.has(region)) {
-      hours.appendChild(element("p", `${region}: ${reserved} Hana reserved hours.`, "note"));
-    }
-  }
+  drawHours();
   drawScope();
   markOverflow();
 }

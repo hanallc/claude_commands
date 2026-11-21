@@ -434,7 +434,8 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
     after_pass_recorded()
     diagnostics: list[str] = []
     try:
-        _ = scratch.end(scratch.worker_task(row.id))
+        for folder in scratch.end(scratch.worker_task(row.id)):
+            diagnostics.append(scratch.retained_task_folder_notice(folder.path, folder.reason))
     except Exception as error:
         diagnostics.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     if diagnostics:

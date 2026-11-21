@@ -210,8 +210,9 @@ class DataclassCodeFinder:
 def start_process(arguments: list[str]) -> str:
     """Select the checkout at interpreter startup and give a direct test run its folder."""
     selected = select_checkout(arguments)
-    if "dataclasses" not in sys.modules and not any(
-            type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path):
+    if (os.environ.get("CLAUDE_DISABLE_DATACLASS_CODE_CACHE") != "1"
+            and "dataclasses" not in sys.modules
+            and not any(type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path)):
         sys.meta_path.insert(0, DataclassCodeFinder())
     _start_test_run(selected, arguments)
     return selected

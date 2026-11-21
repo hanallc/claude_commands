@@ -634,6 +634,10 @@ Provider errors expose safe action names rather than cloud identifiers or signed
 The provider persists its operation before dispatch and holds a separate mutation lock.
 Existing writes store the lifecycle generation and UTC epoch seconds for dispatch, acceptance, or cancellation.
 Acceptance writes identify a direct response or a bootstrap observation.
+The scaler gives `StartInstances` one attempt.
+The provider saves a definite service refusal as `start_refusal_code` before returning the error.
+The record contains the code only.
+A later active observation takes precedence over the refusal for accounting.
 Recovery takes that lock without blocking an active mutation.
 Recovery fences an operation that has not reached dispatch.
 A late worker cannot dispatch that fenced operation.
@@ -913,6 +917,16 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
+An unbilled day is idle only if every run exposure that starts before its end has a confirmed closure before its start.
+An expired permit or reservation still counts until the ledger confirms closure.
+The page, spending guard, and admission use the usual prices and bill carry on run days.
+After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
+It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
+The page, spending guard, and admission use the same idle-day rule.
+The guard keeps any higher established charges.
+The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
+A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
+Legacy cancellations and stopped states retain the full exposure when the journal has no refusal code.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.
@@ -1105,11 +1119,20 @@ A launch row without a region ran in the home region, `region` in `aws_target.co
 The next line names the cheapest merge gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
-The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
-A cell shows `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`.
-The cell lists any Hana reservation after the recorded box hours and marks a gap above the limit with `over`.
-A type and region without a bill read shows `not billed`. Only types with hours have a row.
-An unreadable cost ledger shows a note in place of the billed hours.
+The last card asks “Did AWS bill more machine hours than we used?”
+It uses `run_cost.hours_checks` over the days with a bill in the configured window.
+When a higher bill exceeds the limit, the answer sums the displayed differences for those rows and gives their count.
+If only lower bills exceed the limit, the answer sums the displayed differences for those rows and gives their count.
+If all comparisons pass, the answer gives the total billed hours and the total recorded hours.
+If the answer is “No” and the displayed billed total is higher, a second sentence explains the limit and the Hana allowance.
+The visible table includes only higher bills that exceed the limit.
+The closed “All rows” control opens a table for every type and region with hours in the selected regions.
+The tables show billed hours, recorded hours and the signed difference to one decimal place.
+The difference subtracts the full values before rounding.
+If a marked difference or its sum rounds to zero, it shows as “less than 0.1 hours.”
+The Hana reserved column shows the hours set aside for Hana where the check uses them.
+If the bill for a row is due, the billed hours and the difference show a dash in “All rows.”
+The shared region filter includes all regions with an hours check.
 
 The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
@@ -1128,6 +1151,8 @@ The user approved the combined table on 2026-11-18.
 2. The first two columns show the region and its quota in vCPUs.
    The quota is Standard quota or G and VT quota for the selected types.
    The quota has a blue-gray tint and stays visible when all Show chips are off.
+   The next three columns show the requested vCPUs, request state, and request age.
+   A region without a request shows a dash in those columns.
 3. Each type header includes its vCPU count.
    When multiple values show, each type groups the Spot (USD/h), Gate (USD), or Fit (boxes) columns.
    Fit divides the region quota by the type's vCPU count and rounds down.
