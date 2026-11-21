@@ -5954,12 +5954,14 @@ finally:
 
     def test_an_unread_queue_holds_the_owner_until_a_read_proves_its_steps_ended(self) -> None:
         self.batch()
+        _ = write_config_fixture(self.root / "config/shutdown.conf", "move_build_poll_seconds=47\n")
         held = {"alpha": ("nextest in /w",)}
         unread = stop_resume.BuildQueueUnreadable("no socket")
         with patch.object(stop_resume, "_build_holders", side_effect=[held, unread, {}]), \
-                redirect_stdout(io.StringIO()):
+                patch.object(time, "sleep") as pause, redirect_stdout(io.StringIO()):
             _ = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
         self.assertEqual(self.moved, [["alpha"]])
+        self.assertEqual(pause.call_args_list, [call(47), call(47)])
 
     def test_an_unread_queue_at_the_start_defers_without_a_stop(self) -> None:
         with patch.object(stop_resume, "_build_holders", return_value=stop_resume.BuildQueueUnreadable("no socket")), \

@@ -1014,6 +1014,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             _ = report_without_update("top", "--repo", str(self.repo))
 
     def test_trend_groups_passing_runs_by_place_selection_and_local_day(self) -> None:
+        _ = write_config_fixture(self.config / "test_times.conf", "trend_days=2\n")
         # The first attempt is a hold restart. It still uses CPU.
         self.write_run([module_run("test_alpha.py", 120, restart="hold", status=-15),
                         module_run("test_alpha.py", 100, attempt=2)], host="natedev")
@@ -1023,7 +1024,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                 ("natedev", True, 0, [module_run("test_alpha.py", 9999)], EPOCH),
                 ("natedev", False, 1, [module_run("test_alpha.py", 9999)], EPOCH),
                 ("natedev", False, 0, [], EPOCH),
-                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 9 * 86400),
+                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 3 * 86400),
                 ("builder", False, 0, [module_run("test_alpha.py", 10)], EPOCH),
                 ("natedev", False, 0, [module_run("test_alpha.py", 12)], EPOCH - 10 * 3600)):
             self.write_run(modules, host=host, aborted=aborted, status=status, epoch=epoch)
@@ -1034,7 +1035,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.execute("UPDATE gate_runs SET selection='affected', wall_s=40 WHERE id=?", (affected,)).close()
             writer.execute("UPDATE gate_runs SET wall_s=100 WHERE id='history-1'").close()
             writer.commit()
-        status, output, errors = report_without_update("trend", "--days", "8")
+        status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
         self.assertEqual(list(tables), ["builder merge gates", "natedev merge gates", "natedev targeted tests"])

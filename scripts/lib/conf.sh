@@ -25,6 +25,10 @@ fi
 
 conf_value() {
     local file="$1" key="$2" folder="${CONF_DIR:-$HOME/.claude/config}"
+    if [[ "$key" == *[[:upper:]]* ]]; then
+        printf 'conf_value: configuration key %q must be lower case\n' "$key" >&2
+        return 2
+    fi
     conf_record "$file"
     local raw line name value previous="" limit=""
     local base="" base_limit="" host_value="" host_limit="" base_seen=0 host_seen=0 found=0

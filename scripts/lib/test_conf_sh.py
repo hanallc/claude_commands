@@ -241,6 +241,7 @@ class ShellConfTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "2\n7\n")
+        self.assertFalse((self.root / "python.log").exists())
 
     def test_default_folder_uses_the_private_home(self) -> None:
         folder = Path(self.env["HOME"]) / ".claude/config"

@@ -3704,12 +3704,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     def test_exhausted_result_push_alerts_the_director_once(self) -> None:
         row = self.fixture.worker()
-        for outcome, response in (
-            ("sent", send.Result("sent", "fixture alert result")),
-            ("failed", send.Result("failed", "fixture alert result")),
-            ("sender-exit", SystemExit(2)),
+        for outcome, response, retries, seconds in (
+            ("sent", send.Result("sent", "fixture alert result"), 3, 5),
+            ("failed", send.Result("failed", "fixture alert result"), 3, 5),
+            ("sender-exit", SystemExit(2), 1, 0.25),
         ):
             with self.subTest(outcome=outcome):
+                _ = write_config_fixture(
+                    self.fixture.root / "conf/detached_runs.conf",
+                    f"result_push_retries={retries}\nresult_push_retry_seconds={seconds}\n",
+                )
                 record = self.record(row, f"alert-{outcome}")
                 path = Path(record["log"]).with_suffix(".json")
                 refusal = send.RefusedRelayRequest("failed", "fixture push error")
@@ -3721,8 +3725,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                       contextlib.redirect_stderr(io.StringIO()) as errors):
                     self.assertEqual(detached_runs.main(["supervise", str(path)]), 1)
                     self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
-                self.assertEqual(deliver.call_count, 4)
-                self.assertEqual(delay.call_args_list, [call(5)] * 3)
+                self.assertEqual(deliver.call_count, 1 + retries)
+                self.assertEqual(delay.call_args_list, [call(seconds)] * retries)
                 alert.assert_called_once()
                 options = cast(send.Options, alert.call_args.args[0])
                 self.assertEqual(options.to, self.fixture.parent.id)
@@ -3731,7 +3735,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertIn(detail, options.text or "")
                 saved = worker_lifecycle.read_json_object(path)
                 self.assertIs(saved["push_alert_attempted"], True)
-                self.assertEqual(saved["push_retries"], 3)
+                self.assertEqual(saved["push_retries"], retries)
                 self.assertEqual(saved["delivery"], detached_runs.FAILED_RESULT_PUSH + "failed: " + refusal.detail)
                 self.assertEqual(errors.getvalue().count("anomaly:"), int(outcome != "sent"))
                 if outcome == "sender-exit":
