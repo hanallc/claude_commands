@@ -2838,7 +2838,12 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             self.assertEqual(saved.state.booked_day_rates, saved.day_rates)
             self.assertEqual(saved.rate.usd_per_hour, Decimal('.8'))
             self.book.resolve_gate('attempt', ledger.GateRunning('i-fixture'), instance_type='m7a.4xlarge')
-            self.assertEqual(self.book.read_snapshot().gate_reservations[0].rate.usd_per_hour, Decimal('.12'))
+            self.assertEqual(self.book.read_snapshot().gate_reservations[0].rate.usd_per_hour, Decimal('.80'))
+            _ = self.book.launch_history_path.write_text(json.dumps({
+                'attempt': 'attempt', 'time': self.now, 'instance_type': 'm7a.4xlarge',
+                'region': 'us-east-2', 'result': 'launched'}) + '\n')
+            self.assertEqual(self.book.priced_snapshot(int(self.now)).gate_reservations[0].rate.usd_per_hour,
+                             Decimal('.12'))
 
     def test_combined_rust_cost_refuses_gate_before_launch(self) -> None:
         self.book.observe(ledger.InstanceObservation(int(self.now), 'running', 'fixture'))
@@ -3328,6 +3333,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             self.assertEqual(reserved.usd_per_hour, Decimal('0.8'))
             self.assertEqual(reserved.rate.usd_per_hour, Decimal(2))
             self.assertEqual(reserved.instance_type, 'm7a.4xlarge')
+            _ = self.book.launch_history_path.write_text(json.dumps({
+                'attempt': 'attempt', 'time': self.now, 'instance_type': 'm7a.8xlarge',
+                'region': 'us-east-2', 'result': 'launched'}) + '\n')
             self.book.resolve_gate('attempt', ledger.GateTerminated(int(self.now) + 1, 'i-fixture'), instance_type='m7a.8xlarge')
             cost, cleanup = aws_trial.trial_cost(self.book, {'attempt'}, self.settings, int(self.now) + 1)
         self.assertTrue(cleanup)

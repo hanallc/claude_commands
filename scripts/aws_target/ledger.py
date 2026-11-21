@@ -129,6 +129,14 @@ class GateLaunchPricing(Enum):
     BOOKING_UNTIL_LOGGED = 'booking_until_logged'
 
 
+class GateLaunchLogEvidence(Enum):
+    """Keep evidence from the current launch log read in memory."""
+
+    NOT_READ = 'not read'
+    NO_COMPLETE_ROW = 'no complete row'
+    COMPLETE_ROW = 'complete row'
+
+
 def _gate_quota_cooldown(configuration: conf.ConfigRead) -> float:
     try:
         return configuration.whole('capacity_cooldown_seconds')
@@ -208,6 +216,12 @@ class GateReservation:
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
     launch_pricing: GateLaunchPricing = GateLaunchPricing.CURRENT_EVIDENCE
+    launch_log_evidence: GateLaunchLogEvidence = field(
+        default=GateLaunchLogEvidence.NOT_READ, compare=False, repr=False)
+
+    def has_complete_launch(self) -> bool:
+        """Check the launch log evidence for this booking."""
+        return self.launch_log_evidence is GateLaunchLogEvidence.COMPLETE_ROW
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
@@ -220,7 +234,10 @@ def _gate_holds_booking(reservation: GateReservation) -> bool:
 
 
 def _gate_has_cost_reserve(reservation: GateReservation) -> bool:
-    return gate_is_open(reservation) or _gate_holds_booking(reservation)
+    return gate_is_open(reservation) or (
+        isinstance(reservation.state, GateTerminated) and not reservation.has_complete_launch()
+        and (reservation.launch_log_evidence is not GateLaunchLogEvidence.NOT_READ
+             or _gate_holds_booking(reservation)))
 
 
 @dataclass(frozen=True)
@@ -1334,7 +1351,7 @@ def _complete_day_adjustments(complete_days: Sequence[CompleteDayAmount], interv
     reserved_gates = tuple(row for row in gate_reservations if _gate_has_cost_reserve(row))
     preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
                  for row in reserved_gates}
-    preserved.update('gate:' + row.attempt for row in reserved_gates)
+    preserved.update('gate:' + row.attempt for row in reserved_gates if not row.has_complete_launch())
     usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
     return tuple((day.start, day.usd - period_cost(usage, day.start, day.end)) for day in covered)
 
@@ -1983,7 +2000,7 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
         if reservation.at > now and not reserve:
             continue
         end = exposure.priced_end(now, open_until=max(now, reservation.expires) if reserve else now)
-        if reserve and _gate_holds_booking(reservation):
+        if reserve and not reservation.has_complete_launch():
             end = max(end, reservation.expires)
         rate = _gate_estimate_rate(reservation)
         rates = dict(reservation.day_rates)
@@ -2158,8 +2175,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                 if isinstance(reservation.state, GateAbsent) or reservation.at > stop:
                     continue
                 # Keep the booking on billed days until the launch log has a complete row.
-                if bill is not None and not (_gate_holds_booking(reservation)
-                                             or isinstance(reservation.state, GateLaunchPending)):
+                if bill is not None and reservation.has_complete_launch():
                     continue
                 for charge in gate_compute.get('gate:' + reservation.attempt, ()):
                     groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)
@@ -2552,8 +2568,11 @@ class CostLedger:
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
             launch = launches.get(reservation.attempt)
-            if launch is None and (_gate_holds_booking(reservation) or
-                    isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates):
+            launch_log = GateLaunchLogEvidence.NO_COMPLETE_ROW if launch is None else GateLaunchLogEvidence.COMPLETE_ROW
+            if reservation.launch_log_evidence is not launch_log:
+                reservation = replace(reservation, launch_log_evidence=launch_log)
+            logged = reservation.has_complete_launch()
+            if not logged and (reservation.day_rates or reservation.rate.source != 'not priced'):
                 priced.append(reservation)
                 continue
             size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
@@ -2563,7 +2582,7 @@ class CostLedger:
                          for left, _right in _days(at, max(at + 1, end), ZoneInfo('UTC')))
             regions = (reservation.region,) if reservation.region else configured_regions
             candidates = tuple(GateRateCandidate(size, region) for region in regions)
-            if launch is None and isinstance(reservation.state, GateLaunchPending) and reservation.state.rate_candidates:
+            if not logged and isinstance(reservation.state, GateLaunchPending) and reservation.state.rate_candidates:
                 candidates = reservation.state.rate_candidates
             rates_by_candidate: list[_BillRates] = []
             for candidate in candidates:
