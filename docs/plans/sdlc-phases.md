@@ -1905,6 +1905,24 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 **Workers:** 1 writer, 1 reviewer.
 
+### Phase 108 — Config names are lower case  · status: pending
+**Depends on:** builds 355 on main (about 18:35 EST 2026-11-21)
+
+#### Work Order
+
+**Goal:** every config name in `config/*.conf` is lower case, and a check refuses a new upper-case name. nate approved one form, lower case (2026-11-21, via bob and sdlc, L184). Letter case only; a name that needs other words is a name change for nate. Environment variable names are out of scope.
+**Spec:**
+1. Lower-case the 86 upper-case names in `buildlog`, `detached_runs`, `direct`, `merge_checkpoint`, `merge_gate`, `notify`, `production`, `shutdown`, `staff` and `test_times` `.conf`, in one commit.
+2. Change every reader, test fixture, `settings-orders.json` entry, and command, skill and doc text that names them in the same commit. No old name stays as a second name.
+3. A gate test refuses any `config/*.conf` name with an upper-case letter, host suffix included.
+4. `conf.py` and `conf.sh` refuse a key request with an upper-case letter.
+5. Keep one recovery path: `conf.py` recovers a missing name from committed history. Add none to `conf.sh`; one test proves a shell reader reads the file on each run.
+**Files:** the 10 conf files, `scripts/lib/conf.py`, `scripts/lib/conf.sh`, and the 129 files that name the old names (inventory in the run folder, `phases/108/`).
+**Tests:** each of the 86 names has a cheap test: a fixture value under the lower name and one effect check. Existing tests cover most names after the rename; add one for each name with none.
+**Acceptance gate:** basedpyright clean; full suite passes in the test slot.
+
+**Workers:** 1 writer, 1 reviewer.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
