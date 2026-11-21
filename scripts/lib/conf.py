@@ -613,11 +613,8 @@ def check(file: str | Path, key: str, value: str) -> None:
 
 def main(arguments: list[str] | None = None) -> int:
     args = sys.argv[1:] if arguments is None else arguments
-    if args == ["host"]:
-        print(local_host_key_name())
-        return 0
     if len(args) != 3 or args[0] != "get":
-        print("usage: conf.py get FILE KEY | host", file=sys.stderr)
+        print("usage: conf.py get FILE KEY", file=sys.stderr)
         return 2
     try:
         _require_lower_case(args[2])

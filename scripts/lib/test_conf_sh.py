@@ -53,7 +53,7 @@ class ShellConfTests(unittest.TestCase):
     def write(self, contents: str) -> None:
         _ = (self.config / "example.conf").write_text(contents)
 
-    def run_reader(self, key: str, *, trace: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_reader(self, key: str, *, trace: bool = False, reader: Path = SHELL_READER) -> subprocess.CompletedProcess[str]:
         script = 'PATH="$CONF_TEST_PATH"\n'
         if trace:
             script += (
@@ -64,7 +64,7 @@ class ShellConfTests(unittest.TestCase):
             )
         script += 'source "$1"\nconf_value example "$2"\n'
         return subprocess.run(
-            [*self.shell, "-c", script, "conf-test", str(SHELL_READER), key],
+            [*self.shell, "-c", script, "conf-test", str(reader), key],
             env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
@@ -144,6 +144,23 @@ class ShellConfTests(unittest.TestCase):
         self.assertEqual(result.stdout, "7\n")
         self.assertFalse((self.root / "python.log").exists())
         self.assertFalse((self.root / "subshell.log").exists())
+
+    def test_mixed_case_hostname_without_proc_uses_the_lower_case_override(self) -> None:
+        reader = self.root / "conf.sh"
+        missing = self.root / "no-proc-hostname"
+        _ = reader.write_text(SHELL_READER.read_text().replace("/proc/sys/kernel/hostname", shlex.quote(str(missing))))
+        (reader.parent / "conf_record.sh").symlink_to(SHELL_READER.with_name("conf_record.sh"))
+        programs = self.root / "bin"
+        uname = programs / "uname"
+        _ = uname.write_text('#!/bin/bash\nprintf "%s\\n" "Mixed-Host.Example"\n')
+        uname.chmod(0o755)
+        tr = shutil.which("tr")
+        assert tr is not None
+        (programs / "tr").symlink_to(tr)
+        self.write("count=1\ncount.mixed-host=7\n")
+        result = self.run_reader("count", reader=reader)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "7\n", ""))
+        self.assertFalse((self.root / "python.log").exists())
 
     def test_cr_only_lines_delegate_to_the_python_reader(self) -> None:
         self.write("count=7\rother=9\r")

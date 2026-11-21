@@ -25,6 +25,7 @@ from scripts.lib.waiting_rows import (
     ORDER_PATH, AcceptedSave, LockedJournal, SaveOrders, WaitingChange as WaitingChange,
     append_setting, apply_move, check_move, git,
     journal_path as journal_path, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
+    migrated_setting_name,
     published_orders, replace_value, show, tree_value,
 )
 
@@ -59,6 +60,9 @@ class UnchangedSave:
 
 def editable_setting(stem: str, key: str, value: str, *, accepted: bool = False) -> ExistingSetting | NewModelColor:
     """Validate the change and identify the current setting."""
+    current_stem, _ = migrated_setting_name(stem, key)
+    if current_stem != stem:
+        raise conf.Unusable(f"Use {current_stem} for this Save.")
     if stem == "statusline" and key.startswith("model."):
         if host := model_color_host(key):
             raise conf.Unusable(f"{stem}: {key}: .{host} is a host override, not a model color")
@@ -264,7 +268,7 @@ def main(arguments: list[str] | None = None) -> int:
                 _ = pending.accept(stem, key, AcceptedSave(order, value, base))
                 pending.save()
                 _ = _write_setting(stem, key, value, setting)
-    except (OSError, ValueError, main_publish.Refusal) as error:
+    except (conf.InvalidKey, OSError, ValueError, main_publish.Refusal) as error:
         print(f"live_settings: {error}", file=sys.stderr)
         return 1
     return 0

@@ -15,12 +15,12 @@ unset _CONF_SOURCE
 source "$_CONF_LIB/conf_record.sh"
 if [[ -r /proc/sys/kernel/hostname ]]; then
     IFS= read -r _CONF_HOST < /proc/sys/kernel/hostname
-    _CONF_HOST="${_CONF_HOST%%.*}"
 else
-    _CONF_HOST=""
+    _CONF_HOST="$(uname -n)" || return
 fi
-if [[ -z "$_CONF_HOST" || "$_CONF_HOST" == *[[:upper:]]* ]]; then
-    _CONF_HOST="$("$_CONF_LIB/py" "$_CONF_LIB/conf.py" host)" || return
+_CONF_HOST="${_CONF_HOST%%.*}"
+if [[ "$_CONF_HOST" == *[[:upper:]]* ]]; then
+    _CONF_HOST="$(printf '%s' "$_CONF_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')" || return
 fi
 
 conf_value() {

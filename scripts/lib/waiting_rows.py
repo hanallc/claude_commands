@@ -21,12 +21,13 @@ import tempfile
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import build_folders, conf, conf_reads, git_index, registry_rows
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.lib.transcripts import config_dirs
 
 WAITING_PATHS = ":(glob)config/*.conf"
 REGISTRY_PATH = "config/models.conf"
 ORDER_PATH = "config/settings-orders.json"
+LEGACY_GATE_STEM = "merge_gate"
 RegistryReplay = Callable[[str, str, str], str]
 
 
@@ -101,6 +102,11 @@ class WaitingChangeRecord(TypedDict):
     save_order: NotRequired[int]
 
 
+def migrated_setting_name(stem: str, key: str) -> tuple[str, str]:
+    """Return the current name of a saved setting."""
+    return ("gate" if stem == LEGACY_GATE_STEM else stem), key.lower()
+
+
 def journal_path() -> Path:
     state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
     return Path(state) / "live-settings" / "waiting.json"
@@ -168,6 +174,7 @@ class LockedJournal:
         if (checkout / "config").resolve() != conf.directory().resolve():
             return
         orders = published_orders(checkout, head)
+        _restore_legacy_rows(checkout, head, self)
         changed = self._migrate(checkout, head)
         files: dict[str, str] = {}
         for stem in self.accepted.keys() | orders.keys():
@@ -194,6 +201,7 @@ class LockedJournal:
         """Move old Mac receipts into the register and assign orders to old publication rows."""
         old = self.changes
         self.changes = []
+        accepted_order = False
         for row in old:
             if not row.publish_on_main:
                 if row.save_order >= self.order(row.stem, row.key):
@@ -203,32 +211,72 @@ class LockedJournal:
                 continue
             if not row.save_order:
                 row = replace(row, save_order=self.last_order + 1)
-                _ = self.accept(row.stem, row.key, AcceptedSave(row.save_order, row.value))
+            if row.save_order > self.order(row.stem, row.key):
+                accepted_order |= self.accept(row.stem, row.key, AcceptedSave(row.save_order, row.value))
             self.changes.append(row)
-        return old != self.changes
+        return accepted_order or old != self.changes
+
+
+def _migrate_waiting_names(changes: list[WaitingChange]) -> list[WaitingChange]:
+    renamed: set[tuple[str, str]] = set()
+    migrated: list[WaitingChange] = []
+    for row in changes:
+        stem, key = migrated_setting_name(row.stem, row.key)
+        if (stem, key) != (row.stem, row.key):
+            renamed.add((stem, key))
+            row = replace(row, stem=stem, key=key)
+        migrated.append(row)
+    winners: dict[tuple[str, str], tuple[int, int]] = {}
+    for index, row in enumerate(migrated):
+        name = row.stem, row.key
+        if name in renamed:
+            winners[name] = max(winners.get(name, (0, -1)), (row.save_order, index))
+    return [row for index, row in enumerate(migrated)
+            if winners.get((row.stem, row.key), (row.save_order, index)) == (row.save_order, index)]
+
+
+def _migrate_register(register: dict[str, dict[str, AcceptedOrder]]) -> dict[str, dict[str, AcceptedOrder]]:
+    migrated: dict[str, dict[str, AcceptedOrder]] = {}
+    for stem, keys in register.items():
+        for key, save in keys.items():
+            current_stem, current_key = migrated_setting_name(stem, key)
+            rows = migrated.setdefault(current_stem, {})
+            previous = rows.get(current_key)
+            if previous is None or save.order > previous.order:
+                rows[current_key] = save
+    return migrated
 
 
 def _read_journal(path: Path) -> LockedJournal:
     try:
         data = cast(object, json.loads(path.read_text(encoding="utf-8")))
         if isinstance(data, list):
-            return LockedJournal(path, 0, {}, [WaitingChange(**row) for row in cast(list[WaitingChangeRecord], data)])
-        record = cast(SettingsJournalRecord, data)
+            record = SettingsJournalRecord(last_order=0, changes=cast(list[WaitingChangeRecord], data))
+        else:
+            record = cast(SettingsJournalRecord, data)
         register = record.get("register")
         changes = [WaitingChange(**row) for row in record["changes"]]
         if register is None:
-            waiting = {(row.stem, row.key, row.save_order) for row in changes}
+            waiting = {(*migrated_setting_name(row.stem, row.key), row.save_order) for row in changes}
             register = {stem: {key: AcceptedSaveRecord(order=row["order"], value=row.get("value")
-                                                      if (stem, key, row["order"]) in waiting else None)
+                                                      if (*migrated_setting_name(stem, key), row["order"]) in waiting else None)
                                for key, row in keys.items()} for stem, keys in record.get("accepted", {}).items()}
-        accepted = {stem: {key: AcceptedSave(row["order"], value, row.get("legacy_base"))
-                           if (value := row.get("value")) is not None else AcceptedOrder(row["order"])
-                           for key, row in keys.items()} for stem, keys in register.items()}
-        return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record)
+        accepted: dict[str, dict[str, AcceptedOrder]] = {
+            stem: {key: AcceptedSave(row["order"], value, row.get("legacy_base"))
+                   if (value := row.get("value")) is not None else AcceptedOrder(row["order"])
+                   for key, row in keys.items()} for stem, keys in register.items()
+        }
+        migrated_register = _migrate_register(accepted)
+        migrated_changes = _migrate_waiting_names(changes)
+        journal = LockedJournal(path, record["last_order"], migrated_register, migrated_changes,
+                                migrating="register" not in record)
     except FileNotFoundError:
         return LockedJournal(path, 0, {}, [])
     except (ValueError, TypeError, KeyError) as error:
         raise OSError(f"cannot read settings journal {path}: {error}") from error
+    if migrated_register != accepted or migrated_changes != changes:
+        journal.save()
+    return journal
 
 
 @contextmanager
@@ -330,9 +378,71 @@ def published_save(checkout: Path, commit: str, stem: str, key: str, save: Accep
 def published_orders(checkout: Path, commit: str) -> SaveOrders:
     text = tree_text(checkout, commit, ORDER_PATH)
     try:
-        return cast(SaveOrders, json.loads(text)) if text else {}
+        recorded = cast(SaveOrders, json.loads(text)) if text else {}
     except ValueError as error:
         raise OSError(f"{commit}:{ORDER_PATH}: {error}") from error
+    orders: SaveOrders = {}
+    for stem, keys in recorded.items():
+        for key, order in keys.items():
+            current_stem, current_key = migrated_setting_name(stem, key)
+            rows = orders.setdefault(current_stem, {})
+            rows[current_key] = max(order, rows.get(current_key, 0))
+    return orders
+
+
+def _legacy_row_lines(stem: str, text: str, pending_keys: set[str]) -> dict[str, int]:
+    return {key: setting.line for key, setting in conf.settings(text).items()
+            if (current := migrated_setting_name(stem, key)[1]) != key and current in pending_keys}
+
+
+def _without_rows(text: str, lines: Iterable[int]) -> str:
+    removed = set(lines)
+    return "".join(line for index, line in enumerate(text.splitlines(keepends=True)) if index not in removed)
+
+
+def _restore_legacy_gate_link(checkout: Path, head: str, keys: set[str]) -> None:
+    relative = f"config/{LEGACY_GATE_STEM}.conf"
+    path = checkout / relative
+    if path.is_symlink() or not path.is_file():
+        return
+    text = live_text(path) or ""
+    rows = _legacy_row_lines(LEGACY_GATE_STEM, text, keys)
+    if not rows:
+        return
+    restored = _without_rows(text, rows.values())
+    gate = tree_text(checkout, head, "config/gate.conf") or ""
+    absent = {migrated_setting_name(LEGACY_GATE_STEM, key)[1] for key in rows} - conf.settings(text).keys()
+    expected = _without_rows(gate, (setting.line for key, setting in conf.settings(gate).items() if key in absent))
+    entry = index_entry(checkout, head, relative)
+    if not entry.startswith("120000 ") or show(checkout, head, relative) != "gate.conf" or restored != expected:
+        raise OSError(f"{relative} has local edits other than replayed settings")
+    with tempfile.TemporaryDirectory(prefix="restore-gate-link-", dir=path.parent) as folder:
+        link = Path(folder) / path.name
+        link.symlink_to("gate.conf")
+        _ = link.replace(path)
+        sync_folder(path.parent)
+
+
+def _restore_legacy_rows(checkout: Path, head: str, pending: LockedJournal) -> None:
+    """Remove legacy rows left by the old mover for pending Saves."""
+    keys = {stem: {key for key, save in saves.items() if isinstance(save, AcceptedSave)}
+            for stem, saves in pending.accepted.items()}
+    for row in pending.changes:
+        keys.setdefault(row.stem, set()).add(row.key)
+    files: dict[str, str] = {}
+    for stem, pending_keys in keys.items():
+        if not pending_keys:
+            continue
+        relative = f"config/{stem}.conf"
+        text = live_text(checkout / relative) or ""
+        if rows := _legacy_row_lines(stem, text, pending_keys):
+            tracked = conf.settings(tree_text(checkout, head, relative) or "")
+            repaired = _without_rows(text, (line for key, line in rows.items() if key not in tracked))
+            if repaired != text:
+                files[relative] = repaired
+    if gate_keys := keys.get("gate"):
+        _restore_legacy_gate_link(checkout, head, gate_keys)
+    write_files(checkout, files)
 
 
 def pending_files(checkout: Path, journal: LockedJournal) -> dict[str, dict[str, AcceptedOrder]]:
