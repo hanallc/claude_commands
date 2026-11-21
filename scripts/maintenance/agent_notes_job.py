@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 ROOT = Path(__file__).resolve().parents[2]
 from scripts.lib import process_group
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
-from scripts.maintenance.settings import Part, Schedule, settings
+from scripts.maintenance.settings import InvalidPartSchedule, Part, Schedule, settings
 
 
 class Outcome(str, Enum):
@@ -71,8 +71,14 @@ def run_job() -> list[PartResult]:
         if isinstance(history, ScheduleBusy):
             return [PartResult(part, Outcome.NOT_DUE, 0, 0, "another pass is running") for part in Part]
         deadline = time.monotonic() + config.job.timeout_seconds
-        due = {part for part in Part if history.is_due(part.value, config.parts[part].interval_seconds, time.time())}
+        now = time.time()
+        due: dict[Part, Schedule] = {}
         results: dict[Part, PartResult] = {}
+        for part, cadence in config.parts.items():
+            if isinstance(cadence, InvalidPartSchedule):
+                results[part] = PartResult(part, Outcome.FAILED, 0, 1, cadence.reason)
+            elif history.is_due(part.value, cadence.interval_seconds, now):
+                due[part] = cadence
 
         def record(result: PartResult) -> None:
             results[result.part] = result
@@ -82,12 +88,12 @@ def run_job() -> list[PartResult]:
         # Quota and the pacer read completed notes. The vault parts follow the writers.
         vault_parts = (Part.VAULT, Part.VAULT_SAVE)
         with ThreadPoolExecutor(max_workers=len(Part)) as pool:
-            tasks = {part: pool.submit(run_part, part, config.parts[part], deadline)
-                     for part in Part if part in due and part not in (Part.QUOTA, Part.PACER, *vault_parts)}
+            tasks = {part: pool.submit(run_part, part, cadence, deadline)
+                     for part, cadence in due.items() if part not in (Part.QUOTA, Part.PACER, *vault_parts)}
             def after_notes(part: Part) -> PartResult:
                 if Part.NOTES in tasks:
                     _ = tasks[Part.NOTES].result()
-                return run_part(part, config.parts[part], deadline)
+                return run_part(part, due[part], deadline)
             for part in (Part.QUOTA, Part.PACER):
                 if part in due:
                     tasks[part] = pool.submit(after_notes, part)
@@ -95,7 +101,7 @@ def run_job() -> list[PartResult]:
                 record(task.result())
         for part in vault_parts:
             if part in due:
-                record(run_part(part, config.parts[part], deadline))
+                record(run_part(part, due[part], deadline))
         return [results.get(part, PartResult(part, Outcome.NOT_DUE, 0, 0)) for part in Part]
 
 
@@ -105,7 +111,10 @@ def run_now(part: Part) -> PartResult:
     with locked_history(schedule_directory("job"), wait=True) as history:
         if isinstance(history, ScheduleBusy):
             return PartResult(part, Outcome.NOT_DUE, 0, 0, "another pass is running")
-        result = run_part(part, config.parts[part], time.monotonic() + config.job.timeout_seconds)
+        cadence = config.parts[part]
+        if isinstance(cadence, InvalidPartSchedule):
+            return PartResult(part, Outcome.FAILED, 0, 1, cadence.reason)
+        result = run_part(part, cadence, time.monotonic() + config.job.timeout_seconds)
         if result.outcome is Outcome.SUCCESS:
             history.record(part.value, time.time())
         return result
@@ -177,6 +186,9 @@ def _perform(part: Part) -> int:
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main
         return main()
+    elif part is Part.FOLDER_SIZE:
+        from scripts.maintenance import folder_size
+        folder_size.run()
     elif part is Part.VAULT_SAVE:
         from scripts.maintenance.vault_save import main
 

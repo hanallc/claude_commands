@@ -19,7 +19,7 @@ from unittest.mock import patch
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.maintenance import agent_notes_job as job
 from scripts.maintenance import vault_commit
-from scripts.maintenance.settings import Part, Schedule, settings
+from scripts.maintenance.settings import InvalidPartSchedule, Part, Schedule, settings
 from scripts.maintenance.test_vault_save import job_config_fixture
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
@@ -163,6 +163,14 @@ class JobTests(unittest.TestCase):
             self.assertTrue(all(result.outcome is job.Outcome.SUCCESS for result in job.run_job()))
         self.assertTrue(logins_started.is_set())
 
+    def test_folder_size_part_calls_the_check(self) -> None:
+        from scripts.maintenance import folder_size
+
+        with (patch.dict(os.environ, {"HOME": str(self.root)}),
+              patch.object(folder_size, "run") as check):
+            self.assertEqual(job._perform(Part.FOLDER_SIZE), 0)  # pyright: ignore[reportPrivateUsage]
+        check.assert_called_once_with()
+
     def vault_git(self, *arguments: str) -> str:
         return subprocess.run(
             ["git", "-C", str(self.root / "rust/hanadocs"), *arguments], check=True,
@@ -277,7 +285,7 @@ class JobTests(unittest.TestCase):
     def test_runtime_configuration_controls_each_parts_interval_and_deadline(self) -> None:
         original = self.config.read_text()
         _ = self.config.write_text(original.replace("timeout_seconds = 60", "timeout_seconds = 0.5"))
-        self.assertEqual(settings().parts[Part.NOTES].timeout_seconds, 0.5)
+        self.assertEqual(settings().parts[Part.NOTES], Schedule(120, 0.5))
         def result(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
             return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
         with patch.object(job, "run_part", side_effect=result), patch.object(time, "time", return_value=1000):
@@ -293,8 +301,9 @@ class JobTests(unittest.TestCase):
         for invalid in (59, 3601):
             with self.subTest(interval=invalid):
                 _ = self.config.write_text(original.replace("interval_seconds = 180", f"interval_seconds = {invalid}"))
-                with self.assertRaisesRegex(ValueError, r"parts\.vault_save\.interval_seconds"):
-                    _ = settings()
+                self.assertEqual(settings().parts[Part.VAULT_SAVE], InvalidPartSchedule(
+                    "Invalid [parts.vault_save] schedule. parts.vault_save.interval_seconds must be from 60 through 3600"
+                ))
         _ = self.config.write_text(original.replace("interval_seconds = 180\ntimeout_seconds = 30",
                                                  "interval_seconds = 73\ntimeout_seconds = 150"))
         with patch.object(job, "run_part") as run:
@@ -312,6 +321,30 @@ class JobTests(unittest.TestCase):
                 _ = job.run_job()
             run.assert_called_once()
             self.assertEqual(run.call_args.args[:2], (Part.VAULT_SAVE, Schedule(73, 150)))
+
+    def test_an_invalid_part_schedule_leaves_other_parts_running(self) -> None:
+        original = self.config.read_text()
+
+        def launch(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+            return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
+
+        for invalid in Part:
+            with self.subTest(part=invalid):
+                header = f"\n[parts.{invalid.value}]\n"
+                before, _, after = original.partition(header)
+                _, next_header, rest = after.partition("\n[")
+                _ = self.config.write_text(before + header + "interval_seconds = 0\n" + next_header + rest)
+                with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / invalid.value)}),
+                      patch.object(job, "run_part", side_effect=launch) as run):
+                    results = {result.part: result for result in job.run_job()}
+                    forced = job.run_now(invalid)
+                failed = results[invalid]
+                self.assertEqual(failed.outcome, job.Outcome.FAILED)
+                self.assertIn(f"[parts.{invalid.value}]", failed.output)
+                self.assertEqual(forced, failed)
+                self.assertEqual({part for part, result in results.items() if result.outcome is job.Outcome.SUCCESS},
+                                 set(Part) - {invalid})
+                self.assertEqual(run.call_count, len(Part) - 1)
 
 
 if __name__ == "__main__":
