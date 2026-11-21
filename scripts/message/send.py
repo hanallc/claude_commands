@@ -5261,7 +5261,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                     and sessions.addressed(f"session:{local_member.current_session}", records) is not None):
                 local_recipient = str(local_member.current_session)
     participants: roster.AllRosterSessions | roster.MessageParticipants = roster.AllRosterSessions()
-    if local_recipient:
+    if local_recipient and not options.skip_closed:
         identities = {local_recipient}
         if isinstance(stamp, ClaudeSender):
             identities.add(stamp.session_id)

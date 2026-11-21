@@ -41,6 +41,7 @@ from unittest import mock
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_models_registry import write_registry
 from scripts.herdr import herdr_types
+from scripts.herdr.place import HerdrPlace
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
@@ -7440,9 +7441,13 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
     def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot,
                    registry: sessions.RegistryRead,
                    participants: roster.AllRosterSessions | roster.MessageParticipants) -> roster.Roster:
-        del registry, participants
+        del registry
         self.assertEqual(scope, roster.ThisMachine())
         self.assertEqual(membership, staff.StaffSnapshot(tuple(self.staff_rows.values())))
+        if isinstance(participants, roster.MessageParticipants):
+            return replace(self.local, entries=[entry for entry in self.local.entries if not (
+                entry.kind == "codex" and isinstance(entry.thread, roster.NoCodexThread)
+                and isinstance(entry.pane, HerdrPlace))])
         return self.local
 
     def relay(self, message: send.Message, _timeout: float) -> send.Result:
@@ -7521,17 +7526,25 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_skip_closed_cannot_prove_absence_with_an_incomplete_roster(self) -> None:
         unknown = replace(self.row("", "codex:unknown"), thread=roster.NoCodexThread(),
-                          reach=roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+                          reach=roster.CannotReceiveMessages("interactive Codex in a herdr pane"),
+                          pane=HerdrPlace("agents", "w1:p1"))
         clean = self.recipient_roster([], [])
         unreadable = self.recipient_roster([], ["Codex daemon: socket unreadable"])
         unidentified = self.recipient_roster([unknown], [])
-        for local, peer in ((unreadable, clean), (clean, unreadable),
-                            (unidentified, clean), (clean, unidentified)):
-            with self.subTest(local=local, peer=peer):
+        self.staff_member("holder", "holder")
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                                current_session=staff.StaffId("worker-thread"))
+        self.staff_rows[worker.id] = worker
+        for address, local, peer in (
+            ("codex:gone", unreadable, clean), ("codex:gone", clean, unreadable),
+            ("codex:gone", unidentified, clean), ("codex:gone", clean, unidentified),
+            (f"codex:{worker.current_session}", unidentified, clean),
+        ):
+            with self.subTest(address=address, local=local, peer=peer):
                 self.local = local
                 self.peer(peer.entries, problems=tuple(peer.problems))
                 with mock.patch.object(failed_lookup, "report") as report:
-                    status, output, errors = self.run_main("codex:gone", "--skip-closed")
+                    status, output, errors = self.run_main(address, "--skip-closed")
                 self.assertEqual(status, 3, output + errors)
                 self.assertTrue(output.startswith("FAILED: "), output)
                 report.assert_called_once()
