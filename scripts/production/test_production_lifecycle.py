@@ -203,6 +203,9 @@ class LifecycleTests(LifecycleFixture):
             + f"- **{MERGE_CHECKOUT_FIELD}:** `{self.checkout}`"))
         with (self.checkout / ".git/info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write(f"\n/{live.relative_to(self.checkout).as_posix()}\n/{self.log.name}\n")
+        with mock.patch.dict(os.environ, self.env):
+            if (production_admission.admission_folder() / f"{self.owner_id()}.json").exists():
+                production_admission.record_verified_move(read_production(self.owner_id()), live)
         _ = staff.set_doc(self.owner_id(), staff.LiveDoc(remote.local_machine(), live))
         return live, integration
 
@@ -258,6 +261,7 @@ class LifecycleTests(LifecycleFixture):
         super().setUp()
         self.env["GATE_TEST_HOST"] = remote.local_machine()
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
+        _ = self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": self.env["SHOWRUNNER_STATE_DIR"]}))
         with mock.patch.dict(os.environ, self.env):
             _ = production_admission.capture_rollout_inventory([self.owner_id()])
 
@@ -309,8 +313,9 @@ class LifecycleTests(LifecycleFixture):
         runner, alpha, beta, child = self.staff_tree()
         target = runner.id if retire_showrunner else alpha.id
         original_doc, original_worktree = staff.set_doc, staff.set_worktree
-        def interrupted_doc(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc) -> staff.StaffRow:
-            row = original_doc(staff_id, value)
+        def interrupted_doc(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc, *,
+                            expected: staff.LiveDoc) -> staff.StaffRow:
+            row = original_doc(staff_id, value, expected=expected)
             if staff_id == target:
                 raise OSError("stopped after staff retirement")
             return row
@@ -1484,19 +1489,26 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(result.stderr.count("Worktree pair kept"), 1)
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
 
+    def move_fixture_document(self, destination: Path) -> None:
+        owner = read_production(self.owner_id()).owner
+        binding = staff.LiveDoc(remote.local_machine(), destination)
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.prepare_document_rebind(owner, binding)
+            _ = self.git("mv", str(self.doc), str(destination))
+            _ = production_admission.complete_document_rebind(owner, binding)
+
     def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
         self.running()
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/example-production.md"
         kept.parent.mkdir()
-        _ = self.git("mv", str(self.doc), str(kept))
+        self.move_fixture_document(kept)
         _ = self.git("commit", "-m", "keep the doc in productions/")
         _ = self.git("push", "origin", "production")
         self.doc = kept
 
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
 
@@ -1519,12 +1531,11 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/example-production.md"
         kept.parent.mkdir()
-        _ = self.git("mv", str(self.doc), str(kept))
+        self.move_fixture_document(kept)
         _ = self.git("commit", "-m", "keep the doc in productions/")
         _ = self.git("push", "origin", "production")
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked
@@ -1551,12 +1562,11 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/different-production.md"
         kept.parent.mkdir()
-        _ = self.git("mv", str(self.doc), str(kept))
+        self.move_fixture_document(kept)
         _ = self.git("commit", "-m", "Move the production document")
         _ = self.git("push", "origin", "production")
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked

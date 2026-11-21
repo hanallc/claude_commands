@@ -36,7 +36,7 @@ from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, staged_notes_directory
 from scripts.production.production_admission import (
-    capture_rollout_inventory, record_verified_move, require_admission,
+    capture_rollout_inventory, complete_document_rebind, prepare_document_rebind, record_verified_move, require_admission,
     require_guard_ready as require_guard_ready,
     require_new_document as require_new_document,
 )
@@ -1156,6 +1156,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                     sync_folder(production.doc.parent)
     doc_paths = [] if enrolled else [doc_path_in_checkout(production, production.doc)]
     archive = None if enrolled else archived_doc(production)
+    final_doc = archive if archive is not None else production.doc
+    binding = staff.WrappedDoc(local_machine(), final_doc)
+    prepare_document_rebind(runner, binding)
     if archive is not None:
         archive.parent.mkdir(parents=True, exist_ok=True)
         doc_paths.append(doc_path_in_checkout(production, archive))
@@ -1166,10 +1169,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
         doc_paths[:0] = [source for source, destination in zip(renames[1::3], renames[2::3])
                         if destination == doc_paths[-1]]
-    final_doc = archive if archive is not None else production.doc
     if not final_doc.is_file():
         raise LifecycleStop("staff", "held", f"wrapped production doc is missing: {final_doc}")
-    wrapped_runner = staff.set_doc(runner.id, staff.WrappedDoc(local_machine(), final_doc))
+    wrapped_runner = complete_document_rebind(runner, binding)
     record = replace(record, rows=tuple(wrapped_runner if row.id == wrapped_runner.id else row for row in record.rows))
     if record.pending_retire:
         _ = staff.retire_pending()
