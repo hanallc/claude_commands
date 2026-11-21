@@ -1773,70 +1773,111 @@ def filter_tree(checkout: Path, expected_head: str, log: Path) -> (
     return tree
 
 
+class FilterCheckout(Enum):
+    CLEAN = auto()
+    RESTORED = auto()
+
+
+def unsafe_filter_reset(log: Path, reason: str) -> checkpoint_gate.Stop:
+    return checkpoint_gate.Stop("test", "cancelled", reason,
+                                f"restore the batch tree before retrying; test log: {log}")
+
+
+def restore_filter_tip(checkout: Path, expected_head: str, test_tip: str, log: Path) -> FilterCheckout:
+    """Restore tracked file edits from a filter on a previously clean checkout."""
+    require_filter_head(checkout, expected_head, log)
+    status = subprocess.run(["git", "-C", str(checkout), "status", "--porcelain", "-z", "--untracked-files=all"],
+                            capture_output=True, check=False)
+    if status.returncode:
+        raise unsafe_filter_reset(log, os.fsdecode(status.stderr).strip())
+    changes = tuple(record for record in status.stdout.split(b"\0") if record)
+    if (any(not record.startswith(b" M ") for record in changes)
+            or git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0):
+        raise unsafe_filter_reset(log, "affected tests left changes that a safe reset cannot remove")
+    if changes:
+        require_filter_head(checkout, expected_head, log)
+        paths = (os.fsdecode(record[3:]) for record in changes)
+        restore = git(checkout, "--literal-pathspecs", "restore", "--worktree", "--", *paths)
+        if restore.returncode:
+            raise unsafe_filter_reset(log, failure_detail(restore))
+    require_filter_head(checkout, expected_head, log)
+    if expected_head != test_tip:
+        reset = git(checkout, "reset", "--keep", test_tip)
+        if reset.returncode:
+            raise unsafe_filter_reset(log, failure_detail(reset))
+    tree = filter_tree(checkout, test_tip, log)
+    if isinstance(tree, checkpoint_gate.FilterInconclusive):
+        raise unsafe_filter_reset(log, tree.reason)
+    return FilterCheckout.RESTORED if changes else FilterCheckout.CLEAN
+
+
+def prefix_verdict(result: checkpoint_gate.FilterResults | checkpoint_gate.FilterInconclusive) -> PrefixVerdict:
+    if isinstance(result, checkpoint_gate.FilterInconclusive):
+        return PrefixVerdict.INCONCLUSIVE
+    return PrefixVerdict.RED if result.red else PrefixVerdict.GREEN
+
+
 def confirm_affected_red(production: ProductionDocument, items: tuple[MergedBatchItem, ...],
                          start_tip: str, test_tip: str, main: PinnedMain, names: frozenset[str],
                          log: Path) -> None:
     checkout = production.checkout
-    expected_head = test_tip
-    results: dict[tuple[str, str], PrefixVerdict] = {}
-    confirmed: dict[int, set[str]] = {}
-    try:
-        def probe(head: str, name: str) -> PrefixVerdict:
-            nonlocal expected_head
-            require_filter_head(checkout, expected_head, log)
-            if expected_head != head:
+    results: dict[tuple[str, str], checkpoint_gate.FilterResults | checkpoint_gate.FilterInconclusive] = {}
+    confirmed: dict[int, dict[str, str]] = {}
+
+    def probe(head: str, name: str) -> checkpoint_gate.FilterResults | checkpoint_gate.FilterInconclusive:
+        tree = filter_tree(checkout, test_tip, log)
+        if isinstance(tree, checkpoint_gate.FilterInconclusive):
+            raise unsafe_filter_reset(log, tree.reason)
+        expected_head = test_tip
+        try:
+            if head != test_tip:
                 try:
                     _ = good(git(checkout, "reset", "--keep", head), "bisect")
                     expected_head = head
                     merge_main_commit(production, main.commit)
                 except checkpoint_gate.Stop as error:
                     checkpoint_gate.log_filter(log, "inconclusive", 1, error.detail)
-                    return PrefixVerdict.INCONCLUSIVE
+                    return checkpoint_gate.FilterInconclusive(error.detail)
                 expected_head = good(git(checkout, "rev-parse", "HEAD"), "bisect")
-            tree = filter_tree(checkout, expected_head, log)
-            if isinstance(tree, checkpoint_gate.FilterInconclusive):
-                checkpoint_gate.log_filter(log, "inconclusive", 1, tree.reason)
-                return PrefixVerdict.INCONCLUSIVE
+                tree = filter_tree(checkout, expected_head, log)
+                if isinstance(tree, checkpoint_gate.FilterInconclusive):
+                    raise unsafe_filter_reset(log, tree.reason)
             key = (tree.tree, name)
-            if key not in results:
-                result = checkpoint_gate.run_affected_tests(checkout, (name,))
-                after = filter_tree(checkout, expected_head, log)
-                if isinstance(after, checkpoint_gate.FilterInconclusive):
-                    result = after
-                if isinstance(result, checkpoint_gate.FilterInconclusive):
-                    checkpoint_gate.log_filter(log, "inconclusive", 1, result.reason)
-                    results[key] = PrefixVerdict.INCONCLUSIVE
-                else:
-                    results[key] = PrefixVerdict.RED if name in result.red else PrefixVerdict.GREEN
-            return results[key]
+            result = results[key] if key in results else checkpoint_gate.run_affected_tests(checkout, (name,))
+        finally:
+            restored = restore_filter_tip(checkout, expected_head, test_tip, log)
+        if restored is FilterCheckout.RESTORED:
+            result = checkpoint_gate.FilterInconclusive("the test changed the checkout")
+        if isinstance(result, checkpoint_gate.FilterInconclusive):
+            checkpoint_gate.log_filter(log, "inconclusive", 1, result.reason)
+        results[key] = result
+        return result
 
-        for name in sorted(names):
-            if probe(test_tip, name) is not PrefixVerdict.RED:
-                checkpoint_gate.log_filter(log, "inconclusive", 1, f"{name} did not fail again")
-                continue
-            if probe(start_tip, name) is not PrefixVerdict.GREEN:
-                checkpoint_gate.log_filter(log, "inconclusive", 1, f"{name} did not pass on the base")
-                continue
-            found = bisect_red_batch(items, lambda item: probe(item.merge_head, name))
-            if isinstance(found, UnconfirmedBoundary):
-                continue
-            previous = items[found.position - 1].merge_head if found.position else start_tip
-            if (probe(found.merge_head, name) is PrefixVerdict.RED
-                    and probe(previous, name) is PrefixVerdict.GREEN):
-                confirmed.setdefault(found.position, set()).add(name)
-            else:
-                checkpoint_gate.log_filter(log, "inconclusive", 1, f"no verified red boundary for {name}")
-    finally:
-        require_filter_head(checkout, expected_head, log)
-        if expected_head != test_tip:
-            restore = git(checkout, "reset", "--keep", test_tip)
-            if restore.returncode:
-                raise checkpoint_gate.Stop("test", "cancelled", failure_detail(restore),
-                                           f"restore the batch tree before retrying; test log: {log}")
+    for name in sorted(names):
+        if prefix_verdict(probe(test_tip, name)) is not PrefixVerdict.RED:
+            checkpoint_gate.log_filter(log, "inconclusive", 1, f"{name} did not fail again")
+            continue
+        if prefix_verdict(probe(start_tip, name)) is not PrefixVerdict.GREEN:
+            checkpoint_gate.log_filter(log, "inconclusive", 1, f"{name} did not pass on the base")
+            continue
+        found = bisect_red_batch(items, lambda item: prefix_verdict(probe(item.merge_head, name)))
+        if isinstance(found, UnconfirmedBoundary):
+            continue
+        previous = items[found.position - 1].merge_head if found.position else start_tip
+        boundary = probe(found.merge_head, name)
+        if (isinstance(boundary, checkpoint_gate.FilterResults) and name in boundary.red
+                and prefix_verdict(probe(previous, name)) is PrefixVerdict.GREEN):
+            confirmed.setdefault(found.position, {})[name] = boundary.red[name]
+        else:
+            checkpoint_gate.log_filter(log, "inconclusive", 1, f"no verified red boundary for {name}")
     if confirmed:
         position = min(confirmed)
+        failures = confirmed[position]
+        with log.open("a", encoding="utf-8") as output:
+            for name, failure in failures.items():
+                _ = output.write(f"--- {checkpoint_gate.AFFECTED_TESTS}: {name} ---\n{failure}\n")
         step = checkpoint_gate.CheckpointTestStep(checkpoint_gate.AFFECTED_TESTS, [], checkout)
-        stop = checkpoint_gate.unit_red((checkpoint_gate.RedStep(step, frozenset(confirmed[position])),), log)
+        stop = checkpoint_gate.unit_red((checkpoint_gate.RedStep(step, frozenset(failures)),), log)
         raise BatchItemStop((position,), stop)
 
 
@@ -1866,15 +1907,20 @@ def filter_batch(production: ProductionDocument, items: tuple[MergedBatchItem, .
         checkpoint_gate.log_filter(log, "skipped", 0, "the map selected no modules")
         return
     checkpoint_gate.log_filter(log, "start", len(names), "run the selected modules")
-    result = checkpoint_gate.run_affected_tests(checkout, names)
-    after = filter_tree(checkout, test_tip, log)
-    if isinstance(after, checkpoint_gate.FilterInconclusive):
-        result = after
+    tree = filter_tree(checkout, test_tip, log)
+    if isinstance(tree, checkpoint_gate.FilterInconclusive):
+        raise unsafe_filter_reset(log, tree.reason)
+    try:
+        result = checkpoint_gate.run_affected_tests(checkout, names)
+    finally:
+        restored = restore_filter_tip(checkout, test_tip, test_tip, log)
+    if restored is FilterCheckout.RESTORED:
+        result = checkpoint_gate.FilterInconclusive("the test changed the checkout")
     if isinstance(result, checkpoint_gate.FilterInconclusive):
         checkpoint_gate.log_filter(log, "inconclusive", len(names), result.reason)
     elif result.red:
         checkpoint_gate.log_filter(log, "red", len(names), ", ".join(sorted(result.red)))
-        confirm_affected_red(production, items, start_tip, test_tip, main, result.red, log)
+        confirm_affected_red(production, items, start_tip, test_tip, main, frozenset(result.red), log)
     else:
         checkpoint_gate.log_filter(log, "green", len(names), "all selected modules passed")
 
@@ -1922,10 +1968,10 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                     _ = waits.enter_context(merge_gate_wait(item.request.unit.worktree, item.request.phase,
                                                             item.request.unit.name, item.request.commit))
                 if isinstance(filter_main, PinnedMain):
-                    if any(checkpoint_gate.runs_merge_gate(command) for command in reference.merge_tests):
+                    if any(checkpoint_gate.runs_full_merge_gate(command) for command in reference.merge_tests):
                         filter_batch(reference.production, tuple(items), start_tip, test_tip, filter_main, log)
                     else:
-                        checkpoint_gate.log_filter(log, "skipped", 0, "the batch has no merge gate command")
+                        checkpoint_gate.log_filter(log, "skipped", 0, "the batch has no merge gate command for the full inventory")
                 tests_green = run_checkpoint_tests(reference.production, tuple(sorted(test_paths)), reference.merge_tests,
                                                    reference.flakes, reference.flaky_tests, log, test_tip, start_tip,
                                                    base_tip=start_tip, ledger=reference.parent_production)

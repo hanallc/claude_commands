@@ -93,15 +93,20 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             "tests": [{"test": "test_fixture", "s": 0, "status": "fail"}],
         }
         red = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "", times=red_times)
-        green = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "")
-        refused = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "runner refused")
+        green_times: ModuleTimes = {
+            **red_times, "failures": 0, "tests": [{"test": "test_fixture", "s": 0, "status": "pass"}],
+        }
+        green = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "", times=green_times)
+        no_report = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "")
+        refused = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "runner refused",
+                                           times=green_times)
         tripwire = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "", times=red_times,
                                            tripwire_tripped=True)
         conflict = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "", times=red_times)
         killed = merge_gate.GateJobResult("production", "test_fixture.py", -15, 0, "", killed_for="test limit")
         cases = (
-            ("test failure", merge_gate.GateRun((red,), 0, 0), checkpoint_gate.FilterResults(frozenset({module}))),
-            ("green", merge_gate.GateRun((green,), 0, 0), checkpoint_gate.FilterResults(frozenset())),
+            ("test failure", merge_gate.GateRun((red,), 0, 0), frozenset({module})),
+            ("green", merge_gate.GateRun((green,), 0, 0), frozenset[str]()),
             ("missing", merge_gate.GateRun((), 0, 0),
              checkpoint_gate.FilterInconclusive("the runner did not report a fresh result for each selected module")),
             ("refused", merge_gate.GateRun((refused,), 0, 0),
@@ -112,10 +117,20 @@ class CheckpointRerunTests(MergeCheckpointFixture):
              checkpoint_gate.FilterInconclusive(f"{module} has no test result that agrees with its exit status")),
             ("killed first attempt", merge_gate.GateRun((red,), 0, 0, executions=(killed, red)),
              checkpoint_gate.FilterInconclusive(f"{module} stopped before a valid result")),
+            ("red then green", merge_gate.GateRun((green,), 0, 0, executions=(red, green)),
+             checkpoint_gate.FilterInconclusive(f"{module} had different results on retry")),
+            ("green without a report", merge_gate.GateRun((no_report,), 0, 0),
+             checkpoint_gate.FilterInconclusive(f"{module} has no test report")),
         )
         for case, run, expected in cases:
             with self.subTest(case=case), patch.object(merge_gate, "run_filter_modules", return_value=run) as run_modules:
-                self.assertEqual(checkpoint_gate.run_affected_tests(self.checkout, (module,)), expected)
+                result = checkpoint_gate.run_affected_tests(self.checkout, (module,))
+                if isinstance(expected, frozenset):
+                    self.assertIsInstance(result, checkpoint_gate.FilterResults)
+                    assert isinstance(result, checkpoint_gate.FilterResults)
+                    self.assertEqual(frozenset(result.red), expected)
+                else:
+                    self.assertEqual(result, expected)
                 run_modules.assert_called_once_with(self.checkout, (module,))
 
     def save_case(self) -> Path:

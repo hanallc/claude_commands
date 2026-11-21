@@ -70,7 +70,7 @@ AFFECTED_TESTS = "affected tests"
 
 
 class FilterResults(NamedTuple):
-    red: frozenset[str]
+    red: dict[str, str]
 
 
 class FilterInconclusive(NamedTuple):
@@ -93,23 +93,34 @@ def run_affected_tests(repo: Path, names: Sequence[str]) -> FilterResults | Filt
     if run.time_limit_report:
         return FilterInconclusive("the run time limit expired")
     reported = tuple(f"{job.suite}/{job.module}" for job in run.jobs)
-    if len(reported) != len(names) or set(reported) != set(names) or run.tests_reused:
+    selected = set(names)
+    if len(reported) != len(selected) or set(reported) != selected or run.tests_reused:
         return FilterInconclusive("the runner did not report a fresh result for each selected module")
+    verdicts: dict[str, int] = {}
     for job in (*run.jobs, *run.executions):
+        name = f"{job.suite}/{job.module}"
         if job.kind is not merge_gate.GateJobKind.TEST_MODULE:
             return FilterInconclusive("the runner reported a non-test job")
+        if name not in selected:
+            return FilterInconclusive(f"the runner reported an unselected module: {name}")
         if job.killed_for or job.memory_stopped or job.tripwire_tripped or job.returncode < 0:
-            return FilterInconclusive(f"{job.suite}/{job.module} stopped before a valid result")
-    red: set[str] = set()
-    for name, job in zip(reported, run.jobs, strict=True):
+            return FilterInconclusive(f"{name} stopped before a valid result")
+        if verdicts.setdefault(name, job.returncode) != job.returncode:
+            return FilterInconclusive(f"{name} had different results on retry")
+    red: dict[str, str] = {}
+    for job in (*run.jobs, *run.executions):
+        name = f"{job.suite}/{job.module}"
         times = job.times
-        failed = (not isinstance(times, (NoModuleTimes, TimingNotApplicable))
-                  and any(test["status"] in ("fail", "error", "unexpected_success") for test in times["tests"]))
-        if job.returncode == 1 and failed:
-            red.add(name)
-        elif job.returncode or failed:
+        if isinstance(times, (NoModuleTimes, TimingNotApplicable)):
+            return FilterInconclusive(f"{name} has no test report")
+        statuses = {test["status"] for test in times["tests"]}
+        if job.returncode == 0 and statuses <= {"pass", "skip"} and not (times["failures"] or times["errors"]):
+            continue
+        if job.returncode == 1 and statuses & {"fail", "error", "unexpected_success"}:
+            _ = red.setdefault(name, job.output)
+        else:
             return FilterInconclusive(f"{name} has no test result that agrees with its exit status")
-    return FilterResults(frozenset(red))
+    return FilterResults(red)
 
 
 class CargoPackage(NamedTuple):
@@ -188,6 +199,10 @@ GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit
 
 def runs_merge_gate(command: Sequence[str]) -> bool:
     return any(Path(word).name == "merge_gate.py" for word in command)
+
+
+def runs_full_merge_gate(command: Sequence[str]) -> bool:
+    return runs_merge_gate(command) and not any(word == "--module" or word.startswith("--module=") for word in command)
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
