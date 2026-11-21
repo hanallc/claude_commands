@@ -23,6 +23,7 @@ BYTES_PER_MB = 1_000_000
 RETRY_WINDOW_MINUTES = 365 * 24 * 60
 DELIVERY_SECONDS = 5
 SEND_SECONDS = 10
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 @dataclass(frozen=True)
@@ -67,20 +68,42 @@ def save_crossings(path: Path, crossings: dict[staff.StaffId, LimitCrossing]) ->
     write_text_atomic(path, json.dumps(saved, sort_keys=True) + "\n", new_file_mode=0o600)
 
 
-def _folder_bytes(folder: Path) -> int:
+def _open_measured_directory(parent: int, name: str, observed: os.stat_result) -> int:
+    directory = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
+    try:
+        if not os.path.samestat(observed, os.fstat(directory)):
+            raise OSError(f"directory changed during measurement: {name!r}")
+    except BaseException:
+        os.close(directory)
+        raise
+    return directory
+
+
+def _folder_bytes(root_directory: int) -> int:
     total = 0
-    pending_folders = [folder]
-    while pending_folders:
-        directory = pending_folders.pop()
-        if directory.is_symlink():
-            continue
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                info = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    pending_folders.append(directory / entry.name)
-                elif stat.S_ISREG(info.st_mode):
-                    total += info.st_size
+    stack = [(root_directory, iter(os.listdir(root_directory)))]
+    try:
+        while stack:
+            directory, names = stack[-1]
+            name = next(names, None)
+            if name is None:
+                _ = stack.pop()
+                if directory != root_directory:
+                    os.close(directory)
+                continue
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = _open_measured_directory(directory, name, info)
+                try:
+                    stack.append((child, iter(os.listdir(child))))
+                except BaseException:
+                    os.close(child)
+                    raise
+            elif stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    finally:
+        for directory, _ in stack[1:]:
+            os.close(directory)
     return total
 
 
@@ -122,22 +145,30 @@ def _measure_producers(root: Path) -> list[MeasuredProducerFolder]:
             continue
         folder = path
         try:
-            relative = path.relative_to(root)
-            if ".." in relative.parts:
+            components = path.relative_to(root).parts
+            if ".." in components:
                 raise ValueError("expected a producer folder below the configured root")
-            ancestor = root
-            for component in relative.parts:
-                if not stat.S_ISDIR(ancestor.lstat().st_mode):
-                    raise NotADirectoryError(f"expected a directory at {str(ancestor)!r}")
-                ancestor /= component
-            mode = path.lstat().st_mode
-            if stat.S_ISREG(mode):
-                folder = path.parent
-                if folder == root:
-                    continue
-            elif not stat.S_ISDIR(mode):
-                raise ValueError("expected a regular document file or folder")
-            size = _folder_bytes(folder)
+            directory = os.open(root, DIRECTORY_FLAGS)
+            try:
+                for component in components[:-1]:
+                    child = os.open(component, DIRECTORY_FLAGS, dir_fd=directory)
+                    os.close(directory)
+                    directory = child
+                name = components[-1]
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode):
+                    folder = path.parent
+                    if folder == root:
+                        continue
+                elif stat.S_ISDIR(info.st_mode):
+                    child = _open_measured_directory(directory, name, info)
+                    os.close(directory)
+                    directory = child
+                else:
+                    raise ValueError("expected a regular document file or folder")
+                size = _folder_bytes(directory)
+            finally:
+                os.close(directory)
         except (OSError, ValueError) as error:
             _warn(producer.id, folder, error)
             continue

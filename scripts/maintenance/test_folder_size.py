@@ -7,8 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Iterator
-from contextlib import AbstractContextManager, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
@@ -48,7 +47,9 @@ class FolderSizeTests(unittest.TestCase):
                               current_session=staff.native_id(str(uuid4())))
 
     def set_limit(self, limit: int) -> None:
-        _ = self.config.write_text(f"PRODUCER_FOLDER_ROOT={self.root}\nproducer_folder_limit_mb={limit}\n")
+        _ = self.config.write_text(
+            f"PRODUCER_FOLDER_ROOT={self.root}\n# whole: 1..\nproducer_folder_limit_mb={limit}\n",
+        )
 
     def resize(self, path: Path, size: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,16 +111,45 @@ class FolderSizeTests(unittest.TestCase):
             leaf.mkdir()
         self.resize(leaf / "payload.bin", 3_000_000)
         accepted = subprocess.CompletedProcess[str]([], 0, stdout="SENT: fixture\n")
-        with patch.object(subprocess, "run", return_value=accepted) as send:
+        with (patch.object(os, "open", wraps=os.open) as open_directory,
+              patch.object(subprocess, "run", return_value=accepted) as send):
             original_limit = sys.getrecursionlimit()
             try:
                 sys.setrecursionlimit(150)
                 folder_size.run()
             finally:
                 sys.setrecursionlimit(original_limit)
+        directory_opens = sum(bool(cast(int, call.args[1]) & os.O_DIRECTORY)
+                              for call in open_directory.call_args_list)
+        self.assertEqual(directory_opens, 182)
         send.assert_called_once()
         args = cast(list[str], send.call_args.args[0])
         self.assertIn(f"{str(self.folder)!r} uses 3 MB", args[args.index("--text") + 1])
+
+    def test_keeps_the_open_ancestor_when_its_path_is_replaced(self) -> None:
+        self.resize(self.folder / "payload.bin", 1_500_000)
+        (self.folder / "child").mkdir()
+        replacement = self.root / "replacement"
+        self.resize(replacement / "child/payload.bin", 1_500_000)
+        original = self.folder.stat()
+        list_names = os.listdir
+        replaced = False
+
+        def replace_after_listing(directory: int) -> list[str]:
+            nonlocal replaced
+            names = list_names(directory)
+            if os.path.samestat(os.fstat(directory), original):
+                _ = self.folder.rename(self.root / "moved")
+                _ = replacement.rename(self.folder)
+                replaced = True
+            return names
+
+        with (patch.object(os, "listdir", side_effect=replace_after_listing),
+              patch.object(subprocess, "run") as send, redirect_stdout(io.StringIO()) as output):
+            folder_size.run()
+        self.assertTrue(replaced)
+        self.assertEqual(output.getvalue(), "")
+        send.assert_not_called()
 
     def test_reads_a_changed_limit_without_a_restart(self) -> None:
         self.resize(self.folder / "payload.bin", 2_500_000)
@@ -161,16 +191,17 @@ class FolderSizeTests(unittest.TestCase):
         unreadable = self.member("fixture-unreadable", unreadable_folder)
         self.resize(unreadable_folder / "blocked.bin", 3_000_000)
         self.resize(self.folder / "payload.bin", 3_000_000)
-        scan = os.scandir
+        list_names = os.listdir
+        blocked = unreadable_folder.stat()
 
-        def refuse_one_folder(path: Path) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
-            if path == unreadable_folder:
+        def refuse_one_folder(directory: int) -> list[str]:
+            if os.path.samestat(os.fstat(directory), blocked):
                 raise PermissionError("fixture folder is unreadable")
-            return scan(path)
+            return list_names(directory)
 
         accepted = subprocess.CompletedProcess[str]([], 0, stdout="SENT: fixture\n")
         record = staff.StaffSnapshot((missing, unreadable, producer))
-        with (staff.supplied_snapshot(record), patch.object(os, "scandir", side_effect=refuse_one_folder),
+        with (staff.supplied_snapshot(record), patch.object(os, "listdir", side_effect=refuse_one_folder),
               patch.object(subprocess, "run", return_value=accepted) as send,
               redirect_stdout(io.StringIO()) as output):
             folder_size.run()
@@ -192,10 +223,12 @@ class FolderSizeTests(unittest.TestCase):
         link = self.folder / "linked-directory"
         link.symlink_to(outside, target_is_directory=True)
         accepted = subprocess.CompletedProcess[str]([], 0, stdout="SENT: fixture\n")
-        with (patch.object(os, "scandir", wraps=os.scandir) as scan,
+        with (patch.object(os, "open", wraps=os.open) as open_directory,
               patch.object(subprocess, "run", return_value=accepted) as send, redirect_stdout(io.StringIO()) as output):
             folder_size.run()
-        self.assertNotIn(link, [call.args[0] for call in scan.call_args_list])
+        directory_opens = sum(bool(cast(int, call.args[1]) & os.O_DIRECTORY)
+                              for call in open_directory.call_args_list)
+        self.assertEqual(directory_opens, 2)
         self.assertEqual(output.getvalue(), "")
         send.assert_called_once()
 
