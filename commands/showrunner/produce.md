@@ -128,7 +128,8 @@ The question form for every question to the user is defined by this import:
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
     suggestion, not the user's unsent draft.
-- Send your coordination messages directly to the unit director with SendMessage. Start with the message body.
+- Send coordination messages to the unit director with `send.py`. Start with the message body.
+  See `commands/message.md` for review holds and `--urgent`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
 - **A message from morty is the user's** (user, 2026-11-02).
@@ -185,10 +186,9 @@ The question form for every question to the user is defined by this import:
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
     Send every production-wide unit message through `broadcast.py --production <your name> --units`; never use a remembered list.
-  - **The user's words for a production below you** go to your child that
-    holds it, by SendMessage, beginning `From the user (via <your name>): `.
-    That child relays them to its unit or to its own child. One level at a
-    time.
+  - Send the user's words to the child showrunner for that production with `send.py`.
+    Begin with `From the user (via <your name>): `.
+    The child showrunner relays the words to its unit or its child showrunner.
   - **An item for the user**, when you are not the root, is asked in your own
     reply as always and set in your own `open_for_user`: your own count and
     `/next` show it. Do not send it to the root, which shows only its own
@@ -435,7 +435,7 @@ to confirm the block remains and no compaction is running. Type `/compact` with
 
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
-   The launcher starts it on the configured units account, keeps its recorded model, checks shutdown holds, and preserves its name and Remote Control link.
+   `add_unit.py` starts it on the pane launch's account, else the configured units account, using the latest turn's model and effort, launch or role defaults per field, and `--model` precedence.
    If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units <claudeN>` sets it.
 </LaunchUnits>
 
@@ -494,7 +494,7 @@ once and passes 150K again within 12-20 minutes.)
 ---
 
 <Direct>
-Turns come from unit directors' messages and the user. Handle each message:
+Turns come from unit directors' messages and the user. Read held messages when an adhoc review ends. Handle each message:
 
 | Arrival | Action |
 | --- | --- |

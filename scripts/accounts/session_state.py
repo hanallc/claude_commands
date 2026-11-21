@@ -5,13 +5,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, Protocol, cast
 
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
-
-if TYPE_CHECKING:
-    from scripts.agents.detached_runs import LiveRunEvidence
 
 SessionState = Literal["busy", "idle", "paused", "exited"]
 StaffState = Literal["active", "paused", "exited"]
@@ -54,6 +51,22 @@ class RunningDetachedWork:
 NO_DETACHED_WORK = RunningDetachedWork()
 
 
+# An import of detached_runs here would close an import cycle.
+class RunReadError(Protocol):
+    @property
+    def staff_ids(self) -> frozenset[staff.StaffId]: ...
+
+
+class RunEvidence(Protocol):
+    @property
+    def runs(self) -> Sequence[Mapping[str, object]]: ...
+
+    @property
+    def read_errors(self) -> Sequence[RunReadError]: ...
+
+    def report_errors(self) -> None: ...
+
+
 def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Sequence[Path] = (),
                           worker_runs: LauncherRunDirectories | None = None) -> RunningDetachedWork:
     """Read each run folder once and only the records that live supervisors name."""
@@ -61,7 +74,7 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
 
     live_runs = cast(Callable[[Mapping[Path, frozenset[staff.StaffId]]], Sequence[Mapping[str, object]]],
                      import_module("scripts.agents.detached_runs").live_runs_in_folders)
-    live_evidence = cast("Callable[..., LiveRunEvidence]",
+    live_evidence = cast(Callable[..., RunEvidence],
                          import_module("scripts.agents.detached_runs").live_run_evidence_in_folders)
     worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
                               import_module("scripts.herdr.worker_panes").worker_run_directories)

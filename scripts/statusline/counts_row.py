@@ -28,18 +28,17 @@ from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
 from scripts.review_links import review_items, review_later
 from scripts.production.update_registration import QuestionStaff
+from scripts.statusline.rebuild_row import write_status_cache as write_cache
 from scripts.lib.user_zone import user_zone
+
+try:
+    from scripts.review_links import for_you
+except Exception:
+    for_you = None
 
 
 def cache_path(name: str) -> Path:
     return showrunner_footer.state_root() / "counts" / name
-
-
-def watched(path: Path) -> Path:
-    """The path itself, or for one that does not exist yet its nearest folder that does."""
-    while not path.exists() and path.parent != path:
-        path = path.parent
-    return path
 
 
 def retry_due(sources: list[Path]) -> str:
@@ -166,17 +165,10 @@ def write_unit(identity: str) -> Path:
     return cache
 
 
-def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
-    """Replace the cache with the answer, deadline, source paths, and optional result details."""
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    scratch = cache.with_name(f".{cache.name}.{os.getpid()}")
-    named = dict.fromkeys(str(watched(path)) for path in sources)
-    _ = scratch.write_text("\n".join([line, due, *named, *([details] if details else [])]) + "\n", encoding="utf-8")
-    os.utime(scratch, ns=(began, began))
-    _ = scratch.replace(cache)
-
-
 def main(argv: list[str]) -> int:
+    if argv in (["--for-you"], ["--for-you-console"]):
+        print(for_you.action_count(argv[0]) if for_you is not None else "unavailable")
+        return 0
     if len(argv) == 2 and argv[0] == "--unit":
         _ = write_unit(argv[1])
         return 0

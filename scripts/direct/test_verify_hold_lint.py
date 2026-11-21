@@ -6,6 +6,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from scripts.production import staff
 from scripts.direct.verify_hold_wait_test_support import (
     VERIFY,
     VerifyHoldWaitFixture,
@@ -49,9 +50,10 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                 self.assertEqual(self.hold_commands(starts), [])
 
     def test_holder_session_lint_step_passes_its_own_hold(self) -> None:
-        self.hold("holder-session")
+        owner = staff.caller_identity() or "holder-session"
+        self.hold(owner)
         before = self.cycle_file.read_bytes()
-        process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": "holder-session"})
+        process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": owner})
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
         self.assertNotIn("natedev is held", output)
@@ -59,10 +61,11 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual([event["args"][0] for event in self.fixture.cargo_events()], ["check"])
 
     def test_holder_session_lint_step_waits_while_another_hold_is_in_force(self) -> None:
+        owner = staff.caller_identity() or "holder-session"
         self.hold()
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
-        _ = (holders / "holder-session").write_text((holders / "hana").read_text())
-        process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": "holder-session"})
+        _ = (holders / owner).write_text((holders / "hana").read_text())
+        process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": owner})
         _ = self.wait_for_call(process, "lint (cargo-port): natedev is held by hana")
         self.assertEqual(self.fixture.cargo_events(), [])
         grant_call(self.cycle_file)
