@@ -64,7 +64,7 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 
 ### Per-step stall: scope file → step record → `steps`
 
-1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:
+1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope --collect … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:
 
    ```sh
    exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s
