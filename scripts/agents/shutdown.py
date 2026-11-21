@@ -240,6 +240,8 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         time.sleep(1)
 
 
+SET_MODEL_EXAMPLE = f"agents {set_model.COMMAND} producers fable high"
+
 USAGE = f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
@@ -257,7 +259,7 @@ USAGE = f"""usage: agents COMMAND
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
   agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: {SET_MODEL_EXAMPLE})
 """
 
 
@@ -668,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments == ["_unit-local"]:
         return unit_local_command()
     parser = argparse.ArgumentParser(prog="agents", usage=USAGE.removeprefix("usage: ").rstrip())
-    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    commands = parser.add_subparsers(prog=parser.prog, dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")
     selection = command.add_mutually_exclusive_group(required=True)
     _ = selection.add_argument("session", nargs="?")
@@ -688,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
     _ = command.add_argument("--job", default="")
-    command = commands.add_parser(set_model.COMMAND)
+    command = commands.add_parser(set_model.COMMAND, description=f"Example: {SET_MODEL_EXAMPLE}")
     _ = command.add_argument("role", metavar="ROLE")
     _ = command.add_argument("model", metavar="MODEL")
     _ = command.add_argument("effort", metavar="EFFORT", nargs="?", default="")

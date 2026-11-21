@@ -34,7 +34,7 @@ from typing import Literal, NoReturn, Protocol, TypedDict, cast
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_table, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.lib import conf_reads, git_files, models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, file_lock, git_files, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -2043,6 +2043,18 @@ def validate_dispatch_selection(session_dir: Path, selection: DispatchSelection)
         _validate_dispatch_selection(_read_state(session_dir), selection, selection.slot, selection.phase_id)
 
 
+def pending_dispatch_confirmed(session_dir: Path, selection: DispatchSelection) -> bool:
+    """Validate the selection and read confirmation without waiting for a writer."""
+    with file_lock.exclusive(_recorder_lock_path(session_dir), wait=False) as lock:
+        if lock is file_lock.LockResult.BUSY:
+            return False
+        state = _read_state(session_dir, resolve_staff=False)
+        _validate_dispatch_selection(state, selection, selection.slot, selection.phase_id)
+        passed = _pass_slots(state).get(selection.slot)
+        return (passed is not None
+                and dispatch_delivery(passed).completion_id in _string_list(passed.get("confirmed_delivery_ids")))
+
+
 def _start_pass(args: argparse.Namespace,
                 selection: DispatchSelection | SelectDispatchAtRecorder = SelectDispatchAtRecorder.SELECT) -> str:
     if not _launcher_owned() and not getattr(args, "dispatch_owned", False):
@@ -2299,11 +2311,25 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
     """Record completion for the exact open dispatch."""
+    _complete_dispatch(session_dir, slot, instance_id, status, startup_failed=False)
+
+
+def fail_dispatch_start(session_dir: Path, slot: str, instance_id: str) -> None:
+    """Close the exact pass when the helper fails before startup."""
+    _complete_dispatch(session_dir, slot, instance_id, "error", startup_failed=True)
+
+
+def _complete_dispatch(session_dir: Path, slot: str, instance_id: str, status: Literal["completed", "error"],
+                       *, startup_failed: bool) -> None:
     with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         passed = _open_passes(state).get(slot)
         if passed is not None and passed.get("instance_id") == instance_id:
+            if startup_failed:
+                status_file = _string(passed.get("assign_status_file")) or dispatch_delivery(passed).actions.status_file
+                if status_file:
+                    write_text_atomic(Path(status_file), "error\n")
             _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
 
 
@@ -2379,6 +2405,52 @@ def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: st
         passes = _pass_slots(_read_state(run, resolve_staff=False))
         slot = _assignment_pass_slot(passes, instance_id)
         return isinstance(slot, str) and completion_id in _string_list(passes[slot].get("confirmed_delivery_ids"))
+
+
+def _pending_dispatch_notice_pass(state: dict[str, object], worker_id: staff.StaffId,
+                                  instance_id: str, completion_id: str) -> dict[str, object]:
+    matches = [passed for passed in _open_passes(state).values() if passed.get("worker_id") == worker_id]
+    if len(matches) != 1:
+        return {}
+    passed, = matches
+    if (passed.get("instance_id") != instance_id or passed.get("status") != "active"
+            or not completion_id or dispatch_delivery(passed).completion_id != completion_id
+            or completion_id in _string_list(passed.get("confirmed_delivery_ids"))):
+        return {}
+    return passed
+
+
+def dispatch_uncertainty_pending(run: Path, worker_id: staff.StaffId, instance_id: str, completion_id: str) -> bool:
+    """Check the exact pending delivery under the recorder lock before sending a notice."""
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not _state_path(run).is_file():
+            return False
+        state = _read_state(run, resolve_staff=False)
+        return bool(_pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id))
+
+
+def handoff_busy_dispatch_notice(run: Path, worker_id: staff.StaffId, instance_id: str,
+                                 completion_id: str, attempt_id: uuid.UUID, *, owner_id: staff.StaffId) -> bool:
+    """Accept a notice for the recorded owner and exact unconfirmed delivery."""
+    record = staff.snapshot()
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not _state_path(run).is_file():
+            return False
+        state = _read_state(run, resolve_staff=False)
+        passed = _pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id)
+        stamp = f"busy:{attempt_id}"
+        if not passed or passed.get("hook_notice") == stamp:
+            return False
+        owner = unit_runs.run_owner(state, record)
+        if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+            raise ValueError(f"{run}: {owner.reason}")
+        if owner.id != owner_id:
+            raise ValueError(f"{run}: recorded owner {owner.id} differs from notice recipient {owner_id}")
+        passed["hook_notice"] = stamp
+        _write_state(run, state)
+        return True
 
 
 def confirm_assignment_submission(run: Path, instance_id: str, completion_id: str, *, worker_thread: str = "") -> None:

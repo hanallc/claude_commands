@@ -275,15 +275,20 @@ class WorkerLockHold:
 
     def bind(self, row: staff.StaffRow, *, deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
         """Acquire the fixed-id lock before creation serialization ends."""
-        if not self.active or not row.reports_to(self.parent) or row.name != self.name.value:
+        if self.owns(row):
+            return
+        if (not self.active or self.bound or row.kind != "worker"
+                or not row.reports_to(self.parent) or row.name != self.name.value):
             raise ValueError("worker lock does not own this worker")
-        if row.id not in self._held:
-            self._operations.enter_context(worker_id_lock(row.id, blocking=self._blocking, deadline=deadline))
-            self._held.add(row.id)
+        self._operations.enter_context(worker_id_lock(row.id, blocking=self._blocking, deadline=deadline))
+        self._held.add(row.id)
+
+    @property
+    def bound(self) -> bool:
+        return bool(self._held)
 
     def owns(self, row: staff.StaffRow) -> bool:
-        return self.active and row.id in self._held
-
+        return self.active and row.id in self._held and row.kind == "worker" and row.reports_to(self.parent)
 
 @contextmanager
 def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
@@ -515,7 +520,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         else:
             states.append(ClosedWorker(row))
     terminals: frozenset[str] = frozenset()
-    if isinstance(selection, SelectedWorkers):
+    if isinstance(selection, (SelectedWorkers, SelectedWorkerRows)):
         worker_ids = {row.id for row in workers}
         terminals = frozenset(_text(pane, "terminal_id") for pane in panes
             if (launch_owners.get(_text(pane, "pane_id")) in worker_ids
@@ -525,7 +530,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
 
 
 def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr, *,
-              selection: SelectedWorkers | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
+              selection: SelectedWorkers | SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
     return _parent_evidence(parent, record, _read_panes(record, client), client, selection=selection)
 
 
@@ -1306,7 +1311,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
-                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
+                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                    selection: SelectedWorkerRows | Literal["by_name"] = "by_name") -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -1315,12 +1321,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     owner = record.by_id(parent)
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
-    existing = worker_admission.find_worker(record, parent, name.value)
-    run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
-    if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), DispatchHoldsWorker):
-        run = worker_run(owner, record=record, scanned=runs)
-    allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
-        worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
+    expected = worker_admission.find_worker(record, parent, name.value)
     keep_model = isinstance(policy, UseRolePolicy)
     try:
         policy = launch_policy(role) if isinstance(policy, UseRolePolicy) else policy
@@ -1328,13 +1329,26 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     try:
         with ExitStack() as operations:
-            held = operations.enter_context(worker_lock(parent, name, blocking=existing is None)) if isinstance(lock, WorkerLockAtUse) else lock
+            held = operations.enter_context(worker_lock(parent, name, blocking=expected is None)) if isinstance(lock, WorkerLockAtUse) else lock
             if isinstance(held, Kept):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, held.blocker)
-            if not held.active or held.parent != parent or held.name != name:
+            record = staff.snapshot()
+            existing = worker_admission.find_worker(record, parent, name.value)
+            if (not held.active or held.parent != parent or held.name != name
+                    or (existing is None and held.bound)
+                    or (existing is not None and not held.owns(existing))
+                    or (expected is not None and (existing is None or existing.id != expected.id
+                                                  or existing.current_session != expected.current_session))):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
+            run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
+            if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
+                run = worker_run(owner, record=record, scanned=runs)
+            allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
+                worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
+            target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
-                result = _start_locked(owner, name, role, policy, account, allowed, held, codex, keep_model=keep_model)
+                result = _start_locked(owner, name, role, policy, account, allowed, held, codex,
+                                       keep_model=keep_model, selection=target)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1382,7 +1396,8 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
-                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool) -> WorkerStart:
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool,
+                  selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1393,14 +1408,27 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     deadline = started + start_seconds
     client = _client()
     record = staff.snapshot()
-    selection = SelectedWorkers(frozenset({name.value}))
-    evidence = _evidence(owner.id, record, client, selection=selection)
+    refreshed = worker_admission.find_worker(record, owner.id, name.value)
+    if isinstance(allowed.slot, worker_admission.ExistingWorkerSlot):
+        expected = allowed.slot.row
+        if (refreshed is None or refreshed.id != expected.id or not lock.owns(refreshed)
+                or refreshed.current_session != expected.current_session):
+            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
+    elif refreshed is not None:
+        return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
+
+    def read_evidence(membership: staff.StaffSnapshot) -> PaneEvidence:
+        if isinstance(selection, SelectedWorkerRows):
+            herdr.refresh_restore_pane_evidence()
+        return _evidence(owner.id, membership, client, selection=selection)
+
+    evidence = read_evidence(record)
     current = next((state for state in evidence.states if state.row.name == name.value), None)
     row = current.row if current is not None else None
     backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
     switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
-    if row is not None:
-        lock.bind(row)
+    if row is not None and not lock.owns(row):
+        return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
     if current is None:
@@ -1439,7 +1467,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     if row is not None:
                         return _uncertain(row, f"launch proof is incomplete: {error}")
                     return UnpublishedWorker(identity, str(error))
-                recovered = _evidence(owner.id, staff.snapshot(), client, selection=selection)
+                recovered = read_evidence(staff.snapshot())
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
                 if isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
                     _layout(owner.id, recovered)
@@ -1542,7 +1570,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 if not client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal):
                     raise herdr_types.HerdrFailure("source pane close is incomplete")
                 _retire_launch(current.row, client, record)
-            fresh = _evidence(owner.id, record, client, selection=selection)
+            fresh = read_evidence(record)
             selected = _destination(owner, name.value, fresh, client)
             if isinstance(selected, StartRefused):
                 raise worker_admission.AdmissionRefused(selected.detail)
@@ -1686,7 +1714,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason, created_pane())
     herdr.forget_pane_evidence(client.session, launched.pane)
-    fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
+    fresh = read_evidence(staff.snapshot())
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
     if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
@@ -1742,6 +1770,9 @@ def close(parent: StaffId, name: WorkerName, *,
         client = _client()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
+        if (not held.active or held.parent != parent or held.name != name
+                or (row is None and held.bound) or (row is not None and not held.owns(row))):
+            return Kept("the worker changed before close")
         if row is None:
             _layout(parent, _evidence(parent, record, client))
             return Closed()
