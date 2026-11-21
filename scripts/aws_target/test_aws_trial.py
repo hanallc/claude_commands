@@ -10,7 +10,8 @@ from decimal import Decimal
 from io import StringIO
 import json
 import multiprocessing
-from multiprocessing.connection import Connection
+from multiprocessing.connection import wait as wait_for_channel
+from multiprocessing.process import BaseProcess
 import os
 import pathlib
 import shlex
@@ -30,13 +31,16 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, override_fixture_settings, text_setting
+from scripts.aws_target.ledger_test_support import (
+    CostFixture, account_reply, install_aws_fixture_settings, override_fixture_settings, text_setting,
+)
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
-from scripts.build_queue import cloud_progress
+from scripts.build_queue import cloud_progress, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
 from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib import conf, file_lock
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -66,7 +70,7 @@ class GuestTests(unittest.TestCase):
             + '# range: 0..\nINDEX_TOUCH_MINUTES=60\n'
             + '# whole: 1..\nINDEX_SPILL_PAGES=65536\n')
         _ = (root / 'build_folders.conf').write_text(
-            f'roots.system={root}\nroots.gate={root}\n'
+            f'roots.system={root}\nroots.gate={root}\nroots.build={root / "build"}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'
             + 'names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n'
             + 'patterns.legacy-unique={purpose}{suffix}\n'
@@ -304,6 +308,7 @@ class GuestTests(unittest.TestCase):
                     os.chdir(previous)
             discover.assert_called_once_with(repo)
             payload = ledger.mapping(cast(object, json.loads(uploads[links['result']])))
+            self.assertEqual(payload['verdict'], 'fail', payload.get('error'))
             self.assertNotIn('governor_gib', payload)
             self.assertEqual(ledger.mapping(payload['tools'])['python_sqlite'], sqlite3.sqlite_version)
             self.assertEqual(payload['module_time_limit_s'], module_limit_s)
@@ -315,7 +320,6 @@ class GuestTests(unittest.TestCase):
             seconds = float(str(payload['gate_finished_at'])) - float(str(payload['gate_started_at']))
             self.assertEqual(payload['gate_s'], seconds)
             self.assertAlmostEqual(float(str(payload['cpu_use_percent'])), 100 * busy / (2 * seconds))
-            self.assertEqual(payload['verdict'], 'fail')
             self.assertEqual(payload['tests'], 3)
             self.assertEqual(payload['skips'], 1)
             self.assertEqual(set(cast(list[str], payload['failed_modules'])), {'fixture/test_broken.py', 'fixture/test_stuck.py'})
@@ -364,6 +368,587 @@ class SigningTests(unittest.TestCase):
 
 
 @final
+class PairedWaitTests(CostFixture):
+    def cleanup_environment(self) -> dict[str, str]:
+        connection = trial.PairedCleanupConnection.configured(self.settings)
+        return {trial.PAIRED_CLEANUP_CONNECTION_ENV: json.dumps(snapshot_codec.snapshot_value(connection))}
+
+    def cleanup_api(self, terminated: list[str]) -> AwsCli:
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if 'terminate-instances' in arguments:
+                terminated.extend(arguments[arguments.index('--instance-ids') + 1:arguments.index('--output')])
+                return subprocess.CompletedProcess(arguments, 0, '{}', '')
+            self.assertIn('describe-instances', arguments)
+            return subprocess.CompletedProcess(arguments, 0, json.dumps({'Reservations': [{'Instances': [
+                {'InstanceId': instance, 'State': {'Name': 'terminated'}} for instance in terminated
+            ]}]}), '')
+        return AwsCli('fixture', 'us-east-1', 1, execute)
+
+    def record_attempt(self, cohort: Path, attempt: str, *, running: bool, region: str = 'us-east-1') -> None:
+        folder = cohort / attempt
+        folder.mkdir(parents=True)
+        now = int(time.time())
+        cloud_gate.save(folder / 'request.json', {'attempt': attempt, 'module': attempt, 'rounds': 1,
+                                                  'expires': now + 1200})
+        book = ledger.CostLedger(self.state)
+        _ = book.reserve_gate(self.settings, ledger.GateReservation(
+            attempt, now, now + 1200, Decimal('.8'), Decimal('.02')))
+        if running:
+            cloud_gate.save(folder / 'launch.json', {'instance': 'i-fixture', 'region': region})
+            book.resolve_gate(attempt, ledger.GateRunning('i-fixture'))
+
+    def test_trial_admission_times_out_and_reaps_the_worker(self) -> None:
+        self.configure_gate('paired_admission_timeout_s=0.25\n')
+        self.check_blocked_trial(trial.TrialWait.ADMISSION)
+
+    def test_trial_worker_exit_times_out_and_reaps_the_worker(self) -> None:
+        self.configure_gate('# whole: 0..60\nlifetime_minutes=0\n'
+                            + '# range: 0.01..120\napi_timeout_s=0.25\n'
+                            + '# range: 0.01..600\ntermination_timeout_s=0.03\n')
+        self.check_blocked_trial(trial.TrialWait.WORKER_EXIT)
+
+    def test_queue_wait_does_not_consume_the_preparation_budget(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'module', running=False)
+        admission_timeout = cloud_gate.settings().number('paired_admission_timeout_s')
+        clock = mock.Mock(return_value=0.0)
+        launched = multiprocessing.get_context('fork').Event()
+
+        def module(_folder: Path, _directory: Path, _settings: Path, connection: trial.LaunchBarrier,
+                   *, group: CloudGroup) -> None:
+            self.assertEqual(group.size, 1)
+            connection.send(trial.TrialMessage.READY)
+            if connection.poll(TEST_HANG_GUARD_SECS) and connection.recv() is trial.TrialMessage.LAUNCH:
+                launched.set()
+
+        def late_admission(readers: Sequence[int], timeout: float) -> list[int]:
+            if timeout:
+                ready = wait_for_channel(readers, timeout=TEST_HANG_GUARD_SECS)
+                clock.return_value = admission_timeout - 1
+                return cast(list[int], ready)
+            return cast(list[int], wait_for_channel(readers, timeout=0))
+
+        def reserve(*_args: object, check_workers: Callable[[], None],
+                    before_charge_page: Callable[[], None], cohort: Path) -> None:
+            self.assertEqual(cohort, self.root / 'trial')
+            clock.return_value = admission_timeout + 1
+            check_workers()
+            before_charge_page()
+
+        with (mock.patch.object(trial, 'time', mock.Mock(wraps=time, monotonic=clock)),
+              mock.patch.object(trial, 'paired_module', new=module),
+              mock.patch.object(trial, 'wait', side_effect=late_admission),
+              mock.patch.object(trial, 'reserve_trial', new=reserve),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+        self.assertTrue(launched.is_set())
+
+    def check_blocked_trial(self, wait_for: trial.TrialWait) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        launched = wait_for is trial.TrialWait.WORKER_EXIT
+        self.record_attempt(cohort, 'module', running=launched)
+        context = multiprocessing.get_context('fork')
+        blocked = context.Event()
+        entered = context.Event()
+        reaped: list[int] = []
+        terminated: list[str] = []
+        close = BaseProcess.close
+        paired_module = trial.paired_module
+
+        @contextmanager
+        def admission() -> Generator[cloud_gate.CloudReservation]:
+            entered.set()
+            if not blocked.wait(TEST_HANG_GUARD_SECS):
+                self.fail('The coordinator did not stop the worker in admission')
+            yield cloud_gate.CloudReservation(self.root / 'reservation')
+
+        def module(folder: Path, directory: Path, settings: Path, connection: trial.LaunchBarrier,
+                   *, group: CloudGroup) -> None:
+            self.assertEqual(group.size, 1)
+            if not launched:
+                paired_module(folder, directory, settings, connection, group=group)
+                return
+            connection.send(trial.TrialMessage.READY)
+            _ = blocked.wait(TEST_HANG_GUARD_SECS)
+
+        def wait_for_admission(readers: Sequence[int], timeout: float) -> list[int]:
+            if timeout and not launched:
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+            return cast(list[int], wait_for_channel(readers, timeout=timeout))
+
+        def record_reap(process: BaseProcess) -> None:
+            pid = process.pid
+            close(process)
+            assert pid is not None
+            reaped.append(pid)
+
+        errors = StringIO()
+        with (mock.patch.object(trial, 'paired_module', new=module),
+              mock.patch.object(trial, 'wait', side_effect=wait_for_admission),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              mock.patch.object(cloud_gate, 'cloud_reservation', return_value=admission()),
+              mock.patch.object(trial, 'reserve_trial') as reserve,
+              mock.patch.object(BaseProcess, 'close', new=record_reap),
+              redirect_stdout(StringIO()), redirect_stderr(errors)):
+            self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+        self.assertIn(str(trial.TrialWaitExpired(wait_for)), errors.getvalue())
+        self.assertEqual(reserve.call_count, int(launched))
+        self.assertEqual(terminated, ['i-fixture'] if launched else [])
+        pid, = reaped
+        with self.assertRaises(ChildProcessError):
+            _ = os.waitpid(pid, os.WNOHANG)
+
+    def test_known_box_gets_termination_before_a_cleanup_ledger_timeout(self) -> None:
+        self.configure_gate('# range: 0.01..120\napi_timeout_s=0.03\n'
+                            + 'paired_admission_timeout_s=0.03\n')
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        for exit_path in ('coordinator', 'ExecStopPost'):
+            with self.subTest(exit_path=exit_path):
+                cohort = self.root / exit_path
+                self.record_attempt(cohort, exit_path + '-absent', running=False)
+                self.record_attempt(cohort, exit_path + '-running', running=True)
+                terminated: list[str] = []
+                errors = StringIO()
+                blocked = multiprocessing.get_context('fork').Event()
+
+                def block_admission(*_args: object, **_kwargs: object) -> None:
+                    _ = blocked.wait(TEST_HANG_GUARD_SECS)
+
+                with (file_lock.exclusive(self.state / 'cost-ledger.lock'),
+                      mock.patch.object(trial, 'paired_module', new=block_admission),
+                      mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+                      redirect_stdout(StringIO()), redirect_stderr(errors)):
+                    if exit_path == 'coordinator':
+                        self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+                    else:
+                        self.assertEqual(trial.paired_cleanup_main(
+                            ['--paired-cleanup', str(cohort)], self.settings, self.state), 1)
+                self.assertEqual(terminated, ['i-fixture'])
+                self.assertIn(str(trial.TrialWaitExpired(trial.TrialWait.LEDGER_LOCK)), errors.getvalue())
+
+    def test_five_regions_receive_termination_requests_when_four_time_out(self) -> None:
+        regions = ('us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1')
+        api_timeout = cloud_gate.settings().number('api_timeout_s')
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        for exit_path in ('coordinator', 'ExecStopPost'):
+            with self.subTest(exit_path=exit_path):
+                cohort = self.root / exit_path
+                for number, region in enumerate(regions):
+                    self.record_attempt(cohort, f'{exit_path}-{number}', running=True, region=region)
+                requested: list[str] = []
+                requests_started = threading.Barrier(len(regions))
+
+                def execute(arguments: Sequence[str], *, timeout: float, **_options: object
+                            ) -> subprocess.CompletedProcess[str]:
+                    if 'terminate-instances' in arguments:
+                        region = arguments[arguments.index('--region') + 1]
+                        self.assertIn('i-fixture', arguments)
+                        self.assertGreater(timeout, 0)
+                        self.assertLessEqual(timeout, api_timeout)
+                        requested.append(region)
+                        _ = requests_started.wait(TEST_HANG_GUARD_SECS)
+                        if region != regions[-1]:
+                            raise subprocess.TimeoutExpired(arguments, timeout)
+                        return subprocess.CompletedProcess(arguments, 0, '{}', '')
+                    self.assertIn('describe-instances', arguments)
+                    reply = {'Reservations': [{'Instances': [
+                        {'InstanceId': 'i-fixture', 'State': {'Name': 'terminated'}}
+                    ]}]}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                api = AwsCli('fixture', regions[0], api_timeout, execute)
+                with (mock.patch.object(trial, 'AwsCli', return_value=api),
+                      mock.patch.object(trial, 'paired_module', return_value=None),
+                      mock.patch.object(trial, 'wait', return_value=[]),
+                      redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+                    if exit_path == 'coordinator':
+                        self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+                    else:
+                        self.assertEqual(trial.paired_cleanup_main(
+                            ['--paired-cleanup', str(cohort)], self.settings, self.state), 0)
+                self.assertCountEqual(requested, regions)
+
+    def test_cleanup_requests_termination_after_marker_write_and_config_fail(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'running', running=True)
+        terminated: list[str] = []
+        errors = StringIO()
+        with (mock.patch.dict(os.environ, {**self.cleanup_environment(), 'SERVICE_RESULT': 'timeout'}),
+              mock.patch.object(cloud_gate, 'save', side_effect=OSError('fixture disk is full')) as save,
+              mock.patch.object(conf, 'read', side_effect=OSError('fixture config read failed')),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              redirect_stderr(errors)):
+            self.assertEqual(trial.paired_cleanup_main(
+                ['--paired-cleanup', str(cohort)], self.settings, self.state), 1)
+        save.assert_called_once_with(cohort / trial.SERVICE_TIMEOUT_FILE, {'wait': trial.TrialWait.SERVICE_RUNTIME.name})
+        self.assertEqual(terminated, ['i-fixture'])
+        self.assertIn('fixture disk is full', errors.getvalue())
+        self.assertIn('fixture config read failed', errors.getvalue())
+
+    def test_coordinator_requests_termination_despite_config_read_failure(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'running', running=True)
+        terminated: list[str] = []
+        with (mock.patch.dict(os.environ, self.cleanup_environment()),
+              mock.patch.object(cloud_gate, 'settings', side_effect=OSError('fixture config read failed')),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+        self.assertEqual(terminated, ['i-fixture'])
+
+    def test_cleanup_uses_the_launch_record_when_ledger_evidence_fails(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'running', running=True)
+        terminated: list[str] = []
+        with (mock.patch.object(ledger.CostLedger, 'read_snapshot', side_effect=OSError('fixture ledger read failed')),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              redirect_stderr(StringIO())):
+            self.assertEqual(trial.paired_cleanup_main(
+                ['--paired-cleanup', str(cohort)], self.settings, self.state), 1)
+        self.assertEqual(terminated, ['i-fixture'])
+
+    def test_regional_termination_returns_while_one_request_is_still_running(self) -> None:
+        blocked, other = 'us-east-1', 'us-west-2'
+        api_timeout = 0.05
+        release = threading.Event()
+        requested: list[str] = []
+        join_thread = threading.Thread.join
+
+        def require_bounded_join(thread: threading.Thread, timeout: float | None = None) -> None:
+            assert timeout is not None
+            self.assertLessEqual(timeout, api_timeout)
+            self.assertTrue(thread.daemon)
+            join_thread(thread, timeout)
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('terminate-instances', arguments)
+            self.assertTrue(threading.current_thread().daemon)
+            region = arguments[arguments.index('--region') + 1]
+            requested.append(region)
+            if region == blocked:
+                _ = release.wait(TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(arguments, 0, '{}', '')
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', blocked, api_timeout, execute),
+            ledger.CostLedger(self.state), self.settings, self.root / 'reservation.cgroup')
+        errors = StringIO()
+        try:
+            with (mock.patch.object(threading.Thread, 'join', new=require_bounded_join),
+                  redirect_stderr(errors)):
+                result = worker.request_terminations([
+                    cloud_gate.GateTermination('blocked', 'i-blocked', blocked),
+                    cloud_gate.GateTermination('other', 'i-other', other),
+                ])
+        finally:
+            release.set()
+        self.assertCountEqual(requested, [blocked, other])
+        self.assertEqual(result.unresponsive_regions, frozenset({blocked}))
+        self.assertIn(f'Termination unconfirmed in {blocked}', errors.getvalue())
+
+    def test_trial_launch_decision_times_out_and_releases_the_slot(self) -> None:
+        self.configure_gate('paired_admission_timeout_s=0.03\n')
+        slot = cloud_gate.CloudReservation(self.root / 'reservation.cgroup')
+        released = threading.Event()
+
+        @contextmanager
+        def reservation() -> Generator[cloud_gate.CloudReservation]:
+            try:
+                yield slot
+            finally:
+                released.set()
+
+        peer, worker = socket.socketpair()
+        with peer, worker:
+            coordinator = trial.TrialChannel(peer)
+            with (mock.patch.object(cloud_gate, 'cloud_reservation', return_value=reservation()),
+                  mock.patch.object(cloud_gate.GateWorker, 'execute') as execute,
+                  mock.patch.object(trial, 'preparation_seconds', return_value=0),
+                  mock.patch.object(trial, 'cleanup_trial', return_value=True) as cleanup):
+                trial.paired_module(self.root, self.state, self.settings, trial.TrialChannel(worker),
+                                    group=CloudGroup('trial', 1, time.time(), Owner(1, 'fixture')))
+            self.assertTrue(released.is_set())
+            self.assertIs(coordinator.recv(), trial.TrialMessage.READY)
+            with self.assertRaises(EOFError):
+                _ = coordinator.recv()
+        execute.assert_not_called()
+        cleanup.assert_called_once()
+        self.assertEqual(cloud_gate.read(self.root / 'outcome.json')['wait'], trial.TrialWait.LAUNCH.name)
+
+    def test_trial_reservation_lock_times_out_under_contention(self) -> None:
+        path = self.state / 'controller.lock'
+        wait_for = trial.TrialWait.RESERVATION_LOCK
+        with (file_lock.exclusive(path),
+              self.assertRaises(trial.TrialWaitExpired) as timeout,
+              trial.trial_lock(path, trial.TrialDeadline.after(0.03), wait_for)):
+            self.fail('The trial acquired the held reservation lock')
+        self.assertIs(timeout.exception.wait_for, wait_for)
+
+    def test_trial_ledger_lock_times_out_under_contention(self) -> None:
+        self.configure_gate('# range: 0.01..120\napi_timeout_s=0.03\n')
+        with (file_lock.exclusive(self.state / 'cost-ledger.lock'),
+              self.assertRaises(trial.TrialWaitExpired) as timeout,
+              trial.trial_ledger(self.state).transaction()):
+            self.fail('The trial acquired the held ledger lock')
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.LEDGER_LOCK)
+
+    def test_trial_charge_refresh_refuses_a_slow_final_page(self) -> None:
+        self.configure_gate('paired_cost_refresh_timeout_s=3\n')
+        clock = mock.Mock(return_value=0.0)
+        timeouts: list[float] = []
+
+        def execute(arguments: Sequence[str], *, timeout: float, **_options: object
+                    ) -> subprocess.CompletedProcess[str]:
+            timeouts.append(timeout)
+            reply = account_reply(arguments)
+            if '--next-page-token' not in arguments:
+                clock.return_value = 1.5
+                reply['NextPageToken'] = 'final'
+            else:
+                clock.return_value = 3.0
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        api = AwsCli('fixture', 'us-east-1', 2, execute)
+        worker = cloud_gate.GateWorker(api, trial.trial_ledger(self.state), self.settings,
+                                       self.root / 'reservation.cgroup')
+        with (mock.patch.object(trial, 'time', mock.Mock(wraps=time, monotonic=clock)),
+              mock.patch.object(worker, 'reconcile'),
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            trial.reserve_trial(worker, [])
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.COST_REFRESH)
+        self.assertEqual(timeouts, [2, 1.5])
+
+    def test_trial_charge_refresh_maps_an_executor_timeout(self) -> None:
+        def execute(arguments: Sequence[str], *, timeout: float, **_options: object
+                    ) -> subprocess.CompletedProcess[str]:
+            self.assertIn('get-cost-and-usage', arguments)
+            raise subprocess.TimeoutExpired(arguments, timeout)
+
+        api = AwsCli('fixture', 'us-east-1', 1, execute)
+        worker = cloud_gate.GateWorker(api, trial.trial_ledger(self.state), self.settings,
+                                       self.root / 'reservation.cgroup')
+        with (mock.patch.object(worker, 'reconcile'),
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            trial.reserve_trial(worker, [])
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.COST_REFRESH)
+        self.assertIsInstance(timeout.exception.__cause__, subprocess.TimeoutExpired)
+
+    def test_trial_charge_refresh_checks_deadline_after_processing_the_reply(self) -> None:
+        clock = mock.Mock(return_value=0.0)
+        refresh_timeout = cloud_gate.settings().number('paired_cost_refresh_timeout_s')
+
+        def charges(_record_query: Callable[[Decimal], None], *, page_timeout: Callable[[float], float],
+                    after_page: Callable[[], None]) -> None:
+            _ = page_timeout(1)
+            after_page()
+            clock.return_value = refresh_timeout
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-1', 1), trial.trial_ledger(self.state),
+            self.settings, self.root / 'reservation.cgroup')
+        with (mock.patch.object(trial, 'time', mock.Mock(wraps=time, monotonic=clock)),
+              mock.patch.object(worker, 'reconcile'), mock.patch.object(worker, 'charges', new=charges),
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            trial.reserve_trial(worker, [])
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.COST_REFRESH)
+
+    def test_trial_charge_refresh_reads_twenty_one_fast_pages(self) -> None:
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        pages = 0
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal pages
+            if pages:
+                self.assertEqual(arguments[arguments.index('--next-page-token') + 1], str(pages))
+            pages += 1
+            reply = account_reply(arguments)
+            if pages < 21:
+                reply['NextPageToken'] = str(pages)
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        api = AwsCli('fixture', 'us-east-1', 1, execute)
+        worker = cloud_gate.GateWorker(api, trial.trial_ledger(self.state), self.settings,
+                                       self.root / 'reservation.cgroup')
+        with (mock.patch.object(worker, 'reconcile'), redirect_stderr(StringIO())):
+            trial.reserve_trial(worker, [])
+        self.assertEqual(pages, 21)
+
+    def test_trial_reap_kills_a_worker_that_does_not_terminate(self) -> None:
+        context = multiprocessing.get_context('fork')
+        reader, writer = context.Pipe(duplex=False)
+        process = context.Process(target=lambda: context.Event().wait(TEST_HANG_GUARD_SECS))
+        with reader, writer:
+            process.start()
+            pid = process.pid
+            assert pid is not None
+            writer.close()
+            with mock.patch.object(process, 'terminate') as terminate:
+                trial.stop_workers([process], grace_timeout=0.03, reap_timeout=TEST_HANG_GUARD_SECS)
+            terminate.assert_called_once()
+            self.assertTrue(reader.poll(TEST_HANG_GUARD_SECS))
+            with self.assertRaises(EOFError):
+                _ = reader.recv_bytes()
+        with self.assertRaises(ChildProcessError):
+            _ = os.waitpid(pid, os.WNOHANG)
+
+    def test_trial_reap_expiry_exits_before_interpreter_shutdown(self) -> None:
+        cohort = self.root / 'trial'
+        cohort.mkdir()
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        script = '''
+import atexit, sys
+from pathlib import Path
+from unittest import mock
+from scripts.aws_target import aws_trial, cloud_gate
+
+atexit.register(lambda: print('interpreter exit hook', flush=True))
+print('pending output')
+with (mock.patch.object(aws_trial, 'stop_workers', side_effect=aws_trial.TrialWaitExpired(aws_trial.TrialWait.WORKER_REAP)),
+      mock.patch.object(cloud_gate.GateWorker, 'charges')):
+    raise SystemExit(aws_trial.coordinate_trial(*map(Path, sys.argv[1:])))
+'''
+        reply = subprocess.run([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings)],
+                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(reply.returncode, 1, reply.stderr)
+        self.assertEqual(reply.stdout.splitlines(), ['pending output'])
+        self.assertIn(str(trial.TrialWaitExpired(trial.TrialWait.WORKER_REAP)), reply.stderr)
+
+    def test_trial_reap_expiry_cleans_up_and_exits_with_a_closed_error_stream(self) -> None:
+        cohort = self.root / 'trial'
+        cohort.mkdir()
+        errors = StringIO()
+        errors.close()
+        with (mock.patch.object(trial, 'reserve_trial'),
+              mock.patch.object(trial, 'stop_workers',
+                                side_effect=trial.TrialWaitExpired(trial.TrialWait.WORKER_REAP)) as stop,
+              mock.patch.object(trial, 'cleanup_trial',
+                                side_effect=trial.TrialWaitExpired(trial.TrialWait.LEDGER_LOCK)) as cleanup,
+              mock.patch.object(os, '_exit', side_effect=SystemExit(1)) as exit_now,
+              redirect_stderr(errors), self.assertRaises(SystemExit)):
+            _ = trial.coordinate_trial(cohort, self.state, self.settings)
+        stop.assert_called_once()
+        cleanup.assert_called_once()
+        self.assertEqual(cleanup.call_args.args[0], cohort)
+        exit_now.assert_called_once_with(1)
+
+    def test_trial_commands_time_out_and_reap_their_own_processes(self) -> None:
+        self.configure_gate('git_network_timeout_s=0.03\n')
+        real_popen = subprocess.Popen
+        children: list[subprocess.Popen[str]] = []
+
+        def start_blocked(_command: Sequence[str], **options: object) -> subprocess.Popen[str]:
+            self.assertTrue(options['start_new_session'])
+            child = real_popen([sys.executable, '-c', 'import threading; threading.Event().wait()'],
+                               stdout=subprocess.PIPE if options['stdout'] else None,
+                               stderr=subprocess.PIPE if options['stderr'] else None,
+                               text=True, start_new_session=True)
+            children.append(child)
+            return child
+
+        for wait_for in (trial.TrialWait.LOCAL_GIT, trial.TrialWait.SERVICE, trial.TrialWait.SERVICE_STOP):
+            with (self.subTest(wait_for=wait_for),
+                  mock.patch.object(subprocess, 'Popen', side_effect=start_blocked),
+                  self.assertRaises(trial.TrialWaitExpired) as timeout):
+                if wait_for is trial.TrialWait.LOCAL_GIT:
+                    _ = trial.checked_git(self.root, 'rev-parse', 'HEAD')
+                else:
+                    _ = trial.trial_command(['fixture'], wait_for, timeout=0.03)
+            self.assertIs(timeout.exception.wait_for, wait_for)
+            child = children[-1]
+            self.assertEqual(child.returncode, -signal.SIGKILL)
+            with self.assertRaises(ChildProcessError):
+                _ = os.waitpid(child.pid, os.WNOHANG)
+
+    def test_trial_command_reap_has_a_separate_limit(self) -> None:
+        pid = 90000
+        wait = mock.Mock(side_effect=subprocess.TimeoutExpired('fixture', 0.03))
+        child = mock.Mock(pid=pid, returncode=None, stdout=None, stderr=None, wait=wait)
+        with (mock.patch.object(subprocess, 'Popen', return_value=child),
+              mock.patch.object(trial, 'send_process_group') as stop,
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            _ = trial.trial_command(['fixture'], trial.TrialWait.SERVICE, timeout=0.03)
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.COMMAND_REAP)
+        self.assertEqual(wait.call_count, 2)
+        stop.assert_called_once_with(pid, signal.SIGKILL)
+
+    def test_trial_service_timeout_stops_only_its_unit(self) -> None:
+        wait_for = trial.TrialWait.SERVICE
+        config = cloud_gate.settings()
+        api_timeout = config.number('api_timeout_s')
+        cleanup = config.number('termination_timeout_s') + 2 * api_timeout
+        prepare = cleanup + config.number('paired_cost_refresh_timeout_s') + api_timeout * (config.whole('slots') + 3)
+        runtime = (config.number('paired_admission_timeout_s') + 60 * config.whole('lifetime_minutes')
+                   + prepare + 3 * cleanup + api_timeout)
+        stop_timeout = 2 * cleanup + api_timeout
+        stop_reply = subprocess.CompletedProcess(['systemctl'], 0, '', '')
+        with (mock.patch.object(trial, 'trial_command', side_effect=[trial.TrialWaitExpired(wait_for), stop_reply]) as run,
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            _ = trial.paired_service(['systemd-run', '--unit=fixture-unit'], 'fixture-unit')
+        self.assertIs(timeout.exception.wait_for, wait_for)
+        self.assertEqual(run.call_args_list, [
+            mock.call(['systemd-run', f'--property=RuntimeMaxSec={runtime:g}', '--unit=fixture-unit'],
+                      wait_for, timeout=runtime + stop_timeout),
+            mock.call(['systemctl', '--user', 'stop', 'fixture-unit'],
+                      trial.TrialWait.SERVICE_STOP, timeout=stop_timeout),
+        ])
+
+    def test_trial_service_reports_a_stop_that_systemd_does_not_confirm(self) -> None:
+        stop_reply = subprocess.CompletedProcess(['systemctl'], 5, '', '')
+        errors = StringIO()
+        with (mock.patch.object(trial, 'trial_command',
+                                side_effect=[trial.TrialWaitExpired(trial.TrialWait.SERVICE), stop_reply]),
+              redirect_stderr(errors),
+              self.assertRaisesRegex(trial.TrialServiceStopUnconfirmed, 'systemctl returned 5')):
+            _ = trial.paired_service(['systemd-run', '--unit=fixture-unit'], 'fixture-unit')
+        self.assertIn(str(trial.TrialWaitExpired(trial.TrialWait.SERVICE)), errors.getvalue())
+
+    def test_service_runtime_marker_takes_precedence_after_terminal_timeout_and_stop(self) -> None:
+        cohort = self.root / 'trial'
+        cohort.mkdir()
+
+        def command(arguments: Sequence[str], wait_for: trial.TrialWait, **_options: object
+                    ) -> subprocess.CompletedProcess[str]:
+            if wait_for is trial.TrialWait.SERVICE:
+                raise trial.TrialWaitExpired(wait_for)
+            self.assertIs(wait_for, trial.TrialWait.SERVICE_STOP)
+            cloud_gate.save(cohort / trial.SERVICE_TIMEOUT_FILE, {'wait': trial.TrialWait.SERVICE_RUNTIME.name})
+            return subprocess.CompletedProcess(arguments, 0, '', '')
+
+        with (mock.patch.object(trial, 'trial_command', side_effect=command) as run,
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            _ = trial.paired_service(['systemd-run', '--paired-worker', str(cohort)], 'fixture-unit')
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.SERVICE_RUNTIME)
+        self.assertEqual(run.call_count, 2)
+
+    def test_trial_service_reads_the_timeout_even_when_exec_stop_post_cannot_read_config(self) -> None:
+        cohort = self.root / 'trial'
+        cohort.mkdir()
+        with (mock.patch.dict(os.environ, {'SERVICE_RESULT': 'timeout'}),
+              mock.patch.object(conf, 'read', side_effect=OSError('fixture config read failed')),
+              self.assertRaisesRegex(OSError, 'fixture config read failed')):
+            _ = trial.paired_cleanup_main(['--paired-cleanup', str(cohort)], self.settings, self.state)
+        command = ['systemd-run', '--unit=fixture-unit', '--paired-worker', str(cohort)]
+        reply = subprocess.CompletedProcess(command, 1, '', '')
+        with (mock.patch.object(trial, 'trial_command', return_value=reply) as run,
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            _ = trial.paired_service(command, 'fixture-unit')
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.SERVICE_RUNTIME)
+        run.assert_called_once()
+
+
+@final
 class PairedTrialTests(CostFixture):
     repo: Path = Path()
     origin: Path = Path()
@@ -385,11 +970,15 @@ class PairedTrialTests(CostFixture):
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
         copy_test_runner(self.repo)
-        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
-                         'scripts/aws_target/__init__.py'):
+        for relative in ('scripts/lib/process_group.py', 'scripts/test_times/gate_record.py',
+                         'scripts/aws_target/gate_box.py', 'scripts/aws_target/__init__.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
+        # The paired guest does not use the host codecs or write a gate record.
+        (self.repo / 'scripts/buildlog').mkdir()
+        for relative in ('scripts/aws_target/ledger.py', 'scripts/buildlog/record.py', 'scripts/buildlog/store.py'):
+            (self.repo / relative).touch()
         (self.repo / 'scripts/production').mkdir()
         _ = (self.repo / 'scripts/production/merge_gate.py').write_text(
             "def test_module_environment(root, environment):\n"
@@ -469,6 +1058,10 @@ class Sample(unittest.TestCase):
         cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
         return trial.paired_main(['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
                                   '--modules', 'fixture/test_sample.py'], self.state)
+
+    def configured_stop_timeout(self) -> float:
+        config = cloud_gate.settings()
+        return 2 * trial.cleanup_seconds(config) + config.number('api_timeout_s')
 
     def test_pushed_refs_and_modules_do_not_change_checkout(self) -> None:
         _ = (self.repo / 'private').write_text('local only')
@@ -666,15 +1259,17 @@ class Sample(unittest.TestCase):
         branches = self.remote_branches()
         for number in (signal.SIGINT,):
             with self.subTest(signal=number):
-                def stop_terminal(_command: Sequence[str]) -> None:
-                    signal.raise_signal(number)
-
                 def interrupted(command: Sequence[str], unit: str) -> int:
                     self.assertEqual(len(set(self.remote_branches()) - set(branches)), 2)
-                    with (mock.patch.object(subprocess, 'call', side_effect=stop_terminal),
-                          mock.patch.object(subprocess, 'run') as stop):
+                    prefix = '--setenv=' + trial.PAIRED_CLEANUP_CONNECTION_ENV + '='
+                    saved, = (word.removeprefix(prefix) for word in command if word.startswith(prefix))
+                    connection = trial.PairedCleanupConnection.configured(self.settings)
+                    self.assertEqual(cast(object, json.loads(saved)), snapshot_codec.snapshot_value(connection))
+                    stop_reply = subprocess.CompletedProcess(['systemctl'], 0, '', '')
+                    with mock.patch.object(trial, 'trial_command', side_effect=[KeyboardInterrupt, stop_reply]) as run:
                         result = service(command, unit)
-                        stop.assert_called_once_with(['systemctl', '--user', 'stop', unit], check=False)
+                        run.assert_called_with(['systemctl', '--user', 'stop', unit],
+                                               trial.TrialWait.SERVICE_STOP, timeout=self.configured_stop_timeout())
                         return result
 
                 with mock.patch.object(trial, 'paired_service', side_effect=interrupted):
@@ -819,7 +1414,7 @@ else:
                                    timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(reply.returncode, 0, reply.stderr)
             if not interrupt:
-                self.assertIn('timed out', reply.stderr)
+                self.assertIn('Timed out waiting for network Git', reply.stderr)
             self.assertEqual(self.remote_branches(), branches)
         finally:
             if group_record.exists():
@@ -878,6 +1473,26 @@ else:
                     'paired trial: could not delete branch ' + refused[0].removeprefix('refs/heads/')])
                 self.assertEqual(self.remote_branches(), {**branches, refused[0]: self.base})
 
+    def test_branch_delete_timeout_fails_the_trial_and_still_deletes_the_other_branch(self) -> None:
+        git = trial.checked_git
+        branches = self.remote_branches()
+        refused: list[str] = []
+        wait_for = trial.TrialWait.NETWORK_GIT
+
+        def refuse_delete(repo: Path, *arguments: str) -> str:
+            if arguments[0] == 'push' and '--delete' in arguments and arguments[-1].endswith('-base'):
+                refused.append(arguments[-1])
+                raise trial.TrialWaitExpired(wait_for)
+            return git(repo, *arguments)
+
+        errors = StringIO()
+        with (mock.patch.object(trial, 'checked_git', side_effect=refuse_delete),
+              mock.patch.object(trial, 'paired_service', return_value=0), redirect_stderr(errors)):
+            self.assertEqual(self.invoke_trial(), 1)
+        branch, = refused
+        self.assertIn(str(trial.TrialWaitExpired(wait_for)), errors.getvalue())
+        self.assertEqual(self.remote_branches(), {**branches, branch: self.base})
+
     def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
         for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):
             with self.subTest(modules=modules), self.assertRaises((ValueError, subprocess.SubprocessError)):
@@ -915,7 +1530,6 @@ else:
             trial.validate_paired_result(row, request, 'i-other')
 
     def guest(self, *, limit: float | None = None) -> tuple[dict[str, object], list[dict[str, object]]]:
-        from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
         box.mkdir()
         guest_deadline_s = 600
@@ -983,7 +1597,7 @@ print('200', end='')
         self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
 
     def test_slot_limit_refuses_before_service_or_admin_access(self) -> None:
-        with mock.patch.object(subprocess, 'call', side_effect=AssertionError('service start')):
+        with mock.patch.object(trial, 'paired_service', side_effect=AssertionError('service start')):
             output = StringIO()
             with redirect_stdout(output):
                 status = trial.paired_main(['--base', self.base, '--changed', self.changed,
@@ -1009,19 +1623,23 @@ print('200', end='')
                    *, group: CloudGroup) -> None:
             self.assertEqual(group.size, 2)
             try:
-                connection.send('ready')
+                connection.send(trial.TrialMessage.READY)
                 if folder.name == 'second':
                     self.assertTrue(cost_check.wait(TEST_HANG_GUARD_SECS))
                 else:
-                    _ = received.write_text(str(connection.recv()))
+                    self.assertTrue(connection.poll(TEST_HANG_GUARD_SECS))
+                    _ = received.write_text(connection.recv().name.lower())
             finally:
                 connection.close()
                 if folder.name == 'second':
                     pipe_closed.set()
 
-        def charges(_record_query: Callable[[Decimal], None]) -> None:
+        def charges(_record_query: Callable[[Decimal], None], *, page_timeout: Callable[[float], float],
+                    after_page: Callable[[], None]) -> None:
             cost_check.set()
             self.assertTrue(pipe_closed.wait(TEST_HANG_GUARD_SECS))
+            _ = page_timeout(cloud_gate.settings().number('api_timeout_s'))
+            after_page()
 
         errors = StringIO()
         with (mock.patch.object(trial, 'paired_module', new=module),
@@ -1053,31 +1671,32 @@ print('200', end='')
                    *, group: CloudGroup) -> None:
             self.assertEqual(group.size, len(names))
             try:
-                connection.send('ready')
+                connection.send(trial.TrialMessage.READY)
                 if folder.name == '1-second':
                     self.assertTrue(exit_worker.wait(TEST_HANG_GUARD_SECS))
                     return
+                self.assertTrue(connection.poll(TEST_HANG_GUARD_SECS))
                 message = connection.recv()
                 if folder.name == '3-fourth':
                     last_received.set()
                 if folder.name == '0-first':
                     self.assertTrue(last_received.wait(TEST_HANG_GUARD_SECS))
-                _ = (folder / 'received').write_text(str(message))
+                _ = (folder / 'received').write_text(message.name.lower())
             finally:
                 connection.close()
                 if folder.name == '1-second':
                     pipe_closed.set()
 
-        send = Connection.send
+        send = trial.TrialChannel.send
 
-        def send_then_stop_worker(connection: Connection, message: object) -> None:
+        def send_then_stop_worker(connection: trial.TrialChannel, message: trial.TrialMessage) -> None:
             send(connection, message)
-            if message == 'launch':
+            if message is trial.TrialMessage.LAUNCH:
                 exit_worker.set()
                 self.assertTrue(pipe_closed.wait(TEST_HANG_GUARD_SECS))
 
         errors = StringIO()
-        with (mock.patch.object(Connection, 'send', new=send_then_stop_worker),
+        with (mock.patch.object(trial.TrialChannel, 'send', new=send_then_stop_worker),
               mock.patch.object(trial, 'paired_module', new=module),
               mock.patch.object(trial, 'reserve_trial'),
               mock.patch.object(trial, 'cleanup_trial', return_value=True),
@@ -1113,13 +1732,16 @@ print('200', end='')
         testcase = self
 
         class Barrier:
-            def send(self, obj: object, /) -> None:
-                events.append(obj)
+            def send(self, message: trial.TrialMessage, /) -> None:
+                events.append(message.name.lower())
 
-            def recv(self) -> str:
+            def poll(self, timeout: float) -> bool:
+                return timeout > 0
+
+            def recv(self) -> trial.TrialMessage:
                 testcase.assertIsInstance(cloud_progress.read(sidecar), cloud_progress.NoCloudProgress)
                 events.append('launch')
-                return 'launch'
+                return trial.TrialMessage.LAUNCH
 
             def close(self) -> None:
                 events.append('closed')
@@ -1139,25 +1761,30 @@ print('200', end='')
         self.assertEqual(slot.status, 0)
 
     def test_terminal_exception_stops_the_owning_service(self) -> None:
-        with (mock.patch.object(subprocess, 'call', side_effect=OSError('fixture')),
-              mock.patch.object(subprocess, 'run') as stop,
+        stop_reply = subprocess.CompletedProcess(['systemctl'], 0, '', '')
+        with (mock.patch.object(trial, 'trial_command', side_effect=[OSError('fixture'), stop_reply]) as run,
               mock.patch.object(signal, 'signal', side_effect=AssertionError('handler'))):
             with self.assertRaises(OSError):
                 _ = trial.paired_service(['fixture'], 'fixture-unit')
-        stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+        run.assert_called_with(['systemctl', '--user', 'stop', 'fixture-unit'],
+                               trial.TrialWait.SERVICE_STOP, timeout=self.configured_stop_timeout())
 
     def test_terminal_interrupt_stops_the_owning_service(self) -> None:
-        from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
         for number in (signal.SIGINT,):
-            script = '''import signal, sys
+            script = '''import signal, subprocess, sys
 from unittest import mock
 from scripts.aws_target import aws_trial
-with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(aws_trial.subprocess, 'run') as stop:
+def interrupt(*args, **kwargs):
+    if args[1] is aws_trial.TrialWait.SERVICE:
+        signal.raise_signal(int(sys.argv[1]))
+    return subprocess.CompletedProcess(args[0], 0)
+with mock.patch.object(aws_trial, 'trial_command', side_effect=interrupt) as run:
     assert aws_trial.paired_service(['fixture'], 'fixture-unit') == 1
-    stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+    run.assert_called_with(['systemctl', '--user', 'stop', 'fixture-unit'],
+                           aws_trial.TrialWait.SERVICE_STOP, timeout=float(sys.argv[2]))
 '''
-            reply = subprocess.run([sys.executable, '-c', script, str(number)], capture_output=True, text=True,
-                                   timeout=TEST_HANG_GUARD_SECS)
+            reply = subprocess.run([sys.executable, '-c', script, str(number), str(self.configured_stop_timeout())],
+                                   capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(reply.returncode, 0, reply.stderr)
 
     def test_guest_failed_sample_keeps_measurements_and_counts(self) -> None:
@@ -1175,7 +1802,6 @@ with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command:
         self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
 
     def test_paired_cli_preserves_the_ordered_regional_deployment(self) -> None:
-        from scripts.aws_target import cloud_gate
         regions = [{'region': region, 'template': 'fixture-' + region} for region in ('us-east-2', 'us-west-2')]
         cloud_gate.save(self.state / 'gate-deployment.json', {'regions': regions, 'bucket': 'fixture-bucket'})
         with mock.patch.object(trial, 'paired_service', return_value=0):
@@ -1185,7 +1811,6 @@ with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command:
         self.assertEqual(cloud_gate.read(path)['regions'], regions)
 
     def test_paired_cli_uses_scaler_without_admin_or_new_settings(self) -> None:
-        from scripts.aws_target import cloud_gate
         cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
         with (mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('admin read')),
               mock.patch.object(trial, 'paired_service', return_value=0) as service):

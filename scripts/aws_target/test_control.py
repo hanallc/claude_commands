@@ -568,10 +568,10 @@ region_transfer_usd={"us-west-1":0.00015}
                              * len(self.regions))
         # Every column after the region holds a number.
         self.assertEqual(tables[fast].headers[-1], 'paid runs')
-        self.assertIn('merge gate (minutes)', tables[fast].headers)
+        self.assertIn('gate (minutes)', tables[fast].headers)
         self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
         self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
-                         f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+                         f'Cheapest gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
         self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
         self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
@@ -603,7 +603,7 @@ region_transfer_usd={"us-west-1":0.00015}
                 runs = run_cost.gate_runs(book, start, end, region).runs
                 self.assertEqual([(run.instance_type, run.box_s) for run in runs], [(size, Decimal(360))])
                 self.assertEqual(sum(day.runs for day in book.spend_days(aws_config.read_settings(self.settings), now)), 1)
-                report = aws_report.gate_type_report(self.state, end.date().isoformat(), 1)
+                report = aws_report.gate_type_report(self.state, end.date().isoformat(), 1, home=conf.read(self.settings).text('region'))
                 self.assertTrue(any(line.startswith(f'| {size} |') for line in report.tables))
                 page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
                 payload = page.read_text().split('<script id="aws-prices-data" type="application/json">', 1)[1]
@@ -630,8 +630,10 @@ region_transfer_usd={"us-west-1":0.00015}
                                  Decimal(1), Decimal(0), Decimal(0), (ledger.UsageTypeCost(
                                      ledger.REGION_USAGE_PREFIXES[home][-1] + '-SpotUsage:' + billed_size,
                                      Decimal('0.05'), Decimal('0.1'), 'Hrs'),))
-        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
-            tables = spot_table.spot_tables(self.state, max(int(self.clock.now), midnight + 120), settings_path=self.settings)
+        charges = self.state / 'charges'
+        charges.mkdir(exist_ok=True)
+        _ = (charges / (bill.day + '.json')).write_text(json.dumps(ledger.charge_record(bill)))
+        tables = spot_table.spot_tables(self.state, max(int(self.clock.now), bill.at), settings_path=self.settings)
         cells = {table.title: table.rows[0][6] for table in tables.runs[0].tables}
         self.assertEqual(cells[billed_size], '0.0500 (1 bill due)')
         self.assertEqual(cells[due_size], '1 bill due')
@@ -690,6 +692,7 @@ region_transfer_usd={"us-west-1":0.00015}
                 self.assertEqual(evidence.box_seconds(size, region, ('merge-gate',)), ([Decimal(time) for time in times], source))
 
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
+        self.configure('hours_table_open_row_limit=6')
         self.assertEqual(self.snapshot(), 0)
         folder = self.root / 'page'
         with (mock.patch.object(aws_page, 'output_folder', return_value=folder),
@@ -707,11 +710,11 @@ region_transfer_usd={"us-west-1":0.00015}
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = cast(aws_page.PageData, json.loads(payload))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        expected = aws_page.page_data(tables, data["spend"], int(self.clock.now))
+        expected = aws_page.page_data(tables, data["spend"], int(self.clock.now), hours_table_open_row_limit=6)
         self.assertGreater(data["render_seconds"], 0)
         self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
-                         [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
+                         [('merge-gate', 'Gate runs'), ('targeted-test', 'Targeted test runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
         # The fixture lowest zone price is 0.25 USD/h for every type and region; the region column has no number.
@@ -771,7 +774,7 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual([tile['usd'] for tile in no_bill['tiles']], ['$2.00', '—', '—'])
         self.assertEqual(no_bill['forecast'], '')
         gone = aws_page.spend_data(aws_config.MeasurementUnavailable('ledger unreadable'), now, 2)
-        self.assertEqual(gone, {'unavailable': 'AWS spend unavailable: ledger unreadable.', 'tiles': [], 'forecast': ''})
+        self.assertEqual(gone, {'unavailable': 'AWS spend unavailable: ledger unreadable.', 'tiles': [], 'forecast': '', 'refused_bills': []})
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
         folder = self.root / 'page'
@@ -780,7 +783,7 @@ region_transfer_usd={"us-west-1":0.00015}
         standard, *other_prices = tables.prices
         first, *other_rows = standard.rows
         prices = (replace(standard, rows=((first[0], cell, *first[2:]), *other_rows)), *other_prices)
-        with mock.patch.object(spot_table, 'spot_tables', return_value=replace(tables, prices=prices)):
+        with mock.patch.object(spot_table, 'spot_tables_from', return_value=replace(tables, prices=prices)):
             source = aws_page.publish(self.state, int(self.clock.now), folder).read_text()
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         self.assertEqual(cast(aws_page.PageData, json.loads(payload))['prices'][0]['rows'][0][1], cell)
@@ -1214,10 +1217,14 @@ class HoursCheckTests(CostFixture):
 
     def bill(self, day: datetime, hours: dict[tuple[str, str], Decimal]) -> None:
         start = int(day.timestamp())
-        self.bills.append(ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
+        bill = ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
             Decimal(1), Decimal(0), Decimal(0), tuple(ledger.UsageTypeCost(
                 ledger.REGION_USAGE_PREFIXES[region][-1] + '-SpotUsage:' + size, Decimal(1), quantity, 'Hrs')
-                for (size, region), quantity in hours.items())))
+                for (size, region), quantity in hours.items()))
+        self.bills.append(bill)
+        charges = self.state / 'charges'
+        charges.mkdir(exist_ok=True)
+        _ = (charges / (bill.day + '.json')).write_text(json.dumps(ledger.charge_record(bill)))
 
     def checks(self) -> dict[run_cost.DayKey, run_cost.HoursCheck]:
         end = datetime.fromtimestamp(self.clock.now, UTC)
@@ -1279,8 +1286,11 @@ class HoursCheckTests(CostFixture):
         window = run_cost.hours_checks(ledger.CostLedger(self.state), end - timedelta(days=3), end, self.home,
                                        self.builder, run_cost.SpotHoursScope((self.size,), {}), self.limit)
         self.assertEqual(window[self.size, self.home],
-                         run_cost.hours_check(within + above, Decimal(2), self.limit))
-        self.assertEqual(window[self.size, self.other], run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
+                         run_cost.ComparedMachineHours(within + above, Decimal(2), Decimal(0), True,
+                                                       two.date(), one.date()))
+        self.assertEqual(window[self.size, self.other],
+                         run_cost.ComparedMachineHours(Decimal(0), Decimal('0.5'), Decimal(0), True,
+                                                       one.date(), one.date()))
 
     def test_builder_running_time_counts_as_box_hours_of_the_builder_type(self) -> None:
         one = self.day(1)
@@ -1399,7 +1409,8 @@ class HoursCheckTests(CostFixture):
         assert isinstance(table, spot_table.HoursComparison)
         row = next(row for row in table.rows if row.size == fallback)
         self.assertTrue(row.check.hours_gap_over)
-        self.assertEqual(aws_page.hours_row_data(row)['cells'], [fallback, self.other, '2.0', '0.0', '+2.0', '1.0'])
+        data = aws_page.hours_row_data(row)
+        self.assertEqual((data['billed_tenths'], data['recorded_tenths'], data.get('hana_reserved_tenths')), (20, 0, 10))
 
     def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
         text_setting(self.root / 'hana_aws.conf', 'fallback_instance_types', 'm6a.4xlarge,')
@@ -1417,7 +1428,9 @@ class HoursCheckTests(CostFixture):
         assert isinstance(table, spot_table.HoursComparison)
         row, = table.rows
         self.assertTrue(row.check.hours_gap_over)
-        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.other, '2.0', '1.0', '+1.0', '—'])
+        data = aws_page.hours_row_data(row)
+        self.assertEqual((data['billed_tenths'], data['recorded_tenths']), (20, 10))
+        self.assertNotIn('hana_reserved_tenths', data)
 
     def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
         one = self.day(1)
@@ -1440,7 +1453,7 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(self.notice_run(), 0)
         self.assertEqual(len(self.notice_commands), 1)
 
-    def test_spot_table_shows_separate_hours_and_the_signed_difference(self) -> None:
+    def test_spot_table_keeps_billed_rows_and_their_utc_dates(self) -> None:
         one, two = self.day(1), self.day(2)
         gpu = conf.read_or_repository('cloud_gate').words('gpu_instance_types')[0]
         self.gate(self.size, self.home, one, 3600)
@@ -1449,12 +1462,14 @@ class HoursCheckTests(CostFixture):
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
         hours = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).hours
         assert isinstance(hours, spot_table.HoursComparison)
-        self.assertEqual([aws_page.hours_row_data(row)['cells'] for row in hours.rows], [
-            [self.size, self.home, '1.3', '1.0', '+0.3', '—'],
-            [self.size, self.other, '0.0', '0.5', '-0.5', '—'],
-            [gpu, self.home, '—', '1.0', '—', '—'],
-        ])
-        self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True, False])
+        billed, lower = (aws_page.hours_row_data(row) for row in hours.rows)
+        self.assertEqual((billed['size'], billed['region'], billed['billed_tenths'], billed['recorded_tenths']),
+                         (self.size, self.home, 13, 10))
+        self.assertEqual((lower['size'], lower['region'], lower['billed_tenths'], lower['recorded_tenths']),
+                         (self.size, self.other, 0, 5))
+        for row in (billed, lower):
+            self.assertEqual((row['first_utc_day'], row['last_utc_day']), (one.date().isoformat(),) * 2)
+        self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True])
 
     def test_over_uses_the_full_precision_of_the_hours_and_limit(self) -> None:
         day = self.day(1)
@@ -1466,19 +1481,22 @@ class HoursCheckTests(CostFixture):
                 hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
                 assert isinstance(hours, spot_table.HoursComparison)
                 row, = hours.rows
-                self.assertEqual(aws_page.hours_row_data(row)['cells'][4], '+0.2')
+                data = aws_page.hours_row_data(row)
+                self.assertEqual((data['billed_tenths'], data['recorded_tenths']), (12, 10))
                 self.assertEqual(row.check.hours_gap_over, mark)
 
-    def test_hours_difference_rounds_only_after_subtracting(self) -> None:
-        for billed, recorded, cells in (
-            ('0.96', '1', ['1.0', '1.0', '0.0']),
-            ('4.24', '4.26', ['4.2', '4.3', '0.0']),
-            ('1.24', '1.06', ['1.2', '1.1', '+0.2']),
+    def test_hours_row_data_rounds_each_amount_for_display(self) -> None:
+        day = self.day(1).date()
+        for billed, recorded, expected in (
+            ('0.96', '1', (10, 10)),
+            ('4.24', '4.26', (42, 43)),
+            ('1.24', '1.06', (12, 11)),
         ):
             with self.subTest(billed=billed, recorded=recorded):
-                check = run_cost.hours_check(Decimal(billed), Decimal(recorded), self.limit)
-                row = spot_table.MachineHoursRow(self.size, self.home, check)
-                self.assertEqual(aws_page.hours_row_data(row)['cells'][2:5], cells)
+                check = run_cost.ComparedMachineHours(Decimal(billed), Decimal(recorded), Decimal(0), False, day, day)
+                row = spot_table.ComparedMachineHoursRow(self.size, self.home, check)
+                data = aws_page.hours_row_data(row)
+                self.assertEqual((data['billed_tenths'], data['recorded_tenths']), expected)
 
     def test_billed_hours_empty_states_distinguish_a_missing_bill_from_no_hours(self) -> None:
         def check(note: str) -> None:
@@ -1490,10 +1508,8 @@ class HoursCheckTests(CostFixture):
         check('There are no machine hours to compare.')
         self.gate(self.size, self.home, self.day(1), 3600)
         hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
-        assert isinstance(hours, spot_table.HoursComparison)
-        row, = hours.rows
-        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.home, '—', '1.0', '—', '—'])
-        self.assertFalse(row.check.hours_gap_over)
+        self.assertEqual(hours, spot_table.HoursComparisonUnavailable(
+            'No AWS bill is available yet for the recorded hours.', frozenset({self.home})))
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
         day = self.day(1)
@@ -1505,11 +1521,12 @@ class HoursCheckTests(CostFixture):
         self.bill(day, {(self.size, self.other): Decimal(3), (fallback, self.other): Decimal('0.9')})
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
         assert isinstance(table, spot_table.HoursComparison)
-        cells = {row.size: aws_page.hours_row_data(row)['cells'][1:] for row in table.rows}
-        self.assertEqual(cells, {
-            self.size: [self.other, '3.0', '1.0', '+2.0', '2.0'],
-            fallback: [self.other, '0.9', '0.0', '+0.9', '2.0'],
-        })
+        readings = {row.size: aws_page.hours_row_data(row) for row in table.rows}
+        for size, billed_hours, recorded_hours in ((self.size, 30, 10), (fallback, 9, 0)):
+            with self.subTest(size=size):
+                data = readings[size]
+                self.assertEqual((data['region'], data['billed_tenths'], data['recorded_tenths'],
+                                  data.get('hana_reserved_tenths')), (self.other, billed_hours, recorded_hours, 20))
         self.assertFalse(any(row.check.hours_gap_over for row in table.rows))
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:

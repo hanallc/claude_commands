@@ -11,7 +11,7 @@ import base64
 from configparser import ConfigParser
 from io import StringIO
 from collections.abc import Callable, Generator, Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_CEILING
@@ -29,19 +29,23 @@ import sys
 import tempfile
 import threading
 import time
-from typing import ClassVar, cast, final
+from typing import ClassVar, Literal, cast, final
 from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
+from scripts.aws_target import (
+    admin_secrets, aws_test_identity, box, gate_probe,
+    hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger,
+    plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown,
+)
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
-from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
+from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, SpendingSettings, money, positive_seconds, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings, save_deployment_record
 from scripts.lib import conf
 from scripts.build_targets import target_config
-from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import LockResult
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
@@ -197,6 +201,29 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+class RecoveryStackRefused(DeploymentRefused):
+    """Recovery cannot use the named stack."""
+
+
+class MissingRecoveryStack(RecoveryStackRefused):
+    """CloudFormation confirmed that the stack is absent."""
+
+
+class IncompleteRecoveryStack(RecoveryStackRefused):
+    """The stack lacks complete evidence for recovery."""
+
+
+class PreparationRequired(DeploymentRefused):
+    """The local deployment preparation bundle is missing or incomplete."""
+
+    def __init__(self) -> None:
+        super().__init__('Run deploy.py prepare first to save the deployment preparation bundle.')
+
+
+class DeploymentNetworkUnavailable(DeploymentRefused):
+    """The available evidence does not identify a usable network."""
 
 
 class HanaControlRefused(DeploymentRefused):
@@ -455,6 +482,19 @@ def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool
 
 
 @dataclass(frozen=True)
+class DeploymentNetwork:
+    region: str
+    vpc: str
+    subnets: list[dict[str, object]]
+
+    def subnet_in(self, zone: str) -> str:
+        for subnet in self.subnets:
+            if subnet['zone'] == zone:
+                return ledger.text(subnet, 'id')
+        raise DeploymentNetworkUnavailable(f'{self.region}: no available public subnet in {zone}')
+
+
+@dataclass(frozen=True)
 class RegionalNetwork:
     region: str
     vpc: str
@@ -463,10 +503,54 @@ class RegionalNetwork:
 
 
 @dataclass(frozen=True)
+class HanaNetwork:
+    vpc: str
+    subnet: str
+
+
+@dataclass(frozen=True)
+class DeployedHanaNetwork(HanaNetwork):
+    zone: str
+
+
+@dataclass(frozen=True)
+class RecordedHanaInstance:
+    deployment: str
+    instance: str
+    region: str
+
+
+@dataclass(frozen=True)
+class NoRecordedHanaInstance:
+    """The local Hana records name no instance."""
+
+
+@dataclass(frozen=True)
+class HanaSetupInputs:
+    settings: DeploymentSettings
+    parameters: dict[str, str]
+    template: bytes
+    stack: dict[str, object]
+    network: HanaNetwork
+    approved_parameters: dict[str, str]
+
+
+@dataclass(frozen=True)
 class PreparedDeployment:
     at: int
     fingerprint: str
     parameters: dict[str, str]
+
+
+@dataclass(frozen=True)
+class PreparedDeploymentBundle:
+    prepared: PreparedDeployment
+    files: dict[Path, str]
+
+    def save(self) -> PreparedDeployment:
+        for path, content in self.files.items():
+            write_text_atomic(path, content)
+        return self.prepared
 
 
 @dataclass(frozen=True)
@@ -564,17 +648,28 @@ def _hana_wait_status(registration: dict[str, object], lock_busy: bool) -> str:
     return status + (', controller lock busy' if lock_busy else '')
 
 
-def deployment_parameters(path: Path, settings: DeploymentSettings,
-                          notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
-    spending = read_settings(path)
+def deployment_parameters(spending: SpendingSettings, settings: DeploymentSettings,
+                          notification: BudgetNotificationAddress, deployment_id: str, vpc: str) -> dict[str, str]:
     return {
-        'VpcId': settings.vpc_id, 'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
+        'VpcId': vpc, 'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
         'MonthlyLimitUsd': str(spending.monthly_limit_usd),
         'NoticeLowPercent': str(settings.notice_low), 'NoticeHighPercent': str(settings.notice_high),
         'StopPercent': str(settings.stop_percent), 'CostTagKey': spending.cost_explorer_tag_key,
         'CostTagValue': spending.cost_explorer_tag_value, 'ScalerUserName': settings.scaler_user_name,
         'DeploymentId': deployment_id,
     }
+
+
+def preparation_parameters_text(parameters: dict[str, str]) -> str:
+    return json.dumps([
+        {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
+    ], sort_keys=True) + '\n'
+
+
+def prepared_parameters(output: Path) -> dict[str, object]:
+    prepared = cast(object, json.loads((output / 'parameters.json').read_text()))
+    return {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
+            for row in ledger.rows({'parameters': prepared}, 'parameters')}
 
 
 def fingerprint(settings: DeploymentSettings, parameters: dict[str, str], template: bytes) -> str:
@@ -601,26 +696,31 @@ class Deployment:
         self.mode = mode
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
-    def _deployment_id(self) -> str:
-        settings = read_deployment_settings(self.settings_path)
+    def _deployment_id(self, settings: DeploymentSettings) -> str:
         saved = deployment_record(self.directory)
         if saved.get('stack') and saved['stack'] != settings.stack_name:
             if not saved.get('replacement_deployment_id'):
                 saved['replacement_deployment_id'] = uuid4().hex
-                write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+                save_deployment_record(self.directory, saved)
             return ledger.text(saved, 'replacement_deployment_id')
         if not saved.get('deployment_id'):
             saved.update(deployment_id=uuid4().hex)
             _ = saved.setdefault('stack', settings.stack_name)
             _ = saved.setdefault('region', settings.region)
             _ = saved.setdefault('outputs', {})
-            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            save_deployment_record(self.directory, saved)
         return ledger.text(saved, 'deployment_id')
 
-    def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress) -> dict[str, str]:
-        deployment_id = self._deployment_id()
-        saved = deployment_record(self.directory)
-        parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id)
+    def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress,
+                    vpc: str, spending: SpendingSettings) -> dict[str, str]:
+        deployment_id = self._deployment_id(settings)
+        return self._foundation_parameters(settings, notification, deployment_id, deployment_record(self.directory),
+                                           vpc, spending)
+
+    def _foundation_parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress,
+                               deployment_id: str, saved: dict[str, object], vpc: str,
+                               spending: SpendingSettings) -> dict[str, str]:
+        parameters = deployment_parameters(spending, settings, notification, deployment_id, vpc)
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
@@ -648,7 +748,7 @@ class Deployment:
                 _ = saved.pop(key, None)
         saved.update(account_id=account, region=settings.region, stack=settings.stack_name,
                      deployment_id=parameters['DeploymentId'])
-        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+        save_deployment_record(self.directory, saved)
         change_name = 'identity-' + parameters['DeploymentId']
         try:
             reply = api.call('describe-change-set', '--stack-name', settings.stack_name,
@@ -676,7 +776,7 @@ class Deployment:
                                      parameters.items()]), service='cloudformation')
                 reserved = True
             saved['stack_id'] = ledger.text(reply, 'StackId')
-            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            save_deployment_record(self.directory, saved)
             _ = api.call('wait', 'change-set-create-complete', '--stack-name', ledger.text(saved, 'stack_id'),
                          '--change-set-name', change_name, service='cloudformation',
                          timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
@@ -697,12 +797,11 @@ class Deployment:
         resource = ledger.mapping(api.call('describe-stack-resource', '--stack-name', ledger.text(saved, 'stack_id'),
                                            '--logical-resource-id', 'ScalerUser', service='cloudformation').get('StackResourceDetail'))
         name = ledger.text(resource, 'PhysicalResourceId')
-        user = ledger.mapping(api.call('get-user', '--user-name', name, service='iam').get('User'))
-        identity = {'name': name, 'arn': ledger.text(user, 'Arn'), 'user_id': ledger.text(user, 'UserId')}
+        identity = scaler_identity(api, name)
         if saved.get('scaler_user', identity) != identity:
             raise DeploymentRefused('the scaler IAM identity differs from the deployment record')
         saved['scaler_user'] = identity
-        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+        save_deployment_record(self.directory, saved)
 
     def _guard(self) -> ledger.SpendingAllowed:
         decision = ledger.spending_guard(self.settings_path, self.directory, 'deployment',
@@ -749,8 +848,13 @@ class Deployment:
     def _load(self, notification: BudgetNotificationAddress
               ) -> tuple[DeploymentSettings, dict[str, str]]:
         settings = read_deployment_settings(self.settings_path)
-        parameters = self._parameters(settings, notification)
+        vpc = ledger.text(prepared_parameters(self.output), 'VpcId')
+        parameters = self._parameters(settings, notification, vpc, read_settings(self.settings_path))
         self._before_request(settings, parameters)
+        network = self._deployment_network(settings, self._api(settings))
+        if network.vpc != vpc:
+            raise DeploymentRefused('the deployment VPC changed; run prepare again')
+        _ = network.subnet_in(settings.availability_zone)
         return settings, parameters
 
     def _before_request(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
@@ -758,15 +862,17 @@ class Deployment:
         self._confirm_preparation(settings, parameters)
 
     def prepare_hana(self) -> PreparedDeployment:
-        """Save local preparation without accessing AWS or changing placement."""
+        """Save preparation evidence without changing placement."""
         admin_secrets.refuse_plain_admin(self.settings_path)
         with self._require_hana_control('prepare --workload hana'):
             self._refuse_hana_replacement()
-            settings, parameters, template = self._hana_inputs()
+            _ = read_settings(self.settings_path)
+            inputs = self._hana_inputs()
+            settings, parameters = inputs.settings, inputs.parameters
             decision = self._guard()
-            prepared = self._hana_output()._write_preparation(settings, parameters, template, decision)
+            prepared = self._hana_output()._preparation_bundle(settings, parameters, inputs.template, decision).save()
             path = self.directory / 'hana' / 'setup.json'
-            if not path.exists():
+            if not path.exists() and not isinstance(inputs.network, DeployedHanaNetwork):
                 _save_hana_setup(path, {'version': HANA_SETUP_VERSION, 'deployment': parameters['DeploymentId'],
                                        'stack': settings.stack_name, 'region': settings.region})
             return prepared
@@ -806,20 +912,15 @@ class Deployment:
                     raise DeploymentRefused('The configured Hana image differs from the registration. Review the saved deployment.')
             if ownership is HanaBoxOwnership.STACK:
                 return self._update_stack_owned_hana(path, saved, workload, limits)
-            settings, parameters, template = self._hana_inputs(workload)
-            if not saved:
-                prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
-                prepared_parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
-                                       for row in ledger.rows({'parameters': prepared}, 'parameters')}
-                parameters['DeploymentId'] = ledger.text(prepared_parameters, 'DeploymentId')
-            resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
-            child.confirm_preparation_evidence(settings, parameters, template, allow_expired=resume_stop)
+            inputs = self._hana_inputs(workload, for_setup=True)
+            settings, parameters, template = inputs.settings, inputs.parameters, inputs.template
             book = ledger.CostLedger(self.directory)
             spending = hana_spend.HanaSpending(book, self.settings_path, limits)
             outputs: dict[str, str] = {}
             if saved.get('requested'):
                 saved_settings = replace(settings, region=ledger.text(saved, 'region'))
-                outputs = child._stack(saved_settings, require_outputs=True)
+                stack = inputs.stack
+                outputs = child._stack_outputs(stack, require_outputs=True) if stack else {}
                 if 'Instance' in outputs or 'DataVolume' in outputs:
                     raise DeploymentRefused('The existing Hana stack owns the instance or data disk. ' + HANA_DOWN_FIRST)
                 if outputs:
@@ -843,7 +944,7 @@ class Deployment:
                     print('hana-setup: cleared the saved setup for the missing stack')
                     saved = {}
             template_hash = sha256(template).hexdigest()
-            parameter_hash = _hana_parameter_hash(parameters)
+            parameter_hash = _hana_parameter_hash(inputs.approved_parameters)
             stack_parameters = {key: value for key, value in parameters.items()
                                 if key not in ('InstanceType', 'AvailabilityZone', 'SubnetId', 'DataGiB',
                                                'FallbackInstanceTypes')}
@@ -894,8 +995,13 @@ class Deployment:
                     saved['spot_max_price'] = previous_ceiling
                     update_ceiling = True
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
-                self._validate_inputs(settings)
-                candidates = (() if saved.get('instance') else self._hana_spot_candidates(api, settings, limits, workload))
+                placement = replace(settings, availability_zone=inputs.network.zone) if isinstance(
+                    inputs.network, DeployedHanaNetwork) else settings
+                self._validate_inputs(placement, parameters)
+                candidates = (() if saved.get('instance') else self._hana_spot_candidates(
+                    api, settings, inputs.approved_parameters, limits, workload))
+            if outputs and not (child.output / 'parameters.json').exists():
+                child._write_parameters(parameters)
             launch_deadline = 0
             if not saved.get('instance'):
                 if update_ceiling:
@@ -1337,7 +1443,7 @@ class Deployment:
             ScalerProbe('get-object', lambda api: get_probe_object(api, provider.bucket, key, content)),
         ]).failures
 
-    def _hana_spot_candidates(self, api: AwsCli, settings: DeploymentSettings,
+    def _hana_spot_candidates(self, api: AwsCli, settings: DeploymentSettings, parameters: dict[str, str],
                               limits: hana_spend.PermitSettings, workload: conf.ConfigRead) -> tuple[HanaSpotCandidate, ...]:
         try:
             margin = conf.decimal(workload.text('spot_ceiling_margin', recover_invalid=False))
@@ -1347,11 +1453,12 @@ class Deployment:
             raise DeploymentRefused('Hana setup requires a positive spot_ceiling_margin.')
         sizes = (limits.instance_type, *limits.fallback_instance_types)
         primary = settings.availability_zone
-        subnets = {primary: settings.subnet_id}
-        reply = api.call('describe-subnets', '--filters', 'Name=vpc-id,Values=' + settings.vpc_id)
+        vpc = parameters['VpcId']
+        subnets = {primary: parameters['SubnetId']}
+        reply = api.call('describe-subnets', '--filters', 'Name=vpc-id,Values=' + vpc)
         for row in sorted(ledger.rows(reply, 'Subnets'), key=lambda subnet: ledger.text(subnet, 'SubnetId')):
             zone = ledger.text(row, 'AvailabilityZone')
-            if (zone != primary and zone.startswith(api.region) and row.get('VpcId') == settings.vpc_id
+            if (zone != primary and zone.startswith(api.region) and row.get('VpcId') == vpc
                     and row.get('State') == 'available' and row.get('DefaultForAz') is True):
                 _ = subnets.setdefault(zone, ledger.text(row, 'SubnetId'))
         try:
@@ -1561,9 +1668,8 @@ class Deployment:
             return False
         self._authorize(True)
         limits = hana_spend.read_settings(workload)
-        settings = replace(read_deployment_settings(self.settings_path), region=limits.region,
-                           timeout_s=workload.whole('aws_timeout_s'))
-        zone = workload.text('availability_zone')
+        account = read_deployment_settings(self.settings_path)
+        settings = self._hana_settings(account, workload, limits)
         upload_timeout = workload.whole('image_upload_timeout_s')
         wait_interval = max(workload.whole('image_wait_interval_s'),
                             (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
@@ -1575,9 +1681,8 @@ class Deployment:
             description = 'Hana guest digest ' + digest.value
             api = self._api(settings)
             _ = self._guard()
-            subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
-            if not subnets:
-                raise DeploymentRefused(f'The gate VPC has no available public subnet in {zone}')
+            network = self._deployment_network(account, api)
+            subnet = network.subnet_in(settings.availability_zone)
             images = ledger.rows(api.call('describe-images', '--owners', 'self',
                                           '--filters', 'Name=name,Values=' + built.name), 'Images')
             if not images:
@@ -1648,7 +1753,7 @@ class Deployment:
                 raise DeploymentRefused('The registered Hana image lacks the matching guest digest. Build a fresh Hana image.')
             path = hana_image.save(self.directory, hana_image.RegisteredImage(
                 built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
-                settings.vpc_id, str(subnets[0]['id']), digest))
+                network.vpc, subnet, digest))
         print(f'Hana image ready. The record is in {path}.')
         return True
 
@@ -1848,7 +1953,8 @@ class Deployment:
                 return True
             saved = remote.read_record(path)
             workload = conf.read_or_repository('hana_aws')
-            settings, _, _ = self._hana_inputs(workload)
+            settings = self._hana_settings(read_deployment_settings(self.settings_path), workload,
+                                           hana_spend.read_settings(workload))
             if 'region' in saved:
                 settings = replace(settings, region=ledger.text(saved, 'region'))
             api = self._api(settings)
@@ -2020,42 +2126,157 @@ class Deployment:
                          'Name=tag:HanaDeployment,Values=' + ledger.text(saved, 'deployment'))
         return frozenset(ledger.text(row, 'VolumeId') for row in ledger.rows(reply, 'Volumes'))
 
-    def _hana_inputs(self, workload: conf.ConfigRead | None = None) -> tuple[DeploymentSettings, dict[str, str], bytes]:
+    @staticmethod
+    def _hana_settings(account: DeploymentSettings, workload: conf.ConfigRead,
+                       limits: hana_spend.PermitSettings) -> DeploymentSettings:
+        settings = replace(account, stack_name=workload.text('stack_name'), region=limits.region,
+                           availability_zone=workload.text('availability_zone'), timeout_s=workload.whole('aws_timeout_s'))
+        if settings.stack_name == account.stack_name:
+            raise DeploymentRefused('The Hana stack must differ from the gate stack')
+        if not settings.availability_zone.startswith(settings.region):
+            raise DeploymentRefused('The Hana zone must belong to its region')
+        return settings
+
+    def _deployment_network(self, account: DeploymentSettings, api: AwsCli) -> DeploymentNetwork:
+        foundation = describe_regional_stack(api, account.stack_name) if api.region == account.region else {}
+        return resolve_deployment_network(api, foundation)
+
+    def _hana_inputs(self, workload: conf.ConfigRead | None = None, *, for_setup: bool = False) -> HanaSetupInputs:
         """Share the existing deployment validation and use only Hana sizes and prices."""
         if workload is None:
             workload = conf.read_or_repository('hana_aws')
         limits = hana_spend.read_settings(workload)
-        # Empty identity values are allowed here; text() refuses an empty value.
-        present = workload.values('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')
-        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone')}
-        names.update({key: present.get(key, '') for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')})
+        account = read_deployment_settings(self.settings_path)
+        settings = self._hana_settings(account, workload, limits)
+        image_values = workload.values('ami_id', 'ami_owner_id')
+        image = image_values.get('ami_id', '')
+        owner = image_values.get('ami_owner_id', '')
         registered = hana_image.saved(self.directory)
         if isinstance(registered, hana_image.RegisteredImage):
-            # Configured values win; the saved registration keeps cloud identities out of the repository.
-            for key, value in (('ami_id', registered.image), ('ami_owner_id', registered.owner),
-                               ('vpc_id', registered.vpc), ('subnet_id', registered.subnet)):
-                names[key] = names[key] or value
-        if not all(names.values()):
-            raise DeploymentRefused('Configure the reviewed Hana image, owner, VPC, and subnet before prepare')
-        settings = replace(read_deployment_settings(self.settings_path), **names,
-            region=limits.region, timeout_s=workload.whole('aws_timeout_s'))
-        if settings.stack_name == conf.read(self.settings_path).text('stack_name'):
-            raise DeploymentRefused('The Hana stack must differ from the gate stack')
-        if not settings.availability_zone.startswith(settings.region):
-            raise DeploymentRefused('The Hana zone must belong to its region')
+            image = image or registered.image
+            owner = owner or registered.owner
+        if not image or not owner:
+            raise DeploymentRefused('Configure the reviewed Hana image and owner before prepare')
+        settings = replace(settings, ami_id=image, ami_owner_id=owner)
         identity_path = self.directory / 'hana' / 'setup.json'
         saved = remote.read_record(identity_path) if identity_path.exists() else {}
-        identity = ledger.text(saved, 'deployment') if saved else uuid4().hex
         if saved and saved.get('stack') != settings.stack_name:
             raise DeploymentRefused('The saved Hana stack differs; review replacement before setup')
+        output = self.output / 'hana'
+        template = HANA_TEMPLATE.read_bytes()
+        evidence: dict[str, object] = {}
+        if for_setup:
+            resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
+            evidence = self._read_preparation_evidence(output, settings, template, allow_expired=resume_stop)
+        recorded = self._recorded_hana_instance(saved)
+        if isinstance(recorded, RecordedHanaInstance):
+            saved_settings = replace(settings, region=recorded.region)
+        else:
+            saved_settings = replace(settings, region=ledger.text(saved, 'region')) if saved.get('requested') else settings
+        read_stack = saved.get('requested') or (isinstance(recorded, NoRecordedHanaInstance)
+                                               and not isinstance(registered, hana_image.RegisteredImage))
+        stack = self._read_stack(saved_settings) if read_stack else {}
+        if stack or isinstance(recorded, RecordedHanaInstance):
+            network = self._existing_hana_network(saved_settings, stack, saved, recorded)
+        elif isinstance(registered, hana_image.RegisteredImage):
+            network = HanaNetwork(registered.vpc, registered.subnet)
+        else:
+            discovered = self._deployment_network(account, self._api(settings))
+            network = HanaNetwork(discovered.vpc, discovered.subnet_in(settings.availability_zone))
+        if isinstance(recorded, RecordedHanaInstance):
+            if for_setup and not saved.get('instance'):
+                raise DeploymentRefused('The saved Hana setup lacks instance. Complete approved setup first.')
+            if for_setup and not saved.get('requested'):
+                raise DeploymentRefused('The Hana instance has no matching setup record. Review the saved deployment.')
+            identity = recorded.deployment
+        else:
+            identity = (ledger.text(saved, 'deployment') if saved else
+                        ledger.text(prepared_parameters(output), 'DeploymentId') if for_setup else uuid4().hex)
         parameters = {
             'DeploymentId': identity, 'Image': settings.ami_id, 'InstanceType': limits.instance_type,
             'FallbackInstanceTypes': ','.join(limits.fallback_instance_types),
-            'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
+            'AvailabilityZone': settings.availability_zone, 'VpcId': network.vpc, 'SubnetId': network.subnet,
             'RootDevice': settings.root_device_name, 'RootGiB': str(limits.root_gib), 'DataGiB': str(limits.data_gib),
             'SpotMaxPrice': str(limits.spot_max_usd_per_hour), 'ScalerUser': settings.scaler_user_name,
         }
-        return settings, parameters, HANA_TEMPLATE.read_bytes()
+        approved_parameters = parameters
+        if for_setup:
+            approved_parameters = self._hana_approved_parameters(settings, network, parameters, saved)
+            if evidence.get('fingerprint') not in (fingerprint(settings, parameters, template),
+                                                   fingerprint(settings, approved_parameters, template)):
+                raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
+        return HanaSetupInputs(settings, parameters, template, stack, network, approved_parameters)
+
+    def _recorded_hana_instance(self, saved: dict[str, object]) -> RecordedHanaInstance | NoRecordedHanaInstance:
+        try:
+            lifecycle = remote.read_record(self.directory / 'hana' / 'lifecycle.json')
+        except FileNotFoundError:
+            lifecycle = {}
+        identity = ledger.mapping(lifecycle.get('identity', {}))
+        if 'instance' in identity:
+            recorded = RecordedHanaInstance(*(ledger.text(identity, key) for key in ('deployment', 'instance', 'region')))
+            if any(key in saved and saved[key] != identity[key] for key in ('deployment', 'instance', 'region')):
+                raise DeploymentNetworkUnavailable('The Hana lifecycle and setup name different deployments. Review the saved records.')
+            return recorded
+        if 'instance' in saved:
+            return RecordedHanaInstance(*(ledger.text(saved, key) for key in ('deployment', 'instance', 'region')))
+        return NoRecordedHanaInstance()
+
+    def _existing_hana_network(self, settings: DeploymentSettings, stack: dict[str, object], saved: dict[str, object],
+                               recorded: RecordedHanaInstance | NoRecordedHanaInstance) -> HanaNetwork:
+        unavailable = 'The existing Hana deployment has no confirmed subnet. Review the saved deployment.'
+        try:
+            parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
+                          for row in ledger.rows(stack, 'Parameters')} if 'Parameters' in stack else {}
+            if isinstance(recorded, RecordedHanaInstance):
+                instance = recorded.instance
+            else:
+                instance = self._stack_outputs(stack, require_outputs=True).get('Instance', '')
+            if instance or 'pending_launch' in saved:
+                filters = ('--instance-ids', instance) if instance else (
+                    '--filters', f'Name=client-token,Values={PendingHanaLaunch.decode(saved["pending_launch"]).token}',
+                    'Name=instance-state-name,Values=' + spot_end.LIVE_BOX_STATES)
+                reply = self._api(settings).call('describe-instances', *filters)
+                instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
+                if instances or instance:
+                    if len(instances) != 1 or (instance and instances[0].get('InstanceId') != instance):
+                        raise DeploymentNetworkUnavailable(unavailable)
+                    row, = instances
+                    vpc = ledger.text(row, 'VpcId')
+                    if parameters.get('VpcId', vpc) != vpc:
+                        raise DeploymentNetworkUnavailable(unavailable)
+                    return DeployedHanaNetwork(vpc, ledger.text(row, 'SubnetId'),
+                                               ledger.text(ledger.mapping(row['Placement']), 'AvailabilityZone'))
+            vpc = ledger.text(parameters, 'VpcId')
+        except (AwsUnavailable, KeyError, ledger.LedgerUnavailable, OSError, subprocess.SubprocessError) as error:
+            raise DeploymentNetworkUnavailable(unavailable) from error
+        subnet = parameters.get('SubnetId')
+        if isinstance(subnet, str) and subnet:
+            return HanaNetwork(vpc, subnet)
+        try:
+            prepared = prepared_parameters(self.output / 'hana')
+            if prepared.get('VpcId') == vpc:
+                return HanaNetwork(vpc, ledger.text(prepared, 'SubnetId'))
+        except (OSError, json.JSONDecodeError, ledger.LedgerUnavailable):
+            pass
+        raise DeploymentNetworkUnavailable(unavailable)
+
+    def _hana_approved_parameters(self, settings: DeploymentSettings, network: HanaNetwork, parameters: dict[str, str],
+                                  saved: dict[str, object]) -> dict[str, str]:
+        approved_hash = saved.get('parameters_sha256')
+        if (not approved_hash or _hana_parameter_hash(parameters) == approved_hash
+                or not isinstance(network, DeployedHanaNetwork) or network.zone == settings.availability_zone
+                or saved.get('region') != settings.region):
+            return parameters
+        # A fallback launch keeps the approval for the original zone and subnet.
+        reply = self._api(settings).call('describe-subnets', '--filters', f'Name=vpc-id,Values={network.vpc}',
+                                         f'Name=availability-zone,Values={settings.availability_zone}')
+        for row in ledger.rows(reply, 'Subnets'):
+            if row.get('VpcId') == network.vpc and row.get('AvailabilityZone') == settings.availability_zone:
+                candidate = parameters | {'SubnetId': ledger.text(row, 'SubnetId')}
+                if _hana_parameter_hash(candidate) == approved_hash:
+                    return candidate
+        return parameters
 
     def _hana_output(self) -> Deployment:
         """Use separate preparation files with the existing deployment helper."""
@@ -2064,38 +2285,60 @@ class Deployment:
         child.admin = self.admin
         return child
 
-    def _write_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
-                           decision: ledger.SpendingAllowed, resources: tuple[ledger.PricedResource, ...] = ()) -> PreparedDeployment:
+    def _preparation_bundle(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
+                            decision: ledger.SpendingAllowed,
+                            resources: tuple[ledger.PricedResource, ...] = ()) -> PreparedDeploymentBundle:
         prepared = PreparedDeployment(int(self.clock()), fingerprint(settings, parameters, template), parameters)
-        self.output.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(self.output / 'template.json', template.decode())
-        write_text_atomic(self.output / 'parameters.json', json.dumps([
-            {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
-        ], sort_keys=True) + '\n')
-        write_text_atomic(self.output / 'preflight.json', json.dumps({
-            'at': prepared.at, 'fingerprint': prepared.fingerprint,
-            'decision': ledger.decision_record(decision),
-            'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)} for resource in resources],
-        }, sort_keys=True) + '\n')
-        return prepared
+        return PreparedDeploymentBundle(prepared, {
+            self.output / 'template.json': template.decode(),
+            self.output / 'parameters.json': preparation_parameters_text(parameters),
+            self.output / 'preflight.json': remote.record_text({
+                'at': prepared.at, 'fingerprint': prepared.fingerprint,
+                'decision': ledger.decision_record(decision),
+                'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)}
+                              for resource in resources],
+            }),
+        })
 
-    def prepare(self) -> PreparedDeployment:
+    def _write_parameters(self, parameters: dict[str, str]) -> None:
+        write_text_atomic(self.output / 'parameters.json', preparation_parameters_text(parameters))
+
+    @contextmanager
+    def _prepare_foundation(
+        self, command: Literal['prepare', 'recover'], network_for: Callable[[DeploymentSettings], DeploymentNetwork],
+        parameters_for: Callable[[DeploymentSettings, BudgetNotificationAddress, str, SpendingSettings], dict[str, str]],
+    ) -> Generator[PreparedDeploymentBundle]:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with self._require_hana_control('prepare'):
+        with self._require_hana_control(command):
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
-            parameters = self._parameters(settings, notification)
+            # Recovery uses the guard to report and record an invalid spending configuration.
+            spending = read_settings(self.settings_path) if command == 'prepare' else None
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
             resources = state.inventories[-1].resources if state.inventories else ()
             if not state.inventories:
                 book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
             decision = self._guard()
-            template = TEMPLATE.read_bytes()
-            return self._write_preparation(settings, parameters, template, decision, resources)
+            network = network_for(settings)
+            _ = network.subnet_in(settings.availability_zone)
+            if spending is None:
+                spending = read_settings(self.settings_path)
+            parameters = parameters_for(settings, notification, network.vpc, spending)
+            yield self._preparation_bundle(settings, parameters, TEMPLATE.read_bytes(), decision, resources)
+
+    def prepare(self) -> PreparedDeployment:
+        with (self._require_account_stack('prepare'),
+              self._prepare_foundation('prepare', lambda settings: self._deployment_network(settings, self._api(settings)),
+                                       self._parameters) as bundle):
+            return bundle.save()
 
     def _stack(self, settings: DeploymentSettings, *, require_outputs: bool = False) -> dict[str, str]:
+        stack = self._read_stack(settings)
+        return self._stack_outputs(stack, require_outputs=require_outputs) if stack else {}
+
+    def _read_stack(self, settings: DeploymentSettings) -> dict[str, object]:
         try:
             row = self._api(settings).call('describe-stacks', '--stack-name', settings.stack_name, service='cloudformation')
         except AwsUnavailable as error:
@@ -2110,7 +2353,7 @@ class Deployment:
         if (saved.get('stack_id') and saved.get('stack') == settings.stack_name
                 and stack.get('StackId') != saved['stack_id']):
             raise DeploymentRefused('the live StackId differs from the deployment record')
-        return self._stack_outputs(stack, require_outputs=require_outputs)
+        return stack
 
     @staticmethod
     def _stack_outputs(stack: dict[str, object], *, require_outputs: bool) -> dict[str, str]:
@@ -2129,7 +2372,7 @@ class Deployment:
             raise DeploymentRefused('The existing Hana stack has no outputs. Reconcile it before setup.')
         return outputs
 
-    def _validate_inputs(self, settings: DeploymentSettings) -> None:
+    def _validate_image(self, settings: DeploymentSettings) -> None:
         reply = self._api(settings).call('describe-images', '--image-ids', settings.ami_id,
                            '--owners', settings.ami_owner_id)
         images = ledger.rows(reply, 'Images')
@@ -2142,9 +2385,12 @@ class Deployment:
                 or settings.nixos_release not in str(image.get('Name', ''))
                 or image.get('RootDeviceName') != settings.root_device_name):
             raise DeploymentRefused('the image identity, release, architecture or root device does not match')
-        subnet = self._api(settings).call('describe-subnets', '--subnet-ids', settings.subnet_id)
+
+    def _validate_inputs(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
+        self._validate_image(settings)
+        subnet = self._api(settings).call('describe-subnets', '--subnet-ids', parameters['SubnetId'])
         rows = ledger.rows(subnet, 'Subnets')
-        if len(rows) != 1 or rows[0].get('VpcId') != settings.vpc_id or rows[0].get('AvailabilityZone') != settings.availability_zone:
+        if len(rows) != 1 or rows[0].get('VpcId') != parameters['VpcId'] or rows[0].get('AvailabilityZone') != settings.availability_zone:
             raise DeploymentRefused('the subnet does not match the VPC and availability zone')
 
     @staticmethod
@@ -2281,33 +2527,55 @@ class Deployment:
         self._save_scaler_identity(settings)
         outputs = self._stack(settings)
         saved = deployment_record(self.directory)
-        saved['outputs'] = {**ledger.mapping(saved.get('outputs', {})), **outputs}
-        if outputs.get('BudgetName'):
-            saved['budget_name'] = outputs['BudgetName']
-        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+        save_deployment_record(self.directory, merge_foundation_outputs(saved, outputs))
+
+    def _prepared_preflight(self) -> dict[str, object]:
+        try:
+            for name in ('template.json', 'parameters.json'):
+                if not (self.output / name).is_file():
+                    raise FileNotFoundError(name)
+            preflight = remote.read_record(self.output / 'preflight.json')
+            digest = ledger.text(preflight, 'fingerprint')
+            _ = ledger.instant(preflight, 'at')
+            if re.fullmatch(r'[a-f0-9]{64}', digest):
+                return preflight
+        except (OSError, ValueError):
+            pass
+        raise PreparationRequired()
+
+    def _prepared_deployment_id(self) -> str:
+        try:
+            parameters = cast(object, json.loads((self.output / 'parameters.json').read_text()))
+            return ledger.text(stack_parameter_values({'Parameters': parameters}), 'DeploymentId')
+        except (OSError, ValueError):
+            raise PreparationRequired() from None
 
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
         current = read_deployment_settings(self.settings_path)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
-        current_parameters = self._parameters(current, notification)
+        current_parameters = self._parameters(current, notification, parameters['VpcId'], read_settings(self.settings_path))
         self.confirm_preparation_evidence(settings, parameters, TEMPLATE.read_bytes(), renew=renew,
             current_fingerprint=fingerprint(current, current_parameters, TEMPLATE.read_bytes()))
 
     def confirm_preparation_evidence(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
                                     *, renew: bool = False, current_fingerprint: str = '', allow_expired: bool = False) -> None:
         """Verify saved preparation before either workload can create resources."""
-        preflight = remote.read_record(self.output / 'preflight.json')
-        at = ledger.instant(preflight, 'at')
+        preflight = self._read_preparation_evidence(self.output, settings, template, renew=renew, allow_expired=allow_expired)
         expected = current_fingerprint or fingerprint(settings, parameters, template)
-        age = int(self.clock()) - at
-        if ((not renew and (age < 0 or (not allow_expired and age > settings.preflight_max_age_s)))
-                or preflight.get('fingerprint') != expected
-                or fingerprint(settings, parameters, template) != expected
-                or (self.output / 'template.json').read_bytes() != template):
+        if preflight.get('fingerprint') != expected or fingerprint(settings, parameters, template) != expected:
             raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
         if renew:
             preflight['at'] = int(self.clock())
             write_text_atomic(self.output / 'preflight.json', json.dumps(preflight, sort_keys=True) + '\n')
+
+    def _read_preparation_evidence(self, output: Path, settings: DeploymentSettings, template: bytes, *,
+                                   renew: bool = False, allow_expired: bool = False) -> dict[str, object]:
+        preflight = remote.read_record(output / 'preflight.json')
+        age = int(self.clock()) - ledger.instant(preflight, 'at')
+        if ((not renew and (age < 0 or (not allow_expired and age > settings.preflight_max_age_s)))
+                or (output / 'template.json').read_bytes() != template):
+            raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
+        return preflight
 
     def _authorize(self, approve_resources: bool) -> None:
         if isinstance(self.mode, plan_run.PlanRun):
@@ -2341,7 +2609,7 @@ class Deployment:
                         raise DeploymentRefused('delete the old stack before replacement')
                 elif not stack:
                     raise DeploymentRefused('use a new stack_name to preserve the retained Budget')
-            self._validate_inputs(settings)
+            self._validate_image(settings)
             if not stack:
                 self._deploy(settings, parameters)
                 stack = self._stack(settings)
@@ -2351,8 +2619,8 @@ class Deployment:
             self._deploy(settings, parameters)
             outputs = self._stack(settings)
             saved = deployment_record(self.directory)
-            saved['fingerprint'] = fingerprint(settings, parameters, TEMPLATE.read_bytes())
-            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            digest = ledger.text(self._prepared_preflight(), 'fingerprint')
+            save_deployment_record(self.directory, prepared_foundation_record(saved, outputs, digest))
             self.scaler_key()
             return outputs
 
@@ -2583,16 +2851,9 @@ class Deployment:
     def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str,
                          *, home_image: dict[str, object] | None = None) -> RegionalNetwork:
         """Read the default VPC and public subnets of a gate region, and find or copy its gate image."""
-        target = api.in_region(region)
-        vpcs = ledger.rows(target.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
-        if not vpcs:
-            raise DeploymentRefused(region + ': no default VPC is available')
-        vpc = ledger.text(vpcs[0], 'VpcId')
-        try:
-            subnets = gate_subnets(target, vpc)
-        except DeploymentRefused as error:
-            raise DeploymentRefused(region + ': ' + str(error)) from error
-        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region, home_image=home_image))
+        network = resolve_deployment_network(api.in_region(region), {})
+        return RegionalNetwork(region, network.vpc, network.subnets,
+                               self.regional_image(api, settings, region, home_image=home_image))
 
     def _regional_gate_values(self, settings: DeploymentSettings, parameters: dict[str, str],
                               network: RegionalNetwork, deployment: str, profile: str) -> dict[str, str]:
@@ -2613,7 +2874,7 @@ class Deployment:
         template_text = json.dumps(definition, sort_keys=True) + '\n'
         definitions = ledger.mapping(definition['Parameters'])
         values = {key: value for key, value in values.items() if key in definitions}
-        name = settings.stack_name + '-gates-' + region
+        name = regional_gate_stack_name(settings.stack_name, region)
         digest = sha256(json.dumps({
             'template': template_text, 'name': name, 'parameters': values,
         }, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -2648,8 +2909,8 @@ class Deployment:
                 raise AwsUnavailable('\n'.join([f'{region}: {error}', *failed_stack_events(target, name, started)])) from error
             stack = ledger.rows(target.call('describe-stacks', '--stack-name', name, service='cloudformation'), 'Stacks')[0]
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')}
-        result: dict[str, object] = {'region': region, 'image': network.image, 'subnets': network.subnets, 'template': outputs['GateLaunchTemplate'],
-                'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'], 'stack': name}
+        result = gate_launch_region(region, network.image, network.subnets, outputs)
+        result['stack'] = name
         if not unchanged:
             entry = regional_stack_digest(digest, stack)
             if entry:
@@ -2661,7 +2922,9 @@ class Deployment:
         """Print regional Spot prices without resource identities."""
         settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
+        # start time: loaded only by the Spot prices command
         from scripts.aws_target import cloud_gate
+
         values = cloud_gate.settings()
         configured_types = values.words('instance_types')
         largest = largest_gate_vcpus(configured_types)
@@ -2703,7 +2966,9 @@ class Deployment:
 
     def quota_status(self) -> bool:
         """Read regional Spot quotas with the plan identity."""
+        # start time: loaded only by quota-status
         from scripts.aws_target import gpu_size_trial
+
         plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
         _ = plan.credential
         settings = read_deployment_settings(self.settings_path)
@@ -2770,7 +3035,9 @@ class Deployment:
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
         """Check terminal approval and start the scaler service."""
+        # start time: loaded only by gpu-size-trial
         from scripts.aws_target import cloud_gate, gpu_size_trial
+
         self._authorize(approve_resources)
         limits = gpu_size_trial.settings()
         timeout = (limits.lifetime_minutes * 60 * (len(limits.spot_max_usd_per_hour) + 2)
@@ -2788,6 +3055,7 @@ class Deployment:
             self._gate_plan_locked(self.mode)
 
     def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
+        # Load these modules only when planning gate setup.
         from scripts.aws_target import cloud_gate, gpu_size_trial
 
         settings = read_deployment_settings(self.settings_path)
@@ -2816,7 +3084,6 @@ class Deployment:
                                for row in ledger.rows(stack, 'Parameters')}
             if (not re.fullmatch(r'[a-f0-9]{32}', deployment)
                     or live_parameters.get('DeploymentId') != deployment
-                    or live_parameters.get('VpcId') != settings.vpc_id
                     or live_parameters.get('ScalerUserName') != settings.scaler_user_name
                     or outputs.get('ScalerUserName') != settings.scaler_user_name):
                 raise DeploymentRefused('The home gate deployment parameters differ from the saved identity.')
@@ -2854,15 +3121,18 @@ class Deployment:
         for region in regions:
             try:
                 if region == settings.region:
-                    networks[region] = RegionalNetwork(region, settings.vpc_id, gate_subnets(api, settings.vpc_id),
-                                                       settings.ami_id)
+                    network = resolve_deployment_network(api, stack)
+                    _ = network.subnet_in(settings.availability_zone)
+                    networks[region] = RegionalNetwork(region, network.vpc, network.subnets, settings.ami_id)
                 else:
                     networks[region] = self.regional_network(api, settings, region, home_image=home_image)
             except plan_run.PLAN_ERRORS as error:
                 failures[region] = plan_run.safe_reason(error)
 
         try:
-            parameters = gate_parameters(settings, values, owner.partition, owner.account,
+            if settings.region not in networks:
+                raise DeploymentNetworkUnavailable(failures[settings.region])
+            parameters = gate_parameters(settings, networks[settings.region].vpc, values, owner.partition, owner.account,
                                          [networks[region] for region in regions[1:] if region in networks], gpu_types)
             proposed = live_parameters | parameters
             regional_template = region_gate_template()
@@ -2901,7 +3171,7 @@ class Deployment:
                         change_kind = preview.summary
                     regional_outputs = outputs
                 else:
-                    name = settings.stack_name + '-gates-' + region
+                    name = regional_gate_stack_name(settings.stack_name, region)
                     regional = plan.gate_stack(target, name)
                     if regional.get('StackStatus') == 'ROLLBACK_COMPLETE':
                         change_kind = 'permissions passed; approved setup must recreate the rolled-back stack'
@@ -2962,7 +3232,9 @@ class Deployment:
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
+        # Load these modules only when setting up gates.
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
+
         self._authorize(approve_resources)
         with self._require_account_stack('up --workload merge-gates'):
             gate_probe.invalidate_record(self.directory)
@@ -2974,7 +3246,8 @@ class Deployment:
             _ = self._stack(settings)
             stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
                                        service='cloudformation'), 'Stacks')[0]
-            subnets = gate_subnets(api, settings.vpc_id)
+            network = resolve_deployment_network(api, stack)
+            _ = network.subnet_in(settings.availability_zone)
             revision = aws_trial.host_nixpkgs_revision()
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
@@ -2990,7 +3263,7 @@ class Deployment:
             comparison_caps = gpu_size_trial.settings().spot_max_usd_per_hour
             gpu_types = sorted(comparison_caps.keys() | set(values.words('hana_gpu_instance_types')))
             gpu_caps = comparison_caps | gpu_size_trial.price_caps(values.text('hana_gpu_spot_max_usd_per_hour'))
-            parameters = gate_parameters(settings, values, partition, account, networks, gpu_types)
+            parameters = gate_parameters(settings, network.vpc, values, partition, account, networks, gpu_types)
             book = ledger.CostLedger(self.directory)
             inventory = book.read_snapshot().inventories
             resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
@@ -3007,16 +3280,9 @@ class Deployment:
                     self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
             deployment_id = ledger.text(saved, 'deployment_id')
-            home: dict[str, object] = {'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
-                'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
-                'security_group': outputs['GateSecurityGroup']}
-            manifest: dict[str, object] = {
-                'deployment_id': deployment_id, 'revision': revision,
-                'instance_types': values.words('instance_types'),
-                'gpu_instance_types': gpu_types,
-                'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
-                'regions': [home],
-            }
+            home = gate_launch_region(settings.region, settings.ami_id, network.subnets, outputs)
+            manifest = gate_launch_manifest(deployment_id, revision, values.words('instance_types'), gpu_types,
+                                            outputs, [home])
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
             timings.announce(GateRegionOperation.STACK, additional)
@@ -3031,6 +3297,81 @@ class Deployment:
             scaler_arn = f"arn:{partition}:iam::{account}:user/{outputs['ScalerUserName']}"
             return self._probe_gate_gpu(settings, values, manifest, gpu_caps, admin_api=api,
                                         scaler_arn=scaler_arn, partition=partition, account_id=account)
+
+    def recover(self, *, write: bool = False) -> bool:
+        """Restore the deployment records from complete stacks through the plan identity."""
+        from scripts.aws_target import aws_trial
+
+        settings = conf.read(self.settings_path)
+        home = settings.text('region', recover_invalid=False)
+        name = settings.text('stack_name', recover_invalid=False)
+        timeout = settings.value('deployment_timeout_s', positive_seconds, recover_invalid=False)
+        regions = gate_regions(home)
+        plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
+        with self._require_account_stack('recover'):
+            preflight = self._prepared_preflight()
+            prepared_deployment_id = self._prepared_deployment_id()
+            owner = plan.credential.owner
+            api = plan.api(home, timeout)
+            with recovery_stack_evidence(home, name):
+                stack = read_recovery_stack(plan, api, name)
+                stack_id = ledger.text(stack, 'StackId')
+                parameters = stack_parameter_values(stack)
+                outputs = self._stack_outputs(stack, require_outputs=False)
+                deployment = ledger.text(parameters, 'DeploymentId')
+                if not re.fullmatch(r'[a-f0-9]{32}', deployment):
+                    raise IncompleteRecoveryStack(f'Stack {name} in {home} has no valid deployment identity.')
+                identity = recover_scaler_identity(api, owner, stack_id, outputs)
+                budget_name = ledger.text(outputs, 'BudgetName')
+                try:
+                    saved = deployment_record(self.directory)
+                except ValueError:
+                    saved = {}
+                foundation = saved if saved.get('stack_id') == stack_id else {}
+                foundation.update(account_id=owner.account, region=home, stack=name, stack_id=stack_id,
+                                  deployment_id=deployment, scaler_user=identity, budget_name=budget_name)
+                if parameters.get('BudgetName'):
+                    _ = foundation.setdefault('preserve_budget_name', True)
+                home_network = resolve_deployment_network(api, stack)
+                launch_regions = [recover_gate_region(home_network, parameters, outputs)]
+                types = recovery_instance_types(ledger.text(parameters, 'GateInstanceTypes'))
+                if not types:
+                    raise IncompleteRecoveryStack(f'Stack {name} in {home} has no gate instance types.')
+                gpu_types = recovery_instance_types(parameters['GateGpuInstanceTypes'])
+                _ = ledger.text(outputs, 'GateBucket'), ledger.text(outputs, 'GateRoleId')
+                profile = ledger.text(outputs, 'GateProfileArn')
+            for region in regions[1:]:
+                regional_name = regional_gate_stack_name(name, region)
+                target = api.in_region(region)
+                with recovery_stack_evidence(region, regional_name):
+                    stack = read_recovery_stack(plan, target, regional_name)
+                    parameters = stack_parameter_values(stack)
+                    if parameters.get('DeploymentId') != deployment or parameters.get('HomeGateProfileArn') != profile:
+                        raise IncompleteRecoveryStack(f'Stack {regional_name} in {region} belongs to a different deployment.')
+                    regional_outputs = self._stack_outputs(stack, require_outputs=False)
+                    network = resolve_deployment_network(target, stack)
+                    launch = recover_gate_region(network, parameters, regional_outputs)
+                    launch['stack'] = regional_name
+                    launch_regions.append(launch)
+            revision = aws_trial.host_nixpkgs_revision()
+            print(f'nixpkgs revision from host lock {aws_trial.NIXOS_LOCK} is {revision}.')
+            manifest = gate_launch_manifest(deployment, revision, types, gpu_types, outputs, launch_regions)
+            if prepared_deployment_id == deployment:
+                record = prepared_foundation_record(foundation, outputs, ledger.text(preflight, 'fingerprint'))
+                return save_recovered_deployment(self.directory, record, manifest, {}, write=write)
+
+            print('The preparation bundle has a different deployment ID.')
+            if not write:
+                print('Run deploy.py recover --write to replace the preparation bundle and deployment records.')
+                return False
+
+            def parameters_for(settings: DeploymentSettings, notification: BudgetNotificationAddress,
+                               vpc: str, spending: SpendingSettings) -> dict[str, str]:
+                return self._foundation_parameters(settings, notification, deployment, foundation, vpc, spending)
+
+            with self._prepare_foundation('recover', lambda _settings: home_network, parameters_for) as bundle:
+                record = prepared_foundation_record(foundation, outputs, bundle.prepared.fingerprint)
+                return save_recovered_deployment(self.directory, record, manifest, bundle.files, write=write)
 
     def _gate_scaler_api(self, settings: DeploymentSettings, timeout: float) -> AwsCli:
         # Use the GPU worker's profile and credential file without inherited admin credentials.
@@ -3050,6 +3391,7 @@ class Deployment:
     def _probe_gate_gpu(self, settings: DeploymentSettings, values: conf.ConfigRead, manifest: dict[str, object],
                         caps: dict[str, Decimal], *, admin_api: AwsCli, scaler_arn: str,
                         partition: str, account_id: str) -> bool:
+        # start time: loaded only by the GPU setup probe
         from scripts.aws_target import gpu_size_trial
 
         api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
@@ -3254,11 +3596,205 @@ class Deployment:
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
 
-def gate_parameters(settings: DeploymentSettings, values: conf.ConfigRead, partition: str, account: str,
+def merge_foundation_outputs(saved: dict[str, object], outputs: dict[str, str]) -> dict[str, object]:
+    record = {**saved, 'outputs': {**ledger.mapping(saved.get('outputs', {})), **outputs}}
+    if outputs.get('BudgetName'):
+        record['budget_name'] = outputs['BudgetName']
+    return record
+
+
+def prepared_foundation_record(saved: dict[str, object], outputs: dict[str, str], digest: str) -> dict[str, object]:
+    return {**merge_foundation_outputs(saved, outputs), 'fingerprint': digest}
+
+
+def scaler_identity(api: AwsCli, name: str) -> dict[str, str]:
+    user = ledger.mapping(api.call('get-user', '--user-name', name, service='iam').get('User'))
+    return {'name': name, 'arn': ledger.text(user, 'Arn'), 'user_id': ledger.text(user, 'UserId')}
+
+
+def regional_gate_stack_name(home_stack: str, region: str) -> str:
+    return f'{home_stack}-gates-{region}'
+
+
+def gate_launch_region(region: str, image: str, subnets: list[dict[str, object]],
+                       outputs: dict[str, str]) -> dict[str, object]:
+    return {'region': region, 'image': image, 'subnets': subnets, 'template': outputs['GateLaunchTemplate'],
+            'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup']}
+
+
+def gate_launch_manifest(deployment: str, revision: str, types: Sequence[str], gpu_types: Sequence[str],
+                         outputs: dict[str, str], launch_regions: list[dict[str, object]]) -> dict[str, object]:
+    return {'deployment_id': deployment, 'revision': revision, 'instance_types': list(types),
+            'gpu_instance_types': list(gpu_types), 'bucket': outputs['GateBucket'],
+            'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':', 'regions': launch_regions}
+
+
+@contextmanager
+def recovery_stack_evidence(region: str, name: str) -> Generator[None]:
+    _ = plan_identity.PlanStack(region, name)
+    try:
+        yield
+    except plan_run.GateStackAbsent:
+        raise MissingRecoveryStack(f'Stack {name} in {region} does not exist.') from None
+    except IncompleteRecoveryStack:
+        raise
+    except (AwsUnavailable, plan_run.PlanRefused):
+        raise RecoveryStackRefused(f'Could not confirm stack {name} in {region}.') from None
+    except (KeyError, ValueError):
+        raise IncompleteRecoveryStack(f'Stack {name} in {region} lacks complete recovery evidence.') from None
+
+
+def read_recovery_stack(plan: plan_run.PlanRun, api: AwsCli, name: str) -> dict[str, object]:
+    stack = plan.gate_stack(api, name)
+    if stack.get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
+        raise IncompleteRecoveryStack(f'Stack {name} in {api.region} is incomplete.')
+    return stack
+
+
+def stack_parameter_values(stack: dict[str, object]) -> dict[str, str]:
+    parameters: dict[str, str] = {}
+    for row in ledger.rows(stack, 'Parameters'):
+        key = ledger.text(row, 'ParameterKey')
+        value = row.get('ParameterValue')
+        if not isinstance(value, str) or key in parameters:
+            raise ValueError('Expected one text value for each stack parameter.')
+        parameters[key] = value
+    return parameters
+
+
+def recovery_instance_types(value: str) -> list[str]:
+    return [size.strip() for size in value.split(',') if size.strip()]
+
+
+def recover_scaler_identity(api: AwsCli, owner: plan_identity.PlanAccount, stack_id: str,
+                            outputs: dict[str, str]) -> dict[str, str]:
+    name = ledger.text(outputs, 'ScalerUserName')
+    reply = api.call('describe-stack-resources', '--stack-name', stack_id, service='cloudformation')
+    users = [row for row in ledger.rows(reply, 'StackResources') if row.get('LogicalResourceId') == 'ScalerUser']
+    if (len(users) != 1 or users[0].get('ResourceType') != 'AWS::IAM::User'
+            or users[0].get('PhysicalResourceId') != name):
+        raise ValueError('CloudFormation did not confirm the scaler user.')
+    identity = scaler_identity(api, name)
+    if identity['arn'] != owner.iam('user/' + name):
+        raise ValueError('IAM did not confirm the scaler identity.')
+    return identity
+
+
+def recover_gate_region(network: DeploymentNetwork, parameters: dict[str, str],
+                        outputs: dict[str, str]) -> dict[str, object]:
+    for key in ('GateLaunchTemplate', 'GateLaunchVersion', 'GateSecurityGroup'):
+        _ = ledger.text(outputs, key)
+    return gate_launch_region(network.region, ledger.text(parameters, 'GateImage'), network.subnets, outputs)
+
+
+FOUNDATION_RECOVERY_FIELDS = {'account_id': 'account', 'region': 'home region', 'stack': 'stack name',
+    'stack_id': 'stack identity', 'deployment_id': 'deployment identity', 'outputs': 'stack outputs',
+    'scaler_user': 'scaler user', 'budget_name': 'Budget name', 'preserve_budget_name': 'Budget name retention',
+    'fingerprint': 'preparation fingerprint'}
+GATE_RECOVERY_FIELDS = {'deployment_id': 'deployment identity', 'revision': 'nixpkgs revision',
+    'instance_types': 'instance types', 'gpu_instance_types': 'GPU instance types', 'bucket': 'artifact bucket',
+    'artifact_prefix': 'artifact prefix', 'regions': 'regional launch settings'}
+
+
+@dataclass(frozen=True)
+class MissingRecoveryRecord:
+    pass
+
+
+@dataclass(frozen=True)
+class MatchingRecoveryRecord:
+    pass
+
+
+@dataclass(frozen=True)
+class ChangedRecoveryRecord:
+    fields: tuple[str, ...]
+
+
+type RecoveryRecordComparison = MissingRecoveryRecord | MatchingRecoveryRecord | ChangedRecoveryRecord
+
+
+def review_recovery_record(path: Path, recovered: dict[str, object],
+                           fields: dict[str, str]) -> RecoveryRecordComparison:
+    try:
+        saved = remote.read_record(path)
+    except FileNotFoundError:
+        return MissingRecoveryRecord()
+    except ValueError:
+        return ChangedRecoveryRecord(('record format',))
+    if saved == recovered:
+        return MatchingRecoveryRecord()
+    changed_keys = (saved.keys() ^ recovered.keys()) | {
+        key for key in saved.keys() & recovered.keys() if saved[key] != recovered[key]}
+    changes = tuple(label for key, label in fields.items() if key in changed_keys)
+    if changed_keys - fields.keys():
+        changes += ('other record fields',)
+    return ChangedRecoveryRecord(changes)
+
+
+def publish_recovery_records(records: dict[Path, str]) -> None:
+    """Stage each replacement and restore the prior files if publication fails."""
+    with ExitStack() as staging:
+        replacements: list[tuple[Path, Path, Callable[[], None]]] = []
+        for path, content in records.items():
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+                previous = path.read_bytes()
+            except FileNotFoundError:
+                mode = 0o600
+                restore = lambda path=path: path.unlink(missing_ok=True)
+            else:
+                backup = staging.enter_context(prepared_replacement(path, previous, mode=mode))
+                restore = lambda path=path, backup=backup: os.replace(backup, path)
+            replacement = staging.enter_context(prepared_replacement(path, content, mode=mode))
+            replacements.append((path, replacement, restore))
+
+        with ExitStack() as rollback:
+            folders = dict.fromkeys(path.parent for path in records)
+            for folder in folders:
+                _ = rollback.callback(sync_folder, folder)
+            for path, replacement, restore in replacements:
+                os.replace(replacement, path)
+                _ = rollback.callback(restore)
+            for folder in folders:
+                sync_folder(folder)
+            _ = rollback.pop_all()
+
+
+def save_recovered_deployment(directory: Path, foundation: dict[str, object], manifest: dict[str, object],
+                              preparation_files: dict[Path, str], *, write: bool) -> bool:
+    foundation_path = directory / 'deployment.json'
+    manifest_path = directory / 'gate-deployment.json'
+    proposed = ((foundation_path, foundation, FOUNDATION_RECOVERY_FIELDS),
+                (manifest_path, manifest, GATE_RECOVERY_FIELDS))
+    records = dict(preparation_files)
+    differs = False
+    for path, record, fields in proposed:
+        match review_recovery_record(path, record, fields):
+            case MissingRecoveryRecord():
+                print(f'{path.name} is missing.')
+            case MatchingRecoveryRecord():
+                print(f'{path.name} already matches.')
+                continue
+            case ChangedRecoveryRecord(changed_fields):
+                print(f'{path.name} differs in ' + ', '.join(changed_fields) + '.')
+                differs = True
+        records[path] = remote.record_text(record)
+    if differs and not write:
+        print('Run deploy.py recover --write to replace the deployment records.')
+        return False
+    if records:
+        publish_recovery_records(records)
+        for path in records:
+            print(f'Saved {path.name}.')
+    return True
+
+
+def gate_parameters(settings: DeploymentSettings, home_vpc: str, values: conf.ConfigRead, partition: str, account: str,
                     networks: list[RegionalNetwork], gpu_types: list[str]) -> dict[str, str]:
     return {
         'EnableGates': 'true', 'GateImage': settings.ami_id,
-        'GateVpcs': ','.join([f'arn:{partition}:ec2:{settings.region}:{account}:vpc/{settings.vpc_id}',
+        'GateVpcs': ','.join([f'arn:{partition}:ec2:{settings.region}:{account}:vpc/{home_vpc}',
                               *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
         'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
         'GateInstanceTypes': ','.join(values.words('instance_types')),
@@ -3355,10 +3891,32 @@ def describe_regional_stack(api: AwsCli, stack: str) -> dict[str, object]:
     try:
         stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack, service='cloudformation'), 'Stacks')
     except AwsUnavailable as error:
-        if 'does not exist' in str(error):
+        if 'ValidationError' in str(error) and 'does not exist' in str(error):
             return {}
         raise
     return stacks[0] if stacks else {}
+
+
+def resolve_deployment_network(api: AwsCli, foundation: dict[str, object]) -> DeploymentNetwork:
+    """Use the foundation VPC when present and the default VPC otherwise."""
+    parameters = ledger.rows(foundation, 'Parameters') if 'Parameters' in foundation else ()
+    vpc = next((row.get('ParameterValue') for row in parameters if row.get('ParameterKey') == 'VpcId'), '')
+    if isinstance(vpc, str) and vpc:
+        return DeploymentNetwork(api.region, vpc, gate_subnets(api, vpc))
+    if foundation:
+        if foundation.get('StackStatus') != 'REVIEW_IN_PROGRESS':
+            raise DeploymentNetworkUnavailable(f'{api.region}: the foundation stack has no VpcId parameter')
+        outputs = ledger.rows(foundation, 'Outputs') if 'Outputs' in foundation else ()
+        vpc = next((row.get('OutputValue') for row in outputs if row.get('OutputKey') == 'VpcId'), '')
+        if isinstance(vpc, str) and vpc:
+            return DeploymentNetwork(api.region, vpc, gate_subnets(api, vpc))
+    vpcs = ledger.rows(api.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
+    if not vpcs:
+        raise DeploymentNetworkUnavailable(f'{api.region}: no default VPC is available')
+    if len(vpcs) != 1:
+        raise DeploymentNetworkUnavailable(f'{api.region}: multiple default VPCs are available')
+    vpc = ledger.text(vpcs[0], 'VpcId')
+    return DeploymentNetwork(api.region, vpc, gate_subnets(api, vpc))
 
 
 def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
@@ -3382,7 +3940,7 @@ def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
             zone = ledger.text(subnet, 'AvailabilityZone')
             _ = zones.setdefault(zone, {'zone': zone, 'id': ledger.text(subnet, 'SubnetId')})
     if not zones:
-        raise DeploymentRefused('The gate VPC has no available public subnet')
+        raise DeploymentNetworkUnavailable(f'{api.region}: the VPC has no available public subnet')
     return [zones[zone] for zone in sorted(zones)]
 
 
@@ -3397,6 +3955,7 @@ class DeploymentArguments(argparse.Namespace):
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
         self.approve_release: bool = False
+        self.write: bool = False
         self.plan: bool = False
         self.check: bool = False
         self.trial_action: str | None = None
@@ -3430,13 +3989,15 @@ def run_setup_plan(args: DeploymentArguments) -> int:
 
 def main() -> int:
     if sys.argv[1:2] == ['aws-trial']:
+        # start time: loaded only by aws-trial
         from scripts.aws_target import aws_trial
+
         os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         settings_path = conf.path('aws_target')
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__, epilog=aws_test_identity.CONSOLE_SETUP)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'probe-status', 'prepare', 'hana-setup', 'hana-image', 'hana-release-unknown-stop', 'apply', 'plan-identity', 'test-identity'),
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'probe-status', 'prepare', 'hana-setup', 'hana-image', 'hana-release-unknown-stop', 'apply', 'plan-identity', 'test-identity', 'recover'),
                             help='Use quota-status to read Spot quotas with the plan key. Use quota-request to request increases with the admin key.')
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
@@ -3450,7 +4011,10 @@ def main() -> int:
     _ = parser.add_argument('--approve-release', action='store_true', help='Save an approved release of a Hana unknown stop.')
     _ = parser.add_argument('--plan', action='store_true', help='Check setup with the AWS plan identity.')
     _ = parser.add_argument('--check', action='store_true', help='Verify the saved plan or test identity without a prompt.')
+    _ = parser.add_argument('--write', action='store_true', help='Replace deployment records that differ during recover.')
     args = parser.parse_args(namespace=DeploymentArguments())
+    if args.write and args.command != 'recover':
+        parser.error('Use --write with recover.')
     if args.command == 'test-identity':
         if args.plan:
             parser.error('Use test-identity without --plan.')
@@ -3461,6 +4025,20 @@ def main() -> int:
         return plan_identity.command_check(args.settings)
     if args.plan:
         return run_setup_plan(args)
+    if args.command == 'recover':
+        if args.workload not in ('rust', 'merge-gates') or args.approve_resources or args.approve_destroy or args.approve_release:
+            from scripts.lib.build_steps import read_step_names
+
+            gate = read_step_names().shown('merge-gate')
+            parser.error(f'Use recover for {gate} deployment records. Omit resource approval flags.')
+        subject = Deployment(args.settings, args.directory, args.output)
+        try:
+            return 0 if subject.recover(write=args.write) else 1
+        except (DeploymentRefused, plan_identity.PlanIdentityRefused) as error:
+            print('recover: ' + plan_run.safe_reason(error), file=sys.stderr)
+        except (KeyError, OSError, ValueError):
+            print('recover: Could not read the local settings or restore the deployment records.', file=sys.stderr)
+        return 1
     if args.command == 'probe-status':
         gate_probe.print_status(args.directory, now=datetime.now(UTC))
         return 0

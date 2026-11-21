@@ -14,7 +14,7 @@ from typing import cast, override
 from unittest import mock
 from urllib.parse import urlsplit
 
-from scripts.aws_target import hana_protocol
+from scripts.aws_target import hana_protocol, hana_execution, hana_result, test_hana_execution
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
@@ -144,7 +144,6 @@ class HanaProviderTests(CostFixture):
             self.assertIsInstance(result, box.OperationAccepted)
         descriptor = ledger.mapping(cast(object, json.loads(base64.b64decode(self.fake.userdata))))
         self.assertEqual(descriptor['start_token'], start.token)
-        from scripts.aws_target import test_hana_execution
 
         key = test_hana_execution.HanaExecutionTests().key
         key = replace(key, generation=replace(key.generation, deployment=IDENTITY.deployment, start_token=start.token))
@@ -211,9 +210,7 @@ class HanaProviderTests(CostFixture):
         self.assertEqual([op for _, op, _ in self.fake.calls].count('stop-instances'), 2)
 
     def test_execution_objects_use_the_exact_boot_and_scoped_policy(self) -> None:
-        from scripts.aws_target import test_hana_execution as fixtures
-
-        fixture = fixtures.HanaExecutionTests()
+        fixture = test_hana_execution.HanaExecutionTests()
         request = fixture.request
         access = self.provider.execution_access(request.key)
         envelope = hana_protocol.HanaCommandEnvelope(request,
@@ -234,13 +231,11 @@ class HanaProviderTests(CostFixture):
                             for _, operation, _ in self.fake.calls))
 
     def test_result_download_uses_its_own_limit_and_reports_a_timeout(self) -> None:
-        from scripts.aws_target import hana_result, test_hana_execution as fixtures
-
         _ = (self.state / 'hana').mkdir()
         _ = (self.state / 'hana' / 'setup.json').write_text('{"bucket":"fixture-bucket"}')
         subject = provider.AwsHanaProvider.from_settings(self.settings, self.state, self.workload, execute=self.fake,
             credentials_file=lambda: self.root / 'private-credentials')
-        fixture = fixtures.HanaExecutionTests()
+        fixture = test_hana_execution.HanaExecutionTests()
         access = subject.execution_access(fixture.key)
         result_key = urlsplit(access.result_url).path.lstrip('/')
         document = hana_result.encode_result(fixture.command_result())
@@ -264,11 +259,9 @@ class HanaProviderTests(CostFixture):
                     self.assertIn('83 s (result_transfer_timeout_s)', str(failure.exception))
 
     def test_fence_put_errors_require_acknowledgement_or_window_expiry(self) -> None:
-        from scripts.aws_target import hana_execution as execution, test_hana_execution as fixtures
-
         for response, saved in (('timeout', True), ('403', False), ('AccessDenied', False), ('AccessDenied', True)):
             with self.subTest(response=response, saved=saved):
-                fixture = fixtures.HanaExecutionTests()
+                fixture = test_hana_execution.HanaExecutionTests()
                 fixture.root = self.root / f'{response}-{saved}'
                 _ = fixture.dispatch()
                 access = self.provider.execution_access(fixture.key)
@@ -295,28 +288,26 @@ class HanaProviderTests(CostFixture):
                         self.fake.objects[observation_key] = ledger.mapping(
                             cast(object, json.loads(hana_protocol.encode_observation(observation))))
 
-                window = execution.FenceAcknowledgementWindow(1002.5, 1)
+                window = hana_execution.FenceAcknowledgementWindow(1002.5, 1)
                 with (mock.patch.object(time, 'monotonic', side_effect=lambda: current),
                       mock.patch.object(time, 'sleep', side_effect=advance)):
-                    settled = execution.settle_execution(fixture.root, fixture.request, self.provider,
+                    settled = hana_execution.settle_execution(fixture.root, fixture.request, self.provider,
                         release_claim=fixture.release, reason='The remote attempt ended', fence_window=window)
                 operations = [operation for service, operation, _ in self.fake.calls if service == 's3api']
                 if saved:
-                    self.assertIsInstance(settled, execution.HanaSettled)
+                    self.assertIsInstance(settled, hana_execution.HanaSettled)
                     self.assertEqual(current, 1001)
                     self.assertEqual(fixture.releases, 1)
                     self.assertEqual(operations, ['put-object', 'get-object', 'get-object'])
                 else:
-                    self.assertIsInstance(settled, execution.HanaSettlementPending)
+                    self.assertIsInstance(settled, hana_execution.HanaSettlementPending)
                     self.assertEqual(current, window.deadline)
                     self.assertEqual(fixture.releases, 0)
                     self.assertEqual(operations, ['put-object', 'get-object', 'get-object', 'get-object'])
-                    self.assertTrue(execution.claim_dispatch_pending(fixture.root, fixture.reference))
+                    self.assertTrue(hana_execution.claim_dispatch_pending(fixture.root, fixture.reference))
 
     def test_execution_observation_rejects_oversized_objects(self) -> None:
-        from scripts.aws_target import test_hana_execution as fixtures
-
-        fixture = fixtures.HanaExecutionTests()
+        fixture = test_hana_execution.HanaExecutionTests()
         key = urlsplit(self.provider.execution_access(fixture.key).observation_url).path.lstrip('/')
         self.fake.objects[key] = {'oversized': 'x' * (hana_protocol.CONTROL_MAX_BYTES + 1)}
         with self.assertRaises(provider.ProviderPending):

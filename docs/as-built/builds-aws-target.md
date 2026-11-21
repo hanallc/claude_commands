@@ -49,6 +49,25 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## Restore deployment records after a wipe
+
+1. Restore the AWS credentials on natedev, including `~/.config/aws-build/plan.gpg`.
+2. Run `github-warmup` if the GPG agent is cold.
+3. Restore the private Budget notification address.
+4. Run `deploy.py prepare` to create the local preparation bundle.
+5. Run `deploy.py recover`.
+
+Preparation uses the administrator credentials to discover the network.
+Recovery uses the plan key to read the existing CloudFormation stacks, the scaler identity, and the network settings.
+It reports the nixpkgs revision from `/etc/nixos/flake.lock`.
+When every configured stack is complete, recovery can create `deployment.json` and `gate-deployment.json` under `~/.local/state/build-targets/aws`.
+`prepare` can create a provisional `deployment.json` after a wipe.
+If a record differs, review the reported fields and run `deploy.py recover --write` to accept the replacement.
+When the preparation bundle has a different deployment ID, `recover --write` rebuilds it with the deployment ID from the stack.
+Recovery runs the same preparation checks as `prepare` and records the current time and spending decision.
+
+Restore the cost ledger, launch history, charges, timing history, and Hana lifecycle and setup records from the separate backup.
+
 ## AWS plan identity
 
 Run this command in a terminal on natedev.
@@ -459,7 +478,15 @@ The stack creates the launch template, security group, private control bucket, a
 The launch template uses persistent Spot and stops the instance when AWS interrupts it.
 Before a launch, setup reads Spot prices for the configured type and its fallback types.
 If the instance is already recorded, setup resumes without a Spot price check.
-It checks the registered subnet and each available default subnet in another zone of the same VPC.
+The setup and lifecycle records identify the instance when the Hana stack is missing.
+Preparation and setup read the deployed subnet with `ec2:DescribeInstances`.
+This read uses the existing deployment admin permission.
+Before an instance exists, an existing stack uses its subnet parameter or the matching saved preparation.
+Preparation can regenerate `parameters.json` from the deployed network.
+Setup retains the original parameter approval when the instance uses a fallback zone.
+For a new setup, it uses the network in the saved image record when available.
+Otherwise it finds a public subnet in the configured zone with the deployment network resolver.
+It also checks each available default subnet in another zone of the same VPC.
 Setup prints one reason for each candidate with no price or a price above the ceiling.
 If the price read fails or no candidate qualifies, setup exits before it changes the stack.
 If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
@@ -844,6 +871,8 @@ The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
 The home stack owns the artifact bucket and the global gate role and instance profile.
+The home deployment uses the foundation stack's `VpcId` parameter first.
+A new foundation or an empty stack shell uses the region's default VPC.
 Each fallback region has a separate gate stack in its default VPC.
 The deployment generates each regional template from the home template.
 The regional template contains network, launch, scaler policy, and expiry resources.
@@ -855,6 +884,21 @@ It records copies before it waits for image readiness.
 The deployment record stores ordered regional launch resources and keeps artifact resources at the top level.
 The reader migrates an old single-region record once.
 Launch state, launch logs, and reservations retain the box region.
+Before the launch request, the worker saves the request and its token in `launch.json`.
+The worker captures the launch time when AWS accepts the request.
+The worker saves the instance ID in `launch.json` before it writes the cost ledger.
+If either write fails, the worker requests termination with the instance ID in memory.
+After both writes succeed, the worker takes the launch log lock and repairs any partial row at the end.
+The worker appends the launch with the saved time, then updates prices from the launch log and bills.
+The `launch_log_lock_timeout_s` setting limits each launch log and cost ledger lock wait to five seconds by default.
+If a wait expires, the worker requests termination for the instance.
+After the termination request, the worker tries to record the instance state in the cost ledger.
+If the recovery write fails, the worker reports the missing record. The saved token still permits discovery.
+The worker reads the retry settings when termination needs another attempt or confirmation poll.
+Cleanup sends requests for known instances before it searches for unconfirmed launches.
+Cleanup sends requests for discovered instances before it updates the ledger.
+For a launch log lock timeout, the worker reports `launch_log_lock_timeout` and states that the launch log entry is missing.
+The controller returns that reason without another append to the busy launch log.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
 Reconciliation searches every configured region for an expired reservation without a recorded region.
@@ -930,10 +974,22 @@ Legacy cancellations and stopped states retain the full exposure when the journa
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.
-An account bill qualifies when the name, day label, and bounds match one full UTC day.
+The page and the guard's complete-day adjustment use strict `read_saved_bill`, and admission retains `read_charge` to preserve all existing counts and refusals.
+The later `one-day-amount` phase joins the readers and protects the count with one `LegacyCountAddition`.
+The file name, day label, and bounds must match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
 The newest read time must be valid and cannot be in the future.
-The charge file keeps each read time and amount. A legacy file without a list supplies one read.
+The check rejects duplicate JSON fields and invalid amount histories.
+The history times must increase and the last entry must match the newest read.
+A legacy file without a history supplies one read.
+The page and daily usage use an accepted bill for its UTC day.
+If a refused bill names a day, its estimate excludes saved reconciliation adjustments for that day.
+For a refused day, estimates include local charges such as Hana storage that starts before the newest bill.
+The spend view includes an earlier refused day when it has local charges.
+The page shows one notice when a displayed amount includes a refused day.
+The notice lists the dates from the file name and the bill when the page uses their estimates.
+The tooltip and buildlog report give the UTC day and reason for each applicable record.
+Each publication loads the account settings once.
 Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
 Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
 Reads less than `cost_explorer_interval_seconds` apart count once.
@@ -1121,23 +1177,24 @@ Below them, two tables show the refused requests and the launched boxes of each 
 Refused requests are capacity and quota refusals.
 The last card asks “Did AWS bill more machine hours than we used?”
 It uses `run_cost.hours_checks` over the days with a bill in the configured window.
-When a higher bill exceeds the limit, the answer sums the displayed differences for those rows and gives their count.
-If only lower bills exceed the limit, the answer sums the displayed differences for those rows and gives their count.
-If all comparisons pass, the answer gives the total billed hours and the total recorded hours.
-If the answer is “No” and the displayed billed total is higher, a second sentence explains the limit and the Hana allowance.
-The visible table includes only higher bills that exceed the limit.
-The closed “All rows” control opens a table for every type and region with hours in the selected regions.
-The tables show billed hours, recorded hours and the signed difference to one decimal place.
-The difference subtracts the full values before rounding.
-If a marked difference or its sum rounds to zero, it shows as “less than 0.1 hours.”
-The Hana reserved column shows the hours set aside for Hana where the check uses them.
-If the bill for a row is due, the billed hours and the difference show a dash in “All rows.”
+The answer compares the billed and recorded totals from the table.
+The next sentence reports how many rows exceed the upper limit.
+The answer reports the count below the lower limit when it is greater than zero.
+The table and its totals exclude rows without a bill.
+The “All rows” control closes the table above `hours_table_open_row_limit`.
+The date range gives the first and last UTC days that supply the displayed rows.
+The rows sort by their full difference, from largest to smallest.
+The table rounds billed and recorded hours to one decimal place before it subtracts them.
+The total row sums the displayed values.
+The same Hana allowance can appear on multiple rows in a region.
+The total row shows a dash for the Hana allowance.
 The shared region filter includes all regions with an hours check.
 
 The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
+If the account settings are missing, the buildlog report says that AWS spend is unavailable.
 `spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again
@@ -1545,8 +1602,6 @@ Existing configuration values remain unchanged.
 | `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
 | `ami_id` | Empty | Use the reviewed image from the registration. |
 | `ami_owner_id` | Empty | Use the owner from the registration. |
-| `vpc_id` | Empty | Use the VPC from the registration. |
-| `subnet_id` | Empty | Use the subnet from the registration. |
 | `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
 | `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |

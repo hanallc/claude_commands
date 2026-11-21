@@ -27,11 +27,12 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
+from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
-from scripts.lib import conf, scratch
+from scripts.lib import conf, copy_record, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
@@ -281,7 +282,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [mirror])
 
     def test_unit_owner_keeps_underscore_spelling_and_removes_only_its_mirrors(self) -> None:
-        owner = copies.unit_owner("alpha_unit")
+        owner = copy_record.unit_owner("alpha_unit")
         self.assertEqual(owner, "alpha_unit-unit")
         mine = self.mirror_record(owner)
         other = self.mirror_record("beta-unit", self.mirror.parent / "other")
@@ -635,7 +636,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_workspace_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
         for damaged in (False, True):
             with self.subTest(damaged=damaged):
-                with copies.workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as tree:
+                with registered_workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as tree:
                     cache = (tree / "target").resolve()
                     _ = (tree / ".git/index.lock").write_text("stopped writer")
                     if damaged:
@@ -645,7 +646,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                     _ = copies.git(tree, "read-tree", "HEAD")
                     self.assertEqual((tree / "source.txt").read_text(), "content\n")
                 self.assertTrue(tree.exists())
-                with copies.workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as reused:
+                with registered_workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as reused:
                     self.assertEqual(reused, tree)
                     self.assertEqual((reused / "target").resolve(), cache)
                     self.assertEqual((reused / "source.txt").read_text(), "content\n")

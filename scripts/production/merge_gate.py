@@ -84,7 +84,7 @@ from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
-from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
+from scripts.direct.release_events import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -1109,7 +1109,9 @@ raise SystemExit(99)
         executable = tools / name
         _ = executable.write_text(script)
         executable.chmod(0o755)
-    return {**environment, "TMPDIR": str(root),
+    cargo = str(root / "target")
+    return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+            "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
@@ -2751,7 +2753,32 @@ def nightly_git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def _nightly_unit(args: GateArguments) -> str:
+    """Use the production's merge unit or the nightly role."""
+    if args.unit:
+        return copies.checked_owner(args.unit)
+    if not args.production:
+        raise GateRefused("nightly needs --unit or --production")
+    from scripts.production import showrunners, staff
+
+    record = staff.snapshot()
+    try:
+        owner = showrunners.owner_for(args.production, record)
+    except ValueError as error:
+        raise GateRefused(str(error)) from error
+    units = [unit for unit in record.find(kind="unit", parent=owner.id)
+             if unit.unit_type == staff.UnitDetails("merge")
+             and not isinstance(unit.worktree, staff.RemovedWorktree)
+             and not isinstance(unit.doc, staff.WrappedDoc)]
+    if not units:
+        return "nightly"
+    if len(units) > 1:
+        raise GateRefused(f"{owner.name}: the production record has multiple merge units. Pass --unit.")
+    return copies.checked_owner(str(units[0].id))
+
+
 def nightly(args: GateArguments) -> int:
+    unit = _nightly_unit(args)
     run: GateRun | NightlyRunState = NightlyRunState.NOT_STARTED
     result_sent = False
     try:
@@ -2761,7 +2788,7 @@ def nightly(args: GateArguments) -> int:
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
         owner = nightly_owner(args)
-        with copies.standing(owner, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
+        with copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
@@ -3004,29 +3031,26 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         return 1
 
 
-def _sweep_nightly_slots() -> None:
-    """Sweep both slot pools without changing the nightly result."""
+def _sweep_nightly_build_folders() -> None:
+    """Sweep unused build folders after the nightly run."""
     for machine in ("natedev", "Mac"):
         try:
             if machine == "natedev":
-                from scripts.lib import build_slots
+                from scripts.lint import sweep
 
-                build_slots.sweep_slots()
+                if sweep.main(["--unused-folders"]):
+                    raise RuntimeError("the build folder sweep failed")
             else:
-                settings = conf.read_or_repository("build_folders")
-                if not any(value for key, value in settings.values().items()
-                           if key == "roots.slots" or key.startswith("roots.slots.")):
-                    continue
                 scripts = Path(__file__).resolve().parents[1]
                 _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
                                     sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                    "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
                                     # The nightly runs from $HOME, which is not a repository; the queue refuses that as "repo".
                                     "--worktree", str(scripts.parent), "--", "/bin/zsh", "-c",
-                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
+                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
                                    check=True, capture_output=True, text=True)
         except (Exception, KeyboardInterrupt) as error:
-            detail = f"Nightly slot sweep on {machine} failed: " + " ".join(str(error).splitlines())
+            detail = f"Nightly build folder sweep on {machine} failed: " + " ".join(str(error).splitlines())
             if isinstance(error, subprocess.CalledProcessError):
                 # The queue prints its refusal on stdout and the Mac queue prints its heading on stderr.
                 detail += " " + " ".join((cast(str, error.stderr or "") + cast(str, error.stdout or "")).splitlines())
@@ -3037,7 +3061,7 @@ def _sweep_nightly_slots() -> None:
                 _ = subprocess.run(session_send.send_argv("--to", "builds", "--from", "nightly", "--text", detail),
                                    check=True, capture_output=True, text=True, timeout=send_budget.seconds())
             except (Exception, KeyboardInterrupt) as notice_error:
-                print(f"Nightly slot sweep on {machine}: notice failed: "
+                print(f"Nightly build folder sweep on {machine}: notice failed: "
                       + " ".join(str(notice_error).splitlines()), flush=True)
 
 
@@ -3080,6 +3104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--promote-only needs --merge-branch")
     if args.nightly and not args.merge_branch:
         parser.error("--nightly needs --merge-branch")
+    if args.nightly and not (args.unit or args.production):
+        parser.error("--nightly needs --unit or --production")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
     if args.modules and not args.tests_only:
@@ -3092,13 +3118,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tests_only:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
+        if args.nightly:
+            args.unit = _nightly_unit(args)
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
                 try:
                     return nightly(args)
                 finally:
-                    _sweep_nightly_slots()
+                    _sweep_nightly_build_folders()
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)

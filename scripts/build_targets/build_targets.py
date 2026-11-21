@@ -11,7 +11,6 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
-import importlib
 import io
 import json
 import os
@@ -183,6 +182,7 @@ from scripts.build_targets.target_config import (
     WRITES_TREE,
     read_targets,
 )
+from scripts.direct.release_events import local_release_waiter
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 
 
@@ -1372,10 +1372,6 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
     from scripts.build_hold import build_hold
     from scripts.build_targets.targets import Held, StateUnreadable
 
-    # This CLI's import root excludes the worker module.
-    # Use importlib at the typed provider boundary.
-    release_waiter = cast(Callable[[Path, Path], LocalHoldWait], getattr(
-        importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
     _ = pid
     if not leave_hook and not caller:
         leave_hook = os.environ.get("BUILDLOG_MAC_IDLE_HOOK", "")
@@ -1403,7 +1399,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
-        release_events = notifications.enter_context(release_waiter(
+        release_events = notifications.enter_context(local_release_waiter(
             build_hold.holder_directory(), build_hold.release_directory()))
         context = LOCAL_HOLD_WAIT.set(release_events)
         _ = notifications.callback(LOCAL_HOLD_WAIT.reset, context)

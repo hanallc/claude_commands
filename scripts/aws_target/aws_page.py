@@ -7,11 +7,16 @@ except FileNotFoundError:
 
 import argparse
 from collections import defaultdict
-from collections.abc import Sequence, Set
+from collections.abc import Generator, Sequence, Set
+from contextlib import contextmanager
+import fcntl
+import hashlib
 import json
+import os
+import re
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum, StrEnum
@@ -22,11 +27,14 @@ from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.aws_target.aws_page_location import output_folder as output_folder
+from scripts.build_targets import target_config
+from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import console_theme, page_frame, review_link
+from scripts.lib.file_lock import LockResult
+from scripts.review_links import review_link
 
-PAGE_NAME = 'aws_prices.html'
+PAGE_NAME = ledger.SPEND_PAGE_SOURCE.name
 # The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
 REGION_GROUPS = ('us', 'eu', 'ap', 'ca', 'sa')
 
@@ -83,12 +91,18 @@ class SpendTile(TypedDict):
     note: str
 
 
+class RefusedBillData(TypedDict):
+    days: list[str]
+    reason: str
+
+
 class SpendData(TypedDict):
     # Empty when the spend is available.
     unavailable: str
     # Today, yesterday and the month to date, in that order.
     tiles: list[SpendTile]
     forecast: str
+    refused_bills: list[RefusedBillData]
 
 
 class NormalLaunchRefusal(StrEnum):
@@ -216,26 +230,35 @@ class QuotaHistoryData(TypedDict):
     gpu_summary: GpuQuotaSummary
 
 
-class UnbilledHoursRowData(TypedDict):
-    kind: Literal['unbilled']
-    region: str
-    cells: list[str]
+HoursDifferenceKind = Literal['difference', 'no-difference']
+
+
+class HoursDifferenceKinds(TypedDict):
+    by_tenths: dict[str, HoursDifferenceKind]
+    default: HoursDifferenceKind
+
+
+HOURS_DIFFERENCE_KINDS: HoursDifferenceKinds = {'by_tenths': {'0': 'no-difference'}, 'default': 'difference'}
 
 
 class ComparedHoursRowData(TypedDict):
-    kind: Literal['compared']
+    size: str
     region: str
-    cells: list[str]
-    billed: float
-    recorded: float
-    difference_tenths: int
+    billed_tenths: int
+    recorded_tenths: int
+    difference_kind: HoursDifferenceKind
+    first_utc_day: str
+    last_utc_day: str
+    hana_reserved_tenths: NotRequired[int]
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill']
 
 
 class HoursComparisonData(TypedDict):
     kind: Literal['comparison']
-    rows: list[ComparedHoursRowData | UnbilledHoursRowData]
+    rows: list[ComparedHoursRowData]
     limit_percent: str
+    open_row_limit: int
+    difference_kinds: HoursDifferenceKinds
 
 
 class HoursComparisonUnavailableData(TypedDict):
@@ -272,25 +295,24 @@ def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, **table_rows_data(table)}
 
 
-def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | UnbilledHoursRowData:
+def hours_row_data(row: spot_table.ComparedMachineHoursRow) -> ComparedHoursRowData:
     check = row.check
     billed = check.billed_hours
-    recorded = round(check.box_hours, 1)
-    if billed is None:
-        return {'kind': 'unbilled', 'region': row.region, 'cells': [row.size, row.region, '—', f'{recorded:.1f}', '—', '—']}
-    difference = round(billed - check.box_hours, 1)
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
     if check.hours_gap_over:
         limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
-    if difference:
-        shown_difference = f'{difference:+.1f}'
-    else:
-        shown_difference = 'less than 0.1 hours' if check.hours_gap_over else '0.0'
-    reserved = check.hana_reserved_hours
-    cells = [row.size, row.region, f'{billed:.1f}', f'{recorded:.1f}', shown_difference,
-             f'{reserved:.1f}' if billed >= check.box_hours and reserved > 0 else '—']
-    return {'kind': 'compared', 'region': row.region, 'cells': cells, 'billed': float(billed),
-            'recorded': float(check.box_hours), 'difference_tenths': int(difference * 10), 'limit_result': limit_result}
+    billed_tenths = round(billed * 10)
+    recorded_tenths = round(check.box_hours * 10)
+    difference_kind = HOURS_DIFFERENCE_KINDS['by_tenths'].get(
+        str(billed_tenths - recorded_tenths), HOURS_DIFFERENCE_KINDS['default'])
+    compared: ComparedHoursRowData = {
+        'size': row.size, 'region': row.region, 'limit_result': limit_result,
+        'billed_tenths': billed_tenths, 'recorded_tenths': recorded_tenths, 'difference_kind': difference_kind,
+        'first_utc_day': check.first_utc_day.isoformat(), 'last_utc_day': check.last_utc_day.isoformat(),
+    }
+    if billed >= check.box_hours and check.hana_reserved_hours > 0:
+        compared['hana_reserved_tenths'] = round(check.hana_reserved_hours * 10)
+    return compared
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -346,7 +368,7 @@ def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.Spot
     return spot_table.Table('Spot placement scores', headers, frozenset(range(2, len(headers))), rows, 'rows')
 
 
-def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) -> spot_table.Table:
+def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison], gate_name: str) -> spot_table.Table:
     """Show the run costs and the time price that makes the 32-vCPU box cheaper."""
     def cells(estimate: run_cost.GateRunEstimate | run_cost.NoPricedGateVariant) -> tuple[str, str, str, str]:
         if isinstance(estimate, run_cost.NoPricedGateVariant):
@@ -368,7 +390,7 @@ def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) ->
                '32 vCPU break-even (USD/min)')
     rows = tuple((row.region, *cells(row.small), *cells(row.large), break_even(row))
                  for row in sorted(comparisons, key=lambda row: region_filter_key(row.region)))
-    return spot_table.Table('32-vCPU merge gate break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
+    return spot_table.Table(f'32-vCPU {gate_name} break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
 
 
 def without_prices(table: spot_table.Table) -> spot_table.Table:
@@ -392,19 +414,69 @@ def day_tile(label: str, day: str, spend: aws_spend.Spend, limit: bool) -> Spend
 def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: int, pace_days: int) -> SpendData:
     """Today, yesterday and the month to date, as the buildlog report shows them."""
     if isinstance(spend, aws_config.MeasurementUnavailable):
-        return {'unavailable': f'AWS spend unavailable: {spend.reason}.', 'tiles': [], 'forecast': ''}
+        return {'unavailable': f'AWS spend unavailable: {spend.reason}.', 'tiles': [],
+                'forecast': '', 'refused_bills': []}
     today = datetime.fromtimestamp(now, UTC).date()
+    yesterday = today - timedelta(days=1)
     tiles = [day_tile('Today', today.isoformat(), spend, True),
-             day_tile('Yesterday', (today - timedelta(days=1)).isoformat(), spend, True)]
+             day_tile('Yesterday', yesterday.isoformat(), spend, True)]
     month = aws_spend.month_spend(spend.days, today, pace_days)
+    shown_estimates = {row.day for row in spend.days if row.source != 'AWS bill' and (
+        row.day in (today.isoformat(), yesterday.isoformat())
+        or (month is not None and row.day.startswith(f'{today:%Y-%m}')))}
+    refused: list[RefusedBillData] = [
+        {'days': labels, 'reason': record.reason.value}
+        for record in spend.refused_bills
+        if (labels := [day.isoformat() for day in record.days if day.isoformat() in shown_estimates])]
     if month is None:
         tiles.append({'label': 'Month to date', 'usd': '—', 'note': f'UTC {today:%Y-%m}: no billed day yet'})
-        return {'unavailable': '', 'tiles': tiles, 'forecast': ''}
+        return {'unavailable': '', 'tiles': tiles, 'forecast': '', 'refused_bills': refused}
     tiles.append({'label': 'Month to date', 'usd': f'${month.to_date:.2f}',
                   'note': f'UTC {today:%Y-%m}, of the ${spend.monthly_limit:.2f} monthly limit.'})
     forecast = (f'Month forecast: ${month.forecast:.2f} at ${month.pace:.2f} a day, the average of the last '
                 + f'{month.billed_days} billed days. 32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.')
-    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
+    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast, 'refused_bills': refused}
+
+
+def utc_spend_data(report: aws_spend.UtcSpendReport) -> SpendData:
+    """Show the captured UTC amounts and their sources."""
+    account, evidence = report.account, report.evidence
+    if isinstance(account, ledger.SpendEvidenceUnavailable):
+        return {'unavailable': f'AWS spend unavailable: {account.reason}.', 'tiles': [],
+                'forecast': '', 'refused_bills': []}
+    today = datetime.fromtimestamp(evidence.at, UTC).date()
+    yesterday = today - timedelta(days=1)
+    days = {row.day: row for row in account.days}
+    tiles: list[SpendTile] = []
+    for label, day in (('Today', today), ('Yesterday', yesterday)):
+        row = days.get(day)
+        if isinstance(row, ledger.UtcDaySpend):
+            limit = f'${evidence.settings.daily_limit_usd:.2f}'
+            note = f'UTC {day}, {aws_spend.utc_day_label(row)} of the {limit} daily limit. {row.gate_runs} gate runs.'
+            tiles.append({'label': label, 'usd': f'${row.usd:.2f}', 'note': note})
+        else:
+            reason = row.reason if isinstance(row, ledger.UtcDayWithoutEvidence) else 'no spend evidence'
+            tiles.append({'label': label, 'usd': '—', 'note': f'UTC {day}. {reason}.'})
+    month = aws_spend.utc_month_to_date(account, today)
+    has_amount = any(isinstance(day, ledger.UtcDaySpend) for day in month.days)
+    tiles.append({'label': 'Month to date', 'usd': f'${month.usd:.2f}' if has_amount else '—',
+                  'note': f'UTC {today:%Y-%m}, of the ${evidence.settings.monthly_limit_usd:.2f} monthly limit.'
+                  if has_amount else f'UTC {today:%Y-%m}. No spend evidence.'})
+    pace_days = evidence.forecast_pace_days
+    if isinstance(pace_days, conf.UnavailableValue):
+        raise conf.Unusable(pace_days.reason)
+    forecast = aws_spend.utc_month_forecast(account, today, pace_days)
+    forecast_line = ''
+    if isinstance(forecast, aws_spend.UtcMonthForecast):
+        forecast_line = (f'{forecast.display_line()} '
+                         f'32-CPU gate compute is {forecast.gate_share:.0%} of the spend on those days.')
+    estimate_dates = {row.day for row in (*month.days, days.get(yesterday))
+                      if isinstance(row, ledger.UtcDaySpend) and isinstance(row.source, ledger.EstimatedUtcDaySpend)}
+    refused: list[RefusedBillData] = [
+        {'days': labels, 'reason': record.reason.value}
+        for record in evidence.refused_bills
+        if (labels := [day.isoformat() for day in record.days if day in estimate_dates])]
+    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast_line, 'refused_bills': refused}
 
 
 def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
@@ -547,6 +619,7 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
+              hours_table_open_row_limit: int,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
               gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
@@ -557,8 +630,13 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         percent = format(tables.hours.max_gap_ratio, '%').removesuffix('%')
         if '.' in percent:
             percent = percent.rstrip('0').rstrip('.')
-        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows],
-                 'limit_percent': f'{percent}%'}
+        hours = {
+            'kind': 'comparison', 'limit_percent': f'{percent}%',
+            'rows': [hours_row_data(row) for row in sorted(
+                tables.hours.rows, key=lambda row: row.check.box_hours - row.check.billed_hours)],
+            'open_row_limit': hours_table_open_row_limit,
+            'difference_kinds': HOURS_DIFFERENCE_KINDS,
+        }
     else:
         hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
     return {
@@ -614,53 +692,136 @@ def settled_amount_notes(watched: Sequence[ledger.WatchedChargeDay]) -> tuple[st
     return (summary, *changes)
 
 
-def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
-    """Write the page with the tables of the local snapshot and run ledger."""
-    started = time.perf_counter()
-    configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
-    today = datetime.fromtimestamp(now, UTC).date().isoformat()
-    read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
-    spend = spend_data(read, now, configuration.whole('spend_pace_days'))
+@dataclass(frozen=True)
+class PageAbsent:
+    """The destination has no published page."""
+
+
+@dataclass(frozen=True)
+class LegacyPageRevision:
+    stamp: ledger.SpendFileStamp
+
+
+@dataclass(frozen=True)
+class PublishedPageRevision:
+    at: int
+    source_digest: str
+    stamp: ledger.SpendFileStamp
+
+
+class PagePublicationDeferred(RuntimeError):
+    """The sources do not support the first publication yet."""
+
+
+def published_revision(path: Path) -> PageAbsent | LegacyPageRevision | PublishedPageRevision:
     try:
-        watched = ledger.CostLedger(directory).read_charge_watch(aws_config.read_settings(configuration), now)
-    except (OSError, ValueError):
-        watched = ()
-    try:
-        placement = ledger.read_spot_placement_scores(directory)
-    except (OSError, ValueError, KeyError) as error:
-        print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
-        placement = ()
-    values = cloud_gate.settings()
-    gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
-    tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
-    data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
+        with path.open('rb') as page:
+            info = os.fstat(page.fileno())
+            stamp = ledger.SpendFileStamp(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            _ = page.seek(max(0, info.st_size - 128))
+            footer = page.read()
+    except FileNotFoundError:
+        return PageAbsent()
+    metadata = re.search(rb'\n<!-- aws-spend-revision ([0-9]{1,20}) ([0-9a-f]{64}) -->\n$', footer)
+    if metadata is None:
+        return LegacyPageRevision(stamp)
+    return PublishedPageRevision(int(metadata[1]), metadata[2].decode('ascii'), stamp)
+
+
+def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, started: float) -> str:
+    evidence = report.evidence
+    inputs = evidence.page_inputs
+    if isinstance(inputs, ledger.SpendPageInputsNotCaptured):
+        raise ledger.LedgerUnavailable('page capture requires the page inputs')
+    now, values, configuration = evidence.at, evidence.gate_configuration, evidence.account_configuration
+    spend = utc_spend_data(report)
+    watched = report.account.settlement_notes if isinstance(report.account, ledger.UtcAccountSpend) else ()
+    launches = evidence.launches
+    gate_pricing = run_cost.gate_pricing_from(evidence, launches)
+    tables = spot_table.spot_tables_from(directory, now, values, configuration, gate_pricing=gate_pricing,
+                                         evidence=evidence)
+    data = page_data(tables, spend, now, evidence.placement_scores, launch_records=launches,
+                     hours_table_open_row_limit=configuration.whole('hours_table_open_row_limit'),
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
-    gate_time_price = table_data(gate_time_price_table(comparisons))
+    gate_time_price = table_data(gate_time_price_table(comparisons, inputs.step_names.shown('merge-gate')))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
-    source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
-    # A '</' in a cell must not end the script element.
+    tip = shared_step_tip(inputs.step_tip_template)
     data['render_seconds'] = time.perf_counter() - started
-    page = (page_frame.template(source, 'AWS', 'aws')
+    # Escape closing tags inside JSON values.
+    return (inputs.frame_template
+            .replace('__STEP_TIP_STYLE__', tip.style, 1)
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
             .replace('__AWS_GATE_TIME_DATA__', json.dumps(gate_time_data).replace('</', '<\\/')))
-    page_path = folder / PAGE_NAME
+
+
+@contextmanager
+def _page_publication_lock(folder: Path) -> Generator[LockResult]:
+    """Serialize page replacement with or without an account ledger."""
     folder.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(page_path, page, new_file_mode=0o644)
+    descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield LockResult.BUSY
+        else:
+            yield LockResult.ACQUIRED
+    finally:
+        os.close(descriptor)
+
+
+def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
+    """Replace the page while the captured sources and the page revision match."""
+    started = time.perf_counter()
+    page_path = folder / PAGE_NAME
+    account_path = settings_path if settings_path is not None else aws_config.account_settings_path()
+    reason = 'The AWS page revision changed during publication.'
+    for attempt in range(aws_spend.REPORT_ATTEMPTS):
+        before = published_revision(page_path)
+        report = aws_spend.read_utc_spend(directory, now, settings_path=account_path,
+                                          purpose=ledger.SpendCapturePurpose.PAGE_PUBLICATION)
+        if isinstance(report, ledger.SpendEvidenceUnavailable):
+            reason = report.reason
+            continue
+        evidence = report.evidence
+        digest = hashlib.sha256(repr((evidence.revision.sources, evidence.revision.configurations)).encode()).hexdigest()
+        page = render_report_page(directory, report, started)
+        with ledger.verify_spend_revision(directory, evidence) as verified:
+            if isinstance(verified, ledger.SpendEvidenceUnavailable):
+                reason = verified.reason
+                continue
+            with _page_publication_lock(folder) as publication:
+                if publication is LockResult.BUSY:
+                    reason = 'Another publisher holds the AWS page folder lock.'
+                    continue
+                current = published_revision(page_path)
+                if current != before:
+                    continue
+                if isinstance(current, PublishedPageRevision) and (
+                    current.at > evidence.at or (attempt > 0 and (current.at, current.source_digest) == (evidence.at, digest))
+                ):
+                    return page_path
+                write_text_atomic(page_path, page + f'\n<!-- aws-spend-revision {evidence.at} {digest} -->\n', new_file_mode=0o644)
+                return page_path
+    if isinstance(published_revision(page_path), PageAbsent):
+        raise PagePublicationDeferred(reason)
     return page_path
 
 
 def publish_configured() -> int:
     """Publish both pages from the AWS target state folder."""
     from scripts.aws_target import machines_page
-    from scripts.build_targets.target_config import ssh_target_state_directory
 
-    directory, now, folder = ssh_target_state_directory('aws'), int(time.time()), output_folder()
+    directory, now, folder = target_config.ssh_target_state_directory('aws'), int(time.time()), output_folder()
     status = 0
     try:
-        _ = publish(directory, now, folder, settings_path=conf.path('aws_target'))
+        _ = publish(directory, now, folder, settings_path=aws_config.account_settings_path())
+    except PagePublicationDeferred as error:
+        print(f'aws_page: {error}', file=sys.stderr)
+        status = 1
     except Exception as error:
         print(f'AWS page publication failed: {type(error).__name__}: {error}', file=sys.stderr)
         status = 1
@@ -689,8 +850,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Publish the AWS page, or print its link.')
     _ = parser.add_argument('command', choices=('publish', 'link'))
     if parser.parse_args(argv, namespace=Arguments()).command == 'publish':
-        status = publish_configured()
-        if status:
+        if status := publish_configured():
             return status
     print(page_url())
     return 0

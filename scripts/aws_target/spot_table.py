@@ -12,7 +12,7 @@ from typing import Literal
 from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import SnapshotFailure, gpu_price_sizes, hours_check_scope, largest_gate_vcpus, read_snapshot, snapshot_failures
 from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_quota_requests
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 
 
 # A region is the first cell of a row, a column header, or the second cell after the type.
@@ -37,15 +37,15 @@ class Table:
 
 
 @dataclass(frozen=True)
-class MachineHoursRow:
+class ComparedMachineHoursRow:
     size: str
     region: str
-    check: run_cost.HoursCheck
+    check: run_cost.ComparedMachineHours
 
 
 @dataclass(frozen=True)
 class HoursComparison:
-    rows: tuple[MachineHoursRow, ...]
+    rows: tuple[ComparedMachineHoursRow, ...]
     checked_regions: frozenset[str]
     max_gap_ratio: Decimal
 
@@ -138,7 +138,7 @@ class SpotTables:
     # The standard types, then the GPU types.
     prices: tuple[Table, ...]
     quotas: tuple[Table, ...]
-    # One entry for each scope in run_cost.SCOPES, in that order.
+    # One entry for each scope in run_cost.run_scopes, in that order.
     runs: tuple[RunCosts, ...]
     hours: HoursComparison | HoursComparisonUnavailable
     gpu_quota_needed: int
@@ -159,11 +159,18 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     """Read prices, quotas, run costs, billed hours, and the reason for each unavailable value."""
     values = conf.read_or_repository('cloud_gate')
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
+    return spot_tables_from(directory, now, values, configuration, gate_pricing=gate_pricing)
+
+
+def spot_tables_from(directory: Path, now: int, values: conf.ConfigRead, configuration: conf.ConfigRead, *,
+                     gate_pricing: run_cost.GatePricingInputs | None = None,
+                     evidence: ledger.SpendEvidenceAt | None = None) -> SpotTables:
+    """Build the tables from the settings for this publication."""
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
     gate_types = values.words('instance_types')
     standard = tuple(dict.fromkeys((*gate_types, *values.words('price_compare_instance_types'))))
     gpu = tuple(size for size in gpu_price_sizes(values) if size not in standard)
-    document = read_snapshot(directory)
+    document = read_snapshot(directory) if evidence is None else evidence.spot_snapshot
     readings = {ledger.text(row, 'region'): row for row in ledger.rows(document, 'regions')} if 'regions' in document else {}
     failures = {row.region: row for row in snapshot_failures(document)}
     minimum: dict[tuple[str, str], Decimal] = {}
@@ -186,14 +193,21 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     home = configuration.text('region')
     inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
         directory, now, values, configuration)
-    hours = billed_hours(directory, now, hours_check_scope(values), days, home,
-                         configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
+    page = evidence.page_inputs if evidence is not None else None
+    if isinstance(page, ledger.SpendPageInputsNotCaptured):
+        raise ledger.LedgerUnavailable('page capture requires the Hana hours settings')
+    hana = page.hana_hours if isinstance(page, ledger.SpendPageInputs) else None
+    names = page.step_names if isinstance(page, ledger.SpendPageInputs) else build_steps.read_step_names()
+    hours = billed_hours(directory, now, hours_check_scope(values, hana=hana), days, home,
+                         configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')),
+                         evidence=evidence)
     return SpotTables(
         tuple(reads),
         (price_table(standard, regions, minimum, notes, not_sold), price_table(gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
-        run_costs(directory, now, standard, regions, minimum, values, configuration, inputs),
+        run_costs(directory, now, standard, regions, minimum, values, configuration, inputs, names,
+                  evidence=evidence),
         hours, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
 
 
@@ -236,15 +250,20 @@ def quota_table(label: str, field: str, sizes: tuple[str, ...], regions: tuple[s
 
 def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
               minimum: Mapping[tuple[str, str], Decimal], values: conf.ConfigRead,
-              policy: conf.ConfigRead, gate_pricing: run_cost.GatePricingInputs) -> tuple[RunCosts, ...]:
+              policy: conf.ConfigRead, gate_pricing: run_cost.GatePricingInputs, names: build_steps.StepNames, *,
+              evidence: ledger.SpendEvidenceAt | None = None) -> tuple[RunCosts, ...]:
     """Build the run tables and gate estimates for standard types in each scope."""
     days = policy.whole('run_cost_days')
     home = policy.text('region')
     end = datetime.fromtimestamp(now, UTC)
     start = end - timedelta(days=days)
-    book = ledger.CostLedger(directory)
-    history = run_cost.read_gate_run_history(book, start, end, home)
-    bills = run_cost.spot_bills(book, start, end)
+    if evidence is None:
+        book = ledger.CostLedger(directory)
+        history = run_cost.read_gate_run_history(book, start, end, home)
+        bills = run_cost.spot_bills(book, start, end, bill_policy=run_cost.ValidateBillsAt(now))
+    else:
+        history = run_cost.gate_run_history_from(evidence.launches, start, end, home)
+        bills = run_cost.bills_from_readings(run_cost.readings_in_window(evidence.validated_bills, start, end))
     paid_hourly = run_cost.paid_per_hour(bills)
     allocations = run_cost.billed_allocations(bills, history.runs)
     gate_minimum: dict[tuple[str, str], Decimal] = {}
@@ -254,7 +273,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[
     max_gate_minutes = values.whole('max_gate_minutes')
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
-    for scope in run_cost.SCOPES:
+    for scope in run_cost.run_scopes(names):
         pricing = run_cost.GateRunPricing.from_config(values, gate_pricing.evidence, home, scope.modes)
         explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest deployed zone Spot price '
                        + 'and the median box time, including boot. It adds transfer charges outside the home region. '
@@ -333,23 +352,37 @@ def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations:
 
 
 def billed_hours(directory: Path, now: int, scope: run_cost.SpotHoursScope, days: int, home: str,
-                 builder: str, max_ratio: Decimal) -> HoursComparison | HoursComparisonUnavailable:
+                 builder: str, max_ratio: Decimal, *, evidence: ledger.SpendEvidenceAt | None = None
+                 ) -> HoursComparison | HoursComparisonUnavailable:
     """Read the hours of each type and region in the comparison window."""
     end = datetime.fromtimestamp(now, UTC)
     start = end - timedelta(days=days)
-    book = ledger.CostLedger(directory)
     try:
-        checks = run_cost.hours_checks(book, start, end, home, builder, scope, max_ratio)
+        if evidence is None:
+            book = ledger.CostLedger(directory)
+            readings = run_cost.billed_readings(book, start, end, bill_policy=run_cost.ValidateBillsAt(now))
+            snapshot = book.read_snapshot()
+        elif evidence.has_saved_ledger:
+            readings = run_cost.readings_in_window(evidence.validated_bills, start, end)
+            snapshot = evidence.state
+        else:
+            raise ledger.LedgerUnavailable('the cost ledger is absent')
+        daily = run_cost.day_hours_from(snapshot, readings, start, end, home, builder, scope, max_ratio)
+        checks = run_cost.sum_hours_checks(daily, max_ratio)
         checked_regions = frozenset(region for _size, region in checks)
         size_order = {size: index for index, size in enumerate(scope.sizes)}
-        active = sorted((key for key, check in checks.items() if check.billed_hours or check.box_hours),
-                        key=lambda key: (size_order[key[0]], key[1]))
-        if not active:
-            reason = ('There are no machine hours to compare.' if run_cost.billed_readings(book, start, end)
-                      else f'No AWS bill is available yet for the last {days} days.')
-            return HoursComparisonUnavailable(reason, checked_regions)
+        rows = tuple(sorted(
+            (ComparedMachineHoursRow(size, region, check) for (size, region), check in checks.items()
+             if isinstance(check, run_cost.ComparedMachineHours) and (check.billed_hours or check.box_hours)),
+            key=lambda row: (size_order[row.size], row.region),
+        ))
+        if rows:
+            return HoursComparison(rows, checked_regions, max_ratio)
+        if any(isinstance(check, run_cost.MachineHoursAwaitingBill) and check.box_hours for check in checks.values()):
+            return HoursComparisonUnavailable('No AWS bill is available yet for the recorded hours.', checked_regions)
+        reason = ('There are no machine hours to compare.' if readings
+                  else f'No AWS bill is available yet for the last {days} days.')
+        return HoursComparisonUnavailable(reason, checked_regions)
     except ledger.LedgerUnavailable:
         return HoursComparisonUnavailable('Our records are unreadable.')
-    rows = tuple(MachineHoursRow(size, region, checks[size, region]) for size, region in active)
-    return HoursComparison(rows, checked_regions, max_ratio)
 

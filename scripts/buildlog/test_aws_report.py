@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
@@ -12,6 +13,7 @@ import time
 from typing import cast, override
 from unittest import mock
 import unittest
+from zoneinfo import ZoneInfo
 
 from scripts.buildlog import aws_report, index
 from scripts.buildlog import mac_outcome
@@ -23,9 +25,36 @@ from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-from scripts.aws_target import ledger, measurement, run_cost
-from scripts.aws_target.ledger_test_support import numeric_settings
+from scripts.aws_target import config as aws_config, ledger, measurement, run_cost
+from scripts.aws_target import spend as aws_spend
+from scripts.aws_target.ledger_test_support import numeric_settings, override_fixture_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.snapshot_codec import snapshot_value
+from scripts.lib import conf
+
+
+def utc_fixture(spends: tuple[ledger.DailySpend, ...]) -> ledger.UtcAccountSpend:
+    """Make a UTC result for the report layout tests."""
+    days: list[ledger.UtcDaySpend] = []
+    for spend in spends:
+        day = date.fromisoformat(spend.day)
+        start, end = ledger.period_bounds(day, ZoneInfo('UTC'))
+        estimate = ledger.EstimatedUtcDaySpend(tuple(
+            ledger.GroupedSpendInterval(ledger.ChargedInterval(start, end, group.usd, 'fixture', 'fixed'), group.group)
+            for group in spend.groups))
+        source: ledger.EstimatedUtcDaySpend | ledger.SettledWatchAmount = estimate
+        if spend.source == 'AWS bill':
+            usage_types = ('USE1-SpotUsage:m7a.8xlarge', 'USE1-SpotUsage:m7a.4xlarge',
+                           'USE1-EBS:VolumeUsage.gp3', 'USE1-PublicIPv4:InUseAddress', 'USE1-DataTransfer')
+            by_group = {group.group: group.usd for group in spend.groups}
+            usage = tuple(ledger.UsageTypeCost(usage_type, by_group.get(group, Decimal(0)))
+                          for group, usage_type in zip(ledger.SPEND_GROUPS[:len(usage_types)], usage_types, strict=True))
+            bill = ledger.ChargeRead(spend.day, end, start, end, spend.usd, Decimal(0), spend.query_usd,
+                                     usage, provisional=spend.provisional_bill)
+            source = ledger.SettledWatchAmount(bill, ledger.SettledChargeUnchanged(spend.usd))
+        days.append(ledger.UtcDaySpend(day, source, estimate, spend.runs))
+    return ledger.UtcAccountSpend(tuple(days), ())
 
 
 class AwsReportTests(MeasurementFixture):
@@ -128,11 +157,15 @@ class AwsReportTests(MeasurementFixture):
         account = self.root / 'account/aws_target.conf'
         account.parent.mkdir()
         _ = account.write_bytes(self.settings.read_bytes())
-        numeric_settings(account, {'daily_limit_usd': '7'})
-        self.costs({'daily_limit_usd': '1'})
-        with self.subTest(settings='installed account'), mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(account)}):
+        numeric_settings(account, {'daily_limit_usd': '7', 'gate_type_window_days': '1'})
+        self.costs({'daily_limit_usd': '1', 'gate_type_window_days': '5'})
+        with (self.subTest(settings='installed account'),
+              mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(account)}),
+              mock.patch.object(aws_config, 'account_settings_path', wraps=aws_config.account_settings_path) as resolve):
             output = self.render()
+            resolve.assert_called_once_with()
             self.assertIn('of the $7.00 daily limit', output)
+            self.assertIn('UTC 2026-01-15 through 2026-01-15 (1 days)', output)
             self.assertIn('**Today (UTC 2026-01-15, estimate):', output)
             self.assertNotIn('AWS measurement unavailable', output)
 
@@ -216,6 +249,16 @@ class AwsReportTests(MeasurementFixture):
                 # A us-east-1 usage type has no region prefix; the runs have no region, so they ran in the home region.
                 ledger.UsageTypeCost('SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
+        with self.book().transaction() as state:
+            state.reconciliations.append(ledger.CostReconciliation(
+                reading.at, reading.period_start, reading.period_end, reading.actual_usd, 'Cost Explorer', reading.query_usd))
+            state.charge_refresh_at = reading.at
+        idle = ledger.ChargeRead('2026-01-13', NOW, MIDNIGHT - 2 * 86400, MIDNIGHT - 86400,
+                                 Decimal('.006'), Decimal(0), Decimal(0))
+        _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(idle)))
+        self.book().reconcile(ledger.CostReconciliation(
+            idle.at, idle.period_start, idle.period_end, idle.actual_usd, 'Cost Explorer', idle.query_usd))
+        _ = (charges / 'private-alias.json').write_text(json.dumps(ledger.charge_record(idle)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
             ('merge-bill', 'merge-gate', MIDNIGHT - 3600, 120, 60),
@@ -227,19 +270,22 @@ class AwsReportTests(MeasurementFixture):
             events.extend(({**row, 'time': at - box_s, 'result': 'launched'},
                            {**row, 'time': at, 'result': 'finished', 'gate_s': gate_s}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        with mock.patch.object(ledger.CostLedger, 'spend_days', return_value=spends), \
+        with mock.patch.object(ledger, 'utc_account_spend', return_value=utc_fixture(spends)), \
              mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
             output = self.render()
         section = output.split('### AWS\n', 1)[1].split('Mac copies:', 1)[0]
         self.assertTrue(section.startswith('\n**Today (UTC 2026-01-15, estimate): $0.35 of the $20.00 daily limit. 2 gate runs.**\n\n'))
         today = '| 2026-01-15 | $0.35 | $0.10 | $0.00 | $0.00 | $0.20 | $0.05 | 2 | estimate |'
-        bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | bill |'
+        bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | accepted bill |'
         self.assertIn(today, section)
         self.assertIn(bill, section)
+        self.assertIn('- 2026-01-13: amount below USD 0.01 uses the estimate', section)
+        self.assertIn('- 2026-01-13: file name, day label, or bounds do not match a full UTC day', section)
+        self.assertNotIn('private-alias', section)
         self.assertLess(section.index(today), section.index(bill))
         self.assertEqual(section.count('\n|---'), 3)
         self.assertIn('| All shown days | 2 | 0m 52s | 1m 45s | 2 | 0m 22s | 0m 45s | $0.1500 |', section)
-        self.assertIn('\n\n- Bill read 2026-01-15 07:00 EST. Ledger query fees for these days: $0.06.\n', section)
+        self.assertIn('\n\n- Bill read 2026-01-15 07:00 EST. Ledger query fees for these days: $0.02.\n', section)
         self.assertEqual(section.count('- Spot compute can include the older Spot builder.'), 1)
         self.assertNotIn('Spot cost can include the older builder', section)
         self.assertEqual(section.count('- Source:'), 1)
@@ -267,7 +313,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn('32-CPU gate compute is 67% of the spend on those days.', lines)
         self.assertEqual(report.spend_analysis(spends[:1], Decimal(100), date(2026, 1, 15), 2), [])
 
-    def test_daily_spend_shows_estimates_after_the_newest_bill(self) -> None:
+    def test_daily_spend_shows_estimates_between_and_before_bills(self) -> None:
         spends = tuple(
             ledger.DailySpend(day, source, (ledger.SpendGroupCost('storage', Decimal('1')),), 1, Decimal(0))
             for day, source in (
@@ -277,10 +323,10 @@ class AwsReportTests(MeasurementFixture):
                 ('2026-01-15', 'estimated from the newest bill'),
                 ('2026-01-13', 'AWS bill'),
             ))
-        with mock.patch.object(ledger.CostLedger, 'spend_days', return_value=spends):
+        with mock.patch.object(ledger, 'utc_account_spend', return_value=utc_fixture(spends)):
             for day, expected_days in (
-                (DAY, ('2026-01-15', '2026-01-14', '2026-01-13', '2026-01-12')),
-                ('2026-01-14', ('2026-01-14', '2026-01-13', '2026-01-12')),
+                (DAY, ('2026-01-15', '2026-01-14', '2026-01-13', '2026-01-12', '2026-01-10')),
+                ('2026-01-14', ('2026-01-14', '2026-01-13', '2026-01-12', '2026-01-10')),
             ):
                 with self.subTest(day=day):
                     output = self.render(day)
@@ -288,13 +334,53 @@ class AwsReportTests(MeasurementFixture):
                     rows = [line for line in table.splitlines() if line.startswith('| 2026-')]
                     self.assertEqual(rows, [
                         f'| {at} | $1.00 | $0.00 | $0.00 | $0.00 | $1.00 | $0.00 | 1 | '
-                        + ('estimate' if at > '2026-01-13' else 'bill') + ' |'
+                        + ('accepted bill' if at in ('2026-01-13', '2026-01-12') else 'estimate') + ' |'
                         for at in expected_days])
-                    self.assertNotIn('2026-01-10', table)
                     self.assertEqual(output.count('Spot compute can include the older Spot builder.'), 1)
                     self.assertNotIn('Spot cost can include the older builder', output)
                     if day == DAY:
                         self.assertIn('**Today (UTC 2026-01-15, estimate): $1.00', output)
+
+    def test_month_to_date_uses_estimates_when_no_bill_supplies_a_forecast(self) -> None:
+        output = self.render()
+        self.assertIn('**Month to date (UTC 2026-01): $2.00 of the $400.00 monthly limit.**', output)
+        self.assertNotIn('Month forecast:', output)
+
+    def test_forecast_uses_recovery_from_capture_after_git_history_changes(self) -> None:
+        self.replace('spend_pace_days', '7')
+        self.commit_settings()
+        self.remove('spend_pace_days')
+        with read_only_evidence(self, self.root, allow_private_history=True):
+            evidence = narrow(self, ledger.capture_spend_evidence(self.state, NOW), ledger.SpendEvidenceAt)
+
+        self.costs({'spend_pace_days': '14'})
+        self.commit_settings()
+        self.remove('spend_pace_days')
+        self.assertEqual(conf.read(self.settings).whole('spend_pace_days'), 14)
+
+        bills = tuple(ledger.DailySpend(f'2026-01-{day:02d}', 'AWS bill',
+                                      (ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal(1)),), 1)
+                      for day in range(7, 15))
+        spend_report = aws_spend.UtcSpendReport(evidence, utc_fixture(bills))
+        with read_only_evidence(self, self.root), mock.patch.object(
+                Path, 'open', side_effect=AssertionError('the forecast must use the captured setting')):
+            lines = report.utc_spend_summary(spend_report, date.fromisoformat(DAY))
+        self.assertIn('Month forecast: $25.00 at $1.00 a day. The pace uses 7 accepted bill days.', lines)
+
+    def test_report_keeps_measures_when_the_forecast_setting_is_missing(self) -> None:
+        self.remove('spend_pace_days')
+        self.write_records(self.local_step('forecast-evidence', 60, 10))
+        _ = index.update()
+        with closing(index.read_only()) as connection, read_only_evidence(self, self.root, allow_private_history=True):
+            output = report.report(connection, DAY)
+        notices = [line for line in output.splitlines() if line.startswith('Month forecast unavailable:')]
+        self.assertEqual(notices, [f"Month forecast unavailable: {self.settings}: spend_pace_days='<missing>': "
+                                   + 'key is missing; no usable committed value.'])
+        self.assertNotIn('Month forecast:', output)
+        self.assertIn('**Today (UTC 2026-01-15, estimate): $2.00 of the $20.00 daily limit.', output)
+        self.assertIn('**Month to date (UTC 2026-01): $2.00 of the $400.00 monthly limit.**', output)
+        self.assertIn('Ledger query fees for these days: $0.00.', output)
+        self.assertIn('### Summary: all', output)
 
     def test_gate_type_comparison_uses_finished_times_and_billed_days_in_the_window(self) -> None:
         numeric_settings(self.settings, {'gate_type_window_days': '2'})
@@ -334,7 +420,7 @@ class AwsReportTests(MeasurementFixture):
             _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(reading)))
         output = self.render()
         # The runs launched in us-east-2, so the USW2 bill goes to no run.
-        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', output)
+        self.assertIn('| Machine type | Gate runs | Targeted test runs | All runs |', output)
         self.assertIn('| m7a.8xlarge | $0.0667 per run (2) | $0.1333 per run (1) | $0.1000 per run (3) |', output)
         self.assertIn('| c7a.8xlarge | $0.6750 per run (1) | $0.2250 per run (2) | $0.4500 per run (3) |', output)
         self.assertIn('| All types | $0.3708 per run (3) | $0.1792 per run (3) | $0.2750 per run (6) |', output)
@@ -377,8 +463,10 @@ class AwsReportTests(MeasurementFixture):
         })
 
     def test_gate_fallback_lines_show_one_short_reason_per_event_in_the_window(self) -> None:
+        override_fixture_settings(self.root / 'build_steps.conf', 'names.test-affected=fixture affected')
         events: list[dict[str, object]] = [
             {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'test-affected', 'result': 'fallback',
+             'gate_job': snapshot_value(StepJob('test-affected')),
              'reason': 'The checkout changed after the test selection\nfixture traceback'},
             {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
              'reason': 'image or stack is absent'},
@@ -394,8 +482,8 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual(len(lines), 2)
         at = datetime.fromtimestamp(NOW, UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
         self.assertEqual(lines[0], '- Cloud gate uses natedev: The checkout changed after the test selection '
-                         + f'({at}, targeted-test).')
-        self.assertIn('image or stack is absent', lines[1])
+                         + f'({at}, fixture affected).')
+        self.assertRegex(lines[1], r'image or stack is absent .* UTC, gate\)\.')
         for hidden in ('fixture traceback', 'fixture old reason', 'fixture future reason'):
             self.assertNotIn(hidden, output)
 
@@ -406,7 +494,7 @@ class AwsReportTests(MeasurementFixture):
              'reason': 'fixture ' * 100},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        comparison = aws_report.gate_type_report(self.state, DAY, 1)
+        comparison = aws_report.gate_type_report(self.state, DAY, 1, home='us-east-1')
         lines = [line for line in comparison.tables if line.startswith('- Cloud gate uses natedev:')]
         self.assertEqual(len(lines), 2)
         self.assertIn('Reason unavailable', lines[0])
@@ -419,7 +507,7 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'launched'},
             {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 60}]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
-        comparison = aws_report.gate_type_report(self.state, DAY, 14)
+        comparison = aws_report.gate_type_report(self.state, DAY, 14, home='us-east-1')
         lines = comparison.tables
         self.assertIn('| m7a.8xlarge | — | not billed yet (1) | not billed yet (1) |', lines)
         self.assertFalse(any(line.startswith('| All types |') for line in lines))
@@ -427,10 +515,13 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn('| All shown days | 0 | — | — | 1 | 1m 0s | 2m 0s | not billed yet |', lines)
 
     def test_gate_type_comparison_uses_shared_files_without_a_steps_query(self) -> None:
+        override_fixture_settings(self.root / 'build_steps.conf', 'names.merge-gate=fixture gate')
         with read_only_evidence(self, self.root):
-            comparison = aws_report.gate_type_report(self.state, DAY, 14)
+            comparison = aws_report.gate_type_report(self.state, DAY, 14, home='us-east-1')
         lines = comparison.tables
-        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', lines)
+        self.assertIn('| Machine type | Fixture gate runs | Targeted test runs | All runs |', lines)
+        self.assertIn('| Day (UTC) | Fixture gate runs | Test time (Fixture gate) | Box time (Fixture gate) | '
+                      + 'Targeted test runs | Test time (Targeted test) | Box time (Targeted test) | Cost per run |', lines)
         self.assertIn('| All shown days | 0 | — | — | 0 | — | — | — |', lines)
         self.assertIn('UTC 2026-01-02 through 2026-01-15 (14 days)', comparison.source)
 
@@ -452,6 +543,8 @@ class AwsReportTests(MeasurementFixture):
                 output = self.render()
                 self.assertIn(f'- Gate type comparison unavailable: {reason}', output)
                 self.assertEqual(output.count('Gate type comparison unavailable:'), 1)
+                if filename.startswith('charges/'):
+                    self.assertIn(f'- {DAY}: invalid bill format', output)
                 self.assertIn('### AWS\n', output)
                 self.assertNotIn('AWS: up ', output)
                 self.assertIn('Mac copies: none started.', output)
@@ -486,7 +579,8 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW, 'instance_type': 'm7a.8xlarge', 'result': 'finished', 'gate_s': 10},
             {'time': MIDNIGHT + 86400, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
         ]
-        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(
+            json.dumps({**row, 'attempt': f'fixture-{index}'}) + '\n' for index, row in enumerate(launches)))
         usage = (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('0.06'), Decimal('.1'), 'Hrs'),
                  ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('0.02'), Decimal('.1'), 'Hrs'),
                  ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('0.03'), Decimal('.1'), 'Hrs'),
@@ -496,7 +590,7 @@ class AwsReportTests(MeasurementFixture):
                  ledger.UsageTypeCost('USE2-Lambda-Request', Decimal('.3')))
         for provisional in (False, True):
             with self.subTest(provisional=provisional):
-                label = 'provisional bill' if provisional else 'bill'
+                label = 'unsettled AWS amount so far'
                 reading = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
                                            Decimal(3), reading.estimated_usd, reading.query_usd, usage, provisional)
                 _ = (self.state / 'charges' / f'{reading.day}.json').write_text(json.dumps(ledger.charge_record(reading)))
@@ -512,13 +606,17 @@ class AwsReportTests(MeasurementFixture):
                 self.assertNotIn('**Today (UTC', output)
                 with mock.patch.object(time, 'time', return_value=float(at)):
                     current = self.render('2026-01-16')
-                self.assertIn('**Today (UTC 2026-01-16, estimate): $2.89 of the $20.00 daily limit. 1 gate runs.**', current)
+                self.assertIn('**Today (UTC 2026-01-16, estimate): $1.14 of the $20.00 daily limit. 1 gate runs.**', current)
                 self.assertIn(f'| 2026-01-15 | $3.00 | $0.08 | $0.03 | $0.00 | $2.29 | $0.60 | 3 | {label} |', current)
         for amount in (Decimal('-0.0000036'), Decimal('0.0000036')):
             with self.subTest(amount=amount):
                 dust = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
                     amount, reading.estimated_usd, reading.query_usd, (ledger.UsageTypeCost('storage', amount),))
-                _ = (self.state / 'charges' / f'{dust.day}.json').write_text(json.dumps(ledger.charge_record(dust)))
+                with self.book().transaction() as state:
+                    _ = (self.state / 'charges' / f'{dust.day}.json').write_text(json.dumps(ledger.charge_record(dust)))
+                    state.reconciliations = [replace(row, usd=dust.actual_usd)
+                                             if row.source == 'Cost Explorer' and row.period_start == dust.period_start
+                                             else row for row in state.reconciliations]
                 with mock.patch.object(time, 'time', return_value=float(at)):
                     output = self.render('2026-01-16')
                 self.assertNotIn(f'AWS bill (account, UTC {DAY},', output)

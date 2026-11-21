@@ -70,7 +70,10 @@ SCENARIOS = {
         'test_hana_down_waits_for_a_disk_hidden_after_aws_accepts_creation',
         'test_hana_down_recovers_the_request_and_disk_from_a_saved_instance',
     ),
+    'test_deploy_recover.DeploymentRecoveryTests': (
+        'test_creates_both_records_from_live_stack_values',),
     'test_hana_setup.HanaSetupTests': (
+        'test_resume_restores_missing_parameters_after_a_fallback_launch',
         'test_root_replacement_installs_the_scaler_policy_before_starting',
         'test_root_replacement_replays_the_token_and_polls_the_returned_task_id',
         'test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop',

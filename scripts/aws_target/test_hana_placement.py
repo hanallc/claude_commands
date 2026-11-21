@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -18,19 +18,27 @@ import threading
 from typing import cast, final, override
 from unittest import mock
 
-from scripts.build_queue import execution_identity
-from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
+from scripts.build_queue import execution_identity, admission_client, admission_service
+from scripts.aws_target import (
+    gpu_size_trial, hana_box as box, hana_execution, hana_placement as hana,
+    hana_placement_adapter as adapter, hana_spend, ledger, remote, test_hana_execution,
+)
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock, control_lock
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting, REAL_RUN
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
-from scripts.buildlog import store
+from scripts.buildlog import store, treekey
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.build_hold.owning_session import OwningSession
+from scripts.build_hold import build_hold, hold_enforcer
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+from scripts.copies import copies
+from scripts.direct.runner_result import UsableRunnerResult, read_result
+from scripts.direct.step_selection import Pinned
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -179,7 +187,6 @@ class HanaPlacementTests(CostFixture):
         self.assertIsInstance(constraints.candidates[0].eligibility, placement.AllowedHost)
 
     def test_disallowed_workloads_remain_excluded_when_pinned(self) -> None:
-        from scripts.direct.step_selection import Pinned
         for kind in ('test', 'build', 'final'):
             with self.subTest(kind=kind):
                 constraints = build_targets.fixed_placement_constraints(self.root, 'hana', cast(placement.CommandKind, kind),
@@ -297,8 +304,6 @@ with hana_command_lock(directory) as access:
         self.assertEqual(self.claim(), pending)
 
     def test_placement_releases_only_a_dead_claim_after_lifecycle_abandonment(self) -> None:
-        from scripts.aws_target import hana_execution
-
         pending = self.claim()
         assert isinstance(pending, hana.HanaClaimPending)
         other = replace(self.request(), episode='other')
@@ -337,19 +342,17 @@ with hana_command_lock(directory) as access:
             self.assertEqual(self.claim(), hana.HanaClaimRefused('boot failed'))
 
     def test_placement_releases_a_dead_claim_after_command_admission_refusal(self) -> None:
-        from scripts.aws_target import hana_execution as execution, test_hana_execution as fixtures
-
         adopted = self.ready()
         claim = adopted.reserved.claim.reference
-        template = fixtures.HanaExecutionTests().request
+        template = test_hana_execution.HanaExecutionTests().request
         key = replace(template.key, claim_id=claim.claim_id, generation=adopted.generation)
         self.assertEqual((key.episode, key.attempt), (claim.episode, claim.attempt))
         source = self.assignment.source_key
         assert isinstance(source, execution_identity.SourceKeyKnown)
         request = replace(template, key=key, source_key=source)
-        objects = fixtures.FakeExecutionObjects(request, terminated=True, lease_free=True, fail_fence=True)
+        objects = test_hana_execution.FakeExecutionObjects(request, terminated=True, lease_free=True, fail_fence=True)
         permit = self.provider.published[-1]
-        _ = execution.dispatch_execution(self.state, request, adopted, objects,
+        _ = hana_execution.dispatch_execution(self.state, request, adopted, objects,
             upload_source=lambda: None,
             consume=lambda selected: wire.FirstAuthorization(selected.assignment, selected.claim),
             current_permission=lambda: self.controller.permission(claim.claim_id, key.generation.boot_id, permit.generation),
@@ -357,13 +360,13 @@ with hana_command_lock(directory) as access:
         reason = 'The data mount and a fresh permit are required'
         observation = replace(objects.observe_execution(key), evidence=execution_identity.ExecutionEvidenceUnavailable(reason, self.clock.now))
         with mock.patch.object(objects, 'observe_execution', return_value=observation):
-            _ = execution.observe_execution(self.state, request, objects)
+            _ = hana_execution.observe_execution(self.state, request, objects)
         with mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleaseRefused('The Hana claim is busy')) as release:
-            settled = execution.settle_execution(self.state, request, objects,
+            settled = hana_execution.settle_execution(self.state, request, objects,
                 release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
-                fence_window=execution.FenceAcknowledgementWindow(0, 1))
-        self.assertIsInstance(settled, execution.HanaSettlementPending)
-        self.assertTrue(execution.claim_dispatch_pending(self.state, claim))
+                fence_window=hana_execution.FenceAcknowledgementWindow(0, 1))
+        self.assertIsInstance(settled, hana_execution.HanaSettlementPending)
+        self.assertTrue(hana_execution.claim_dispatch_pending(self.state, claim))
         release.assert_called_once()
         other = replace(self.request(), episode='other')
         evidence = self.evidence(other)
@@ -377,10 +380,9 @@ with hana_command_lock(directory) as access:
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertEqual(evidence.eligibility, placement.AllowedHost())
         self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
-        self.assertTrue(execution.claim_admission_refused(self.state, claim))
+        self.assertTrue(hana_execution.claim_admission_refused(self.state, claim))
 
     def test_settled_attempt_cannot_commit_another_lifecycle_claim(self) -> None:
-        from scripts.aws_target import hana_execution
         with (mock.patch.object(hana_execution, 'execution_command_settled', return_value=True),
                 mock.patch.object(self.controller, 'request', side_effect=AssertionError('Do not reuse a settled attempt'))):
             self.assertIsInstance(self.claim(), hana.HanaClaimRefused)
@@ -388,7 +390,6 @@ with hana_command_lock(directory) as access:
     def test_refused_assignment_release_preserves_another_worktree_claim(self) -> None:
         _ = self.claim()
         second = replace(self.assignment, episode='other', attempt='other')
-        from scripts.aws_target import hana_execution
         before = self.controller.path.read_bytes()
         with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
             self.assertEqual(hana.release_assigned(second, self.holder, self.controller), hana.HanaClaimReleased())
@@ -564,7 +565,6 @@ with hana_command_lock(directory) as access:
         adopted = self.ready()
         self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller),
                          hana.HanaClaimReleaseRefused('The Hana command settlement is unconfirmed'))
-        from scripts.aws_target import hana_execution
         with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
             self.assertEqual(hana.release_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller),
                              hana.HanaClaimReleaseRefused('The local Hana claim differs from the assignment or holder'))
@@ -589,13 +589,10 @@ with hana_command_lock(directory) as access:
         code = "import sys; from scripts.aws_target.hana_placement import HanaHostGeneration; assert 'scripts.aws_target.hana_provider' not in sys.modules"
         result = subprocess.CompletedProcess[str]([], 0)
         # Use the real interpreter because the fixture refuses non-Git commands.
-        from scripts.aws_target.ledger_test_support import REAL_RUN
         result = REAL_RUN([sys.executable, '-E', '-c', code], cwd=REPOSITORY, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_only_an_exact_current_assignment_establishes_a_remote_waiter(self) -> None:
-        from scripts.build_hold import build_hold, hold_enforcer
-        from scripts.build_queue import admission_service
         _ = self.ready()
         key = execution_identity.attempt_key(self.assignment.episode, self.assignment.attempt)
         saved = records.SavedPlacementAssignment(self.assignment)
@@ -662,8 +659,6 @@ class HanaGpuPlacementTests(CostFixture):
             OwningSession('fixture-session'), 0)
 
     def candidate(self, *, command: tuple[str, ...] = command) -> placement.PlacementCandidate:
-        from scripts.direct.step_selection import Pinned
-
         constraints = build_targets.fixed_placement_constraints(
             self.root, self.package, 'test', command, self.assignment.session, self.assignment.source_key,
             selection=Pinned('hana-gpu'))
@@ -691,11 +686,6 @@ class HanaGpuPlacementTests(CostFixture):
     def run_fake_gpu(self, code: int | str, *, confirm_cleanup: bool = True, refuse_start: bool = False,
                      report_unavailable: bool = False, refuse_release: bool = False
                      ) -> tuple[int, str, str, wire.ExecutionReport]:
-        from contextlib import redirect_stdout
-        from scripts.aws_target import gpu_size_trial
-        from scripts.build_queue import admission_client
-        from scripts.buildlog import treekey
-        from scripts.copies import copies
 
         claim_id = execution_identity.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
         reference = placement.ProviderClaimReference('ssh', 'hana-gpu', self.assignment.destination.scope,
@@ -768,8 +758,6 @@ class HanaGpuPlacementTests(CostFixture):
         return status, stdout.getvalue(), stderr.getvalue(), reports[0]
 
     def test_returns_the_pass_or_fail_status_and_output(self) -> None:
-        from scripts.aws_target import gpu_size_trial
-
         for code in (0, 100):
             with self.subTest(code=code):
                 status, stdout, stderr, report = self.run_fake_gpu(code)
@@ -796,14 +784,11 @@ class HanaGpuPlacementTests(CostFixture):
         self.assertEqual(report.path, placement.DispatchPathPending('The GPU service ended'))
 
     def test_reconciled_termination_releases_the_retained_slot(self) -> None:
-        from scripts.aws_target import gpu_size_trial
-        from scripts.aws_target.controller_lock import control_lock
 
         _ = self.run_fake_gpu('Unconfirmed termination', confirm_cleanup=False)
         claim = execution_identity.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
         destination = self.assignment.destination
         transport = target_config.read_execution_transport(target_config.configured_ssh_target(destination.target))
-        from scripts.build_targets.execution_transport import HanaGpuNextestTransport
         assert isinstance(transport, HanaGpuNextestTransport)
         key = placement.HostEvidenceKey(destination, self.assignment.session, self.command, 'fixture',
             package=self.package, command_kind='test')
@@ -838,8 +823,6 @@ class HanaGpuPlacementTests(CostFixture):
             self.assertFalse(adapter.gpu_claim_pending(destination.target, claim))
 
     def test_refused_service_start_releases_its_slot(self) -> None:
-        from scripts.direct.runner_result import UsableRunnerResult, read_result
-
         for refuse_release, expected in (
             (False, placement.DispatchPathSettled()),
             (True, placement.DispatchPathPending('The Hana GPU claim release remains pending')),

@@ -3,7 +3,6 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
-import re
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -40,6 +39,43 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page = fixture.caller_selection_page()
+        expected = (
+            (700001, "recorded cloud", "recorded cloud", "recorded cloud"),
+            (50, "CI nextest", "hana CI", "hana CI"),
+            (301, "held caller", "held caller", "held caller"),
+            (302, "unregistered session", "unregistered session", "unregistered session"),
+            (304, "hana nextest", "unregistered session", "hana nextest"),
+            (200, "recorded local", "recorded local", "recorded local"),
+            (700002, "recorded cloud", "recorded cloud", "recorded cloud"),
+            (303, "recorded slot", "recorded slot", "recorded slot"),
+        )
+        self.assertEqual(page["reserved"], 11.0)
+        self.assertEqual([row["pid"] for row in (*page["walk"], *page["waiters"])],
+                         [pid for pid, *_ in expected])
+        keys = [f"{kind}:{row.get('key')}" for kind, table in (("row", page["walk"]), ("wait", page["waiters"]))
+                for row in table]
+        self.assertEqual(len(set(keys)), len(expected))
+        rendered = cast(list[str], self.page_expression(
+            f"(renderWalk(data), [$('walk').innerHTML, ...{json.dumps(keys)}.map(key => tooltipHtml(key, data))])",
+            cast(object, json.loads(memory_feed.page_json(page))), walk=True))
+        table = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
+        for (pid, name, caller, title), key, hover in zip(expected, keys, rendered[1:], strict=True):
+            with self.subTest(pid=pid):
+                cell = table.find(f".//tr[@data-tip='{key}']/th[@class='step']")
+                chart = table.find(f".//div[@data-tip='{key}']")
+                assert cell is not None and chart is not None
+                self.assertEqual("".join(cell.itertext()), name)
+                self.assertEqual(chart.findtext(".//span[@class='name']"), name)
+                owner = chart.find(".//span[@class='owner']")
+                assert owner is not None
+                self.assertEqual("".join(owner.itertext()), caller)
+                self.assertEqual("".join(ElementTree.fromstring(hover)[0].itertext()), title)
+
     def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
         names = staff_names.StaffNames(staff.StaffSnapshot((unit,)))
@@ -805,32 +841,6 @@ class MemoryHoverTests(unittest.TestCase):
         fields = {row["label"]: row["value"] for row in rows}
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
-
-    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
-        fixture = test_memory_feed.MemoryFeedTests()
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
-        data = fixture.copies_slot_page("python3 /fixture/check.service.sh", source="/fixture/startup",
-                                       unit="startup", staff_id="staff-startup")
-        row, = data["waiters"]
-        key = row.get("key")
-        self.assertIsNotNone(key)
-        body = cast(list[str], self.page_expression(
-            f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}',data)])",
-            cast(object, json.loads(memory_feed.page_json(data))), walk=True))
-        unit = re.search(r'<tr class="wait wait-first"[^>]*>.*?<td class="unit"><span class="cell-text">([^<]*)</span></td>',
-                         body[0])
-        self.assertIsNotNone(unit)
-        assert unit is not None
-        self.assertEqual(unit[1], "startup")
-        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
-
-    def test_repository_slot_wait_has_no_memory_group(self) -> None:
-        data = {"waiters": [{"kind": "repository-slot", "name": "widget build", "need": 0,
-                            "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
-        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-0', data)", data))
-        self.assertEqual({row["label"]: row["value"] for row in rows}["Waits for"], "build slot")
-        self.assertTrue({"Needs", "Free", "Short by"}.isdisjoint(row["label"] for row in rows))
 
     def test_heading_keeps_all_structured_priority_entries(self) -> None:
         data = {"unmatched_priority_entries": [{"unit": "research", "why": "first"},

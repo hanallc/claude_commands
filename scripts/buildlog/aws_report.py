@@ -11,7 +11,7 @@ from statistics import median
 from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import ledger, run_cost
-from scripts.lib import conf
+from scripts.lib import build_steps
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
@@ -75,39 +75,42 @@ def trend_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[run_
     return f'${run_cost.billed_cost_per_run(billed, allocations):.4f}'
 
 
-def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
+def gate_type_report(directory: Path, day: str, days: int, *, home: str) -> GateCostReport:
     """Compare costs and times by machine type, run kind, and UTC completion day."""
     end = datetime.fromisoformat(day).replace(tzinfo=UTC) + timedelta(days=1)
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
-    measured = run_cost.gate_runs(book, start, end, conf.read_or_repository('aws_target').text('region'))
+    measured = run_cost.gate_runs(book, start, end, home)
     runs, omitted, fallbacks = measured.runs, measured.omitted, measured.fallbacks
-    kinds = run_cost.KINDS
+    names = build_steps.read_step_names()
+    gate, targeted = (names.shown(mode) for mode in run_cost.EVERY_KIND)
+    gate, targeted = gate[:1].upper() + gate[1:], targeted[:1].upper() + targeted[1:]
     allocations = run_cost.billed_allocations(run_cost.spot_bills(book, start, end), runs)
-    lines = ['| Machine type | Merge gates | Targeted tests | All runs |', '|---|---:|---:|---:|']
+    lines = [f'| Machine type | {gate} runs | {targeted} runs | All runs |', '|---|---:|---:|---:|']
     sizes = sorted({run.instance_type for run in runs})
     for size in sizes:
         selected = [run for run in runs if run.instance_type == size]
-        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode, _label in kinds]
+        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode in run_cost.EVERY_KIND]
         lines.append(f'| {size} | ' + ' | '.join([*cells, run_cost_cell(selected, allocations)]) + ' |')
     if len(sizes) >= 2:
-        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode, _label in kinds]
+        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode in run_cost.EVERY_KIND]
         lines.append('| All types | ' + ' | '.join([*cells, run_cost_cell(runs, allocations)]) + ' |')
     source = (f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
               + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch.')
-    lines.extend(('', '| Day (UTC) | Merge gates | Merge gate test time | Merge gate box time | Targeted tests | Targeted test time | Targeted box time | Cost per run |',
+    lines.extend(('', f'| Day (UTC) | {gate} runs | Test time ({gate}) | Box time ({gate}) | '
+        + f'{targeted} runs | Test time ({targeted}) | Box time ({targeted}) | Cost per run |',
         '|---|---:|---:|---:|---:|---:|---:|---:|'))
     for at in sorted({run.day for run in runs}, reverse=True):
         selected = [run for run in runs if run.day == at]
         cells: list[str] = []
-        for mode, _label in kinds:
+        for mode in run_cost.EVERY_KIND:
             matching = [run for run in selected if run.mode == mode]
             cells.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                           run_cost.median_run_time([run.box_s for run in matching])))
         cost = trend_cost_cell(selected, allocations)
         lines.append(f'| {at} | ' + ' | '.join([*cells, cost]) + ' |')
     totals: list[str] = []
-    for mode, _label in kinds:
+    for mode in run_cost.EVERY_KIND:
         matching = [run for run in runs if run.mode == mode]
         totals.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                        run_cost.median_run_time([run.box_s for run in matching])))
@@ -118,8 +121,9 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
         reason = ' '.join(reason.split())
         if len(reason) > 200:
             reason = reason[:197] + '...'
-        mode = str(row.get('mode', 'unknown mode'))
-        lines.extend(('', f'- Cloud gate uses natedev: {reason} ({at:%Y-%m-%d %H:%M:%S UTC}, {mode}).'))
+        job = build_steps.saved_gate_job(row)
+        name = names.shown(job.step) if isinstance(job, build_steps.StepJob) else names.shown(str(row.get('mode', 'unknown mode')))
+        lines.extend(('', f'- Cloud gate uses natedev: {reason} ({at:%Y-%m-%d %H:%M:%S UTC}, {name}).'))
     return GateCostReport([*lines, ''], source)
 
 
