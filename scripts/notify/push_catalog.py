@@ -13,6 +13,7 @@ def waiting_tests(count: int) -> str:
     return "1 test waits" if count == 1 else f"{count} tests wait"
 
 
+NATE_ADHOC_TEXT_ID = "nate.adhoc"
 ENTRIES = (
     PushText("accounts.login_sitting", "accounts", "note", "Claude logins will expire", NoActionNeeded(),
         "You asked for early login reminders.\nWithout renewal, Claude work stops at these login end dates:\n{accounts}\nFor each account:\n"
@@ -366,7 +367,7 @@ ENTRIES = (
     # /nate adhoc: an agent writes the values at send time; review them like free text (user, 2026-10-28).
     # The user asked that the template name close each push; pushover.py's "Template:" line does that
     # for every push (user, 2026-10-27).
-    PushText("nate.adhoc", "{sender}", "note", "{sender} {title}", NoActionNeeded(),
+    PushText(NATE_ADHOC_TEXT_ID, "{sender}", "note", "{sender} {title}", NoActionNeeded(),
         "{description}",
         (PushExample("typical", {"sender": "natedev", "title": "the /nate skill is ready",
                                  "description": "You asked to be told when the /nate skill is ready. It is ready now: "
