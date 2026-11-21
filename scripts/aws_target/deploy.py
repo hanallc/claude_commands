@@ -4029,7 +4029,7 @@ def main() -> int:
         if args.workload not in ('rust', 'merge-gates') or args.approve_resources or args.approve_destroy or args.approve_release:
             from scripts.lib.build_steps import read_step_names
 
-            gate = read_step_names().shown('merge-gate')
+            gate = read_step_names().shown('gate')
             parser.error(f'Use recover for {gate} deployment records. Omit resource approval flags.')
         subject = Deployment(args.settings, args.directory, args.output)
         try:

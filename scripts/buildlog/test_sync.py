@@ -389,7 +389,7 @@ class SyncTests(unittest.TestCase):
               mock.patch.object(aws_target, "hourly", return_value=1) as read):
             self.assertEqual(cli.aws_snapshot(), 1)
         state.assert_called_once_with("aws")
-        read.assert_called_once_with(conf.path("aws_target"), folder)
+        read.assert_called_once_with(conf.path("aws_target"), folder, allow_aws_unavailable=True)
 
     def test_aws_page_publishes_from_the_installed_settings_and_state_directory(self) -> None:
         from scripts.aws_target import aws_page

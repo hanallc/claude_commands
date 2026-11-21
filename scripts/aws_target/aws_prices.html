@@ -195,14 +195,16 @@ const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
-const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", "Cost per gate", "Gate", "USD"],
+const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", costViewLabel(), "Gate", "USD"],
               ["quota", "Quota", "Fit", "boxes"]];
 const TYPES = [["standard", "Standard"], ["gpu", "GPU"]];
+const RUN_SCOPE_ALIASES = new Map([["merge-gate", "gate"], ["targeted-test", "test-affected"]]);
 const query = new URLSearchParams(location.search);
 let shown = new Set(data.regions);
 const measures = new Set(query.has("show") ? query.get("show").split(",") : SHOW.map(([key]) => key));
 let types = query.get("types") === "gpu" ? "gpu" : "standard";
-let scope = query.get("runs");
+const savedScope = query.get("runs");
+let scope = RUN_SCOPE_ALIASES.get(savedScope) ?? savedScope;
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -432,6 +434,11 @@ function priceHeader(row, name, unit, className) {
   return cell;
 }
 
+function costViewLabel() {
+  const gateCosts = data.runs.find(entry => entry.scope === "gate");
+  return "Cost per " + (gateCosts?.noun ?? "gate");
+}
+
 function priceCell(row, source, rowIndex, column, className, marks) {
   const text = source.rows[rowIndex][column];
   const place = String([rowIndex, column]);
@@ -510,7 +517,10 @@ const runsChips = document.getElementById("runs-chips");
 const scopeFilters = [runsChips, document.getElementById("filter")];
 
 function drawPrices() {
-  for (const chip of showChips.children) chip.setAttribute("aria-pressed", String(measures.has(chip.dataset.measure)));
+  for (const chip of showChips.children) {
+    chip.setAttribute("aria-pressed", String(measures.has(chip.dataset.measure)));
+    if (chip.dataset.measure === "cost") chip.textContent = costViewLabel();
+  }
   for (const chip of typesChips.children) chip.setAttribute("aria-pressed", String(chip.dataset.types === types));
   runsChips.hidden = document.getElementById("runs-label").hidden = !measures.has("cost");
   const group = types === "gpu" ? 1 : 0;
@@ -571,7 +581,12 @@ function drawPlacementScores() {
 function drawScope() {
   const costs = scopeCosts();
   for (const group of scopeFilters) {
-    for (const button of group.children) button.setAttribute("aria-pressed", String(button.dataset.scope === costs.scope));
+    for (const button of group.children) {
+      const scope = button.dataset.scope;
+      const label = data.runs.find(entry => entry.scope === scope)?.label;
+      if (label !== undefined && button.textContent !== label) button.textContent = label;
+      button.setAttribute("aria-pressed", String(scope === costs.scope));
+    }
   }
   const cheapest = costs.estimates.find(entry => shown.has(entry.region));
   document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;

@@ -70,8 +70,7 @@ faster_box_max_cost_ratio=1.50
         self.account_path = self.directory / 'aws_target.conf'
         _ = self.account_path.write_text('region=fixture-home\n# whole: 1..\nprice_max_age_seconds=7200\n')
         _ = (self.directory / 'build_steps.conf').write_text("""[names]
-names.merge-gate=fixture gate
-names.targeted-test=fixture targeted
+names.gate=fixture gate
 names.test-affected=fixture affected
 names.integrate=fixture integration
 names.test-modules=fixture named
@@ -171,12 +170,12 @@ names.test-all=fixture all
 
     def test_one_size_workloads_report_the_recorded_count(self) -> None:
         workloads = {workload.mode: workload for workload in self.read().workloads}
-        for mode, name in (('targeted-test', 'fixture targeted'), ('test-affected', 'fixture affected')):
-            workload = workloads[mode]
-            assert isinstance(workload, machines_data.WorkloadWithoutComparison)
-            self.assertEqual(workload.name, name)
-            self.assertEqual(workload.sentence,
-                             f'The records for {name} hold 1 completed run on 1 machine size in this period.')
+        self.assertEqual(tuple(workloads), ('gate', 'test-affected'))
+        workload = workloads['test-affected']
+        assert isinstance(workload, machines_data.WorkloadWithoutComparison)
+        self.assertEqual(workload.name, 'fixture affected')
+        self.assertEqual(workload.sentence,
+                         'The records for fixture affected hold 2 completed runs on 1 machine size in this period.')
 
     def test_total_uses_every_measured_job_and_every_step_start(self) -> None:
         data = self.read()
@@ -186,13 +185,13 @@ names.test-all=fixture all
         limits = tuple(machines_data.MachineLimit(limit.ratio, (limit.ratio - 1) * Decimal('.40'))
                        for step in gate.steps for limit in step.limits)
         extra, hours, live = Decimal('.25'), Decimal('.50'), Decimal('1.76')
-        targeted = replace(gate, name='fixture targeted', mode='targeted-test', live_ratio=live,
+        targeted = replace(gate, name='fixture affected', mode='test-affected', live_ratio=live,
             live_extra_usd_per_month=extra, steps=(
                 replace(gate.steps[0], last_ratio=Decimal('1.50'), limits=limits[:-1]),
                 machines_data.MachineStep(last, last, (FAST,), (), extra, hours, extra / hours, limits[-1:]),
             ))
         gate = replace(gate, live_ratio=live)
-        total = replace(data, workloads=(gate, targeted, data.workloads[2])).total
+        total = replace(data, workloads=(gate, targeted)).total
         assert isinstance(total, machines_data.AllJobsProjection)
         self.assertEqual(tuple((step.first_ratio, step.last_ratio) for step in total.steps),
                          tuple((limit.ratio, limit.ratio) for limit in limits))
@@ -240,7 +239,7 @@ names.test-all=fixture all
 
         workloads = {workload.mode: workload for workload in self.read().workloads}
         for mode, name, machine, cost in (
-                ('merge-gate', 'fixture gate', SMALL, '.06'), ('integrate', 'fixture integration', FAST, '.075'),
+                ('gate', 'fixture gate', SMALL, '.06'), ('integrate', 'fixture integration', FAST, '.075'),
                 ('test-modules', 'fixture named', FASTER, '.09'), ('test-all', 'fixture all', SMALL, '.06')):
             with self.subTest(mode=mode):
                 workload = workloads[mode]
@@ -248,9 +247,9 @@ names.test-all=fixture all
                 choice, = (choice for choice in workload.choices if choice.checks or choice.launched)
                 self.assertEqual((choice.machine, choice.checks, choice.launched, choice.usd_per_check),
                                  (machine, 1, 1, Decimal(cost)))
-        targeted = workloads['targeted-test']
+        targeted = workloads['test-affected']
         assert isinstance(targeted, machines_data.WorkloadWithoutComparison)
-        self.assertEqual(targeted.sentence, 'The records for fixture targeted hold 0 completed runs in this period.')
+        self.assertEqual(targeted.sentence, 'The records for fixture affected hold 1 completed run on 1 machine size in this period.')
 
     def test_the_gate_without_two_sizes_has_no_comparison(self) -> None:
         path = self.book.launch_history_path
@@ -302,7 +301,7 @@ names.test-all=fixture all
         merge = self.merge()
         choices = tuple(run_cost.GateLaunchVariant(row.region, row.instance_type, '', 'zone-a') for row in self.spot)
         work = run_cost.RunEvidence(
-            {(machine.instance_type, machine.region, 'merge-gate'): [Decimal(seconds)]
+            {(machine.instance_type, machine.region, 'gate'): [Decimal(seconds)]
              for machine, seconds in ((SMALL, 600), (FAST, 450), (FASTER, 300))},
             {}, {}, {}, {}, Decimal(0))
         ranking = cloud_gate.GateRankingInput(run_cost.PlacementRunHistory((), work),

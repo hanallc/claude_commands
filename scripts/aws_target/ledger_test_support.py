@@ -123,8 +123,7 @@ def write_hana_config(path: Path | None = None) -> Path:
 def write_build_steps_fixture(folder: Path) -> None:
     _ = (folder / 'build_steps.conf').write_text("""\
 [names]
-names.merge-gate=gate
-names.targeted-test=targeted test
+names.gate=gate
 names.integrate=integrate
 names.test-all=test all
 names.test-modules=test named
@@ -143,7 +142,7 @@ owned.ci-default=CI {step}
 
 
 def install_aws_fixture_settings(folder: Path) -> None:
-    """Install the private AWS settings before a fixture copies other files."""
+    """Install fixed AWS settings in the private folder."""
     install_cost_settings(folder / 'aws_target.conf')
     write_gate_config(folder / 'cloud_gate.conf')
     _ = write_hana_config(folder / 'hana_aws.conf')
@@ -182,7 +181,7 @@ def charge_readings(start: int, end: int, usd: Decimal, query_usd: Decimal) -> t
                  for at in range(start, end, 86400))
 
 
-class CostFixture(unittest.TestCase):
+class AwsSettingsFixture(unittest.TestCase):
     root: Path = Path()
     settings: Path = Path()
     state: Path = Path()
@@ -194,27 +193,34 @@ class CostFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.state.mkdir()
         install_aws_fixture_settings(self.root)
-        # The cost fixtures use one day unless a test needs a longer query.
-        self.replace('cost_explorer_watch_days', '1')
-        environment = self.configuration_environment()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **environment, "HOME": str(self.root),
+            **self.fixture_environment(), "HOME": str(self.root),
             "AWS_TARGET_CONFIG": str(self.settings),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
-        # Login shells set AWS_SHARED_CREDENTIALS_FILE to the real home; the fixture home must decide every AWS path.
-        # The patch above restores the removed names when the test ends.
+        # Remove inherited AWS paths and credentials. The patch restores them when the test ends.
         for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
             del os.environ[name]
 
-    def configuration_environment(self) -> dict[str, str]:
-        return config_environment(self.root)
+    def fixture_environment(self) -> dict[str, str]:
+        return {"CONF_DIR": str(self.root)}
 
     def configure(self, overrides: str) -> None:
         override_fixture_settings(self.settings, overrides)
 
     def configure_gate(self, overrides: str) -> None:
         override_fixture_settings(self.root / 'cloud_gate.conf', overrides)
+
+
+class CostFixture(AwsSettingsFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.replace('cost_explorer_watch_days', '1')
+
+    @override
+    def fixture_environment(self) -> dict[str, str]:
+        return config_environment(self.root)
 
     def costs(self, values: dict[str, str]) -> None:
         numeric_settings(self.settings, values)
@@ -249,7 +255,7 @@ class SpendReferenceFixture(CostFixture):
     """Use fixed settings for the account spend reference cases."""
 
     @override
-    def configuration_environment(self) -> dict[str, str]:
+    def fixture_environment(self) -> dict[str, str]:
         _ = shutil.copyfile(FIXTURES / 'console.conf', self.root / 'console.conf')
         return {'CONF_DIR': str(self.root), 'USER_ZONE': 'UTC',
                 'BUILD_TARGETS_CONFIG': str(self.root / 'build_targets.conf')}

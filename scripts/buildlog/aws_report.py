@@ -82,18 +82,21 @@ def gate_type_report(directory: Path, day: str, days: int, *, home: str) -> Gate
     book = ledger.CostLedger(directory)
     measured = run_cost.gate_runs(book, start, end, home)
     runs, omitted, fallbacks = measured.runs, measured.omitted, measured.fallbacks
+    from scripts.production.gate_routes import SuiteMode
+
     names = build_steps.read_step_names()
-    gate, targeted = (names.shown(mode) for mode in run_cost.EVERY_KIND)
+    kinds = run_cost.KINDS
+    gate, targeted = (names.shown(mode) for mode in kinds)
     gate, targeted = gate[:1].upper() + gate[1:], targeted[:1].upper() + targeted[1:]
     allocations = run_cost.billed_allocations(run_cost.spot_bills(book, start, end), runs)
     lines = [f'| Machine type | {gate} runs | {targeted} runs | All runs |', '|---|---:|---:|---:|']
     sizes = sorted({run.instance_type for run in runs})
     for size in sizes:
         selected = [run for run in runs if run.instance_type == size]
-        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode in run_cost.EVERY_KIND]
+        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode in kinds]
         lines.append(f'| {size} | ' + ' | '.join([*cells, run_cost_cell(selected, allocations)]) + ' |')
     if len(sizes) >= 2:
-        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode in run_cost.EVERY_KIND]
+        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode in kinds]
         lines.append('| All types | ' + ' | '.join([*cells, run_cost_cell(runs, allocations)]) + ' |')
     source = (f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
               + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch.')
@@ -103,14 +106,14 @@ def gate_type_report(directory: Path, day: str, days: int, *, home: str) -> Gate
     for at in sorted({run.day for run in runs}, reverse=True):
         selected = [run for run in runs if run.day == at]
         cells: list[str] = []
-        for mode in run_cost.EVERY_KIND:
+        for mode in kinds:
             matching = [run for run in selected if run.mode == mode]
             cells.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                           run_cost.median_run_time([run.box_s for run in matching])))
         cost = trend_cost_cell(selected, allocations)
         lines.append(f'| {at} | ' + ' | '.join([*cells, cost]) + ' |')
     totals: list[str] = []
-    for mode in run_cost.EVERY_KIND:
+    for mode in kinds:
         matching = [run for run in runs if run.mode == mode]
         totals.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                        run_cost.median_run_time([run.box_s for run in matching])))
@@ -122,7 +125,8 @@ def gate_type_report(directory: Path, day: str, days: int, *, home: str) -> Gate
         if len(reason) > 200:
             reason = reason[:197] + '...'
         job = build_steps.saved_gate_job(row)
-        name = names.shown(job.step) if isinstance(job, build_steps.StepJob) else names.shown(str(row.get('mode', 'unknown mode')))
+        step = job.step if isinstance(job, build_steps.StepJob) else str(row.get('mode', 'unknown mode'))
+        name = names.shown(SuiteMode.step(step))
         lines.extend(('', f'- Cloud gate uses natedev: {reason} ({at:%Y-%m-%d %H:%M:%S UTC}, {name}).'))
     return GateCostReport([*lines, ''], source)
 

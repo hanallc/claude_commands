@@ -213,7 +213,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         publish.assert_not_called()
 
     def test_recover_refusal_uses_the_configured_gate_name(self) -> None:
-        names = build_steps.StepNames({'names.merge-gate': 'fixture gate'})
+        names = build_steps.StepNames({'names.gate': 'fixture gate'})
         errors = StringIO()
         with (mock.patch.object(sys, 'argv', ['deploy.py', 'recover', '--approve-resources']),
               mock.patch.object(build_steps, 'read_step_names', return_value=names),

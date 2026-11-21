@@ -170,7 +170,7 @@ class AwsPageLaunchStateTests(PageCostFixture):
 
     def published_launch_state(self, *events: Mapping[str, object],
                                default_attempt_ids: bool = True) -> dict[str, object]:
-        rows = ({'instance_type': 'm7a.8xlarge', 'region': 'us-east-1', 'mode': 'merge-gate',
+        rows = ({'instance_type': 'm7a.8xlarge', 'region': 'us-east-1', 'mode': 'gate',
                  **({'attempt': f'fixture-{index}'} if default_attempt_ids else {}),
                  **event} for index, event in enumerate(events))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
@@ -922,7 +922,7 @@ class AwsCombinedTableTests(PageCostFixture):
                 events.extend(({**run, 'time': now - 60 - seconds, 'result': 'launched'},
                                {**run, 'time': now - 60, 'result': 'finished', 'gate_s': seconds - 60}))
         if blocked:
-            events.append({'attempt': 'blocked-fixture', 'instance_type': standard[0], 'mode': 'merge-gate',
+            events.append({'attempt': 'blocked-fixture', 'instance_type': standard[0], 'mode': 'gate',
                            'region': regions[0], 'time': now - 30, 'result': 'refused', 'error_code': 'Blocked'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events))
         placement_regions = (regions[0], 'us-west-1')
@@ -1100,6 +1100,7 @@ class AwsCombinedTableTests(PageCostFixture):
 
     def test_default_table_marks_and_shared_filters(self) -> None:
         self.run_browser_checks('?prices=cost', """
+    check(scope === null && scopeCosts().scope === "gate", "The default scope shows gate prices");
     const table = () => document.querySelector("#price-table table");
     const click = selector => document.querySelector(selector).click();
     const spot = () => table().tBodies[0].rows[0].cells[5];
@@ -1135,9 +1136,9 @@ class AwsCombinedTableTests(PageCostFixture):
     check(missingGate.title === "no current gate price"
           && missingGate.getAttribute("aria-label") === missingGate.title, "Unavailable Gate price note");
     const merge = gate().textContent;
-    click("#runs-chips [data-scope='targeted-test']");
+    click("#runs-chips [data-scope='test-affected']");
     check(gate().textContent !== merge, "Runs chips change the Gate values");
-    check(document.querySelector("#filter [data-scope='targeted-test']").getAttribute("aria-pressed") === "true",
+    check(document.querySelector("#filter [data-scope='test-affected']").getAttribute("aria-pressed") === "true",
           "Runs chips update Cost per run");
     click("#regions [data-region='us-east-1']");
     check(table().tBodies[0].rows.length === 2 && spot().classList.contains("cheapest"), "Marks use the filtered regions");
@@ -1146,7 +1147,7 @@ class AwsCombinedTableTests(PageCostFixture):
           "Gate marks use the filtered regions");
     click("#show [data-measure='cost']");
     check(document.querySelector("#runs-label").hidden && document.querySelector("#runs-chips").hidden, "Hide Runs");
-    check(params().get("show") === "spot,quota" && params().get("runs") === "targeted-test", "Show and Runs URL");
+    check(params().get("show") === "spot,quota" && params().get("runs") === "test-affected", "Show and Runs URL");
     click("#show [data-measure='spot']");
     check(table().tHead.rows.length === 1 && table().tBodies[0].rows[0].cells.length === 7, "Fit alone");
     click("#show [data-measure='quota']");
@@ -1178,14 +1179,35 @@ class AwsCombinedTableTests(PageCostFixture):
     await loadAws();
     check(settled.children.length === 0, "Refresh removes obsolete settled notes");
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
-          && params().get("runs") === "targeted-test", "Refresh keeps the filter URL");
+          && params().get("runs") === "test-affected", "Refresh keeps the filter URL");
     const pressed = id => [...document.querySelectorAll(`#${id} [aria-pressed='true']`)].map(chip => chip.textContent).join(",");
-    check(pressed("show") === "Spot price,Cost per gate" && pressed("types") === "Standard" && pressed("runs-chips") === "Targeted test runs",
+    check(pressed("show") === "Spot price,Cost per gate" && pressed("types") === "Standard" && pressed("runs-chips") === "Test affected runs",
           "Refresh keeps the selected chips");
     for (const [values, indices, color] of [[[0.1, 0.1, 0.3], [0, 1], "low"], [[0.1, 0.3, 0.3], [1, 2], "high"]]) {
       const {colors} = scaleCells({values: values.map(value => [null, value])}, {rows: [0, 1, 2], columns: [1]});
       check(indices.every(index => colors.get(`${index},1`) === `var(--scale-${color})`), `Tied ${color} endpoint`);
     }
+""")
+
+    def test_old_merge_gate_url_selects_the_gate_scope(self) -> None:
+        self.run_browser_checks('?prices=cost&runs=merge-gate', """
+    check(scope === "gate" && scopeCosts().scope === "gate", "The old URL selects the gate scope");
+""")
+
+    def test_cost_switch_uses_the_configured_gate_name_without_standard_types(self) -> None:
+        ledger_test_support.text_setting(self.root / 'build_steps.conf', 'names.gate', 'fixture gate')
+        read_words = conf.ConfigRead.words
+
+        def words(settings: conf.ConfigRead, key: str) -> tuple[str, ...]:
+            if key in ('instance_types', 'price_compare_instance_types'):
+                return ()
+            return read_words(settings, key)
+
+        with mock.patch.object(conf.ConfigRead, 'words', new=words):
+            self.run_browser_checks('?prices=cost', """
+    check(scopeCosts().tables.length === 0, "The gate scope has no tables");
+    check(document.querySelector("#show [data-measure='cost']").textContent === "Cost per fixture gate",
+          "The switch uses the configured gate name");
 """)
 
     def test_quota_cells_and_gpu_summary_use_the_latest_request(self) -> None:
@@ -1469,7 +1491,7 @@ class AwsPagePlacementScoresTests(PageCostFixture):
 
 class AwsPageGateTimePriceTests(PageCostFixture):
     def test_page_compares_the_lowest_run_cost_for_each_size_in_each_region(self) -> None:
-        ledger_test_support.override_fixture_settings(self.root / 'build_steps.conf', 'names.merge-gate=fixture gate')
+        ledger_test_support.override_fixture_settings(self.root / 'build_steps.conf', 'names.gate=fixture gate')
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'
         candidate_only = 'eu-south-2'
@@ -1496,7 +1518,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
         prices: list[ledger.RegionalSpotPrice] = []
         for size, rate, seconds in (('c7a.4xlarge', '0.6', 600), (slow_type, '0.6', 780),
                                     ('c7a.8xlarge', '2.4', 360), ('m7a.8xlarge', '1.8', 300)):
-            base = {'attempt': size, 'instance_type': size, 'region': east, 'mode': 'merge-gate'}
+            base = {'attempt': size, 'instance_type': size, 'region': east, 'mode': 'gate'}
             history.extend(({**base, 'result': 'launched', 'time': now - 1000},
                             {**base, 'result': 'finished', 'time': now - 1000 + seconds, 'gate_s': seconds - 60}))
             prices.append(ledger.RegionalSpotPrice(east, east + 'a', size, Decimal(rate), now))
@@ -1537,24 +1559,24 @@ class AwsPageGateTimePriceTests(PageCostFixture):
         self.assertEqual(table['rows'][2], [north, *(['—'] * 8), 'no current price'])
 
         page = cast(aws_page.PageData, payload(source, 'aws-prices-data'))
-        merge_gates = next(costs for costs in page['runs'] if costs['scope'] == 'merge-gate')
-        self.assertEqual(merge_gates['label'], 'Fixture gate runs')
+        gates = next(costs for costs in page['runs'] if costs['scope'] == 'gate')
+        self.assertEqual(gates['label'], 'Fixture gate runs')
         self.assertNotRegex(source.lower(), r'\bmerge (?:gate|check|test)\b')
-        gate_prices = merge_gates['prices'][0]
+        gate_prices = gates['prices'][0]
         size = 'c7a.4xlarge'
         column = gate_prices['headers'].index(size)
         prices_by_region = {row[0]: row[column] for row in gate_prices['rows']}
         end = datetime.fromtimestamp(now, UTC)
         days = conf.read(self.settings).whole('run_cost_days')
         evidence = run_cost.run_evidence(history, end - timedelta(days=days), end, east)
-        pricing = run_cost.GateRunPricing.from_config(conf.read(config), evidence, east, ('merge-gate',))
+        pricing = run_cost.GateRunPricing.from_config(conf.read(config), evidence, east, ('gate',))
         for row in table['rows'][:2]:
             region = row[0]
             with self.subTest(region=region):
                 self.assertEqual(prices_by_region[region], row[4])
                 self.assertEqual(prices_by_region[region], f'{pricing.expected_usd(Decimal("0.6"), size, region):.4f}')
                 self.assertIn({'region': region, 'summary': f'Cheapest fixture gate: {size} in {region}, {row[4]} USD (estimate)'},
-                              merge_gates['estimates'])
+                              gates['estimates'])
         spot_prices = page['prices'][0]
         for region, instance_type, spot, gate in (
             (east, size, 0.006, '0.1000'),
@@ -1567,7 +1589,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
                 self.assertEqual(gate_prices['rows'][index][gate_prices['headers'].index(instance_type)], gate)
         for region, instance_type in ((east, undeployed_type), (west, 'm7a.8xlarge')):
             self.assertFalse(any(entry['region'] == region and instance_type in entry['summary']
-                                 for entry in merge_gates['estimates']))
+                                 for entry in gates['estimates']))
         self.assertLess(source.index('id="placement-scores"'), source.index('id="gate-time-price"'))
         self.assertIn('fill(document.getElementById("gate-time-price"), data.gateTimePrice,', source)
 
@@ -1576,7 +1598,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
             slow_column = gate_prices['headers'].index(slow_type)
             self.assertEqual(gate_prices['rows'][east_index][slow_column], 'too slow')
             self.assertIsNone(gate_prices['values'][east_index][slow_column])
-            self.assertFalse(any(slow_type in entry['summary'] for entry in merge_gates['estimates']))
+            self.assertFalse(any(slow_type in entry['summary'] for entry in gates['estimates']))
         with self.subTest(gate='current price with no run history'):
             empty_column = gate_prices['headers'].index(unmeasured_type)
             self.assertEqual(gate_prices['rows'][east_index][empty_column], 'no runs')
@@ -1599,7 +1621,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
         values, policy = conf.read(config), conf.read(self.settings)
         with self.subTest(deployment='valid types with a null entry'):
             _ = deployment.write_text(json.dumps({'instance_types': [None, *deployed_types], 'regions': deployed_regions}))
-            comparisons = run_cost.merge_gate_comparisons(self.state, now, values, policy)
+            comparisons = run_cost.gate_comparisons(self.state, now, values, policy)
             small = comparisons[0].small
             self.assertIsInstance(small, run_cost.GateRunEstimate)
             assert isinstance(small, run_cost.GateRunEstimate)
@@ -1611,7 +1633,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
 
         with self.subTest(history='launch before the cutoff and finish inside it'):
             cutoff = now - days * 86400
-            crossing = {'attempt': 'cutoff', 'instance_type': size, 'region': east, 'mode': 'merge-gate'}
+            crossing = {'attempt': 'cutoff', 'instance_type': size, 'region': east, 'mode': 'gate'}
             recent = [{**row, 'time': now - 460, 'gate_s': 480}
                       if row['attempt'] == slow_type and row['result'] == 'finished' else row for row in history]
             ordered = sorted(recent, key=lambda row: int(str(row['time'])))
@@ -1624,7 +1646,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
                                            clock=lambda: now)
             variants = run_cost.read_deployed_gate_variants(self.state, deployed_types, east)
             ranked = worker.rank_variants([row for row in variants if row.region == east
-                                           and row.instance_type in (size, slow_type)], 'merge-gate')
+                                           and row.instance_type in (size, slow_type)], 'gate')
             self.assertEqual(ranked[0].instance_type, slow_type)
             gates = spot_table.spot_tables(self.state, now, settings_path=self.settings).runs[0]
             east_prices = next(row for row in gates.gate_prices.rows if row[0] == east)
@@ -1632,7 +1654,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
             self.assertEqual(east_prices[gates.gate_prices.headers.index(slow_type)], '0.0900')
             cheapest = next(entry for entry in gates.estimates if entry.region == east)
             self.assertEqual((cheapest.size, cheapest.usd), (ranked[0].instance_type, Decimal('0.09')))
-            small = run_cost.merge_gate_comparisons(self.state, now, values, policy)[0].small
+            small = run_cost.gate_comparisons(self.state, now, values, policy)[0].small
             self.assertIsInstance(small, run_cost.GateRunEstimate)
             assert isinstance(small, run_cost.GateRunEstimate)
             self.assertEqual((small.instance_type, small.usd_per_run), (cheapest.size, cheapest.usd))
@@ -1650,7 +1672,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
                 self.assertFalse(tables.runs[0].estimates)
                 self.assertTrue(all(cell == 'no current gate price' for row in tables.runs[0].gate_prices.rows
                                     for cell in row[1:]))
-                comparisons = run_cost.merge_gate_comparisons(self.state, now, conf.read(config), conf.read(self.settings))
+                comparisons = run_cost.gate_comparisons(self.state, now, conf.read(config), conf.read(self.settings))
                 self.assertEqual(comparisons, expected)
 
     def test_page_refresh_redraws_the_break_even_table_and_region_filter(self) -> None:
