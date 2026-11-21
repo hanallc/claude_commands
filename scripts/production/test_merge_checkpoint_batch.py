@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 import shlex
 import shutil
@@ -10,7 +11,7 @@ import unittest
 from typing import final
 from unittest.mock import patch
 
-from scripts.production import land_runs, merge_checkpoint, staff
+from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -427,6 +428,89 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                     self.assertIn("alpha phase 2", warning)
                     self.assertIn("beta phase 2", warning)
                     self.assertEqual(results.read_bytes(), b"\xff\n")
+
+    def test_resumed_batch_leaves_unowned_merges_open(self) -> None:
+        for case in ("operator merge during red gate", "operator merge before main merge", "changed conflict index"):
+            with self.subTest(case=case):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                start = self.git("rev-parse", "HEAD")
+                alpha = self.checkpoint()
+                beta = self.beta_checkpoint("src/beta.txt", "beta conflict\n")
+                rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
+                with (patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
+                      self.assertRaises(KeyboardInterrupt)):
+                    _ = self.land_batch(rows)
+                tested_tip = self.git("rev-parse", "HEAD")
+                main = self.push_main_change("src/beta.txt", "main conflict\n")
+                edit_owned_conflict = case == "changed conflict index"
+                gate_fails = case == "operator merge during red gate"
+                if not edit_owned_conflict:
+                    _ = self.git("fetch", "origin", "main")
+                    _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
+                    self.executable(self.bin / "checkpoint-test", STUB + f'''
+import subprocess
+conflict = subprocess.run(["git", "merge", "--no-ff", "--no-commit", {main!r}],
+                          capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+assert conflict.returncode == 1, conflict.stdout + conflict.stderr
+if {gate_fails!r}:
+    Path("src/beta.txt").write_text("operator resolution\\n")
+    subprocess.run(["git", "add", "src/beta.txt"], check=True, timeout=TEST_HANG_GUARD_SECS)
+    raise SystemExit(1)
+subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "origin", "main"],
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+''')
+
+                finish = merge_checkpoint.finish_batch_stop
+                git = merge_checkpoint.git
+                index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index"))
+                edited_file = self.checkout / "src/beta.txt"
+                saved_state: list[tuple[bytes, str]] = []
+                mutations: list[tuple[str, ...]] = []
+
+                def finish_after_operator_edit(
+                    stop: checkpoint_gate.Stop, notices: Iterable[merge_checkpoint.BatchStopNotice],
+                    rollback: merge_checkpoint.ResetBatchCheckout | merge_checkpoint.KeepBatchCheckout,
+                ) -> int:
+                    if not gate_fails:
+                        assert isinstance(stop, merge_checkpoint.MainConflict)
+                        self.assertEqual(isinstance(stop.ownership, merge_checkpoint.OwnedMainConflict), edit_owned_conflict)
+                    if edit_owned_conflict:
+                        _ = edited_file.write_text("operator resolution\n")
+                        _ = self.git("add", "src/beta.txt")
+                    self.assertEqual(self.git("rev-parse", "MERGE_HEAD"), main)
+                    if gate_fails or edit_owned_conflict:
+                        self.assertEqual(self.git("show", ":src/beta.txt"), "operator resolution")
+                    else:
+                        self.assertIn("src/beta.txt", self.git("ls-files", "--unmerged"))
+                    saved_state.append((index.read_bytes(), edited_file.read_text()))
+                    return finish(stop, notices, rollback)
+
+                def git_with_trace(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                    if saved_state and (args == ("merge", "--abort") or args[:1] == ("reset",)):
+                        mutations.append(args)
+                    return git(checkout, *args)
+
+                with (patch.object(merge_checkpoint, "finish_batch_stop", finish_after_operator_edit),
+                      patch.object(merge_checkpoint, "git", git_with_trace)):
+                    result = self.land_batch(rows)
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.events("checkpoint-test"), [] if edit_owned_conflict else [[]])
+                report = "red: failed — merge test 1 failed" if gate_fails else "push: held — origin/main conflicts: src/beta.txt"
+                self.assertIn(report, result.stdout)
+                self.assertIn("batch: resume", result.stdout)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+                before, _, warning = result.stdout.partition("rollback failed:")
+                self.assertIn(notices[-1], before)
+                refusal = "the main conflict changed" if edit_owned_conflict else "cannot reset an open merge without ownership evidence"
+                self.assertIn(refusal, warning)
+                self.assertEqual(mutations, [])
+                self.assertEqual(self.git("rev-parse", "HEAD"), tested_tip)
+                self.assertEqual(self.git("rev-parse", "MERGE_HEAD"), main)
+                self.assertEqual(saved_state, [(index.read_bytes(), edited_file.read_text())])
 
     def test_failed_gate_can_reset_to_a_newly_published_start_tip(self) -> None:
         for publish_start in (True, False):
