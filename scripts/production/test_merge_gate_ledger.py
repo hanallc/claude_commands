@@ -282,7 +282,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     @override
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = super().fixture_configuration(directory)
-        pin_ledger_settings(directory, directory, Path("/dev/shm"))
+        pin_ledger_settings(directory, directory, Path("/tmp").resolve())
         return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
 
     @override
@@ -322,6 +322,7 @@ class MergeGateLedgerTests(MergeGateFixture):
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
+        self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.state / "build-targets/aws/cloud-gate-launches.jsonl").is_file())

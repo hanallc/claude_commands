@@ -290,7 +290,7 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
 
 
 def pin_gate_root(configuration: Path, root: Path) -> None:
-    """Keep the fixture gate on its private tmpfs path."""
+    """Keep the fixture gate in its private folder."""
     _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
 
 
@@ -335,7 +335,7 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = config_environment(directory)
-        pin_gate_root(directory / "build_folders.conf", Path("/dev/shm"))
+        pin_gate_root(directory / "build_folders.conf", Path("/tmp").resolve())
         return environment
 
     @classmethod
