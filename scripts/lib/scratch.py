@@ -694,7 +694,9 @@ class HeldScratchFolders:
 
     @classmethod
     def from_holds(cls, holds: Mapping[str, Hold], *, ending_task: str | None = None,
-                   mounts: Sequence[proc_text.Mount] | None = None, now: float | None = None) -> HeldScratchFolders:
+                   mounts: Sequence[proc_text.Mount] | None = None, now: float | None = None,
+                   require_mounts: bool = True) -> HeldScratchFolders:
+        """Check hold identities. Manual review can proceed without mount aliases."""
         moment = time.time() if now is None else now
         held: set[tuple[int, int]] = set()
         parents: set[Path] = set()
@@ -711,7 +713,7 @@ class HeldScratchFolders:
         visible: tuple[proc_text.Mount, ...] = ()
         if paths and sys.platform == "linux":
             entries = proc_text.read_mounts() if mounts is None else mounts
-            if not entries:
+            if not entries and require_mounts:
                 raise ScratchHoldsUnreadable("cannot read the mount table for scratch holds")
             visible = visible_mounts(entries)
         locations = tuple(FilesystemLocation.at(path, visible) for path in paths) if visible else ()

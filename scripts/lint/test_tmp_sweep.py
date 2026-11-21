@@ -464,6 +464,42 @@ class CopyTests(TmpSweepCase):
         self.assertEqual(sibling.read_text(), "other data")
         self.assertTrue(mounted.is_dir())
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mountinfo")
+    def test_review_lists_an_unheld_folder_with_a_nested_mount(self) -> None:
+        source = self.tmp / "source"
+        mounted = source / "bound"
+        payload = write(mounted / "data", "mounted data")
+        table = write(self.tmp.parent / "mountinfo",
+                      f"1 0 0:1 / / rw - ext4 fixture rw\n"
+                      + f"2 1 0:2 / {mounted} rw - ext4 fixture rw\n")
+        self.now += 8 * DAY
+
+        with mock.patch.object(proc_text, "read_mounts", return_value=proc_text.read_mounts(table)):
+            result = self.sweep()
+
+        self.assertEqual(result.failed, [])
+        self.assertIn(f"tree contains a mount point at {mounted}", self.plan.rows[source].reason)
+        self.assertEqual(self.plan.rows[source].fingerprint, "")
+        self.assertEqual(payload.read_text(), "mounted data")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mountinfo")
+    def test_review_lists_each_candidate_when_the_mount_table_is_unreadable(self) -> None:
+        payloads = [write(self.tmp / name / "data", name) for name in ("first", "second", "held")]
+        held = payloads[-1].parent
+        _ = scratch.hold(held, "phase:demo/1", "Keep this folder.")
+        self.now += 8 * DAY
+
+        with mock.patch.object(proc_text, "read_mounts", return_value=()):
+            result = self.sweep()
+
+        self.assertEqual(result.failed, [])
+        for payload in payloads[:-1]:
+            row = self.plan.rows[payload.parent]
+            self.assertIn("cannot read the mount table", row.reason)
+            self.assertEqual(row.fingerprint, "")
+        self.assertNotIn(held, self.plan.rows)
+        self.assertEqual([payload.read_text() for payload in payloads], ["first", "second", "held"])
+
     @unittest.skipUnless(sys.platform == "linux", "requires Linux mount IDs")
     def test_run_cleanup_reports_the_source_without_opening_a_removal_journal(self) -> None:
         run = self.tmp / "ended"
@@ -597,6 +633,7 @@ class CopyTests(TmpSweepCase):
 
         self.assertTrue(pair.is_dir())
         self.assertTrue(unheld.is_dir())
+        self.assert_reviewed(unheld)
         self.assertNotIn(pair, self.plan.rows)
         self.assertTrue(scratch.release(pair))
         hold_file = write(scratch.holds_file(), '{"partial":')

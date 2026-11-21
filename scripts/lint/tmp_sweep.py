@@ -291,14 +291,23 @@ class Roots:
             return
         if root in self.copies:
             for pair in listing(root):
-                if pair.is_dir(follow_symlinks=False):
-                    for entry in listing(pair.path):
-                        copy = scratch.removal_target(Path(entry.path))
-                        if copy is not None:
-                            removal = scratch.checked_removal(copy)
-                            if isinstance(removal, (copy_record.Registered, scratch.StaleRemoval)):
-                                continue
-                        yield entry
+                if not pair.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    with os.scandir(pair.path) as entries:
+                        empty = True
+                        for entry in entries:
+                            empty = False
+                            copy = scratch.removal_target(Path(entry.path))
+                            if copy is not None:
+                                removal = scratch.checked_removal(copy)
+                                if isinstance(removal, (copy_record.Registered, scratch.StaleRemoval)):
+                                    continue
+                            yield entry
+                        if empty:
+                            yield pair
+                except OSError:
+                    continue
             return
         for entry in listing(root):
             if root not in self.temp or self.judged_temp(root, entry):
@@ -1269,6 +1278,27 @@ class ClosedPhaseEntry(RemovableEntry):
     """The phase is closed under a director or session worktree guard."""
 
 
+def _review_holds(settings: conf.ConfigRead | UseConfiguredValue, *, now: float | None = None) -> scratch.HeldScratchFolders:
+    """Check direct holds for review even when mount aliases are unknown."""
+    refuse_live_test_roots((scratch.holds_file(scratch_settings=settings),))
+    return scratch.HeldScratchFolders.from_holds(scratch.read_holds(scratch_settings=settings),
+                                                now=now, require_mounts=False)
+
+
+def _review_has_hold(path: Path, settings: conf.ConfigRead | UseConfiguredValue) -> bool:
+    holds = _review_holds(settings)
+    return bool(holds.held) and any(holds.protects(candidate) for candidate in scratch.resolved_removal_paths((path,)))
+
+
+def _review_mount_reason(path: Path) -> str:
+    """Give the mount reason for a manual review row."""
+    try:
+        scratch.CoordinatedRemoval.check_tree(path)
+    except scratch.MountRemovalRefused as error:
+        return str(error)
+    return ""
+
+
 def judge_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -1332,11 +1362,12 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     uses = entry_uses(paths.paths, judged + pairs)
     held: scratch.HeldScratchFolders | scratch.ScratchHoldsUnreadable
     try:
-        held = scratch.HeldScratchFolders.from_holds(scratch.read_holds(scratch_settings=scratch_settings), now=now)
+        held = _review_holds(scratch_settings, now=now)
     except scratch.ScratchHoldsUnreadable as error:
         held = error
     for root in judged:
         for entry in roots.entries(root):
+            copy_entry = root in roots.copies and Path(entry.path).parent != Path(root)
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
@@ -1347,7 +1378,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 except (OSError, ValueError):
                     reason = UNREADABLE
             landed_remote_check = False
-            if root in roots.copies and reason is None:
+            if copy_entry and reason is None:
                 state = scratch.lifetime(Path(entry.path), now, scratch_settings=scratch_settings,
                                          intent=scratch.RemovalIntentAccess.READ_ONLY)
                 landed_remote_check = isinstance(state, scratch.LandedRemoteCheckNeeded) and inspection is scratch.RemoteInspection.ADVERTISE
@@ -1408,7 +1439,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 if isinstance(work, scratch.KeptFolder):
                     yield KeptEntry(entry.path, work.reason)
                     continue
-            pending = root in roots.copies and isinstance(scratch.checked_removal(path), copy_record.Registered)
+            pending = copy_entry and isinstance(scratch.checked_removal(path), copy_record.Registered)
             git = (GitWork.SAVED if landed_remote_check or pending
                    or scratch.is_throwaway(path, intent=scratch.RemovalIntentAccess.READ_ONLY)
                    else git_work(path, keep_worktree_registrations=True))
@@ -1473,9 +1504,8 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         result.keep(entry.path, "its phases parent changed")
         return False
     try:
-        scratch.CoordinatedRemoval.check_tree(path)
-        with scratch.coordinate_removals(dry_run=True, scratch_settings=scratch_settings) as removal:
-            removal.check(path)
+        if _review_has_hold(path, scratch_settings):
+            raise scratch.RemovalRefused(scratch.HELD_FOLDER_REASON)
     except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
         print(f"tmp sweep: keep {entry.path}: {error}")
         result.keep(entry.path, str(error))
@@ -1484,9 +1514,13 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         if not idle:
             result.keep(entry.path, IN_USE)
         else:
+            mount_reason = _review_mount_reason(path)
             if not dry_run and isinstance(plan, removal_guard.RemovalList):
-                _ = plan.add_manual(removal_guard.Tool.TEMPORARY, path, Path(entry.root), entry.size, entry.reason)
-            result.keep(entry.path, "manual review")
+                _ = plan.add_manual(removal_guard.Tool.TEMPORARY, path, Path(entry.root), entry.size,
+                                    mount_reason or entry.reason, entry.maker)
+            if mount_reason:
+                print(f"tmp sweep: keep {entry.path}: {mount_reason}")
+            result.keep(entry.path, mount_reason or "manual review")
     return False
 
 
@@ -1541,18 +1575,19 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
         try:
             if isinstance(entry, FormerSessionEntry) and not dry_run and not review_former_session(entry, result):
                 continue
-            with scratch.coordinate_removals(dry_run=True, scratch_settings=scratch_settings) as removal:
-                removal.check(path)
+            if _review_has_hold(path, scratch_settings):
+                result.keep(entry.path, scratch.HELD_FOLDER_REASON)
+                continue
             with scratch.judgment_lock(path) as idle:
                 if not idle:
                     result.keep(entry.path, IN_USE)
                     continue
-                scratch.CoordinatedRemoval.check_tree(path)
+                reason = _review_mount_reason(path) or entry.reason
                 if isinstance(plan, removal_guard.RemovalList):
                     maker = (removal_guard.review_evidence(path)
                              if isinstance(entry.maker, removal_guard.UnknownMaker) else entry.maker)
                     _ = plan.add_manual(removal_guard.Tool.TEMPORARY, path, Path(entry.root), entry.size,
-                                        entry.reason, maker)
+                                        reason, maker)
         except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
             result.keep(entry.path, str(error))
             continue
@@ -1561,7 +1596,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
             continue
         result.freed += entry.size
         result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
-                                           last_change=when(entry.newest), reason=entry.reason))
+                                           last_change=when(entry.newest), reason=reason))
     return result
 
 
