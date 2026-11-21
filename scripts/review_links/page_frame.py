@@ -337,6 +337,16 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .review-actions{display:flex;align-items:flex-end;gap:26px;flex-wrap:wrap}
 .review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
 .review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}
+.review-actions label.action-select{display:inline-flex;align-items:center;gap:8px;margin:0;font:inherit;max-width:100%}
+.action-select select{box-sizing:border-box;min-height:44px;max-width:min(23ch,65vw);padding:6px 10px;
+border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);font:inherit}
+@supports (appearance:base-select){
+.action-select select,.action-select select::picker(select){appearance:base-select}
+.action-select select::picker(select){max-height:20rem;overflow:auto;padding:4px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--ink)}
+.action-select option{padding:5px 10px;border-radius:4px}
+.action-select option:hover{background:var(--bg)}
+}
 .review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
 @media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
@@ -424,6 +434,12 @@ def review_action_groups(closing_buttons: str, returning_buttons: str, later_con
         + f'<div{controls_class}>{controls}</div></div>'
         for label, controls, group_class, controls_class in groups if controls
     ) + '</div>'
+
+
+def action_select(name: str, label: str, options: str) -> str:
+    """Render a select next to the action that uses it."""
+    return (f'<label class="action-select">{html.escape(label)}'
+            + f'<select name="{html.escape(name, quote=True)}">{options}</select></label>')
 
 
 COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">

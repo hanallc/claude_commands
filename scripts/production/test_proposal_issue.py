@@ -735,6 +735,10 @@ class ProposalIssueTests(unittest.TestCase):
             with self.subTest(outcome=outcome), self.assertRaisesRegex(proposal_issue.Refusal, "The record changed"):
                 _ = action()
             self.assertEqual(self.issue.read_bytes(), before)
+        with self.assertRaisesRegex(proposal_issue.Refusal, "The record changed"):
+            proposal_issue.approve_from_review(self.issue, staff.StaffId(fixture_runtime_id("names")),
+                                               today, ("Approve",), check=refuse)
+        self.assertEqual(self.issue.read_bytes(), before)
 
     def test_fill_ranking_writes_an_empty_ranking_once_under_the_issue_lock(self) -> None:
         self.decision_issue()

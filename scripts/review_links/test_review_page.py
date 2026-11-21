@@ -4551,6 +4551,149 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                                 for entry in saved.log))
             self.assertEqual(review_later.times()[key], until)
 
+    def test_decision_cards_list_current_assignees_in_role_colors(self) -> None:
+        proposal, efficiency = self.decisions()
+        runner = fixture_member('showrunner', name='air', doc=staff.DocUnfilled())
+        worker = fixture_member('worker', name='worker', parent=self.fixture.unit.id)
+        wrapped = fixture_member('showrunner', name='wrapped',
+                                 doc=staff.WrappedDoc(local_machine(), self.fixture.temporary / 'wrapped.md'))
+        snapshot = review_page.build_snapshot(self.root)
+        expected = [
+            (runner.id, ' style="color:#a379fd"', runner.name),
+            (self.fixture.unit.id, ' style="color:#ffaf02"', self.fixture.unit.name),
+            (self.fixture.showrunner_id, ' style="color:#a379fd"', 'page-owner'),
+        ]
+        for key in (proposal, efficiency):
+            with self.subTest(key=key):
+                body = snapshot.body(key).decode()
+                self.assertIn('>Approve</button><label class="action-select">Assign', body)
+                self.assertEqual(body.count('name="assignee"'), 1)
+                options = body.partition('<select name="assignee">')[2].partition('</select>')[0]
+                self.assertEqual(re.findall(r'<option value="([^"]*)"([^>]*)>([^<]+)</option>', options),
+                                 [('', '', 'page-owner decides'), *expected])
+                for member in (worker, wrapped):
+                    self.assertNotIn(member.id, options)
+
+    def test_explicit_approval_delivers_and_records_the_assignee(self) -> None:
+        proposal, efficiency = self.decisions()
+        path = Path(proposal.removeprefix('proposal/'))
+        second_path = path.with_name('P2.md')
+        _ = second_path.write_text(path.read_text().replace('P1', 'P2'))
+        second_proposal = 'proposal/'+str(second_path)
+        runner = fixture_member('showrunner', name='destination')
+        unit = fixture_member('unit', name='implementation', parent=runner.id)
+        for key, assignee in ((proposal, unit), (second_proposal, runner), (efficiency, runner)):
+            with self.subTest(key=key):
+                snapshot = review_page.build_snapshot(self.root)
+                request = self.card_body(snapshot, key, 'approve')+'&'+urlencode({'assignee': assignee.id})
+                with patch.object(proposal_issue, 'write_issue', wraps=proposal_issue.write_issue) as write:
+                    delivery, answer = review_page.submit(self.root, request, self.status, snapshot=snapshot)
+                expected = 'approved, assigned to '+assignee.name
+                self.assertEqual(answer, expected)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                self.assertEqual(delivery.recipients, (assignee.id,))
+                saved = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(saved.state, review_items.ReviewState.DONE)
+                self.assertEqual(saved.log[-1].words, expected)
+                if key == proposal:
+                    write.assert_called_once()
+                    assert isinstance(saved.source, review_items.ProposalSource)
+                    issue = saved.source.record
+                    self.assertEqual(issue.value('unit'), unit.id)
+                    self.assertEqual(issue.value('approved_in'), runner.id)
+                    self.assertEqual(issue.value('approved_by'), 'user')
+                    self.assertEqual([entry.words for entry in proposal_issue.review_log(issue)], [expected])
+                    self.assertIn('The user approved the proposal and assigned it to you.', delivery.message)
+                    self.assertIn('The approval is recorded.', delivery.message)
+                    self.assertNotIn('proposal_issue.py approve', delivery.message)
+                else:
+                    self.assertIn('The user assigned this item to you.', delivery.message)
+                    if key == second_proposal:
+                        assert isinstance(saved.source, review_items.ProposalSource)
+                        self.assertEqual(saved.source.record.value('unit'), '')
+                        self.assertIn('proposal_issue.py approve', delivery.message)
+                        self.assertIn(' --by user --unit <staff id>', delivery.message)
+                    else:
+                        self.assertIn('candidates.py outcome E1 accepted', delivery.message)
+                self.fixture.messages.clear()
+                change_page.deliver(delivery, self.status)
+                self.assertEqual([target for target, _, _ in self.fixture.messages], [assignee.name])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_approve_sends_the_assignment_after_refresh(self) -> None:
+        proposal, _ = self.decisions()
+        source = browser_markup(self.root)
+        setup = r"""<script>
+window.refreshMarkup=MARKUP;
+window.posts=[];
+const nativeFetch=fetch;
+window.fetch=async(url,options={})=>{
+ if(options.method!=='POST') return {ok:true,text:async()=>window.refreshMarkup};
+ if(url==='/results') return nativeFetch(url,options);
+ window.posts.push(new URLSearchParams(options.body));
+ return {ok:true,json:async()=>({answer:'approved',state:'Done'})};
+};
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        page = source.replace('<script>', setup+'<script>', 1)
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=()=>[...document.querySelectorAll('[data-list-item]')].find(node=>node.dataset.key===KEY);
+ const updates=document.querySelector('[data-show-record-updates]');
+ let revision=0;
+ window.transformFixtureBody=(text,key)=>{
+  if(key!==KEY) return text;
+  const panel=document.createElement('template');
+  panel.innerHTML=text;
+  panel.content.querySelector('[name="revision"]').value='fixture-'+revision;
+  if(revision===2){
+   const option=[...panel.content.querySelectorAll('[name="assignee"] option')]
+    .find(option=>option.value===ASSIGNEE);
+   option.remove();
+  }
+  return panel.innerHTML;
+ };
+ try{
+  row().querySelector('.list-toggle').click();
+  const original=await readyReviewCard(row());
+  const assignee=original.elements.assignee;
+  check(assignee.value==='' && assignee.selectedOptions[0].textContent==='page-owner decides',
+        'Assign starts with the card owner.');
+  assignee.value=ASSIGNEE;
+  assignee.dispatchEvent(new Event('change',{bubbles:true}));
+  const refresh=async shown=>{
+   revision++;
+   const offered=new Promise(resolve=>{
+    const observer=new MutationObserver(()=>{
+     if(!updates.hidden){observer.disconnect();resolve();}
+    });
+    observer.observe(updates,{attributes:true,attributeFilter:['hidden']});
+   });
+   const refreshed=new Promise(resolve=>document.querySelector('[data-review]')
+     .addEventListener('review-refreshed',resolve,{once:true}));
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await Promise.all([refreshed,offered]);
+   check(await readyReviewCard(row())===shown,'The form stays in place until Show updates.');
+   updates.click();
+   return readyReviewCard(row());
+  };
+  const form=await refresh(original);
+  check(form!==original && form.elements.assignee.value===ASSIGNEE,'Show updates keeps the assignment.');
+  const name=form.elements.assignee.selectedOptions[0].textContent;
+  const refreshed=await refresh(form);
+  const unavailable=refreshed.elements.assignee.selectedOptions[0];
+  check(refreshed!==form && unavailable.value===ASSIGNEE && unavailable.textContent===name+' — not available',
+        'Refresh keeps the unavailable assignee selected.');
+  refreshed.requestSubmit(refreshed.querySelector('[value="approve"]'));
+  check(window.posts.length===1 && window.posts[0].get('outcome')==='approve' &&
+        window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the unavailable assignee ID.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>""".replace('KEY', json.dumps(proposal)).replace('ASSIGNEE', json.dumps(self.fixture.unit.id))
+        self.assertEqual(firefox_probe_results((page+probe).encode()), [[]])
+
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
         _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
         proposal, efficiency = self.decisions()
@@ -4567,11 +4710,15 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
         for key, command in commands.items():
             with self.subTest(key=key, action='approve'):
-                delivery, result = review_page.submit(self.root, self.body(key, 'approve', 'Use it.'), self.status)
+                request = self.body(key, 'approve', 'Use it.')+'&assignee='
+                delivery, result = review_page.submit(self.root, request, self.status)
                 self.assertEqual(result, 'approved, sent to page-owner')
                 assert isinstance(delivery, change_page.MessageDelivery)
                 self.assertIn('Use it.', delivery.message)
                 self.assertIn(command, delivery.message)
+                self.fixture.messages.clear()
+                change_page.deliver(delivery, self.status)
+                self.assertEqual([target for target, _, _ in self.fixture.messages], ['page-owner'])
                 approved = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(approved.state, review_items.ReviewState.DONE, 'Approve makes the item Done at once.')
                 self.assertEqual(approved.log[-1].words, 'Approve: Use it.')
