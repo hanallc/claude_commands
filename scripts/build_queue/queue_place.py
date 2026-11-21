@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -22,7 +22,9 @@ import threading
 import time
 from typing import BinaryIO, TypedDict, Unpack
 
+from scripts.agents.worker_lifecycle import effective_deadline, operation_deadline
 from scripts.lib import build_folders, atomic_file, cancellation, conf
+from scripts.lib.operation_deadline import remaining
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import step_estimator
@@ -148,7 +150,11 @@ class ProgramTree:
 
     def live_members(self, scope_members: set[int]) -> dict[int, str]:
         """Retain observed descendants after a session change or reparenting."""
-        with self.lock:
+        budget = remaining()
+        acquired = self.lock.acquire() if budget == float("inf") else self.lock.acquire(timeout=budget)
+        if not acquired:
+            raise TimeoutError("The program sampler still holds the process tree")
+        try:
             processes = memory_admit.process_table(Path("/proc"))
             roots = dict(self.observed)
             if isinstance(self.adopter, wire.Owner):
@@ -166,6 +172,8 @@ class ProgramTree:
             live = {pid: processes[pid].start for pid in members if pid in processes}
             self.observed = live
             return live
+        finally:
+            self.lock.release()
 
 
 @dataclass
@@ -180,6 +188,7 @@ class StartedProgram:
     sampler: threading.Thread | UnmeasuredProbe
     tracking: ScopedProgram | ProgramTree
     record: Path
+    cleanup_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,18 @@ def queue_place_folder() -> Generator[Path]:
         yield path
 
 
+@contextmanager
+def gate_placement_sidecar() -> Generator[Path]:
+    """Keep local gate evidence available after an unconfirmed release."""
+    files = admission_client.LocalGateRunFiles(admission_client.LocalGateRunFiles.root() / uuid.uuid4().hex)
+    files.directory.mkdir(parents=True, mode=0o700)
+    try:
+        yield program_sidecar(files.directory)
+    finally:
+        if not files.assignment.exists():
+            files.remove()
+
+
 def cleanup_queue_place_folders() -> None:
     """Remove this account's temporary folders after their exact holders end."""
     prefix = build_folders.FOLDER_PREFIXES["queue-place"]
@@ -249,23 +270,15 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             continue
         if admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
             continue
-        deadline = time.monotonic() + configuration.program_stop_seconds
-        if record.scope:
-            stop_scope(Path(record.scope), deadline, configuration.program_sample_seconds)
-        else:
-            start = admission_records.process_start_time(record.program.pid)
-            if start is None or start == record.program.start_time:
-                tree = ProgramTree(record.program.pid)
-                tree.observed[record.program.pid] = record.program.start_time
-                while members := tree.live_members(set()):
-                    number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-                    for pid, identity in members.items():
-                        try:
-                            if admission_records.process_start_time(pid) == identity:
-                                os.kill(pid, number)
-                        except ProcessLookupError:
-                            pass
-                    time.sleep(configuration.program_sample_seconds)
+        with operation_deadline(timeout=configuration.program_stop_seconds):
+            if record.scope:
+                stop_scope(Path(record.scope), configuration.program_sample_seconds)
+            else:
+                start = admission_records.process_start_time(record.program.pid)
+                if start is None or start == record.program.start_time:
+                    tree = ProgramTree(record.program.pid)
+                    tree.observed[record.program.pid] = record.program.start_time
+                    stop_tree(lambda: tree.live_members(set()), configuration.program_sample_seconds)
         path.unlink(missing_ok=True)
 
 
@@ -283,25 +296,50 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
     raise QueuePlaceRefused("the program did not enter its memory scope")
 
 
-def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
-    """Stop scope members until the scope is empty."""
-    while members := memory_admit.scope_members(scope):
-        number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-        killed_scope = False
+def stop_program(stop: Callable[[signal.Signals], bool], sample_seconds: float) -> None:
+    """Return when the program has ended or raise when its deadline expires."""
+    grace_end = time.monotonic() + remaining() / 2
+    while True:
+        _ = remaining()
+        grace = grace_end - time.monotonic()
+        if stop(signal.SIGTERM if grace > 0 else signal.SIGKILL):
+            return
+        pause = min(sample_seconds, remaining() / 4)
+        if grace > 0:
+            pause = min(pause, max(0, grace_end - time.monotonic()))
+        time.sleep(pause)
+
+
+def stop_tree(read_members: Callable[[], dict[int, str]], sample_seconds: float) -> None:
+    def stop(number: signal.Signals) -> bool:
+        members = read_members()
+        for pid, identity in members.items():
+            with suppress(ProcessLookupError):
+                if admission_records.process_start_time(pid) == identity:
+                    os.kill(pid, number)
+        return not members
+
+    stop_program(stop, sample_seconds)
+
+
+def stop_scope(scope: Path, sample_seconds: float) -> None:
+    """Stop scope members and confirm that the scope is empty."""
+    def stop(number: signal.Signals) -> bool:
+        members = memory_admit.scope_members(scope)
+        if not members:
+            return True
         if number == signal.SIGKILL:
             try:
                 _ = (scope / "cgroup.kill").write_text("1\n")
-                killed_scope = True
+                return False
             except FileNotFoundError:
                 pass
-        if not killed_scope:
-            for pid in members:
-                try:
-                    os.kill(pid, number)
-                except ProcessLookupError:
-                    pass
-        time.sleep(min(sample_seconds, max(0, deadline - time.monotonic()))
-                   if number == signal.SIGTERM else sample_seconds)
+        for pid in members:
+            with suppress(ProcessLookupError):
+                os.kill(pid, number)
+        return False
+
+    stop_program(stop, sample_seconds)
 
 
 def program_members(tree: ProgramTree, sidecar: Path) -> dict[int, str]:
@@ -426,39 +464,33 @@ class QueuePlace:
                 return
 
     def finish(self, *, failed: bool = False) -> None:
-        if not isinstance(self.program, StartedProgram):
+        if not isinstance(self.program, StartedProgram) or self.program.cleanup_confirmed:
             return
         program = self.program
         process = program.process
-        try:
+        config = self.configuration
+        program.stopped.set()
+        with operation_deadline(timeout=config.program_stop_seconds):
             completed = process.poll()
-            config = self.configuration
-            deadline = time.monotonic() + config.program_stop_seconds
             if isinstance(program.tracking, ScopedProgram):
-                stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
+                scope = self.sidecar.read_text().strip()
+                if scope:
+                    stop_scope(Path(scope), config.program_sample_seconds)
+                elif completed is None:
+                    tree = ProgramTree(process.pid)
+                    stop_tree(lambda: tree.live_members(set()), config.program_sample_seconds)
             else:
-                members = program_members(program.tracking, self.sidecar)
-                while members:
-                    number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-                    for pid, start in members.items():
-                        try:
-                            if admission_records.process_start_time(pid) == start:
-                                os.kill(pid, number)
-                        except ProcessLookupError:
-                            pass
-                    _ = process.poll()
-                    time.sleep(min(config.program_sample_seconds,
-                                   max(0, deadline - time.monotonic())) if number == signal.SIGTERM
-                               else config.program_sample_seconds)
-                    members = program_members(program.tracking, self.sidecar)
-            _ = process.wait()
+                tracking = program.tracking
+                stop_tree(lambda: program_members(tracking, self.sidecar), config.program_sample_seconds)
+            _ = process.wait(timeout=max(0, effective_deadline() - time.monotonic()))
+            if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
+                program.sampler.join(max(0, effective_deadline() - time.monotonic()))
+                if program.sampler.is_alive():
+                    raise TimeoutError("The program sampler did not stop")
             if completed is not None and not failed:
                 self.status = completed
             program.record.unlink(missing_ok=True)
-        finally:
-            program.stopped.set()
-            if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
-                program.sampler.join()
+            program.cleanup_confirmed = True
 
 
 @dataclass(frozen=True)
@@ -492,14 +524,14 @@ def request_place(request: QueueRequest | RefreshedLaunch, output: admission_cli
 
 def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> wire.Ok | wire.Refused:
     """End a reservation with its holder's status. This is the one place that releases."""
-    with cancellation.defer_cleanup_signals():
-        return admission_client.release(reservation, status, timing)
+    return admission_client.release(reservation, status, timing)
 
 
 @dataclass
 class HeldReservation:
     grant: wire.Admitted
     status: int = 1
+    cleanup_pending: bool = False
 
 
 @contextmanager
@@ -518,7 +550,82 @@ def held_reservation(request: QueueRequest, *,
     try:
         yield held
     finally:
-        _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
+        if not held.cleanup_pending:
+            _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
+
+
+def program_sizing(config: admission_records.MemoryConfig, name: str) -> admission_records.HistoryPeakSizing:
+    first = config.program_first_peaks.get(name)
+    if first is None:
+        raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
+    return admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
+
+
+def program_sidecar(directory: Path) -> Path:
+    sidecar = directory / "program.cgroup"
+    atomic_file.atomic_sample(sidecar, "")
+    return sidecar
+
+
+@dataclass(frozen=True)
+class FinishProgramOnly:
+    """The caller owns reservation release."""
+
+
+FINISH_PROGRAM_ONLY = FinishProgramOnly()
+
+
+@contextmanager
+def observed_place(place: QueuePlace, *,
+                   assignment_file: Path | FinishProgramOnly = FINISH_PROGRAM_ONLY) -> Generator[QueuePlace]:
+    failed = False
+    try:
+        yield place
+    except BaseException as error:
+        failed = True
+        place.status = (128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else
+                        error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
+        raise
+    finally:
+        files = admission_client.LocalGateRunFiles.for_sidecar(place.sidecar)
+        try:
+            with cancellation.defer_cleanup_signals() if isinstance(assignment_file, FinishProgramOnly) else nullcontext():
+                place.finish(failed=failed)
+        finally:
+            if isinstance(files, admission_client.LocalGateRunFiles):
+                files.save_result(place.status)
+        if isinstance(assignment_file, Path):
+            groups_remain = isinstance(files, admission_client.LocalGateRunFiles) and memory_admit.gate_journal_groups(files)
+            if not groups_remain:
+                _ = admission_client.finish_step(assignment_file, place.status)
+                if isinstance(files, admission_client.LocalGateRunFiles):
+                    files.remove()
+            elif not failed:
+                raise QueuePlaceRefused("The local gate still has journaled job groups")
+
+
+@contextmanager
+def placed_program(grant: wire.LocalPlacementGranted, sidecar: Path,
+                   config: admission_records.MemoryConfig) -> Generator[QueuePlace]:
+    """Use the reservation that placement already granted."""
+    assignment_file = sidecar.with_suffix(".assignment.json")
+    try:
+        admission_client.write_assignment(assignment_file, grant)
+    except BaseException:
+        _ = release_place(grant.grant.reservation, 1, grant.grant.cleanup_timing)
+        raise
+    try:
+        place = QueuePlace(Path(grant.grant.max_path).with_suffix(""), sidecar, configuration=config)
+    except BaseException:
+        files = admission_client.LocalGateRunFiles.for_sidecar(sidecar)
+        if isinstance(files, admission_client.LocalGateRunFiles):
+            files.save_result(1)
+        _ = admission_client.finish_step(assignment_file, 1)
+        if isinstance(files, admission_client.LocalGateRunFiles):
+            files.remove()
+        raise
+    with observed_place(place, assignment_file=assignment_file):
+        yield place
 
 
 @contextmanager
@@ -545,10 +652,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
     if purpose == ProgramPurpose.BATCH and arguments and name == "cargo" and isinstance(sizing, ConfiguredFirstPeak):
         estimate = admission_records.INFER_FROM_ARGV
     if purpose == ProgramPurpose.BATCH and isinstance(estimate, ConfiguredFirstPeak):
-        first = config.program_first_peaks.get(name)
-        if first is None:
-            raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
-        estimate = admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
+        estimate = program_sizing(config, name)
     cleanup_program_starts(config)
     cleanup_queue_place_folders()
     pid = os.getpid()
@@ -557,8 +661,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         raise QueuePlaceRefused("owner no longer exists")
     # The reservation ends before its folder: the service can read the sidecar until release.
     with queue_place_folder() as temporary, ExitStack() as reservation:
-        sidecar = temporary / "program.cgroup"
-        atomic_file.atomic_sample(sidecar, "")
+        sidecar = program_sidecar(temporary)
         grant: HeldReservation | UnreservedProgram = UnreservedProgram()
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)
@@ -574,19 +677,13 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
                        else temporary / "program")
         place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
-        failed = False
         try:
-            yield place
-        except BaseException as error:
-            failed = True
-            place.status = (128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else
-                            error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
-            raise
+            with observed_place(place):
+                yield place
         finally:
-            with cancellation.defer_cleanup_signals():
-                place.finish(failed=failed)
-                if isinstance(grant, HeldReservation):
-                    grant.status = place.status
+            if isinstance(grant, HeldReservation):
+                grant.status = place.status
+                grant.cleanup_pending = isinstance(place.program, StartedProgram) and not place.program.cleanup_confirmed
 
 
 class ShellArguments(argparse.Namespace):

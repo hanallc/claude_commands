@@ -7,7 +7,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -24,12 +24,15 @@ import sys
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
+from scripts.agents.worker_lifecycle import operation_deadline
+from scripts.lib.operation_deadline import remaining
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
 from scripts.build_targets import target_config
+from scripts.buildlog import store
 from scripts.direct import step_selection
 if TYPE_CHECKING:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
@@ -238,6 +241,82 @@ def token_prerequisite(choice: str) -> placement.TokenRequired | placement.Token
     return placement.TokenNotRequired() if choice == "after-grant" else placement.TokenRequired()
 
 
+@dataclass(frozen=True)
+class LocalGateResult:
+    """The command status saved before the caller asks for release."""
+
+    status: int
+
+
+@dataclass(frozen=True)
+class LocalGateResultPending:
+    """The caller has not saved a command status."""
+
+
+@dataclass(frozen=True)
+class LocalGateRunFiles:
+    """Keep scope evidence and the result until the admission service confirms settlement."""
+
+    directory: Path
+
+    @staticmethod
+    def root() -> Path:
+        return store.root() / "local-gate-runs"
+
+    @classmethod
+    def for_sidecar(cls, sidecar: Path) -> LocalGateRunFiles | OtherReservationSidecar:
+        folder = sidecar.parent
+        if (sidecar.name == "program.cgroup" and folder.parent == cls.root()
+                and len(folder.name) == 32 and all(char in "0123456789abcdef" for char in folder.name)):
+            return cls(folder)
+        return OtherReservationSidecar()
+
+    @property
+    def sidecar(self) -> Path:
+        return self.directory / "program.cgroup"
+
+    @property
+    def assignment(self) -> Path:
+        return self.sidecar.with_suffix(".assignment.json")
+
+    @property
+    def result(self) -> Path:
+        return self.sidecar.with_suffix(".result.json")
+
+    @property
+    def group_journal(self) -> Path:
+        return self.sidecar.with_suffix(".groups")
+
+    def save_result(self, status: int) -> None:
+        write_text_atomic(self.result, wire.encode_record(LocalGateResult(status)))
+
+    def read_result(self) -> LocalGateResult | LocalGateResultPending:
+        try:
+            return wire.parse_record(self.result.read_text(), LocalGateResult)
+        except FileNotFoundError:
+            return LocalGateResultPending()
+
+    def remove(self) -> None:
+        for path in (self.sidecar, self.assignment, self.result, self.group_journal):
+            path.unlink(missing_ok=True)
+        with suppress(FileNotFoundError):
+            self.directory.rmdir()
+
+
+@dataclass(frozen=True)
+class OtherReservationSidecar:
+    """The reservation uses the caller's own files."""
+
+
+def local_result_report(assignment: placement.PlacementAssignment, status: int,
+                        reason: str = "") -> wire.ExecutionReport:
+    return wire.ExecutionReport(uuid.uuid4().hex, assignment, placement.NoProviderClaim(),
+        execution_identity.ExecutionNotStarted() if reason else
+        execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
+        placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
+        placement.DispatchPathSettled())
+
+
 def finish_step(path: Path, status: int, reason: str = "", *,
                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
                 ) -> wire.DispatchStatus:
@@ -246,14 +325,14 @@ def finish_step(path: Path, status: int, reason: str = "", *,
     reply = read_assignment(path)
     if not isinstance(reply, wire.LocalPlacementGranted):
         raise wire.AdmissionUnavailable("finish-step requires a local grant")
-    if not isinstance(prerequisite, KeepPlacementPrerequisite):
-        _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
-            reply.assignment.episode, reply.assignment.owner, prerequisite))
-    _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
-    result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
-        execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
-        placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
-        placement.DispatchPathSettled()))
+    with operation_deadline(timeout=reply.grant.cleanup_timing.silence_seconds):
+        if not isinstance(prerequisite, KeepPlacementPrerequisite):
+            _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
+                reply.assignment.episode, reply.assignment.owner, prerequisite))
+        released = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+        if isinstance(released, wire.Refused):
+            raise wire.AdmissionUnavailable(released.reason)
+        result = report_execution(local_result_report(reply.assignment, status, reason))
     if result.assignment != reply.assignment or result.state != placement.ClosedAssignment(reason or "completed"):
         raise wire.AdmissionUnavailable("the service did not confirm the end of the local attempt")
     return result
@@ -506,7 +585,9 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     was_refreshing = retry.estimate_refresh_pending
+    previous_deadline = retry.deadline
     try:
+        retry.deadline = min(retry.deadline, CLOCK.monotonic() + remaining())
         if isinstance(configuration, ReadConfigurationAtUse):
             from scripts.build_queue import admission_records as records
             resolved = records.read_memory_config(report=False)
@@ -525,10 +606,13 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         if not owns_retry:
             raise
         return refuse(str(error))
+    except TimeoutError as error:
+        return refuse(str(error))
     except conf.Unusable as error:
         return refuse(str(error), checker=True)
     finally:
         retry.estimate_refresh_pending = was_refreshing
+        retry.deadline = previous_deadline
         _ACQUISITION_RETRY.reset(token)
 
 
@@ -569,6 +653,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     def deadline_reply() -> wire.Refused | wire.RepositorySlotExpired:
         if slot_waiting is not None:
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
+        if isinstance(first, wire.ReleaseRequest):
+            return refuse("The admission service did not confirm reservation release")
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
     def check_unreachable() -> None:
@@ -885,7 +971,11 @@ def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.
 
 
 def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration)
+    request = wire.ReleaseRequest(request_id(), reservation, status)
+    if isinstance(configuration, wire.CleanupTiming):
+        with operation_deadline(timeout=configuration.silence_seconds):
+            return _mutation(request, configuration)
+    return _mutation(request, configuration)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
 from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
@@ -1010,12 +1010,55 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
     return process_memory(members, proc) if members else GoneMemory()
 
 
+if TYPE_CHECKING:
+    from scripts.build_queue.admission_client import LocalGateRunFiles
+
+
+def gate_journal_groups(files: LocalGateRunFiles) -> dict[int, str]:
+    """Read the gate's journal while it owns its job groups."""
+    try:
+        journal = Path(files.group_journal.read_text())
+        row = cast(dict[str, object], json.loads(journal.read_text()))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(group_rows := row.get("groups"), dict):
+        raise ValueError(f"{journal}: the local gate has no group record")
+    return {int(group): start for group, start in cast(dict[str, str], group_rows).items()}
+
+
+@dataclass(frozen=True)
+class GateGroupsUnsettled:
+    """A placed gate can still have job groups after its owner exits."""
+
+
+def gate_groups_pending(sidecar: Path) -> bool:
+    from scripts.build_queue.admission_client import LocalGateRunFiles
+    from scripts.lib.process_start import Started, Zombie, process_start
+    from scripts.mac_test.claim_state import owned_groups_alive
+
+    files = LocalGateRunFiles.for_sidecar(sidecar)
+    if not isinstance(files, LocalGateRunFiles):
+        return False
+    try:
+        for group, start in gate_journal_groups(files).items():
+            if group <= 1:
+                raise ValueError("the local gate has an invalid group")
+            leader = process_start(group)
+            if isinstance(leader, (Started, Zombie)) and leader.start != start:
+                continue
+            if owned_groups_alive(group, session=False):
+                return True
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class EndedStep:
     pass
 
 
-StepLifetime = PopulatedStepScope | LiveOwnerProcess | EndedStep
+StepLifetime = PopulatedStepScope | LiveOwnerProcess | GateGroupsUnsettled | EndedStep
 
 
 def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
@@ -1038,6 +1081,8 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
             except OSError as error:
                 if error.errno != errno.ENODEV:
                     raise
+        if not owner_live and gate_groups_pending(Path(sidecar)):
+            return GateGroupsUnsettled()
     return LiveOwnerProcess() if owner_live else EndedStep()
 
 
@@ -1048,6 +1093,8 @@ def step_memory(row: Reservation, processes: dict[int, ProcessIdentity],
     lifetime = reservation_lifetime(row, owner_live)
     if isinstance(lifetime, EndedStep):
         return GoneMemory()
+    if isinstance(lifetime, GateGroupsUnsettled):
+        return PromisedMemory(row["need"])
     if isinstance(lifetime, PopulatedStepScope):
         try:
             reading = process_memory(lifetime, proc)

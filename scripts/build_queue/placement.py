@@ -7,7 +7,7 @@ from typing import Literal
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.mac_test.claim_state import ClaimScope
+from scripts.mac_test.claim_state import ClaimScope, RemoteJobClaim
 
 SubmittingSession = OwningSession | NoOwningSession
 
@@ -377,6 +377,19 @@ class AdoptedProviderClaim:
     host: str
     generation: str
 
+
+    @classmethod
+    def from_remote_record(cls, reference: ProviderClaimReference, coordinator: str,
+                           record: RemoteJobClaim) -> AdoptedProviderClaim:
+        session_id = record["submitting_session"]
+        session = OwningSession(session_id) if session_id else NoOwningSession()
+        return cls(reference, ClaimHolderIdentity(coordinator, record["pid"], record["proc_start"]),
+                   session, record["remote_host"], record.get("instance_generation", ""))
+
+    def matches(self, assignment: PlacementAssignment, reference: ProviderClaimReference,
+                holder: ClaimHolderIdentity) -> bool:
+        return (self.reference == reference and self.holder == holder
+                and self.session == assignment.session and self.host == assignment.destination.host)
 
 @dataclass(frozen=True)
 class RetainedCleanupClaim:

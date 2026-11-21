@@ -5,7 +5,7 @@ from __future__ import annotations
 
 
 from datetime import datetime, timedelta, timezone
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from collections.abc import Callable
 import io
 import json
@@ -3112,10 +3112,37 @@ class ClaimWatchTests(NotificationGuardedTestCase):
     def read_claim(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.paths.run.read_text()))
 
+    def run_final_claim_check(
+        self, paths: mac_test.StatePaths, command: mac_test.ClaimWatchCommand, _budget: float,
+        *options: str, pass_fds: tuple[int, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertEqual(command, "claim-watch-finish")
+        descriptor, = pass_fds
+        self.assertEqual(options, ("--state-lock-channel", str(descriptor)))
+        status = mac_test.claim_watch_finish(paths, os.dup(descriptor))
+        return subprocess.CompletedProcess([command], status, stdout="", stderr="")
+
+    def test_final_claim_check_releases_watcher_while_holding_state_lock(self) -> None:
+        def verify_locks() -> None:
+            with (mac_test.lock_if_available(self.paths.claim_watch_lock) as watcher_free,
+                  mac_test.lock_if_available(self.paths.lock) as state_free):
+                self.assertTrue(watcher_free)
+                self.assertFalse(state_free)
+
+        with (ExitStack() as watcher_lock,
+              mock.patch.object(mac_test, "supervise_claim_watch_command", side_effect=self.run_final_claim_check)):
+            _ = watcher_lock.callback(verify_locks)
+            self.assertTrue(watcher_lock.enter_context(mac_test.lock_if_available(self.paths.claim_watch_lock)))
+            self.assertTrue(mac_test.finish_claim_watch(self.paths, watcher_lock))
+        with mac_test.lock_if_available(self.paths.lock) as state_free:
+            self.assertTrue(state_free)
+
     def watch_once(self) -> str:
         output = io.StringIO()
-        with mock.patch.object(mac_test, "utc_now", return_value=self.now), \
-             mock.patch.object(time, "sleep", side_effect=ClaimPassEnded) as sleep, redirect_stdout(output):
+        with (mock.patch.object(mac_test, "utc_now", return_value=self.now),
+              mock.patch.object(mac_test, "supervised_claim_watch_pass", side_effect=mac_test.claim_watch_pass),
+              mock.patch.object(mac_test, "supervise_claim_watch_command", side_effect=self.run_final_claim_check),
+              mock.patch.object(time, "sleep", side_effect=ClaimPassEnded) as sleep, redirect_stdout(output)):
             try:
                 self.assertEqual(mac_test.command_watch_claim(self.paths, mac_test.read_config()), 0)
             except ClaimPassEnded:
@@ -3247,7 +3274,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             _ = self.watch_once()
         self.assertFalse(self.paths.run.exists())
         activity.assert_called_once()
-        block_watch.assert_called_once_with(self.paths)
+        block_watch.assert_called_once_with(self.paths, budget=mac_test.message_timeout_s())
         send.assert_called_once()
         self.assertEqual(send.call_args.args[0], "session:holder-session")
         self.assertEqual(send.call_args.args[2], f"mac-claim-idle-{record['pid']}-{record['since']}")
@@ -3267,7 +3294,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         arguments.attempt = cast(str, record["attempt"])
         with mock.patch.object(mac_test, "start_watcher") as release_watch:
             self.assertEqual(mac_test.command_release(arguments, self.paths), 0)
-        release_watch.assert_called_once_with(self.paths)
+        release_watch.assert_called_once_with(self.paths, budget=mac_test.message_timeout_s())
 
         with self.subTest(prepared_fence=True):
             from scripts.mac_test import offload, claim_state
@@ -3290,9 +3317,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             pending_before = pending.read_bytes()
             transport_calls = 0
 
-            def release_transport(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            def release_transport(arguments: list[str], _budget: float) -> subprocess.CompletedProcess[str]:
                 nonlocal transport_calls
-                del options
                 transport_calls += 1
                 self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
                 if transport_calls == 1:
@@ -3301,7 +3327,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
             with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
                  mock.patch.object(mac_test, "send_message", return_value=True) as send, \
-                 mock.patch.object(subprocess, "run", side_effect=release_transport):
+                 mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", side_effect=release_transport):
                 _ = self.watch_once()
                 self.assertEqual(self.read_claim(), record)
                 self.assertEqual(pending.read_bytes(), pending_before)
@@ -3320,7 +3346,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         # A copy stopped before its final status leaves remote work and a held start fence.
         for leftovers, released in ((0, True), (1, False)):
             with self.subTest(leftovers=leftovers):
-                record = self.write_claim()
+                record = self.write_claim(attempt=f"attempt-{leftovers}")
                 identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
                                                      cast(str, record["attempt"]))
                 prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
@@ -3335,14 +3361,13 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     self.assertEqual((repository.name, target, slot), ("alpha", self.paths.target, 1))
                     return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
 
-                def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-                    del options
+                def remote(arguments: list[str], _budget: float) -> subprocess.CompletedProcess[str]:
                     self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
                     scripts.append(arguments[-1])
                     return self.run_private_shell(arguments[-1], self.root)
 
                 with mock.patch.object(offload, "leftover_check_script", side_effect=end_work), \
-                     mock.patch.object(subprocess, "run", side_effect=remote), \
+                     mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", side_effect=remote), \
                      mock.patch.object(mac_test, "start_watcher"):
                     answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
                         remote_work=mac_test.EndStoppedWork(eligibility.KnownRepository("alpha")))
@@ -3369,7 +3394,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                                                  "received_bytes": 21, "complete": True}
         for new_owner in (False, True):
             with self.subTest(new_owner=new_owner):
-                record = self.write_claim()
+                record = self.write_claim(attempt=f"attempt-{new_owner}")
                 identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
                                                      cast(str, record["attempt"]))
                 prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
@@ -3383,12 +3408,11 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 if new_owner:
                     rewritten["pid"] = cast(int, record["pid"]) + 1
 
-                def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-                    del options
+                def remote(arguments: list[str], _budget: float) -> subprocess.CompletedProcess[str]:
                     _ = self.paths.run.write_text(json.dumps(rewritten))
                     return self.run_private_shell(arguments[-1], self.root)
 
-                with mock.patch.object(subprocess, "run", side_effect=remote), \
+                with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", side_effect=remote), \
                      mock.patch.object(mac_test, "start_watcher"):
                     answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "")
                 if new_owner:

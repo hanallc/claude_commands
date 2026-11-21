@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from datetime import timedelta
 import io
 import json
 import os
@@ -171,6 +172,17 @@ def with_cargo_folder(request: wire.PlacementRequest, path: str) -> str:
 def local_cargo_request(fixture: PlacementFixture) -> wire.PlacementRequest:
     request = placement_request(fixture)
     return replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+
+
+def shared_mac_run_request(fixture: PlacementFixture, request: wire.PlacementRequest) -> wire.PlacementRequest:
+    command = ("targeted-test",)
+    assert isinstance(request.local, wire.LocalAdmissionContext)
+    first_peak = request.profile.peak.bytes
+    sizing = records.HistoryPeakSizing(first_peak, records.FirstProgramPeak(first_peak), fixture.clock.now())
+    profile = records.ProgramProfile(command[0], str(fixture.root), str(fixture.root), sizing)
+    return replace(request, profile=profile, local=replace(request.local, argv=command), constraints=replace(request.constraints,
+        command=command, command_kind="run", package="",
+        candidates=(*request.constraints.candidates, local_candidate(fixture))))
 
 
 def scoped_cargo_request(fixture: PlacementFixture, folder: placement.CargoFolder) -> wire.PlacementRequest:
@@ -535,6 +547,167 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_mac_assignments_reserve_scope_while_runners_wait_to_claim(self) -> None:
+        orders = (("gate", "cargo"), ("cargo", "gate"), ("gate", "manual"), ("manual", "gate"))
+        for order in orders:
+            with self.subTest(order=order), PlacementFixture() as fixture:
+                def mac_request(kind: str, session: OwningSession, since: float) -> wire.PlacementRequest:
+                    request = placement_request(fixture, session=session, since=since)
+                    if kind == "cargo":
+                        return request
+                    program = shared_mac_run_request(fixture, request)
+                    mac, local = program.constraints.candidates
+                    if kind == "gate":
+                        return replace(program, constraints=replace(program.constraints, candidates=(
+                            mac, replace(local, eligibility=placement.FixedExclusion("blocked")))))
+                    return replace(program, constraints=replace(program.constraints, candidates=(mac,),
+                                                                 selection=placement.MacOnlyHost()))
+
+                older = mac_request(order[0], SUBMITTING_SESSION, fixture.clock.now() - 30)
+                _ = publish_candidate(fixture, older)
+                assigned = assignment_for(fixture, older)
+                self.assertEqual(assigned.destination.provider, "mac")
+                self.assertEqual(claim_state.read_claims(claim_state.state_paths(assigned.destination.target)), ())
+
+                younger = mac_request(order[1], OwningSession("younger"), fixture.clock.now())
+                _ = publish_candidate(fixture, younger)
+                waiting, = fixture.connect(younger).replies()
+                self.assertIsInstance(waiting, wire.PlacementWait)
+                self.assertNotIn(younger.episode, fixture.server.current_assignments)
+
+                fixture.restart()
+                _ = publish_candidate(fixture, younger)
+                waiting, = fixture.connect(younger).replies()
+                self.assertIsInstance(waiting, wire.PlacementWait)
+                cancelled, = fixture.connect(wire.CancelPlacement(
+                    "cancel-older", older.episode, older.owner, "runner stopped before the claim")).replies()
+                self.assertIsInstance(cancelled, wire.Ok)
+                _ = publish_candidate(fixture, younger)
+                self.assertEqual(assignment_for(fixture, younger).destination, assigned.destination)
+
+    def test_shared_mac_run_saves_one_winner_and_authorization_across_restart(self) -> None:
+        with PlacementFixture() as fixture:
+            request = shared_mac_run_request(fixture, placement_request(fixture))
+            _ = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            self.assertEqual(assigned.destination.provider, "mac")
+            self.assertEqual(len(fixture.server.assignments), 1)
+            self.assertEqual(fixture.caller_reservations(), {})
+            fixture.restart()
+            self.assertEqual(assignment_for(fixture, request), assigned)
+            claim = placement.assigned_claim_reference(assigned)
+            with (mock.patch.object(offload, "confirm_assigned_mac_adoption", return_value=offload.MacClaimAdopted()),
+                  mock.patch.object(mac_test, "free_now", return_value="backoff") as availability):
+                blocked, = fixture.connect(consume_permission("gate-backoff", assigned, claim)).replies()
+                assert isinstance(blocked, wire.DispatchStatus)
+                self.assertEqual((blocked.reason, blocked.permission), ("backoff", placement.PermissionAvailable()))
+                availability.return_value = "busy"
+                first, = fixture.connect(consume_permission("gate-start", assigned, claim)).replies()
+                self.assertEqual(first, wire.FirstAuthorization(assigned, claim))
+                fixture.restart()
+                replay, = fixture.connect(consume_permission("gate-replay", assigned, claim)).replies()
+                self.assertIsInstance(replay, wire.DispatchStatus)
+                self.assertEqual(len(fixture.server.assignments), 1)
+                self.assertEqual(fixture.caller_reservations(), {})
+
+    def test_shared_mac_run_transfers_only_after_settled_prelaunch_refusal(self) -> None:
+        with PlacementFixture() as fixture:
+            request = shared_mac_run_request(fixture, placement_request(fixture))
+            _ = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            claim = placement.assigned_claim_reference(assigned)
+            report = wire.ExecutionReport("gate-refusal", assigned, claim, execution_identity.ExecutionNotStarted(),
+                placement.PrelaunchRefused("blocked"), placement.DispatchPathPending("cleanup in progress"))
+            pending, = fixture.connect(report).replies()
+            assert isinstance(pending, wire.DispatchStatus)
+            self.assertIsInstance(pending.state, placement.CurrentAssignment)
+            self.assertEqual(fixture.caller_reservations(), {})
+            self.assertEqual(assignment_for(fixture, request), assigned)
+            settled, = fixture.connect(replace(report, request_id="gate-settled",
+                path=placement.DispatchPathSettled())).replies()
+            assert isinstance(settled, wire.DispatchStatus)
+            self.assertEqual(settled.state, placement.ClosedAssignment("blocked"))
+            self.assertEqual(settled.retry, placement.DoNotRetry("blocked"))
+
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            self.assertEqual((granted.assignment.episode, granted.assignment.since), (request.episode, request.since))
+            late = replace(report, request_id="gate-late", outcome=placement.AttemptCompleted(0),
+                           path=placement.DispatchPathSettled())
+            self.assertEqual(fixture.connect(late).replies(), [settled])
+            self.assertEqual(fixture.connect(request).replies(), [granted])
+            self.assertEqual(set(fixture.caller_reservations()), {request.episode})
+            self.assertEqual(len(fixture.server.assignments), 2)
+
+    def test_mac_authorization_checks_the_same_claim_for_gate_and_cargo(self) -> None:
+        for shared in (False, True):
+            with self.subTest(shared=shared), PlacementFixture() as fixture, fixture.loop_turn():
+                _, request, destination = self.target_settings_fixture(fixture, platform="macos")
+                if shared:
+                    request = shared_mac_run_request(fixture, request)
+                _ = publish_candidate(fixture, request)
+                assigned = assignment_for(fixture, request)
+                reference = placement.assigned_claim_reference(assigned)
+                paths = claim_state.state_paths(destination.target)
+                path = mac_test.claim_path(paths, destination.scope)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                assert isinstance(destination.scope, RepositoryScope)
+                record: mac_test.RemoteJobClaim = {
+                    "claim_id": reference.claim_id, "episode": reference.episode, "attempt": reference.attempt,
+                    "submitting_session": claim_state.session_id(assigned.session),
+                    "pid": assigned.owner.pid, "proc_start": assigned.owner.start_time,
+                    "what": "gate tests", "worktree": request.constraints.repository,
+                    "since": mac_test.timestamp(mac_test.utc_now()), "remote_host": destination.host,
+                    "repo_name": destination.scope.name, "repo_key": destination.scope.key,
+                }
+                no_execution = execution_identity.ExecutionEvidenceUnavailable("fixture work has not started", fixture.clock.now())
+                with mock.patch.object(fixture.server, "_observe_provider_execution", return_value=no_execution):
+                    for label, observed in (
+                        ("holder", {**record, "proc_start": "wrong-start"}),
+                        ("session", {**record, "submitting_session": "wrong-session"}),
+                        ("host", {**record, "remote_host": "wrong-host"}),
+                        ("claim", {**record, "claim_id": "wrong-claim"}),
+                        ("exact", record),
+                    ):
+                        with self.subTest(claim=label):
+                            mac_test.write_json(path, observed)
+                            evidence = self.read_target(fixture, request)
+                            fixture.provider_evidence[evidence.key] = evidence
+                            fixture.server.publish_host_evidence(evidence)
+                            reply, = fixture.server.handle_request(consume_permission(label, assigned, reference))
+                            if label == "exact":
+                                self.assertEqual(reply, wire.FirstAuthorization(assigned, reference))
+                            else:
+                                assert isinstance(reply, wire.DispatchStatus)
+                                self.assertEqual((reply.reason, reply.permission),
+                                                 ("the exact claim is not adopted", placement.PermissionAvailable()))
+
+    def test_shared_mac_run_uses_local_admission_when_mac_is_unavailable(self) -> None:
+        for reason in ("blocked", "backoff", "off"):
+            with self.subTest(reason=reason), PlacementFixture() as fixture, fixture.loop_turn():
+                settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
+                request = shared_mac_run_request(fixture, request)
+                paths = claim_state.state_paths(destination.target)
+                if reason == "blocked":
+                    now = mac_test.utc_now()
+                    paths.block.parent.mkdir(parents=True, exist_ok=True)
+                    mac_test.write_block(paths.block, mac_test.ActiveMacBlock(
+                        "fixture", "maintenance", now, now + timedelta(minutes=1), mac_test.HolderQueue("fixture"),
+                        mac_test.NO_SHOWRUNNER, "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED))
+                elif reason == "backoff":
+                    offload.write_backoff(time.time() + 60, destination.target)
+                else:
+                    _ = settings.write_text(settings.read_text().replace("offload=on", "offload=off"))
+                with mock.patch.object(offload, "read_leftovers", side_effect=AssertionError("unexpected SSH")) as ssh:
+                    evidence = self.read_target(fixture, request)
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.TemporaryExclusion(reason))
+                    fixture.provider_evidence[evidence.key] = evidence
+                    fixture.server.publish_host_evidence(evidence)
+                    reply, = fixture.server.handle_request(request)
+                    self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                    ssh.assert_not_called()
+
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:
         for operation in ("claim", "cleanup"):
             with self.subTest(operation=operation), PlacementFixture() as fixture:
@@ -1551,7 +1724,7 @@ args.claim_id, args.episode, args.attempt = sys.argv[4:7]
 claim = Path(sys.argv[7])
 real_run, real_unlink = subprocess.run, Path.unlink
 
-def private_transport(arguments, **options):
+def private_transport(arguments, budget):
     return real_run(["bash", "-c", arguments[-1]], capture_output=True,
                     text=True, check=False, timeout=5)
 
@@ -1560,7 +1733,7 @@ def kill_before_claim_unlink(path, missing_ok=False):
         os.kill(os.getpid(), signal.SIGKILL)
     real_unlink(path, missing_ok=missing_ok)
 
-with mock.patch.object(subprocess, "run", side_effect=private_transport), \
+with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", side_effect=private_transport), \
      mock.patch.object(Path, "unlink", kill_before_claim_unlink):
     raise SystemExit(mac_test.command_release(args, paths))
 """

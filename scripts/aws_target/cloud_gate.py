@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import BinaryIO, Literal, cast, final
+from typing import BinaryIO, Literal, Protocol, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
@@ -38,6 +38,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
@@ -1170,20 +1171,76 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
         return tree.stdout.strip(), dirty
 
 
-def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '') -> None:
+class BundleGit(Protocol):
+    def __call__(self, repository: Path, /, *arguments: str) -> subprocess.CompletedProcess[str]: ...
+
+
+def bundle_git(repository: Path, /, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return gate.git(repository, *arguments)
+
+
+@dataclass(frozen=True)
+class BundleRefs:
+    repository: Path
+    refs: tuple[str, ...]
+
+    def remove(self, run_git: BundleGit) -> None:
+        failures: list[str] = []
+        for ref in self.refs:
+            result = run_git(self.repository, 'update-ref', '-d', ref)
+            if result.returncode:
+                failures.append(ref)
+        listing = run_git(self.repository, 'for-each-ref', '--format=%(refname)', *self.refs)
+        if listing.returncode:
+            raise GateRefused('Git could not confirm removal of the source bundle refs')
+        failures.extend(ref for ref in listing.stdout.splitlines() if ref in self.refs)
+        if failures:
+            raise GateRefused('Git did not remove the source bundle refs: ' + ', '.join(dict.fromkeys(failures)))
+
+    def save(self, journal: Path) -> None:
+        save(journal, {'repository': str(self.repository.resolve()), 'refs': list(self.refs)})
+
+    @classmethod
+    def read(cls, journal: Path) -> BundleRefs:
+        row = read(journal)
+        repository = Path(ledger.text(row, 'repository'))
+        refs = row.get('refs')
+        if (not repository.is_absolute() or not isinstance(refs, list) or not refs
+                or not all(isinstance(ref, str) and re.fullmatch(r'refs/cloud-gates/[a-zA-Z0-9_-]+', ref)
+                           for ref in cast(list[object], refs))):
+            raise GateRefused('The source bundle ref journal is invalid')
+        return cls(repository, tuple(cast(list[str], refs)))
+
+
+@dataclass(frozen=True)
+class NoBundleRefJournal:
+    """The caller owns bundle cleanup for the lifetime of this command."""
+
+
+NO_BUNDLE_REF_JOURNAL = NoBundleRefJournal()
+
+
+def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '',
+                         journal: Path | NoBundleRefJournal = NO_BUNDLE_REF_JOURNAL,
+                         run_git: BundleGit = bundle_git) -> None:
     """Write one bundle for the requested tips and an optional common base."""
-    refs: list[str] = []
+    tips = tuple(dict.fromkeys(commits))
+    first = f'refs/cloud-gates/{bundle.parent.name}'
+    refs = BundleRefs(repo, tuple(f'{first}-{index}' if index else first for index in range(len(tips))))
+    if isinstance(journal, Path):
+        refs.save(journal)
+    def checked(*arguments: str) -> None:
+        result = run_git(repo, *arguments)
+        if result.returncode:
+            raise GateRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
+
     try:
-        for index, commit in enumerate(dict.fromkeys(commits)):
-            suffix = f'-{index}' if index else ''
-            ref = f'refs/cloud-gates/{bundle.parent.name}{suffix}'
-            refs.append(ref)
-            _ = gate.checked_git(repo, 'update-ref', ref, commit)
+        for ref, commit in zip(refs.refs, tips, strict=True):
+            checked('update-ref', ref, commit)
         prerequisite = ('^' + exclude,) if exclude else ()
-        _ = gate.checked_git(repo, 'bundle', 'create', str(bundle), *refs, *prerequisite)
+        checked('bundle', 'create', str(bundle), *refs.refs, *prerequisite)
     finally:
-        for ref in refs:
-            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
+        refs.remove(run_git)
 
 
 def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,

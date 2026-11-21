@@ -272,6 +272,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.bin_directory: Path = Path()
         self.config_path: Path = Path()
         self.result_path: Path = Path()
+        self.command_attempts: set[str] = set()
         self.environment: dict[str, str] = {}
         self.config: dict[str, str] = {}
         self.fixture: CommandFixture = {
@@ -418,6 +419,22 @@ class OffloadCommandFixture(unittest.TestCase):
         if "--assignment-file" in runner_options:
             return []
         admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            # End settled prelaunch episodes before the next fixture command.
+            for key in tuple(self.command_attempts):
+                saved = admission.server.assignments.get(key)
+                if saved is None:
+                    self.command_attempts.remove(key)
+                    continue
+                report = saved.terminal_report
+                if (isinstance(saved.state, placement.ClosedAssignment)
+                        and isinstance(report, placement.TerminalAttemptReport)
+                        and isinstance(report.outcome, placement.PrelaunchRefused)
+                        and isinstance(report.path, placement.DispatchPathSettled)):
+                    assignment = saved.assignment
+                    self.assertEqual(admission.server.handle_request(wire.CancelPlacement(
+                        uuid.uuid4().hex, assignment.episode, assignment.owner, "the fixture command ended")), [wire.Ok()])
+                    self.command_attempts.remove(key)
         owner_start = process_identity.process_start(os.getpid())
         if not isinstance(owner_start, process_identity.Started):
             self.fail("The command fixture has no checked coordinator identity")
@@ -452,6 +469,8 @@ class OffloadCommandFixture(unittest.TestCase):
             time.sleep(0.01)
         if not isinstance(reply, wire.Assignment):
             self.fail(f"The command fixture could not obtain its assigned destination: {reply!r}")
+        assignment = reply.assignment
+        self.command_attempts.add(execution_identity.attempt_key(assignment.episode, assignment.attempt))
         assignment_file = self.root / f"assignment-{local.episode}.json"
         _ = assignment_file.write_text(wire.encode_reply(reply))
         return ["--assignment-file", str(assignment_file)]

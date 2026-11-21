@@ -95,6 +95,7 @@ from threading import get_ident
 from typing import Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
+from scripts.agents.worker_lifecycle import acquire_flock
 from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
 from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
@@ -371,7 +372,7 @@ def directory_record_lock(path: Path, *, wait: bool,
             reentered = identity in RECORD_LOCKS.get()
             if not reentered:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                    acquire_flock(descriptor, mode=fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
                 except BlockingIOError:
                     if wait:
                         raise
@@ -479,7 +480,7 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
                     else:
                         created.add(mark)
                 held[mark] = fd
-                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                acquire_flock(fd, mode=fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except OSError:
             acquired = False
         if acquired:
@@ -1944,7 +1945,7 @@ def locked_holds(*,
     path = holds_file(scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        acquire_flock(lock)
         yield holds(scratch_settings=scratch_settings)
 
 

@@ -50,6 +50,12 @@ FIXTURE_POLICY = admission_policy_fixture()
 SERVING_POLL_SECONDS = 0.05
 
 
+def transient_scope_prefix(*options: str) -> list[str]:
+    """Start a test scope with a fixed memory limit."""
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            "--expand-environment=no", "--property=MemoryMax=2G", *options, "--"]
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.epoch: float = NOW
@@ -717,7 +723,7 @@ class AdmissionFixture(ExitStack):
             capture_output=True, timeout=3, check=False)
         if probe.returncode:
             raise unittest.SkipTest("real transient scope needs a user systemd manager")
-        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
+        child: subprocess.Popen[bytes] = subprocess.Popen([*transient_scope_prefix(f"--unit={unit}"),
             "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         def stop() -> None:
             _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,

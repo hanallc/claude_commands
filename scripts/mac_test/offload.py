@@ -35,7 +35,9 @@ from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO,
 from urllib.parse import quote
 
 
+from scripts.agents.worker_lifecycle import operation_deadline
 from scripts.build_queue import execution_identity
+from scripts.lib.operation_deadline import remaining
 from scripts.aws_target import hana_protocol
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
@@ -520,26 +522,28 @@ for path in base.parent.glob("*.lock"):
     return shlex.join(["python3", "-c", program, encoded])
 
 
+def fence_settlement_path(relative: Path) -> Path:
+    return relative.parent.parent.with_name("dispatch-fence-settlement") / relative.parent.name / relative.name
+
+
 def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
     """Create the start identity before the probe acknowledges preparation."""
-    encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
-    program = '''import pathlib, sys
-base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+    from scripts.mac_test.mac_gate import RemotePreparationAction, remote_creation_command
+
+    relative = start_fence_relative(identity, target, scope_key=scope_key)
+    program = """import pathlib, sys
+base = pathlib.Path.home() / sys.argv[1]
 base.parent.mkdir(parents=True, exist_ok=True)
 base.with_suffix(".lock").touch()
-'''
-    return shlex.join(["python3", "-c", program, encoded])
+"""
+    prepare = shlex.join(["python3", "-c", program, str(relative)])
+    return remote_creation_command(fence_settlement_path(relative), prepare, RemotePreparationAction.PREPARE)
 
 
-def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
-                        scope_key: str = "run") -> str:
-    """Use the prepared identity without permitting recreation after release."""
-    key = pending_start_key(identity)
-    relative = str(start_fence_relative(identity, target, scope_key=scope_key))
-    encoded = relative.encode().hex()
-    if settle:
-        program = '''import fcntl, pathlib, sys
-base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+
+def remove_start_fence_command(relative: Path, key: str) -> str:
+    program = '''import fcntl, pathlib, sys
+base = pathlib.Path.home() / sys.argv[1]
 path = base.with_suffix(".lock")
 try:
     lock = path.open("r")
@@ -555,7 +559,20 @@ with lock:
     path.unlink(missing_ok=True)
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
 '''
-        return shlex.join(["python3", "-c", program, encoded, key])
+    return shlex.join(["python3", "-c", program, str(relative), key])
+
+
+def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
+                        scope_key: str = "run") -> str:
+    """Use the prepared identity without permitting recreation after release."""
+    key = pending_start_key(identity)
+    relative = start_fence_relative(identity, target, scope_key=scope_key)
+    encoded = str(relative).encode().hex()
+    if settle:
+        from scripts.mac_test.mac_gate import RemotePreparationAction, remote_creation_command
+
+        command = remove_start_fence_command(relative, key)
+        return remote_creation_command(fence_settlement_path(relative), command, RemotePreparationAction.SETTLE)
     program = '''import fcntl, os, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 fcntl.flock(8, fcntl.LOCK_EX)
@@ -569,7 +586,7 @@ if not matches:
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
     sys.exit(75)
 '''
-    lock = shlex.quote(relative + ".lock")
+    lock = shlex.quote(str(relative.with_suffix(".lock")))
     missing = start_fence_command(identity, target, settle=True, scope_key=scope_key)
     return (f'if [ ! -f "$HOME"/{lock} ]; then {missing}; exit 75; fi\n'
             + f'exec 8<"$HOME"/{lock} || exit 75\n'
@@ -577,12 +594,16 @@ if not matches:
 
 
 def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
-    """Remove the prepared identity after the existing remote command ends."""
+    """Remove this fence when the command finishes. The claim can prepare again."""
+    from scripts.mac_test.mac_gate import RemotePreparationAction, remote_creation_command
+
+    relative = start_fence_relative(identity, target, scope_key=scope_key)
+    finish = remove_start_fence_command(relative, pending_start_key(identity))
     return (start_fence_command(identity, target, scope_key=scope_key)
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
             + "(\n" + command + "\n)\n"
             + "dispatch_status=$?\nexec 8<&-\n"
-            + start_fence_command(identity, target, settle=True, scope_key=scope_key)
+            + remote_creation_command(fence_settlement_path(relative), finish, RemotePreparationAction.FINISH)
             + '\nexit "$dispatch_status"')
 
 
@@ -920,10 +941,14 @@ class CliArguments(argparse.Namespace):
         self.fetch: str | None = None
 
 
+OFFLOAD_TERMINATE_GRACE_S = 2.0
+
+
 class ProcessController:
     """Starts one child at a time and exposes it to signal cleanup."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, claim_in_runner_group: bool = False) -> None:
+        self.claim_in_runner_group: bool = claim_in_runner_group
         self.active: ActiveProcess = IDLE_PROCESS
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
@@ -950,12 +975,9 @@ class ProcessController:
             if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
                 self.pending = SettledDispatchOperations()
             return
-        process.terminate()
-        try:
-            _ = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            _ = process.wait()
+        from scripts.mac_test.mac_gate import terminate_and_wait
+
+        terminate_and_wait(process, grace=OFFLOAD_TERMINATE_GRACE_S)
         self.active = IDLE_PROCESS
         if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
             self.pending = SettledDispatchOperations()
@@ -966,45 +988,55 @@ class ProcessController:
         self.active.interruption = OffloadInterrupted(signal_number)
         return True
 
-    def complete_claim(self, arguments: Sequence[str], attempt: LocalClaimAttempt) -> None:
+    def complete_claim(self, arguments: Sequence[str], attempt: LocalClaimAttempt, *,
+                       limit: CommandDeadline = NO_COMMAND_TIME_LIMIT) -> None:
         """Read the bounded local claim's reply even when the runner is signalled."""
         self.active = attempt
         self.pending = PendingClaimOperation()
+        bounded = isinstance(limit, CommandTimeLimit)
+        settled = False
         try:
-            try:
-                process = subprocess.Popen(
-                    arguments,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
-            except OSError:
-                self.attempt_evidence.provider = placement.NoProviderClaim()
-                attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
-            else:
-                attempt.process = RunningProcess(process)
-                stdout, stderr = process.communicate()
-                answer = CommandOutput(process.returncode, stdout, stderr)
-                expected = self.expected_claim
-                attempt.answer = read_claim_answer(answer, expected=expected,
-                    assigned_slot=self.placement.assignment.destination.slot
-                        if isinstance(self.placement, AssignedOffloadRequest) else 0)
-                if answer.status in (0, 13):
-                    self.claim_identity = claim_state.reply_claim_identity(stdout)
-                elif isinstance(self.placement, AssignedOffloadRequest):
-                    self.inspect_claim(attempt, expected)
-        finally:
-            if isinstance(attempt.process, RunningProcess) and attempt.process.process.poll() is None:
-                process = attempt.process.process
-                process.terminate()
+            with operation_deadline(timeout=limit.seconds if bounded else math.inf) as deadline:
                 try:
-                    _ = process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    _ = process.wait()
+                    if bounded:
+                        _ = remaining()
+                    process = subprocess.Popen(
+                        arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        start_new_session=not self.claim_in_runner_group,
+                        process_group=0 if bounded and self.claim_in_runner_group else None,
+                    )
+                except TimeoutError:
+                    raise
+                except OSError:
+                    self.attempt_evidence.provider = placement.NoProviderClaim()
+                    attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
+                else:
+                    attempt.process = RunningProcess(process)
+                    if bounded:
+                        stdout, stderr = claim_state.collect_command_output(process, deadline, owns_group=True)
+                    else:
+                        stdout, stderr = process.communicate()
+                    assert process.returncode is not None
+                    answer = CommandOutput(process.returncode, stdout, stderr)
+                    expected = self.expected_claim
+                    attempt.answer = read_claim_answer(answer, expected=expected,
+                        assigned_slot=self.placement.assignment.destination.slot
+                            if isinstance(self.placement, AssignedOffloadRequest) else 0)
+                    if answer.status in (0, 13):
+                        self.claim_identity = claim_state.reply_claim_identity(stdout)
+                    elif isinstance(self.placement, AssignedOffloadRequest):
+                        self.inspect_claim(attempt, expected)
+                settled = True
+        finally:
+            if not bounded and isinstance(attempt.process, RunningProcess) and attempt.process.process.poll() is None:
+                process = attempt.process.process
+                try:
+                    claim_state.terminate_and_wait(process, grace=OFFLOAD_TERMINATE_GRACE_S)
+                finally:
+                    claim_state.close_process_pipes(process)
             self.active = IDLE_PROCESS
-            self.pending = SettledDispatchOperations()
+            if settled or not bounded:
+                self.pending = SettledDispatchOperations()
 
     def inspect_claim(self, attempt: LocalClaimAttempt,
                       expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity) -> None:
@@ -1013,22 +1045,19 @@ class ProcessController:
             return
         assigned = self.placement.assignment
         paths = claim_state.state_paths(assigned.destination.target)
+        start = process_identity.process_start(os.getpid())
+        if not isinstance(start, process_identity.Started):
+            return
+        holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
         with claim_state.locked(paths.lock):
-            for held in claim_state.read_claims(paths):
-                record = held.record
-                if (claim_state.claim_identity(record) != expected or held.scope != assigned.destination.scope
-                        or record["pid"] != os.getpid()
-                        or record["submitting_session"] != claim_state.session_id(assigned.session)):
-                    continue
-                start = process_identity.process_start(os.getpid())
-                if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
-                    continue
-                self.claim_identity = expected
-                if "remote_host" in record and record.get("cleanup_pending"):
-                    attempt.answer = TakenOverMacClaim(record["remote_host"], record.get("slot", 1))
-                elif "remote_host" in record:
-                    attempt.answer = FreshMacClaim(record.get("slot", 1))
+            claim = read_assigned_mac_claim(assigned)
+            if not isinstance(claim, AssignedMacClaim) or not claim.held_by(assigned, holder):
                 return
+            self.claim_identity = expected
+            if claim.record.get("cleanup_pending"):
+                attempt.answer = TakenOverMacClaim(claim.record["remote_host"], claim.record.get("slot", 1))
+            else:
+                attempt.answer = FreshMacClaim(claim.record.get("slot", 1))
 
     def capture(
         self,
@@ -1110,8 +1139,10 @@ class ProcessController:
             "the remote start has no final observation", time.time())
         raw_output = process.stdout
         if raw_output is None:
-            process.kill()
-            _ = process.wait()
+            from scripts.mac_test.mac_gate import kill_and_wait
+
+            deadline = time.monotonic() + OFFLOAD_TERMINATE_GRACE_S
+            kill_and_wait(process, deadline)
             return MISSING_MAC_STATUS
         output = cast(BinaryIO | TextIO, raw_output)
         self.active = RunningProcess(process)
@@ -1480,7 +1511,8 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = (), *,
+                    fresh_only: bool = False) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
     identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
                 if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
@@ -1511,6 +1543,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--remote",
         config.host,
         *copy_words,
+        *(["--fresh-only"] if fresh_only else []),
         *identity_words,
         *assigned_claim_arguments(request),
         "--identity", "--session", session,
@@ -2397,18 +2430,12 @@ class LeftoverObservation:
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
                    target: str) -> LeftoverObservation:
     """End and count one mirror's work without exposing the check to a second signal."""
+    from scripts.mac_test.claim_state import QueueProcessUnsettled, capture_cleanup_command
+
     try:
         arguments = ["ssh", *ssh_options(config), host, script]
-        result = subprocess.run(
-            arguments,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=config.leftover_timeout_s,
-        )
-    except subprocess.TimeoutExpired:
+        result = capture_cleanup_command(arguments, config.leftover_timeout_s)
+    except (TimeoutError, subprocess.TimeoutExpired, QueueProcessUnsettled):
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s"), "")
     except OSError:
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)"), "")
@@ -2495,7 +2522,8 @@ def check_taken_over_claim(
 
 def claim_for_run(
     controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository,
-    leased_slots: tuple[int, ...] = (),
+    leased_slots: tuple[int, ...] = (), *, fresh_only: bool = False,
+    limit: CommandDeadline = NO_COMMAND_TIME_LIMIT,
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
     controller.placement = request.placement
@@ -2514,7 +2542,11 @@ def claim_for_run(
             assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
             identity.claim_id, identity.episode, identity.attempt)
     try:
-        controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
+        arguments = claim_arguments(request, config, leased_slots, fresh_only=fresh_only)
+        if isinstance(limit, CommandTimeLimit):
+            controller.complete_claim(arguments, attempt, limit=limit)
+        else:
+            controller.complete_claim(arguments, attempt)
         if isinstance(attempt.answer, (FreshMacClaim, TakenOverMacClaim)):
             claim_path = cast(Callable[[claim_state.StatePaths, claim_state.ClaimScope], Path],
                               getattr(import_module("scripts.mac_test.mac_test"), "claim_path"))
@@ -2547,6 +2579,79 @@ def claim_for_run(
             if isinstance(checked, LeftoversEnded):
                 _ = release_claim(controller, request.target)
         raise
+
+
+def claim_for_assigned_mac_run(controller: ProcessController, assignment: placement.PlacementAssignment,
+                               repo: Path) -> MacClaimAnswer:
+    """Claim the host and scope from an existing Mac assignment."""
+    target = assignment.destination.target
+    config = eligibility.read_config(eligibility.configured_ssh_target(target).settings).for_host(
+        assignment.destination.host)
+    request = OffloadRequest(repo, "", assignment.episode, NO_RESULT_FILE, (), owner="",
+        holder_session=claim_state.session_id(assignment.session), target=target,
+        placement=AssignedOffloadRequest(assignment))
+    repository = eligibility.repository_identity(repo)
+    if not isinstance(repository, KnownRepository):
+        return MacClaimNotConfirmed("repo", "", "The gate repository identity is unavailable")
+    return claim_for_run(controller, config, request, repository, fresh_only=True,
+                         limit=CommandTimeLimit(config.connection.leftover_timeout_s))
+
+
+@dataclass(frozen=True)
+class AssignedMacClaim:
+    reference: placement.ProviderClaimReference
+    record: claim_state.RemoteJobClaim
+
+    def held_by(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity) -> bool:
+        claim = placement.AdoptedProviderClaim.from_remote_record(self.reference, store.host_name(), self.record)
+        return claim.matches(assignment, placement.assigned_claim_reference(assignment), holder)
+
+
+@dataclass(frozen=True)
+class MacClaimAdopted:
+    """The assignment holder owns the exact claim and can use it."""
+
+
+@dataclass(frozen=True)
+class MacClaimSettled:
+    """The exact claim and its pending start fence are absent."""
+
+
+@dataclass(frozen=True)
+class MacClaimUnconfirmed:
+    reason: str
+
+
+def read_assigned_mac_claim(
+    assignment: placement.PlacementAssignment,
+) -> AssignedMacClaim | MacClaimSettled | MacClaimUnconfirmed:
+    """Read the claim by identity. A takeover can change the holder and session."""
+    destination = assignment.destination
+    reference = placement.assigned_claim_reference(assignment)
+    identity = claim_state.ClaimIdentity(reference.claim_id, reference.episode, reference.attempt)
+    paths = claim_state.state_paths(destination.target)
+    matches = [claim for claim in claim_state.read_claims(paths)
+               if claim_state.claim_identity(claim.record) == identity]
+    if matches:
+        claim = matches[0]
+        record = claim.record
+        if (len(matches) == 1 and claim.scope == destination.scope and "remote_host" in record
+                and record["remote_host"] == destination.host):
+            return AssignedMacClaim(reference, record)
+        return MacClaimUnconfirmed("the Mac claim does not match the assigned scope and host")
+    if pending_start_path(destination.target, identity).exists():
+        return MacClaimUnconfirmed("the Mac start fence remains pending")
+    return MacClaimSettled()
+
+
+def confirm_assigned_mac_adoption(
+    assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
+) -> MacClaimAdopted | MacClaimUnconfirmed:
+    claim = read_assigned_mac_claim(assignment)
+    if (isinstance(claim, AssignedMacClaim) and claim.held_by(assignment, holder)
+            and not claim.record.get("cleanup_pending")):
+        return MacClaimAdopted()
+    return MacClaimUnconfirmed("the exact claim is not adopted")
 
 
 def observe_cleanup(evidence: AttemptEvidence, checked: LeftoverCheckResult) -> None:

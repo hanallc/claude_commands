@@ -33,6 +33,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
+from scripts.agents.worker_lifecycle import acquire_flock
 from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, scratch
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
@@ -1874,7 +1875,8 @@ def remove_deferred_mirrors(host: str) -> None:
 
 def unregister_remote(host: str, path: str) -> None:
     """Remove the registry record after confirmed mirror cleanup."""
-    with file_lock.exclusive(remote_registry() / "records.lock"):
+    with (remote_registry() / "records.lock").open("a") as lock:
+        acquire_flock(lock)
         key = remote_key(host, path)
         (remote_registry() / (key + ".json")).unlink(missing_ok=True)
 

@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TYPE_CHECKING
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.test_times import gate_record
+
+if TYPE_CHECKING:
+    from scripts.build_queue import placement
 
 
 class SuiteMode(Enum):
@@ -111,9 +114,25 @@ class MacGateExclusions:
     paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MacGateCompleted:
+    run: GateRun
+
+
+@dataclass(frozen=True)
+class MacGatePrelaunchRefused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class MacGateUnresolved:
+    reason: str
+
+
 class MacGateRoute(Protocol):
     """Read the exclude list and run the modules that the Mac queue assigns."""
     def read_modules(self, repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing: ...
 
-    def route(self, repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
-              selected: TreeSelection, cancellation: MacGateCancellation) -> GateRun | str: ...
+    def run_assigned(self, repo: Path, *, assignment: placement.PlacementAssignment, mode: SuiteMode,
+                     full: bool, module_time_limit_s: float, selected: TreeSelection,
+                     ) -> MacGateCompleted | MacGatePrelaunchRefused | MacGateUnresolved: ...

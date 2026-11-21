@@ -484,7 +484,7 @@ class ClientTests(unittest.TestCase):
             self.assertIsInstance(release, wire.ReleaseRequest)
             if isinstance(release, wire.ReleaseRequest):
                 self.assertEqual((release.reservation, release.status), (granted.reservation, 137))
-            self.assertEqual(transport.timeouts[-1], 7)
+            self.assertAlmostEqual(transport.timeouts[-1], 7, places=2)
             self.assertNotIn("step stopped", output.getvalue())
 
     def test_wait_events_name_each_holder_change_without_repeating_an_unchanged_holder(self) -> None:
@@ -1767,6 +1767,22 @@ class ClientTests(unittest.TestCase):
             reader.assert_called_once_with(report=False)
             self.assertEqual(transport.attempts, [0, 3, 6, 9])
             self.assertEqual(output.getvalue().count("admission service unavailable:"), 2)
+
+    def test_release_ends_at_one_deadline_across_reconnects(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(silence_seconds=5, reconnect_seconds=2)
+            config = records.read_memory_config()
+            timing = wire.CleanupTiming(config.silence_seconds, config.reconnect_seconds)
+            transport = self.use_transport(fixture,
+                *(Exchange(connect_error=FileNotFoundError()) for _ in range(3)),
+                Exchange(reply_bytes(wire.Ok())))
+            with redirect_stderr(io.StringIO()):
+                result = client.release("reservation", 0, timing)
+            self.assertEqual(result, wire.Refused("The admission service did not confirm reservation release"))
+            self.assertEqual(transport.attempts, [0, 2, 4])
+            self.assertAlmostEqual(fixture.clock.monotonic(), timing.silence_seconds, places=2)
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(client.release("reservation", 0, timing), wire.Ok())
 
     def test_unreachable_limit_stops_missing_and_refused_connections(self) -> None:
         for error in (FileNotFoundError(), ConnectionRefusedError()):

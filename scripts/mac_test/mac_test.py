@@ -9,25 +9,29 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
+from importlib import import_module
 import json
 import math
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import threading
 import uuid
-from typing import TYPE_CHECKING, Literal, TypeGuard, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypeGuard, cast
 from urllib.parse import quote
 
 
+from scripts.agents.worker_lifecycle import operation_deadline
+from scripts.lib.operation_deadline import check as check_deadline
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
@@ -329,7 +333,9 @@ class CliArguments(argparse.Namespace):
         self.settings: str = ""
         self.repo_root: str = ""
         self.copy: bool = False
+        self.fresh_only: bool = False
         self.target: str = ""
+        self.state_lock_channel: int = -1
         self.leased_slots: list[int] = []
         self.assignment_file: str = ""
         self.assignment: str = ""
@@ -1285,53 +1291,9 @@ def watcher_is_running(paths: StatePaths) -> bool:
         return not acquired
 
 
-def start_watcher(paths: StatePaths) -> None:
-    if watcher_is_running(paths):
-        return
-    environment = [
-        f"{name}={value}"
-        for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
-    ]
-    command = [
-        "systemd-run",
-        "--user",
-        "--collect",
-        "--quiet",
-        "--no-block",
-        "--unit",
-        f"mac-test-watch-{os.getpid()}",
-        "--",
-        "/usr/bin/env",
-        f"HOME={os.environ.get('HOME', '')}",
-        f"PATH={os.environ.get('PATH', '')}",
-        *environment,
-        str(Path(__file__).resolve().parents[1] / "lib/py"),
-        str(Path(__file__).resolve()),
-        "watch",
-        *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
-    ]
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        failed = result.returncode != 0
-    except OSError:
-        failed = True
-    if failed:
-        print(
-            f"warning: the {'Mac' if paths.target == 'mac' else paths.target} block watcher could not be started",
-            file=sys.stderr,
-        )
+def launch_watcher(paths: StatePaths, watch: str, unit: str, budget: float) -> None:
+    from scripts.mac_test.claim_state import QueueProcessUnsettled, capture_cleanup_command
 
-
-def start_claim_watcher(paths: StatePaths) -> None:
-    with lock_if_available(paths.claim_watch_lock) as acquired:
-        if not acquired:
-            return
     environment = [
         f"{name}={value}"
         for name, value in sorted(os.environ.items())
@@ -1339,22 +1301,33 @@ def start_claim_watcher(paths: StatePaths) -> None:
     ]
     command = [
         "systemd-run", "--user", "--collect", "--quiet", "--no-block",
-        "--unit", f"mac-test-claim-watch-{os.getpid()}", "--", "/usr/bin/env",
+        "--unit", f"mac-test-{unit}-{os.getpid()}", "--", "/usr/bin/env",
         f"HOME={os.environ.get('HOME', '')}",
         f"PATH={os.environ.get('PATH', '')}",
-        *environment, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "watch-claim",
+        *environment, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), watch,
         *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
     ]
     try:
-        result = subprocess.run(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        )
+        result = capture_cleanup_command(command, budget)
         failed = result.returncode != 0
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired, QueueProcessUnsettled):
         failed = True
     if failed:
-        print(f"warning: the {'Mac' if paths.target == 'mac' else paths.target} claim watcher could not be started",
+        name = "claim" if watch == "watch-claim" else "block"
+        print(f"warning: the {'Mac' if paths.target == 'mac' else paths.target} {name} watcher could not be started",
               file=sys.stderr)
+
+
+def start_watcher(paths: StatePaths, *, budget: float) -> None:
+    if not watcher_is_running(paths):
+        launch_watcher(paths, "watch", "watch", budget)
+
+
+def start_claim_watcher(paths: StatePaths) -> None:
+    with lock_if_available(paths.claim_watch_lock) as acquired:
+        if not acquired:
+            return
+    launch_watcher(paths, "watch-claim", "claim-watch", message_timeout_s())
 
 
 def mac_activity_script() -> str:
@@ -1434,6 +1407,17 @@ def claim_host(run: RunRecord, config: MacTestConfig) -> str:
     return run["remote_host"] if "remote_host" in run else config.host
 
 
+class AssignedQueueRecovery(Protocol):
+    def recover_ended_assigned_runs(self, target: str, /) -> None: ...
+
+    def assigned_journal_owns_claim(self, target: str, identity: claim_state.ClaimIdentity, /, *,
+                                    registered_only: bool = False) -> bool: ...
+
+
+def assigned_queue_recovery() -> AssignedQueueRecovery:
+    return cast(AssignedQueueRecovery, cast(object, import_module("scripts.mac_test.mac_queue_run")))
+
+
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     """Check every live claim once; return whether another pass may still be needed.
 
@@ -1449,17 +1433,21 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     if paths.platform == "linux":
         # The Linux controller must confirm remote cleanup before claim removal.
         return True
+    recovery = assigned_queue_recovery()
+    ordinary_claims = tuple(claim for claim in claims
+                            if not recovery.assigned_journal_owns_claim(
+                                paths.target, claim_state.claim_identity(claim.record)))
     activity: dict[str, MacActivity] = {}
     traffic: dict[str, transfer_bytes.TransferLedger] = {}
-    for claim in claims:
+    for claim in ordinary_claims:
         host = claim_host(claim.record, config)
         if host not in activity:
             traffic[host] = transfer_bytes.TransferLedger()
             with transfer_bytes.measure_transfers(traffic[host]):
                 activity[host] = check_mac_activity(config, host)
     now = utc_now()
-    watched = False
-    for claim in claims:
+    watched = len(ordinary_claims) != len(claims)
+    for claim in ordinary_claims:
         host = claim_host(claim.record, config)
         with transfer_bytes.measure_transfers(traffic[host]):
             if watch_claim(paths, config, claim, activity[host], now):
@@ -1546,6 +1534,86 @@ def watch_claim(
     return False
 
 
+CLAIM_WATCH_FINISHED = 3
+ClaimWatchCommand = Literal["claim-watch-budget", "claim-watch-recovery", "claim-watch-pass", "claim-watch-finish"]
+
+
+class ClaimWatchCommandUnresolved:
+    """The supervisor could not confirm the command result."""
+
+
+def supervise_claim_watch_command(
+    paths: StatePaths, command: ClaimWatchCommand, budget: float, *options: str,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str] | ClaimWatchCommandUnresolved:
+    arguments = [sys.executable, __file__, command, *options,
+                 *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else [])]
+    try:
+        result = claim_state.capture_cleanup_command(arguments, budget, pass_fds=pass_fds, supervise_session=True)
+    except (OSError, subprocess.TimeoutExpired, claim_state.QueueProcessUnsettled) as error:
+        print(f"Mac {command} remains unresolved: {error}", flush=True)
+        return ClaimWatchCommandUnresolved()
+    if result.stdout and command != "claim-watch-budget":
+        print(result.stdout, end="", flush=True)
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+    return result
+
+
+def supervised_claim_watch_recovery(paths: StatePaths, budget: float) -> bool:
+    resolved = supervise_claim_watch_command(paths, "claim-watch-budget", budget)
+    if isinstance(resolved, ClaimWatchCommandUnresolved) or resolved.returncode != 0:
+        return False
+    try:
+        recovery_budget = float(resolved.stdout)
+        if not math.isfinite(recovery_budget) or recovery_budget <= 0:
+            raise ValueError("the recovery budget must be positive and finite")
+    except ValueError as error:
+        print(f"Mac claim recovery remains unresolved: {error}", flush=True)
+        return False
+    recovery = supervise_claim_watch_command(paths, "claim-watch-recovery", recovery_budget)
+    return isinstance(recovery, subprocess.CompletedProcess) and recovery.returncode == 0
+
+
+def supervised_claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
+    budget = config.connect_timeout_s + message_timeout_s()
+    recovered = paths.platform != "macos" or supervised_claim_watch_recovery(paths, budget)
+    housekeeping = supervise_claim_watch_command(paths, "claim-watch-pass", budget)
+    return (not recovered or isinstance(housekeeping, ClaimWatchCommandUnresolved)
+            or housekeeping.returncode != CLAIM_WATCH_FINISHED)
+
+
+def claim_watch_finish(paths: StatePaths, descriptor: int) -> int:
+    """Send the locked state descriptor if the watcher can exit."""
+    with (socket.socket(fileno=descriptor) as channel,
+          claim_state.state_lock_descriptor(paths.lock) as state_lock):
+        if any(run_is_live(claim.record) for claim in read_claims(paths)):
+            return 0
+        _ = socket.send_fds(channel, [b"1"], [state_lock])
+        return CLAIM_WATCH_FINISHED
+
+
+def finish_claim_watch(paths: StatePaths, watcher_lock: ExitStack) -> bool:
+    receiver, sender = socket.socketpair()
+    with receiver, sender:
+        descriptor = sender.fileno()
+        result = supervise_claim_watch_command(paths, "claim-watch-finish", message_timeout_s(),
+                                               "--state-lock-channel", str(descriptor), pass_fds=(descriptor,))
+        if isinstance(result, ClaimWatchCommandUnresolved) or result.returncode != CLAIM_WATCH_FINISHED:
+            return False
+        sender.close()
+        receiver.setblocking(False)
+        data, descriptors = socket.recv_fds(receiver, 1, 1)[:2]
+        with ExitStack() as state_lock:
+            for locked_state in descriptors:
+                _ = state_lock.callback(os.close, locked_state)
+            if data != b"1" or len(descriptors) != 1:
+                raise StateReadError("The final claim check did not return the state lock")
+            # Release the watcher lock while the state lock still blocks new claims.
+            watcher_lock.close()
+            return True
+
+
 def command_watch_claim(paths: StatePaths, config: MacTestConfig) -> int:
     with ExitStack() as watcher_lock:
         acquired = watcher_lock.enter_context(lock_if_available(paths.claim_watch_lock))
@@ -1553,12 +1621,8 @@ def command_watch_claim(paths: StatePaths, config: MacTestConfig) -> int:
             return 0
         while True:
             try:
-                if not claim_watch_pass(paths, config):
-                    with locked(paths.lock):
-                        if not any(run_is_live(claim.record) for claim in read_claims(paths)):
-                            # A new claimant must see the watcher lock released.
-                            watcher_lock.close()
-                            return 0
+                if not supervised_claim_watch_pass(paths, config) and finish_claim_watch(paths, watcher_lock):
+                    return 0
             except (OSError, StateReadError) as error:
                 print(f"Mac claim state unreadable: {error}", flush=True)
             time.sleep(config.claim_poll_seconds)
@@ -1645,7 +1709,7 @@ def full_settle(
             not watcher_holds_lock
             and not isinstance(outcome.block, NoMacBlock)
         ):
-            start_watcher(paths)
+            start_watcher(paths, budget=config.connect_timeout_s)
         return outcome
 
     ci_problem: Problem = NO_PROBLEM
@@ -1724,7 +1788,7 @@ def full_settle(
             warning_text(block, paths.target),
         )
     if not watcher_holds_lock:
-        start_watcher(paths)
+        start_watcher(paths, budget=config.connect_timeout_s)
     return SettleOutcome(
         claims,
         block,
@@ -1818,7 +1882,8 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
 
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
-               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
+               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
+               watch_before_write: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
     try:
         claims = live_claims(paths)
@@ -1878,10 +1943,14 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
             and args.leased_slots and scope.slot not in args.leased_slots):
         return ClaimFinished(11)
-    if isinstance(args.remote, str) or reserve_wait:
+    if not args.fresh_only and (isinstance(args.remote, str) or reserve_wait):
         for claim in overlapping:
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record):
+                recovery = cast(AssignedQueueRecovery, cast(object, import_module("scripts.mac_test.mac_queue_run")))
+                if recovery.assigned_journal_owns_claim(paths.target, claim_state.claim_identity(record),
+                                                        registered_only=True):
+                    return ClaimBusy(record)
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -1920,6 +1989,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             claimed["slot"] = scope.slot
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if watch_before_write:
+        # The watcher must take this lock before it checks the new claim.
+        start_claim_watcher(paths)
     write_json(path, claimed)
     print_claim_identity(args, claimed)
     if isinstance(scope, RepositoryScope) and scope.slot:
@@ -2042,14 +2114,30 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
+    watch_before_write = (watch_claim and args.fresh_only and not args.from_pid
+                          and not isinstance(assignment, UnassignedClaim)
+                          and assignment.destination.provider == "mac")
+    independent_watcher = watch_claim
+    if watch_before_write:
+        recovery = cast(AssignedQueueRecovery, cast(object, import_module("scripts.mac_test.mac_queue_run")))
+        identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+        if recovery.assigned_journal_owns_claim(paths.target, identity, registered_only=True):
+            # The admission service owns cleanup before this claim is published.
+            independent_watcher = watch_before_write = False
     while True:
-        with locked(paths.lock):
-            attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
-                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
-        if isinstance(attempt, ClaimFinished):
-            if watch_claim and attempt.status in (0, 13):
-                start_claim_watcher(paths)
-            return attempt.status
+        try:
+            with operation_deadline(timeout=message_timeout_s()):
+                with locked(paths.lock):
+                    attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
+                               else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim,
+                                               assignment=assignment, watch_before_write=watch_before_write))
+                if isinstance(attempt, ClaimFinished):
+                    if independent_watcher and not watch_before_write and attempt.status in (0, 13):
+                        start_claim_watcher(paths)
+                    return attempt.status
+        except TimeoutError:
+            print("cannot claim: the Mac claim state lock is held", file=sys.stderr)
+            return 12
         if isinstance(attempt, ClaimHeldByCopy):
             # Signal outside state.lock, then wait for each copy's runner to
             # clean up and release; the lock is never held while waiting.
@@ -2109,14 +2197,48 @@ class ClaimReleaseRefused:
     reason: str
 
 
+@contextmanager
+def claim_release_lock(path: Path, *, provider_lock_held: bool, wait_for_provider_lock: bool
+                       ) -> Generator[bool, None, None]:
+    if provider_lock_held:
+        yield True
+    else:
+        with ExitStack() as lock:
+            try:
+                mode = fcntl.LOCK_EX if wait_for_provider_lock else fcntl.LOCK_EX | fcntl.LOCK_NB
+                lock.enter_context(locked(path, mode=mode))
+            except (BlockingIOError, TimeoutError):
+                yield False
+            else:
+                yield True
+
+
 def release_exact_claims(
-    paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
+    paths: StatePaths, holder: int | placement.ClaimHolderIdentity, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
+    wait_for_provider_lock: bool = True,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
+    try:
+        with operation_deadline(timeout=message_timeout_s()):
+            return settle_exact_claims(paths, holder, identity, settings, provider_lock_held=provider_lock_held,
+                                       remote_work=remote_work, wait_for_provider_lock=wait_for_provider_lock)
+    except TimeoutError:
+        return ClaimReleaseRefused("the Mac claim cleanup deadline expired")
+
+
+def settle_exact_claims(
+    paths: StatePaths, holder: int | placement.ClaimHolderIdentity, identity: claim_state.ClaimIdentity, settings: str, *,
+    provider_lock_held: bool, remote_work: EndStoppedWork | KeepRemoteWork, wait_for_provider_lock: bool,
+) -> ClaimsReleased | ClaimReleaseRefused:
     from scripts.mac_test import eligibility, offload
 
-    with nullcontext() if provider_lock_held else locked(paths.lock):
+    pid = holder if isinstance(holder, int) else holder.pid
+    lock_busy = ClaimReleaseRefused("the Mac claim state lock is held")
+    with claim_release_lock(paths.lock, provider_lock_held=provider_lock_held,
+                            wait_for_provider_lock=wait_for_provider_lock) as acquired:
+        if not acquired:
+            return lock_busy
         # Each file is read alone, so another repository's damaged record
         # cannot keep this owner's claim in place.
         owned: list[tuple[Path, RunRecord]] = []
@@ -2125,7 +2247,8 @@ def release_exact_claims(
                 record = read_run(path)
             except StateReadError:
                 continue
-            if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
+            if (isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity
+                    and (isinstance(holder, int) or record["proc_start"] == holder.start_time)):
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
@@ -2142,18 +2265,23 @@ def release_exact_claims(
                 return ClaimReleaseRefused("the remote work of the claim has not ended")
             if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
                 return ClaimReleaseRefused("the remote start fence remains unconfirmed")
-        with nullcontext() if provider_lock_held else locked(paths.lock):
-            # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
+    with claim_release_lock(paths.lock, provider_lock_held=provider_lock_held,
+                            wait_for_provider_lock=wait_for_provider_lock) as acquired:
+        if not acquired:
+            return lock_busy
+        block_present = not isinstance(read_block(paths.block), NoMacBlock)
+        # Check every claim identity before changing the claim files.
+        for path, record in owned:
             current = read_run(path)
             if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
             transfers.extend(current.get("transfers", []))
-            pending.unlink(missing_ok=True)
+        check_deadline()
+        for path, _ in owned:
+            offload.pending_start_path(paths.target, identity).unlink(missing_ok=True)
             path.unlink(missing_ok=True)
-    with nullcontext() if provider_lock_held else locked(paths.lock):
-        block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
-        start_watcher(paths)
+        start_watcher(paths, budget=message_timeout_s())
     return ClaimsReleased(len(owned), tuple(transfers))
 
 
@@ -2594,6 +2722,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--wait", type=float, default=0.0)
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
+    _ = claim.add_argument("--fresh-only", action="store_true")
 
     _ = claim.add_argument("--leased-slot", dest="leased_slots", type=int, action="append", default=[])
     _ = claim.add_argument("--from-pid", type=int, default=0)
@@ -2632,6 +2761,11 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
     _ = commands.add_parser("watch-claim")
+    _ = commands.add_parser("claim-watch-pass")
+    _ = commands.add_parser("claim-watch-budget")
+    _ = commands.add_parser("claim-watch-recovery")
+    finish = commands.add_parser("claim-watch-finish")
+    _ = finish.add_argument("--state-lock-channel", type=int, required=True)
 
     def parsed_session(value: str) -> SubmittingSession:
         return OwningSession(value) if value else NoOwningSession()
@@ -2668,6 +2802,15 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
         return command_free_now(args, paths)
     if args.command == "status" and args.target:
         return command_target_status(paths)
+    if args.command == "claim-watch-budget":
+        print(claim_state.queue_cancel_seconds(paths.target))
+        return 0
+    if args.command == "claim-watch-finish":
+        return claim_watch_finish(paths, args.state_lock_channel)
+    if args.command == "claim-watch-recovery":
+        if paths.platform == "macos":
+            assigned_queue_recovery().recover_ended_assigned_runs(paths.target)
+        return 0
     try:
         config = read_config(args.target)
     except MacIdleConfigError as error:
@@ -2681,6 +2824,9 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
         return command_watch(paths, config)
     if args.command == "watch-claim":
         return command_watch_claim(paths, config)
+    if args.command == "claim-watch-pass":
+        watching = claim_watch_pass(paths, config)
+        return 0 if watching else CLAIM_WATCH_FINISHED
     return command_status(paths, config)
 
 

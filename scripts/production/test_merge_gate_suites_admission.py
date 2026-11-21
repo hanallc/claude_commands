@@ -23,7 +23,8 @@ from scripts.production import merge_gate
 from scripts.lib import build_folders
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
-from scripts.build_queue import progress_profile as progress, step_estimator
+from scripts.build_queue import first_step, progress_profile as progress, step_estimator
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
@@ -72,6 +73,23 @@ class ServiceGateFixture(GateSuitesFixture):
 
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
+    def test_copy_handoff_retains_its_position_for_the_final_gate_tree(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            command = ["merge_gate.py", "--tests-only"]
+            with first_step.admitted_run(command, self.checkout) as admitted:
+                self.assertIsInstance(admitted.grant, first_step.GatePlacementAfterCopy)
+                self.assert_gate_released()
+                admitted.handoff(self.checkout)
+                config = admission_records.read_memory_config()
+                with queue.queue_place_folder() as folder:
+                    request = first_step.gate_placement_request(self.checkout, "fixture-tree", "merge-gate", (),
+                        queue.program_sidecar(folder), config, GATE_JOB_NOT_RECORDED)
+                position = admitted.queue_position
+                self.assertEqual((request.episode, request.since), (position.episode, position.since))
+                self.assertEqual(request.run, client.parse_run_identity(os.environ["BUILDLOG_RUN"]))
+            self.assertNotIn(first_step.GATE_PLACEMENT_EPISODE, os.environ)
+            self.assertNotIn(first_step.GATE_PLACEMENT_SINCE, os.environ)
+
     @gate_suites("lib", "hooks")
     def test_suite_progress_counts_test_modules_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
