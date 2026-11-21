@@ -12,7 +12,7 @@ from contextlib import ExitStack, redirect_stderr, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
-from functools import cache, partial
+from functools import cache, cached_property, partial
 import io
 import json
 import math
@@ -32,7 +32,7 @@ from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
-from scripts.lib import conf, detached, models_registry, unit_runs
+from scripts.lib import atomic_file, conf, detached, models_registry, unit_runs
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
@@ -488,32 +488,28 @@ def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCo
 
 
 @dataclass(frozen=True)
-class SavedReply:
+class ExistingArtifact:
     content: bytes
     mode: int
 
 
-class ReplyMissing(Enum):
-    ABSENT = "no reply file exists"
+class ArtifactAbsent(Enum):
+    MISSING = "the destination does not exist"
 
 
-def _read_saved_reply(parent: int, path: Path) -> SavedReply | ReplyMissing:
+def _read_review_artifact(parent: int, path: Path) -> ExistingArtifact | ArtifactAbsent:
     try:
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     except FileNotFoundError:
-        return ReplyMissing.ABSENT
+        return ArtifactAbsent.MISSING
     with os.fdopen(descriptor, "rb") as source:
         mode = os.fstat(source.fileno()).st_mode
         if not stat.S_ISREG(mode):
-            raise OSError(f"{path}: expected a regular reply file")
-        return SavedReply(source.read(), stat.S_IMODE(mode))
+            raise OSError(f"{path}: expected a regular completion file")
+        return ExistingArtifact(source.read(), stat.S_IMODE(mode))
 
 
-def save_reply(path: Path, reply: str) -> None:
-    path = path.absolute()
-    if ".." in path.parts:
-        raise OSError(f"{path}: expected a reply path without parent references")
-    content = (reply.rstrip() + "\n").encode()
+def _write_review_artifact(path: Path, content: bytes) -> None:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     with ExitStack() as directories:
         parent = os.open(path.anchor, flags)
@@ -527,29 +523,99 @@ def save_reply(path: Path, reply: str) -> None:
                 child = os.open(folder, flags, dir_fd=parent)
             parent = child
             _ = directories.callback(os.close, parent)
-        existing = _read_saved_reply(parent, path)
-        if isinstance(existing, SavedReply) and existing.content == content:
+        existing = _read_review_artifact(parent, path)
+        if isinstance(existing, ExistingArtifact) and existing.content == content:
             return
         temporary = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
         try:
             with os.fdopen(descriptor, "wb") as output:
-                if isinstance(existing, SavedReply):
+                if isinstance(existing, ExistingArtifact):
                     os.fchmod(output.fileno(), existing.mode)
                 _ = output.write(content)
                 output.flush()
                 os.fsync(output.fileno())
-            if isinstance(existing, ReplyMissing):
+            if isinstance(existing, ArtifactAbsent):
                 os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
                 os.unlink(temporary, dir_fd=parent)
             else:
-                if _read_saved_reply(parent, path) != existing:
-                    raise OSError(f"{path}: reply changed before publication")
+                if _read_review_artifact(parent, path) != existing:
+                    raise OSError(f"{path}: completion file changed before publication")
                 os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
             os.fsync(parent)
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary, dir_fd=parent)
+
+
+def _read_ordinary_artifact(path: Path) -> ExistingArtifact | ArtifactAbsent:
+    try:
+        with path.open("rb") as source:
+            return ExistingArtifact(source.read(), stat.S_IMODE(os.fstat(source.fileno()).st_mode))
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise
+        return ArtifactAbsent.MISSING
+
+
+def _write_ordinary_artifact(path: Path, content: bytes) -> None:
+    existing = _read_ordinary_artifact(path)
+    if isinstance(existing, ExistingArtifact) and existing.content == content:
+        return
+    mode = existing.mode if isinstance(existing, ExistingArtifact) else 0o600
+    with atomic_file.prepared_replacement(path, content, mode=mode) as temporary:
+        if _read_ordinary_artifact(path) != existing:
+            raise OSError(f"{path}: completion file changed before publication")
+        os.replace(temporary, path)
+    atomic_file.sync_folder(path.parent)
+
+
+def save_reply(path: Path, reply: str) -> None:
+    """Save a plain reply through the ordinary path policy."""
+    _write_ordinary_artifact(path, (reply.rstrip() + "\n").encode())
+
+
+@dataclass(frozen=True)
+class CompletionArtifacts:
+    owner: staff.StaffRow
+    run: Path
+
+    @cached_property
+    def policy(self) -> EnrolledPaths | worker_panes.OrdinaryWorkerOwner:
+        if self.owner.kind not in ("unit", "showrunner"):
+            raise OSError("completion artifacts require a unit or showrunner owner")
+        if self.owner.kind == "showrunner" and isinstance(self.owner.doc, staff.DocUnfilled):
+            raise OSError("showrunner completion requires its staff document")
+        return worker_panes.enrolled_worker_owner(self.owner)
+
+    def require_protected_status(self, passed: dict[str, object]) -> None:
+        if passed.get("assign_status_file") and isinstance(self.policy, EnrolledPaths):
+            raise OSError("the enrolled review has a recorder-owned status file")
+
+    def require_unit_style_output(self) -> None:
+        if isinstance(self.policy, EnrolledPaths):
+            raise OSError("send style review output to a unit")
+
+    def authorized_path(self, path: Path) -> Path:
+        policy = self.policy
+        if isinstance(policy, EnrolledPaths):
+            if refusal := worker_panes.review_run_refusal(self.owner, self.run, policy, path):
+                raise OSError(refusal.reason)
+            return path.absolute()
+        return path
+
+    def write(self, path: Path, text: str) -> None:
+        destination = self.authorized_path(path)
+        if isinstance(self.policy, EnrolledPaths):
+            _write_review_artifact(destination, text.encode())
+        else:
+            _write_ordinary_artifact(destination, text.encode())
+
+    def reply(self, path: Path, text: str) -> None:
+        if isinstance(self.policy, EnrolledPaths):
+            self.write(path, text.rstrip() + "\n")
+        else:
+            save_reply(path, text)
 
 
 @dataclass(frozen=True)
@@ -727,6 +793,10 @@ def _require_review_delivery(owner: staff.StaffRow, row: staff.StaffRow, run: Pa
     artifacts = tuple(Path(value) for value in (passed.get("prompt_file"), delivery.reply_file, delivery.early_ready)
                       if isinstance(value, str) and value)
     _ = _require_review_order(owner, worker_panes.dispatch_role(row), run, *artifacts, *_review_artifacts(delivery.actions))
+    writer = CompletionArtifacts(owner, run)
+    writer.require_protected_status(passed)
+    if delivery.actions.style_directory:
+        writer.require_unit_style_output()
 
 
 def _require_running_review(owner: staff.StaffRow, client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
@@ -750,19 +820,27 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
     """Record the hook destinations, submit one prompt, and return at once."""
     record = staff.snapshot()
     owner = record.by_id(parent)
-    enrolled = False
-    if owner is not None:
-        destination = reply if isinstance(reply, Path) else prompt.with_name(prompt.stem + "_reply.txt")
-        artifacts = (prompt, destination, *(path for path in (early_ready,) if isinstance(path, Path)),
-                     *_review_artifacts(completion_actions))
-        try:
-            enrolled = isinstance(_require_review_order(owner, role, session_dir, *artifacts), EnrolledPaths)
-        except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
-            print(error, file=sys.stderr)
-            return ExitCode.REFUSED
+    if owner is None:
+        print(f"{parent}: dispatch owner is unavailable", file=sys.stderr)
+        return ExitCode.REFUSED
+    record_status = os.environ.get(progress_history.ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else ""
+    destination = reply if isinstance(reply, Path) else prompt.with_name(prompt.stem + "_reply.txt")
+    artifacts = (prompt, destination, *(path for path in (early_ready,) if isinstance(path, Path)),
+                 *(Path(value) for value in (record_status,) if value), *_review_artifacts(completion_actions))
+    try:
+        enrolled = isinstance(_require_review_order(owner, role, session_dir, *artifacts), EnrolledPaths)
+        if enrolled and completion_actions.style_directory:
+            raise OSError("send style review output to a unit")
+    except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+        print(error, file=sys.stderr)
+        return ExitCode.REFUSED
     prompt = prompt.absolute() if enrolled else prompt.resolve()
-    if enrolled and isinstance(reply, Path):
-        reply = reply.absolute()
+    if enrolled:
+        if isinstance(reply, Path):
+            reply = reply.absolute()
+        if record_status and not completion_actions.status_file:
+            status = progress_history.worker_artifact(Path(record_status), slot, name.value).absolute()
+            completion_actions = replace(completion_actions, status_file=str(status))
     with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
@@ -825,7 +903,10 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 delivery = progress_history.dispatch_delivery(passed)
                 receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
                 if isinstance(receipt, DispatchComplete):
-                    save_reply(Path(delivery.reply_file), receipt.reply)
+                    holder = record.by_id(parent)
+                    if holder is None:
+                        raise OSError(f"{parent}: completion owner is unavailable")
+                    CompletionArtifacts(holder, session_dir).reply(Path(delivery.reply_file), receipt.reply)
                 _ = notice_delivery.callback(completion_notices.repeat_completion_notice(
                     row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
                     worker_panes.worker_pass(row, session_dir)))
@@ -856,6 +937,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             _ = on_submission()
 
         try:
+            if enrolled and record_status:
+                _ = os.environ.pop(progress_history.ASSIGN_STATUS_FILE_ENV, None)
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
@@ -864,6 +947,9 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return _prompt_conflict(refused.conflict)
         except progress_history.DispatchSelectionChanged as error:
             return _selection_changed(error)
+        finally:
+            if enrolled and record_status:
+                os.environ[progress_history.ASSIGN_STATUS_FILE_ENV] = record_status
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
@@ -880,6 +966,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             saved = progress_history.DispatchDelivery(line, dispatch_id, str(destination),
                 str(early_ready) if isinstance(early_ready, Path) else "", completion_actions)
             progress_history.save_dispatch_delivery(session_dir, instance, saved)
+            if enrolled and kind == "assign" and completion_actions.status_file:
+                holder = record.by_id(parent)
+                if holder is None:
+                    raise OSError(f"{parent}: completion owner is unavailable")
+                CompletionArtifacts(holder, session_dir).write(Path(completion_actions.status_file), "running\n")
         deferred = False
 
         def defer_compaction() -> None:
@@ -1080,12 +1171,13 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
                 if passed.get("instance_id") != instance or passed.get("status") != "active":
                     return ExitCode.OK
                 owner = record.by_id(parent)
-                if owner is not None:
-                    try:
-                        _require_review_delivery(owner, row, run, passed)
-                    except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
-                        print(error, file=sys.stderr)
-                        return ExitCode.REFUSED
+                if owner is None or not row.reports_to(parent):
+                    raise OSError(f"{parent}: dispatch owner is unavailable")
+                try:
+                    _require_review_delivery(owner, row, run, passed)
+                except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+                    print(error, file=sys.stderr)
+                    return ExitCode.REFUSED
                 delivery = progress_history.dispatch_delivery(passed)
                 if delivery.completion_id != completion_id:
                     return ExitCode.OK
@@ -1145,7 +1237,13 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
             _ = _dispatch_failure_step(identity, "pass end", end_pass)
             completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
                 run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
-            reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
+            def save_error_reply() -> None:
+                holder = staff.snapshot().by_id(parent)
+                if holder is None:
+                    raise OSError(f"{parent}: completion owner is unavailable")
+                CompletionArtifacts(holder, run).reply(path, detail)
+
+            reply_saved = _dispatch_failure_step(identity, "error reply", save_error_reply)
     if submission_unproved:
         _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
             parent, identity, run, instance, passed, "uncertain", detail))
