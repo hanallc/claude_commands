@@ -259,6 +259,53 @@ class AccountsPageTests(unittest.TestCase):
             _ = accounts_page.page()
         cleared.assert_called_once_with(accounts_page.quota_state(self.review_root))
 
+    def test_page_shows_mac_token_state_and_configured_account_below_models(self) -> None:
+        notes = self.review_root.parent / "agents"
+        notes.mkdir()
+        made = AT - timedelta(days=335)
+        _ = (notes / "Mac fallback token.md").write_text(
+            f"---\naccount: claude9\nmade: {made.isoformat()}\nchecked_at: {AT.isoformat()}\n"
+            + f"last_good_use: {(AT - timedelta(minutes=1)).isoformat()}\n"
+            + f"last_login_failure: {AT.isoformat()}\n---\n", encoding="utf-8")
+        config = Path(os.environ["CONF_DIR"]) / "showrunners.conf"
+        _ = config.write_text("mac_token.account=\ntoken_expiry.lead_days=30 7\n", encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            page = accounts_page.page()
+            mac_section = page.split(b'aria-label="Mac fallback token"', 1)[1].split(b"</section>", 1)[0]
+            self.assertIn(b">Unknown</td>", mac_section)
+            self.assertIn(b"<p>Set <code>mac_token.account</code> first.</p>", mac_section)
+            self.assertNotIn(b"<ol>", mac_section)
+            _ = config.write_text("mac_token.account=claude2\ntoken_expiry.lead_days=30 7\n", encoding="utf-8")
+            page = accounts_page.page()
+        self.assertLess(page.index(b'aria-label="Models"'), page.index(b'aria-label="Mac fallback token"'))
+        table = page.split(b'aria-label="Mac fallback token"', 1)[1].split(b"</table>", 1)[0]
+        for value in (b">claude2</td>", b">2025-12-15</time>", b">2026-12-15</time>",
+                      b">Sun 11-15 14:59 UTC</time>", b'<span class="error">Login failed</span><br>'
+                      + b'<span class="warning">Expires in 30 days</span>'):
+            self.assertIn(value, table)
+        renewal = page.split(b'<section class="mac-token-steps">', 1)[1].split(b"</section>", 1)[0].decode()
+        steps = [match[1] for match in re.finditer(r"<li>(.*?)</li>", renewal)]
+        self.assertEqual(steps, [
+            "In a plain Terminal or iTerm window, not in a herdr pane, run <code>mac-token-renew</code>.",
+            "Approve access in the browser while signed in to claude2.",
+            "Copy the token that setup-token shows, then paste it at the hidden prompt and press Enter.",
+        ])
+        self.assertIn("The command uses claude2, stores the token encrypted, clears the clipboard "
+                      + "and updates this page.", renewal)
+        self.assertNotIn("<pre>", renewal)
+
+    def test_page_marks_old_mac_token_metadata_stale(self) -> None:
+        notes = self.review_root.parent / "agents"
+        notes.mkdir()
+        made = AT - timedelta(days=2)
+        _ = (notes / "Mac fallback token.md").write_text(
+            f"---\nmade: {made.isoformat()}\nchecked_at: {made.isoformat()}\n---\n", encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            page = accounts_page.page()
+        self.assertIn(b"<caption>Stale token data</caption>", page)
+
     def test_next_accounts_response_shows_nav_quota_from_the_same_store(self) -> None:
         home = self.review_root.parent / "home"
         home.mkdir()

@@ -18,7 +18,7 @@ from typing import TypedDict, cast
 from scripts.accounts import accounts, next_moves
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
-from scripts.whoami import quota_alert, run_out
+from scripts.whoami import mac_fallback_token, note_file, quota_alert, run_out
 
 PAGE_NAME = "accounts.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -556,6 +556,67 @@ def models_board(reading: accounts.StatusReading) -> str:
             + f'<tbody>{rows}</tbody></table></div></section>')
 
 
+def mac_token_steps(account: note_file.NumberedAccountLabel | mac_fallback_token.Unknown) -> str:
+    if isinstance(account, mac_fallback_token.Unknown):
+        return '<section class="mac-token-steps"><p>Set <code>mac_token.account</code> first.</p></section>'
+    label = account.label
+    return (
+        '<section class="mac-token-steps"><h3>Replace the token on the Mac</h3><ol>'
+        + '<li>In a plain Terminal or iTerm window, not in a herdr pane, run <code>mac-token-renew</code>.</li>'
+        + f'<li>Approve access in the browser while signed in to {label}.</li>'
+        + '<li>Copy the token that setup-token shows, then paste it at the hidden prompt and press Enter.</li></ol>'
+        + f'<p>The command uses {label}, stores the token encrypted, clears the clipboard and updates this page.</p>'
+        + '</section>'
+    )
+
+
+def mac_token_board(reading: accounts.StatusReading) -> str:
+    token = mac_fallback_token.read()
+    now, zone = reading.checked_at, reading.zone
+    settings = conf.read("showrunners")
+    try:
+        account = mac_fallback_token.configured_account(settings)
+    except (OSError, ValueError):
+        account = mac_fallback_token.Unknown.VALUE
+
+    def token_date(value: datetime | mac_fallback_token.Unknown, format_string: str) -> str:
+        if not isinstance(value, datetime):
+            return "Unknown"
+        return (f'<time datetime="{value.isoformat()}" title="{value.astimezone(timezone.utc):%Y-%m-%d %H:%M UTC}">'
+                f'{value.astimezone(zone):{format_string}}</time>')
+
+    cells = [account.label if isinstance(account, note_file.NumberedAccountLabel) else "Unknown", *["Unknown"] * 4]
+    caption = ""
+    if isinstance(token, mac_fallback_token.MacFallbackToken):
+        cells[1:4] = [token_date(token.made, "%Y-%m-%d"), token_date(token.expires, "%Y-%m-%d"),
+                      token_date(token.last_good_use, quota_alert.WEEKLY_EMPTY_FORMAT)]
+        if not token.recently_checked(now):
+            caption = "<caption>Stale token data</caption>"
+        alerts: list[str] = []
+        if isinstance(token.active_login_failure(now), datetime):
+            alerts.append('<span class="error">Login failed</span>')
+        if now >= token.expires:
+            alerts.append('<span class="warning">Expired</span>')
+        else:
+            try:
+                leads = mac_fallback_token.expiry_days(settings)
+            except (OSError, ValueError):
+                alerts.append("Expiry schedule unavailable")
+            else:
+                if token.expiry_lead(now, zone, leads) is not None:
+                    days = token.days_left(now, zone)
+                    expiry = "Expires today" if days == 0 else "Expires in 1 day" if days == 1 else f"Expires in {days} days"
+                    alerts.append(f'<span class="warning">{expiry}</span>')
+        cells[4] = '<br>'.join(alerts) if alerts else "No active alert"
+    head = "".join(f'<th class="left" scope="col">{heading}</th>'
+                   for heading in ("account", "made", "expires", "last good use", "state"))
+    row = "".join(_cell(value) for value in cells)
+    return ('<section class="card mac-token-card"><h2>Mac fallback token</h2><div class="scroll">'
+            f'<table aria-label="Mac fallback token">{caption}<thead><tr>{head}</tr></thead>'
+            f'<tbody><tr>{row}</tr></tbody></table></div>'
+            f'{mac_token_steps(account)}</section>')
+
+
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
@@ -565,7 +626,7 @@ def page() -> bytes:
     except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
-    body = board(reading, alerts) + models_board(reading)
+    body = board(reading, alerts) + models_board(reading) + mac_token_board(reading)
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
@@ -605,7 +666,14 @@ STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
-.models-card{margin-top:24px}
+.models-card,.mac-token-card{margin-top:24px}
+.mac-token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
+.mac-token-steps h3{font-size:.93rem;margin:0 0 7px}
+.mac-token-steps ol{margin:0;padding-left:1.5rem}
+.mac-token-steps li + li{margin-top:5px}
+.mac-token-steps li::marker,.mac-token-steps p{color:var(--ink-2)}
+.mac-token-steps code{overflow-wrap:anywhere}
+.mac-token-steps p{margin:0}.mac-token-steps ol + p{margin:10px 0 0;padding-left:1.5rem}
 .roles-table td{vertical-align:top}
 .role-line{min-height:1.5em}
 .model-tooltip{position:fixed;width:max-content;padding:7px 11px;background:var(--model-tooltip-bg);
