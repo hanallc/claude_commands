@@ -403,7 +403,7 @@ The console inlines the icons and makes no CDN, font, script, or stylesheet requ
 
 An open item shows its detail and actions in the item dialog.
 A refresh updates the table and stores the latest detail for the open item.
-Outside the delivery window, the detail and its signed form stay in place until the user selects **Show updates**.
+Outside the delivery window, a refresh that changes the detail offers **Show updates**. The detail and its signed form stay in place until the user selects it.
 The dialog keeps edits made during a save, including the field selection.
 A save response from before the dialog closed cannot replace the reopened detail.
 The dialog reserves space for the update notice outside the scrolling body.
@@ -416,7 +416,6 @@ A confirmed Park or Close closes the dialog, even if the detail cannot refresh.
 The response reports whether message delivery is pending.
 The dialog applies refreshes automatically through the first refresh that reports delivery ended.
 The setting page_delivery_window_seconds limits the time for automatic refreshes.
-Later refreshes offer **Show updates** when the detail changes.
 Review publishes the current question delivery notice before it reports that delivery ended.
 Linked and standalone Review cards reserve a 52 pixel status row above the body.
 The row shows the save failure and **Show updates** without moving the shown detail.
@@ -585,7 +584,8 @@ The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
 Standard Send, List Send and Review Send to the List owner use the same owner check.
-Send uses an active parent when the selected owner has wrapped.
+Send uses an active parent when the owner has wrapped.
+A recipient chosen in the dialog gets no parent: Send refuses an unavailable chosen recipient.
 If a named local document cannot be read, Send reports the reason and leaves the request free for an edit.
 Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
 The page owner dialog lists the evidence under **Sent with your words**.
