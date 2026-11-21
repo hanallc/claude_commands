@@ -925,6 +925,25 @@ class MacPlacementWaitTests(unittest.TestCase):
 
 @final
 class BusyHolderTests(unittest.TestCase):
+    def test_claim_reply_preserves_other_output_and_decodes_only_known_checks(self) -> None:
+        output = "claim child output\n"
+        unknown = "cannot adopt the Mac claim: unknown check\n"
+        cases = (
+            (12, "state", "", offload.NoWaitClaimCheck),
+            (11, "busy", "cannot adopt the Mac claim: leased slot\n", offload.WaitClaimCheck.LEASED_SLOT),
+        )
+        for status, reason, diagnostic, check in cases:
+            with self.subTest(status=status):
+                result = offload.read_claim_answer(offload.CommandOutput(status, output, diagnostic + unknown))
+                self.assertIsInstance(result, offload.MacClaimChildRefusal)
+                assert isinstance(result, offload.MacClaimChildRefusal)
+                self.assertEqual((result.status, result.reason), (status, reason))
+                self.assertEqual((result.stdout, result.stderr), (output, unknown))
+                if isinstance(check, offload.WaitClaimCheck):
+                    self.assertIs(result.check, check)
+                else:
+                    self.assertIsInstance(result.check, check)
+
     def test_busy_claim_line_keeps_the_job_and_kept_claim_description(self) -> None:
         for what in ("cargo nextest -p hana", "leftovers of cargo test on prior-mac", "job since last week"):
             with self.subTest(what=what):

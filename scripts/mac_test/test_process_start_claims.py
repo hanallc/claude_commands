@@ -78,13 +78,50 @@ class ClaimProcessStartTests(unittest.TestCase):
             self.assertEqual(claim_state.claim_identity(adopted.record), exact)
             self.assertEqual((adopted.record["pid"], adopted.record["proc_start"]), (runner_pid, runner_start.start))
 
+    def test_direct_claim_adopts_the_same_worktree_with_a_raw_path_on_either_side(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "scripts").mkdir()
+            raw = str(root / "scripts" / "..")
+            canonical = str(root)
+            cases = ((raw, canonical, False), (canonical, raw, False), (canonical, canonical, True))
+            parser = mac_test.parser()
+            for index, (reserved_path, runner_path, stored_raw_path) in enumerate(cases):
+                with self.subTest(reserved_path=reserved_path, runner_path=runner_path, stored_raw_path=stored_raw_path):
+                    paths = mac_test.StatePaths(root / f"provider-{index}")
+                    words = ["claim", "--what", "nextest hana", "--claim-id", "claim-a",
+                             "--episode", "episode-a", "--attempt", "attempt-a", "--session", "fixture"]
+                    reserve = parser.parse_args([*words, "--pid", "41", "--worktree", reserved_path],
+                                                namespace=mac_test.CliArguments())
+                    adopt = parser.parse_args([*words, "--pid", "42", "--from-pid", "41", "--worktree", runner_path,
+                                               "--remote", "fixture-mac"], namespace=mac_test.CliArguments())
+
+                    def read_start(pid: int) -> identity.ProcessStart:
+                        return identity.Started(str(pid * 1000))
+
+                    errors = io.StringIO()
+                    with mock.patch.object(identity, "process_start", side_effect=read_start), \
+                            redirect_stdout(io.StringIO()), redirect_stderr(errors):
+                        self.assertEqual(mac_test.command_claim(reserve, paths, watch_claim=False, session=reserve.session), 0)
+                        reserved, = mac_test.read_claims(paths)
+                        if stored_raw_path:
+                            mac_test.write_json(reserved.path, {**reserved.record, "worktree": raw})
+                        status = mac_test.command_claim(adopt, paths, watch_claim=False, session=adopt.session)
+                    self.assertEqual(status, 0, errors.getvalue())
+                    self.assertEqual(reserved.record["worktree"], canonical)
+                    adopted, = mac_test.read_claims(paths)
+                    self.assertEqual(claim_state.claim_identity(adopted.record), claim_state.claim_identity(reserved.record))
+                    self.assertEqual((adopted.record["pid"], adopted.record["proc_start"]), (42, "42000"))
+
     def test_adoption_refusal_names_the_failed_check_without_changing_the_reservation(self) -> None:
         checks = ("runner pid start", "no reservation", "reservation count", "scope", "pid", "identity",
-                  "submitting session", "remote host", "proc_start", "worktree", "remote missing", "block state")
+                  "submitting session", "remote host", "proc_start", "worktree", "remote missing", "block state",
+                  "leased slot")
         for check in checks:
             with self.subTest(check=check), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                paths = mac_test.StatePaths(root)
+                paths = (mac_test.StatePaths(root, "box", platform="linux") if check == "leased slot"
+                         else mac_test.StatePaths(root))
                 scope = mac_test.RepositoryScope("hana")
                 session = OwningSession("fixture-session")
                 record: mac_test.ProcessBoundClaim = {
@@ -102,6 +139,9 @@ class ClaimProcessStartTests(unittest.TestCase):
                     args.remote = "fixture-mac"
                 if check == "submitting session":
                     session = OwningSession("foreign-session")
+                if check == "leased slot":
+                    record["slot"] = 2
+                    args.leased_slots = [1]
                 if check != "no reservation":
                     mac_test.write_json(paths.run, {**record, "remote_host": "fixture-mac"} if check == "remote host"
                                         else record)
@@ -121,7 +161,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                 with mock.patch.object(identity, "process_start", side_effect=read_start), redirect_stderr(errors), \
                         redirect_stdout(io.StringIO()):
                     result = mac_test.adopt_wait_claim(args, paths, scope, session=session)
-                self.assertEqual(result, mac_test.ClaimFinished(12))
+                self.assertEqual(result, mac_test.ClaimFinished(11 if check == "leased slot" else 12))
                 self.assertEqual(errors.getvalue().splitlines(), [f"cannot adopt the Mac claim: {check}"])
                 self.assertEqual(mac_test.read_claims(paths), before)
 

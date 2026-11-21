@@ -11,7 +11,7 @@ import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from functools import partial
 from importlib import import_module
 import fcntl
@@ -737,9 +737,43 @@ class MacClaimNotConfirmed:
     stderr: str
 
 
+def claim_worktree_path(worktree: str) -> Path:
+    """Resolve a claim's worktree path before use or comparison."""
+    return Path(worktree).resolve()
+
+
+WAIT_CLAIM_CHECK_PREFIX = "cannot adopt the Mac claim: "
+
+
+class WaitClaimCheck(StrEnum):
+    RUNNER_START = "runner pid start"
+    NO_RESERVATION = "no reservation"
+    RESERVATION_COUNT = "reservation count"
+    SCOPE = "scope"
+    PID = "pid"
+    IDENTITY = "identity"
+    SESSION = "submitting session"
+    REMOTE_HOST = "remote host"
+    OWNER_START = "proc_start"
+    WORKTREE = "worktree"
+    REMOTE_MISSING = "remote missing"
+    BLOCK_STATE = "block state"
+    LEASED_SLOT = "leased slot"
+
+    @property
+    def diagnostic(self) -> str:
+        return WAIT_CLAIM_CHECK_PREFIX + self.value
+
+
+class NoWaitClaimCheck:
+    """The claim child reported no known adoption check."""
+
+
 @dataclass(frozen=True)
-class MacClaimChildStateFailure(MacClaimNotConfirmed):
+class MacClaimChildRefusal(MacClaimNotConfirmed):
+    reason: Literal["state", "busy"]
     status: int
+    check: WaitClaimCheck | NoWaitClaimCheck
 
 
 MacClaimAnswer = FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
@@ -1607,6 +1641,22 @@ def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
     return ["--assignment", wire.encode_reply(wire.Assignment(request.placement.assignment)).strip()]
 
 
+def read_claim_refusal(result: CommandOutput) -> MacClaimChildRefusal:
+    check: WaitClaimCheck | NoWaitClaimCheck = NoWaitClaimCheck()
+    error_lines = result.stderr.splitlines(keepends=True)
+    for index, line in enumerate(error_lines):
+        if not line.startswith(WAIT_CLAIM_CHECK_PREFIX):
+            continue
+        try:
+            check = WaitClaimCheck(line.removeprefix(WAIT_CLAIM_CHECK_PREFIX).rstrip("\r\n"))
+        except ValueError:
+            continue
+        del error_lines[index]
+        break
+    reason = "busy" if result.status == 11 else "state"
+    return MacClaimChildRefusal(reason, result.stdout, "".join(error_lines), result.status, check)
+
+
 def read_claim_answer(result: CapturedCommandResult, *,
                       expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
                       assigned_slot: int = 0) -> MacClaimAnswer:
@@ -1632,9 +1682,7 @@ def read_claim_answer(result: CapturedCommandResult, *,
         return TakeoverHostUnreadable()
     if result.status == 10:
         return MacClaimNotConfirmed("blocked", result.stdout, result.stderr)
-    if result.status == 11:
-        return MacClaimNotConfirmed("busy", result.stdout, result.stderr)
-    return MacClaimChildStateFailure("state", result.stdout, result.stderr, result.status)
+    return read_claim_refusal(result)
 
 
 def probe_reachability(
@@ -3330,12 +3378,6 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
-        if claim_from_wait and isinstance(claim, MacClaimChildStateFailure):
-            check = " ".join((claim.stderr.strip() or claim.stdout.strip()).splitlines())
-            diagnostic = f"state: claim child exited {claim.status}"
-            if check:
-                diagnostic += f": {check}"
-            return WaitClaimAdoptionDeclined(elapsed_seconds(started), diagnostic=diagnostic)
         if claim.reason in ("busy", "blocked"):
             controller.attempt_evidence.provider = placement.NoProviderClaim()
         if not decline_already_shown(claim.reason, request.last_decline):
@@ -3343,8 +3385,16 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                 print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
             if claim.stderr:
                 print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            if (isinstance(claim, MacClaimChildRefusal) and not isinstance(claim.check, NoWaitClaimCheck)
+                    and (claim.reason == "busy" or not claim_from_wait)):
+                print(claim.check.diagnostic, file=sys.stderr, flush=True)
         if claim.reason == "busy":
             return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
+        if claim_from_wait and isinstance(claim, MacClaimChildRefusal):
+            diagnostic = f"state: claim child exited {claim.status}"
+            if not isinstance(claim.check, NoWaitClaimCheck):
+                diagnostic += f": {claim.check.diagnostic}"
+            return WaitClaimAdoptionDeclined(elapsed_seconds(started), diagnostic=diagnostic)
         return declined(claim.reason, started)
     if claim.slot not in leases:
         _ = release_claim(controller, request.target)
@@ -3447,7 +3497,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
             arguments.target = saved.assignment.destination.target
     return OffloadRequest(
         placement=assigned,
-        repo_root=Path(arguments.repo_root).resolve(),
+        repo_root=claim_worktree_path(arguments.repo_root),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
         owner=copies.source_owner(Path(arguments.repo_root)),
         holder_session=holder_session(),

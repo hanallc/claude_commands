@@ -12,7 +12,6 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from enum import StrEnum
 import fcntl
 import json
 import math
@@ -97,6 +96,7 @@ if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
     from scripts.mac_test import eligibility
+    from scripts.mac_test.offload import WaitClaimCheck
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -716,19 +716,23 @@ def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
 
 
 def preferred_slots(paths: StatePaths, scope: RepositoryScope, worktree: str, capacity: int) -> tuple[int, ...]:
+    from scripts.mac_test.offload import claim_worktree_path
+
     affinity = read_json_object(affinity_path(paths, scope)) or {}
     if any(type(slot) is not int or slot < 1 for slot in affinity.values()):
         raise StateReadError("invalid repository slot affinity")
-    preferred = affinity.get(str(Path(worktree).resolve()))
+    preferred = affinity.get(str(claim_worktree_path(worktree)))
     slots = tuple(range(1, capacity + 1))
     return (cast(int, preferred), *(slot for slot in slots if slot != preferred)) if preferred in slots else slots
 
 
 def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) -> None:
+    from scripts.mac_test.offload import claim_worktree_path
+
     path = affinity_path(paths, scope)
     affinity = {worktree: slot for worktree, slot in (read_json_object(path) or {}).items()
                 if Path(worktree).exists()}
-    affinity[str(Path(record["worktree"]).resolve())] = scope.slot
+    affinity[str(claim_worktree_path(record["worktree"]))] = scope.slot
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, affinity)
 
@@ -1821,6 +1825,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
                assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
+    from scripts.mac_test.offload import claim_worktree_path
+
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
@@ -1855,7 +1861,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             print(f"state unreadable: {error}")
             return ClaimFinished(12)
         for claim in overlapping:
-            if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
+            if (claim.record["pid"] == args.pid and str(claim_worktree_path(claim.record["worktree"])) == args.worktree
                     and claim_state.claim_identity(claim.record) == identity
                     and not run_is_kept(claim.record) and "slot" in claim.record
                     and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
@@ -1949,29 +1955,16 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
-class WaitClaimCheck(StrEnum):
-    RUNNER_START = "runner pid start"
-    NO_RESERVATION = "no reservation"
-    RESERVATION_COUNT = "reservation count"
-    SCOPE = "scope"
-    PID = "pid"
-    IDENTITY = "identity"
-    SESSION = "submitting session"
-    REMOTE_HOST = "remote host"
-    OWNER_START = "proc_start"
-    WORKTREE = "worktree"
-    REMOTE_MISSING = "remote missing"
-    BLOCK_STATE = "block state"
-
-
-def refuse_wait_claim(check: WaitClaimCheck) -> ClaimFinished:
-    print(f"cannot adopt the Mac claim: {check}", file=sys.stderr)
-    return ClaimFinished(12)
+def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) -> ClaimFinished:
+    print(check.diagnostic, file=sys.stderr)
+    return ClaimFinished(status)
 
 
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                      *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer a live reservation under the target lock without releasing capacity."""
+    from scripts.mac_test.offload import WaitClaimCheck, claim_worktree_path
+
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
         return refuse_wait_claim(WaitClaimCheck.RUNNER_START)
@@ -1981,6 +1974,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if not owners:
         return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    worktree = claim_worktree_path(args.worktree)
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
         (WaitClaimCheck.SCOPE, lambda claim: scopes_overlap(claim.scope, scope)),
@@ -1989,8 +1983,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
         (WaitClaimCheck.OWNER_START, lambda claim:
             process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
-        (WaitClaimCheck.WORKTREE, lambda claim: claim.record["worktree"] == args.worktree
-            or claim.record.get("cleanup_pending") is True),
+        (WaitClaimCheck.WORKTREE, lambda claim: claim.record.get("cleanup_pending") is True
+            or claim_worktree_path(claim.record["worktree"]) == worktree),
     )
     for check, matches in checks:
         owners = tuple(claim for claim in owners if matches(claim))
@@ -2001,7 +1995,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     claim = owners[0]
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(claim.scope, RepositoryScope)
             and args.leased_slots and claim.scope.slot not in args.leased_slots):
-        return ClaimFinished(11)
+        return refuse_wait_claim(WaitClaimCheck.LEASED_SLOT, status=11)
     # A reservation grants capacity. A later block still prevents new work.
     # Retained remote work keeps its cleanup path.
     if "remote_host" not in claim.record:
@@ -2035,10 +2029,11 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
                        assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
     """Reserve a slot for a live local wait without starting remote work."""
     from scripts.mac_test import eligibility
+    from scripts.mac_test.offload import claim_worktree_path
 
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = eligibility.read_config(settings)
-    worktree = Path(args.repo_root).resolve()
+    worktree = claim_worktree_path(args.repo_root)
     if isinstance(eligibility.mac_step_eligibility(config, worktree, args.package,
                                              args.verb, args.target, kind=kind), eligibility.IneligibleMacStep):
         return 1
@@ -2050,6 +2045,9 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
 def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True,
                   session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                   assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
+    from scripts.mac_test.offload import claim_worktree_path
+
+    args.worktree = str(claim_worktree_path(args.worktree))
     if (args.assignment_file or args.assignment) and isinstance(assignment, UnassignedClaim):
         from scripts.build_queue import admission_wire as wire
 
