@@ -1591,7 +1591,7 @@ class MigrationShortNames:
 
         name = remove_words(tree.path.name)
         if not name:
-            return "director"
+            return UNIT_WORKTREE_NAME
         if name.isdecimal():
             name = remove_words(tree.branch) or name
             if name.isdecimal():
