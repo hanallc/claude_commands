@@ -24,7 +24,7 @@ from scripts.build_queue import execution_identity
 from scripts.accounts import outage_alerts
 from scripts.message import send_result
 from scripts.message import roster
-from scripts.message.session_send import session_send_argv
+from scripts.message.session_send import PYTHON_LAUNCHER, session_send_argv
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.lib.socket_test_support import short_socket_directory
@@ -324,7 +324,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(sent.place, wire.CloudPlace("aws"))
 
     def test_import_does_not_load_memory_admission(self) -> None:
-        result = subprocess.run([sys.executable, "-c",
+        result = subprocess.run([str(PYTHON_LAUNCHER), "-c",
             "import sys\nfrom scripts.build_queue import admission_client\nprint('\\n'.join(sys.modules))"],
             cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True)
         self.assertNotIn("scripts.lint.memory_admit", result.stdout.splitlines())

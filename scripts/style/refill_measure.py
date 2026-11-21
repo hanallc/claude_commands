@@ -32,6 +32,7 @@ from typing import ParamSpec, TypeVar, cast, override
 from unittest.mock import patch
 
 from scripts.lib import berth_board
+from scripts.message.session_send import PYTHON_LAUNCHER
 from scripts.style import refill_facts, refill_findings, refill_inputs, rules, style_config, style_ledger, style_plan, style_proposals, style_reader
 from scripts.style.unit_files import unit_worktrees
 from scripts.style.unit_plans import family_pilot_scopes, unit_plan_path
@@ -176,12 +177,12 @@ class ProcessTreeUsage:
 
 def measured_run(repo: Path, database: Path, unit: str, environment: Mapping[str, str], *, stages: bool = False) -> dict[str, object]:
     """Measure a fresh process so a cold or warm run has its own memory peak."""
-    command = [sys.executable, "-m", "scripts.style.refill_measure", "--worker", "--repo", str(repo),
+    command = [str(PYTHON_LAUNCHER), "-m", "scripts.style.refill_measure", "--worker", "--repo", str(repo),
                "--ledger", str(database), "--unit", unit]
     if stages:
         command.append("--stages")
     started = time.perf_counter()
-    child_environment = dict(environment, REFILL_MEASURE_STARTED=str(started))
+    child_environment = dict(environment, CLAUDE_PYTHON=sys.executable, REFILL_MEASURE_STARTED=str(started))
     with subprocess.Popen(command, env=child_environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         usage = ProcessTreeUsage(process.pid)
         usage.sample()

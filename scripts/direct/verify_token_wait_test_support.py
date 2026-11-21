@@ -25,6 +25,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from typing import ClassVar, cast, override
+from scripts.lib import signal_test_support
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
@@ -42,11 +43,6 @@ BOARD = VERIFY.with_name("board.sh")
 
 
 Record = dict[str, object]
-
-
-def restore_sigint() -> None:
-    _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
-
 
 
 class VerifyTokenWaitFixture(unittest.TestCase):
@@ -513,7 +509,7 @@ esac
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True,
-                                 preexec_fn=restore_sigint)
+                                 preexec_fn=signal_test_support.restore_sigint)
         self.started_groups.add(first.pid)
         try:
             self.wait_for_running((self.root / "running"), first)

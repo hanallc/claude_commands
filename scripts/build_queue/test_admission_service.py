@@ -848,7 +848,7 @@ class ImportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
             result = subprocess.run(
-                [sys.executable, "-c", "import sys; from scripts.build_queue import admission_service; "
+                [str(session_send.PYTHON_LAUNCHER), "-c", "import sys; from scripts.build_queue import admission_service; "
                  + "assert not {'argparse', 'scripts.message.send_budget', 'scripts.message.send_result', "
                  + "'scripts.message.session_send'}.intersection(sys.modules)"],
                 cwd=Path(__file__).resolve().parents[2], env=environment,
@@ -5755,7 +5755,7 @@ class ServiceTests(unittest.TestCase):
                         fixture.restart()
                         restored = wire.encode_record(fixture.server.ledger[release.request_id].reply)
                     else:
-                        result = subprocess.run([sys.executable, "-c", "\n".join((
+                        result = subprocess.run([str(session_send.PYTHON_LAUNCHER), "-c", "\n".join((
                             "import sys",
                             "from scripts.build_queue import admission_protocol as wire",
                             "from scripts.build_queue.admission_test_support import AdmissionFixture",

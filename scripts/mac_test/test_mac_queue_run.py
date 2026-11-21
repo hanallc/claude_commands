@@ -16,10 +16,12 @@ from typing import TextIO, cast
 import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib import signal_test_support
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message.session_send import PYTHON_LAUNCHER
 
 
 QUEUE = r'''
@@ -122,7 +124,8 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
 
 class QueueRunTests(unittest.TestCase):
     def command(self, root: Path, kind: str = "shot") -> list[str]:
-        return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
+        return [str(PYTHON_LAUNCHER), "-m", "scripts.mac_test.mac_queue_run",
+                "--what", "camera shot", "--kind", kind,
                 "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",
                 "/bin/zsh", "-c", "cargo build -p hana; printf '%s' 'quoted value'"]
 
@@ -289,8 +292,10 @@ else:
             with self.subTest(waiting=waiting, signum=signum), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 environment = {**queue_fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
+                reset_sigint = signal_test_support.restore_sigint if signum == signal.SIGINT else None
                 with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, env=environment, start_new_session=True) as process:
+                                      text=True, env=environment, start_new_session=True,
+                                      preexec_fn=reset_sigint) as process:
                     try:
                         wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
                         if signum == signal.SIGINT:

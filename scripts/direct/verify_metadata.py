@@ -86,8 +86,12 @@ def check_targets(meta: CargoMetadata) -> str:
     return "\n".join([*selection, "--bins"])
 
 
-def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str) -> str:
+def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str, *, filtered: bool = False) -> str:
     if not package_name:
+        if filtered and len(meta["workspace_members"]) > 1:
+            print("verify.sh: use --package <name> for a filtered test in a workspace with multiple packages.",
+                  file=sys.stderr)
+            raise SystemExit(2)
         packages = [package for package in meta["packages"] if package["id"] in meta["workspace_members"]]
         return "\n".join((["--lib"] if any(package_has_library(package) for package in packages) else []) + ["--bins", "--tests"])
     package = require_package(meta, package_name)
@@ -178,8 +182,8 @@ def answer(meta: CargoMetadata, request: str) -> str:
         return ""
     if name == "example-features" and len(arguments) == 2:
         return example_features(meta, arguments[0], arguments[1])
-    if name == "test-targets" and len(arguments) == 2:
-        return test_targets(meta, arguments[0], arguments[1])
+    if name == "test-targets" and len(arguments) >= 2 and arguments[2:] in ([], ["filtered"]):
+        return test_targets(meta, arguments[0], arguments[1], filtered=arguments[2:] == ["filtered"])
     if name == "check-targets" and not arguments:
         return check_targets(meta)
     if name == "build-targets" and len(arguments) == 3:

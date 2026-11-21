@@ -11,6 +11,9 @@ import tempfile
 from typing import TypedDict, cast
 import unittest
 
+from scripts.build_queue import admission_protocol as wire
+from scripts.direct.verify_metadata import CargoMetadata, CargoPackage
+from scripts.direct.verify_token_wait_test_support import VERIFY, VerifyTokenWaitFixture
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_function, shell_functions
@@ -122,6 +125,61 @@ class VerifyMetadataTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.values(result.stdout), {"TARGET_DIRECTORY": target_line.removeprefix("target ")})
+
+
+class VerifyFilteredPlacementTests(VerifyTokenWaitFixture):
+    def test_filtered_workspace_requires_a_package_before_placement(self) -> None:
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"], "test": True}])
+        metadata = cast(CargoMetadata, json.loads(environment["TEST_METADATA"]))
+        sample, = metadata["packages"]
+        sample["id"] = f"path+{self.root.as_uri()}#sample@0.1.0"
+        sample["manifest_path"] = str(self.root / "Cargo.toml")
+        other_root = self.root / "other"
+        other: CargoPackage = {**sample, "name": "other", "id": f"path+{other_root.as_uri()}#other@0.1.0",
+                               "manifest_path": str(other_root / "Cargo.toml")}
+        metadata["packages"].append(other)
+        metadata["workspace_root"] = str(self.root)
+        request_file = self.root / "first-step.json"
+        environment.update({"BUILDLOG_FIRST_STEP_REQUEST": str(request_file), "UNIT_DETACHED_RUN": "1"})
+        filter_words = ("--filter", "smoke")
+        workspace = ("--lib", "--bins", "--tests")
+        package = ("--lib",)
+        package_filter = "package(sample) & test(smoke)"
+        other_member = (other["id"],)
+        integration_with_filter_text = ("--test", "integration --filter smoke")
+        for extra_members, arguments, expected_package, expected_filter, selection in (
+            (other_member, filter_words, "", "", ()),
+            (other_member, ("--run-ignored", "only"), "", "", ()),
+            ((), filter_words, "", "test(smoke)", workspace),
+            (other_member, ("--package", "sample", *filter_words), "sample", package_filter, package),
+            (other_member, ("sample", *filter_words), "sample", package_filter, package),
+            (other_member, (), "", "", workspace),
+            (other_member, ("--test", "integration"), "", "", ("--test", "integration")),
+            (other_member, integration_with_filter_text, "", "", integration_with_filter_text),
+        ):
+            with self.subTest(extra_members=extra_members, arguments=arguments):
+                request_file.unlink(missing_ok=True)
+                metadata["workspace_members"] = [sample["id"], *extra_members]
+                environment["TEST_METADATA"] = json.dumps(metadata)
+                result = subprocess.run(["bash", str(VERIFY), "test", *arguments], cwd=self.root,
+                                        env=environment, capture_output=True, text=True, check=False,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                if not selection:
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--package <name>", result.stderr)
+                    self.assertFalse(request_file.exists())
+                    continue
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                request = wire.parse_request(request_file.read_text())
+                assert isinstance(request, wire.PlacementRequest)
+                self.assertEqual(request.constraints.package, expected_package)
+                command = request.constraints.command
+                if expected_filter:
+                    self.assertEqual(command[command.index("-E") + 1], expected_filter)
+                else:
+                    self.assertNotIn("-E", command)
+                start = command.index("--workspace") + 1
+                self.assertEqual(tuple(command[start:start + len(selection)]), selection)
 
 
 class VerifyShellHelperTests(unittest.TestCase):
