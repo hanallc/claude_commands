@@ -265,12 +265,14 @@ try {
           const reading = structuredClone(base);
           const running = reading.walk.find(row => row.queued && !row.ci);
           Object.assign(running, {name:'builds bb15', unit:'natemerge', showrunner:'natemerge',
-            title:{unit:'natemerge',step:'integrate'}, machine:'natedev'});
+            title:{unit:'natemerge',step:'integrate'}, machine:'natedev', started_at:reading.read_at-8*60});
+          delete running.caller;
           reading.walk = [running];
           const waiting = reading.waiters[0];
           const reason = 'waits for natemerge integrate';
           Object.assign(waiting, {name:'queue nextest', unit:'queue', showrunner:'builds',
-            why:'gate job', reason, need:4, targets:['natedev']});
+            why:'gate job', reason, need:4, targets:['natedev'], since:reading.read_at-2*60});
+          delete waiting.caller;
           reading.waiters = [waiting];
           reading.ram.build_tools_bytes = 0;
           servedReading = reading;
@@ -287,6 +289,7 @@ try {
             const bottom = Math.ceil(waiting.getBoundingClientRect().bottom + scrollY) + 6;
             return {
               text:note?.textContent, oneLine:note && getComputedStyle(note).whiteSpace === 'nowrap',
+              owners:[running, waiting].map(row=>row.querySelector('.row-label .owner').textContent),
               fits:note && note.scrollWidth <= note.clientWidth,
               inGap:bounds && bounds.left >= waiting.querySelector('.row-label').getBoundingClientRect().right
                 && bounds.right <= bar.left + 1,
@@ -294,6 +297,7 @@ try {
             };
           })()`);
           assert.equal(result.text, reason);
+          assert.deepEqual(result.owners, ['natemerge', 'builds']);
           assert.ok(result.oneLine && result.fits && result.inGap, JSON.stringify(result));
           const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
           await writeFile(join(folder,'builds-waits-for-natemerge-integrate-dark.png'),Buffer.from(shot.data,'base64'));

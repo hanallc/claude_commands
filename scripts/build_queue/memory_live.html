@@ -124,10 +124,9 @@ __PAGE_FRAME_STYLE__
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
-.tip dd.reason { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
-.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
+.tip:has(dd:is(.call, .reason)) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
+.tip:has(dd:is(.call, .reason)) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
 .tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden; white-space: normal; }
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
