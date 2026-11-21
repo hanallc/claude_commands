@@ -459,7 +459,15 @@ The stack creates the launch template, security group, private control bucket, a
 The launch template uses persistent Spot and stops the instance when AWS interrupts it.
 Before a launch, setup reads Spot prices for the configured type and its fallback types.
 If the instance is already recorded, setup resumes without a Spot price check.
-It checks the registered subnet and each available default subnet in another zone of the same VPC.
+The setup and lifecycle records identify the instance when the Hana stack is missing.
+Preparation and setup read the deployed subnet with `ec2:DescribeInstances`.
+This read uses the existing deployment admin permission.
+Before an instance exists, an existing stack uses its subnet parameter or the matching saved preparation.
+Preparation can regenerate `parameters.json` from the deployed network.
+Setup retains the original parameter approval when the instance uses a fallback zone.
+For a new setup, it uses the network in the saved image record when available.
+Otherwise it finds a public subnet in the configured zone with the deployment network resolver.
+It also checks each available default subnet in another zone of the same VPC.
 Setup prints one reason for each candidate with no price or a price above the ceiling.
 If the price read fails or no candidate qualifies, setup exits before it changes the stack.
 If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
@@ -844,6 +852,8 @@ The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
 The home stack owns the artifact bucket and the global gate role and instance profile.
+The home deployment uses the foundation stack's `VpcId` parameter first.
+A new foundation or an empty stack shell uses the region's default VPC.
 Each fallback region has a separate gate stack in its default VPC.
 The deployment generates each regional template from the home template.
 The regional template contains network, launch, scaler policy, and expiry resources.
@@ -1532,8 +1542,6 @@ Existing configuration values remain unchanged.
 | `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
 | `ami_id` | Empty | Use the reviewed image from the registration. |
 | `ami_owner_id` | Empty | Use the owner from the registration. |
-| `vpc_id` | Empty | Use the VPC from the registration. |
-| `subnet_id` | Empty | Use the subnet from the registration. |
 | `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
 | `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |

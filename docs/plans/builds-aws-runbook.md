@@ -240,7 +240,8 @@ For a home-only change, regional time goes to network and image preparation and 
 
 ## Foundation maintenance
 
-`prepare` validates the retained deployment inputs and records the foundation plan.
+`prepare` reads the VPC from the home foundation stack, or uses the default VPC if the stack is absent.
+It checks for an available public subnet in the configured zone and records the foundation plan.
 `apply --approve-resources` creates or updates the Budget and scaler foundation.
 It also confirms the scaler credential file.
 These commands do not create a permanent builder.
@@ -480,9 +481,15 @@ The defaults use a 15-second interval and 240 attempts.
 The command saves the image name and snapshot ID as a pending registration before it waits for the snapshot.
 The command registers the snapshot as an x86_64 image that requires IMDSv2.
 The registration applies the cost tag only to the image.
-It selects the public subnet of the gate VPC in `availability_zone`.
+It finds a public subnet in `availability_zone` with the deployment network resolver.
 It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
-An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses only a complete registration record.
+An empty `ami_id` or `ami_owner_id` in `config/hana_aws.conf` uses the saved image record.
+Hana preparation and setup keep the deployed instance subnet even if the stack is missing.
+The deployment admin uses its existing `ec2:DescribeInstances` permission to read the instance subnet.
+Before an instance exists, an existing stack uses its subnet parameter or the matching saved preparation.
+Run `prepare --workload hana` to restore missing preparation files from the deployed network.
+For a new setup, the image record supplies the network when available.
+Otherwise, setup resolves the network in the configured zone.
 A rerun with the same image build finds the registered image by name and does not upload again.
 If AWS has no image with that name, a rerun waits for the saved pending snapshot and registers it.
 Without a matching pending record, the command checks snapshots owned by the account with a description equal to the image name.
