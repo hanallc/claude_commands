@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -1021,6 +1022,36 @@ class HanaSetupTests(CostFixture):
             self.assertEqual(remote.read_record(saved_path)['parameters_sha256'], approved_hash)
             self.assertNotIn('create-change-set', calls)
             self.assertNotIn('run-instances', calls)
+
+    def test_fallback_network_recovers_approval_and_checks_the_deployed_subnet(self) -> None:
+        fake = FakeAws(self.clock)
+        subject = self.subject(fake)
+        settings = self.base_settings()
+        network = deploy.DeployedHanaNetwork('fixture-vpc', 'fixture-other-subnet', 'us-east-2c')
+        parameters = {'VpcId': network.vpc, 'SubnetId': network.subnet}
+        approved = parameters | {'SubnetId': 'fixture-subnet'}
+        saved = {'region': settings.region, 'parameters_sha256': deploy._hana_parameter_hash(approved)}
+
+        def reply(operation: str, *arguments: str, **_options: object) -> dict[str, object]:
+            if operation == 'describe-images':
+                self.assertEqual(arguments, ('--image-ids', settings.ami_id, '--owners', settings.ami_owner_id))
+                return {'Images': [{'ImageId': settings.ami_id, 'OwnerId': settings.ami_owner_id,
+                    'Architecture': 'x86_64', 'State': 'available', 'Name': f'nixos-{settings.nixos_release}',
+                    'RootDeviceName': settings.root_device_name}]}
+            self.assertEqual(operation, 'describe-subnets')
+            if arguments[0] == '--filters':
+                self.assertEqual(arguments, ('--filters', f'Name=vpc-id,Values={network.vpc}',
+                                             f'Name=availability-zone,Values={settings.availability_zone}'))
+                return {'Subnets': [{'VpcId': network.vpc, 'SubnetId': approved['SubnetId'],
+                                     'AvailabilityZone': settings.availability_zone}]}
+            self.assertEqual(arguments, ('--subnet-ids', network.subnet))
+            return {'Subnets': [{'VpcId': network.vpc, 'SubnetId': network.subnet,
+                                 'AvailabilityZone': network.zone}]}
+
+        with fake_aws_calls(reply):
+            self.assertEqual(subject._hana_approved_parameters(settings, network, parameters, saved), approved)
+            subject._validate_inputs(replace(settings, availability_zone=network.zone), parameters)
+        self.assertEqual(fake.calls, [])
 
     def test_resume_restores_missing_parameters_after_a_fallback_launch(self) -> None:
         override_fixture_settings(self.workload, 'stop_wait_timeout_s=25')
