@@ -944,6 +944,13 @@ class AwsCombinedTableTests(PageCostFixture):
   result.id = "table-checks";
   document.body.appendChild(result);
   function check(condition, description) { if (!condition) throw new Error(description); }
+  function refreshPrices(prices) {
+    const gateTime = document.getElementById("aws-gate-time-data").textContent;
+    window.fetch = async () => ({ok: true, text: async () =>
+      `<script type="application/json" id="aws-prices-data">${JSON.stringify(prices)}</scr` + "ipt>"
+      + `<script type="application/json" id="aws-gate-time-data">${gateTime}</scr` + "ipt>"});
+    return loadAws();
+  }
   try {
 """ + checks + """
     result.textContent = "passed";
@@ -1169,17 +1176,11 @@ class AwsCombinedTableTests(PageCostFixture):
     const notes = ["Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).",
                    "2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08)."];
     const prices = JSON.parse(document.getElementById("aws-prices-data").textContent);
-    let refreshed = JSON.stringify({...prices, render_seconds: 12, settled_notes: notes});
-    const gateTime = document.getElementById("aws-gate-time-data").textContent;
-    window.fetch = async () => ({ok: true, text: async () =>
-      `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"
-      + `<script type="application/json" id="aws-gate-time-data">${gateTime}</scr` + "ipt>"});
-    const status = await loadAws();
+    const status = await refreshPrices({...prices, render_seconds: 12, settled_notes: notes});
     check(status.renderSeconds === 12 && scroller().scrollLeft === 150, "Refresh keeps scroll position");
     check(settled.innerHTML === notes.map(note => '<p class="note">' + note + '</p>').join(""),
           "Refresh renders the settled notes in Spend");
-    refreshed = JSON.stringify({...data, settled_notes: []});
-    await loadAws();
+    await refreshPrices({...data, settled_notes: []});
     check(settled.children.length === 0, "Refresh removes obsolete settled notes");
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
           && params().get("runs") === "test-affected", "Refresh keeps the filter URL");
@@ -1195,6 +1196,39 @@ class AwsCombinedTableTests(PageCostFixture):
     def test_old_merge_gate_url_selects_the_gate_scope(self) -> None:
         self.run_browser_checks('?prices=cost&runs=merge-gate', """
     check(scope === "gate" && scopeCosts().scope === "gate", "The old URL selects the gate scope");
+""")
+
+    def test_refresh_keeps_the_test_affected_scope(self) -> None:
+        for url_scope in ('test-affected', 'targeted-test'):
+            with self.subTest(url_scope=url_scope):
+                self.run_browser_checks(f'?runs={url_scope}', """
+    const selected = id => document.querySelector(`#${id} [aria-pressed='true']`)?.dataset.scope;
+    check(selected("runs-chips") === "test-affected", "The URL selects test affected runs");
+    const prices = data;
+    const legacyScopes = {gate: "merge-gate", "test-affected": "targeted-test"};
+    const explanation = "Updated cost per test affected run.";
+    const runs = prices.runs.map(entry => entry.scope === "test-affected" ? {...entry, explanation} : entry);
+    for (const nextRuns of [runs.map(entry => ({...entry, scope: legacyScopes[entry.scope] ?? entry.scope})), runs]) {
+      await refreshPrices({...prices, runs: nextRuns});
+      check(selected("runs-chips") === "test-affected", "Refresh keeps the selected scope above Prices");
+      check(selected("filter") === "test-affected", "Refresh keeps the selected scope above Cost per run");
+      check(document.getElementById("explanation").textContent === explanation, "Refresh shows the new costs");
+    }
+""")
+
+    def test_grid_uses_the_configured_gate_name_after_refresh(self) -> None:
+        ledger_test_support.text_setting(self.root / 'build_steps.conf', 'names.gate', 'fixture gate')
+        self.run_browser_checks('?show=spot,cost', """
+    const heading = () => document.querySelector("#price-table thead tr:nth-child(2) th:nth-child(2)").textContent;
+    const chip = () => document.querySelector("#show [data-measure='cost']").textContent;
+    const filter = () => document.querySelector("#runs-chips [data-scope='gate']").textContent;
+    check(heading() === "Fixture gate USD", "The grid uses the configured gate name");
+    const runs = data.runs.map(entry => entry.scope === "gate"
+      ? {...entry, noun: "renamed gate", label: "Renamed gate runs"} : entry);
+    await refreshPrices({...data, runs});
+    check(heading() === "Renamed gate USD", "The grid uses the refreshed gate name");
+    check(chip() === "Cost per renamed gate" && filter() === "Renamed gate runs",
+          "The filters use the refreshed gate name");
 """)
 
     def test_cost_switch_uses_the_configured_gate_name_without_standard_types(self) -> None:

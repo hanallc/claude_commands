@@ -184,10 +184,17 @@ __PAGE_TITLE__
 <script>
 "use strict";
 __PAGE_REFRESH_SCRIPT__
+const RUN_SCOPE_ALIASES = new Map([["merge-gate", "gate"], ["targeted-test", "test-affected"]]);
+
+function canonicalRunScope(scope) {
+  return RUN_SCOPE_ALIASES.get(scope) ?? scope;
+}
+
 function readAwsPage(page) {
   const prices = JSON.parse(page.getElementById("aws-prices-data").textContent);
   const gateTime = JSON.parse(page.getElementById("aws-gate-time-data").textContent);
-  return {...prices, regions: gateTime.regions, gateTimePrice: gateTime.table};
+  const runs = prices.runs.map(entry => ({...entry, scope: canonicalRunScope(entry.scope)}));
+  return {...prices, runs, regions: gateTime.regions, gateTimePrice: gateTime.table};
 }
 let data = readAwsPage(document);
 const REGIONS_KEY = "aws-prices-regions";
@@ -195,16 +202,14 @@ const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
-const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", costViewLabel(), "Gate", "USD"],
+const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", costViewLabel(), null, "USD"],
               ["quota", "Quota", "Fit", "boxes"]];
 const TYPES = [["standard", "Standard"], ["gpu", "GPU"]];
-const RUN_SCOPE_ALIASES = new Map([["merge-gate", "gate"], ["targeted-test", "test-affected"]]);
 const query = new URLSearchParams(location.search);
 let shown = new Set(data.regions);
 const measures = new Set(query.has("show") ? query.get("show").split(",") : SHOW.map(([key]) => key));
 let types = query.get("types") === "gpu" ? "gpu" : "standard";
-const savedScope = query.get("runs");
-let scope = RUN_SCOPE_ALIASES.get(savedScope) ?? savedScope;
+let scope = canonicalRunScope(query.get("runs"));
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -434,9 +439,13 @@ function priceHeader(row, name, unit, className) {
   return cell;
 }
 
-function costViewLabel() {
+function gateStepName() {
   const gateCosts = data.runs.find(entry => entry.scope === "gate");
-  return "Cost per " + (gateCosts?.noun ?? "gate");
+  return gateCosts?.noun ?? "gate";
+}
+
+function costViewLabel() {
+  return "Cost per " + gateStepName();
 }
 
 function priceCell(row, source, rowIndex, column, className, marks) {
@@ -525,8 +534,10 @@ function drawPrices() {
   runsChips.hidden = document.getElementById("runs-label").hidden = !measures.has("cost");
   const group = types === "gpu" ? 1 : 0;
   const quota = data.quotas[group];
-  // The snapshot gives Spot, Gate and quota tables the same region and type order.
+  // The price and quota tables share the same region and type order.
   const tables = {spot: data.prices[group], cost: scopeCosts().prices[0], quota};
+  const gateName = gateStepName();
+  const gateGridLabel = gateName.charAt(0).toUpperCase() + gateName.slice(1);
   const sources = SHOW.filter(([key]) => measures.has(key) && (group === 0 || key !== "cost"))
     .map(([key, , label, unit]) => {
       const table = tables[key];
@@ -534,7 +545,7 @@ function drawPrices() {
       const marks = key === "quota" ? undefined : {
         ...scaleCells(table, {columns: columns.slice(1), rows}), notSold: new Set(table.not_sold.map(String))
       };
-      return {table, label, unit, marks};
+      return {table, label: label ?? gateGridLabel, unit, marks};
     });
   const regionRows = new Map(quota.rows.map(([region], index) => [region, index]));
   const visibleRegions = new Set(data.regions.filter(region => shown.has(region) && regionRows.has(region)));
