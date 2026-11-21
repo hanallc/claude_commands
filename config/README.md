@@ -751,14 +751,6 @@ Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their t
 Disk cleanup failures retain the separate `mac_cleanup=1` result.
 `leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
 
-`loopback.*` settings control the manual Tailscale SSH proof on natedev.
-`loopback.port` selects the SSH port. An empty value uses the SSH default.
-`loopback.known_hosts` selects the known_hosts file. An empty value uses the user's normal known_hosts file.
-A selected known_hosts file requires strict host key checking for SSH and rsync.
-The proof creates a managed scratch home and a tiny Rust fixture.
-It uses private memory files and executes test, check, and staged doc in one warm slot.
-It removes the scratch home when the proof ends. Automated tests never execute this proof.
-
 ## dev_shell.conf
 
 A test step outside a nix shell adds the flake development shell's program folders to the end of `PATH` (`scripts/lib/dev_shell.py`).
