@@ -46,6 +46,7 @@ from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
+from scripts.direct import recorder_state
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
@@ -977,9 +978,31 @@ def live_runs(runs: Path, worker: str, *, identity: str = "") -> list[RunRecord]
     return evidence.require_readable()
 
 
-def run_execution_blocker(run: Path) -> unit_runs.RunExecutionBlocker | unit_runs.NoRunExecutionBlocker:
+@contextlib.contextmanager
+def prepared_run_admission(run: Path) -> Generator[bool]:
+    """Exclude detached starts while a prepared run's pointer is cleared."""
+    runs = run / DETACHED_RUNS_DIR
+    runs.mkdir(exist_ok=True)
+    directory = os.open(runs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        descriptor = os.open(".start.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o666, dir_fd=directory)
+        with os.fdopen(descriptor, "a") as admission:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+            else:
+                yield True
+    finally:
+        os.close(directory)
+
+
+def run_execution_blocker(run: Path, *, admission_lock_held: bool = False) -> unit_runs.RunExecutionState:
     """Read command execution after dispatch admission ends."""
     runs = run / DETACHED_RUNS_DIR
+    if admission_lock_held:
+        return _detached_execution_blocker(runs)
     try:
         with (runs / ".start.lock").open("r") as admission:
             try:
@@ -1143,6 +1166,31 @@ def resume_context(runs: Path, worker: str) -> str:
     return "\n".join(lines)
 
 
+def _start_refusal(run: Path, caller: Caller) -> str:
+    path = run / unit_runs.STATE_FILE
+    try:
+        state = recorder_state.read_state(path)
+    except FileNotFoundError:
+        if path.exists(follow_symlinks=False):
+            return "the recorder state is unavailable"
+        membership = staff.initial_snapshot()
+        if isinstance(caller, DirectorCaller):
+            owner = membership.by_id(caller.staff_id)
+        elif isinstance(caller, PaneCaller):
+            member = membership.by_id(caller.staff_id)
+            owner = membership.parent_of(member) if member is not None else None
+        else:
+            owner = None
+        if owner is None or not unit_runs.points_to_run(owner, run):
+            return "the run has no recorder state or matching owner pointer"
+    except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+        return str(error)
+    else:
+        if unit_runs.terminal_run(state):
+            return "the run has ended dispatch admission"
+    return ""
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -1167,7 +1215,6 @@ def command_start(args: argparse.Namespace) -> int:
             return 2
         if not session_dir:
             return NOT_A_DETACHED_WORKER
-        name = seat_name(session_dir, name)
     session_dir = str(Path(session_dir).resolve())
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     kind = cast(DetachedRunKind, args.kind)
@@ -1181,9 +1228,11 @@ def command_start(args: argparse.Namespace) -> int:
     try:
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
-            if unit_runs.terminal_run(unit_runs.read_run_fields(Path(session_dir))):
-                print(f"detached_runs: {session_dir}: the run has ended dispatch admission", file=sys.stderr)
+            if refusal := _start_refusal(Path(session_dir), caller):
+                print(f"detached_runs: {session_dir}: {refusal}", file=sys.stderr)
                 return 2
+            if isinstance(caller, NotDetachedWorker) or isinstance(caller, DirectorCaller) and not reference:
+                name = seat_name(session_dir, name)
             reaped = _reap_orphans_locked(runs)
             if twin := live_twin(runs, name, command, tree_key):
                 started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))

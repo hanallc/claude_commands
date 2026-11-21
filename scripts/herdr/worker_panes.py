@@ -989,6 +989,8 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
                   for item in _worker_passes_in(row, _run_state(directory, read), record)]
     if not passes:
         latest = progress_history.last_dispatch(row.id)
+        if isinstance(latest, progress_history.DispatchHistoryUnknown):
+            return DispatchHoldsWorker(latest.reason)
         if (not isinstance(latest, progress_history.RecordedDispatch)
                 or latest.status is progress_history.DispatchDetailNotRecorded.UNRECORDED):
             return ReleasedWorkerPass.NO_PROMPT_DELIVERED

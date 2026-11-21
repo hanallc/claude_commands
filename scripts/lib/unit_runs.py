@@ -112,6 +112,18 @@ class NoRunExecutionBlocker(Enum):
 type RunExecutionState = RunExecutionBlocker | NoRunExecutionBlocker
 
 
+@dataclass(frozen=True)
+class PreparedRunEnded:
+    """Carry the checked owner into cleanup after pointer removal."""
+
+    run: Path
+    owner: staff.StaffId
+
+
+class CleanupOwnerFromState(Enum):
+    RECORDED = "read the saved owner for cleanup"
+
+
 def environ(name: str) -> str:
     """The run variable `UNIT_<name>`, else the name a run started before the rename exports.
 

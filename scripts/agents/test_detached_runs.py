@@ -2263,12 +2263,17 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(unit.name, showrunner.name)
         self.assertNotEqual(unit.id, showrunner.id)
         run_dir = self.fixture.root / "showrunner-state"
+        _ = staff.set_run(showrunner.id, staff.OpenRun(run_dir))
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": showrunner.current_session}),
               patch.object(treekey, "tree_key", return_value="private-tree"),
               patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
               contextlib.redirect_stdout(io.StringIO()) as output):
             self.assertEqual(detached_runs.main(["start", "--session-dir", str(run_dir), "--", "private-land"]),
                              0, output.getvalue())
+            _ = staff.clear_run(showrunner.id, run_dir)
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(detached_runs.main(["start", "--session-dir", str(run_dir), "--", "private-land"]), 2)
+            self.assertIn("matching owner pointer", errors.getvalue())
         spawn.assert_called_once()
         self.assertIs(cast(object, spawn.call_args.kwargs["start_new_session"]), True)
         path, = (run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
@@ -2749,7 +2754,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         agent = test_worker.DispatchAgent(self.fixture)
         agent.pane_commands(self)
         cases = ((True, ""), (False, ""), (False, "new prompt"), (False, "new DONE"), (False, "detached result"),
-                 (False, "slot cleared"),
+                 (False, "slot cleared"), (False, "slot cleared with damaged ledger"),
                  (False, "assign after result"), (False, "retry after result"), (False, "retry after reassignment"),
                  (False, "assign during retry"))
         for before_stop, later in cases:
@@ -2772,13 +2777,29 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 if not before_stop:
                     agent.append(pane, "assistant", result)
                     late_reply = reply.with_name(f"reply_late_{dispatch}.txt")
-                    if later == "slot cleared":
+                    if later in ("slot cleared", "slot cleared with damaged ledger"):
                         passed = worker_panes.worker_pass(row, self.run_dir)
                         state = unit_runs.read_run_fields(self.run_dir)
                         state["finishing_passes"] = {dispatch: passed}
                         state["pass"] = {}
                         write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps(state))
                         self.fixture.world.locations[pane]["agent_status"] = "done"
+                        if later == "slot cleared with damaged ledger":
+                            newer = self.run_dir.with_name("later-dispatch")
+                            newer.mkdir()
+                            ledger = newer / "events.jsonl"
+                            write_text_atomic(newer / unit_runs.STATE_FILE, json.dumps({
+                                unit_runs.OWNER_FIELD: self.fixture.parent.id, "history_file": str(ledger),
+                            }))
+                            _ = ledger.write_text("{an incomplete dispatch\n")
+                            try:
+                                self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, row.id),
+                                                 worker.CompletionRecovery.PENDING_CLOSE)
+                                self.assertIn(pane, self.fixture.world.locations)
+                                self.assertFalse(late_reply.exists())
+                            finally:
+                                (newer / unit_runs.STATE_FILE).unlink()
+                            continue
                         self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, row.id),
                                          worker.CompletionRecovery.RECOVERED)
                         self.assertNotIn(pane, self.fixture.world.locations)

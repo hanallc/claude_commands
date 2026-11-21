@@ -510,10 +510,13 @@ def _read_review_artifact(parent: int, path: Path) -> ExistingArtifact | Artifac
         return ExistingArtifact(source.read(), stat.S_IMODE(mode))
 
 
-def _write_review_artifact(parent: int, path: Path, content: bytes) -> None:
+def _write_review_artifact(parent: int, path: Path, content: bytes, *, create_only: bool = False) -> None:
     existing = _read_review_artifact(parent, path)
-    if isinstance(existing, ExistingArtifact) and existing.content == content:
-        return
+    if isinstance(existing, ExistingArtifact):
+        if create_only:
+            raise FileExistsError(f"{path}: the artifact already exists")
+        if existing.content == content:
+            return
     temporary = f".{path.name}.{uuid.uuid4().hex}.tmp"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
     try:
@@ -683,10 +686,13 @@ class CompletionArtifacts:
         with self.open_read(path) as stream:
             return stream.read()
 
-    def write(self, path: Path, text: str) -> None:
+    def write(self, path: Path, text: str, *, create_only: bool = False) -> None:
         if self.protected:
             with self._parent(path, create=True) as parent:
-                _write_review_artifact(parent, path, text.encode())
+                _write_review_artifact(parent, path, text.encode(), create_only=create_only)
+        elif create_only:
+            if not atomic_file.create_text_atomic(path, text):
+                raise FileExistsError(f"{path}: the artifact already exists")
         else:
             _write_ordinary_artifact(path, text.encode())
 

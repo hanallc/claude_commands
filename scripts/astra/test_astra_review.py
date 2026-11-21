@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -13,7 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.agents import remote
+from scripts.agents import detached_runs, remote
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
@@ -24,7 +25,7 @@ from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
-from scripts.direct import assign, progress_history
+from scripts.direct import assign, progress_history, remove_run_scratch, workers
 from scripts.message import send
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 from scripts.lib import unit_runs
@@ -392,7 +393,8 @@ class AstraReviewTests(StaffTestCase):
 
     def test_staff_review_uses_its_staff_target_and_saves_the_report(self) -> None:
         ordinary_owner = self.fixture.fixture.parent
-        for scenario in ("unit", "enrolled", "end prepared run", "recover after release", "release interrupted",
+        for scenario in ("unit", "enrolled", "end prepared run", "end prepared run during admission",
+                         "recorder state appears during start", "recover after release", "release interrupted",
                          "concurrent reviewers", "run end while a reviewer runs", "capacity stop"):
             with self.subTest(scenario=scenario), contextlib.ExitStack() as context:
                 owner = ordinary_owner
@@ -412,19 +414,64 @@ class AstraReviewTests(StaffTestCase):
                     _ = context.enter_context(patch.object(astra_review, "run_folder", return_value=reviewed_run))
                 self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
                 self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
-                if scenario == "end prepared run":
-                    self.assertFalse((reviewed_run / unit_runs.STATE_FILE).exists())
-                    ended = invoke_recorder(["finish-run", "--session-dir", str(reviewed_run), "--status", "stopped"],
-                                            self.environment, self.root)
+                state_file = reviewed_run / unit_runs.STATE_FILE
+                start_run = ["start-run", "--session-dir", str(reviewed_run), "--working-dir", str(self.root),
+                             "--main-session-id", owner.current_session, "--main-family", "codex",
+                             "--main-model", "gpt-main", "--main-effort", "xhigh"]
+                if scenario.startswith("end prepared run"):
+                    cache = reviewed_run / "verify_cache"
+                    cache.mkdir()
+                    cleanup_environment = {
+                        **self.environment,
+                        "SCRATCH_ROOT": str(self.root / "prepared-scratch"),
+                        "SCRATCH_VISIBLE_ROOT": str(self.root / "prepared-scratch-visible"),
+                        "SCRATCH_HOLDS": str(self.root / "prepared-scratch-holds.json"),
+                    }
+
+                    def end_prepared() -> subprocess.CompletedProcess[str]:
+                        return invoke_cli(workers, lambda: workers.finish_prepared_session(
+                            reviewed_run, (), remove_run_scratch.main),
+                            ["--tracked", str(reviewed_run)], cleanup_environment, self.root)
+
+                    if scenario == "end prepared run during admission":
+                        admission = reviewed_run / detached_runs.DETACHED_RUNS_DIR / ".start.lock"
+                        admission.parent.mkdir()
+                        with admission.open("a") as lock:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                            refused = end_prepared()
+                        self.assertEqual(refused.returncode, 1, refused.stderr)
+                        self.assertIn("a detached command is starting", refused.stderr)
+                        self.assertEqual(unit_runs.open_run(owner.current_session), reviewed_run)
+                        self.assertTrue(cache.is_dir())
+                    ended = end_prepared()
                     self.assertEqual(ended.returncode, 0, ended.stderr)
-                    current = staff.by_id(owner.id)
-                    assert current is not None
-                    self.assertIsInstance(current.run, staff.NoRun)
-                    state = unit_runs.read_run_fields(reviewed_run)
-                    self.assertTrue(unit_runs.terminal_run(state))
-                    self.assertEqual(state[unit_runs.OWNER_FIELD], owner.id)
-                    self.assertEqual(state["run_id"], reviewed_run.name)
-                    self.assertTrue(state["run_end_instance"])
+                    self.assertIsNone(unit_runs.open_run(owner.current_session))
+                    self.assertFalse(state_file.exists())
+                    self.assertFalse(cache.exists())
+                    _ = staff.set_run(owner.id, staff.OpenRun(reviewed_run))
+                    restarted = invoke_recorder(start_run, self.environment, self.root)
+                    self.assertEqual(restarted.returncode, 0, restarted.stderr)
+                    phase = invoke_recorder(["start-phase", "--session-dir", str(reviewed_run), "--phase-id", "review"],
+                                            self.environment, self.root)
+                    self.assertEqual(phase.returncode, 0, phase.stderr)
+                    closed = invoke_recorder(["finish-run", "--session-dir", str(reviewed_run), "--status", "stopped"],
+                                             self.environment, self.root)
+                    self.assertEqual(closed.returncode, 0, closed.stderr)
+                    continue
+                if scenario == "recorder state appears during start":
+                    published = json.dumps({unit_runs.OWNER_FIELD: owner.id, "run_id": "published"})
+                    set_run = staff.set_run
+
+                    def publish(identity: staff.StaffId, pointer: staff.OpenRun) -> staff.StaffRow:
+                        result = set_run(identity, pointer)
+                        _ = state_file.write_text(published)
+                        return result
+
+                    with (patch.object(unit_runs, "is_unit_run", return_value=True),
+                          patch.object(staff, "set_run", side_effect=publish),
+                          self.assertRaises(FileExistsError)):
+                        _ = invoke_recorder(start_run, self.environment, self.root)
+                    self.assertEqual(state_file.read_text(), published)
                     continue
                 self.fixture.agent.without_done = False
                 self.fixture.agent.finish_after = 1

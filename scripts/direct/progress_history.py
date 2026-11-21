@@ -455,7 +455,7 @@ class RunArtifactWriter(Protocol):
     def protected(self) -> bool: ...
     def append(self, path: Path) -> AbstractContextManager[TextIO]: ...
     def read(self, path: Path) -> str: ...
-    def write(self, path: Path, text: str) -> None: ...
+    def write(self, path: Path, text: str, *, create_only: bool = False) -> None: ...
     def unlink(self, path: Path) -> None: ...
     def authorized_path(self, path: Path) -> Path: ...
 
@@ -627,11 +627,13 @@ def _write_state(session_dir: Path, state: dict[str, object], *, create_only: bo
     } if passed.get("worker_id") else {})} for slot, passed in _pass_slots(state).items()}
     path = _state_path(session_dir)
     text = json.dumps(stored, indent=2, sort_keys=True) + "\n"
-    if create_only and isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
-        if not create_text_atomic(path, text):
-            raise FileExistsError(f"{path}: the recorder state already exists")
-    else:
+    artifacts = _recorder_artifacts.get()
+    if not create_only:
         _write_run_artifact(path, text)
+    elif not isinstance(artifacts, OrdinaryRecorderRun):
+        artifacts.write(path, text, create_only=True)
+    elif not create_text_atomic(path, text):
+        raise FileExistsError(f"{path}: the recorder state already exists")
 
 
 def move_run(_history_file: Path, _old: Path, _new: Path, _new_branch: str) -> list[Path]:
@@ -1310,11 +1312,18 @@ class NoDispatchRecorded:
     """The worker has no recorded dispatch."""
 
 
+@dataclass(frozen=True)
+class DispatchHistoryUnknown:
+    """The dispatch lookup cannot establish the latest pass."""
+
+    reason: str
+
+
 @dataclass
 class DispatchReads:
     record: staff.StaffSnapshot
-    states: dict[Path, dict[str, object]]
-    events: dict[Path, list[dict[str, object]]]
+    states: dict[Path, dict[str, object] | DispatchHistoryUnknown]
+    events: dict[Path, list[dict[str, object]] | DispatchHistoryUnknown]
 
 
 class ReadDispatches(Enum):
@@ -1325,15 +1334,20 @@ _dispatch_reads: ContextVar[DispatchReads | ReadDispatches] = ContextVar("dispat
 
 
 @contextmanager
-def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generator[None]:
+def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path], *,
+                   expected_states: Collection[Path] = ()) -> Generator[None]:
     """Share history reads within one command, without retaining them afterward."""
-    states: dict[Path, dict[str, object]] = {}
+    states: dict[Path, dict[str, object] | DispatchHistoryUnknown] = {}
     for run in runs:
         path = run / unit_runs.STATE_FILE
         try:
-            states[path] = _json_object(path.read_text(encoding="utf-8")) or {}
-        except (OSError, UnicodeError):
-            continue
+            state = _json_object(path.read_text(encoding="utf-8"))
+            states[path] = (DispatchHistoryUnknown(f"{path}: invalid recorder state") if state is None else state)
+        except FileNotFoundError as error:
+            if path in expected_states or path.is_symlink():
+                states[path] = DispatchHistoryUnknown(str(error))
+        except (OSError, UnicodeError) as error:
+            states[path] = DispatchHistoryUnknown(f"{path}: {error}")
     token = _dispatch_reads.set(DispatchReads(record, states, {}))
     try:
         yield
@@ -1341,7 +1355,18 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generat
         _dispatch_reads.reset(token)
 
 
-def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
+def _dispatch_state_paths() -> set[Path]:
+    paths: set[Path] = set()
+    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+        with suppress(FileNotFoundError):
+            for folder in root.iterdir():
+                path = _state_path(folder)
+                if path.exists(follow_symlinks=False):
+                    paths.add(path)
+    return paths
+
+
+def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded | DispatchHistoryUnknown:
     """Read the newest open or finished dispatch across the staff parent's runs."""
     from scripts.direct import phase_reservation
 
@@ -1349,35 +1374,72 @@ def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchReco
     if isinstance(reads, ReadDispatches):
         try:
             membership = staff.local_snapshot()
-        except staff.StaffUnreadable:
-            return NoDispatchRecorded()
-        runs = [path.parent for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT"))
-                for path in root.glob(f"*/{unit_runs.STATE_FILE}")]
+            paths = _dispatch_state_paths()
+            linked = recorded_dispatch_run(worker_id)
+        except (OSError, ValueError) as error:
+            return DispatchHistoryUnknown(str(error))
+        if isinstance(linked, RecordedDispatchRun):
+            paths.add(_state_path(linked.directory))
+        runs = {path.parent for path in paths}
         if private := unit_runs.environ("RUN_DIR"):
-            runs.append(Path(private))
-        with dispatch_reads(membership, dict.fromkeys(runs)):
+            runs.add(Path(private))
+        member = membership.by_id(worker_id)
+        parent = membership.parent_of(member) if member is not None else None
+        if parent is not None and isinstance(parent.run, staff.OpenRun):
+            runs.add(parent.run.path)
+        with dispatch_reads(membership, sorted(runs), expected_states=paths):
             return last_dispatch(worker_id)
     membership = reads.record
     worker = membership.by_id(worker_id)
     if worker is None or worker.kind != "worker":
         return NoDispatchRecorded()
     parent = membership.parent_of(worker)
+    if parent is None:
+        return DispatchHistoryUnknown(f"{worker.name}: the staff parent is unavailable")
     records: list[tuple[Path, dict[str, object]]] = []
     for path, state in reads.states.items():
+        if isinstance(state, DispatchHistoryUnknown):
+            return state
+        owner_id = state.get(unit_runs.OWNER_FIELD)
+        if owner_id != parent.id:
+            if ((not isinstance(owner_id, str) and owner_id is not None)
+                    or unit_runs.points_to_run(parent, path.parent)):
+                return DispatchHistoryUnknown(f"{path}: the recorder owner does not match {parent.name}")
+            continue
         try:
-            owner = unit_runs.run_owner(state, membership)
-        except (OSError, UnicodeError):
-            continue
-        if owner != parent:
-            continue
-        recorder_state.require_current_shape(path, state)
+            recorder_state.require_current_shape(path, state)
+        except recorder_state.OldRecorderState as error:
+            return DispatchHistoryUnknown(str(error))
+        slots = state.get("pass", {})
+        if not isinstance(slots, dict) or (
+                "instance_id" not in slots and any(not isinstance(item, dict)
+                                                   for item in cast(dict[str, object], slots).values())):
+            return DispatchHistoryUnknown(f"{path}: invalid recorder pass records")
         if path not in reads.events:
-            reads.events[path] = _run_events(state, record=membership)
-        passes = [*_pass_slots(state).values(), *(
-                {**event, "instance_id": event.get("pass_instance_id"), "kind": event.get("pass_kind"),
-                 "started_at": event.get("pass_started_at"), "finished_at": event.get("timestamp_epoch"),
-                 "phase": {"id": event.get("phase_id")}}
-                for event in reads.events[path] if event.get("event_type") == "pass_finished")]
+            try:
+                reads.events[path] = _run_events(state, record=membership, require_complete=True)
+            except (OSError, ValueError) as error:
+                reads.events[path] = DispatchHistoryUnknown(f"{path}: {error}")
+        events = reads.events[path]
+        if isinstance(events, DispatchHistoryUnknown):
+            return events
+        passes = list(_pass_slots(state).values())
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type not in ("pass_started", "pass_finished") or event.get("worker_id") != worker_id:
+                continue
+            status = event.get("status") if event_type == "pass_finished" else "active"
+            timestamp = event.get("timestamp_epoch")
+            if (not _string(event.get("pass_instance_id")) or not _string(event.get("pass_kind"))
+                    or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+                    or not -float("inf") < timestamp < float("inf")
+                    or status not in ("active", "completed", "error", "canceled", "interrupted", "refused")):
+                return DispatchHistoryUnknown(f"{path}: invalid dispatch in the history ledger")
+            if event_type == "pass_started":
+                continue
+            passes.append({**event, "instance_id": event["pass_instance_id"], "kind": event["pass_kind"],
+                           "started_at": event.get("pass_started_at"), "finished_at": timestamp,
+                           "phase": {"id": event.get("phase_id")}})
         records.extend((path.parent, record) for record in passes
                        if _string(record.get("status")) in {"active", "refused", "completed", "error", "canceled", "interrupted"}
                        and record.get("worker_id") == worker_id)
@@ -1750,7 +1812,7 @@ def _start_run(args: argparse.Namespace) -> None:
         _claim_run_pointer(owner, session_dir)
     if private_helper:
         state[unit_runs.PRIVATE_HELPER_SLOT] = private_helper
-    _write_state(session_dir, state)
+    _write_state(session_dir, state, create_only=True)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
 
@@ -3733,14 +3795,18 @@ LEGACY_BOTH_LENSES: tuple[str, ...] = ("adversary", "contract")
 
 
 def _run_events(state: dict[str, object], *,
-                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL
+                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+                require_complete: bool = False,
                 ) -> list[dict[str, object]]:
     """Every event this run recorded, oldest first.
 
     Read only this run for its phase table.
     The read cost depends on this run's history.
     """
-    history_file = _string(state.get("history_file"))
+    saved_history = state.get("history_file", "")
+    if require_complete and not isinstance(saved_history, str):
+        raise ValueError("invalid history ledger path")
+    history_file = _string(saved_history)
     if not history_file:
         return []
     try:
@@ -3749,13 +3815,19 @@ def _run_events(state: dict[str, object], *,
             lines = handle.read().splitlines()
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except OSError:
+        if require_complete:
+            raise
         return []
     events: list[dict[str, object]] = []
     record = staff.initial_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
-    for line in lines:
+    for number, line in enumerate(lines, 1):
         event = _json_object(line)
         if event is not None and _integer(event.get("schema_version")) == SCHEMA_VERSION:
+            if require_complete and not _string(event.get("event_type")):
+                raise ValueError(f"{history_file}:{number}: missing history event type")
             events.append(plan_history.staff_directory(event, record))
+        elif require_complete and line.strip():
+            raise ValueError(f"{history_file}:{number}: invalid history event")
     return events
 
 
@@ -7571,7 +7643,13 @@ def _record_run_end(request: RunEndRequested, session_dir: Path) -> InterruptedW
     return InterruptedWorkerPasses(session_dir, tuple(dict.fromkeys(interrupted)))
 
 
+class DetachedRunEnd(Protocol):
+    def prepared_run_admission(self, run: Path) -> AbstractContextManager[bool]: ...
+    def run_execution_blocker(self, run: Path, *, admission_lock_held: bool = False) -> unit_runs.RunExecutionState: ...
+
+
 def _run_execution_blocker(session_dir: Path, state: dict[str, object], record: staff.StaffSnapshot, owner: staff.StaffRow,
+                           *, admission_lock_held: bool = False,
                            ) -> unit_runs.RunExecutionState:
     from scripts.agents import detached_run_process
 
@@ -7587,9 +7665,8 @@ def _run_execution_blocker(session_dir: Path, state: dict[str, object], record: 
             executable = [str(Path(command[1]).with_suffix(".py")), *command[2:]]
             if detached_run_process.runs_command(pid, executable):
                 return unit_runs.RunExecutionBlocker(f"launcher {pid} can still be running")
-    detached = cast(Callable[[Path], unit_runs.RunExecutionState],
-                    import_module("scripts.agents.detached_runs").run_execution_blocker)
-    result = detached(session_dir)
+    detached = cast(DetachedRunEnd, cast(object, import_module("scripts.agents.detached_runs")))
+    result = detached.run_execution_blocker(session_dir, admission_lock_held=admission_lock_held)
     if isinstance(result, unit_runs.RunExecutionBlocker):
         return result
     if workers or (staff.record_path().parent / "locks").is_dir():
@@ -7603,27 +7680,42 @@ def _run_end_stamp(state: dict[str, object]) -> RunEndStamp:
     return RunEndStamp(_string(state.get("run_end_instance")), _number(state.get("finished_at")))
 
 
-def _record_prepared_run_end(session_dir: Path, owner: staff.StaffRow, request: RunEndRequested) -> None:
-    path = _state_path(session_dir)
-    current = _run_pointer(session_dir, staff.initial_snapshot())
-    if path.exists(follow_symlinks=False):
-        return
-    if not isinstance(current, staff.StaffRow) or current.id != owner.id:
-        raise ValueError(f"{session_dir}: prepared run owner changed")
-    _write_state(session_dir, {
-        "schema_version": SCHEMA_VERSION,
-        unit_runs.OWNER_FIELD: owner.id,
-        "run_id": session_dir.name,
-        "status": request.outcome,
-        "finished_at": plan_history.now_epoch(),
-        "run_end_instance": str(uuid.uuid4()),
-    }, create_only=True)
+def _end_prepared_run(session_dir: Path, owner: staff.StaffRow,
+                      ) -> unit_runs.PreparedRunEnded | unit_runs.RunExecutionBlocker:
+    detached = cast(DetachedRunEnd, cast(object, import_module("scripts.agents.detached_runs")))
+    with detached.prepared_run_admission(session_dir) as admitted:
+        if not admitted:
+            return unit_runs.RunExecutionBlocker("a detached command is starting")
+        record = staff.initial_snapshot()
+        current = _run_pointer(session_dir, record)
+        if not isinstance(current, staff.StaffRow) or current.id != owner.id:
+            return unit_runs.RunExecutionBlocker("the prepared run owner changed")
+        if _state_path(session_dir).exists(follow_symlinks=False):
+            return unit_runs.RunExecutionBlocker("the recorder state appeared during run end")
+        blocker = _run_execution_blocker(session_dir, {}, record, current, admission_lock_held=True)
+        if isinstance(blocker, unit_runs.RunExecutionBlocker):
+            return blocker
+        if _state_path(session_dir).exists(follow_symlinks=False):
+            return unit_runs.RunExecutionBlocker("the recorder state appeared during run end")
+        released = staff.clear_run(current.id, session_dir)
+        if isinstance(released.run, staff.OpenRun):
+            return unit_runs.RunExecutionBlocker("the prepared run pointer changed")
+        return unit_runs.PreparedRunEnded(session_dir.resolve(), current.id)
 
 
 def end_run(session_dir: Path, request: RunEndRequested | RetryRunEnd,
-            ) -> RunEndSettled | unit_runs.RunExecutionBlocker:
+            ) -> RunEndSettled | unit_runs.PreparedRunEnded | unit_runs.RunExecutionBlocker:
     """Fence dispatches, check execution outside the run lock, then release."""
-    state = unit_runs.read_run_fields(session_dir)
+    path = _state_path(session_dir)
+    try:
+        state = recorder_state.read_state(path)
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise
+        state = {}
+        missing_state = True
+    else:
+        missing_state = False
     record = staff.initial_snapshot()
     if isinstance(request, RetryRunEnd) and not unit_runs.terminal_run(state):
         return RunEndSettled.OPEN
@@ -7631,14 +7723,13 @@ def end_run(session_dir: Path, request: RunEndRequested | RetryRunEnd,
     if (not state or unit_runs.terminal_run(state)) and not isinstance(pointer, staff.StaffRow):
         return RunEndSettled.CLOSED
 
-    prepared_owner = (pointer if not state and isinstance(pointer, staff.StaffRow)
-                      and pointer.kind in ("unit", "showrunner")
-                      and not _state_path(session_dir).exists(follow_symlinks=False) else _NO_PREPARED_OWNER)
+    prepared_owner = (pointer if missing_state and isinstance(pointer, staff.StaffRow)
+                      and pointer.kind in ("unit", "showrunner") else _NO_PREPARED_OWNER)
     passes = InterruptedWorkerPasses(session_dir)
     with _recorder_lock(session_dir, prepared_owner=prepared_owner) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if isinstance(request, RunEndRequested) and isinstance(prepared_owner, staff.StaffRow):
-            _record_prepared_run_end(session_dir, prepared_owner, request)
+        if isinstance(prepared_owner, staff.StaffRow):
+            return _end_prepared_run(session_dir, prepared_owner)
         state = _read_state(session_dir, resolve_staff=False)
         if not unit_runs.terminal_run(state):
             if isinstance(request, RetryRunEnd):

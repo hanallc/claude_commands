@@ -932,6 +932,8 @@ def _stopped_pane_use(row: staff.StaffRow, run: Path, receipt: progress_history.
             return worker.CloseCompletedPane.CLOSE, StoppedPassPane.CURRENT
         if not current and receipt.worker_session and receipt.worker_session == row.current_session:
             last = progress_history.last_dispatch(row.id)
+            if isinstance(last, progress_history.DispatchHistoryUnknown):
+                return worker.DispatchEvidenceUnknown(last.reason)
             if isinstance(last, progress_history.RecordedDispatch) and last.instance_id == receipt.instance_id:
                 return worker.CloseCompletedPane.CLOSE, StoppedPassPane.CURRENT
     except (OSError, ValueError, recorder_state.OldRecorderState) as error:

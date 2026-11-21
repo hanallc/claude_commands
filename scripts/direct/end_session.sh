@@ -81,22 +81,36 @@ while IFS= read -r run; do
 done <<< "${HELD}"
 
 if (( ${#RUNS[@]} > 0 )); then
+  PREPARED_RUN=""
+  if [[ -n "${SESSION_DIR}" && ! -e "${SESSION_DIR}/progress_history_state.json" && ! -L "${SESSION_DIR}/progress_history_state.json" ]]; then
+    PREPARED_RUN="${SESSION_DIR}"
+  fi
   for run in "${RUNS[@]}"; do
+    [[ "${run}" != "${PREPARED_RUN}" ]] || continue
     if ! "$PY" -c 'from scripts.direct import progress_history; progress_history.main()' \
       finish-run --session-dir "${run}" --status stopped; then
       echo "end_session: run end failed for ${run}. If work still runs, run end_session.sh again after it stops." >&2
       exit 1
     fi
   done
-  REMOVE_ARGS=()
-  for run in "${RUNS[@]}"; do
-    REMOVE_ARGS+=(--session-dir "${run}")
-  done
-  for run in "${RUNS[@]}"; do
-    cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
-  done
-  cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
-  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}"
+  if [[ -n "${PREPARED_RUN}" ]]; then
+    if ! "$PY" -c 'import sys; from pathlib import Path; from scripts.direct import remove_run_scratch, workers
+sys.exit(workers.finish_prepared_session(Path(sys.argv[2]), tuple(map(Path, sys.argv[3:])), remove_run_scratch.main))' \
+      --tracked "${RUNS[@]}"; then
+      echo "end_session: failed to end and clean ${PREPARED_RUN}. If work still runs, run end_session.sh again after it stops." >&2
+      exit 1
+    fi
+  else
+    REMOVE_ARGS=()
+    for run in "${RUNS[@]}"; do
+      REMOVE_ARGS+=(--session-dir "${run}")
+    done
+    for run in "${RUNS[@]}"; do
+      cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
+    done
+    cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
+    cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}"
+  fi
 fi
 
 "$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
