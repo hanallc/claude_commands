@@ -13,8 +13,7 @@ from unittest import mock
 
 from scripts.disks import measure, slots
 from scripts.disks.measure import DisksData, Folder
-from scripts.lib import build_slots, conf
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders, conf
 
 GIB = 1 << 30
 DAY = 86400
@@ -66,75 +65,39 @@ class ReadSlotsTests(unittest.TestCase):
                 self.assertEqual(use.get("name_parts"), [{"kind": "staff", "text": "builder"},
                     {"kind": "text", "text": " " + expected}])
 
-    def test_slots_group_by_repository_with_size_use_and_the_nightly_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            settings_file = Path(directory) / "build_folders.conf"
-            lines = ("slots.unused_days=7", "slots.host.default_max=2", "slots.host.hana.max=8")
-            _ = settings_file.write_text("".join(f"# whole: 1..\n{line}\n" for line in lines))
-            root = Path(directory) / "slot"
-            root.mkdir()
-            for name, work, days in (("hana-slot1", "integrate", 0), ("hana-slot2", "lint", 9), ("hana-slot10", "", 2),
-                                     ("organon-slot1", "", 8)):
-                (root / name).mkdir()
-                lease = {"showrunner": "builds", "unit": "id-of-" + name, "work": work, "purpose": work or "verify",
-                         "last_use": datetime.fromtimestamp(NOW - days * DAY, timezone.utc).isoformat()}
-                _ = build_slots.lease_path(root / name).write_text(json.dumps(lease))
-            (root / "notes").mkdir()
-
-            def state(path: Path) -> Literal["held", "free"]:
-                return "held" if path.name in {"hana-slot1", "organon-slot1"} else "free"
-
-            owners = {"id-of-hana-slot1": "natemerge"}.get
-            report = slots.read_slots(root, Path("/build/cargo"), conf.read(settings_file), "host", DATA, NOW, state,
-                                      owners=lambda owner: owners(owner, owner))
-        self.assertEqual(report["root"], str(root))
-        self.assertEqual([(group["repository"], group["maximum"], [row["name"] for row in group["slots"]])
-                          for group in report["groups"]],
-                         [("hana", 8, ["hana-slot1", "hana-slot2", "hana-slot10"]), ("organon", 2, ["organon-slot1"])])
-        first, second, tenth = report["groups"][0]["slots"]
-        self.assertEqual((first["size"], first["last_used"], first["used_by"], first["deleted_tonight"]),
-                         (70 * GIB, NOW, {"name": "natemerge integrate", "showrunner": "builds", "name_parts": [
-                             {"kind": "staff", "text": "natemerge"}, {"kind": "text", "text": " integrate"}]}, False))
-        self.assertEqual((second["size"], second["used_by"], second["deleted_tonight"]), (40 * GIB, None, True))
-        self.assertEqual((tenth["size"], tenth["last_used"], tenth["deleted_tonight"]), (0, NOW - 2 * DAY, False))
-        self.assertFalse(report["groups"][1]["slots"][0]["deleted_tonight"])
-        # A lease with no step key keeps its owner and its purpose text.
-        self.assertEqual(report["groups"][1]["slots"][0]["used_by"], {"name": "id-of-organon-slot1 verify", "showrunner": "builds",
-            "name_parts": [{"kind": "staff", "text": "id-of-organon-slot1"}, {"kind": "text", "text": " verify"}]})
-
-    def test_slot_report_reads_the_common_or_machine_pool(self) -> None:
+    def test_copies_group_by_unit_and_report_their_own_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            configuration = private_slot_config(root, repository="widget")
-            common = root / "default-slots"
-            for pool, number in ((common, 1), (configuration.slots, 2)):
-                (pool / f"widget-slot{number}").mkdir(parents=True)
-            original = configuration.settings.read_text()
-            cases = (("common", common, 1), ("machine", configuration.slots, 2))
-            with mock.patch.dict(os.environ, configuration.environment), \
-                    mock.patch.object(measure, "read_data", return_value=DATA):
-                for name, pool, number in cases:
-                    with self.subTest(root=name):
-                        lines = original.splitlines()
-                        if name == "common":
-                            lines = [line for line in lines
-                                     if not line.startswith(f"roots.slots.{configuration.machine}=")]
-                        _ = configuration.settings.write_text("\n".join(lines) + "\n")
-                        report = slots.slot_report(NOW)
-                        self.assertIsNotNone(report)
-                        assert report is not None
-                        self.assertEqual(report["root"], str(pool))
-                        self.assertEqual([(group["repository"], group["maximum"],
-                                           [row["name"] for row in group["slots"]]) for group in report["groups"]],
-                                         [("widget", 2, [f"widget-slot{number}"])])
+            settings = root / "build_folders.conf"
+            _ = settings.write_text("# whole: 1..\nfolders.unused_days=2\n")
+            for unit, number, days in (("one", 1, 0), ("one", 2, 3), ("two", 1, 1)):
+                path = root / "hana" / unit / str(number)
+                path.mkdir(parents=True)
+                used = NOW - days * DAY
+                stamp = path / build_folders.COPY_USE_STAMP
+                stamp.touch()
+                os.utime(stamp, (used, used))
+                lease = {"showrunner": "builds", "unit": unit, "work": "integrate",
+                         "purpose": "integrate", "last_use": datetime.fromtimestamp(used, timezone.utc).isoformat()}
+                _ = build_folders.lease_path(path).write_text(json.dumps(lease))
 
-    def test_no_slot_root_in_the_config_gives_no_report(self) -> None:
-        class Settings:
-            def values(self) -> dict[str, str]:
-                return {"roots.slot_cargo": "/build/cargo", "slots.unused_days": "7"}
+            def state(path: Path) -> Literal["held", "free"]:
+                return "held" if path.parent.name == "one" and path.name == "1" else "free"
 
-        with mock.patch.object(conf, "read_or_repository", return_value=Settings()):
-            self.assertIsNone(slots.slot_report(NOW))
+            report = slots.read_slots(root, conf.read(settings), "fixture", None, NOW, state,
+                                      owners=lambda owner: owner)
+        self.assertEqual(report["root"], str(root))
+        first, second = report["groups"]
+        self.assertEqual((first["repository"], second["repository"]), ("hana/one", "hana/two"))
+        self.assertIsNone(first["maximum"])
+        held, expired = first["slots"]
+        self.assertEqual(held["used_by"], {"name": "one integrate", "showrunner": "builds", "name_parts": [
+            {"kind": "staff", "text": "one"}, {"kind": "text", "text": " integrate"}]})
+        self.assertEqual((held.get("key"), expired.get("key"), second["slots"][0].get("key")),
+                         ("hana/one/1", "hana/one/2", "hana/two/1"))
+        self.assertTrue(expired["needs_review"])
+        self.assertFalse(held["needs_review"])
+        self.assertFalse(second["slots"][0]["needs_review"])
 
 
 if __name__ == "__main__":

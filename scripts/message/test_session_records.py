@@ -1,5 +1,6 @@
 """Test registry evidence through the shared reader."""
 
+from collections.abc import Iterator
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +9,26 @@ from typing import final
 from unittest.mock import patch
 
 from scripts.message import session_records
+
+
+@final
+class TranscriptScanTests(unittest.TestCase):
+    def test_failed_projects_scan_does_not_hide_transcripts_in_other_roots(self) -> None:
+        home = Path(self.enterContext(TemporaryDirectory())).resolve()
+        unreadable, readable = home / ".claude", home / ".claude2"
+        project = readable / "projects" / "fixture"
+        project.mkdir(parents=True)
+        (project / "found.jsonl").touch()
+        glob = Path.glob
+
+        def scan(root: Path, pattern: str) -> Iterator[Path]:
+            if root == unreadable / "projects":
+                raise PermissionError("fixture cannot scan projects")
+            yield from glob(root, pattern)
+
+        with (patch.object(session_records, "config_dirs", return_value=[unreadable, readable]),
+              patch.object(Path, "glob", autospec=True, side_effect=scan)):
+            self.assertEqual(session_records.transcript_session_ids({"found", "missing"}), {"found"})
 
 
 @final
