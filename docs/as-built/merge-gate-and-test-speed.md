@@ -960,9 +960,6 @@ Repository imports use `scripts.<folder>` package names, including mock patch ta
 Entry scripts load that helper after their docstring and future imports.
 Bare `python3 <path>` therefore imports the entry's own checkout from any caller folder.
 A copied entry without the helper can use an existing `PYTHONPATH`.
-`package_imports.py bootstrap <checkout>` adds the four-line block to new entry scripts.
-It preserves CRLF and skips test and test-support modules.
-The command provides no import converter.
 
 The gate starts test modules through the checked tree's `scripts/lib/py`.
 It removes the caller's `PYTHONPATH` before the shim sets the checked tree's package root.

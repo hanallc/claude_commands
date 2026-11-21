@@ -1322,7 +1322,7 @@ class RestartTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "save_layout"))
         _ = self.enterContext(patch.object(herdr.Herdr, "remember_row_tab"))
         _ = self.enterContext(patch.object(herdr.Herdr, "tab_sessions", return_value=[]))
-        from scripts.agents.test_pane_restore import fixture_launch_transcript
+        from scripts.agents.test_pane_record_recovery import fixture_launch_transcript
 
         saved_records = pane_record.save
         def save(session: str, entries: dict[str, pane_record.PaneLaunch]) -> None:
@@ -2014,7 +2014,7 @@ class RestartTests(RestartTestCase):
                     entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
                         {"CODEX_HOME": str(self.root / ".codex2")}, ["codex", "--model", "old-model", "--sandbox", "read-only",
                          "-c", 'model_reasoning_effort="low"', "-c", 'service_tier="flex"'], kind="codex")
-                    from scripts.agents.test_pane_restore import fixture_launch_transcript
+                    from scripts.agents.test_pane_record_recovery import fixture_launch_transcript
                     fixture_launch_transcript(self.root, entry, staff.StaffSnapshot((row,)))
                     publication = pane_launch.LaunchPublication(self.root / "agents.json", entry) if saved else None
                     with (self.subTest(kind=row.kind, saved=saved, target=requested),
@@ -2519,7 +2519,7 @@ class RestartTests(RestartTestCase):
                             and own_only else herdr.NewTab("producers", producer.name))
                 self.assertEqual(self.launches, [(producer.name, expected)])
 
-        from scripts.agents.test_pane_restore import FakeClient
+        from scripts.agents.test_pane_record_recovery import FakeClient
 
         base_producer = producer
         for commands, refused, failure, scenario in (

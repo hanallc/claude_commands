@@ -58,7 +58,7 @@ from scripts.notify.push_texts import RenderedPush, render
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
-from scripts.agents.test_pane_restore import FakeClient, fixture_launch_transcript
+from scripts.agents.test_pane_record_recovery import FakeClient, fixture_launch_transcript
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 ROLE_ACCOUNT = accounts.role_account

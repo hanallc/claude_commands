@@ -305,7 +305,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/unit_move.py` | write | native_id, row_operation, set_worktree, snapshot |
 | `scripts/production/unit_phases.py` | read | snapshot |
 | `scripts/production/unit_queue.py` | read | local_snapshot, by_current_session, caller_identity, StaffId |
-| `scripts/production/unit_run.py` | read | snapshot |
 | `scripts/production/unit_status.sh` | read | snapshot |
 | `scripts/production/unit_status_test_support.py` | write | set_doc, set_worktree |
 | `scripts/production/update_registration.py` | read | snapshot |
@@ -335,7 +334,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
-| `scripts/agents/pane_restore.py` | read | row_operation |
 | `scripts/agents/producer_creation.py` | read | authority_snapshot, is_owner, slot_operation, validate_name, producer_creation_registry; the staff owner reads and updates the creation marker |
 | `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
