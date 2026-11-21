@@ -5,18 +5,21 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from typing import cast
 
+from scripts.agents import remote
 from scripts.lib import conf
 from scripts.production import delivery_state, record_store, staff, unrouted_alert
 from scripts.production.issues import source_paths
 from scripts.production.production_doc import Refusal, production_field
-from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
@@ -162,6 +165,34 @@ class ProductionPathUnreadable(OSError):
         self.path: Path = path
 
 
+class ReviewDocumentRoute(Enum):
+    LOCAL_OR_UNBOUND = "the staff document is local or unrecorded"
+    REMOTE_LEGACY = "the remote staff document permits legacy fallback"
+    REMOTE_ENROLLED = "the remote staff document has Merge checkout"
+    REMOTE_UNVERIFIED = "the remote staff document could not be read"
+
+
+def _remote_document_route(document: staff.LiveDoc | staff.WrappedDoc, *,
+                           production_record: bool) -> ReviewDocumentRoute:
+    try:
+        if production_record:
+            machine = remote.machine_alias(document.machine)
+            if isinstance(machine, remote.MachineNameRefused):
+                return ReviewDocumentRoute.REMOTE_UNVERIFIED
+            remote_read = shlex.join(["cat", "--", str(document.path)])
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine.alias, remote_read],
+                                    capture_output=True, text=True, timeout=2, check=False)
+            if result.returncode:
+                return ReviewDocumentRoute.REMOTE_UNVERIFIED
+            content = result.stdout
+        else:
+            content = document.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, subprocess.SubprocessError, conf.Unusable):
+        return ReviewDocumentRoute.REMOTE_UNVERIFIED
+    return (ReviewDocumentRoute.REMOTE_ENROLLED if staff.declares_merge_checkout(content.splitlines())
+            else ReviewDocumentRoute.REMOTE_LEGACY)
+
+
 class StaffRouting:
     """Read fixed producer identities and staff parent edges."""
 
@@ -176,20 +207,24 @@ class StaffRouting:
         self.list_documents: dict[str, list[Path]] = {
             name: _list_document_paths(text) for name, text in lists if name not in documents}
         self.checked_paths: dict[Path, bool | ProductionPathUnreadable] = {}
-        self.legacy_paths: dict[Path, bool] = {}
+        self.document_routes: dict[str, ReviewDocumentRoute] = {}
 
-    def _remote_document(self, name: str) -> staff.LiveDoc | staff.WrappedDoc | None:
-        runner = self.runners_by_name.get(name)
-        if (runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc))
-                and record_store.local_document(runner) is None):
-            return runner.doc
-        return None
+    def _document_route(self, name: str) -> ReviewDocumentRoute:
+        if name not in self.document_routes:
+            runner = self.runners_by_name.get(name)
+            route = ReviewDocumentRoute.LOCAL_OR_UNBOUND
+            if (runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    and record_store.local_document(runner) is None):
+                if self.sources is not None and not self.record.production:
+                    self.sources.append(runner.doc.path)
+                route = _remote_document_route(runner.doc, production_record=self.record.production)
+            self.document_routes[name] = route
+        return self.document_routes[name]
 
     def production(self, name: str) -> Path | None:
         """Check only documents that can supply this production."""
         runner = self.runners_by_name.get(name)
-        remote_document = self._remote_document(name)
-        if remote_document is not None and remote_document.path.name.endswith(LIVE_DOCUMENT_SUFFIX):
+        if self._document_route(name) in (ReviewDocumentRoute.REMOTE_ENROLLED, ReviewDocumentRoute.REMOTE_UNVERIFIED):
             return None
         candidates: list[Path] = []
         document = record_store.local_document(runner)
@@ -210,21 +245,9 @@ class StaffRouting:
             available = self.checked_paths[path]
             if isinstance(available, ProductionPathUnreadable):
                 raise available
-            if available and (remote_document is None or self._is_legacy_document(path)):
+            if available:
                 return path
         return None
-
-    def _is_legacy_document(self, path: Path) -> bool:
-        if path not in self.legacy_paths:
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-                self.legacy_paths[path] = not staff.declares_merge_checkout(lines) and bool(
-                    production_field(lines, "Showrunner checkout"))
-            except (FileNotFoundError, Refusal):
-                self.legacy_paths[path] = False
-            except OSError as error:
-                raise ProductionPathUnreadable(path, error) from error
-        return self.legacy_paths[path]
 
     @cached_property
     def documents(self) -> dict[str, Path]:
@@ -316,7 +339,9 @@ class StaffRouting:
                            else owner.tab)
         document = self.production(production_name)
         missing_owner = isinstance(owner, ShowrunnerOwnChange) and isinstance(owner.showrunner_id, MissingShowrunner)
-        if missing_owner or (document is None and self._remote_document(production_name) is None):
+        route = self._document_route(production_name)
+        if missing_owner or (document is None and route in (ReviewDocumentRoute.LOCAL_OR_UNBOUND,
+                                                            ReviewDocumentRoute.REMOTE_LEGACY)):
             root = self._root
             if root is not None:
                 root_document = document if document is not None else self.production(root.name)
