@@ -1342,7 +1342,7 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
                          all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))))
 
 
-def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
+def _remote(arguments: list[str], *, input_text: str | None = None, machine: str = OWNER_MACHINE) -> object:
     # Direct worker writers run inside the caller's membership lock. Match the
     # local API's row transaction without entering the outer lifecycle operation.
     import shlex
@@ -1354,7 +1354,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
     timeout = _wait_seconds("REMOTE_SECONDS")
-    command = ["ssh", "-o", "BatchMode=yes", OWNER_MACHINE,
+    command = ["ssh", "-o", "BatchMode=yes", machine,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
     try:
@@ -1364,10 +1364,10 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     except (OSError, subprocess.TimeoutExpired) as error:
         if time.monotonic() >= worker_lifecycle.effective_deadline():
             raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
-        raise StaffUnreadable(f"{OWNER_MACHINE} not reached") from error
+        raise StaffUnreadable(f"{machine} not reached") from error
     reason = done.stderr.strip()
     if done.returncode != 0 and (done.returncode == 255 or not reason):
-        raise StaffUnreadable(f"{OWNER_MACHINE} not reached")
+        raise StaffUnreadable(f"{machine} not reached")
     if done.returncode == 1 and reason.startswith("staff member not found: "):
         raise StaffNotFound(StaffId(reason.removeprefix("staff member not found: ")))
     if done.returncode == 2:
@@ -1725,20 +1725,20 @@ def _document_for_owner(rows: list[StaffRow], owner: StaffId,
                         doc: LiveDoc | WrappedDoc) -> LiveDoc | WrappedDoc:
     from scripts.agents import remote
 
-    if doc.machine != remote.local_machine():
-        return doc
-    try:
-        enrolled = declares_merge_checkout(doc.path.read_text(encoding="utf-8").splitlines())
-    except FileNotFoundError:
-        return doc
-    if not enrolled:
-        return doc
-    path = doc.path.resolve(strict=True)
+    local = doc.machine == remote.local_machine()
+    path = doc.path.resolve() if local else doc.path
     if any(other.id != owner and isinstance(other.doc, LiveDoc | WrappedDoc)
-           and other.doc.machine == doc.machine and other.doc.path.resolve() == path
+           and other.doc.machine == doc.machine
+           and (other.doc.path.resolve() if local else other.doc.path) == path
            for other in rows):
         raise StaffRefused(f"{path}: another staff row already owns this document")
-    return replace(doc, path=path)
+    if not local:
+        return doc
+    try:
+        enrolled = declares_merge_checkout(path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return replace(doc, path=path)
+    return replace(doc, path=path) if enrolled else doc
 
 
 def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo | StaffRoot, *,
@@ -1960,6 +1960,7 @@ def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -
             return row
         if row.kind != source:
             raise StaffRefused(f"{identity}: role change requires a {source}")
+        _require_document_change(row, doc)
         rows[rows.index(row)] = changed
         if not promoting:
             # A unit cannot own other directors. Its workers retain their parent.
@@ -2151,17 +2152,64 @@ def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
     return _transaction(edit)
 
 
-def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
-    """Set one showrunner's document through the existing owner transaction."""
+@dataclass(frozen=True)
+class NoExpectedDocument:
+    """The caller did not supply a prior binding."""
+
+
+NO_EXPECTED_DOCUMENT = NoExpectedDocument()
+
+
+def _doc_arguments(doc: LiveDoc | WrappedDoc | DocUnfilled, prefix: str = "") -> list[str]:
+    if isinstance(doc, DocUnfilled):
+        return [f"--{prefix}state", "unfilled"]
+    return [f"--{prefix}machine", doc.machine, f"--{prefix}path", str(doc.path),
+            f"--{prefix}state", "live" if isinstance(doc, LiveDoc) else "wrapped"]
+
+
+def _verify_document_change(identity: StaffId, previous: LiveDoc | WrappedDoc,
+                            destination: LiveDoc | WrappedDoc | DocUnfilled, conditional: bool) -> None:
+    verify = cast(Callable[[StaffId, LiveDoc | WrappedDoc, LiveDoc | WrappedDoc | DocUnfilled, bool], None],
+                  import_module("scripts.production.production_admission").verify_document_change)
+    verify(identity, previous, destination, conditional)
+
+
+def _require_document_change(row: StaffRow, destination: LiveDoc | WrappedDoc | DocUnfilled,
+                             conditional: bool = False) -> None:
+    from scripts.agents import remote
+
+    previous = row.doc
+    if row.kind != "showrunner" or isinstance(previous, DocUnfilled) or previous == destination:
+        return
+    if previous.machine == remote.local_machine() or (_file_override() and _file().resolve() != _default_file().resolve()):
+        _verify_document_change(row.id, previous, destination, conditional)
+        return
+    arguments = ["verify-doc-change", row.id, *_doc_arguments(destination), *_doc_arguments(previous, "expected-")]
+    if conditional:
+        arguments.append("--conditional")
+    _ = _remote(arguments, machine=remote.other_machine())
+
+
+def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc, *,
+            expected: LiveDoc | WrappedDoc | DocUnfilled | NoExpectedDocument = NO_EXPECTED_DOCUMENT) -> StaffRow:
+    """Set the document through the authority and verify admitted changes on the document machine."""
     if not is_owner():
-        return _remote_row(["set-doc", showrunner, "--machine", doc.machine, "--path", str(doc.path),
-                            "--state", "live" if isinstance(doc, LiveDoc) else "wrapped"])
+        arguments = ["set-doc", showrunner, *_doc_arguments(doc)]
+        if not isinstance(expected, NoExpectedDocument):
+            arguments.extend(_doc_arguments(expected, "expected-"))
+        return _remote_row(arguments)
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, showrunner)
         if row.kind not in ("showrunner", "producer"):
             raise StaffRefused("set-doc requires a showrunner or producer")
         location = _document_for_owner(rows, row.id, doc) if row.kind == "showrunner" else doc
+        if row.doc == location:
+            return row
+        conditional = not isinstance(expected, NoExpectedDocument)
+        if conditional and row.doc != expected:
+            raise StaffRefused(f"{showrunner}: the staff document differs from the expected binding")
+        _require_document_change(row, location, conditional)
         changed = replace(row, doc=_keep_location_fields(location, row.doc))
         rows[rows.index(row)] = changed
         return changed
@@ -2306,7 +2354,9 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
         if isinstance(row.doc, DocUnfilled):
             print(f"staff: keeping {row.id}: doc is unfilled", file=sys.stderr)
             return False
-        changed = replace(row, doc=_keep_location_fields(WrappedDoc(row.doc.machine, row.doc.path), row.doc))
+        destination = WrappedDoc(row.doc.machine, row.doc.path)
+        _require_document_change(row, destination)
+        changed = replace(row, doc=_keep_location_fields(destination, row.doc))
     else:
         raise StaffRefused("pending retirement is for units and showrunners")
     rows[rows.index(row)] = changed
@@ -2476,6 +2526,7 @@ class _Arguments:
     expected_state: str = ""
     expected_machine: str = ""
     expected_path: str = ""
+    conditional: bool = False
     branch: str = ""
     expected_branch: str = ""
     worktree: list[str] | None = None
@@ -2578,11 +2629,12 @@ def _parser() -> argparse.ArgumentParser:
     _ = defer_parser.add_argument("ids", nargs="*")
     pending_parser = verbs.add_parser("retire-pending", help=argparse.SUPPRESS)
     location_parsers: list[argparse.ArgumentParser] = []
-    for command, states in (("set-worktree", ("present", "removed")), ("set-doc", ("live", "wrapped"))):
+    for command, states in (("set-worktree", ("present", "removed")), ("set-doc", ("live", "wrapped")),
+                            ("verify-doc-change", ("live", "wrapped", "unfilled"))):
         location_parser = verbs.add_parser(command)
         _ = location_parser.add_argument("target")
-        _ = location_parser.add_argument("--machine", required=True)
-        _ = location_parser.add_argument("--path", required=True)
+        _ = location_parser.add_argument("--machine", required=command != "verify-doc-change", default="")
+        _ = location_parser.add_argument("--path", required=command != "verify-doc-change", default="")
         _ = location_parser.add_argument("--state", required=True, choices=states)
         if command == "set-worktree":
             _ = location_parser.add_argument("--expected-state", required=True, choices=("unfilled", "present", "removed"))
@@ -2590,6 +2642,12 @@ def _parser() -> argparse.ArgumentParser:
             _ = location_parser.add_argument("--expected-path", default="")
             _ = location_parser.add_argument("--branch", default="")
             _ = location_parser.add_argument("--expected-branch", default="")
+        else:
+            _ = location_parser.add_argument("--expected-state", choices=("unfilled", "live", "wrapped"), default="")
+            _ = location_parser.add_argument("--expected-machine", default="")
+            _ = location_parser.add_argument("--expected-path", default="")
+            if command == "verify-doc-change":
+                _ = location_parser.add_argument("--conditional", action="store_true")
         location_parsers.append(location_parser)
     for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
@@ -2602,6 +2660,18 @@ def _parent(value: str | None) -> ReportsTo | StaffRoot:
 
 def _print_row(row: StaffRow, path: str) -> None:
     print(f"{row.id:<12}  {row.kind:<10}  {path}")
+
+
+def _expected_document(arguments: _Arguments) -> LiveDoc | WrappedDoc | DocUnfilled | NoExpectedDocument:
+    match arguments.expected_state:
+        case "live":
+            return LiveDoc(arguments.expected_machine, Path(arguments.expected_path))
+        case "wrapped":
+            return WrappedDoc(arguments.expected_machine, Path(arguments.expected_path))
+        case "unfilled":
+            return DOC_UNFILLED
+        case _:
+            return NO_EXPECTED_DOCUMENT
 
 
 def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
@@ -2645,7 +2715,7 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "set-doc":
         doc = (LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live"
                else WrappedDoc(arguments.machine, Path(arguments.path)))
-        return set_doc(StaffId(arguments.target), doc)
+        return set_doc(StaffId(arguments.target), doc, expected=_expected_document(arguments))
     if arguments.verb == "defer-retire":
         return defer_retire(tuple(StaffId(value) for value in arguments.ids))
     if arguments.verb == "retire-pending":
@@ -2684,6 +2754,18 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "verify-doc-change":
+        from scripts.agents import remote
+
+        previous = _expected_document(arguments)
+        if not isinstance(previous, (LiveDoc, WrappedDoc)) or previous.machine != remote.local_machine():
+            raise StaffRefused("verify the change on the document machine")
+        destination = (DOC_UNFILLED if arguments.state == "unfilled" else
+                       LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live" else
+                       WrappedDoc(arguments.machine, Path(arguments.path)))
+        _verify_document_change(StaffId(arguments.target), previous, destination, arguments.conditional)
+        print("null")
+        return 0
     if arguments.verb == "producer-creation":
         action = arguments.creation_action
         creation = producer_creation_registry("read" if action == "read-named" else action,

@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -30,7 +30,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, unit_runs, build_folders, waiting_rows
+from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, session_move, unit_runs, build_folders, waiting_rows
 from scripts.lib.file_lock import exclusive
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
@@ -41,6 +41,7 @@ from scripts.production import (
     unit_lookup,
     unit_move,
     completion_receipt,
+    production_admission,
     worker,
     add_unit,
     unit_names,
@@ -52,7 +53,7 @@ from scripts.production.production_doc import (
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib import origin_deletion
-from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
 from scripts.worktree.worktrees import release_worktree_pair
 from scripts.agents import (
     producer_lifecycle,
@@ -2030,8 +2031,7 @@ def rename_check_branch(checkout: Path, target: str) -> str:
     return branch
 
 
-def _live_rename(doc: staff.LiveDoc, destination: Path, branch: str, name: str) -> LiveDocBranchMove | KeepDocBranch:
-    source = doc.path
+def _live_rename(source: Path, destination: Path, branch: str, name: str) -> LiveDocBranchMove | KeepDocBranch:
     if source != destination and source.exists() and unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
     path = source if source.exists() else destination
@@ -2098,25 +2098,26 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
         raise RenameRefused(f"{row.name}: the staff document is unfilled")
     if doc.machine != remote.local_machine():
         raise RenameRefused(f"{row.name}: run the document move on {doc.machine}")
-    destination = Path(to_doc).expanduser().resolve() if to_doc else doc.path
+    source = production_admission.canonical_document_path(doc.path)
+    destination = production_admission.canonical_document_path(Path(to_doc).expanduser()) if to_doc else source
     if isinstance(doc, staff.LiveDoc):
-        document = doc.path if doc.path.exists() else destination
+        document = source if source.exists() else destination
         if document.is_file() and isinstance(optional_field(
                 document.read_text(encoding="utf-8").splitlines(), MERGE_CHECKOUT_FIELD), FieldPresent):
-            return RenamePlan(row, new, _live_rename(doc, destination, to_branch, row.name))
+            return RenamePlan(row, new, _live_rename(source, destination, to_branch, row.name))
     if bool(to_doc) != bool(to_branch):
         raise RenameRefused("--to-doc and --to-branch are required together")
-    checkout = unit_move.checkout_folders(doc.path.parent).toplevel
+    checkout = unit_move.checkout_folders(source.parent).toplevel
     _ = destination.relative_to(checkout)
     branch = rename_check_branch(checkout, to_branch)
-    if doc.path != destination and doc.path.exists() and unit_move.exists(destination):
+    if source != destination and source.exists() and unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
-    if doc.path == destination and branch == to_branch:
+    if source == destination and branch == to_branch:
         return RenamePlan(row, new, KeepDocBranch())
-    source = str(doc.path.relative_to(checkout))
+    relative_source = str(source.relative_to(checkout))
     target = str(destination.relative_to(checkout))
-    entry = unit_move.git(checkout, "ls-files", "-s", "--", source)
-    if doc.path != destination and not doc.path.exists() and unit_move.exists(destination):
+    entry = unit_move.git(checkout, "ls-files", "-s", "--", relative_source)
+    if source != destination and not source.exists() and unit_move.exists(destination):
         target_entry = unit_move.git(checkout, "ls-files", "-s", "--", target)
         if unit_move.git(checkout, "ls-tree", "HEAD", "--", target):
             raise RenameRefused(f"destination already exists: {destination}")
@@ -2125,15 +2126,15 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
                 raise RenameRefused(f"destination already exists: {destination}")
         elif not entry:
             changes = unit_move.git(checkout, "diff", "--cached", "--name-status", "-z", "--find-renames",
-                                    "--", source, target).split("\0")
-            if len(changes) != 4 or not changes[0].startswith("R") or changes[1:3] != [source, target]:
+                                    "--", relative_source, target).split("\0")
+            if len(changes) != 4 or not changes[0].startswith("R") or changes[1:3] != [relative_source, target]:
                 raise RenameRefused(f"destination already exists: {destination}")
         entry = entry or target_entry
     staged_blob: StagedDocumentBlob | NoStagedDocumentBlob = NoStagedDocumentBlob()
     parts = entry.split(maxsplit=3)
     if len(entry.splitlines()) == 1 and len(parts) == 4 and parts[2] == "0":
         staged_blob = StagedDocumentBlob(parts[0], parts[1])
-    return RenamePlan(row, new, DocBranchMove(doc.path, destination, checkout, branch, to_branch, bool(entry), staged_blob))
+    return RenamePlan(row, new, DocBranchMove(source, destination, checkout, branch, to_branch, bool(entry), staged_blob))
 
 
 def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
@@ -2148,13 +2149,15 @@ def _rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
     row = staff.by_id(request.member.id)
     if row is None or isinstance(row.doc, staff.DocUnfilled):
         raise RenameRefused(f"{request.member.id}: the staff document is unavailable")
-    if row.doc.path not in (move.source, move.destination):
+    if production_admission.canonical_document_path(row.doc.path) not in (move.source, move.destination):
         raise RenameRefused(f"{row.id}: the staff document changed during the move")
     source = str(move.source.relative_to(move.checkout))
     destination = str(move.destination.relative_to(move.checkout))
     document = move.source if move.source.exists() else move.destination
     if not document.is_file():
         raise RenameRefused(f"{document}: the document is unavailable")
+    binding = replace(row.doc, path=move.destination)
+    production_admission.prepare_document_rebind(row, binding)
     if isinstance(move, LiveDocBranchMove):
         notes = f"{NOTES_DIRECTORY}/{request.member.id}/"
         for relative in dict.fromkeys((source, destination, move.log.relative_to(move.checkout).as_posix(), notes)):
@@ -2168,7 +2171,12 @@ def _rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
         if move.tracked:
             _ = unit_move.git(move.checkout, "mv", "--", source, destination)
         else:
-            _ = move.source.rename(move.destination)
+            with ExitStack() as folders:
+                source_fd = os.open(move.source.parent, session_move.DIRECTORY_OPEN)
+                _ = folders.callback(os.close, source_fd)
+                destination_fd = os.open(move.destination.parent, session_move.DIRECTORY_OPEN)
+                _ = folders.callback(os.close, destination_fd)
+                session_move.rename_exclusive(source_fd, move.source.name, destination_fd, move.destination.name)
         changed = True
     if not move.destination.is_file():
         raise RenameRefused(f"{move.destination}: the moved document is unavailable")
@@ -2185,10 +2193,8 @@ def _rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
             changed = True
     if isinstance(move, LiveDocBranchMove) and source != destination:
         git_exclude.remove_exact_exclusion(move.checkout, source)
-    if row.doc.path != move.destination:
-        _ = staff.set_doc(row.id, replace(row.doc, path=move.destination))
-        changed = True
-    return changed
+    _ = production_admission.complete_document_rebind(row, binding)
+    return changed or row.doc != binding
 
 
 def rename_move_branch(move: DocBranchMove) -> bool:
@@ -2200,15 +2206,20 @@ def rename_move_branch(move: DocBranchMove) -> bool:
     if changed:
         _ = unit_move.git(checkout, "branch", "-m", move.branch)
     if isinstance(move, LiveDocBranchMove) and move.documented_branch != move.branch:
-        with move.destination.open(encoding="utf-8", newline="") as document:
-            lines = document.readlines()
+        before = move.destination.read_bytes()
+        mode = move.destination.stat().st_mode & 0o777
+        lines = before.decode("utf-8").splitlines(keepends=True)
         prefix = "- **Merge branch:**"
         for number, line in enumerate(lines):
             if line.startswith(prefix):
                 content = line.rstrip("\r\n")
                 _, separator, commentary = content.partition(" — ")
                 lines[number] = f"{prefix} `{move.branch}`{separator}{commentary}{line[len(content):]}"
-                write_text_atomic(move.destination, "".join(lines))
+                with prepared_replacement(move.destination, "".join(lines), mode=mode) as temporary:
+                    if move.destination.stat().st_mode & 0o777 != mode or move.destination.read_bytes() != before:
+                        raise RenameRefused(f"{move.destination}: the document changed during the branch rename")
+                    _ = temporary.replace(move.destination)
+                    sync_folder(move.destination.parent)
                 return True
         raise RenameRefused(f"{move.destination}: production doc lacks Merge branch")
     return changed
@@ -2365,17 +2376,21 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
             return request
         move = request.move
         row = request.member
+        if isinstance(move, DocBranchMove) or to_doc:
+            production_admission.require_document_receipt(row.id)
         changed = row.name != request.name
         if not changed:
             changed = rename_qualified_workers(row)
         row = rename_owner(row, request.name)
-        if isinstance(move, DocBranchMove):
-            try:
+        try:
+            if isinstance(move, DocBranchMove):
                 changed = rename_move_doc(request, move) or changed
                 changed = rename_move_branch(move) or changed
-            except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound) as error:
-                print(f"anomaly: document_move: {error}", file=sys.stderr)
-                changed = True
+            elif to_doc and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+                _ = production_admission.complete_document_rebind(row, row.doc)
+        except (OSError, ValueError, Refusal, staff.StaffRefused, staff.StaffNotFound) as error:
+            print(f"anomaly: document_move: {error}", file=sys.stderr)
+            changed = True
         try:
             changed = rename_repair_displays(row) or changed
         except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound, herdr_types.HerdrFailure) as error:
@@ -2533,7 +2548,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, Refusal, RenameRefused, herdr_types.HerdrFailure) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

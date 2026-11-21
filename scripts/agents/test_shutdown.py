@@ -22,7 +22,8 @@ from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.lib import atomic_file, conf, git_exclude, waiting_rows
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.message import sessions
-from scripts.production import production_doc, record_store, staff
+from scripts.production import production_admission, production_doc, record_store, showrunners, staff
+from scripts.production.add_showrunner_test_support import write_guard_proof
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.production.test_production_doc import enrolled_document
 
@@ -43,7 +44,8 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         self.repository = self.root / "main"
         self.integration = self.root / "integration"
         self.environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
-                            "XDG_STATE_HOME": str(self.root / "state")}
+                            "XDG_STATE_HOME": str(self.root / "state"),
+                            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}
         self.enterContext(patch.dict(os.environ, self.environment, clear=True))
         _ = subprocess.run(["git", "init", "-qb", "main", str(self.repository)], env=self.environment, check=True)
         _ = commit_repository(self.repository, "Fixture", allow_empty=True, env=self.environment)
@@ -105,6 +107,14 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         self.assertTrue(self.git("ls-remote", "--heads", "origin", "integration"))
 
     def test_live_rename_resumes_an_interrupted_branch_rename_without_changing_main(self) -> None:
+        state = self.root / "showrunner"
+        excludes = self.repository / ".git/info/exclude"
+        with excludes.open("a", encoding="utf-8") as output:
+            _ = output.write(f"\n/{self.document.relative_to(self.repository).as_posix()}\n/docs/plans/fixture-log.md\n")
+        write_guard_proof(self.root, state, self.repository)
+        with (patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
+              patch.object(production_doc, "GUARD_REPOSITORY", self.repository)):
+            production_admission.require_admission(production_doc.read_production(self.owner))
         tracked = production_doc.legacy_document_path(self.document)
         historical = self.repository / "former-proposals"
         _ = tracked.write_text("- **Proposals:** former-proposals\n")
