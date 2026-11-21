@@ -561,10 +561,10 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
     """Map a queue step name, such as nextest or mend, to its routing kind."""
     from scripts.mac_test import eligibility
 
+    kind = eligibility.recorded_step_kind(step)
     verbs = cast(tuple[eligibility.MacVerb, ...], get_args(eligibility.MacVerb))
-    for verb in verbs:
-        if eligibility.step_kind(verb) == step:
-            return cast(StepKind, eligibility.verb_kind(verb))
+    if kind in get_args(StepKind) and any(eligibility.step_kind(verb) == step for verb in verbs):
+        return cast(StepKind, kind)
     return KindNotOffloaded()
 
 

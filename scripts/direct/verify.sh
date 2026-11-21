@@ -1517,7 +1517,7 @@ esac
 # A build call with --attached does not detach: its caller reads the binary line inline.
 DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$BUILD_HELPER_ROOT/agents/detached_runs.py}"
 verify_helper --start
-if [[ "$CMD" != validation && -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" \
+if [[ "${1:-}" != validation && -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" \
         && " ${*:2} " != *" --attached "* ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
