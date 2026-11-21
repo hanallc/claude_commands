@@ -24,7 +24,7 @@ from typing import BinaryIO, Literal, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf, file_lock
+from scripts.lib import build_steps, conf, file_lock
 from scripts.aws_target import hana_result, remote
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -122,6 +122,13 @@ class GateTerminated:
     instance_id: str
 
 
+class GateLaunchPricing(Enum):
+    """Select the price evidence for an accepted instance."""
+
+    CURRENT_EVIDENCE = 'current_evidence'
+    BOOKING_UNTIL_LOGGED = 'booking_until_logged'
+
+
 def _gate_quota_cooldown(configuration: conf.ConfigRead) -> float:
     try:
         return configuration.whole('capacity_cooldown_seconds')
@@ -200,11 +207,20 @@ class GateReservation:
     mode: str = ''
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
+    launch_pricing: GateLaunchPricing = GateLaunchPricing.CURRENT_EVIDENCE
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
     """Keep pending and running reservations open until AWS confirms closure."""
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
+
+
+def _gate_holds_booking(reservation: GateReservation) -> bool:
+    return reservation.launch_pricing is GateLaunchPricing.BOOKING_UNTIL_LOGGED
+
+
+def _gate_has_cost_reserve(reservation: GateReservation) -> bool:
+    return gate_is_open(reservation) or _gate_holds_booking(reservation)
 
 
 @dataclass(frozen=True)
@@ -974,7 +990,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                             text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown(),
             str(item.get('mode', '')),
             GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
-            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))))
+            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))),
+            GateLaunchPricing(item.get('launch_pricing', GateLaunchPricing.CURRENT_EVIDENCE.value)))
         if isinstance(gate_state, GateLaunchPending):
             # Older workers saved the booked rates in the estimate fields.
             booked = gate_state.booked_day_rates or reservation.day_rates
@@ -1068,6 +1085,7 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'mode': r.mode, 'root_gib': r.root_gib,
+             **({'launch_pricing': r.launch_pricing.value} if _gate_holds_booking(r) else {}),
              'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
                       if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
@@ -1313,10 +1331,10 @@ def _complete_day_adjustments(complete_days: Sequence[CompleteDayAmount], interv
     covered = tuple(day for day in complete_days if start <= day.start and day.end <= end)
     if not covered:
         return ()
-    open_gates = tuple(row for row in gate_reservations if gate_is_open(row))
+    reserved_gates = tuple(row for row in gate_reservations if _gate_has_cost_reserve(row))
     preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
-                 for row in open_gates}
-    preserved.update('gate:' + row.attempt for row in open_gates)
+                 for row in reserved_gates}
+    preserved.update('gate:' + row.attempt for row in reserved_gates)
     usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
     return tuple((day.start, day.usd - period_cost(usage, day.start, day.end)) for day in covered)
 
@@ -1965,6 +1983,8 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
         if reservation.at > now and not reserve:
             continue
         end = exposure.priced_end(now, open_until=max(now, reservation.expires) if reserve else now)
+        if reserve and _gate_holds_booking(reservation):
+            end = max(end, reservation.expires)
         rate = _gate_estimate_rate(reservation)
         rates = dict(reservation.day_rates)
         intervals.extend(day_compute_intervals(reservation.at, end, minimum_seconds, lambda day: rates.get(day, rate),
@@ -2044,7 +2064,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     month_start, _ = period_bounds(local.date().replace(day=1), settings.accounting_zone)
     first = min(today.replace(day=1), datetime.fromtimestamp(month_start, zone).date())
     last_at = max((r.expires for r in state.gate_reservations
-                   if gate_is_open(r)), default=now) if reserve else now
+                   if _gate_has_cost_reserve(r)), default=now) if reserve else now
     last = datetime.fromtimestamp(max(now, last_at - 1), zone).date()
     bills = {r.day: r for r in readings if is_billed_day(r) and r.period_end <= now}
     if bills:
@@ -2147,7 +2167,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
                 continue
             if ((bill is None and (latest is None or use_local_charges)) or
-                    (reserve and gate_is_open(reservation))):
+                    (reserve and _gate_has_cost_reserve(reservation))):
                 allowance = gate_allowance(reservation)
                 groups['other'] += allowance.usd
                 include(ChargedInterval(reservation.at, reservation.at, allowance.usd,
@@ -2212,7 +2232,7 @@ def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: 
     daily: dict[str, Decimal] = {}
     monthly: dict[str, Decimal] = {}
     for reservation in state.gate_reservations:
-        if isinstance(reservation.state, (GateAbsent, GateTerminated)):
+        if not _gate_has_cost_reserve(reservation):
             continue
         pending = replace(state, gate_reservations=[reservation])
         reserved_days, _months = spending_periods(
@@ -2495,12 +2515,16 @@ class CostLedger:
         return tuple(refused)
 
     def launches(self) -> tuple[dict[str, object], ...]:
-        path = self.launch_history_path
-        return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
+        """Read complete launch rows and discard any unfinished tail."""
+        try:
+            complete, _, _ = self.launch_history_path.read_bytes().rpartition(b'\n')
+        except FileNotFoundError:
+            return ()
+        return tuple(mapping(cast(object, json.loads(line))) for line in complete.splitlines())
 
     def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int, *,
                      accounting: GateLaunchAccounting | Literal['current_settings'] = 'current_settings') -> None:
-        """Refresh cost estimates and keep existing pending bookings fixed."""
+        """Keep the booking until the launch log gives the actual launch."""
         launch_rows = self.launches()
         launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
         gate_counts: dict[str, int] = {}
@@ -2523,7 +2547,8 @@ class CostLedger:
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
             launch = launches.get(reservation.attempt)
-            if launch is None and isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates:
+            if launch is None and (_gate_holds_booking(reservation) or
+                    isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates):
                 priced.append(reservation)
                 continue
             size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
@@ -2544,7 +2569,8 @@ class CostLedger:
             rates = tuple((day, max((index.for_day(day, reservation.usd_per_hour) for index in rates_by_candidate),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
-            reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates)
+            reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates,
+                                  launch_pricing=GateLaunchPricing.CURRENT_EVIDENCE)
             priced.append(replace(reservation, booked_allowance=_book_allowance(reservation, rates_by_candidate)))
         state.gate_reservations = priced
         _correct_allowance_estimates(state, readings, now)
@@ -2740,7 +2766,8 @@ class CostLedger:
     @staticmethod
     def _apply_gate_outcome(state: LedgerEvidence, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated,
                             instance_type: str, now: int, *,
-                            quota_cooldown_s: float | Literal['current_setting'] = 'current_setting') -> bool:
+                            quota_cooldown_s: float | Literal['current_setting'] = 'current_setting',
+                            launch_pricing: GateLaunchPricing = GateLaunchPricing.CURRENT_EVIDENCE) -> bool:
         """Preserve confirmed termination against every later outcome."""
         if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
             return False
@@ -2750,19 +2777,29 @@ class CostLedger:
         if isinstance(outcome, GateRunning):
             # Clear expired marks before this launch increases the count.
             state.clear_ended_quota_refusals(now, cooldown)
-        state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
-                                   if row.attempt == attempt else row for row in state.gate_reservations]
+        for index, row in enumerate(state.gate_reservations):
+            if row.attempt != attempt:
+                continue
+            if isinstance(outcome, GateAbsent) and _gate_holds_booking(row):
+                return False
+            pricing = row.launch_pricing
+            if isinstance(row.state, GateLaunchPending) and not isinstance(outcome, GateAbsent):
+                pricing = launch_pricing
+            state.gate_reservations[index] = replace(row, state=outcome, instance_type=instance_type or row.instance_type,
+                                                     launch_pricing=pricing)
+            break
         state.clear_ended_quota_refusals(now, cooldown)
         return True
 
     def record_gate_launch_outcome(self, attempt: str, outcome: GateRunning | GateTerminated, *,
                                    instance_type: str, lock_timeout_s: float,
                                    accounting: GateLaunchAccounting) -> None:
-        """Save the known instance state without reading the launch log."""
+        """Save the known instance and keep the booking until the launch log records it."""
         with self._locked(lock_timeout_s=lock_timeout_s) as state:
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
             if self._apply_gate_outcome(state, attempt, outcome, instance_type, now,
-                                        quota_cooldown_s=accounting.quota_cooldown_s):
+                                        quota_cooldown_s=accounting.quota_cooldown_s,
+                                        launch_pricing=GateLaunchPricing.BOOKING_UNTIL_LOGGED):
                 self._save(state)
 
     def refresh_gate_prices(self, *, lock_timeout_s: float, accounting: GateLaunchAccounting) -> None:
@@ -2771,11 +2808,12 @@ class CostLedger:
             self._price_gates(state, self.read_bills(), int(time.time()), accounting=accounting)
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '',
+                     launch_pricing: GateLaunchPricing = GateLaunchPricing.CURRENT_EVIDENCE) -> None:
         """Save the outcome with current prices."""
         with self._locked() as state:
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
-            if self._apply_gate_outcome(state, attempt, outcome, instance_type, now):
+            if self._apply_gate_outcome(state, attempt, outcome, instance_type, now, launch_pricing=launch_pricing):
                 self._price_gates(state, self.read_bills(), now)
                 self._save(state)
 
@@ -3191,6 +3229,7 @@ class SpendPageInputsNotCaptured:
 @dataclass(frozen=True)
 class SpendPageInputs:
     hana_hours: conf.ConfigRead
+    step_names: build_steps.StepNames
     frame_template: str
     step_tip_template: str
 
@@ -3344,6 +3383,7 @@ _SPEND_UTC = ZoneInfo('UTC')
 _REPOSITORY_GATE_SPEND_SETTINGS = Path(__file__).resolve().parents[2] / 'config' / 'cloud_gate.conf'
 _REPOSITORY_HANA_HOURS_SETTINGS = _REPOSITORY_GATE_SPEND_SETTINGS.with_name('hana_aws.conf')
 _REPOSITORY_CONSOLE_SETTINGS = _REPOSITORY_GATE_SPEND_SETTINGS.with_name('console.conf')
+_REPOSITORY_BUILD_STEP_SETTINGS = _REPOSITORY_GATE_SPEND_SETTINGS.with_name('build_steps.conf')
 SPEND_PAGE_SOURCE = Path(__file__).with_name('aws_prices.html')
 
 
@@ -3386,7 +3426,8 @@ def _spend_source_paths(book: CostLedger, at: int, settings_path: Path,
         from scripts.review_links import page_frame
 
         paths.update((conf.path('hana_aws'), _REPOSITORY_HANA_HOURS_SETTINGS, conf.path('console'),
-                      _REPOSITORY_CONSOLE_SETTINGS, SPEND_PAGE_SOURCE, memory_files.PAGE_SOURCE,
+                      _REPOSITORY_CONSOLE_SETTINGS, conf.path('build_steps'), _REPOSITORY_BUILD_STEP_SETTINGS,
+                      SPEND_PAGE_SOURCE, memory_files.PAGE_SOURCE,
                       *page_frame.title_source_paths()))
     versions = tuple(SpendSourceVersion(str(path.absolute()), _spend_path_stamp(path)) for path in sorted(paths))
     return _SpendSourcePaths(bills, journal, PageEvidenceRevision(at, versions))
@@ -3485,13 +3526,14 @@ def _captured_ledger(contents: str | SpendFileAbsent, journal: remote.HanaStartJ
     return state
 
 
-def _capture_spend_page(hana: conf.ConfigRead, console: conf.ConfigRead) -> SpendPageInputs:
+def _capture_spend_page(hana: conf.ConfigRead, console: conf.ConfigRead, steps: conf.ConfigRead) -> SpendPageInputs:
     from scripts.build_queue import memory_files
     from scripts.review_links import console_theme, page_frame
 
     source = console_theme.with_theme(SPEND_PAGE_SOURCE.read_text(encoding='utf-8'))
     frame = page_frame.template(source, 'AWS', 'aws', settings=console)
-    return SpendPageInputs(hana, frame, memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
+    return SpendPageInputs(hana, build_steps.read_step_names(steps), frame,
+                           memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
 
 
 def _spend_configurations_match(versions: Sequence[SpendConfigurationVersion]) -> bool:
@@ -3530,8 +3572,9 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
                 account, gate = account.freeze(), gate.freeze()
                 hana = conf.read_or_repository('hana_aws').freeze()
                 console = conf.read_or_repository('console').freeze()
-                page_inputs = _capture_spend_page(hana, console)
-                configurations = (account, gate, hana, console)
+                steps = conf.read_or_repository('build_steps').freeze()
+                page_inputs = _capture_spend_page(hana, console, steps)
+                configurations = (account, gate, hana, console, steps)
             else:
                 account, gate = account.freeze_settings(), gate.freeze_settings()
                 page_inputs = SpendPageInputsNotCaptured()

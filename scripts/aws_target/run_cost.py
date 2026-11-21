@@ -16,10 +16,9 @@ from typing import cast
 from scripts.aws_target import hana_spend, ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 
-KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
-EVERY_KIND = tuple(mode for mode, _label in KINDS)
+EVERY_KIND = ('merge-gate', 'targeted-test')
 _MODE_ALIASES = {'gate': 'merge-gate', 'test-affected': 'targeted-test'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
@@ -89,9 +88,13 @@ class RunScope:
     modes: tuple[str, ...]
 
 
-SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
-          RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
-          RunScope('both', 'Both', 'run', EVERY_KIND))
+def run_scopes(names: build_steps.StepNames) -> tuple[RunScope, ...]:
+    scopes: list[RunScope] = []
+    for mode in EVERY_KIND:
+        name = names.shown(mode)
+        label = name[:1].upper() + name[1:] + ' runs'
+        scopes.append(RunScope(mode, label, name, (mode,)))
+    return (*scopes, RunScope('both', 'Both', 'run', EVERY_KIND))
 
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})

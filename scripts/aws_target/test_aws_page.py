@@ -1180,7 +1180,7 @@ class AwsCombinedTableTests(PageCostFixture):
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
           && params().get("runs") === "targeted-test", "Refresh keeps the filter URL");
     const pressed = id => [...document.querySelectorAll(`#${id} [aria-pressed='true']`)].map(chip => chip.textContent).join(",");
-    check(pressed("show") === "Spot price,Cost per gate" && pressed("types") === "Standard" && pressed("runs-chips") === "Targeted runs",
+    check(pressed("show") === "Spot price,Cost per gate" && pressed("types") === "Standard" && pressed("runs-chips") === "Targeted test runs",
           "Refresh keeps the selected chips");
     for (const [values, indices, color] of [[[0.1, 0.1, 0.3], [0, 1], "low"], [[0.1, 0.3, 0.3], [1, 2], "high"]]) {
       const {colors} = scaleCells({values: values.map(value => [null, value])}, {rows: [0, 1, 2], columns: [1]});
@@ -1469,6 +1469,7 @@ class AwsPagePlacementScoresTests(PageCostFixture):
 
 class AwsPageGateTimePriceTests(PageCostFixture):
     def test_page_compares_the_lowest_run_cost_for_each_size_in_each_region(self) -> None:
+        ledger_test_support.override_fixture_settings(self.root / 'build_steps.conf', 'names.merge-gate=fixture gate')
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'
         candidate_only = 'eu-south-2'
@@ -1525,6 +1526,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
         source = publish()
         data = ledger.mapping(payload(source, 'aws-gate-time-data'))
         table = cast(aws_page.TableData, data['table'])
+        self.assertEqual(table['title'], '32-vCPU fixture gate break-even')
         self.assertEqual(table['region_axis'], 'rows')
         self.assertEqual(data['regions'], [east, west, north, candidate_only])
         self.assertEqual([row[0] for row in table['rows']], [east, west, north])
@@ -1536,6 +1538,8 @@ class AwsPageGateTimePriceTests(PageCostFixture):
 
         page = cast(aws_page.PageData, payload(source, 'aws-prices-data'))
         merge_gates = next(costs for costs in page['runs'] if costs['scope'] == 'merge-gate')
+        self.assertEqual(merge_gates['label'], 'Fixture gate runs')
+        self.assertNotRegex(source.lower(), r'\bmerge (?:gate|check|test)\b')
         gate_prices = merge_gates['prices'][0]
         size = 'c7a.4xlarge'
         column = gate_prices['headers'].index(size)
@@ -1549,7 +1553,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
             with self.subTest(region=region):
                 self.assertEqual(prices_by_region[region], row[4])
                 self.assertEqual(prices_by_region[region], f'{pricing.expected_usd(Decimal("0.6"), size, region):.4f}')
-                self.assertIn({'region': region, 'summary': f'Cheapest merge gate: {size} in {region}, {row[4]} USD (estimate)'},
+                self.assertIn({'region': region, 'summary': f'Cheapest fixture gate: {size} in {region}, {row[4]} USD (estimate)'},
                               merge_gates['estimates'])
         spot_prices = page['prices'][0]
         for region, instance_type, spot, gate in (

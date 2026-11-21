@@ -12,7 +12,7 @@ from typing import Literal
 from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import SnapshotFailure, gpu_price_sizes, hours_check_scope, largest_gate_vcpus, read_snapshot, snapshot_failures
 from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_quota_requests
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 
 
 # A region is the first cell of a row, a column header, or the second cell after the type.
@@ -138,7 +138,7 @@ class SpotTables:
     # The standard types, then the GPU types.
     prices: tuple[Table, ...]
     quotas: tuple[Table, ...]
-    # One entry for each scope in run_cost.SCOPES, in that order.
+    # One entry for each scope in run_cost.run_scopes, in that order.
     runs: tuple[RunCosts, ...]
     hours: HoursComparison | HoursComparisonUnavailable
     gpu_quota_needed: int
@@ -197,6 +197,7 @@ def spot_tables_from(directory: Path, now: int, values: conf.ConfigRead, configu
     if isinstance(page, ledger.SpendPageInputsNotCaptured):
         raise ledger.LedgerUnavailable('page capture requires the Hana hours settings')
     hana = page.hana_hours if isinstance(page, ledger.SpendPageInputs) else None
+    names = page.step_names if isinstance(page, ledger.SpendPageInputs) else build_steps.read_step_names()
     hours = billed_hours(directory, now, hours_check_scope(values, hana=hana), days, home,
                          configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')),
                          evidence=evidence)
@@ -205,7 +206,8 @@ def spot_tables_from(directory: Path, now: int, values: conf.ConfigRead, configu
         (price_table(standard, regions, minimum, notes, not_sold), price_table(gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
-        run_costs(directory, now, standard, regions, minimum, values, configuration, inputs, evidence=evidence),
+        run_costs(directory, now, standard, regions, minimum, values, configuration, inputs, names,
+                  evidence=evidence),
         hours, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
 
 
@@ -248,7 +250,7 @@ def quota_table(label: str, field: str, sizes: tuple[str, ...], regions: tuple[s
 
 def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
               minimum: Mapping[tuple[str, str], Decimal], values: conf.ConfigRead,
-              policy: conf.ConfigRead, gate_pricing: run_cost.GatePricingInputs, *,
+              policy: conf.ConfigRead, gate_pricing: run_cost.GatePricingInputs, names: build_steps.StepNames, *,
               evidence: ledger.SpendEvidenceAt | None = None) -> tuple[RunCosts, ...]:
     """Build the run tables and gate estimates for standard types in each scope."""
     days = policy.whole('run_cost_days')
@@ -271,7 +273,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[
     max_gate_minutes = values.whole('max_gate_minutes')
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
-    for scope in run_cost.SCOPES:
+    for scope in run_cost.run_scopes(names):
         pricing = run_cost.GateRunPricing.from_config(values, gate_pricing.evidence, home, scope.modes)
         explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest deployed zone Spot price '
                        + 'and the median box time, including boot. It adds transfer charges outside the home region. '

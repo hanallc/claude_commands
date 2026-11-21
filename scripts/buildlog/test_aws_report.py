@@ -27,8 +27,10 @@ use_test_log()
 
 from scripts.aws_target import config as aws_config, ledger, measurement, run_cost
 from scripts.aws_target import spend as aws_spend
-from scripts.aws_target.ledger_test_support import numeric_settings
+from scripts.aws_target.ledger_test_support import numeric_settings, override_fixture_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.snapshot_codec import snapshot_value
 from scripts.lib import conf
 
 
@@ -418,7 +420,7 @@ class AwsReportTests(MeasurementFixture):
             _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(reading)))
         output = self.render()
         # The runs launched in us-east-2, so the USW2 bill goes to no run.
-        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', output)
+        self.assertIn('| Machine type | Gate runs | Targeted test runs | All runs |', output)
         self.assertIn('| m7a.8xlarge | $0.0667 per run (2) | $0.1333 per run (1) | $0.1000 per run (3) |', output)
         self.assertIn('| c7a.8xlarge | $0.6750 per run (1) | $0.2250 per run (2) | $0.4500 per run (3) |', output)
         self.assertIn('| All types | $0.3708 per run (3) | $0.1792 per run (3) | $0.2750 per run (6) |', output)
@@ -461,8 +463,10 @@ class AwsReportTests(MeasurementFixture):
         })
 
     def test_gate_fallback_lines_show_one_short_reason_per_event_in_the_window(self) -> None:
+        override_fixture_settings(self.root / 'build_steps.conf', 'names.test-affected=fixture affected')
         events: list[dict[str, object]] = [
             {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'test-affected', 'result': 'fallback',
+             'gate_job': snapshot_value(StepJob('test-affected')),
              'reason': 'The checkout changed after the test selection\nfixture traceback'},
             {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
              'reason': 'image or stack is absent'},
@@ -478,8 +482,8 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual(len(lines), 2)
         at = datetime.fromtimestamp(NOW, UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
         self.assertEqual(lines[0], '- Cloud gate uses natedev: The checkout changed after the test selection '
-                         + f'({at}, targeted-test).')
-        self.assertIn('image or stack is absent', lines[1])
+                         + f'({at}, fixture affected).')
+        self.assertRegex(lines[1], r'image or stack is absent .* UTC, gate\)\.')
         for hidden in ('fixture traceback', 'fixture old reason', 'fixture future reason'):
             self.assertNotIn(hidden, output)
 
@@ -511,10 +515,13 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn('| All shown days | 0 | — | — | 1 | 1m 0s | 2m 0s | not billed yet |', lines)
 
     def test_gate_type_comparison_uses_shared_files_without_a_steps_query(self) -> None:
+        override_fixture_settings(self.root / 'build_steps.conf', 'names.merge-gate=fixture gate')
         with read_only_evidence(self, self.root):
             comparison = aws_report.gate_type_report(self.state, DAY, 14, home='us-east-1')
         lines = comparison.tables
-        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', lines)
+        self.assertIn('| Machine type | Fixture gate runs | Targeted test runs | All runs |', lines)
+        self.assertIn('| Day (UTC) | Fixture gate runs | Test time (Fixture gate) | Box time (Fixture gate) | '
+                      + 'Targeted test runs | Test time (Targeted test) | Box time (Targeted test) | Cost per run |', lines)
         self.assertIn('| All shown days | 0 | — | — | 0 | — | — | — |', lines)
         self.assertIn('UTC 2026-01-02 through 2026-01-15 (14 days)', comparison.source)
 

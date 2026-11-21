@@ -41,6 +41,7 @@ from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
+from scripts.lib.build_steps import saved_gate_job
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
@@ -246,15 +247,6 @@ def read(path: Path) -> dict[str, object]:
 
 def save(path: Path, row: dict[str, object]) -> None:
     write_text_atomic(path, remote.record_text(row))
-
-
-def _saved_gate_job(record: dict[str, object]) -> StepJob | GateJobNotRecorded:
-    """Read the saved job for an attempt."""
-    try:
-        return cast(StepJob | GateJobNotRecorded,
-            snapshot_codec.parse_snapshot_value(record.get('gate_job'), StepJob | GateJobNotRecorded))
-    except (ValueError, OverflowError):
-        return GATE_JOB_NOT_RECORDED
 
 
 def append_launch(directory: Path, row: dict[str, object], *, gate_job: StepJob | GateJobNotRecorded,
@@ -674,7 +666,8 @@ class GateWorker:
                   result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
         self._confirm_termination(instance)
         ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
-        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
+        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance),
+                               launch_pricing=ledger.GateLaunchPricing.BOOKING_UNTIL_LOGGED)
 
     def _confirm_termination(self, instance: str, *, report_retries: bool = True) -> None:
         api = self.regional_api(self.box_region)
@@ -764,7 +757,8 @@ class GateWorker:
                 if not box.record_in_ledger:
                     continue
                 try:
-                    self.book.resolve_gate(box.attempt, ledger.GateTerminated(int(self.clock()), box.instance))
+                    self.book.resolve_gate(box.attempt, ledger.GateTerminated(int(self.clock()), box.instance),
+                                           launch_pricing=ledger.GateLaunchPricing.BOOKING_UNTIL_LOGGED)
                     continue
                 except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
                     _cleanup_warning(f'paired cleanup: {error}')
@@ -879,7 +873,7 @@ class GateWorker:
             row['gate_s'] = gate_s
         else:
             row.update({'availability_zone': zone, 'error_code': error_code, 'reason': reason})
-        append_launch(self.book.directory, row, gate_job=_saved_gate_job(request), lock_timeout_s=lock_timeout_s)
+        append_launch(self.book.directory, row, gate_job=saved_gate_job(request), lock_timeout_s=lock_timeout_s)
         if result == 'refused':
             if error_code in run_cost.QUOTA_REFUSALS:
                 pool = ledger.SpotQuotaPool(self.box_region, ledger.spot_quota_class(size))
@@ -1712,7 +1706,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 pass
             else:
                 attempt.identifier = folder.name
-                attempt.gate_job = _saved_gate_job(previous)
+                attempt.gate_job = saved_gate_job(previous)
                 with cloud_reservation(repo, folder / 'reservation.cgroup', mode, gate_job=command_job) as reservation:
                     outcome = _complete_outcome(repo, folder, request, row)
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
@@ -1734,7 +1728,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
             folder = root / uuid4().hex
         elif same_request:
-            attempt.gate_job = _saved_gate_job(previous)
+            attempt.gate_job = saved_gate_job(previous)
         attempt.identifier = folder.name
         folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
@@ -1780,7 +1774,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                                             selected=selected, gate_job=attempt.gate_job))
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
-                    if _saved_gate_job(request) != attempt.gate_job:
+                    if saved_gate_job(request) != attempt.gate_job:
                         request['gate_job'] = state['gate_job']
                     request['full'] = full
                     if retry_launch:

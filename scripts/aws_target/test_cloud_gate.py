@@ -431,7 +431,7 @@ class GateLaunchRecoveryTests(unittest.TestCase):
                 cloud_gate.GateCleanupAttempt(replace(known, attempt='discovered', state=ledger.GateLaunchPending()),
                                               {'arguments': {'ClientToken': 'fixture-token'}}, True),
             )
-            def fail_write(*_arguments: object) -> None:
+            def fail_write(*_arguments: object, **_options: object) -> None:
                 self.assertEqual(fake.terminated_instances, {'i-known', 'i-fixture'})
                 raise OSError('The fixture ledger is unavailable')
 
@@ -2533,6 +2533,113 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             instance_type=small.instance_type))
         assert isinstance(booked, ledger.GateReserved)
         self.assertEqual(booked.reservation.rate.usd_per_hour, Decimal('.12'))
+
+    def book_large_rate_for_small_launch(self, attempt: str, variant: cloud_gate.GateLaunchVariant,
+                                         large: cloud_gate.GateLaunchVariant, folder: Path) -> None:
+        now = int(self.now)
+        booked = self.book.reserve_gate(self.settings, ledger.GateReservation(
+            attempt, now, now + 1200, Decimal('.8'), Decimal('.02'), instance_type=variant.instance_type,
+            state=ledger.GateLaunchPending(tuple(ledger.GateRateCandidate(row.instance_type, row.region)
+                                                 for row in (variant, large)))))
+        assert isinstance(booked, ledger.GateReserved)
+        self.assertEqual(booked.reservation.rate.usd_per_hour, Decimal('.80'))
+        cloud_gate.save(folder / 'launch.json', {'variant': 0, 'region': variant.region, 'zone': variant.zone,
+            'arguments': {'InstanceType': variant.instance_type, 'ClientToken': 'token-' + attempt}})
+
+    def priced_launch_reserve(self, attempt: str) -> tuple[ledger.GateReservation, Decimal]:
+        book = ledger.CostLedger(self.state)
+        now = int(self.now)
+        state = book.priced_snapshot(now)
+        booking = next(row for row in state.gate_reservations if row.attempt == attempt)
+        policy = read_settings(self.settings)
+        amount = sum((row.usd for row in ledger.gate_compute_intervals(
+            state, now, policy.box_minimum_seconds, reserve=True) if row.source == 'gate:' + attempt), Decimal(0))
+        return booking, amount
+
+    def test_repricing_after_the_instance_save_holds_the_booking_until_append(self) -> None:
+        worker, bill, small, large = self.launch_rate_fixture()
+        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
+            self.book_large_rate_for_small_launch('attempt', small, large, self.folder)
+            _, before = self.priced_launch_reserve('attempt')
+            record = worker.record_launch
+
+            def reprice_before_append(request: dict[str, object], size: str, zone: str, result: str, *,
+                                      lock_timeout_s: float, event_at: float) -> None:
+                _ = self.book.launch_history_path.write_text(json.dumps({
+                    'time': event_at, 'attempt': request['attempt'], 'instance_type': size, 'result': result}))
+                self.assertEqual(self.book.launches(), ())
+                accounting = ledger.GateLaunchAccounting.from_config(cloud_gate.settings())
+                with mock.patch.object(time, 'time', return_value=self.now):
+                    ledger.CostLedger(self.state).refresh_gate_prices(lock_timeout_s=lock_timeout_s,
+                                                                      accounting=accounting)
+                saved, amount = self.priced_launch_reserve('attempt')
+                self.assertEqual(saved.state, ledger.GateRunning('i-fixture'))
+                self.assertEqual(saved.rate.usd_per_hour, Decimal('.80'))
+                self.assertEqual(amount, before)
+                self.assertEqual(result, 'launched')
+                record(request, size, zone, 'launched', lock_timeout_s=lock_timeout_s, event_at=event_at)
+
+            with mock.patch.object(worker, 'record_launch', side_effect=reprice_before_append) as append:
+                self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+            append.assert_called_once()
+            saved, amount = self.priced_launch_reserve('attempt')
+            launched, = self.book.launches()
+            self.assertEqual(launched['instance_type'], small.instance_type)
+            self.assertEqual(saved.rate.usd_per_hour, Decimal('.12'))
+            self.assertLess(amount, before)
+
+    def test_launch_crashes_keep_the_instance_and_the_booking_until_append(self) -> None:
+        worker, bill, small, large = self.launch_rate_fixture()
+        refresh = self.book.refresh_gate_prices
+        save = cloud_gate.save
+        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
+            for step in ('acceptance', 'identity', 'booking', 'append', 'repricing'):
+                with self.subTest(step=step):
+                    folder = self.folder / step
+                    folder.mkdir()
+                    request = {**self.request, 'attempt': step}
+                    path = folder / 'launch.json'
+                    save(folder / 'request.json', request)
+                    self.book_large_rate_for_small_launch(step, small, large, folder)
+                    _, before = self.priced_launch_reserve(step)
+
+                    def save_identity(target: Path, row: dict[str, object]) -> None:
+                        if step == 'acceptance' and target == path and 'instance' in row:
+                            raise SystemExit
+                        save(target, row)
+                        if step == 'identity' and target == path and 'instance' in row:
+                            raise SystemExit
+
+                    def price_then_exit(*, lock_timeout_s: float, accounting: ledger.GateLaunchAccounting) -> None:
+                        if step == 'repricing':
+                            refresh(lock_timeout_s=lock_timeout_s, accounting=accounting)
+                        raise SystemExit
+
+                    with (mock.patch.object(cloud_gate, 'save', side_effect=save_identity),
+                          mock.patch.object(worker, 'record_launch', wraps=worker.record_launch,
+                                            side_effect=SystemExit if step == 'booking' else None),
+                          mock.patch.object(self.book, 'refresh_gate_prices', side_effect=price_then_exit),
+                          self.assertRaises(SystemExit)):
+                        _ = worker.launch(folder, request, self.deployment)
+
+                    launch = cloud_gate.read(path)
+                    self.assertEqual(ledger.mapping(launch['arguments'])['ClientToken'], 'token-' + step)
+                    self.assertEqual(launch.get('instance'), None if step == 'acceptance' else 'i-fixture')
+                    logged = step in ('append', 'repricing')
+                    self.assertEqual(any(row['attempt'] == step for row in self.book.launches()), logged)
+                    saved, amount = self.priced_launch_reserve(step)
+                    self.assertEqual(saved.rate.usd_per_hour, Decimal('.12') if logged else Decimal('.80'))
+                    if not logged:
+                        self.assertEqual(amount, before)
+
+                    self.fake.terminated = False
+                    self.fake.terminated_instances.clear()
+                    self.assertTrue(cloud_gate.cleanup_folder(folder, worker))
+                    self.assertTrue(self.fake.terminated)
+                    saved, amount = self.priced_launch_reserve(step)
+                    self.assertIsInstance(saved.state, ledger.GateTerminated)
+                    if not logged:
+                        self.assertEqual(amount, before)
 
     def launch_with_bill_update(self, refusal: str, update: Callable[[Path, ledger.ChargeRead], None]) -> str | cloud_gate.LocalFallback:
         _, bill, small, large = self.launch_rate_fixture()

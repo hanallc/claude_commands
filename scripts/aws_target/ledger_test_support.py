@@ -120,11 +120,34 @@ def write_hana_config(path: Path | None = None) -> Path:
     return path
 
 
+def write_build_steps_fixture(folder: Path) -> None:
+    _ = (folder / 'build_steps.conf').write_text("""\
+[names]
+names.merge-gate=gate
+names.targeted-test=targeted test
+names.integrate=integrate
+names.test-all=test all
+names.test-modules=test named
+names.test-affected=test affected
+names.test-nightly=test nightly
+names.fast-track=fast track
+names.toolchain-trial=toolchain trial
+names.promote=promote
+names.ci=CI
+
+[owned]
+owned.default={unit} {step}
+owned.showrunner-default=showrunner {step}
+owned.ci-default=CI {step}
+""")
+
+
 def install_aws_fixture_settings(folder: Path) -> None:
     """Install the private AWS settings before a fixture copies other files."""
     install_cost_settings(folder / 'aws_target.conf')
     write_gate_config(folder / 'cloud_gate.conf')
     _ = write_hana_config(folder / 'hana_aws.conf')
+    write_build_steps_fixture(folder)
 
 
 def install_hana_spending_settings(path: Path) -> None:

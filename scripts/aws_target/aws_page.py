@@ -367,7 +367,7 @@ def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.Spot
     return spot_table.Table('Spot placement scores', headers, frozenset(range(2, len(headers))), rows, 'rows')
 
 
-def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) -> spot_table.Table:
+def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison], gate_name: str) -> spot_table.Table:
     """Show the run costs and the time price that makes the 32-vCPU box cheaper."""
     def cells(estimate: run_cost.GateRunEstimate | run_cost.NoPricedGateVariant) -> tuple[str, str, str, str]:
         if isinstance(estimate, run_cost.NoPricedGateVariant):
@@ -389,7 +389,7 @@ def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) ->
                '32 vCPU break-even (USD/min)')
     rows = tuple((row.region, *cells(row.small), *cells(row.large), break_even(row))
                  for row in sorted(comparisons, key=lambda row: region_filter_key(row.region)))
-    return spot_table.Table('32-vCPU merge gate break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
+    return spot_table.Table(f'32-vCPU {gate_name} break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
 
 
 def without_prices(table: spot_table.Table) -> spot_table.Table:
@@ -747,7 +747,7 @@ def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, starte
                      hours_table_open_row_limit=configuration.whole('hours_table_open_row_limit'),
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
-    gate_time_price = table_data(gate_time_price_table(comparisons))
+    gate_time_price = table_data(gate_time_price_table(comparisons, inputs.step_names.shown('merge-gate')))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
     tip = shared_step_tip(inputs.step_tip_template)

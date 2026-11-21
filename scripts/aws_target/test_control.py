@@ -568,10 +568,10 @@ region_transfer_usd={"us-west-1":0.00015}
                              * len(self.regions))
         # Every column after the region holds a number.
         self.assertEqual(tables[fast].headers[-1], 'paid runs')
-        self.assertIn('merge gate (minutes)', tables[fast].headers)
+        self.assertIn('gate (minutes)', tables[fast].headers)
         self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
         self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
-                         f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+                         f'Cheapest gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
         self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
         self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
@@ -714,7 +714,7 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertGreater(data["render_seconds"], 0)
         self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
-                         [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
+                         [('merge-gate', 'Gate runs'), ('targeted-test', 'Targeted test runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
         # The fixture lowest zone price is 0.25 USD/h for every type and region; the region column has no number.
