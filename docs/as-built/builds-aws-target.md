@@ -1189,7 +1189,7 @@ A region filter at the top of the page shows all regions by default; the user as
    One region has no column scale or column box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
-6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=merge-gate`.
+6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=gate`. An old link with `runs=merge-gate` still opens the gate runs.
 
 ### Billed hours check
 

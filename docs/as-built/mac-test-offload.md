@@ -506,7 +506,7 @@ Use `mac_run.sh --manual` to request a manual Hana run.
 Use `mac_test.py free-now --target mac --manual` to check capacity for a manual Mac command.
 These commands skip the switch and still check capacity.
 Automated commands omit `--manual` and use the switch.
-The nightly slot sweep is an automated command.
+The nightly build folder sweep is an automated command.
 For commands from `mac_queue_run.py`, the reply that supplies the assignment also authorizes launch.
 The service can repeat that reply to the same coordinator for the same source and command.
 An adapter claim authorizes launch through the first reply to its claim request.
