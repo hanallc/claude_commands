@@ -2144,10 +2144,6 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
     return log
 
 
-class NoClaudeExpiry(Enum):
-    IN_WINDOW = "no forecast in the alert window"
-
-
 @dataclass(frozen=True)
 class ClaudeExpirySchedule:
     lead: timedelta
@@ -2160,7 +2156,7 @@ class NoClaudeExpirySchedule(Enum):
 
 def _claude_expiry_schedule() -> ClaudeExpirySchedule | NoClaudeExpirySchedule:
     settings = conf.read(CONFIG)
-    keys = ("claude_expiry_alert_hours", "claude_expiry_repeat_hours")
+    keys = ("claude_expiry.alert_hours", "claude_expiry.repeat_hours")
     if isinstance(settings.settings, dict) and not any(settings.effective_key(key) in settings.settings for key in keys):
         return NoClaudeExpirySchedule.CONFIGURED
     try:
@@ -2173,26 +2169,59 @@ def _claude_expiry_schedule() -> ClaudeExpirySchedule | NoClaudeExpirySchedule:
     return ClaudeExpirySchedule(timedelta(hours=lead), timedelta(hours=repeat))
 
 
-def _claude_expiry_time(readings: list[run_out.Reading], now: datetime,
-                        deadline: datetime) -> datetime | NoClaudeExpiry:
-    latest = next((reading for reading in reversed(readings) if reading.at <= now), None)
+WEEKLY_EMPTY_FORMAT = "%a %m-%d %H:%M %Z"
+
+
+@dataclass(frozen=True)
+class WeeklyForecast:
+    used_per_hour: float
+    empty_at: datetime | None
+    lasts_to_deadline: bool
+
+
+def weekly_forecast(readings: list[run_out.Reading], now: datetime,
+                    reset: datetime | None, *, current: run_out.Reading) -> WeeklyForecast | None:
+    """Estimate weekly use from readings in the current window."""
+    if not now - run_out.MAX_GAP <= current.at <= now or not 0 <= current.used_percent < 100:
+        return None
+    latest = next((reading for reading in reversed(readings) if reading.at <= current.at), None)
     if latest is None or now - latest.at > run_out.MAX_GAP:
-        return NoClaudeExpiry.IN_WINDOW
-    rate = run_out.weighted_rate(readings, latest.at.timestamp())
+        return None
+    start = reset - timedelta(weeks=1) if reset is not None else None
+    if (reset is not None and reset <= now) or (start is not None and current.at < start):
+        return None
+    readings = [reading for reading in readings
+                if (start is None or start <= reading.at) and reading.at < current.at] + [current]
+    # A refill can start a new window before the scheduled reset.
+    for end in range(len(readings) - 1, 0, -1):
+        if readings[end].used_percent < readings[end - 1].used_percent:
+            readings = readings[end:]
+            break
+    rate = run_out.weighted_rate(readings, current.at.timestamp())
     if rate is None or not math.isfinite(rate) or rate <= 0:
-        return NoClaudeExpiry.IN_WINDOW
-    seconds = (100 - latest.used_percent) / rate
-    if not (now - latest.at).total_seconds() < seconds < (deadline - latest.at).total_seconds():
-        return NoClaudeExpiry.IN_WINDOW
-    return latest.at + timedelta(seconds=seconds)
+        return None
+    seconds = (100 - current.used_percent) / rate
+    empty_at = None
+    lasts_to_deadline = reset is not None and seconds >= (reset - current.at).total_seconds()
+    if reset is not None and not lasts_to_deadline and (now - current.at).total_seconds() < seconds:
+        empty_at = current.at + timedelta(seconds=seconds)
+    return WeeklyForecast(rate * 3600, empty_at, lasts_to_deadline)
 
 
-def _expiry_note_window(note: AgentNote, now: datetime) -> note_file.KnownReset | NoClaudeExpiry:
-    left, reset = note_file.remaining(note), reset_time(note.get("resets"))
-    if (note_file.in_use(note) and isinstance(reset, note_file.KnownReset) and reset.value > now
-            and left is not None and 0 < left <= 100):
-        return reset
-    return NoClaudeExpiry.IN_WINDOW
+def _expiry_current_reading(note: AgentNote, readings: list[run_out.Reading],
+                            now: datetime, left: float) -> run_out.Reading | None:
+    observed = reset_time(note.get("weekly_usage_checked_at"))
+    if isinstance(observed, note_file.InvalidReset):
+        return None
+    cutoff = observed.value if isinstance(observed, note_file.KnownReset) else now
+    latest = next((reading for reading in reversed(readings) if reading.at <= cutoff), None)
+    # The log retains more precision than the note for the same observation.
+    if (latest is not None and (isinstance(observed, note_file.NoResetKnown) or latest.at == cutoff)
+            and math.isclose(left, 100 - latest.used_percent, rel_tol=5e-6)):
+        return latest
+    if isinstance(observed, note_file.KnownReset):
+        return run_out.Reading(observed.value, 100 - left)
+    return None
 
 
 def _expiry_attempt_time() -> datetime:
@@ -2203,11 +2232,15 @@ def _send_claude_expiry(note: AgentNote, readings: list[run_out.Reading],
                         now: datetime, schedule: ClaudeExpirySchedule) -> list[str]:
     from scripts.notify.push_texts import render
 
-    reset = _expiry_note_window(note, now)
-    if not isinstance(reset, note_file.KnownReset):
+    left, reset = note_file.remaining(note), reset_time(note.get("resets"))
+    if (not note_file.in_use(note) or not isinstance(reset, note_file.KnownReset) or reset.value <= now
+            or left is None or not 0 < left <= 100):
         return []
-    empty_at = _claude_expiry_time(readings, now, min(reset.value, now + schedule.lead))
-    if not isinstance(empty_at, datetime):
+    current = _expiry_current_reading(note, readings, now, left)
+    if current is None:
+        return []
+    forecast = weekly_forecast(readings, now, reset.value, current=current)
+    if forecast is None or forecast.empty_at is None or forecast.empty_at >= now + schedule.lead:
         return []
     label = note.label
     try:
@@ -2217,7 +2250,7 @@ def _send_claude_expiry(note: AgentNote, readings: list[run_out.Reading],
         return []
     if silence.active():
         return []
-    display = empty_at.astimezone(user_zone()).strftime("%a %m-%d %H:%M %Z")
+    display = forecast.empty_at.astimezone(user_zone()).strftime(WEEKLY_EMPTY_FORMAT)
     push = render("quota.claude_expiry", account=label, empty_at=display)
     with state_file() as state:
         at = _expiry_attempt_time()

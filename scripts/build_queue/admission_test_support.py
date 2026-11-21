@@ -724,7 +724,8 @@ class AdmissionFixture(ExitStack):
             capture_output=True, timeout=3, check=False)
         if probe.returncode:
             raise unittest.SkipTest("real transient scope needs a user systemd manager")
-        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
+        child: subprocess.Popen[bytes] = subprocess.Popen([
+            "systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no", f"--unit={unit}",
             "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         def stop() -> None:
             _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,

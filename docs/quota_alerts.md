@@ -12,12 +12,12 @@ Natedev sends both Claude quota pushes.
 The quota check forecasts when each in-use Claude account will run out of weekly usage.
 It divides the weekly percentage left by the recent rate and adds that duration to the reading's time.
 The forecast needs a positive rate, a recent reading, and a known future reset.
-The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry_alert_hours` away.
+The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry.alert_hours` away.
 Scheduled moves suppress the push when they cover every group on that account.
 Consumed moves give no coverage.
 The push title is `<account> runs out <time>`, with the forecast time in the user's zone.
 Its action is `Type /agents move <role> <account>`, and it has no body.
-The repeat interval starts at the attempt time and uses `claude_expiry_repeat_hours`.
+The repeat interval starts at the attempt time and uses `claude_expiry.repeat_hours`.
 Both keys are in `config/showrunners.conf`.
 The lead time is 12 hours and the repeat interval is 2 hours.
 During silence, the quota check skips the expiry push and saves no attempt.
