@@ -4840,10 +4840,10 @@ class ServiceTests(unittest.TestCase):
             fixture.hold_starts()
             older = fixture.request(since=fixture.clock.now() - 1)
             _ = fixture.server.handle_request(older)
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "session-b",
                                               "BUILDLOG_UNIT": "a"}):
-                request = replace(request, identity=client.step_identity("merge-gate", request.cwd))
+                request = replace(request, identity=client.step_identity("gate", request.cwd))
             _ = fixture.server.handle_request(request)
             younger = fixture.request(since=fixture.clock.now() + 1)
             younger = replace(younger, identity=replace(younger.identity, unit="a"))

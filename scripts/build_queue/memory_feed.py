@@ -990,7 +990,7 @@ def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members:
             **page_owner_labels(label, unit=unit, caller=caller),
             **call_notes(verify, identity.step,
                          build_command_call(copied.arguments) if isinstance(copied, CopiesRunCommand) else ""),
-            **job_notes(job, names, step="" if legacy_gate else identity.step,
+            **job_notes(job, names, step="gate" if legacy_gate else identity.step,
                         verify=verify, kind="repository-slot"),
             "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
             "reason": slot.wait.text, "fits": False, "why": "build slot", "runs_on": slot.machine}

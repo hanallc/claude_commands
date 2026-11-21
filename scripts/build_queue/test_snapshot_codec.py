@@ -151,7 +151,7 @@ class SnapshotCodecTests(unittest.TestCase):
                 reservation = fixture_reservation(42, GIB)
                 reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
                     "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": reserved})
-                facts = records.EndedStepFacts("merge-gate", "hana", "hana", "/fixture/hana", member.id,
+                facts = records.EndedStepFacts("gate", "hana", "hana", "/fixture/hana", member.id,
                                                caller_name=stored)
                 held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
                 current = replace(inputs, reservations=(reservation,), slots=(held,))
