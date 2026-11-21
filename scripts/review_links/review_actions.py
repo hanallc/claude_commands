@@ -227,18 +227,18 @@ def later(item: review_items.ReviewItem, value: str, words: str, *,
 
 
 def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save: Callable[[], object],
-         status: change_page.DeliveryStatus, *, question_text: str = '',
+         status: change_page.DeliveryStatus, *, recipient: staff.StaffId, question_text: str = '',
          scoped: ScopedWait | NoScopedWait = NO_SCOPED_WAIT) -> change_page.MessageDelivery:
-    """Save the action and its message under one delivery claim, then deliver it to the owner."""
+    """Save the action and its message under one delivery claim, then deliver it to the recipient."""
     question: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
     if question_text:
         identity = scoped.token if isinstance(scoped, ScopedWait) else secrets.token_hex(4)
         key = scoped.key if isinstance(scoped, ScopedWait) else item.key
         question = change_page.OpenQuestion(identity, question_text, change_page.NoDelivery())
         message = message.replace(change_page.reply_command(item.key), change_page.reply_command(key, identity))
-    saved: change_page.StoredReviewMessage = {'saved':False,'source':str(path),'owner':item.owner,'message':message,'row':row}
+    saved: change_page.StoredReviewMessage = {'saved':False,'source':str(path),'owner':recipient,'message':message,'row':row}
     page = change_page.ReviewMessagePage(path,path.parent,(row,),'',saved)
-    return save_delivery(page, item.owner, save, status, question)
+    return save_delivery(page, recipient, save, status, question)
 
 
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
@@ -312,7 +312,7 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
                   question: change_page.NoQuestion | change_page.OpenQuestion) -> change_page.MessageDelivery:
     row = page.rows[0]
     with status.locked():
-        previous_page = status.metadata_page(page)
+        previous_page = status.metadata_page(change_page.ReviewPage(page.review_list, page.production, page.rows, page.token))
         previous_slots = status.slots(page, row)
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt,'verdict',recipients=(owner,))
@@ -373,12 +373,19 @@ def investigation_action(item: review_items.ReviewItem, action: str, words: str,
     if action == 'question':
         message += '\nAnswer with this command:\n'+change_page.reply_command(item.key)
     path = source.path
-    delivery = send(item,path,record.id,message,save,status,question_text=words if action == 'question' else '', scoped=scoped)
+    delivery = send(item,path,record.id,message,save,status,recipient=item.owner,
+                    question_text=words if action == 'question' else '', scoped=scoped)
     return delivery,('question sent' if action == 'question' else 'feedback sent')
 
 
+def approval_assignees(members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """List the current showrunners and unit directors by name."""
+    return tuple(sorted(staff.active(members, 'showrunner') + staff.active(members, 'unit'),
+                        key=lambda member: (member.name.casefold(), member.id)))
+
+
 def decision_action(item: review_items.ReviewItem, action: str, words: str,
-                    status: change_page.DeliveryStatus, *,
+                    status: change_page.DeliveryStatus, *, assignee: str = '',
                     verify_revision: Callable[[], object] | None = None
                     ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     """Apply Approve, Decline, Send feedback or Ask question to a proposal or an efficiency."""
@@ -386,12 +393,27 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
     if action in ('feedback','question') and not words.strip():
         raise question_record.AnswerRefused('enter your words')
     waiting = item.state == review_items.ReviewState.WAITING
-    answer = ('approved, sent to '+review_items.name(item.owner,staff.snapshot()) if action == 'approve' else
-              {'decline':'declined','feedback':'feedback sent','question':'question sent'}[action])
+    recipient = item.owner
+    approve_proposal_for_unit = False
     logged = {'feedback':'feedback sent','question':'question','approve':'Approve','decline':'Decline'}[action]
+    message = message_text(item,action,words)
+    if action == 'approve':
+        members = staff.snapshot()
+        if assignee:
+            assigned = next((member for member in approval_assignees(members) if member.id == assignee), None)
+            if assigned is None:
+                raise question_record.AnswerRefused('Choose a current showrunner or unit director.')
+            approve_proposal_for_unit = isinstance(source, review_items.ProposalSource) and assigned.kind == 'unit'
+            recipient = assigned.id
+            answer = logged = f'approved, assigned to {assigned.name}'
+            if not approve_proposal_for_unit:
+                message += '\nThe user assigned this item to you.'
+        else:
+            answer = 'approved, sent to '+review_items.name(item.owner, members)
+    else:
+        answer = {'decline':'declined','feedback':'feedback sent','question':'question sent'}[action]
     logged += ': '+words if words else ''
     mark: MarkChange = ReviewMark.WAITING if action == 'question' else ReviewMark.DONE
-    message = message_text(item,action,words)
     events = (superseded_words(action), logged) if waiting else (logged,)
     if isinstance(source, review_items.EfficiencySource):
         identity = decision_store.efficiency_identity(item)
@@ -421,7 +443,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
                     resume_efficiency(item)
                 with review_items.after_store_write(item.key):
                     log_superseded(item, events[0])
-        delivery = send(item,efficiency_reviews.path(source.path),identity,message,save_efficiency,status,
+        delivery = send(item,efficiency_reviews.path(source.path),identity,message,save_efficiency,status,recipient=recipient,
                         question_text=words if action == 'question' else '')
     else:
         assert isinstance(source, review_items.ProposalSource)
@@ -430,7 +452,9 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
         scoped = (ScopedWait(review_submissions.submission_key(new_item_dialog.SubmissionKind.PROPOSAL,
                              staff.StaffId(source.record.value('proposed_by')), source.record.value('proposal_id'), origin.request_id))
                   if isinstance(origin, new_item_dialog.ReviewSubmission) else NO_SCOPED_WAIT)
-        if action == 'approve':
+        if approve_proposal_for_unit:
+            message += '\nThe user approved the proposal and assigned it to you. The approval is recorded.'
+        elif action == 'approve':
             message += ('\nApprove accepts the proposed ranking; the words above can change a value. Record it:\n'
                         +PY+'production/proposal_issue.py approve '+shlex.quote(str(issue))+' --by user --unit <staff id>')
         elif action == 'decline':
@@ -438,7 +462,9 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
 
         def save() -> None:
             day = datetime.now(user_zone()).date()
-            if action == 'decline':
+            if approve_proposal_for_unit:
+                proposal_issue.approve_from_review(issue, recipient, day, events, check=verify_revision)
+            elif action == 'decline':
                 _ = proposal_issue.edit(issue, {'style_answer':'declined', 'style_answer_words':words},
                                         day, check=verify_revision)
                 with review_items.after_store_write(item.key):
@@ -450,5 +476,6 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
             if waiting:
                 with review_items.after_store_write(item.key):
                     log_superseded(item, events[0])
-        delivery = send(item,issue,issue.stem,message,save,status,question_text=words if action == 'question' else '', scoped=scoped)
+        delivery = send(item,issue,issue.stem,message,save,status,recipient=recipient,
+                        question_text=words if action == 'question' else '', scoped=scoped)
     return delivery,answer

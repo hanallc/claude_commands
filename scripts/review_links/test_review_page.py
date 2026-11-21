@@ -40,7 +40,7 @@ from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
-from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_page
+from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
@@ -70,6 +70,8 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
             entry['waitingWhy'] = why
         if len(row) > 13 and row[13] is True:
             entry['type'] = review_items.ReviewType.RESPONSE
+        if len(row) > 14 and isinstance(action_status := row[14], str):
+            entry['actionStatus'] = action_status
         entries.append(entry)
     return entries
 
@@ -308,7 +310,8 @@ window.fetch=(url,options)=>{
  check(responses.previousElementSibling===chip('type','question') &&
   responses.nextElementSibling===chip('type','change') && responses.textContent.trim()==='Responses 1',
   'Responses has a count between Questions and Changes.');
- check(chip('show','Validating').hidden && !chip('show','Done') && selected('show')===chip('show','open'),
+ check(chip('show','Validating').hidden && chip('show','Done')?.querySelector('b').textContent==='0' &&
+  selected('show')===chip('show','open'),
   'Responses uses Open when Validating was selected.');
  const row=rows().find(item=>item.dataset.type==='response');
  chip('owner',row.dataset.owner).click();
@@ -2275,7 +2278,9 @@ window.fetch=(url,options)=>{
 addEventListener('error',event=>window.coldErrors.push(event.message));
 addEventListener('unhandledrejection',event=>window.coldErrors.push(String(event.reason)));
 const measuredFetch=fetch;window.fetch=async(url,options)=>{
- if(new URL(url,location.href).searchParams.get('body')==='page-owner/C399' && window.coldBodyMounts===undefined){
+ const fields=new URL(url,location.href).searchParams;
+ if(fields.has('index') && fields.get('for-you')!=='1') throw new Error('The Review index request must include For you.');
+ if(fields.get('body')==='page-owner/C399' && window.coldBodyMounts===undefined){
   window.coldBodyMounts=document.querySelectorAll('[data-list-item]').length;
   const response=measuredFetch(url,options);
   await new Promise(resolve=>{window.releaseColdBody=resolve;});
@@ -2624,7 +2629,198 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
     def test_review_state_row_starts_with_all(self) -> None:
         markup = review_page.render(self.root).decode()
         self.assertEqual(re.findall(r'data-show-chip="([^"]+)" aria-pressed="[^"]+">([^<]+) <b>', markup),
-                         [('all', 'All'), ('open', 'Open'), ('Waiting', 'Waiting'), ('Validating', 'Validating')])
+                         [('all', 'All'), ('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('Validating', 'Validating')])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_for_you_notifier_copy_done_and_rebuild_keep_the_review_draft(self) -> None:
+        _ = self.question()
+        opened = for_you.ForYouRow(f'action/{uuid4()}', 'action', 'Restore GitHub access', 'cd /tmp\ngithub-warmup',
+                                   'natedev', '/tmp', 'builder-unit', 'The login needs your browser.',
+                                   'The release check', '2026-11-17T15:00:00+00:00', 'open', 'manual', '')
+        completed = replace(opened, key=f'action/{uuid4()}', title='Completed action', status='done')
+        rebuild = replace(opened, key='rebuild/natedev', kind='rebuild', title='Rebuild natedev', completion='automatic')
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed, rebuild), ())):
+            payload = console.for_you_payload()
+            review = browser_markup(self.root)
+        review = review.replace('<head>', r"""<head><script>
+window.copied='';
+Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{window.copied=text;}}});
+window.fetch=async(_url,options)=>options?.method==='POST'
+ ? Response.json({answer:'Done',state:'Done'})
+ : new Response(null,{status:304});
+</script>""", 1)
+        pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
+                                     console.AvailablePage('/console/review.html')),
+                 console.ConsolePage('list', 'List', 'list-checks', 'List', console.AvailablePage('/console/list.html')))
+        list_counts = ''.join(list_page.count_link(alias, path+'#showrunner=page-owner', alias)
+                              for alias, path in (('changes', '/console/changes.html'),
+                                                  ('questions', '/console/changes.html?type=questions')))
+        list_html = change_page.document(list_counts+'<img hidden src="/list-load">', 'List fixture')
+        error_html = change_page.document('<p data-review-unavailable>The Review page is not available.</p>')
+        shell = console.render(pages, console.AvailablePage('/console/rebuilds.html')).decode()
+        shell = shell.replace('<head>', r"""<head><script>
+const sendProbe=fetch;
+window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resolve(Response.json(NOTIFIER)) :
+ String(url).endsWith('/console/news') ? Promise.resolve(Response.json({new:[]})) : sendProbe(url,options);
+</script>""".replace('NOTIFIER', json.dumps(payload).replace('</', '<\\/')), 1)
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const until=async(predicate,label)=>{
+  const end=performance.now()+8000;
+  while(!predicate()){
+   if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const frame=document.querySelector('[data-console-page=review]');
+ const review=()=>frame.contentDocument;
+ const row=key=>review().querySelector('[data-list-item][data-key="'+key+'"]');
+ const chip=value=>review().querySelector('[data-show-chip="'+value+'"]');
+ const count=value=>Number(chip(value).querySelector('b').textContent);
+ const rows=()=>[...review().querySelectorAll('[data-list-item][data-type="for-you"]:not([hidden])')];
+ const expanded=key=>row(key)?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true';
+ const detail=key=>frame.contentWindow.recordDetails(row(key));
+ const draft=()=>detail('page-owner/C1')?.querySelector('textarea');
+ const words='Keep these unsent words.';
+ const nav=page=>document.querySelector('[data-page='+page+']');
+ const list=()=>document.querySelector('[data-console-page=list]')?.contentDocument;
+ const aliasLink=alias=>list()?.querySelector('a[href*="page='+alias+'&"]');
+ const selectedType=type=>review().querySelector('[data-type-chip="'+type+'"][aria-pressed="true"]');
+ try{
+  await until(()=>review().readyState==='complete' && review().querySelector('[data-review-unavailable]'),
+   'the failed Review document');
+  const failed=review();
+  check(typeof frame.contentWindow.consoleNavigate==='undefined','The error page does not register navigation.');
+  nav('list').click();
+  await until(()=>list()?.readyState==='interactive' && aliasLink('questions'),'the interactive List document');
+  aliasLink('questions').click();
+  await until(()=>review()!==failed && review().querySelector('[data-review-loading]'),'the second Review request');
+  check(review().readyState==='loading','The second Review document waits for the fixture.');
+  check(frame.contentWindow.location.hash.startsWith('#') && !frame.contentWindow.location.search,
+   'The alias reloads Review at a fragment URL.');
+  nav('list').click();
+  aliasLink('questions').click();
+  nav('list').click();
+  aliasLink('changes').click();
+  await fetch('/release-pages');
+  await until(()=>selectedType('change'),'the last requested alias');
+  check(review()!==failed && !frame.hidden,'The alias replaces the 503 document.');
+  const original=review();
+  row('page-owner/C1').querySelector('.list-toggle').click();
+  await until(draft,'the draft field');
+  draft().value=words;
+  draft().dispatchEvent(new frame.contentWindow.Event('input',{bubbles:true}));
+  [...document.querySelectorAll('[data-for-you-toggle]')].find(button=>button.getClientRects().length).click();
+  const cardLink=()=>document.querySelector('[data-for-you-entries] [data-key="'+KEY+'"] a');
+  await until(cardLink,'the notifier card link');
+  cardLink().click();
+  await until(()=>expanded(KEY) && detail(KEY)?.querySelector('[data-copy-code]'),'the selected action body');
+  check(review()===original,'The notifier keeps the Review document.');
+  const chips=[...review().querySelectorAll('[data-type-chip]')];
+  check(chips[0].dataset.typeChip==='' && chips[1].dataset.typeChip==='for-you','For you follows All.');
+  check(chips[1].getAttribute('aria-pressed')==='true' && chips[1].querySelector('b').textContent==='2',
+        'The notifier selects For you with two open rows.');
+  detail(KEY).querySelector('[data-copy-code]').click();
+  check(frame.contentWindow.copied===COMMAND && detail(KEY).querySelector('[value=done]')?.disabled===false,
+        'Copy keeps the action open.');
+  check(count('open')===2 && rows().length===2 && count('Done')===1,'The initial counts match the rows.');
+  detail(KEY).querySelector('[value=done]').click();
+  const notice=()=>review().querySelector('[data-hidden-action-status]').textContent;
+  await until(()=>notice()==='Saved: Done','the saved notice');
+  check(!row(KEY) && count('open')===1 && rows().length===1,'Open loses the completed action and its count.');
+  chip('Done').click();
+  check(count('Done')===2 && rows().length===2 && row(KEY)?.dataset.state==='Done' && row(COMPLETED),
+        'Done gains the completed action and its count.');
+  chip('all').click();
+  check(count('all')===3 && rows().length===3 && row(KEY),'All keeps the completed action.');
+  row(REBUILD).querySelector('.list-toggle').click();
+  const details=()=>detail(REBUILD)?.querySelector('a[target="_top"]');
+  await until(details,'the rebuild details link');
+  details().click();
+  check(new URL(location.href).searchParams.get('page')==='rebuilds' && frame.hidden && review()===original,
+        'Rebuild details selects Rebuilds and keeps the Review frame.');
+  document.querySelector('[data-page=review]').click();
+  check(expanded(REBUILD),'Review keeps the selected rebuild card.');
+  for(const [alias,type] of [['questions','question'],['changes','change']]){
+   nav('list').click();
+   aliasLink(alias).click();
+   await until(()=>selectedType(type),'the Review filter for '+alias);
+   check(new URL(location.href).searchParams.get('page')==='review' && !frame.hidden && review()===original,
+    'The List '+alias+' link selects the existing Review frame.');
+   check(review().querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerName==='page-owner',
+    'The List '+alias+' link keeps the selected owner.');
+  }
+  row('page-owner/C1').querySelector('.list-toggle').click();
+  await until(draft,'the restored draft field');
+  check(draft().value===words,'Review keeps the draft after navigation.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for name, value in (('KEY', opened.key), ('COMMAND', opened.command), ('COMPLETED', completed.key),
+                            ('REBUILD', rebuild.key)):
+            probe = probe.replace(name, json.dumps(value))
+        shell_html = shell.replace('</body>', probe+'<img hidden src="/complete"></body>', 1).encode()
+        review_head, review_body = review.split('</head>', 1)
+        review_start = (review_head+'</head><body><span hidden data-review-loading></span>').encode()
+        review_end = review_body.removeprefix('<body>').encode()
+        results: list[list[str]] = []
+        review_requests: list[tuple[int, str]] = []
+        released, complete = threading.Event(), threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = urlsplit(self.path).path
+                if path == '/complete':
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                elif path == '/list-load':
+                    _ = released.wait(TEST_HANG_GUARD_SECS)
+                elif path == '/release-pages':
+                    released.set()
+                status = 200
+                if path == '/console/review.html':
+                    status = 200 if review_requests else 503
+                    review_requests.append((status, self.path))
+                    body = review_start if status == 200 else error_html
+                else:
+                    body = {'/console/': shell_html, '/console/list.html': list_html,
+                            '/console/rebuilds.html': b'<h1>Rebuilds</h1>'}.get(path, b'')
+                self.send_response(status)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                _ = self.wfile.write(body)
+                if path == '/console/review.html' and status == 200:
+                    _ = released.wait(TEST_HANG_GUARD_SECS)
+                    _ = self.wfile.write(review_end)
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                released.set()
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with tempfile.TemporaryDirectory() as profile:
+                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                        '--window-size', '1440,900', '--screenshot', str(Path(profile)/'page.png'),
+                        f'http://127.0.0.1:{server.server_port}/console/?page=review'],
+                        capture_output=True, text=True, timeout=45)
+                self.assertEqual(done.returncode, 0, done.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
+        self.assertEqual(review_requests, [(503, review_page.PAGE_PATH), (200, review_page.PAGE_PATH)])
 
     def test_validating_change_has_a_card_and_uses_only_a_saved_handoff_time(self) -> None:
         key = 'page-owner/C1'
@@ -2939,7 +3135,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertTrue(all(item.actions for item in actionable))
         self.assertEqual(review_items.read(self.root, show='open'), actionable)
         self.assertEqual(review_page.SHOWS,
-                         (('all', 'All'), ('open', 'Open'), ('Waiting', 'Waiting'), ('Validating', 'Validating')))
+                         (('all', 'All'), ('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('Validating', 'Validating')))
         for spelling in ('For you', 'for-you', 'for you'):
             with self.subTest(spelling=spelling):
                 markup = review_page.render(self.root, show=spelling).decode()
@@ -3100,7 +3296,7 @@ window.fetch=async(url,options)=>{
  try{
   await flush();
   check([...document.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip).join('|')===
-    'all|open|Waiting|Validating','The State chips appear in the required order.');
+    'all|open|Waiting|Done|Validating','The State chips appear in the required order.');
   check(selected('open'),'exactly one Open chip starts pressed');
   check(exactKeys('open'),'F020: Open mounts the exact Open keys');
   check(noMountedKey(EXPECTED.doneKey),'F064: Open does not mount the Done investigation');
@@ -3108,11 +3304,11 @@ window.fetch=async(url,options)=>{
   check(noMountedState('Done'),'F064: the initial Open view mounts no Done rows');
   check(noMountedKey(EXPECTED.Validating[0]),'Open must not mount the active check.');
   check(count('open')?.textContent==='6' && count('Waiting')?.textContent==='2' && count('Validating')?.textContent==='1' &&
-    !chip('Done') && count('all')?.textContent==='9',
+    count('Done')?.textContent==='0' && count('all')?.textContent==='9',
     'F001: Open shows complete counts, including the active check in Validating');
-  check(Number(count('all').textContent)===['open','Waiting','Validating']
+  check(Number(count('all').textContent)===['open','Waiting','Done','Validating']
     .reduce((sum,state)=>sum+Number(count(state).textContent),0),
-    'The Open, Waiting and Validating counts add up to All.');
+    'The State counts add up to All.');
   check(chip('Validating') && getComputedStyle(chip('Validating')).opacity==='1',
     'A nonzero Validating chip has full opacity.');
   const search=document.querySelector('#list-search');
@@ -3202,7 +3398,7 @@ window.fetch=async(url,options)=>{
   check(selected('Validating') && new URLSearchParams(location.hash.slice(1)).get('show')==='Validating',
     'A State chip changes the pressed state and address.');
   check(exactKeys('Validating'),'Validating shows the active check.');
-  check(['all','open','Waiting','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|1',
+  check(['all','open','Waiting','Done','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|0|1',
     'State counts exclude the completed investigation.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(selected('Validating') && new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version'),
@@ -3221,7 +3417,7 @@ window.fetch=async(url,options)=>{
     'Open retains the two decision rows after a Show load');
   }
   chip('all')?.click();await flush();await flush();
-  check(['all','open','Waiting','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|1' &&
+  check(['all','open','Waiting','Done','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|0|1' &&
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
@@ -3246,7 +3442,7 @@ window.fetch=async(url,options)=>{
   check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
     groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
     'Show follows Type and Owner follows Show');
-  check(buttons.length===4 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
+  check(buttons.length===5 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
     'Show chips use native keyboard buttons in tab order');
   chip('all')?.focus();
   check(document.activeElement===chip('all'),'a Show chip accepts keyboard focus');
@@ -3438,7 +3634,7 @@ window.fetch=async(url,options)=>{
  try{
   await flush();
   check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
-  check(counts('[data-show-chip]')==='4|3|1|0','The index counts states outside the rendered view.');
+  check(counts('[data-show-chip]')==='4|3|1|0|0','The index counts states outside the rendered view.');
   const allCount=show('all').querySelector('b');
   const nativeNow=Date.now,deadline=Date.parse(LATER_DEADLINE);
   let crossedDeadline=false;
@@ -3451,10 +3647,10 @@ window.fetch=async(url,options)=>{
     crossedDeadline=true;
    }});
    search('Later count fixture');
-   check(crossedDeadline && counts('[data-show-chip]')==='0|0|0|0',
+   check(crossedDeadline && counts('[data-show-chip]')==='0|0|0|0|0',
     'State counts add up when a Later item becomes eligible after the All count.');
    search('Later count fixture');
-   check(counts('[data-show-chip]')==='1|0|1|0','The next render counts the Waiting item.');
+   check(counts('[data-show-chip]')==='1|0|1|0|0','The next render counts the Waiting item.');
   }finally{
    delete allCount.textContent;
    Date.now=nativeNow;
@@ -3466,33 +3662,33 @@ window.fetch=async(url,options)=>{
   const chooseOwner=value=>ownerChip(value).click();
   show('all').click();await flush();await flush();
   chooseOwner(builder);
-  check(counts('[data-show-chip]')==='1|0|1|0','Show counts use the selected owner.');
+  check(counts('[data-show-chip]')==='1|0|1|0|0','Show counts use the selected owner.');
   check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
    'Type counts use the selected owner.');
   type('change').click();
-  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|2|0|0',
+  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|2|0|0|0',
    'F007: an owner without the selected type resets to All.');
   type('investigation').click();
   chooseOwner(builder);show('open').click();await flush();await flush();
-  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='1|0|1|0' &&
+  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='1|0|1|0|0' &&
    [...document.querySelectorAll('[data-list-item]')].every(row=>row.hidden),
    'F007: the user case keeps an owner with rows in another Show.');
   show('all').click();await flush();await flush();
-  check(counts('[data-show-chip]')==='1|0|1|0','Show counts combine the type and owner.');
+  check(counts('[data-show-chip]')==='1|0|1|0|0','Show counts combine the type and owner.');
   search('gate');
-  check(counts('[data-show-chip]')==='1|0|1|0' && ownerChip('').textContent==='All 1',
+  check(counts('[data-show-chip]')==='1|0|1|0|0' && ownerChip('').textContent==='All 1',
    'All counts combine the words, owner, type and Show filters.');
   search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
   type('change').click();
-  check(counts('[data-show-chip]')==='2|2|0|0','Show counts use the selected type.');
+  check(counts('[data-show-chip]')==='2|2|0|0|0','Show counts use the selected type.');
   search('Numbered');
-  check(counts('[data-show-chip]')==='1|1|0|0','Show counts use the words filter.');
+  check(counts('[data-show-chip]')==='1|1|0|0|0','Show counts use the words filter.');
   check(type('change').querySelector('b').textContent==='1' && type('question').querySelector('b').textContent==='0',
    'Type counts use the words filter and Show.');
   check(selectedOwner().textContent==='All 1',
    'Owner counts use the type, Show and words.');
   search('no matching title');
-  check(counts('[data-show-chip]')==='0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
+  check(counts('[data-show-chip]')==='0|0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
    selectedOwner().textContent==='All 0',
    'An empty filtered view has zero in every applicable count.');
   search('');show('all').click();await flush();await flush();
@@ -3503,12 +3699,12 @@ window.fetch=async(url,options)=>{
   const form=recordDetails(row).querySelector('form');form.elements.feedback.value='Use the first layout.';
   form.requestSubmit(form.querySelector('[value="answer"]'));
   await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(counts('[data-show-chip]')==='0|0|0|0','A save removes the completed entry from all State counts.');
+  check(counts('[data-show-chip]')==='0|0|0|0|0','A save removes the completed entry from all State counts.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   await flush();await flush();
-  check(counts('[data-show-chip]')==='0|0|0|0','A refresh retains the saved state from the server index.');
+  check(counts('[data-show-chip]')==='0|0|0|0|0','A refresh retains the saved state from the server index.');
   type('change').click();
-  check(counts('[data-show-chip]')==='2|1|0|1','A refresh replaces an unsaved entry in the index.');
+  check(counts('[data-show-chip]')==='2|1|0|0|1','A refresh replaces an unsaved entry in the index.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/result',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('LATER_DEADLINE', json.dumps(deadline.isoformat()))
@@ -3754,8 +3950,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         done_key = f'investigation/{ready.owner}/{ready.id}'
         waiting_key = f'investigation/{waiting.owner}/{waiting.id}'
         done = review_page.render(self.root, show='Done').decode()
-        self.assertIn('data-show="open"', done)
-        self.assertNotIn('data-show-chip="Done"', done)
+        self.assertIn('data-show="Done"', done)
+        self.assertIn('data-show-chip="Done" aria-pressed="true"', done)
         all_items = review_page.render(self.root, show='all').decode()
         self.assertNotIn(done_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
         self.assertIn(waiting_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
@@ -4588,6 +4784,149 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                                 for entry in saved.log))
             self.assertEqual(review_later.times()[key], until)
 
+    def test_decision_cards_list_current_assignees_in_role_colors(self) -> None:
+        proposal, efficiency = self.decisions()
+        runner = fixture_member('showrunner', name='air', doc=staff.DocUnfilled())
+        worker = fixture_member('worker', name='worker', parent=self.fixture.unit.id)
+        wrapped = fixture_member('showrunner', name='wrapped',
+                                 doc=staff.WrappedDoc(local_machine(), self.fixture.temporary / 'wrapped.md'))
+        snapshot = review_page.build_snapshot(self.root)
+        expected = [
+            (runner.id, ' style="color:#a379fd"', runner.name),
+            (self.fixture.unit.id, ' style="color:#ffaf02"', self.fixture.unit.name),
+            (self.fixture.showrunner_id, ' style="color:#a379fd"', 'page-owner'),
+        ]
+        for key in (proposal, efficiency):
+            with self.subTest(key=key):
+                body = snapshot.body(key).decode()
+                self.assertIn('>Approve</button><label class="action-select">Assign', body)
+                self.assertEqual(body.count('name="assignee"'), 1)
+                options = body.partition('<select name="assignee">')[2].partition('</select>')[0]
+                self.assertEqual(re.findall(r'<option value="([^"]*)"([^>]*)>([^<]+)</option>', options),
+                                 [('', '', 'page-owner decides'), *expected])
+                for member in (worker, wrapped):
+                    self.assertNotIn(member.id, options)
+
+    def test_explicit_approval_delivers_and_records_the_assignee(self) -> None:
+        proposal, efficiency = self.decisions()
+        path = Path(proposal.removeprefix('proposal/'))
+        second_path = path.with_name('P2.md')
+        _ = second_path.write_text(path.read_text().replace('P1', 'P2'))
+        second_proposal = 'proposal/'+str(second_path)
+        runner = fixture_member('showrunner', name='destination')
+        unit = fixture_member('unit', name='implementation', parent=runner.id)
+        for key, assignee in ((proposal, unit), (second_proposal, runner), (efficiency, runner)):
+            with self.subTest(key=key):
+                snapshot = review_page.build_snapshot(self.root)
+                request = self.card_body(snapshot, key, 'approve')+'&'+urlencode({'assignee': assignee.id})
+                with patch.object(proposal_issue, 'write_issue', wraps=proposal_issue.write_issue) as write:
+                    delivery, answer = review_page.submit(self.root, request, self.status, snapshot=snapshot)
+                expected = 'approved, assigned to '+assignee.name
+                self.assertEqual(answer, expected)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                self.assertEqual(delivery.recipients, (assignee.id,))
+                saved = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(saved.state, review_items.ReviewState.DONE)
+                self.assertEqual(saved.log[-1].words, expected)
+                if key == proposal:
+                    write.assert_called_once()
+                    assert isinstance(saved.source, review_items.ProposalSource)
+                    issue = saved.source.record
+                    self.assertEqual(issue.value('unit'), unit.id)
+                    self.assertEqual(issue.value('approved_in'), runner.id)
+                    self.assertEqual(issue.value('approved_by'), 'user')
+                    self.assertEqual([entry.words for entry in proposal_issue.review_log(issue)], [expected])
+                    self.assertIn('The user approved the proposal and assigned it to you.', delivery.message)
+                    self.assertIn('The approval is recorded.', delivery.message)
+                    self.assertNotIn('proposal_issue.py approve', delivery.message)
+                else:
+                    self.assertIn('The user assigned this item to you.', delivery.message)
+                    if key == second_proposal:
+                        assert isinstance(saved.source, review_items.ProposalSource)
+                        self.assertEqual(saved.source.record.value('unit'), '')
+                        self.assertIn('proposal_issue.py approve', delivery.message)
+                        self.assertIn(' --by user --unit <staff id>', delivery.message)
+                    else:
+                        self.assertIn('candidates.py outcome E1 accepted', delivery.message)
+                self.fixture.messages.clear()
+                change_page.deliver(delivery, self.status)
+                self.assertEqual([target for target, _, _ in self.fixture.messages], [assignee.name])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_approve_sends_the_assignment_after_refresh(self) -> None:
+        proposal, _ = self.decisions()
+        source = browser_markup(self.root)
+        setup = r"""<script>
+window.refreshMarkup=MARKUP;
+window.posts=[];
+const nativeFetch=fetch;
+window.fetch=async(url,options={})=>{
+ if(options.method!=='POST') return {ok:true,text:async()=>window.refreshMarkup};
+ if(url==='/results') return nativeFetch(url,options);
+ window.posts.push(new URLSearchParams(options.body));
+ return {ok:true,json:async()=>({answer:'approved',state:'Done'})};
+};
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        page = source.replace('<script>', setup+'<script>', 1)
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=()=>[...document.querySelectorAll('[data-list-item]')].find(node=>node.dataset.key===KEY);
+ const updates=document.querySelector('[data-show-record-updates]');
+ let revision=0;
+ window.transformFixtureBody=(text,key)=>{
+  if(key!==KEY) return text;
+  const panel=document.createElement('template');
+  panel.innerHTML=text;
+  panel.content.querySelector('[name="revision"]').value='fixture-'+revision;
+  if(revision===2){
+   const option=[...panel.content.querySelectorAll('[name="assignee"] option')]
+    .find(option=>option.value===ASSIGNEE);
+   option.remove();
+  }
+  return panel.innerHTML;
+ };
+ try{
+  row().querySelector('.list-toggle').click();
+  const original=await readyReviewCard(row());
+  const assignee=original.elements.assignee;
+  check(assignee.value==='' && assignee.selectedOptions[0].textContent==='page-owner decides',
+        'Assign starts with the card owner.');
+  assignee.value=ASSIGNEE;
+  assignee.dispatchEvent(new Event('change',{bubbles:true}));
+  const refresh=async shown=>{
+   revision++;
+   const offered=new Promise(resolve=>{
+    const observer=new MutationObserver(()=>{
+     if(!updates.hidden){observer.disconnect();resolve();}
+    });
+    observer.observe(updates,{attributes:true,attributeFilter:['hidden']});
+   });
+   const refreshed=new Promise(resolve=>document.querySelector('[data-review]')
+     .addEventListener('review-refreshed',resolve,{once:true}));
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await Promise.all([refreshed,offered]);
+   check(await readyReviewCard(row())===shown,'The form stays in place until Show updates.');
+   updates.click();
+   return readyReviewCard(row());
+  };
+  const form=await refresh(original);
+  check(form!==original && form.elements.assignee.value===ASSIGNEE,'Show updates keeps the assignment.');
+  const name=form.elements.assignee.selectedOptions[0].textContent;
+  const refreshed=await refresh(form);
+  const unavailable=refreshed.elements.assignee.selectedOptions[0];
+  check(refreshed!==form && unavailable.value===ASSIGNEE && unavailable.textContent===name+' — not available',
+        'Refresh keeps the unavailable assignee selected.');
+  refreshed.requestSubmit(refreshed.querySelector('[value="approve"]'));
+  check(window.posts.length===1 && window.posts[0].get('outcome')==='approve' &&
+        window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the unavailable assignee ID.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>""".replace('KEY', json.dumps(proposal)).replace('ASSIGNEE', json.dumps(self.fixture.unit.id))
+        self.assertEqual(firefox_probe_results((page+probe).encode()), [[]])
+
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
         _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
         proposal, efficiency = self.decisions()
@@ -4604,11 +4943,15 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
         for key, command in commands.items():
             with self.subTest(key=key, action='approve'):
-                delivery, result = review_page.submit(self.root, self.body(key, 'approve', 'Use it.'), self.status)
+                request = self.body(key, 'approve', 'Use it.')+'&assignee='
+                delivery, result = review_page.submit(self.root, request, self.status)
                 self.assertEqual(result, 'approved, sent to page-owner')
                 assert isinstance(delivery, change_page.MessageDelivery)
                 self.assertIn('Use it.', delivery.message)
                 self.assertIn(command, delivery.message)
+                self.fixture.messages.clear()
+                change_page.deliver(delivery, self.status)
+                self.assertEqual([target for target, _, _ in self.fixture.messages], ['page-owner'])
                 approved = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(approved.state, review_items.ReviewState.DONE, 'Approve makes the item Done at once.')
                 self.assertEqual(approved.log[-1].words, 'Approve: Use it.')
