@@ -739,6 +739,15 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     # Capture every scope before the loop applies current reservation ownership.
     unowned = gate.unowned_slice_memory([], processes, proc.path,
         activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+    has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
+    staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
+
+    def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
+        return records.queue_caller(evidence.session_id, "", evidence.session_name, "", evidence.folder,
+                                    members=staff_members, unit=unit)
+
+    unowned = tuple(replace(row, activity=replace(evidence, session_name=scope_caller(evidence).name))
+                    if isinstance(evidence := row.activity, ScopeProcesses) else row for row in unowned)
     members: dict[str, frozenset[int]] = {}
     workers: dict[str, frozenset[int]] = {}
     for reading in unowned:
@@ -772,10 +781,11 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         measured = gate.tree_memory(run.pid, run.start_time, processes, proc.path)
         if isinstance(measured, records.GoneMemory):
             continue
+        caller = scope_caller(evidence, place.unit)
         memory = records.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
-                                         pid=run.pid, activity=replace(evidence, run=live_run))
-        between.append(records.RunningStep(evidence.session_id, evidence.session_name, "between steps",
-            evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=place.unit))
+            pid=run.pid, activity=replace(evidence, run=live_run, session_name=caller.name))
+        between.append(records.RunningStep(caller.session_id, caller.name, "between steps",
+            evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=caller.unit))
     host = readings.host()
     # Retain all pressure values so a pending policy can use the same reading.
     pressure_policy = replace(plan.config.policy,
@@ -1284,6 +1294,7 @@ def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
 
 # systemd passes the first inherited socket at this descriptor.
 LISTEN_FD = 3
+ADMISSION_SOURCE_RELOAD = "BUILD_ADMISSION_SOURCE_RELOAD"
 
 
 def _notify(message: str) -> None:
@@ -1384,16 +1395,15 @@ class StateIntents:
 
 @dataclass(frozen=True)
 class ServiceEstimatedAdmission(wire.AdmitRequest):
-    """Retain service estimation for this connection without changing saved records."""
+    """Keep the runner separate from the unit used for priority."""
+    runner: str = field(kw_only=True)
 
 
 def wait_line_name(waiting: WaitingAdmission) -> str:
     """Name a queued build from its recorded owner and step."""
     row = waiting.row
-    identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
-    name = (f"hana CI · {identity.get('unit', '')}" if isinstance(waiting.request, ServiceEstimatedAdmission)
-            else gate.waiter_unit_name(identity, row["pid"]))
-    return f"{name} · {identity['step']}" if identity["step"] else name
+    return codec.wait_line_name(row.get("unit", ""), row.get("session_name", ""),
+                                      row.get("folder", ""), row.get("step", ""))
 
 
 @cache
@@ -1540,6 +1550,7 @@ class AdmissionServer:
         self.sources: dict[Path, tuple[int, int] | SourceMissing] = {
             path: self._stamp(path) for path in self._source_paths()}
         self.source_change_at: float | SourcesUnchanged = SourcesUnchanged()
+        self.changed_sources: set[Path] = set()
         state_dir.mkdir(parents=True, exist_ok=True)
 
         self.config_path: Path = conf.path("build_admission")
@@ -1573,8 +1584,22 @@ class AdmissionServer:
         if path.exists():
             self._persisted = path.read_text()
             state = parse_service_state(self._persisted, warn_missing_folders=True)
-            for record in state.reservations.values():
+            members = (records.queue_staff() if state.reservations or state.places or state.placement_requests
+                       else records.NO_STAFF_LOOKUP)
+            for episode, record in state.reservations.items():
+                row = record.queue_waiter
+                if not row.get("ci_runner"):
+                    caller = self._stored_caller(row.get("session_id", ""), row.get("session_name", ""),
+                        row.get("folder") or record.worktree, row.get("unit", ""), members=members)
+                    record = replace(record, queue_waiter={**row, "session_name": caller.name, "unit": caller.unit})
+                    state.reservations[episode] = record
                 self.writes.register(record)
+            for key, place in state.places.items():
+                identity = place.queue_identity
+                caller = self._stored_caller(identity["session_id"], identity["session_name"],
+                                             identity["folder"], identity.get("unit", ""), members=members)
+                state.places[key] = replace(place, queue_identity={
+                    **identity, "session_name": caller.name, "unit": caller.unit})
             self.reservations, self.places = state.reservations, state.places
             self.ledger = ReplayLedger(state.ledger)
             self.spacing, self.priority = state.spacing, state.priority
@@ -1582,7 +1607,9 @@ class AdmissionServer:
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
-            self.placement_requests = state.placement_requests
+            self.placement_requests = {
+                key: replace(request, identity=self._named_identity(self._placement_identity(request), members=members))
+                for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
             self.pending_cloud_groups = state.pending_cloud_groups
@@ -1804,13 +1831,31 @@ class AdmissionServer:
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
+    @staticmethod
+    def _priority_name(row: records.Waiter) -> str:
+        return row.get("ci_runner") or row.get("unit", "")
+
     def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
         rows = self._ordered_waiters()
-        sessions = [row.get("session_id", "") for _, row in rows if not row.get("unit")]
-        labels: Mapping[str, gate.UnitMembership] = (
-            gate.priority_labels(sessions)
-            if sessions and not isinstance(self.priority, records.NoQueuePriority) else {})
-        return gate.apply_queue_priority(rows, gate.QueueOrderContext(self.priority, labels))
+        if isinstance(self.priority, records.NoQueuePriority):
+            return rows, self.priority
+        # Match CI priority by runner. Keep the runner out of the published unit field.
+        ci_waiters: dict[Path, records.RankedWaiter] = {}
+        sessions: list[str] = []
+        ranking_rows: list[tuple[Path, records.Waiter]] = []
+        for path, row in rows:
+            name = self._priority_name(row)
+            if name != row.get("unit", ""):
+                ci_waiters[path] = row
+                row = row.copy()
+                row["unit"] = name
+            elif not name:
+                sessions.append(row.get("session_id", ""))
+            ranking_rows.append((path, row))
+        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
+        ranked, priority = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(self.priority, labels))
+        return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
+                 if path in ci_waiters else row) for path, row in ranked], priority
 
 
     def _prune_runs(self) -> None:
@@ -1947,6 +1992,8 @@ class AdmissionServer:
             row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
             row["job"] = identity.job
+        if isinstance(request, ServiceEstimatedAdmission):
+            row["ci_runner"] = request.runner
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -2722,7 +2769,7 @@ class AdmissionServer:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
                 row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED),
-                verify=row.get("verify", records.NotVerifyCall()))
+                ci_runner=row.get("ci_runner", ""), verify=row.get("verify", records.NotVerifyCall()))
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -3463,10 +3510,6 @@ done
 
     def _placement_admission(self, request: wire.PlacementRequest) -> wire.AdmitRequest | wire.LaunchRequest:
         identity = request.identity
-        if not identity.step:
-            session = request.constraints.session
-            identity = wire.Identity(session.session_id if isinstance(session, OwningSession) else "",
-                "", request.profile.step, request.profile.worktree)
         owner = wire.Owner(request.owner.pid, request.owner.start_time)
         local = request.local
         if isinstance(local, wire.LocalAdmissionUnavailable):
@@ -4437,11 +4480,31 @@ done
             share_percent=configuration.peak_history_share_percent,
             build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
             location=step_estimator.RepositoryLocation(request.repository, request.worktree))
-        label = config.ci_label.format(runner=request.runner, job=request.job)
-        identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
+        label = codec.ci_label(config.ci_label, request.runner, request.job)
+        identity = wire.Identity("", label, estimate.profile.step, request.worktree)
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
-            isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version)
+            isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version,
+            runner=request.runner)
+
+    @staticmethod
+    def _stored_caller(session: str, name: str, folder: str, unit: str, *,
+                       members: records.QueueStaff) -> records.QueueCaller:
+        caller = records.queue_caller(session, "", "", "", folder, members=members, unit=unit)
+        return replace(caller, name=codec.resolve_queue_caller(stored_caller=name, staff_caller=caller.name))
+
+    def _named_identity(self, identity: wire.Identity, *, members: records.QueueStaff, folder: str = "") -> wire.Identity:
+        caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit,
+                                     members=members)
+        return replace(identity, name=caller.name, unit=caller.unit)
+
+    @staticmethod
+    def _placement_identity(request: wire.PlacementRequest) -> wire.Identity:
+        identity = request.identity
+        session = request.constraints.session
+        return replace(identity, session_id=identity.session_id or (
+            session.session_id if isinstance(session, OwningSession) else ""),
+            step=identity.step or request.profile.step, folder=identity.folder or request.profile.worktree)
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
@@ -4475,9 +4538,15 @@ done
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
-            return self._repository_slot(request, connection)
+            members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
+            identity = self._named_identity(request.identity, members=members)
+            return self._repository_slot(replace(request, identity=identity), connection)
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
+        if isinstance(request, wire.PlacementRequest):
+            identity = self._placement_identity(request)
+            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
+            request = replace(request, identity=self._named_identity(identity, members=members))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
@@ -4541,6 +4610,10 @@ done
                     and isinstance(group := request.place.group, status_wire.CloudGroup)):
                 if (refused := self._register_cloud_group(request.place, group)) is not None:
                     return self._mutation_reply(key, refused)
+            if not isinstance(request, ServiceEstimatedAdmission):
+                folder = request.cwd if isinstance(request, wire.AdmitRequest) else request.profile.worktree
+                members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
+                request = replace(request, identity=self._named_identity(request.identity, members=members, folder=folder))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
@@ -4667,10 +4740,11 @@ done
                 return self._mutation_reply(key, wire.Ok())
             rows = [waiting.row for waiting in self.waiters.values()]
             rows.extend(record.queue_waiter for record in self.reservations.values())
-            recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
-            units = {label.unit for session, label in labels.items() if session not in recorded_sessions}
-            units.update(row.get("unit", "") for row in rows if row.get("unit", ""))
-            if request.unit == "—" or request.unit not in units:
+            recorded_names = [(row.get("session_id", ""), name) for row in rows if (name := self._priority_name(row))]
+            recorded_sessions = {session for session, _ in recorded_names}
+            known_names = {label.unit for session, label in labels.items() if session not in recorded_sessions}
+            known_names.update(name for _, name in recorded_names)
+            if request.unit == "—" or request.unit not in known_names:
                 return self._mutation_reply(key, wire.Refused(
                     f"unknown unit {request.unit}; the queue priority did not change"))
             changed = True
@@ -4796,6 +4870,10 @@ done
         print(f"memory admission: source watch checks {len(self.sources)} paths first {first_check}", file=sys.stderr)
         revision = loaded_git_revision(self.source_root)
         _notify("READY=1")
+        if os.environ.pop(ADMISSION_SOURCE_RELOAD, ""):
+            version = admission_code.reload_source_version(self.source_root)
+            print(f"memory admission: reload ready, source hash {version or 'unavailable'}",
+                  file=sys.stderr, flush=True)
         print(f"memory admission: ready with git revision {revision}", file=sys.stderr)
 
     def _drop_deferred_requests(self, connection: Connection) -> None:
@@ -4937,7 +5015,7 @@ done
             filename = cast(object, getattr(module, "__file__", None))
             if isinstance(filename, str):
                 path = Path(filename).resolve()
-                if path.is_relative_to(self.source_root):
+                if path.suffix == admission_code.RELOAD_SOURCE_SUFFIX and path.is_relative_to(self.source_root):
                     paths.add(path)
         return paths
 
@@ -4959,7 +5037,9 @@ done
         current = {path: self._stamp(path) for path in self.sources}
         now = self.clock.monotonic()
         if current != self.sources:
-            changed = ", ".join(str(path) for path in sorted(current) if current[path] != self.sources[path])
+            changed_paths = sorted(path for path, stamp in current.items() if self.sources[path] != stamp)
+            self.changed_sources.update(changed_paths)
+            changed = ", ".join(map(str, changed_paths))
             print(f"memory admission: source watch detected changes at monotonic {now:.3f} in {changed}",
                   file=sys.stderr)
             self.sources = current
@@ -5405,6 +5485,9 @@ def main() -> int:
         if server.replace_in_place:
             # The new code takes the same socket without the systemd restart delay; a failed start restarts as before.
             os.set_inheritable(LISTEN_FD, True)
+            os.environ[ADMISSION_SOURCE_RELOAD] = "1"
+            changed = ", ".join(str(path) for path in sorted(server.changed_sources))
+            print(f"memory admission: reload for changed source {changed}", file=sys.stderr, flush=True)
             os.execv(sys.executable, sys.orig_argv)
         return 0
     except override_guard.SharedStateWriteRefused as error:
