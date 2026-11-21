@@ -31,6 +31,7 @@ from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
 
@@ -45,10 +46,12 @@ class StaffCommandTestCase(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root),
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "ROSTER_RUN_ROOT": str(self.root / "unit"),
             "UNIT_RUN_ROOT": str(self.root / "unit"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
-        })))
+        }, clear=True)))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
 
     @override
@@ -1600,6 +1603,22 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(staff.snapshot().by_worktree("natedev", path), claimed)
         wrapped = staff.set_doc(runner.id, staff.WrappedDoc("natedev", doc))
         self.assertEqual(staff.StaffRow.from_json(wrapped.to_json()), wrapped)
+        _ = doc.write_text("- **Merge checkout:** /fixture/main\n")
+        alias = self.root / "alias.md"
+        alias.symlink_to(doc)
+        binding = staff.LiveDoc("natedev", alias)
+        another = fixture_member("showrunner", name="another")
+        before = self.staff_file.read_bytes()
+        for action, claim in (
+            ("set", lambda: staff.set_doc(another.id, binding)),
+            ("ensure", lambda: staff.ensure("showrunner", name="new", doc=binding,
+                                            runtime_id=fixture_runtime_id("duplicate-doc"))),
+            ("promote", lambda: staff.promote_unit(other.id, name="other", parent=runner.id, doc=binding)),
+        ):
+            with self.subTest(action=action), self.assertRaisesRegex(staff.StaffRefused, "already owns this document"):
+                _ = claim()
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
 
     def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:
         runner, unit, _ = self.tree()

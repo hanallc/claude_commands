@@ -6,6 +6,7 @@ from __future__ import annotations
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr_types
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import fixture_git_environment
 
 import io
 import json
@@ -38,7 +39,7 @@ from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.production.add_showrunner_test_support import write_guard_proof
-from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
+from scripts.production.production_names import GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production import staff, staff_sources, unit_config
 from scripts.production.fake_unit_host import process, private_process_registry
 
@@ -255,6 +256,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True)))
         for name, path in {
             "NOTIFIER_STATE_DIR": self.root / "notifier",
             "SHOWRUNNER_STATE_DIR": self.root / "showrunner-state",
@@ -418,6 +422,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
         worker = fixture_member("worker", name="impl1", parent=unit.id)
         plan = self.worktree / "plan.md"
         plan_bytes = plan.read_bytes()
+        proof = self.root / "showrunner-state" / GUARD_READY_FILE
+        saved = proof.read_bytes()
+        proof.unlink()
+        with self.subTest(guard_proof=False):
+            code, output, errors = self.run_main()
+            self.assertEqual(code, 2, output + errors)
+            self.assertIn(GUARD_READY_FILE, errors)
+            self.assert_nothing_stopped()
+            self.assertEqual(staff.by_id(unit.id), unit)
+        _ = proof.write_bytes(saved)
         code, output, errors = self.run_main()
         self.assertEqual(code, 0, output + errors)
         self.assert_native_promotion(unit)

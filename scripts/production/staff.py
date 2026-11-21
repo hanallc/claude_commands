@@ -1721,6 +1721,26 @@ def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
     return row
 
 
+def _document_for_owner(rows: list[StaffRow], owner: StaffId,
+                        doc: LiveDoc | WrappedDoc) -> LiveDoc | WrappedDoc:
+    from scripts.agents import remote
+
+    if doc.machine != remote.local_machine():
+        return doc
+    try:
+        enrolled = declares_merge_checkout(doc.path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return doc
+    if not enrolled:
+        return doc
+    path = doc.path.resolve(strict=True)
+    if any(other.id != owner and isinstance(other.doc, LiveDoc | WrappedDoc)
+           and other.doc.machine == doc.machine and other.doc.path.resolve() == path
+           for other in rows):
+        raise StaffRefused(f"{path}: another staff row already owns this document")
+    return replace(doc, path=path)
+
+
 def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo | StaffRoot, *,
                 worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
                 doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
@@ -1733,6 +1753,11 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
         raise StaffRefused(f"{kind} cannot hold doc")
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
+    if kind == "showrunner" and not isinstance(doc, DocUnfilled):
+        if existing is not None:
+            doc = _document_for_owner(rows, existing.id, doc)
+        elif runtime_id:
+            doc = _document_for_owner(rows, native_id(runtime_id), doc)
     if existing is not None:
         if isinstance(existing.retirement, RetiredProducer):
             raise StaffRefused(f"{name}: retired; use agents resume {name} --retired")
@@ -1923,10 +1948,12 @@ def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -
         row = _required(rows, identity)
         kind: Kind = "showrunner" if promoting else "unit"
         source = "unit" if promoting else "showrunner"
+        doc = (_document_for_owner(rows, row.id, destination.doc)
+               if isinstance(destination, ShowrunnerRole) else DOC_UNFILLED)
         changed = replace(row, kind=kind, name=destination.name, parent=ReportsTo(destination.parent),
                           unit_type=NotUnit() if promoting else UnitDetails(cast(UnitRole, destination).unit_type),
                           worktree=WORKTREE_UNFILLED if promoting else cast(UnitRole, destination).worktree,
-                          doc=cast(ShowrunnerRole, destination).doc if promoting else DOC_UNFILLED)
+                          doc=doc)
         if row.kind == kind:
             if row != changed:
                 raise StaffRefused(f"{identity}: director destination conflicts")
@@ -2131,24 +2158,10 @@ def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
                             "--state", "live" if isinstance(doc, LiveDoc) else "wrapped"])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
-        from scripts.agents import remote
-
         row = _required(rows, showrunner)
         if row.kind not in ("showrunner", "producer"):
             raise StaffRefused("set-doc requires a showrunner or producer")
-        location = doc
-        if row.kind == "showrunner" and doc.machine == remote.local_machine():
-            try:
-                enrolled = declares_merge_checkout(doc.path.read_text(encoding="utf-8").splitlines())
-            except FileNotFoundError:
-                enrolled = False
-            if enrolled:
-                path = doc.path.resolve(strict=True)
-                if any(other.id != row.id and isinstance(other.doc, LiveDoc | WrappedDoc)
-                       and other.doc.machine == doc.machine and other.doc.path.resolve() == path
-                       for other in rows):
-                    raise StaffRefused(f"{path}: another staff row already owns this document")
-                location = replace(doc, path=path)
+        location = _document_for_owner(rows, row.id, doc) if row.kind == "showrunner" else doc
         changed = replace(row, doc=_keep_location_fields(location, row.doc))
         rows[rows.index(row)] = changed
         return changed

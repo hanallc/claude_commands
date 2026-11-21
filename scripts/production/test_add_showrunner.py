@@ -10,6 +10,7 @@ import json
 import math
 import os
 import subprocess
+import tempfile
 import sys
 import unittest
 from contextlib import redirect_stderr
@@ -25,7 +26,7 @@ from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.production import add_showrunner
 from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
-from scripts.production.production_names import MERGE_CHECKOUT_FIELD
+from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD
 from scripts.production import showrunners
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
@@ -43,6 +44,7 @@ from scripts.production.fake_unit_host import process as write_process
 from scripts.lib import operation_deadline, script_prompts
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class NativeClaudeShowrunnerTests(StaffTestCase):
@@ -98,6 +100,13 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(staff.by_id(owner.id), owner)
 
     def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
+        proof = Path(self.env["SHOWRUNNER_STATE_DIR"]) / GUARD_READY_FILE
+        saved = proof.read_bytes()
+        proof.unlink()
+        with self.subTest(guard_proof=False):
+            self.refused(self.run_command("kid"), GUARD_READY_FILE)
+            self.assertIsNone(staff.by_path("kid"))
+        _ = proof.write_bytes(saved)
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -107,6 +116,15 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
         self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
         self.assertEqual(child.parent, staff.ReportsTo(parent.id))
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        directory = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        _ = cls.enterClassContext(patch.dict(os.environ, {
+            **fixture_git_environment(directory), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True))
+        super().setUpClass()
 
     @override
     def setUp(self) -> None:
