@@ -261,6 +261,8 @@ def render(data: machines_data.MachinesPageData, now: int) -> str:
                            for index, job in enumerate(jobs))
     other_workloads = ''.join(f'<p>{escape(workload.sentence)}</p>'
                               for workload in data.workloads if isinstance(workload, machines_data.WorkloadWithoutComparison))
+    if other_workloads:
+        other_workloads = f'<section class="card other-workloads"><h2>Other workloads</h2>\n{other_workloads}</section>'
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     body = page_frame.template(source, 'AWS Machines', console_tune.AWS_MACHINES_PAGE, action=_price_pill(data.price_read))
     page = body.replace('__ALL_JOBS_CONTROLS__', controls, 1).replace('__JOB_SECTIONS__', job_sections, 1).replace(

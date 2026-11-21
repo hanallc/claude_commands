@@ -27,6 +27,8 @@ NOW = int(END.timestamp()) + 12 * 3600
 PRICE_READ = NOW - 3600
 RATIO_KEY = 'faster_box_max_cost_ratio'
 WORKLOAD_NAME = 'gate'
+AFFECTED_NAME = 'test affected'
+AFFECTED_RUNS = 646
 PAGE_SETTINGS = """# range: 1..10
 machines.ratio_max=3.00
 # range: 0.01..1
@@ -49,7 +51,7 @@ def cost_step(ratio: str, extra: str) -> machines_data.CostRatioStep:
 
 
 def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
-    """Give the page three measured machines and two single-size workloads."""
+    """Give the page three measured machines and one single-size workload."""
     small = ledger.GateRateCandidate('c7a.4xlarge', 'eu-south-2')
     large = ledger.GateRateCandidate('c7a.8xlarge', 'eu-north-1')
     reserve = ledger.GateRateCandidate('m7a.8xlarge', 'us-east-2')
@@ -74,7 +76,7 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
             machines_data.MachineRunShare(large, D('.978')), machines_data.MachineRunShare(reserve, D('.014')),
             machines_data.MachineRunShare(small, D('.008'))), D('15.10'), D(222), D('15.10') / D(222), limits[2]),
     )
-    workload = machines_data.MeasuredWorkload(WORKLOAD_NAME, 'merge-gate', choices, small, 1075, D(4658),
+    workload = machines_data.MeasuredWorkload(WORKLOAD_NAME, 'gate', choices, small, 1075, D(4658),
         D('62.72'), ((1, 611), (2, 272), (3, 125), (4, 43), (5, 19), (6, 5)), D('1.50'), D('14.14'), steps,
         (cost_step('1', '0'), cost_step('1.25', '14.14'), cost_step('2.15', '15.10')),
         ('A month has 52 weeks divided by 12.',
@@ -82,10 +84,8 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
          'The estimate uses a quota of 136 vCPUs for Sweden.'))
     return machines_data.MachinesPageData(START, END, D('3.00'), D('.05'),
         machines_data.SavedSpotPriceRead(PRICE_READ, aws_closed), (workload,
-        machines_data.WorkloadWithoutComparison('targeted test', 'targeted-test',
-            'The records for targeted test hold 608 completed runs on 1 machine size in this period.'),
-        machines_data.WorkloadWithoutComparison('test affected', 'test-affected',
-            'The records for test affected hold 38 completed runs on 1 machine size in this period.')))
+        machines_data.WorkloadWithoutComparison(AFFECTED_NAME, 'test-affected',
+            f'The records for {AFFECTED_NAME} hold {AFFECTED_RUNS} completed runs on 1 machine size in this period.')))
 
 
 def fixture_two_jobs() -> machines_data.MachinesPageData:
@@ -94,7 +94,7 @@ def fixture_two_jobs() -> machines_data.MachinesPageData:
     gate = data.workloads[0]
     assert isinstance(gate, machines_data.MeasuredWorkload)
     small, large = (replace(choice, checks=count, launched=count, small_sample=False)
-                    for choice, count in zip(gate.choices[:2], (568, 40), strict=True))
+                    for choice, count in zip(gate.choices[:2], (AFFECTED_RUNS - 40, 40), strict=True))
     large = replace(large, quota_fit_share=D(1), spot_granted_share=D('.75'), free_share=D('.75'))
     base, extra, hours = D('35.28'), D('5.08'), D(70)
     limits = tuple(machines_data.MachineLimit(limit.ratio, (limit.ratio - 1) * base)
@@ -106,10 +106,10 @@ def fixture_two_jobs() -> machines_data.MachinesPageData:
             machines_data.MachineRunShare(small.machine, D('.25'))),
             extra, hours, extra / hours, limits[7:]),
     )
-    targeted = machines_data.MeasuredWorkload('targeted test', 'targeted-test', (small, large), small.machine,
-        608, D(2635), base, ((1, 608),), gate.live_ratio, extra, steps,
+    affected = machines_data.MeasuredWorkload(AFFECTED_NAME, 'test-affected', (small, large), small.machine,
+        AFFECTED_RUNS, D(AFFECTED_RUNS * 52) / 12, base, ((1, AFFECTED_RUNS),), gate.live_ratio, extra, steps,
         (cost_step('1', '0'), cost_step('1.35', '5.08')), ('The measured run rate repeats.',))
-    return replace(data, workloads=(gate, targeted, data.workloads[2]))
+    return replace(data, workloads=(gate, affected))
 
 
 class _PageServer(ThreadingHTTPServer):
@@ -141,7 +141,7 @@ class MachinesPageTests(unittest.TestCase):
 
     def test_page_with_no_comparison_shows_the_recorded_reason(self) -> None:
         data = fixture_data()
-        unavailable = machines_data.WorkloadWithoutComparison(WORKLOAD_NAME, 'merge-gate',
+        unavailable = machines_data.WorkloadWithoutComparison(WORKLOAD_NAME, 'gate',
             'The records for gate hold 1 completed run on 1 machine size in this period.')
         page = machines_page.render(replace(data, workloads=(unavailable, *data.workloads[1:]),
             price_read=machines_data.NoSavedSpotPriceRead()), NOW)
@@ -158,14 +158,16 @@ class MachinesPageTests(unittest.TestCase):
         self.assertIn('<h2>Where the jobs run · Landing &amp; validation', page)
         self.assertIn('Set the limit</button>', page)
         self.assertIn('1,075 completed runs for Landing &amp; validation', page)
-        self.assertNotRegex(page.lower(), r'merge[- ](?:check|gate)')
+        self.assertIn('646 completed runs for test affected', page)
+        self.assertNotIn('Other workloads', page)
+        self.assertNotRegex(page.lower(), r'merge[- ](?:gate|check|test)|targeted[- ]test')
 
-    def test_page_shows_a_comparison_when_only_a_targeted_test_has_one(self) -> None:
+    def test_page_shows_a_comparison_when_only_a_named_test_has_one(self) -> None:
         data = fixture_data()
         primary = data.workloads[0]
         assert isinstance(primary, machines_data.MeasuredWorkload)
-        targeted = replace(primary, name='test named', mode='test-modules')
-        page = machines_page.render(replace(data, workloads=(*data.workloads[1:], targeted)), NOW)
+        named = replace(primary, name='test named', mode='test-modules')
+        page = machines_page.render(replace(data, workloads=(*data.workloads[1:], named)), NOW)
         self.assertIn('<h2>What we measured for test named</h2>', page)
         self.assertEqual(page.count('data-job-projection>'), 1)
         self.assertEqual(page.count('id="machine-controls"'), 1)
@@ -226,9 +228,10 @@ machines.ratio_step=0.25
   check(document.querySelector('.price-pill').innerText.includes('AWS is closed. Last saved prices'), 'Closed AWS price');
   check(document.querySelector('.price-pill time').dateTime === '2026-11-20T11:00:00+00:00', 'Saved price time');
   const otherWorkloads = document.querySelector('.other-workloads').innerText;
-  check(otherWorkloads.includes('targeted test hold 608 completed runs on 1 machine size'), 'Targeted test');
-  check(otherWorkloads.includes('test affected hold 38 completed runs on 1 machine size'), 'Test affected');
-  check(!/\bmerge\b/i.test(document.querySelector('main').innerText), 'No old name in the visible page');
+  check(otherWorkloads.includes('test affected hold 646 completed runs on 1 machine size'), 'Test affected');
+  check(document.querySelectorAll('.other-workloads p').length === 1, 'One job for affected runs');
+  check(!/\b(?:merge (?:gate|check|test)|targeted test)\b/i.test(document.querySelector('main').innerText),
+        'The page uses the current names');
   check(document.querySelectorAll('.sample').length === 2, 'Small samples');
   check(slider.valueAsNumber === 1.5 && amount.value === '31.36', 'Live ratio and ceiling');
   check(go.textContent === 'Set the limit to 1.50', 'Go uses the shared limit');
@@ -287,7 +290,7 @@ const jobValues = selector => jobs.map(job => job.querySelector(selector).textCo
 function check(condition, label) { if (!condition) throw new Error(label); }
 let result = 'passed';
 try {
- check(jobValues('h2').join('|') === 'Where the jobs run · gate at 1.50|Where the jobs run · targeted test at 1.50',
+ check(jobValues('h2').join('|') === 'Where the jobs run · gate at 1.50|Where the jobs run · test affected at 1.50',
        'Jobs are shown in data order');
  check(jobValues('[data-job-extra]').join('|') === '$14.14|$5.08', 'Job estimates');
  check(document.getElementById('extra-cost').textContent === '$19.22', 'Total estimate');
@@ -296,15 +299,15 @@ try {
  check(amount.value === '49.00' && document.getElementById('monthly-cap').textContent.includes('$49.00'),
        'The amount and the cap use the total ceiling');
  const steps = [...document.querySelectorAll('[data-step]')];
- check(steps[2].innerText.includes('targeted test') && steps[2].innerText.includes('c7a.8xlarge'),
+ check(steps[2].innerText.includes('test affected') && steps[2].innerText.includes('c7a.8xlarge'),
        'The step names the job and the added machine');
  steps[1].querySelector('button').click();
  check(slider.valueAsNumber === 1.25 && amount.value === '24.50', 'A step selects its first limit');
  check(jobValues('[data-job-ratio]').join('|') === '1.25|1.25', 'Both jobs follow the slider');
- check(jobValues('[data-job-extra]').join('|') === '$14.14|$0.00', 'The targeted test has no extra cost at 1.25');
+ check(jobValues('[data-job-extra]').join('|') === '$14.14|$0.00', 'The affected test has no extra cost at 1.25');
  check(jobValues('[data-choice="1"] [data-share]').join('|') === '97.8%|0%', 'Both jobs use their saved shares');
  go.click();
- check(summary.textContent === 'Change from 1.50 to 1.25. targeted test -$5.08 a month. Total -$5.08 a month.',
+ check(summary.textContent === 'Change from 1.50 to 1.25. test affected -$5.08 a month. Total -$5.08 a month.',
        'Confirmation names the one job that changes');
  slider.value = '1.55';
  slider.dispatchEvent(new Event('input', {bubbles:true}));
@@ -313,14 +316,14 @@ try {
        'Confirmation names no job when the estimate stays the same');
  steps[0].querySelector('button').click();
  go.click();
- check(summary.textContent === 'Change from 1.50 to 1.00. gate -$14.14 a month, targeted test -$5.08 a month. '
+ check(summary.textContent === 'Change from 1.50 to 1.00. gate -$14.14 a month, test affected -$5.08 a month. '
        + 'Total -$19.22 a month.', 'Confirmation names both jobs and the total');
  const saved = new Promise(resolve => document.getElementById('save-limit').addEventListener('setting-saved', resolve, {once:true}));
  document.querySelector('[data-setting-save]').click();
  await saved;
  steps[2].querySelector('button').click();
  go.click();
- check(summary.textContent === 'Change from 1 to 1.35. gate +$14.14 a month, targeted test +$5.08 a month. '
+ check(summary.textContent === 'Change from 1 to 1.35. gate +$14.14 a month, test affected +$5.08 a month. '
        + 'Total +$19.22 a month.', 'Confirmation after save: ' + summary.textContent);
 } catch (error) {
  result = String(error);

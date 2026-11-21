@@ -169,7 +169,13 @@ names.test-all=fixture all
         self.assertAlmostEqual(first.hours_saved_per_month, Decimal(13 * 150) / 3 / 3600)
         self.assertEqual(tuple(row.machine for row in second.shares), (FAST, FASTER, SMALL))
 
-    def test_one_size_workloads_report_the_recorded_count(self) -> None:
+    def test_old_and_new_affected_records_count_each_run_once(self) -> None:
+        path = self.book.launch_history_path
+        rows = self.book.launches()
+        duplicates = tuple({**row, 'mode': 'test-affected'} for row in rows
+                           if row['mode'] == 'targeted-test' and row['result'] == 'finished')
+        _ = path.write_text(''.join(json.dumps(row) + '\n'
+            for row in sorted((*rows, *duplicates), key=lambda row: float(str(row['time'])))))
         workloads = {workload.mode: workload for workload in self.read().workloads}
         self.assertEqual(tuple(workloads), ('gate', 'test-affected'))
         workload = workloads['test-affected']
@@ -249,9 +255,17 @@ names.test-all=fixture all
                 choice, = (choice for choice in workload.choices if choice.checks or choice.launched)
                 self.assertEqual((choice.machine, choice.checks, choice.launched, choice.usd_per_check),
                                  (machine, 1, 1, Decimal(cost)))
-        targeted = workloads['test-affected']
-        assert isinstance(targeted, machines_data.WorkloadWithoutComparison)
-        self.assertEqual(targeted.sentence, 'The records for fixture affected hold 1 completed run on 1 machine size in this period.')
+        affected = workloads['test-affected']
+        assert isinstance(affected, machines_data.WorkloadWithoutComparison)
+        self.assertEqual(affected.sentence, 'The records for fixture affected hold 1 completed run on 1 machine size in this period.')
+
+    def test_missing_prices_preserve_the_run_count(self) -> None:
+        self.spot = ()
+        self.write_prices()
+        gate = self.read().workloads[0]
+        assert isinstance(gate, machines_data.WorkloadWithoutComparison)
+        self.assertEqual(gate.sentence, 'The records for fixture gate hold 3 completed runs on 2 machine sizes in this period.'
+                         ' No eligible measured choice has a saved price.')
 
     def test_the_gate_without_two_sizes_has_no_comparison(self) -> None:
         path = self.book.launch_history_path

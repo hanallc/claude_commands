@@ -503,16 +503,17 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
             refused[machine], launched[machine], len(times) < small_sample_checks, quota_vcpus, assumed,
             fits, granted, fits * granted)
     measured_sizes = {choice.vcpus for choice in choices.values() if choice.checks}
+    measurement = _measurement_sentence(name, checks, len(measured_sizes))
     if len(measured_sizes) == 1:
-        return WorkloadWithoutComparison(name, mode, _measurement_sentence(name, checks, 1), tuple(choices.values()))
+        return WorkloadWithoutComparison(name, mode, measurement, tuple(choices.values()))
     if not ranked_rows:
         return WorkloadWithoutComparison(name, mode,
-            f'No deployed choice has a measurement for {name} within the time limit.', tuple(choices.values()))
+            f'{measurement} No deployed choice has a measurement within the time limit.', tuple(choices.values()))
     ranking = cloud_gate.rank_gate_choices(ranked_rows, types, _RULE_OFF)
     reference = ranking.reference
     if not isinstance(reference, cloud_gate.GateRankedChoice):
         return WorkloadWithoutComparison(name, mode,
-            f'No eligible measured choice for {name} has a saved price.', tuple(choices.values()))
+            f'{measurement} No eligible measured choice has a saved price.', tuple(choices.values()))
     assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
     monthly_checks = Decimal(checks * _DAYS_PER_WEEK * _WEEKS_PER_YEAR) / (_MONTHS_PER_YEAR * (end - start).days)
     steps = _steps(ranked_rows, types, ratios, reference, choices, monthly_checks)
