@@ -1830,6 +1830,23 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 **Order:** parallel with phases 100–102.
 
+### Phase 104 — Item 154 follow-up: old publish and fixture defects  · status: todo
+**Depends on:** phases 100–103
+
+#### Work Order
+
+**Goal:** close two defects that exist on main before item 154 and that the phase 102 review found in round 4.
+**Spec:**
+1. A legacy `merge_gate.py --merge-branch main --promote` pushes to `origin/main` before `promote` checks the CI verdict (`merge_gate.py:2242,2246`). Check the verdict of the exact commit before the push. The phase 102 round 4 promotion operation should already cover this route; verify it, and fix it if it does not.
+2. The direct gate fixture in `test_merge_gate.py:557` adds its environment over the caller's environment and keeps inherited `GIT_DIR` and `GIT_WORK_TREE`. Use the shared helper in `scripts/lib/git_test_support.py`.
+**Files:** `merge_gate.py`, `test_merge_gate.py`.
+**Tests:** a row in the existing legacy promotion table that refuses an unchecked commit before any push; the direct gate test leaves the caller's repository unchanged with `GIT_DIR` set.
+**Acceptance gate:** as phase 100.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** before the item 154 combined branch merges to main; item 154 claims full publication coverage only after spec 1 passes.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
