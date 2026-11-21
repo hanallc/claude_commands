@@ -840,9 +840,17 @@ def state_file() -> Generator[State]:
 
 
 
-def percent(note: AgentNote) -> str:
+def percent(note: AgentNote, *, whole: bool = False) -> str:
     value = note_file.remaining(note)
-    return "unknown" if value is None else f"{value:g}%"
+    if value is None:
+        return "unknown"
+    if not whole:
+        return f"{value:g}%"
+    if not 0 <= value <= 100:
+        return "unknown"
+    if 0 < value < 1:
+        return "<1%"
+    return f"{math.floor(value)}%"
 
 
 def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
@@ -1283,7 +1291,7 @@ def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> Qu
             return QuotaStatusNote(note.label, "what happens next is set up")
     except next_moves.NextMoveError as error:
         return QuotaStatusNote(note.label, str(error))
-    return UserPush(note.label, render("quota.claude_next_move", account=note.label, remaining=percent(note)))
+    return UserPush(note.label, render("quota.claude_next_move", account=note.label, remaining=percent(note, whole=True)))
 
 
 def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODEX_QUOTA_FALLBACK,
@@ -1314,19 +1322,10 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
     credits_allowed = isinstance(agent_accounts.codex_credits_setting(note.label), agent_accounts.CreditsOn)
     chosen = _zero_destination(note.label, at, prefer_weekly_room=True, included_only=credits_allowed)
     destination = chosen.label if isinstance(chosen, accounts.PickedAccount) else "Claude"
-    outcome_title = "use paid credits" if credits_allowed and isinstance(chosen, accounts.NoAccountWithRoom) else f"move to {destination}"
-    if credits_allowed and isinstance(chosen, accounts.NoAccountWithRoom):
-        outcome_body = (", and no move is set up for its workers. When it runs out, "
-                        + f"they spend its paid credits, then move to {destination}.")
-    elif isinstance(chosen, accounts.NoAccountWithRoom):
-        outcome_body = (". When it runs out, its workers move on their own to Claude, "
-                        + "since no other Codex account has room.")
-    else:
-        outcome_body = (f". When it runs out, its workers move on their own to {destination}, "
-                        + "the Codex account with room whose weekly reset comes first.")
+    outcome_title = ("paid credits next" if credits_allowed and isinstance(chosen, accounts.NoAccountWithRoom)
+                     else f"{destination} next")
     return UserPush(note.label, render("quota.codex_next_move", account=note.label,
-                                      remaining=percent(note), fallback=destination,
-                                      outcome_title=outcome_title, outcome_body=outcome_body))
+                                      remaining=percent(note, whole=True), outcome_title=outcome_title))
 
 
 @dataclass(frozen=True)
