@@ -950,7 +950,7 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
     try:
-        settings = conf.read("merge_gate")
+        settings = conf.read("gate")
         declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
         candidates = {base.commit: base} if isinstance(base, CertifiedBase) else {}
         for branch in settings.words("landing_branches"):

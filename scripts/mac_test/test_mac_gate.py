@@ -31,7 +31,7 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
 from scripts.mac_test.test_mac_queue_run import queue_fixture
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
 
@@ -193,7 +193,7 @@ from pathlib import Path
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
 from scripts.mac_test import mac_gate
-from scripts.production.merge_gate import SuiteMode
+from scripts.production.gate_routes import SuiteMode
 from scripts.production import gate_routes
 
 repo, callback, fd = sys.argv[1:]
@@ -202,7 +202,7 @@ if wrapper := os.environ.pop('MAC_GATE_QUEUE_WRAPPER', ''):
     os.environ['MAC_GATE_QUEUE_ENTRY'] = mac_gate.QUEUE_COMMAND[1]
     mac_gate.QUEUE_COMMAND = (sys.executable, wrapper)
 cancellation = gate_routes.MacGateCancellation(int(fd)) if fd else mac_gate.USE_CALLER_PROCESS_LIFETIME
-print(mac_gate.route(Path(repo), mode=SuiteMode.MERGE_GATE, full=True,
+print(mac_gate.route(Path(repo), mode=SuiteMode.GATE, full=True,
                      module_time_limit_s=30, cancellation=cancellation), flush=True)
 """
 
@@ -253,6 +253,8 @@ class MacGateTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {'GATE_STATE_DIR': str(self.root / 'gate-state')})))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         _ = gate.checked_git(self.repo, 'init', '-q')
@@ -279,7 +281,7 @@ class MacGateTests(unittest.TestCase):
               mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command))),
               mock.patch.object(mac_gate, 'MAC_TIME_LIMIT_S', timeout)):
             selection = gate.TreeSelection((module_path(job),), self.tree)
-            return mac_gate.route(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            return mac_gate.route(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                   module_time_limit_s=30, selected=selection)
 
     def test_returns_pass_and_test_failure(self) -> None:
@@ -349,7 +351,7 @@ class MacGateTests(unittest.TestCase):
                 folder = self.root / f'mac-gate-{kind}'
                 if kind == 'dirty':
                     _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# dirty fixture\n')
-                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
                 cloud_gate.save(folder / 'request.json', request)
                 cloud_gate.save(folder / 'checkout.json', {'path': str(clone)})
                 _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# fixture\n')
@@ -370,7 +372,7 @@ class MacGateTests(unittest.TestCase):
 
     def test_remote_commands_set_pythonpath_in_zsh(self) -> None:
         folder = self.root / 'mac-gate-fixture'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         cloud_gate.save(folder / 'request.json', request)
         clone = self.exercise_bundle(self.repo, folder, request, expected=False)
 
@@ -462,7 +464,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 
     def test_checkout_probe_rejects_a_nonzero_remote_status(self) -> None:
         folder = self.root / 'mac-gate-fixture'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         error = subprocess.CalledProcessError(3, ['ssh'], output=f"{request['commit']}\npresent\npresent\n")
         with (mock.patch.object(subprocess, 'check_output', side_effect=error),
               self.assertRaises(subprocess.CalledProcessError)):
@@ -837,6 +839,14 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertEqual(empty, MacGateExclusions(()))
         _ = path.write_text('scripts/fixture/test_absent.py\nscripts/fixture/test_one.py\n')
         self.assertEqual(mac_gate.read_modules(self.repo), MacGateExclusions(('scripts/fixture/test_one.py',)))
+
+    def test_listed_production_modules_exist(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        entries = (checkout / mac_gate.MODULE_LIST).read_text().splitlines()
+        missing = [name for line in entries
+                   if (name := line.partition('#')[0].strip()).startswith('scripts/production/')
+                   and not (checkout / name).is_file()]
+        self.assertEqual(missing, [])
 
     def test_list_writer_excludes_failures_and_count_mismatches(self) -> None:
         mac = (module_job('one'), module_job('tests', tests=11), module_job('skips', skips=1),
