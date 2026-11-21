@@ -54,7 +54,7 @@ class ProductionMacPull:
 
 @dataclass(frozen=True)
 class MacPullAwaitingPublication:
-    """An older production pull needs a publication with a recorded SHA."""
+    """An older pull lacks proof of the commit or the settings route."""
 
     mac: PurePosixPath
     source: Path
@@ -321,6 +321,9 @@ def parse_queue(contents: bytes) -> PendingMacPull | NoPendingMacPull:
     if not all(isinstance(fields.get(key), str) for key in ("zone", "text", "since", "reason")):
         return NoPendingMacPull()
     label = cast(str, fields["zone"])
+    notice = cast(str, fields["text"])
+    words = label.split()
+    old_settings_label = label == "main" or (bool(words) and all("." in word for word in words))
     rows = fields.get("pulls", [{"mac": str(DEFAULT_MAC_CHECKOUT), "source": ""}])
     if not isinstance(rows, list):
         return NoPendingMacPull()
@@ -338,12 +341,16 @@ def parse_queue(contents: bytes) -> PendingMacPull | NoPendingMacPull:
             if not source or not isinstance(sha, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
                 return NoPendingMacPull()
             pulls.append(ProductionMacPull(mac_path, Path(source), sha))
-        elif source and (row.get("kind") == "production" or (
-                "kind" not in row and (label.startswith("mac ") or mac_path != DEFAULT_MAC_CHECKOUT))):
-            pulls.append(MacPullAwaitingPublication(mac_path, Path(source)))
+        elif not source:
+            if row.get("kind") == "production":
+                return NoPendingMacPull()
+            pulls.append(MacCheckoutPull(mac_path, MacPullSourceUnrecorded()))
+        elif row.get("kind") == "settings" or (
+                "kind" not in row and mac_path == DEFAULT_MAC_CHECKOUT and old_settings_label and not notice):
+            pulls.append(MacCheckoutPull(mac_path, Path(source)))
         else:
-            pulls.append(MacCheckoutPull(mac_path, Path(source) if source else MacPullSourceUnrecorded()))
-    return PendingMacPull(label, cast(str, fields["text"]),
+            pulls.append(MacPullAwaitingPublication(mac_path, Path(source)))
+    return PendingMacPull(label, notice,
                           cast(str, fields["since"]), cast(str, fields["reason"]), tuple(pulls))
 
 

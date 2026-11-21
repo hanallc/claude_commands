@@ -6,6 +6,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr
 from functools import cached_property
 import io
+import json
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
@@ -709,6 +710,19 @@ class MainPublishTests(PublicationTestCase):
             self.assertEqual((pending.label, pending.text, pending.reason), ("example.amount", "", "Mac asleep"))
             main_publish.clear_pull_only()
             self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
+
+        with self.subTest(queue="legacy pull with a zone notice"):
+            _ = queue_path.write_text(json.dumps({
+                "zone": "America/New_York", "text": "A waiting zone notice", "since": "2026-11-01",
+                "reason": "Mac asleep", "pulls": [{"mac": "~/.claude", "source": str(repo.checkout)}],
+            }))
+            result = zone.drain(repo.checkout, pulled=None)
+            self.assertIn("record the published commit", " ".join(result))
+            self.assertFalse(repo.ssh_log.exists())
+            pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual(pending.text, "A waiting zone notice")
 
 
 if __name__ == "__main__":
