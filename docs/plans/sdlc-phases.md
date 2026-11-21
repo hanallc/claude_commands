@@ -1889,6 +1889,22 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 **Order:** after the item 154 combined branch merges to main.
 
+### Phase 107 — Remove the hana_shot signal handlers  · status: in progress
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `hana_shot.py` installs no signal handlers (user rule 2026-11-09: our processes clean up after themselves, the way a temporary directory does). The showrunner assigned it from the signal handler inventory on main 06586b2227.
+**Spec:**
+1. Remove the SIGINT, SIGTERM and SIGHUP handlers (`hana_shot.py:3343-3345`) and `exit_for_signal`.
+2. Remove the exit-signal latch that only those handlers make live.
+3. Keep the window restore and keep-awake end in `close()` and the failure path. Ctrl-C still raises `KeyboardInterrupt`.
+**Files:** `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py`.
+**Tests:** delete the tests that pin only the removed latch; the cleanup tests stay.
+**Acceptance gate:** basedpyright clean; `test_hana_shot.py` passes in the test slot.
+
+**Workers:** 1 writer, 1 reviewer.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
