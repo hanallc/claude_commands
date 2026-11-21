@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterable
-from contextlib import ExitStack, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
@@ -1215,51 +1215,100 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         return result
 
 
-def _refuse_answer(name: WorkerName, reason: str, code: ExitCode = ExitCode.REFUSED) -> ExitCode:
-    print(f"{name.value}: {reason}. Use assign.sh for new work.", file=sys.stderr)
-    return code
+@dataclass(frozen=True)
+class WorkerAnswerRefused:
+    reason: str
+    code: ExitCode = ExitCode.REFUSED
+
+    def detail(self, name: str) -> str:
+        return f"{name}: {self.reason}. Use assign.sh for new work."
 
 
-def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
+@dataclass(frozen=True)
+class WorkerAnswer:
+    worker: worker_panes.OpenWorker
+    backend: staff.ClaudeBackend | staff.CodexBackend
+    text: str
+
+
+class CurrentWorker(Enum):
+    BY_NAME = "select the current worker by name"
+
+
+@dataclass(frozen=True)
+class ExpectedWorker:
+    row: staff.StaffRow
+
+
+@contextmanager
+def worker_answer(parent: StaffId, name: WorkerName, text: str, *,
+                  identity: CurrentWorker | ExpectedWorker,
+                  server: worker_panes.SharedServer | worker_panes.ObservedServer
+                  ) -> Generator[WorkerAnswer | WorkerAnswerRefused]:
+    """Hold the worker lock through the pass check and input."""
     with worker_panes.worker_lock(parent, name) as hold:
         if isinstance(hold, worker_panes.Kept):
-            return _refuse_answer(name, hold.blocker, ExitCode.BUSY)
+            yield WorkerAnswerRefused(hold.blocker, ExitCode.BUSY)
+            return
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         if row is None:
-            print(f"{name.value}: no worker staff row", file=sys.stderr)
-            return ExitCode.REFUSED
+            yield WorkerAnswerRefused("no worker staff row")
+            return
+        if not hold.owns(row) or (isinstance(identity, ExpectedWorker)
+                                  and (row.id != identity.row.id or row.current_session != identity.row.current_session)):
+            yield WorkerAnswerRefused("the worker changed before delivery", ExitCode.UNCERTAIN)
+            return
         run = worker_panes.worker_run(row, record=record)
         active = progress_history.active_dispatch(row.id, run)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
-            return _refuse_answer(name, "the active pass is unavailable", ExitCode.UNCERTAIN)
+            yield WorkerAnswerRefused("the active pass is unavailable", ExitCode.UNCERTAIN)
+            return
         if isinstance(active, progress_history.NoActiveDispatch):
-            return _refuse_answer(name, "no active pass")
+            yield WorkerAnswerRefused("no active pass")
+            return
         passed = worker_panes.worker_pass(row, run, record=record)
         delivery = progress_history.dispatch_delivery(passed)
         if passed.get("instance_id") != active.instance_id or not all((delivery.line, delivery.completion_id, delivery.reply_file)):
-            return _refuse_answer(name, "the active pass has no saved delivery")
+            yield WorkerAnswerRefused("the active pass has no saved delivery")
+            return
 
         backend = record.backends.get(row.id, staff.BACKEND_UNAVAILABLE)
         if isinstance(backend, staff.BackendUnavailable):
-            return _refuse_answer(name, "the worker transcript is unavailable", ExitCode.UNCERTAIN)
+            yield WorkerAnswerRefused("the worker transcript is unavailable", ExitCode.UNCERTAIN)
+            return
         receipt = transcript_receipt(_receipt_records(row, backend), delivery.line, DoneReply(delivery.completion_id),
                                      stop_at_done=True).receipt
         if isinstance(receipt, DispatchComplete):
-            return _refuse_answer(name, "the active pass already has a DONE reply")
+            yield WorkerAnswerRefused("the active pass already has a DONE reply")
+            return
         if isinstance(receipt, DispatchEvidenceUnknown):
-            return _refuse_answer(name, "the worker transcript is unavailable", ExitCode.UNCERTAIN)
+            yield WorkerAnswerRefused("the worker transcript is unavailable", ExitCode.UNCERTAIN)
+            return
         if isinstance(receipt, DispatchNotSubmitted):
-            return _refuse_answer(name, "the transcript does not show acceptance of the active pass")
+            yield WorkerAnswerRefused("the transcript does not show acceptance of the active pass")
+            return
 
-        state = worker_panes.observe_worker(parent, row, record)
+        state = worker_panes.observe_worker(parent, row, record, server=server)
         if not isinstance(state, worker_panes.OpenWorker):
-            return ExitCode.UNCERTAIN
+            yield WorkerAnswerRefused("the worker pane is unavailable", ExitCode.UNCERTAIN)
+            return
+        yield WorkerAnswer(state, backend, text + "\n" + _done_instruction(delivery.completion_id))
+
+
+def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
+    with worker_answer(parent, name, text, identity=CurrentWorker.BY_NAME,
+                       server=worker_panes.SharedServer.CONFIGURED) as checked:
+        if isinstance(checked, WorkerAnswerRefused):
+            print(checked.detail(name.value), file=sys.stderr)
+            return checked.code
+        state = checked.worker
+        target = str(state.row.current_session)
         client = _client()
-        if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
-            client.answer_question(state.pane, text, target=str(row.current_session))
+        if state.status is herdr.AgentStatus.BLOCKED and isinstance(checked.backend, staff.CodexBackend):
+            client.answer_question(state.pane, text, target=target)
         else:
-            client.prompt(state.pane, text + "\n" + _done_instruction(delivery.completion_id), target=str(row.current_session))
+            client.prompt(state.pane, checked.text, target=target)
         return ExitCode.OK
 
 
