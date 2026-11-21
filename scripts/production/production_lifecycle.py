@@ -406,7 +406,8 @@ def move_files(production: Production, lines: list[str], record: staff.StaffSnap
         if not same_log:
             _ = require_move_window(approval)
             write_move_copy(targets.log, log, production.log.stat().st_mode & 0o777)
-        if targets.live_doc.read_bytes() != document or targets.log.read_bytes() != production.log.read_bytes():
+        if (targets.live_doc.read_bytes() != document or doc_lines(production) != lines
+                or targets.log.read_bytes() != production.log.read_bytes()):
             raise Refusal("the live document or LOG differs after the move")
         verified = production_doc.resolve_production_paths(targets.live_doc)
         if (not isinstance(verified, production_doc.EnrolledPaths) or verified.live_doc != targets.live_doc
@@ -427,7 +428,7 @@ def stage_notes(production: Production, lines: list[str], record: staff.StaffSna
     if source != source.resolve() or destination != destination.resolve():
         raise Refusal("notes must use canonical paths")
     ensure_excluded(plan.main, "/" + relative.as_posix())
-    if not source.exists() or source == destination:
+    if not source.exists() or (destination.exists() and source.samefile(destination)):
         return
     copies: list[tuple[Path, bytes, int]] = []
     for entry in sorted(source.rglob("*")):
@@ -562,7 +563,10 @@ def require_new_document(document: production_doc.ProductionDocument) -> None:
 
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
     if not resume and isinstance(doc_status(lines), ProductionPlanned):
-        require_new_document(production)
+        record = staff.snapshot()
+        if (staff.declares_merge_checkout(lines)
+                or isinstance(showrunners.timer_for(production.owner, record), showrunners.NoTimer)):
+            require_new_document(production)
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
     if scratch is not None:
@@ -999,6 +1003,10 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     enrolled = staff.declares_merge_checkout(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
+    if enrolled:
+        main = session_staff.production_session_directory(production.doc, production.checkout)
+        for path in (production.doc, production.log):
+            require_untracked_ignored(main, path.relative_to(main).as_posix())
     record = staff.snapshot()
     if isinstance(status, ProductionRunning):
         refuse_running_children(production.name, record)

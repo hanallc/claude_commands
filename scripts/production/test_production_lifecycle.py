@@ -11,6 +11,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 import contextlib
 import fcntl
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 import io
 import json
 import os
@@ -20,7 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
 
 
@@ -34,7 +35,7 @@ from scripts.production.fake_unit_host import HostedUnit
 
 
 from scripts.production import staff, unit_config
-from scripts.production.production_doc import read_production, Refusal
+from scripts.production.production_doc import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, read_production, Refusal
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.production.cli_fixture import production_paths
@@ -68,6 +69,61 @@ class ProductionReaderTests(StaffTestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    def test_move_and_reverse_keep_the_original_cargo_liner_log_in_main(self) -> None:
+        target = staff.rename(self.owner_id(), staff.CARGO_LINER_PRODUCTION)
+        executor = fixture_member("showrunner", name="executor")
+        merge_name = f"{target.name}-merges"
+        integration = self.root / merge_name / "integration"
+        staging = integration.parent / "staging"
+        integration.parent.mkdir()
+        _ = self.git("worktree", "add", "-b", f"{merge_name}-integration", str(integration), "main")
+        _ = self.git("worktree", "add", "-b", f"{merge_name}-staging", str(staging), "main")
+        _ = staff.ensure("unit", name=merge_name, parent=staff.ReportsTo(target.id),
+                         worktree=staff.PresentWorktree(remote.local_machine(), staging), unit_type="merge",
+                         runtime_id=fixture_runtime_id(merge_name))
+        _ = self.doc.write_text(self.doc.read_text().replace(
+            "- **Merge branch:** `production`", f"- **Merge branch:** `main`\n- **Repository:** `{self.checkout}`"))
+        original_doc = self.doc.read_bytes()
+        original_log = b"First entry\r\nSecond entry\n"
+        _ = self.log.write_bytes(original_log)
+        inode = self.log.stat().st_ino
+        live_doc = self.doc.with_name(self.doc.stem + LIVE_DOCUMENT_SUFFIX)
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        with (common / "info/exclude").open("a", encoding="utf-8") as output:
+            _ = output.write(f"\n/{self.log.name}\n/{live_doc.relative_to(self.checkout).as_posix()}\n")
+        tip, index = self.git("rev-parse", "main"), (common / "index").read_bytes()
+        offset = timezone(timedelta(hours=-5))
+        now = datetime.now(UTC).astimezone(offset)
+        with mock.patch.object(production_lifecycle, "require_approval_terminal"):
+            approved = self.run_lifecycle("approve-move", "--production", target.name,
+                "--executor", executor.name, "--window-start", (now - timedelta(minutes=1)).isoformat(),
+                "--window-end", (now + timedelta(minutes=10)).isoformat())
+        self.assertEqual(approved.returncode, 0, approved.stdout + approved.stderr)
+        approval = cast(dict[str, object], json.loads(approved.stdout))
+        self.assertEqual(approval["status"], {"kind": "open"})
+        self.assertEqual(approval["executor_staff_id"], executor.id)
+        self.assertEqual(approval["destinations"], {"live_doc": str(live_doc), "log": str(self.log)})
+        self.env["CLAUDE_CODE_SESSION_ID"] = executor.current_session
+        moved = self.run_lifecycle("move-files", "--production", target.name)
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        approval_path = self.state / "showrunner" / target.id / production_lifecycle.MOVE_RECORD
+        saved = cast(dict[str, object], json.loads(approval_path.read_text()))
+        self.assertEqual(cast(dict[str, object], saved["status"])["kind"], "closed")
+        self.assertEqual((self.doc.read_bytes(), self.log.read_bytes(), self.log.stat().st_ino),
+                         (original_doc, original_log, inode))
+        _ = staff.set_doc(target.id, staff.LiveDoc(remote.local_machine(), live_doc))
+        live = read_production(target.id)
+        self.assertEqual((live.checkout, live.log), (integration, self.log))
+        with live.log.open("ab") as output:
+            _ = output.write(b"Entry after the move\n")
+        assert isinstance(target.doc, staff.LiveDoc)
+        _ = staff.set_doc(target.id, target.doc)
+        restored = read_production(target.id)
+        self.assertEqual((restored.doc, restored.log), (self.doc, self.log))
+        self.assertEqual((restored.log.read_bytes(), restored.log.stat().st_ino),
+                         (original_log + b"Entry after the move\n", inode))
+        self.assertEqual((self.git("rev-parse", "main"), (common / "index").read_bytes()), (tip, index))
+
     def test_wrap_preserves_each_units_standing_responsibilities_in_its_parked_file(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
         original = unit_config.read(self.alpha)
@@ -84,6 +140,39 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta, staff.ParkedBranch("beta-branch"))))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.by_id(child.id), child)
+
+    def test_enrolled_wrap_retires_merge_staging_and_keeps_integration(self) -> None:
+        self.merged_units()
+        integration = self.root / "integration"
+        legacy = self.doc.read_text()
+        _ = self.git("switch", "main")
+        _ = self.git("worktree", "add", str(integration), "production")
+        live = self.doc.with_name(self.doc.stem + LIVE_DOCUMENT_SUFFIX)
+        self.write(live, legacy.replace(
+            f"- **Showrunner checkout:** `{self.checkout}`",
+            f"- **Showrunner checkout:** `{integration}`\n- **Repository:** `{self.checkout}`\n"
+            + f"- **{MERGE_CHECKOUT_FIELD}:** `{self.checkout}`"))
+        with (self.checkout / ".git/info/exclude").open("a", encoding="utf-8") as output:
+            _ = output.write(f"\n/{live.relative_to(self.checkout).as_posix()}\n")
+        runner = staff.set_doc(self.owner_id(), staff.LiveDoc(remote.local_machine(), live))
+        staging = self.root / "merge-staging"
+        _ = self.git("worktree", "add", "-b", "merge-staging", str(staging), "production")
+        _ = self.git("push", "origin", "merge-staging")
+        merge_unit = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+                                  worktree=staff.PresentWorktree(remote.local_machine(), staging), unit_type="merge",
+                                  runtime_id=fixture_runtime_id("example-merges"))
+        with mock.patch.dict(os.environ, self.env):
+            _ = unit_config.write(staging, unit_config.UnitConfig(
+                unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.NoAppPort(), ()))
+        refs = self.git("rev-parse", "production", "origin/production")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(staging.exists())
+        self.assertEqual(staff.by_id(merge_unit.id), replace(merge_unit, worktree=staff.RemovedWorktree(
+            remote.local_machine(), staging, staff.ParkedBranch("merge-staging"))))
+        self.assertTrue(integration.is_dir())
+        self.assertEqual(self.git("rev-parse", "production", "origin/production"), refs)
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), live)))
 
     def test_wrap_refuses_a_permanent_child_before_any_file_or_staff_change(self) -> None:
         runner, alpha, beta, child, permanent = self.permanent_staff_tree()

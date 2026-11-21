@@ -285,12 +285,12 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
 def enrolled_launch_directory(lines: list[str], legacy: Path) -> Path:
     if not staff.declares_merge_checkout(lines):
         return legacy
-    from scripts.production.production_doc import Refusal, production_field
+    from scripts.production.production_doc import MERGE_CHECKOUT_FIELD, Refusal, production_field
 
     try:
         directory = Path(production_field(lines, "Repository"))
-        if not directory.is_absolute():
-            raise Refusal("Repository must name the absolute main checkout path")
+        if not directory.is_absolute() or directory != Path(production_field(lines, MERGE_CHECKOUT_FIELD)):
+            raise Refusal("Repository must match the absolute main checkout path")
         return directory
     except Refusal as error:
         raise ValueError(str(error)) from error
