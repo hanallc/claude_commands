@@ -129,14 +129,6 @@ class GateLaunchPricing(Enum):
     BOOKING_UNTIL_LOGGED = 'booking_until_logged'
 
 
-class GateLaunchLogEvidence(Enum):
-    """Keep evidence from the current launch log read in memory."""
-
-    NOT_READ = 'not read'
-    NO_COMPLETE_ROW = 'no complete row'
-    COMPLETE_ROW = 'complete row'
-
-
 def _gate_quota_cooldown(configuration: conf.ConfigRead) -> float:
     try:
         return configuration.whole('capacity_cooldown_seconds')
@@ -216,14 +208,6 @@ class GateReservation:
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
     launch_pricing: GateLaunchPricing = GateLaunchPricing.CURRENT_EVIDENCE
-    launch_log_evidence: GateLaunchLogEvidence = field(
-        default=GateLaunchLogEvidence.NOT_READ, compare=False, repr=False)
-
-    def retains_unlogged_booking(self, *, day_is_settled: bool = False) -> bool:
-        """Keep unlogged bookings for open gates or crash recovery on unsettled days."""
-        return self.launch_log_evidence is not GateLaunchLogEvidence.COMPLETE_ROW and (
-            gate_is_open(self) or (isinstance(self.state, GateTerminated)
-                                   and _gate_has_recovery_booking(self) and not day_is_settled))
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
@@ -231,12 +215,12 @@ def gate_is_open(reservation: GateReservation) -> bool:
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
 
 
-def _gate_has_recovery_booking(reservation: GateReservation) -> bool:
+def _gate_holds_booking(reservation: GateReservation) -> bool:
     return reservation.launch_pricing is GateLaunchPricing.BOOKING_UNTIL_LOGGED
 
 
-def _gate_has_cost_reserve(reservation: GateReservation, *, day_is_settled: bool = False) -> bool:
-    return gate_is_open(reservation) or reservation.retains_unlogged_booking(day_is_settled=day_is_settled)
+def _gate_has_cost_reserve(reservation: GateReservation) -> bool:
+    return gate_is_open(reservation) or _gate_holds_booking(reservation)
 
 
 @dataclass(frozen=True)
@@ -1101,7 +1085,7 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'mode': r.mode, 'root_gib': r.root_gib,
-             **({'launch_pricing': r.launch_pricing.value} if _gate_has_recovery_booking(r) else {}),
+             **({'launch_pricing': r.launch_pricing.value} if _gate_holds_booking(r) else {}),
              'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
                       if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
@@ -1347,10 +1331,10 @@ def _complete_day_adjustments(complete_days: Sequence[CompleteDayAmount], interv
     covered = tuple(day for day in complete_days if start <= day.start and day.end <= end)
     if not covered:
         return ()
-    reserved_gates = tuple(row for row in gate_reservations if _gate_has_cost_reserve(row, day_is_settled=True))
+    reserved_gates = tuple(row for row in gate_reservations if _gate_has_cost_reserve(row))
     preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
                  for row in reserved_gates}
-    preserved.update('gate:' + row.attempt for row in reserved_gates if row.retains_unlogged_booking(day_is_settled=True))
+    preserved.update('gate:' + row.attempt for row in reserved_gates)
     usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
     return tuple((day.start, day.usd - period_cost(usage, day.start, day.end)) for day in covered)
 
@@ -1999,7 +1983,7 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
         if reservation.at > now and not reserve:
             continue
         end = exposure.priced_end(now, open_until=max(now, reservation.expires) if reserve else now)
-        if reserve and reservation.retains_unlogged_booking():
+        if reserve and _gate_holds_booking(reservation):
             end = max(end, reservation.expires)
         rate = _gate_estimate_rate(reservation)
         rates = dict(reservation.day_rates)
@@ -2072,8 +2056,7 @@ def _spend_day_storage_costs(costs: Sequence[ChargedInterval], day: date, refuse
 
 
 def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings: Sequence[ChargeRead], now: int, *,
-                    reserve: bool = False, estimate_days: Sequence[date] = (),
-                    complete_days: Sequence[CompleteDayAmount] = ()) -> tuple[DailySpend, ...]:
+                    reserve: bool = False, estimate_days: Sequence[date] = ()) -> tuple[DailySpend, ...]:
     """Use account bills for completed days and bill rates for unbilled days."""
     zone = ZoneInfo('UTC')
     today = datetime.fromtimestamp(now, zone).date()
@@ -2115,7 +2098,6 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
         last = max(last, datetime.fromtimestamp(max(r.end for r in hana) - 1, zone).date())
     days: list[DailySpend] = []
     local_estimate_days = set(estimate_days)
-    settled_starts = {day.start for day in complete_days}
     requested_days = sorted(day for day in local_estimate_days if day < first)
     report_days = (first + timedelta(days=offset) for offset in range((last - first).days + 1))
     for day in chain(requested_days, report_days):
@@ -2137,7 +2119,6 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             include(charge)
         query_usd = period_cost(query_charges, start, end)
         bill = bills.get(key)
-        day_is_settled = start in settled_starts
         use_local_charges = day in local_estimate_days
         runs = sum(start <= r.at < end and isinstance(r.state, (GateRunning, GateTerminated))
                    for r in state.gate_reservations)
@@ -2172,11 +2153,8 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             groups[spend_group('SpotUsage:' + settings.instance_type)] += period_cost(older, start, end)
             for charge in older:
                 include(charge)
-        if bill is None or reserve:
             for reservation in state.gate_reservations:
                 if isinstance(reservation.state, GateAbsent) or reservation.at > stop:
-                    continue
-                if bill is not None and not reservation.retains_unlogged_booking(day_is_settled=day_is_settled):
                     continue
                 for charge in gate_compute.get('gate:' + reservation.attempt, ()):
                     groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)
@@ -2189,7 +2167,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
                 continue
             if ((bill is None and (latest is None or use_local_charges)) or
-                    (reserve and _gate_has_cost_reserve(reservation, day_is_settled=day_is_settled))):
+                    (reserve and _gate_has_cost_reserve(reservation))):
                 allowance = gate_allowance(reservation)
                 groups['other'] += allowance.usd
                 include(ChargedInterval(reservation.at, reservation.at, allowance.usd,
@@ -2249,24 +2227,18 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
             max(Decimal(0), monthly - monthly_accrued))
 
 
-def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
-                        complete_days: Sequence[CompleteDayAmount] = ()) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: int) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
     """Reserve each open gate across all affected days and months."""
     daily: dict[str, Decimal] = {}
     monthly: dict[str, Decimal] = {}
-    settled_starts = {day.start for day in complete_days}
     for reservation in state.gate_reservations:
         if not _gate_has_cost_reserve(reservation):
             continue
         pending = replace(state, gate_reservations=[reservation])
-        reserved = gate_compute_intervals(pending, now, settings.box_minimum_seconds, reserve=True)
-        accrued = gate_compute_intervals(pending, now, settings.box_minimum_seconds)
-        if isinstance(reservation.state, GateTerminated) and settled_starts:
-            # Remove settled UTC days before splitting the reserve into local days.
-            reserved, accrued = (tuple(row for row in intervals if reservation.retains_unlogged_booking(
-                day_is_settled=row.start - row.start % 86400 in settled_starts)) for intervals in (reserved, accrued))
-        reserved_days, _months = spending_periods(reserved, settings.accounting_zone)
-        accrued_days, _months = spending_periods(accrued, settings.accounting_zone)
+        reserved_days, _months = spending_periods(
+            gate_compute_intervals(pending, now, settings.box_minimum_seconds, reserve=True), settings.accounting_zone)
+        accrued_days, _months = spending_periods(
+            gate_compute_intervals(pending, now, settings.box_minimum_seconds), settings.accounting_zone)
         for day, reserved in reserved_days.items():
             cost = max(Decimal(0), reserved - accrued_days.get(day, Decimal(0)))
             daily[day] = daily.get(day, Decimal(0)) + cost
@@ -2278,10 +2250,9 @@ def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: 
     return daily, monthly
 
 
-def gate_future_costs(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
-                      complete_days: Sequence[CompleteDayAmount] = ()) -> tuple[Decimal, Decimal]:
+def gate_future_costs(state: LedgerEvidence, settings: SpendingSettings, now: int) -> tuple[Decimal, Decimal]:
     """Return open reservations for the current accounting periods."""
-    daily, monthly = gate_future_periods(state, settings, now, complete_days=complete_days)
+    daily, monthly = gate_future_periods(state, settings, now)
     day = datetime.fromtimestamp(now, settings.accounting_zone).strftime('%Y-%m-%d')
     return daily.get(day, Decimal(0)), monthly.get(day[:7], Decimal(0))
 
@@ -2322,7 +2293,7 @@ def _guard_limit_amounts(state: LedgerEvidence, settings: SpendingSettings, cost
                          complete_days: Sequence[CompleteDayAmount]) -> tuple[_GuardAccrual, _GuardAccrual]:
     now = costs.at
     daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
-    gate_daily, gate_monthly = gate_future_costs(state, settings, now, complete_days=complete_days)
+    gate_daily, gate_monthly = gate_future_costs(state, settings, now)
     reserved, reserved_months = spending_periods(
         hana_intervals(state, now, settings.box_minimum_seconds, reserve=True), settings.accounting_zone)
     accrued, accrued_months = spending_periods(
@@ -2553,7 +2524,7 @@ class CostLedger:
 
     def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int, *,
                      accounting: GateLaunchAccounting | Literal['current_settings'] = 'current_settings') -> None:
-        """Keep the booking until the launch log gives the actual launch."""
+        """Use the saved booking as a minimum until the launch log gives the actual launch."""
         launch_rows = self.launches()
         launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
         gate_counts: dict[str, int] = {}
@@ -2576,12 +2547,8 @@ class CostLedger:
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
             launch = launches.get(reservation.attempt)
-            launch_log = GateLaunchLogEvidence.NO_COMPLETE_ROW if launch is None else GateLaunchLogEvidence.COMPLETE_ROW
-            if reservation.launch_log_evidence is not launch_log:
-                reservation = replace(reservation, launch_log_evidence=launch_log)
-            if reservation.retains_unlogged_booking() and (reservation.day_rates or reservation.rate.source != 'not priced'):
-                priced.append(reservation)
-                continue
+            holds_booking = launch is None and (_gate_holds_booking(reservation) or bool(
+                isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates))
             size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
             at = int(float(str(launch['time']))) if launch is not None else reservation.at
             end = reservation.state.at if isinstance(reservation.state, GateTerminated) else max(now, reservation.expires)
@@ -2600,6 +2567,14 @@ class CostLedger:
             rates = tuple((day, max((index.for_day(day, reservation.usd_per_hour) for index in rates_by_candidate),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
+            if holds_booking:
+                saved_rates = dict(reservation.day_rates)
+                saved_rate = _gate_estimate_rate(reservation)
+                for day, current in rates:
+                    booked = saved_rates.get(day, saved_rate)
+                    saved_rates[day] = current if current.usd_per_hour > booked.usd_per_hour else booked
+                priced.append(replace(reservation, rate=saved_rates[days[0]], day_rates=tuple(sorted(saved_rates.items()))))
+                continue
             reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates,
                                   launch_pricing=GateLaunchPricing.CURRENT_EVIDENCE)
             priced.append(replace(reservation, booked_allowance=_book_allowance(reservation, rates_by_candidate)))
@@ -2749,7 +2724,7 @@ class CostLedger:
                          costs: CostEstimate, readings: Sequence[ChargeRead],
                          complete_days: Sequence[CompleteDayAmount]) -> str:
         """Apply the account bill cap to the priced resource reservations."""
-        days = gate_spend_days(state, settings, readings, now, reserve=True, complete_days=complete_days)
+        days = gate_spend_days(state, settings, readings, now, reserve=True)
         fixed_daily, fixed_monthly = _reserved_fixed_costs(state, settings, costs)
         if any(is_billed_day(r) and r.period_end <= now for r in readings):
             fixed_daily = fixed_monthly = Decimal(0)
@@ -2811,7 +2786,7 @@ class CostLedger:
         for index, row in enumerate(state.gate_reservations):
             if row.attempt != attempt:
                 continue
-            if isinstance(outcome, GateAbsent) and _gate_has_recovery_booking(row):
+            if isinstance(outcome, GateAbsent) and _gate_holds_booking(row):
                 return False
             pricing = row.launch_pricing
             if isinstance(row.state, GateLaunchPending) and not isinstance(outcome, GateAbsent):
