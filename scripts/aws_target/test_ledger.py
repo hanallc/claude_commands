@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import subprocess
 from threading import Event
+import time
 from typing import cast, override
 from unittest import mock
 import unittest
@@ -633,6 +634,48 @@ class LedgerTests(CostFixture):
         request = ledger.GateReservation('open', self.start, self.start + 1200, Decimal('.8'), Decimal('.02'),
                                          instance_type='m7a.8xlarge', region='us-east-2')
         self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
+
+    def test_recovered_gate_repricing_keeps_the_booking_as_a_minimum(self) -> None:
+        self.costs({'monthly_limit_usd': '.70', 'limit_reserve_usd': '0', 'cost_explorer_unchanged_reads': '1'})
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        now = self.start + 4500
+        booking = ledger.GateReservation('recovered', self.start, now, Decimal('.40'), Decimal(0),
+                                         instance_type='m7a.8xlarge', region='us-east-2')
+        reserved = self.book.reserve_gate(self.settings, booking)
+        assert isinstance(reserved, ledger.GateReserved)
+        self.assertEqual(reserved.reservation.rate.usd_per_hour, Decimal('.40'))
+        accounting = ledger.GateLaunchAccounting(0, (booking.region,), 0)
+        with mock.patch.object(time, 'time', return_value=now):
+            self.book.record_gate_launch_outcome(booking.attempt, ledger.GateRunning('i-fixture'),
+                instance_type=booking.instance_type, lock_timeout_s=1, accounting=accounting)
+        self.assertEqual(self.book.launches(), ())
+
+        start = self.start - 86400
+        usage = ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.10'), Decimal('.5'), 'Hrs')
+        bill = ledger.ChargeRead('2026-01-14', self.start, start, self.start, Decimal('.10'), Decimal(0),
+                                 Decimal(0), (usage,), False)
+        self.write_complete_bill_fixture(bill)
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal('.60'))
+        self.assertIsInstance(self.guard(now), ledger.SpendingAllowed)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].rate.usd_per_hour, Decimal('.40'))
+
+        self.write_complete_bill_fixture(replace(bill, usage_types=(replace(usage, quantity=Decimal('.125')),)))
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal('1.10'))
+        guard = self.guard(now)
+        assert isinstance(guard, ledger.SpendingRefused)
+        self.assertEqual(guard.reason, 'monthly_limit')
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].rate.usd_per_hour, Decimal('.80'))
+        proposal = replace(booking, attempt='next', at=now, expires=now + 60)
+        self.assertEqual(self.book.reserve_gate(self.settings, proposal), ledger.GateCapReached('monthly_limit'))
+
+        self.write_complete_bill_fixture(bill)
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal('1.10'))
+        _ = self.book.launch_history_path.write_text(json.dumps({'attempt': booking.attempt, 'time': booking.at,
+            'instance_type': booking.instance_type, 'region': booking.region, 'result': 'launched'}) + '\n')
+        priced, = self.book.priced_snapshot(now).gate_reservations
+        self.assertEqual(priced.rate.usd_per_hour, Decimal('.20'))
+        self.assertEqual(priced.launch_pricing, ledger.GateLaunchPricing.CURRENT_EVIDENCE)
 
     def test_reservation_rejects_closed_attempt_ids(self) -> None:
         request = self.allowance_gate()

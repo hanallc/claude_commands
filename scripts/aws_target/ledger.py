@@ -2524,7 +2524,7 @@ class CostLedger:
 
     def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int, *,
                      accounting: GateLaunchAccounting | Literal['current_settings'] = 'current_settings') -> None:
-        """Keep the booking until the launch log gives the actual launch."""
+        """Use the saved booking as a minimum until the launch log gives the actual launch."""
         launch_rows = self.launches()
         launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
         gate_counts: dict[str, int] = {}
@@ -2547,10 +2547,8 @@ class CostLedger:
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
             launch = launches.get(reservation.attempt)
-            if launch is None and (_gate_holds_booking(reservation) or
-                    isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates):
-                priced.append(reservation)
-                continue
+            holds_booking = launch is None and (_gate_holds_booking(reservation) or bool(
+                isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates))
             size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
             at = int(float(str(launch['time']))) if launch is not None else reservation.at
             end = reservation.state.at if isinstance(reservation.state, GateTerminated) else max(now, reservation.expires)
@@ -2569,6 +2567,14 @@ class CostLedger:
             rates = tuple((day, max((index.for_day(day, reservation.usd_per_hour) for index in rates_by_candidate),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
+            if holds_booking:
+                saved_rates = dict(reservation.day_rates)
+                saved_rate = _gate_estimate_rate(reservation)
+                for day, current in rates:
+                    booked = saved_rates.get(day, saved_rate)
+                    saved_rates[day] = current if current.usd_per_hour > booked.usd_per_hour else booked
+                priced.append(replace(reservation, rate=saved_rates[days[0]], day_rates=tuple(sorted(saved_rates.items()))))
+                continue
             reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates,
                                   launch_pricing=GateLaunchPricing.CURRENT_EVIDENCE)
             priced.append(replace(reservation, booked_allowance=_book_allowance(reservation, rates_by_candidate)))
