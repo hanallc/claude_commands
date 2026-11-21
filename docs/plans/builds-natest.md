@@ -400,7 +400,9 @@ Parked 2026-11-20: at most 14 AWS s; reopen from the top list.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
 
-### Phase 391 — the gate wakes on child exit and reads job memory from its cgroup  · status: todo
+### Phase 391 — the gate wakes on child exit and reads job memory from its cgroup  · status: dropped (2026-11-21)
+
+**Dropped:** Phase 398 measured all gate work outside the module rows at a mean of 214 CPU s for each full natedev gate (3%). The gate polls are only a part of it. The work costs about 8 worker hours in gate.py. Sent to builds with item 80 on 11-21.
 **Depends on:** Phase 392, Phase 383
 
 Phase 392 changes the gate job start and stop. The queue item 44df is dropped (bob, List item 140): job memory comes from each module's own scope, with no gate scope.
@@ -554,7 +556,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   2. basedpyright zero errors and warnings on changed files.
   3. Full natedev gate passes (reds that also occur on base do not count).
 
-### Phase 398 — the fixed cost of each gate module and the gate work outside the modules are measured  · status: todo
+### Phase 398 — the fixed cost of each gate module and the gate work outside the modules are measured  · status: done (no change; measure)
+
+**As built:** no code change. Work outside the module rows: mean 214 CPU s for each full natedev gate (7 gates of 11-20 with a matched scope; range 146 to 325), not 750. Fixed cost of one module job: 0.17 CPU s (one empty module, 11-21); 840 launches are about 143 CPU s (estimate). Together about 357 CPU s, 5.5% of the 6,452 CPU s gate mean. Decision: no work on the fixed job cost; Phase 391 dropped. Result and proposal sent to builds with item 80 on 11-21.
 **Depends on:** none
 
 #### Work Order
@@ -786,7 +790,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** the four tests pass in 20 repeated runs with each importer of changed code, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review and the aws review have no open finding; the full gate that builds runs for the merge passes. After the phase is merged to main, the director writes in the next file the mean modules for each AWS merge gate and the count of nightly reds that no merge gate selected.
 
-### Phase 407 — the broad CPU rise in unchanged modules has a measured cause  · status: todo
+### Phase 407 — the broad CPU rise in unchanged modules has a measured cause  · status: done (no change; measure)
+
+**As built:** no code change. Six unchanged modules, tree e7670cf8d7 to b576bf26b5 on natedev: 15.9 to 19.3 CPU s (+21%), with the same process starts and execs. The rise is in Python programs: module_run.py 0.08 to 0.12 for each module; update_registration.py 0.96 to 2.33 and 0.24 to 0.73; python3 -c 3.09 to 3.97. The run does not isolate one commit. Candidates: 70e6c54344 (changed python_startup/sitecustomize.py and module_run.py), 51a28f5e8c (module_run.py), 6fc8f9c49c (Review imports in update_registration.py). Phase 412 measures the Python start cost.
 **Depends on:** none
 
 #### Work Order
@@ -939,3 +945,22 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Constraints from prior phases:** Phase 409 changed `only_tests` and the module limits; the base is main after 409. Phase 355 renames `merge_gate.py` to `gate.py`; merge-tree against the 355 tip before the hash. Phase 406 (held) sends an affected selection to the AWS gate; this phase does not depend on it and changes no AWS request. natest changes no process doc. Tests read no tunable config value.
 
 **Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; one blind review; 20 repeated runs of each changed test module after natemerge's go; the gate route that builds names for the merge passes.
+
+### Phase 412 — the CPU cost of one Python start in a gate has a measured cause  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** one report gives the CPU of one Python process start with the gate environment on tree e7670cf8d7 and on current main, and names the code that added cost. Predicted saving: 0 CPU in this phase (measure). The target is the broad rise of about 1,018 CPU s for each AWS full gate (measured, AWS, Phase 399).
+- **Spec:**
+  1. In private clones of the two trees, start `python3 -c pass` 200 times with the gate interpreter and the gate environment (sitecustomize from `scripts/lib/python_startup`). Record user plus system CPU for each tree. Fresh TMPDIR on /tmp, bytecode on.
+  2. Repeat with `python3 -I -c pass` to give the cost without sitecustomize.
+  3. When the tip costs more, use `python3 -X importtime` and a bisect over the commits that changed `scripts/lib/python_startup/` to name the commit and the lines.
+  4. Count the Python starts of one full gate from one task_cpu.py trace or from the per-module process counts of module_cost.py on 20 modules. Give the cost times the count.
+  5. Proposal to builds: the repair, its CPU saved for each gate, its owner (devtools if 70e6c54344 is the cause). Change no repository file.
+- **Files:** none (a report in the session folder).
+- **Workers:** 1 writer.
+  - impl: all steps; nothing splits.
+- **Constraints from prior phases:** Phase 407 found the rise in Python programs with no change in process starts. Runs of test modules need natemerge's go; step 1 to 3 run no test module.
+- **Acceptance gate:**
+  1. Each number names its tree and its command.
+  2. The report says which part of the 407 rise the start cost explains.
