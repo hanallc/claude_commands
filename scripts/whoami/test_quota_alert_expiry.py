@@ -12,10 +12,11 @@ from io import StringIO
 from typing import cast, final, override
 from unittest import mock
 
-from scripts.accounts import next_moves, role_map
+from scripts.accounts import accounts, next_moves, role_map
 from scripts.notify import push_texts, pushover, review, silence
 from scripts.notify.user_action import ActionRequired
-from scripts.whoami import quota_alert, quota_alert_test_support as support, run_out
+from scripts.review_links import accounts_page
+from scripts.whoami import agent_accounts, note_file, quota_alert, quota_alert_test_support as support, run_out
 
 setUpModule = support.setUpModule
 
@@ -49,6 +50,16 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
                             "remaining": left + step * rate / 6})
                 for label, rate in rates.items() for step in range(12, -1, -1)]
         _ = run_out.READINGS_LOG.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def recorded_note(self, at: datetime, left: float, reset: str | None = None) -> note_file.Note:
+        path = self.note("claude2.md", "active", f"{left:g}", reset).path
+        text = path.read_text(encoding="utf-8")
+        updated = text.replace("weekly_remaining_usage:",
+                               f"weekly_usage_checked_at: {at.isoformat()}\nweekly_remaining_usage:")
+        _ = path.write_text(updated, encoding="utf-8")
+        note = note_file.read_note(path)
+        assert isinstance(note, note_file.Note)
+        return note
 
     def expiry_accounts(self) -> list[str]:
         return [push.values["account"] for push in self.noted if push.id == "quota.claude_expiry"]
@@ -116,6 +127,22 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
                 self.assertEqual(len(self.expiry_accounts()), 1)
                 self.check(self.now + timedelta(minutes=elapsed + 2))
                 self.assertEqual(len(self.expiry_accounts()), 1)
+
+    def test_reset_excludes_the_same_history_for_the_page_and_the_expiry_push(self) -> None:
+        reset = self.now + timedelta(weeks=1, minutes=-1)
+        self.save_rates(self.now - timedelta(minutes=2), {"claude2": 6}, left=1)
+        note = self.recorded_note(self.now, 98, reset.isoformat())
+        row = accounts.StatusRow(
+            label="claude2", tool="claude", folder="~/.claude2", login="", roles=(),
+            weekly_left_percent=98, resets_at=reset, credits=0, on_credits="no", use_credits=False,
+            read_at=self.now, read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=self.now)
+        status = accounts.StatusReading((row,), (), (), timezone.utc, self.now)
+
+        page = accounts_page.board(status)
+        self.assertEqual(page.count('title="No usage rate is available."'), 2)
+        self.assertNotIn("<time", page)
+        _ = self.alert([note])
+        self.assertEqual(self.expiry_accounts(), [])
 
     def test_sender_result_that_proves_no_post_retries_at_the_next_check(self) -> None:
         outcomes = (
@@ -266,8 +293,10 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
             deliver.assert_called_once()
 
     def test_forecast_uses_the_age_and_balance_of_the_latest_reading(self) -> None:
-        self.save_rates(self.now - timedelta(minutes=10), {"claude2": 2}, left=24 + 1 / 6)
-        _ = self.alert([self.note("claude2.md", "active", "24.1666666667")])
+        observed = self.now - timedelta(minutes=10)
+        left = 24 + 1 / 6
+        self.save_rates(observed, {"claude2": 2}, left=left)
+        _ = self.alert([self.recorded_note(observed, left)])
 
         self.assertEqual(self.expiry_accounts(), ["claude2"])
         self.assertEqual((self.noted[0].title, self.noted[0].body), ("claude2 runs out Sun 11-22 04:55 EST", ""))
