@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import final
@@ -39,6 +40,13 @@ class BatchFixture(MergeCheckpointFixture):
 
     def batch_record(self) -> Path:
         return Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "checkpoint-batches/production"))
+
+    def interrupt_batch(self, *lines: str) -> str:
+        self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
+        with self.assertRaises(KeyboardInterrupt):
+            _ = self.land_batch(list(lines))
+        self.executable(self.bin / "checkpoint-test", STUB)
+        return self.git("rev-parse", "HEAD")
 
     def land_batch(self, lines: list[str]) -> subprocess.CompletedProcess[str]:
         batch = self.root / "batch.txt"
@@ -104,13 +112,15 @@ class MergeCheckpointBatchTests(BatchFixture):
 
         check = merge_checkpoint.merge_checked_checkpoint
 
-        def interrupt(request: merge_checkpoint.MergeRequest) -> merge_checkpoint.CheckedCheckpointMerge:
+        def interrupt(request: merge_checkpoint.MergeRequest, *, merging: Callable[[], None],
+                      merged: Callable[[str], None]) -> merge_checkpoint.CheckedCheckpointMerge:
             if outcome == "first merge interrupted":
+                merging()
                 _ = self.git("merge", "--no-commit", "--no-ff", alpha)
                 raise KeyboardInterrupt
             if request.commit == beta:
                 raise KeyboardInterrupt
-            return check(request)
+            return check(request, merging=merging, merged=merged)
 
         if outcome in ("interrupted batch", "first merge interrupted"):
             with (patch.object(merge_checkpoint, "merge_checked_checkpoint", side_effect=interrupt),
@@ -130,10 +140,12 @@ class MergeCheckpointBatchTests(BatchFixture):
             self.assertEqual(self.git("rev-parse", "MERGE_HEAD"), beta)
             self.assertEqual(self.git("diff", "--cached", "--name-only"), "src/beta.txt")
 
-        def stage_resolution(request: merge_checkpoint.MergeRequest) -> merge_checkpoint.CheckedCheckpointMerge:
+        def stage_resolution(request: merge_checkpoint.MergeRequest, *, merging: Callable[[], None],
+                             merged: Callable[[str], None]) -> merge_checkpoint.CheckedCheckpointMerge:
             if request.commit == beta:
+                merging()
                 stage_beta()
-            return check(request)
+            return check(request, merging=merging, merged=merged)
 
         if outcome == "pre-existing merge":
             stage_beta()
@@ -157,7 +169,7 @@ class MergeCheckpointBatchTests(BatchFixture):
 
         report = merge_checkpoint.report_checkpoint_stop
 
-        def report_after_reset(request: merge_checkpoint.MergeRequest, error: checkpoint_gate.Stop) -> int:
+        def report_after_reset(production: str, row: merge_checkpoint.CheckpointNotice, error: checkpoint_gate.Stop) -> int:
             head = self.git("rev-parse", "HEAD")
             if blocked:
                 self.assertNotEqual(head, start)
@@ -165,9 +177,9 @@ class MergeCheckpointBatchTests(BatchFixture):
                 self.assertEqual(head, start)
             owned = outcome not in ("repeated checkpoint", "identical rows", "pre-existing merge")
             self.assertEqual(self.batch_record().exists(), owned)
-            return report(request, error)
+            return report(production, row, error)
 
-        def crash_after_reset(_request: merge_checkpoint.MergeRequest, _error: checkpoint_gate.Stop) -> int:
+        def crash_after_reset(_production: str, _row: merge_checkpoint.CheckpointNotice, _error: checkpoint_gate.Stop) -> int:
             self.assertEqual(self.git("rev-parse", "HEAD"), start)
             self.assertTrue(self.batch_record().is_file())
             raise KeyboardInterrupt
@@ -213,6 +225,11 @@ class MergeCheckpointBatchTests(BatchFixture):
             for message in (result.stdout, *notices):
                 self.assertIn("preserve the edits in src/beta.txt", message)
                 self.assertIn(command, message)
+                self.assertIn("branch --show-current", message)
+                self.assertIn("rev-parse HEAD", message)
+                self.assertIn("ls-remote --exit-code origin", message)
+                self.assertIn("merge-base --is-ancestor", message)
+                self.assertIn("--git-path MERGE_HEAD", message)
             self.assertTrue(self.batch_record().is_file())
             self.assertEqual((self.checkout / "src/beta.txt").read_text(), "local edit\n")
             retained = self.root / "retained-edit"
@@ -246,6 +263,151 @@ class MergeCheckpointBatchTests(BatchFixture):
         self.assertIn("send alpha: phase 4 merged and pushed", next_result.stdout)
         merge = "production^2" if main_tip == start else "production^1^2"
         self.assertEqual(self.git("rev-parse", merge, cwd=self.origin), next_commit)
+
+    def test_interrupted_batch_uses_only_recorded_ownership(self) -> None:
+        for case in (
+            "same start with unrelated merge", "unrelated HEAD", "only alpha published", "origin after alpha",
+            "external alpha merge", "origin past both rows", "new push policy", "fetch failure",
+            "legacy record", "legacy record without start",
+        ):
+            with self.subTest(case=case):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.check_interrupted_ownership(case)
+
+    def check_interrupted_ownership(self, case: str) -> None:
+        if case == "new push policy":
+            self.push = "validate_and_push"
+            self.production_doc()
+        start = self.git("rev-parse", "HEAD")
+        alpha = self.checkpoint(content="alpha change\n")
+        beta = self.beta_checkpoint("src/beta.txt", "beta change\n")
+        flags = ("--cancel-prior",) if case == "new push policy" else ()
+        lines = [self.batch_line("alpha", "2", alpha, *flags), self.batch_line("beta", "3", beta)]
+        beta_merge = self.interrupt_batch(*lines)
+        alpha_merge = self.git("rev-parse", "HEAD^1")
+        path = self.batch_record()
+        saved = path.read_bytes()
+        self.assertEqual(self.git("rev-parse", f"{alpha_merge}^2"), alpha)
+        self.assertEqual(self.git("rev-parse", f"{beta_merge}^2"), beta)
+
+        published: dict[str, str] = {}
+        expected_head = start
+        moved = False
+        origin = start
+        if case == "same start with unrelated merge":
+            _ = self.git("reset", "--keep", start)
+            _ = self.git("merge", "--no-commit", "--no-ff", beta)
+            self.write(self.checkout, "src/beta.txt", "unrelated staged edit\n")
+            _ = self.git("add", "src/beta.txt")
+            moved = True
+        elif case == "unrelated HEAD":
+            self.write(self.checkout, "unrelated.txt", "unrelated commit\n")
+            _ = self.git("add", "unrelated.txt")
+            _ = self.git("commit", "-m", "Unrelated commit")
+            expected_head = self.git("rev-parse", "HEAD")
+            moved = True
+        elif case in ("only alpha published", "origin after alpha", "origin past both rows"):
+            published["alpha"] = alpha_merge
+            origin = alpha_merge
+            expected_head = alpha_merge
+            if case == "origin past both rows":
+                published["beta"] = beta_merge
+                origin = beta_merge
+            _ = self.git("push", "origin", f"{origin}:production")
+            if case != "only alpha published":
+                main = self.push_main_change("src/later.txt", "later main change\n")
+                _ = self.git("fetch", "origin", "main", "production", cwd=self.other)
+                _ = self.git("switch", "--detach", origin, cwd=self.other)
+                _ = self.git("merge", "--no-ff", "-m", "Merge later origin/main", main, cwd=self.other)
+                origin = self.git("rev-parse", "HEAD", cwd=self.other)
+                _ = self.git("push", "origin", "HEAD:production", cwd=self.other)
+                expected_head = beta_merge
+        elif case == "external alpha merge":
+            _ = self.git("fetch", "origin", "alpha-branch", cwd=self.other)
+            _ = self.git("switch", "--detach", start, cwd=self.other)
+            _ = self.git("merge", "--no-ff", "-m", "Merge alpha in another checkout", alpha, cwd=self.other)
+            origin = self.git("rev-parse", "HEAD", cwd=self.other)
+            self.assertNotEqual(origin, alpha_merge)
+            self.assertEqual(self.git("rev-parse", "HEAD^2", cwd=self.other), alpha)
+            _ = self.git("push", "origin", "HEAD:production", cwd=self.other)
+            expected_head = beta_merge
+        elif case == "new push policy":
+            self.push = "git"
+            self.production_doc()
+        elif case in ("legacy record", "legacy record without start"):
+            prefix = f"start-tip\t{start}\n" if case == "legacy record" else ""
+            _ = path.write_text(f"{prefix}{alpha}\t{lines[0]}\n{beta}\t{lines[1]}\n", encoding="utf-8")
+            expected_head = beta_merge
+        elif case == "fetch failure":
+            _ = self.git("remote", "set-url", "origin", str(self.root / "missing-origin"))
+            lines = [self.batch_line("alpha", "4", alpha), self.batch_line("beta", "5", beta)]
+            expected_head = beta_merge
+
+        before = self.git("status", "--porcelain")
+        result = self.land_batch(lines)
+        expected_status = 0 if case == "origin past both rows" else 1
+        self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+        notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+        self.assertEqual(len(notices), 2, result.stdout)
+        cause = ("an interrupted batch waits for a fetch; send the row again" if case == "fetch failure"
+                 else "the batch was interrupted; send the row again")
+        phases = ("4", "5") if case == "fetch failure" else ("2", "3")
+        for notice, unit, phase, commit in zip(notices, ("alpha", "beta"), phases, (alpha, beta), strict=True):
+            self.assertTrue(notice.startswith(f"send {unit}: phase {phase} "), notice)
+            if unit in published:
+                self.assertIn(f"merged and pushed as {published[unit]};", notice)
+                self.assertIn(f"{unit} phase {phase} ({commit}) merged as {published[unit]};", self.log.read_text())
+            else:
+                self.assertIn(f"({commit[:12]})", notice)
+                self.assertIn(cause, notice)
+        if moved:
+            self.assertIn("the checkout moved after the interruption", result.stdout)
+        if case in ("origin after alpha", "external alpha merge"):
+            self.assertIn("the fetched tip is outside the rollback target", result.stdout)
+        if case.startswith("legacy record"):
+            self.assertIn("the prior batch record has no merge IDs", result.stdout)
+        if case == "same start with unrelated merge":
+            self.assertEqual(self.git("rev-parse", "MERGE_HEAD"), beta)
+            self.assertEqual(self.git("show", ":src/beta.txt"), "unrelated staged edit")
+        if case == "fetch failure":
+            self.assertEqual(path.read_bytes(), saved)
+        else:
+            self.assertFalse(path.exists())
+        self.assertEqual(self.git("status", "--porcelain"), before)
+        self.assertEqual(self.git("rev-parse", "HEAD"), expected_head)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), origin)
+        self.assertEqual(self.events("checkpoint-test"), [[]])
+        self.assertEqual([(row["merge_commit"], row["source_checkpoint"]) for row in self.receipts()],
+                         [(published[unit], commit) for unit, commit in (("alpha", alpha), ("beta", beta))
+                          if unit in published])
+
+    def test_single_checkpoint_succeeds_when_the_completion_marker_fails(self) -> None:
+        alpha = self.checkpoint(content="alpha change\n")
+        touch = Path.touch
+
+        def fail_marker(path: Path, mode: int = 0o666, exist_ok: bool = True) -> None:
+            if path.name == "promotion":
+                raise PermissionError("fixture cannot write the completion marker")
+            touch(path, mode=mode, exist_ok=exist_ok)
+
+        with patch.object(Path, "touch", fail_marker):
+            result = self.run_checkpoint(alpha).process
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip = self.git("rev-parse", "production", cwd=self.origin)
+        success = f"send alpha: phase 2 merged and pushed as {tip}; continue with the next step"
+        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("send ")], [success])
+        self.assertIn("fixture cannot write the completion marker", result.stdout)
+        with patch.dict("os.environ", self.env):
+            landed = land_runs.last_results()[alpha]
+        self.assertTrue(landed["landed"])
+        self.assertEqual(self.log.read_text().count(f"({alpha}) merged as {tip}"), 1)
+
+        resumed = self.run_checkpoint(alpha).process
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual([line for line in resumed.stdout.splitlines() if line.startswith("send ")], [success])
+        self.assertEqual(self.log.read_text().count(f"({alpha}) merged as {tip}"), 1)
 
 
 if __name__ == "__main__":

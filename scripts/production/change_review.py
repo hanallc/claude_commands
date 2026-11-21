@@ -2378,12 +2378,17 @@ class ReadinessScan:
 
 
 @dataclass(frozen=True)
+class PublishedMerge:
+    merged: str
+
+
+@dataclass(frozen=True)
 class CompletedStep:
     merged: str
     step: str
 
 
-_READINESS_SCAN = ReadinessScan()
+READINESS_SCAN = ReadinessScan()
 
 
 def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list[str]:
@@ -2456,7 +2461,7 @@ class ReviewListDurabilityUnconfirmed(ReviewListWriteFailed):
 
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
-               selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+               selection: ReadinessScan | PublishedMerge | CompletedStep = READINESS_SCAN,
                known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
     """Return the Markdown for the rows written to the review lists."""
     return [row.markdown for row in list_ready_rows(repo, production, merge_branch, review_list=review_list,
@@ -2465,7 +2470,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
 
 def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
                     review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
-                    selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+                    selection: ReadinessScan | PublishedMerge | CompletedStep = READINESS_SCAN,
                     known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
@@ -2479,8 +2484,9 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
         detail = " ".join((fetched.stderr or fetched.stdout).splitlines())
         print(f"change review: git fetch origin main failed; no rows added: {detail}", file=sys.stderr)
         return []
-    if isinstance(selection, CompletedStep):
-        _require_main(repo, selection.merged)
+    if isinstance(selection, (PublishedMerge, CompletedStep)):
+        if isinstance(selection, CompletedStep):
+            _require_main(repo, selection.merged)
         merges = _git(repo, "log", "-1", "--format=%H%x09%s", selection.merged, "--").splitlines()
     else:
         merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
@@ -2588,7 +2594,7 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
             stamp = now()
             try:
                 written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                      on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                      on_hold=None if isinstance(selection, CompletedStep) else note,
                                       merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
             except ReviewListDurabilityUnconfirmed as error:
                 raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error

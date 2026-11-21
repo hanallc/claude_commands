@@ -245,7 +245,9 @@ raise AssertionError("the interrupted batch ran validation again")
                         self.assertEqual(batch_record.read_bytes(), saved_record)
                     else:
                         self.assertFalse(batch_record.exists())
-                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                        if partial:
+                            self.assertIn("the checkout moved after the interruption", result.stdout)
+                        self.assertEqual(self.git("rev-parse", "HEAD"), combined if partial else start)
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
 
     def test_review_rows_written_before_receipt_are_not_duplicated(self) -> None:
@@ -623,13 +625,6 @@ print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
         self.assertEqual(self.git("rev-parse", "HEAD^1"), pushed)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), third)
 
-    def interrupt_batch(self, *lines: str) -> str:
-        self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
-        with self.assertRaises(KeyboardInterrupt):
-            _ = self.land_batch(list(lines))
-        self.executable(self.bin / "checkpoint-test", STUB)
-        return self.git("rev-parse", "HEAD")
-
     def assert_batch_requires_reset(self, result: subprocess.CompletedProcess[str], published: str, unpublished: str) -> None:
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("reset the merge branch to its pushed tip, then start a fresh batch", result.stdout)
@@ -678,9 +673,10 @@ print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
         lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
         merge = merge_checkpoint.merge
 
-        def stop_after_first_merge(request: merge_checkpoint.MergeRequest) -> str:
+        def stop_after_first_merge(request: merge_checkpoint.MergeRequest, *,
+                                   merging: Callable[[], None], merged: Callable[[str], None]) -> str:
             self.assertEqual(request.commit, first)
-            _ = merge(request)
+            _ = merge(request, merging=merging, merged=merged)
             raise KeyboardInterrupt
 
         with (patch.object(merge_checkpoint, "merge", side_effect=stop_after_first_merge),
@@ -783,11 +779,19 @@ print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
                 self.assertEqual(self.git("rev-parse", "HEAD^2"), second)
                 self.assertEqual(self.git("rev-parse", "HEAD^1^2"), first)
                 self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-                saved = self.batch_record().read_text(encoding="utf-8").splitlines()
+                path = self.batch_record()
+                saved = merge_checkpoint.read_batch_record(path, path.read_text(encoding="utf-8"))
+                first_merge = self.git("rev-parse", "HEAD^1")
+                second_merge = self.git("rev-parse", "HEAD")
 
                 result = self.land_batch(lines)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertEqual(saved, [f"start-tip\t{published}", f"{first}\t{lines[0]}", f"{second}\t{lines[1]}"])
+                self.assertEqual(saved.start_tip, published)
+                self.assertEqual(saved.checkout_tip, second_merge)
+                self.assertEqual(saved.in_progress, merge_checkpoint.NoRowInProgress())
+                self.assertEqual([(row.notice.commit, row.arguments, row.merge) for row in saved.rows],
+                                 [(first, lines[0], merge_checkpoint.RowMerge(first_merge)),
+                                  (second, lines[1], merge_checkpoint.RowMerge(second_merge))])
                 for unit, commit in (("alpha", first), ("beta", second)):
                     self.assertIn(f"send {unit}: phase 2 ({commit[:12]})", result.stdout)
                 self.assertEqual(result.stdout.count("the batch was interrupted; send the row again"), 2)

@@ -332,8 +332,9 @@ Each local Promote checkout must exist before the command pushes.
      A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
      A command that cannot start on the base, and a main conflict, also leave the red with the unit.
      A resumed merge whose restored tip already holds the checkpoint runs no base check.
-     Recovery stops an interrupted batch before publication.
-     After publication, recovery completes the outstanding records without testing, pushing, or promoting.
+     Recovery completes each saved row whose recorded merge is an ancestor of the fetched tip.
+     It returns every other saved row to its requester.
+     Recovery runs no tests, push, or promotion.
      A batch stops at its first red test step and returns every outstanding row.
      Each report names the failed step and states whether the row selects it.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.

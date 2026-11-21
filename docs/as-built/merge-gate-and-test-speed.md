@@ -736,14 +736,19 @@ A batch can contain one item.
 3. For a new batch, fetch the unit branches. Fetch all origin heads only if an item needs a commit or a fresh tracking ref.
 4. Resolve every item to a commit. Refuse the batch and name an item that fails to resolve.
 5. Refuse to start if the checkout already has an unfinished merge. Preserve the merge and its staged edits.
-6. Save the starting tip, the ordered arguments, and the resolved commits in Git's internal directory.
+6. Save the starting tip, report fields, and completion fields in a JSON record in Git's internal directory.
+   Save the row index before its merge starts.
+   Save its merge ID and clear the index in one atomic write after the merge succeeds.
 7. Check and merge the rows in order. Test the code paths from the published tip through HEAD.
 8. Publish and promote the tested tip. Complete each row's records and notice before removing the batch record.
 
-If the saved merges are on the fetched tip, use that tip to find each merge and finish its outstanding completion records.
-Published recovery runs no tests, push, or promotion.
-If the batch is unpublished, stop it and report that each outstanding row must be sent again.
-A new row submitted during recovery receives a notice to send it again.
+A row is published when its recorded merge is an ancestor of the fetched tip.
+Use that merge ID for its receipt and completion records.
+Report each other saved row to its requester so they can send it again.
+Use the saved report fields even if the production policy changed.
+Recovery runs no tests, push, or promotion.
+Report each new row submitted during recovery so its requester can send it again.
+If the fetch fails, retain the record and report each row from the current queue item.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
@@ -755,16 +760,24 @@ Each merge retains its own review ownership and completion record.
 A hold, failure, or cancellation stops an unpublished batch.
 A red report names the first failed test step and states whether the row selects it.
 
-1. Abort any unfinished merge that the batch started.
-2. Restore the saved starting tip.
-3. Report every outstanding row.
-4. Remove the batch record.
+1. Check that the branch and HEAD match the batch record.
+2. Abort a merge only when its MERGE_HEAD matches the checkpoint of the recorded row in progress.
+3. Restore the last published row merge or the starting tip, if the target contains the fetched tip.
+4. Report the rows.
+5. Remove the batch record.
+
+If the checkout moved outside the recorded state, preserve the checkout and report that it moved.
+The tool returns the rows from an older record without merge IDs and preserves the checkout.
 
 A crash before record removal lets recovery send the reports again.
 A failed result write leaves the requester notices available.
 If a tracked edit blocks `git reset --keep`, preserve the edit and retain the record.
-Each report names the blocked files and gives the exact recovery command.
-After the owner preserves the edits, run the printed command and start the batch again to complete recovery.
+Each report names the blocked files and gives a recovery command with safety checks.
+The command checks the branch, HEAD, the open merge, and the live origin before it changes the checkout.
+Preserve the edits before you run the command.
+Start the batch again to complete recovery.
+A completion marker write can fail after the success notice.
+The result remains successful, and a retry can print the success notice again.
 If the record is missing and unpublished checkpoint merges exist, the tool refuses to start a new batch.
 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
