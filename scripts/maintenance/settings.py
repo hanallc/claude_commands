@@ -19,6 +19,7 @@ class Part(str, Enum):
     LOGINS = "logins"
     PRUNE = "prune"
     VAULT = "vault"
+    VAULT_SAVE = "vault_save"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,13 @@ def schedule(value: object) -> Schedule:
     return Schedule(positive(values, "interval_seconds"), positive(values, "timeout_seconds"))
 
 
+def vault_save_schedule(value: object) -> Schedule:
+    cadence = schedule(value)
+    if not 60 <= cadence.interval_seconds <= 3600:
+        raise ValueError("parts.vault_save.interval_seconds must be from 60 through 3600")
+    return cadence
+
+
 def configuration_path() -> Path:
     return Path(os.environ.get("AGENT_NOTES_JOB_CONFIG", str(Path(__file__).resolve().parents[2] / "config/agent_notes.toml")))
 
@@ -90,7 +98,9 @@ def settings() -> Settings:
     named = vault.get("named_paths")
     if isinstance(named, bool) or not isinstance(named, int) or named <= 0:
         raise ValueError("agent-notes config: named_paths must be a positive integer")
-    return Settings(schedule(values.get("job")), {part: schedule(parts.get(part.value)) for part in Part},
+    schedules = {part: (vault_save_schedule if part is Part.VAULT_SAVE else schedule)(parts.get(part.value))
+                 for part in Part}
+    return Settings(schedule(values.get("job")), schedules,
                     positive(vault, "git_seconds"), named, positive(table(values.get("watchdog")), "dispatch_seconds"),
                     positive(table(values.get("watchdog")), "recovery_seconds"),
                     positive(table(values.get("watchdog")), "pass_dispatch_seconds"),

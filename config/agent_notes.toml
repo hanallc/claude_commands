@@ -58,6 +58,12 @@ timeout_seconds = 60
 interval_seconds = 120
 timeout_seconds = 60
 
+[parts.vault_save]
+# Sets the time between completed whole-vault saves. Use 60 through 3600 seconds.
+interval_seconds = 180
+# Limits the duration of a save. Use a finite positive number.
+timeout_seconds = 60
+
 [vault]
 # Limits how long each Git command in the vault commit process can run.
 # Use a finite positive number.
