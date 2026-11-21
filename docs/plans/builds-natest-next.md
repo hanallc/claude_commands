@@ -418,3 +418,41 @@ Tests follow source. natest sends each row to its owner through builds; the owne
 | D4c | `message/send.py`: resolve, deliver, log; one hook point for each policy | 3,000 lines | up to 394 tests |
 | D4d | `admission_service.py`: no wire versions, no state replay | 2,000 to 3,000 lines | up to 283 tests |
 | D4e | The gate's own resource governor in `merge_gate.py` | not determined | 93 tests, 81 CPU s |
+
+## Dead-code answers
+
+Phase 404 found 30 candidates on main at `9f3459ec1b`. Builds routes the questions to the owners.
+Record the owner and the date with each answer. The answers are `delete`, `keep`, and `not yet`.
+
+- `scripts/style/selection_capture.py` — delete (resources, 2026-11-21).
+- `scripts/style/refill_measure.py` — not asked yet.
+- `scripts/direct/demo_refusals.sh` — not asked yet.
+- `scripts/production/unit_run.py` — not asked yet.
+- `scripts/style/order_waste.py` — not asked yet.
+- `scripts/style/style_reader_tables.py` — not asked yet.
+- `scripts/style/style_reader_oracle.py` — not asked yet.
+- `scripts/style/style_reader_parity.py` — not asked yet.
+- `scripts/direct/phase_process.py` — not asked yet.
+- `scripts/production/roles_audit.py` — not asked yet.
+- `scripts/whoami/profile_notes_pass.py` — not asked yet.
+- `scripts/whoami/worker_usage.py` — not asked yet.
+- `scripts/usage/compaction_replay.py` — not asked yet.
+- `scripts/lint/gate_folders_delete.py` — delete (resources, 2026-11-21). Also remove its name from `scripts/lib/removal_guard.py` and its tests.
+- `scripts/agents/pane_restore.py` — not asked yet.
+- `scripts/hooks/session-end-pane-record.py` — not asked yet.
+- `scripts/mac_test/loopback_proof.py` — not asked yet.
+- `scripts/lint/package_imports.py` — not asked yet.
+- `scripts/statusline/statusline_rows.py` — delete (natest, 2026-11-21). `statusline.sh` calls `assignment.py` directly since 79a64de8e0.
+- `scripts/aws_target/terminal_table.py` — delete (aws, 2026-11-21). Main dropped its only use in 89e5ebf9b7.
+- `scripts/nix_env/heal.py` — not asked yet.
+- `scripts/test_times/coverage_overlap.py` — not asked yet.
+- `scripts/message/repeats.py` — not answered. queue is not the owner (2026-11-21); routed to postmaster.
+- `scripts/message/install_codex_agents.py` — not answered. queue is not the owner; queue says it is a manual tool (`docs/as-built/session-roster.md:781`) (2026-11-21).
+- `scripts/buildlog/width_trial.py` — not asked yet.
+- `scripts/model_study/` — not asked yet.
+- `scripts/style/crate_run.py` — not answered. resources is not the owner; routed to style (2026-11-21).
+- `scripts/style/bulk_run.py` — not answered. resources is not the owner; routed to style (2026-11-21).
+- `scripts/style/bulk_constants.py` — not asked yet.
+- `scripts/style/bulk_rename.py` except `cargo_output` and its dependencies — not asked yet.
+
+Natest decision, 2026-11-21: keep `test_times/coverage_overlap.py`. It supports manual coverage reviews. Phase 184 recorded 941 tests with unknown coverage. Phase 392 names the collector as an entry point for test isolation.
