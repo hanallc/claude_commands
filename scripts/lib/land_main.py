@@ -129,12 +129,18 @@ def remote_branch_commit(checkout: Path, remote: str, branch: str, *,
     # Another clone can still publish a different commit after ls-remote.
     ref = f"refs/heads/{branch}"
     query = run_git(checkout, "ls-remote", "--refs", "--", remote, ref, time_limit=time_limit)
-    advertised = git_output(query, "ls-remote").splitlines()
-    if not advertised:
+    matching_shas: list[str] = []
+    for row in git_output(query, "ls-remote").splitlines():
+        sha, _, advertised_ref = row.partition("\t")
+        if not advertised_ref or "\t" in advertised_ref or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+            raise LandError(f"{remote}: malformed ls-remote output for {ref}")
+        if advertised_ref == ref:
+            matching_shas.append(sha)
+    if not matching_shas:
         raise RemoteBranchMissing(f"{remote} does not advertise {ref}")
-    sha, _, advertised_ref = advertised[0].partition("\t")
-    if len(advertised) != 1 or advertised_ref != ref or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+    if len(matching_shas) != 1:
         raise LandError(f"{remote}: expected one full commit SHA for {ref}")
+    sha = matching_shas[0]
     _ = checked_git(checkout, "fetch", "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
                     "--", remote, sha, time_limit=time_limit)
     resolved = checked_git(checkout, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}",

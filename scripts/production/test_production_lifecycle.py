@@ -957,7 +957,8 @@ class LifecycleTests(LifecycleFixture):
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
-        for hook_state in ("done", "equal pending", "newer pending", "newer completion", "intervening fetch"):
+        for hook_state in ("done", "equal pending", "newer pending", "newer completion", "intervening fetch",
+                           "suffix match"):
             with self.subTest(installed="newer integration commit", hook=hook_state):
                 base = self.git("rev-parse", "HEAD", cwd=destination)
                 earlier = self.git("commit-tree", "HEAD^{tree}", "-p", base, "-m", "Requested promotion")
@@ -993,7 +994,9 @@ class LifecycleTests(LifecycleFixture):
                     return subprocess.run(["bash", "-c", retry_command], cwd=self.checkout, env=retry_env,
                                           capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
-                if hook_state == "equal pending":
+                if hook_state in ("equal pending", "suffix match"):
+                    if hook_state == "suffix match":
+                        _ = self.git("push", "origin", f"{later}:refs/heads/archive/refs/heads/main")
                     hold.unlink()
                     result = retry()
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
