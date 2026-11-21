@@ -397,7 +397,7 @@ class CrateRunTests(CargoProjectTests):
         checkout = build_folders.worktree_path(repo, unit, short)
         output = build_folders.output_path(repo, unit, short)
         make.assert_called_once_with(repo, unit, short, source)
-        remove.assert_called_once_with(checkout, self.repo)
+        remove.assert_called_once_with(checkout, self.repo, before_report=mock.ANY)
         self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
         self.assertEqual(Path(record["checkout"]), checkout)
         self.assertEqual((checkout / "target").resolve(), output)
@@ -470,14 +470,15 @@ class CrateRunTests(CargoProjectTests):
         checkout = self.batch.read()["crates"]["bulk_sample"]["checkout"]
         notice = f"kept for a manual removal list: {checkout} "
         first, second = io.StringIO(), io.StringIO()
-        report = worktrees.remove_git_checkout
+        report = worktrees.report_retained_folder
 
-        def report_after_save(path: Path, repository: Path) -> None:
-            self.assertTrue(self.batch.read()["crates"]["bulk_sample"].get("removal_reported"))
-            report(path, repository)
+        def report_after_save(path: Path, reason: str) -> None:
+            if reason == "the checkout is selected for removal":
+                self.assertTrue(self.batch.read()["crates"]["bulk_sample"].get("removal_reported"))
+            report(path, reason)
 
         with (redirect_stderr(first),
-              mock.patch.object(worktrees, "remove_git_checkout", side_effect=report_after_save)):
+              mock.patch.object(worktrees, "report_retained_folder", side_effect=report_after_save)):
             _ = self.advance("bulk_sample")
         resumed = crates.CrateRun(self.authority, self.batch.run_id)
         with redirect_stderr(second):
@@ -486,6 +487,118 @@ class CrateRunTests(CargoProjectTests):
         self.assertNotIn(notice, second.getvalue())
         self.assertTrue(result["crates"]["bulk_sample"].get("removal_reported"))
         self.assertTrue(Path(checkout).is_dir())
+
+    def test_refused_removal_check_leaves_the_notice_pending(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        checkout = self.batch.read()["crates"]["bulk_sample"]["checkout"]
+        notice = f"kept for a manual removal list: {checkout} "
+        refused, retried = io.StringIO(), io.StringIO()
+        checked_output = worktrees.checked_output
+
+        def refuse_terminal_output(layout: worktrees.RecordedWorktreeOutput) -> Path:
+            record = self.batch.read()["crates"]["bulk_sample"]
+            if record["stage"] == crates.CrateStage.INTEGRATED:
+                raise ValueError("invalid worktree output")
+            return checked_output(layout)
+
+        with (redirect_stderr(refused),
+              mock.patch.object(worktrees, "checked_output", side_effect=refuse_terminal_output)):
+            _ = self.advance("bulk_sample")
+
+        saved = self.batch.read()["crates"]["bulk_sample"]
+        self.assertEqual(saved["stage"], crates.CrateStage.INTEGRATED)
+        self.assertNotIn("removal_reported", saved)
+        self.assertIn(f"bulk_run: cannot report removal for {checkout!r}: invalid worktree output",
+                      refused.getvalue().splitlines())
+        self.assertNotIn("the checkout is selected for removal", refused.getvalue())
+        with redirect_stderr(retried):
+            _ = self.advance("bulk_sample")
+            _ = self.advance("bulk_sample")
+        self.assertTrue(self.batch.read()["crates"]["bulk_sample"].get("removal_reported"))
+        self.assertEqual(retried.getvalue().count(notice), 1)
+
+    def test_refused_removal_check_allows_the_next_crate_notice(self) -> None:
+        self.freeze()
+        records = self.batch.read()["crates"]
+        first, second = records
+        first_checkout = Path(records[first]["checkout"])
+        second_checkout = Path(records[second]["checkout"])
+        checked_output = worktrees.checked_output
+
+        def refuse_first_output(layout: worktrees.RecordedWorktreeOutput) -> Path:
+            record = self.batch.read()["crates"][first]
+            if layout.short_name == first_checkout.name and record["stage"] == crates.CrateStage.INTEGRATED:
+                raise worktrees.Refused(1, "invalid worktree output\ninvalid layout")
+            return checked_output(layout)
+
+        output = io.StringIO()
+        with (redirect_stderr(output),
+              mock.patch.object(worktrees, "checked_output", side_effect=refuse_first_output)):
+            _ = self.advance(first)
+            _ = self.advance(second)
+            result = self.advance(second)
+
+        saved = result["crates"]
+        self.assertEqual([saved[package]["stage"] for package in (first, second)], [crates.CrateStage.INTEGRATED] * 2)
+        self.assertNotIn("removal_reported", saved[first])
+        self.assertTrue(saved[second].get("removal_reported"))
+        self.assertEqual(result, self.batch.read())
+        notices = output.getvalue()
+        self.assertEqual(notices.splitlines().count(
+            f"bulk_run: cannot report removal for {str(first_checkout)!r}: invalid worktree output invalid layout"), 3)
+        self.assertNotIn(f"kept for a manual removal list: {first_checkout} ", notices)
+        self.assertEqual(notices.count(f"kept for a manual removal list: {second_checkout} "), 1)
+
+    def test_record_damage_and_permission_error_allow_the_next_crate_notice(self) -> None:
+        self.freeze()
+        first, second = self.batch.read()["crates"]
+        with mock.patch.object(worktrees, "remove_git_checkout"):
+            _ = self.advance(first)
+            terminal = self.advance(second)
+        first_checkout = Path(terminal["crates"][first]["checkout"])
+        second_checkout = Path(terminal["crates"][second]["checkout"])
+        first_notice = f"kept for a manual removal list: {first_checkout} "
+        second_notice = f"kept for a manual removal list: {second_checkout} "
+        record_path = worktrees.record_file(first_checkout)
+        original = record_path.read_text()
+        fields = cast(dict[str, object], json.loads(original))
+        missing_branch = fields.copy()
+        _ = missing_branch.pop("branch")
+        cases = (
+            ("missing branch", missing_branch, f"{record_path}: worktree record field 'branch' must be text"),
+            ("wrong version", {**fields, "version": True}, f"{record_path}: worktree record field 'version' must be an integer"),
+            ("permission denied", fields, "fixture checkout permission denied"),
+        )
+        path_exists = Path.exists
+
+        for failure, damaged, reason in cases:
+            def checked_exists(path: Path) -> bool:
+                if failure == "permission denied" and path == first_checkout:
+                    raise PermissionError(reason)
+                return path_exists(path)
+
+            with self.subTest(failure=failure):
+                self.batch.save(terminal)
+                _ = record_path.write_text(json.dumps(damaged))
+                refused, retried = io.StringIO(), io.StringIO()
+                with redirect_stderr(refused), mock.patch.object(Path, "exists", new=checked_exists):
+                    _ = self.advance(second)
+                    _ = self.advance(second)
+                saved = self.batch.read()["crates"]
+                self.assertNotIn("removal_reported", saved[first])
+                self.assertTrue(saved[second].get("removal_reported"))
+                refusals = refused.getvalue()
+                line = f"bulk_run: cannot report removal for {str(first_checkout)!r}: {reason}"
+                self.assertEqual(refusals.splitlines().count(line), 2)
+                self.assertNotIn(first_notice, refusals)
+                self.assertEqual(refusals.count(second_notice), 1)
+
+                _ = record_path.write_text(original)
+                with redirect_stderr(retried):
+                    _ = self.advance(second)
+                self.assertTrue(self.batch.read()["crates"][first].get("removal_reported"))
+                self.assertEqual(retried.getvalue().count(first_notice), 1)
+                self.assertNotIn(second_notice, retried.getvalue())
 
     def test_worker_validation_waits_before_it_takes_a_validation_slot(self) -> None:
         self.freeze(paths=("src/lib.rs",))
@@ -1889,11 +2002,11 @@ class CrateRunTests(CargoProjectTests):
         self.freeze(paths=("src/lib.rs",))
         remove = worktrees.remove_git_checkout
 
-        def unchanged_before_task_end(checkout: Path, repository: Path) -> None:
+        def unchanged_before_task_end(checkout: Path, repository: Path, *, before_report: Callable[[], None]) -> None:
             record = self.batch.read()["crates"]["bulk_sample"]
             self.assertEqual((Path(record["checkout"]) / "src/lib.rs").read_bytes(),
                              (self.repo / "src/lib.rs").read_bytes())
-            remove(checkout, repository)
+            remove(checkout, repository, before_report=before_report)
 
         with mock.patch.object(worktrees, "remove_git_checkout", side_effect=unchanged_before_task_end) as end:
             result = self.advance("bulk_sample")
@@ -1901,7 +2014,7 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
         self.assertIn("shared or cross-crate", record.get("error", ""))
         self.assertEqual(self.commands.calls, [])
-        end.assert_called_once_with(Path(record["checkout"]), self.repo)
+        end.assert_called_once_with(Path(record["checkout"]), self.repo, before_report=mock.ANY)
         self.assertTrue(Path(record["checkout"]).is_dir())
 
     def test_partial_refusal_publication_resumes_without_releasing_checkpointed_ticket(self) -> None:

@@ -12,7 +12,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 import fcntl
 import hashlib
 import json
@@ -147,7 +147,27 @@ def record_file(path: Path) -> Path:
 
 
 def read_record(path: Path) -> WorktreeRecord:
-    fields = cast(dict[str, object], json.loads(path.read_text()))
+    try:
+        decoded = cast(object, json.loads(path.read_text()))
+    except ValueError as error:
+        raise ValueError(f"{path}: invalid worktree record: {error}") from error
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{path}: worktree record must be an object")
+    fields = cast(dict[str, object], decoded)
+
+    def text_field(name: str) -> str:
+        value = fields.get(name)
+        if not isinstance(value, str):
+            raise ValueError(f"{path}: worktree record field {name!r} must be text")
+        return value
+
+    version = fields.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ValueError(f"{path}: worktree record field 'version' must be an integer")
+    try:
+        stage = MakeStage(fields.get("stage", MakeStage.DONE.value))
+    except ValueError as error:
+        raise ValueError(f"{path}: invalid worktree record field 'stage'") from error
     layout: RecordedWorktreeOutput | UnassignedOutput = UnassignedOutput()
     if {"unit", "short_name", "output"} & fields.keys():
         unit, short_name, output = fields.get("unit"), fields.get("short_name"), fields.get("output")
@@ -155,11 +175,9 @@ def read_record(path: Path) -> WorktreeRecord:
             raise ValueError(f"{path}: incomplete worktree output record")
         layout = RecordedWorktreeOutput(unit, short_name, Path(output))
     return WorktreeRecord(
-        version=cast(int, fields["version"]), path=cast(str, fields["path"]),
-        branch=cast(str, fields["branch"]), repo=cast(str, fields["repo"]),
-        base=cast(str, fields["base"]), merge_branch=cast(str, fields["merge_branch"]),
-        owner=cast(str, fields["owner"]), made_at=cast(str, fields["made_at"]), layout=layout,
-        stage=MakeStage(fields.get("stage", MakeStage.DONE.value)))
+        version=version, path=text_field("path"), branch=text_field("branch"), repo=text_field("repo"),
+        base=text_field("base"), merge_branch=text_field("merge_branch"), owner=text_field("owner"),
+        made_at=text_field("made_at"), layout=layout, stage=stage)
 
 
 def write_record(record: WorktreeRecord) -> None:
@@ -505,22 +523,28 @@ def release_worktree_pair(path: Path) -> None:
         print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
 
 
-def clean_legacy_output(checkout: Path) -> None:
-    """Report the output assigned by the former Cargo mirror."""
+def _legacy_output(checkout: Path) -> Path | UnassignedOutput:
     settings = conf.read_or_repository("build_folders").values("roots.slot_cargo", "roots.cargo_paths")
     cargo_root = settings.get("roots.slot_cargo")
     mirror_root = settings.get("roots.cargo_paths")
     if not cargo_root or not mirror_root:
-        return
+        return UnassignedOutput()
     root = Path(os.path.expandvars(cargo_root)).expanduser().resolve()
     mirror = Path(os.path.expandvars(mirror_root)).expanduser()
     if not mirror.is_absolute() or not checkout.is_dir() or not checkout.name:
-        return
+        return UnassignedOutput()
     entry = mirror.joinpath(*checkout.parts[1:])
     output = entry.parent.resolve() / entry.name
     if root not in output.parents or output.is_symlink() or not output.is_dir():
-        return
-    report_retained_folder(output, "the legacy checkout ended")
+        return UnassignedOutput()
+    return output
+
+
+def clean_legacy_output(checkout: Path) -> None:
+    """Report the output assigned by the former Cargo mirror."""
+    output = _legacy_output(checkout)
+    if isinstance(output, Path):
+        report_retained_folder(output, "the legacy checkout ended")
 
 
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
@@ -775,20 +799,38 @@ def make(repo: str, unit: str, short_name: str, snapshot: staff.StaffSnapshot | 
                            fixed_base=isinstance(snapshot, FrozenWorktreeSource), use_recorded_branch=True)
 
 
-def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, retain_record: bool = False) -> None:
-    """Report a Git checkout and its output for manual review."""
+def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, retain_record: bool = False,
+                        before_report: Callable[[], None] | None = None) -> None:
+    """Report the checkout and its output for manual review.
+
+    Call before_report after all checks and before the first notice.
+    """
     _ = force
     if path.exists() and git_files.at(path).common_dir != git_files.locate(repository).common_dir:
         raise ValueError(f"{path}: worktree belongs to another repository")
     if path == main_checkout(repository):
         raise ValueError(f"{path}: cannot remove the main checkout")
     layout = worktree_output(path)
+    reason = "the checkout is selected for removal"
     if isinstance(layout, RecordedWorktreeOutput):
-        report_retained_folder(checked_output(layout), "the checkout is selected for removal")
+        output = checked_output(layout)
+        output_reason = reason
     else:
-        clean_legacy_output(path)
-    if os.path.lexists(path) or path in worktree_branches(repository):
-        report_retained_folder(path, "the checkout is selected for removal")
+        output = _legacy_output(path)
+        output_reason = "the legacy checkout ended"
+
+    def report_output() -> None:
+        if isinstance(output, Path):
+            report_retained_folder(output, output_reason)
+
+    if before_report is None:
+        report_output()
+    retain_checkout = os.path.lexists(path) or path in worktree_branches(repository)
+    if before_report is not None and (isinstance(output, Path) or retain_checkout):
+        before_report()
+        report_output()
+    if retain_checkout:
+        report_retained_folder(path, reason)
     elif not retain_record:
         release_worktree_pair(path)
         record_file(path).unlink(missing_ok=True)

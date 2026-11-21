@@ -18,7 +18,7 @@ import sys
 import tempfile
 from typing import Callable, NamedTuple, TypedDict, cast, override
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 from uuid import uuid4
@@ -630,6 +630,20 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 check.assert_not_called()
         self.assertTrue(tree.is_dir())
         self.assertTrue(artifact.is_file())
+
+    def test_remove_reports_output_before_listing_a_missing_checkout(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        output = (tree / "target").readlink()
+        _ = tree.rename(tree.with_name("unavailable"))
+        notices = StringIO()
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(worktrees, "worktree_branches", side_effect=worktrees.Refused(1, "Git listing failed")),
+              redirect_stderr(notices),
+              self.assertRaisesRegex(worktrees.Refused, "Git listing failed")):
+            worktrees.remove_git_checkout(tree, self.home / "rust/origin")
+        self.assertEqual(notices.getvalue(),
+                         f"kept for a manual removal list: {output} (worktrees, the checkout is selected for removal)\n")
 
     def test_retire_lists_the_unit_folders_from_each_repo(self) -> None:
         self.layout_fixture()

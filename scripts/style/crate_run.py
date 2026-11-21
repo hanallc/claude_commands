@@ -16,6 +16,7 @@ import json
 import posixpath
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -1238,11 +1239,20 @@ class CrateRun:
                     continue
                 path = Path(record["checkout"])
                 if "worktree_branch" in record:
-                    if not record.get("removal_reported") and path.exists():
-                        record["removal_reported"] = True
-                        self.save(saved)
-                        manifest["crates"][package]["removal_reported"] = True
-                        worktrees.remove_git_checkout(path, self.repo)
+                    if not record.get("removal_reported"):
+                        def save_removal_report() -> None:
+                            record["removal_reported"] = True
+                            self.save(saved)
+                            manifest["crates"][package]["removal_reported"] = True
+
+                        try:
+                            if path.exists():
+                                worktrees.remove_git_checkout(path, self.repo, before_report=save_removal_report)
+                        except (OSError, ValueError, worktrees.Refused) as error:
+                            if record.get("removal_reported"):
+                                raise
+                            reason = " ".join(str(error).splitlines())
+                            print(f"bulk_run: cannot report removal for {str(path)!r}: {reason}", file=sys.stderr)
                     continue
                 paths.append(path)
                 if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):

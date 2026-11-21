@@ -502,11 +502,11 @@ class WorkspaceRunTests(BulkRunFixture):
 
         remove = worktrees.remove_git_checkout
 
-        def end_under_run_lock(path: Path, repository: Path) -> None:
+        def end_under_run_lock(path: Path, repository: Path, *, before_report: Callable[[], None]) -> None:
             with (batch.folder / "run.lock").open("a") as second:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                remove(path, repository)
+                remove(path, repository, before_report=before_report)
 
         with mock.patch.object(run, "execute_plan", wraps=run.execute_plan) as execute:
             with (mock.patch.object(worktrees, "remove_git_checkout", side_effect=end_under_run_lock) as end,
@@ -520,7 +520,7 @@ class WorkspaceRunTests(BulkRunFixture):
             first = batch.read()["crates"]["bulk_sample"]
             self.assertEqual(first["stage"], crate_run.CrateStage.INTEGRATED)
             remaining = Path(first["checkout"])
-            end.assert_called_once_with(remaining, self.repo)
+            end.assert_called_once_with(remaining, self.repo, before_report=mock.ANY)
             self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.SELECTED)
             with self.subTest("terminal resume keeps an earlier workspace"):
                 self.assertTrue(remaining.exists())
