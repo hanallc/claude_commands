@@ -442,7 +442,7 @@ Record the owner and the date with each answer. The answers are `delete`, `keep`
 - `scripts/hooks/session-end-pane-record.py` — delete (natedev, 2026-11-21), with `scripts/agents/pane_restore.py`.
 - `scripts/mac_test/loopback_proof.py` — delete (devtools, 2026-11-21).
 - `scripts/lint/package_imports.py` — delete (natedev, 2026-11-21). No command, doc or lint message names it.
-- `scripts/statusline/statusline_rows.py` — delete (natest, 2026-11-21). `statusline.sh` calls `assignment.py` directly since 79a64de8e0.
+- `scripts/statusline/statusline_rows.py` — keep (builds, 2026-11-21 18:23). sfillB rebuildrow `f53bbd0c17` changes it, so it is live.
 - `scripts/aws_target/terminal_table.py` — delete (aws, 2026-11-21). Main dropped its only use in 89e5ebf9b7.
 - `scripts/nix_env/heal.py` — keep. natedev answered delete, but phase 405 found a live reader: `~/.local/state/notifier/nix-heal/conf:3` calls it every five minutes.
 - `scripts/test_times/coverage_overlap.py` — keep (natest, 2026-11-21). Manual coverage reviews and Phase 392 test isolation use it.
