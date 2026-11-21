@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import IO, cast, override
 from unittest import mock
 
@@ -351,8 +352,9 @@ class HolderTests(PoolCase):
         run = tokens.test_run(["cargo", "nextest", "run", "--test-threads", "4"])
         assert isinstance(run, tokens.SizedTestRun)
         errors = StringIO()
+        remove = mock.Mock(side_effect=PermissionError("fixture denies removal"))
         with (mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}),
-              mock.patch.object(shutil, "rmtree", side_effect=PermissionError("fixture denies removal")) as remove,
+              mock.patch.object(tokens, "shutil", SimpleNamespace(rmtree=remove)),
               mock.patch("sys.stderr", errors)):
             status = tokens.run_with_tokens(run, self.pool, 2, None, lambda _: None, nested_tokens=0)
         remove.assert_called_once_with(str(stale))
@@ -412,6 +414,19 @@ class HolderTests(PoolCase):
         self.assertIn("free during nextest: 3\n", output)
         self.assertEqual(self.free_tokens(), 7)
         _ = os.write(self.keeper, compile_tokens)
+
+    def test_nested_cargo_cannot_borrow_shared_tokens_at_the_width_limit(self) -> None:
+        self.fill(7)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder(
+            "cargo", "nextest", "run", "--test-threads", "4",
+            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.pool}"},
+        )
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn("free during nextest: 3\n", output)
+        self.assertIn("nested borrowed: 0\n", output)
+        self.assertEqual(self.free_tokens(), 7)
 
     def test_the_test_floor_can_use_the_entire_pool(self) -> None:
         self.fill(4)

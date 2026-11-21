@@ -5,8 +5,9 @@ Build and list the tests before taking tokens. Limit total tokens to the
 requested width and the selected test count plus `nested_tokens`. Wait for
 `test_token_floor` test tokens, up to the selected test count and requested width.
 Take more free tokens up to the limit. Give nested Cargo up to `nested_tokens`
-of the tokens above the test floor. Give one remaining token to each test thread.
-Return all shared tokens when nextest exits. If a signal ends the launcher,
+of the tokens above the test floor. Give the test child a private FIFO even
+when nested Cargo gets zero tokens. Give one remaining token to each test
+thread. Return all shared tokens when nextest exits. If a signal ends the launcher,
 steve reclaims its tokens and the step group ends the test child.
 """
 
@@ -240,8 +241,6 @@ def clean_jobserver_parent(launcher_start: process_start.ProcessStart) -> Path:
 
 def run_test_phase(run: SizedTestRun, threads: int, nested: bytearray, parent: Path,
                    launcher_start: process_start.ProcessStart) -> int:
-    if not nested:
-        return run_child(run.with_threads(threads))
     pid = os.getpid()
     start = launcher_start.start.encode().hex() if isinstance(launcher_start, process_start.Started) else "unknown"
     with tempfile.TemporaryDirectory(dir=parent, prefix=f"{pid}-{start}-") as directory:

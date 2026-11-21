@@ -5671,7 +5671,7 @@ class QueueLeaveTests(unittest.TestCase):
         ran_args, reservation, waited = case / "args", case / "reservation", case / "waited"
         listing = case / "test-list.json"
         _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
-            f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(3)
+            f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
         }}}}), encoding="utf-8")
         os.mkfifo(pool)
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
@@ -5701,9 +5701,9 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(calls.read_text().splitlines(), [
             "nextest run --no-run --workspace",
             "nextest list --message-format json --workspace",
-            "nextest run --test-threads 3 --workspace",
+            "nextest run --test-threads 4 --workspace",
         ])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 3)
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 4)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
