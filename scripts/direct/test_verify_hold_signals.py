@@ -73,6 +73,8 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                 self.assert_group_stop_clears_memory_wait(signum)
 
     def test_sigint_before_placement_pid_is_saved_reaps_the_waiter(self) -> None:
+        if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+            self.skipTest("The caller ignores SIGINT.")
         hold = self.fixture.runner_state
         os.mkfifo(hold / "placement-ready")
         interrupted = shell_functions(VERIFY, "verify_interrupted")
