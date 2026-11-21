@@ -22,7 +22,8 @@ from scripts.direct.group_cleanup import group_has_live_members, wait_for_group_
 from scripts.direct.group_cleanup import signal_and_resume as signal_and_resume, stop_group as stop_group
 from scripts.lib import build_folder_lock, conf
 from scripts.lib.build_folders import (
-    ForegroundMarker, cleanup_incomplete, mark_cleanup_incomplete as mark_cleanup_incomplete, remove_build_folder,
+    ForegroundMarker, Removed, attempt_folder_removal, cleanup_incomplete,
+    mark_cleanup_incomplete as mark_cleanup_incomplete, report_removal_refusal,
 )
 
 
@@ -168,7 +169,11 @@ def main(argv: Sequence[str]) -> int:
         return run_command(arguments[6:], owner, group, lease, CleanupLeaseUse(arguments[4]),
                            marker=ForegroundMarker[arguments[3]], lifetime=CommandLifetime(arguments[5]))
     if command == "remove":
-        return 0 if remove_build_folder(Path(arguments[0]), wait=cleanup_timing()) else 2
+        result = attempt_folder_removal(Path(arguments[0]), wait=cleanup_timing())
+        if isinstance(result, Removed):
+            return 0
+        report_removal_refusal(result)
+        return 2
     if command in ("cancel-group", "group-exit"):
         group = int(arguments[0])
         try:

@@ -257,7 +257,7 @@ merge_gate.run_suites(Path.cwd(), full=True)
 from pathlib import Path
 import sys
 def cleanup_event(event, arguments):
-    if event != "shutil.rmtree" or arguments[1] is None:
+    if event != "os.rmdir" or arguments[1] < 0:
         return
     if not Path(arguments[0]).name.startswith("merge-gate"):
         return

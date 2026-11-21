@@ -227,7 +227,9 @@ def cleanup_queue_place_folders() -> None:
             continue
         try:
             if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
-                _ = build_folders.remove_build_folder(path)
+                result = build_folders.attempt_folder_removal(path)
+                if not isinstance(result, build_folders.Removed):
+                    build_folders.report_removal_refusal(result)
         except FileNotFoundError:
             pass
 

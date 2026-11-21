@@ -2284,7 +2284,8 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                             continue
                         acquired = True
                         for root in sorted(roots):
-                            if root not in locked_targets and not guards.enter_context(scratch.removal_lock(Path(root))):
+                            if root not in locked_targets and not guards.enter_context(
+                                    scratch.content_lock(Path(root), removing=True)):
                                 acquired = False
                                 break
                         if not acquired:
@@ -2893,7 +2894,6 @@ def shrink_floor(
             busy.update(current_uses)
             continue
         with ExitStack() as guards:
-            lock = scratch.judgment_lock if dry_run else scratch.removal_lock
             blocked_pair = False
             for paired in paired_roots:
                 for slot in output_slot_leases(paired):
@@ -2903,7 +2903,7 @@ def shrink_floor(
                         break
                 if blocked_pair:
                     break
-                if not guards.enter_context(lock(Path(paired))):
+                if not guards.enter_context(scratch.content_lock(Path(paired), removing=not dry_run)):
                     busy[paired] = LockHeld(os.path.join(paired, ".claude-busy"))
                     blocked_pair = True
                     break

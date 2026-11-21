@@ -6,7 +6,7 @@ import os
 from contextlib import ExitStack
 from types import TracebackType
 
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folder_lock, build_folders
 from scripts.lint.memory_test_support import config_environment
 from pathlib import Path
 from typing import override
@@ -20,7 +20,10 @@ _swept: set[Path] = set()
 
 def socket_parent() -> Path:
     """Return the parent; the first call in a process removes the free folders killed runs left."""
-    parent = Path(conf.read_or_repository("build_folders").text("roots.system")) / PARENT
+    run_root = build_folders.private_run_root()
+    if run_root is not None:
+        return run_root
+    parent = build_folder_lock.system_temporary_parent() / PARENT
     parent.mkdir(mode=0o700, exist_ok=True)
     if parent not in _swept:
         _swept.add(parent)

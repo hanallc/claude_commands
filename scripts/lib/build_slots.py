@@ -86,6 +86,14 @@ class SlotsFull(RuntimeError):
         super().__init__(f"slots: all {maximum} slots for {repository} on {machine} are held")
 
 
+class SlotResetRefused(BlockingIOError):
+    """The slot reset could not reserve its work or output tree."""
+
+    def __init__(self, reason: build_folders.RemovalRefusal) -> None:
+        self.reason: build_folders.RemovalRefusal = reason
+        super().__init__(f"slots: {build_folders.removal_refusal_detail(reason)}")
+
+
 class SlotRepositoryMismatch(ValueError):
     """The slot belongs to a different source repository."""
 
@@ -300,6 +308,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
     repository = _slot_repository(pool)
     checkout = build_folders.SlotCheckout(repository, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
     source_busy: build_folders.SlotSourceBusy | None = None
+    reset_refusal: build_folders.RemovalRefusal | None = None
     with _slot_commit(repository, pool.source, checkout.commit):
         for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,
@@ -314,35 +323,48 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     continue
                 except BlockingIOError:
                     continue
-                descriptor = build_folders.build_folder_lock_fd(path)
-                (git_files.at(path).git_dir / "index.lock").unlink(missing_ok=True)
-                target = path / "target"
-                if target.is_symlink():
-                    target.unlink()
-                    target.mkdir()
-                _exclude_slot_target(path, path, descriptor)
-                _rescue(path)
-                _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1), pass_fds=(descriptor,))
-                _ = _git(path, "checkout", "--force", "--detach", checkout.commit, pass_fds=(descriptor,))
-                _ = _git(path, "clean", "-ffdx", "--exclude=/target", pass_fds=(descriptor,))
                 cargo = pool.cargo_root / path.name
-                settings = conf.read_or_repository("build_folders")
-                key = f"slots.{pool.machine}.{pool.repository}.max_bytes"
-                if key in settings.values():
-                    limit = settings.whole(key)
-                    size = _size(path) + _size(cargo)
-                    if size > limit:
-                        if cargo.exists():
-                            shutil.rmtree(cargo)
-                        target = path / "target"
-                        if target.is_dir() and not target.is_symlink():
-                            shutil.rmtree(target)
-                        report(f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
-                               + "its build output is deleted once.")
-                cargo.mkdir(parents=True, exist_ok=True)
+                with ExitStack() as guards:
+                    output = guards.enter_context(build_folders.reserve_cargo_output(cargo, alongside=(path,)))
+                    if not isinstance(output, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
+                        reset_refusal = output
+                        continue
+                    scan = guards.enter_context(build_folders.hold_descendant_leases(path))
+                    if not isinstance(scan, build_folders.DescendantLeasesHeld):
+                        reset_refusal = scan
+                        continue
+                    descriptor = build_folders.build_folder_lock_fd(path)
+                    (git_files.at(path).git_dir / "index.lock").unlink(missing_ok=True)
+                    target = path / "target"
+                    if target.is_symlink():
+                        target.unlink()
+                        target.mkdir()
+                    _exclude_slot_target(path, path, descriptor)
+                    _rescue(path)
+                    _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1), pass_fds=(descriptor,))
+                    _ = _git(path, "checkout", "--force", "--detach", checkout.commit, pass_fds=(descriptor,))
+                    _ = _git(path, "clean", "-ffdx", "--exclude=/target", pass_fds=(descriptor,))
+                    settings = conf.read_or_repository("build_folders")
+                    key = f"slots.{pool.machine}.{pool.repository}.max_bytes"
+                    if key in settings.values():
+                        limit = settings.whole(key)
+                        size = _size(path) + _size(cargo)
+                        if size > limit:
+                            removed = output.remove()
+                            if not isinstance(removed, build_folders.Removed):
+                                reset_refusal = removed
+                                continue
+                            target = path / "target"
+                            if target.is_dir() and not target.is_symlink():
+                                shutil.rmtree(target)
+                            report(f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
+                                   + "its build output is deleted once.")
+                    cargo.mkdir(parents=True, exist_ok=True)
                 yield Slot(path, cargo, pool.repository, number,
                            MappingProxyType({"CARGO_BUILD_BUILD_DIR": str(cargo)}))
             return
+        if reset_refusal is not None:
+            raise SlotResetRefused(reset_refusal)
         if source_busy is not None:
             raise source_busy
         raise SlotsFull(pool.repository, pool.machine, maximum)
@@ -455,41 +477,54 @@ def sweep_slots() -> None:
     if not root.exists():
         return
     for path, repository, _ in slot_paths(root):
-        with build_folders.collector_lease(path, wait=False) as free:
-            if not free:
+        cargo = cargo_root / path.name
+        with ExitStack() as guards:
+            output = guards.enter_context(build_folders.reserve_cargo_output(cargo))
+            if not isinstance(output, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
                 continue
-            settings = conf.read_or_repository("build_folders")
             record_path = lease_path(path)
-            cargo = cargo_root / path.name
-            if not path.exists():
-                if cargo.exists():
-                    shutil.rmtree(cargo)
-                record_path.unlink()
-                continue
-            lease = cast(dict[str, object], json.loads(record_path.read_text()))
-            last_use = datetime.fromisoformat(cast(str, lease["last_use"]))
-            if unused(last_use, settings, datetime.now(timezone.utc)):
-                try:
-                    _rescue(path)
-                except git_rescue.RescueError as error:
-                    detail = " ".join(str(error).splitlines())
-                    _ = sys.stderr.write(f"slots: keeps {path.name}: {detail}\n")
+            oversized_report = ""
+            checkout_guarded = False
+            if path.exists():
+                lease_guard = guards.enter_context(build_folders.folder_removal_lease(path, children=True, wait=False))
+                checkout_guarded = not isinstance(lease_guard, build_folders.RefusedRemovalLease)
+            if path.exists():
+                if not checkout_guarded:
                     continue
-                descriptor = build_folders.build_folder_lock_fd(path)
-                _ = _git(source_checkout(path), "worktree", "remove", "--force", str(path), pass_fds=(descriptor,))
-                if cargo.exists():
-                    shutil.rmtree(cargo)
-                record_path.unlink()
-                continue
-            key = f"slots.{machine}.{repository}.max_bytes"
-            if key in settings.values():
-                limit = settings.whole(key)
-                size = _size(path) + _size(cargo)
-                if size > limit and cargo.exists():
-                    shutil.rmtree(cargo)
-                    _ = sys.stdout.write(
+                settings = conf.read_or_repository("build_folders")
+                lease = cast(dict[str, object], json.loads(record_path.read_text()))
+                last_use = datetime.fromisoformat(cast(str, lease["last_use"]))
+                if unused(last_use, settings, datetime.now(timezone.utc)):
+                    try:
+                        _rescue(path)
+                    except git_rescue.RescueError as error:
+                        detail = " ".join(str(error).splitlines())
+                        _ = sys.stderr.write(f"slots: keeps {path.name}: {detail}\n")
+                        continue
+                    descriptor = build_folders.build_folder_lock_fd(path)
+                    _ = _git(source_checkout(path), "worktree", "remove", "--force", str(path), pass_fds=(descriptor,))
+                else:
+                    key = f"slots.{machine}.{repository}.max_bytes"
+                    if key not in settings.values() or isinstance(output, build_folders.CargoOutputAbsent):
+                        continue
+                    limit = settings.whole(key)
+                    size = _size(path) + _size(cargo)
+                    if size <= limit:
+                        continue
+                    oversized_report = (
                         f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
                         + "its build output is deleted.\n")
+            removed = output.remove()
+            if not isinstance(removed, build_folders.Removed):
+                build_folders.report_removal_refusal(removed)
+            elif oversized_report:
+                _ = sys.stdout.write(oversized_report)
+            elif checkout_guarded:
+                record_path.unlink(missing_ok=True)
+            elif record_path.exists():
+                with build_folders.folder_removal_lease(path, wait=False) as lease_guard:
+                    if not isinstance(lease_guard, build_folders.RefusedRemovalLease) and not path.exists():
+                        record_path.unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str]) -> int:
@@ -526,7 +561,7 @@ def main(argv: Sequence[str]) -> int:
     except SlotsNotConfigured as error:
         _ = sys.stderr.write(f"{error}\n")
         return 2
-    except (SlotGitFailure, build_folders.SlotSourceBusy, subprocess.SubprocessError) as error:
+    except (SlotGitFailure, SlotResetRefused, build_folders.SlotSourceBusy, subprocess.SubprocessError) as error:
         _ = sys.stderr.write(f"{error}\n")
         return 2
 

@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from typing import cast, override
 
 from scripts.lib import build_folders
 from scripts.lib.socket_test_support import PARENT, short_socket_directory
@@ -17,6 +18,11 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 
 
 class ShortSocketDirectoryTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ)))
+        _ = os.environ.pop(build_folders.PRIVATE_RUN_ROOT, None)
+
     def test_socket_parent_uses_current_build_folder_configuration(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)

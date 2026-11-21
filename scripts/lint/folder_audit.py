@@ -69,7 +69,7 @@ from typing import Protocol, cast
 from scripts.lint import sweep, tmp_sweep
 from scripts.message import session_send
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-from scripts.lib import cargo_output, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folder_lock, build_folders, cargo_output, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
@@ -787,7 +787,12 @@ def clean_checkout_cargo_output(path: Path) -> None:
             stamp = root / scratch.USE_STAMP
             if stamp.exists() and stamp.stat().st_mtime > attempt_started:
                 raise OSError(f"Cargo output was used after cleanup started: {root}")
-            shutil.rmtree(root)
+            with build_folders.reserve_cargo_output(root, held_locks=locked.held) as reservation:
+                if not isinstance(reservation, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
+                    raise OSError(build_folders.removal_refusal_detail(reservation))
+                removed = reservation.remove()
+                if not isinstance(removed, build_folders.Removed):
+                    raise OSError(build_folders.removal_refusal_detail(removed))
             remove_empty_mirror_parents(root, output.roots.workspace_root, path)
         finally:
             sweep.release(locked.held)
@@ -804,9 +809,12 @@ def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None
     folder = root.parent
     while folder.is_relative_to(top):
         try:
-            _ = checked_scan_roots([folder])
-            check_cargo_output_location(folder)
-            folder.rmdir()
+            with build_folder_lock.mutation_lock(folder, wait=False) as guard:
+                if isinstance(guard, build_folder_lock.ParentChanged):
+                    return
+                _ = checked_scan_roots([folder])
+                check_cargo_output_location(folder)
+                folder.rmdir()
         except ValueError as error:
             print(f"Cargo mirror kept: {error}", file=sys.stderr)
             return

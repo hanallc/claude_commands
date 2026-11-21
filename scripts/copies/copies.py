@@ -2761,7 +2761,9 @@ def release_run_scope(parent: Path) -> int:
                     raise ValueError(f"foreground cleanup is incomplete; kept {parent}")
         except FileNotFoundError:
             pass
-        if not build_folders.remove_build_folder(parent, wait=False):
+        result = build_folders.attempt_folder_removal(parent, wait=False)
+        if not isinstance(result, build_folders.Removed):
+            build_folders.report_removal_refusal(result)
             return 2
     except (OSError, ValueError) as error:
         print(f"copies: release private copy: {error}", file=sys.stderr)

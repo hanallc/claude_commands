@@ -106,7 +106,7 @@ def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float, *,
                     _ = shutil.copyfile(path, target)
                 if shell_key(inputs, selector) != key:
                     raise ValueError('shell inputs changed during the copy')
-                os.replace(stage, destination)
+                build_folders.publish_build_folder(stage, destination)
         inputs = destination / 'inputs'
         if shell_key(inputs, selector) != key:
             raise ValueError('cached shell inputs do not match their key')

@@ -1,12 +1,13 @@
 """Repository slots retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime, timedelta
 import io
 import json
 import os
+import select
 from pathlib import Path
 import signal
 import shutil
@@ -459,6 +460,94 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                     _ = (path / "target" / "new").write_text("slot output\n")
                     self.assertFalse((outside / "new").exists())
 
+    @contextmanager
+    def hold_slot_output(self, folder: Path) -> Generator[None]:
+        program = """from pathlib import Path
+import sys
+from scripts.lib import build_folders
+folder = Path(sys.argv[1])
+request = build_folders.StableOwnerFolder(folder.name, build_folders.ExplicitBuildParent(folder.parent))
+with build_folders.leased_build_folder(request) as path:
+    (path / "keep").write_text("live work")
+    print(path, flush=True)
+    sys.stdin.buffer.read(1)
+"""
+        child: subprocess.Popen[str] = subprocess.Popen(
+            [sys.executable, "-c", program, str(folder)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with child:
+            try:
+                assert child.stdout is not None
+                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                self.assertEqual(cast(str, child.stdout.readline()).strip(), str(folder))
+                yield
+                stdout, stderr = child.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(child.returncode, 0, stdout + stderr)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+
+    def test_reset_refuses_a_slot_while_its_checkout_or_cargo_has_a_live_lease(self) -> None:
+        _ = private_slot_config(self.root, repository="widget", maximum=1)
+        with self.take() as slot:
+            path, cargo = slot.path, slot.cargo_dir
+        for held in (path / "nested", cargo, cargo / "nested"):
+            with self.subTest(held=held), self.hold_slot_output(held):
+                with self.assertRaises(BlockingIOError) as refused:
+                    with self.take():
+                        self.fail("the slot reset started")
+                self.assertIsInstance(refused.exception, build_slots.SlotResetRefused)
+                if isinstance(refused.exception, build_slots.SlotResetRefused):
+                    self.assertEqual(refused.exception.reason, build_folders.BlockedByLiveLease(held))
+                self.assertEqual((held / "keep").read_text(), "live work")
+        with self.take() as reused:
+            self.assertEqual(reused.path, path)
+
+    def test_sweep_keeps_cargo_with_a_live_lease(self) -> None:
+        with self.take() as slot:
+            cargo = slot.cargo_dir
+        _ = write_config_fixture(self.settings,
+                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=1\n")
+        for held in (cargo, cargo / "nested"):
+            with self.subTest(held=held), self.hold_slot_output(held):
+                build_slots.sweep_slots()
+                self.assertEqual((held / "keep").read_text(), "live work")
+            build_slots.sweep_slots()
+            self.assertFalse(cargo.exists())
+
+    @contextmanager
+    def lose_checkout_parent_during_sweep(self) -> Generator[None]:
+        list_slots = build_slots.slot_paths
+
+        def remove_checkout_parent(root: Path) -> list[tuple[Path, str, int]]:
+            slots = list_slots(root)
+            _ = root.rename(self.root / "retained-slots")
+            return slots
+
+        with mock.patch.object(build_slots, "slot_paths", side_effect=remove_checkout_parent):
+            yield
+
+    def test_sweep_keeps_leased_cargo_when_the_checkout_parent_disappears(self) -> None:
+        with self.take() as slot:
+            cargo = slot.cargo_dir
+        held = cargo / "nested"
+        with self.hold_slot_output(held), self.lose_checkout_parent_during_sweep():
+            try:
+                build_slots.sweep_slots()
+            finally:
+                self.assertTrue((held / "keep").is_file(), "the sweep removed leased Cargo output")
+            self.assertFalse(self.slot_root.exists())
+
+    def test_sweep_removes_free_cargo_when_the_checkout_parent_disappears(self) -> None:
+        with self.take() as slot:
+            cargo = slot.cargo_dir
+            name = slot.path.name
+            _ = (cargo / "discard").write_text("free output")
+        with self.lose_checkout_parent_during_sweep():
+            build_slots.sweep_slots()
+        self.assertFalse(cargo.exists())
+        self.assertTrue((self.root / "retained-slots" / name).is_dir())
+
     def test_reset_rescues_edits_and_retains_unchanged_files_target_and_cargo(self) -> None:
         with self.take() as first:
             path, cargo = first.path, first.cargo_dir
@@ -679,7 +768,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
             path, cargo = slot.path, slot.cargo_dir
             _ = (cargo / "cache").write_text("cached output\n")
         self.age_lease(path)
-        with mock.patch.object(shutil, "rmtree", side_effect=OSError("cargo removal stopped")):
+        with mock.patch.object(build_folders.ReservedCargoOutput, "remove", side_effect=OSError("cargo removal stopped")):
             with self.assertRaisesRegex(OSError, "cargo removal stopped"):
                 build_slots.sweep_slots()
         self.assertFalse(path.exists())

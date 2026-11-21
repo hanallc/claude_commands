@@ -429,9 +429,12 @@ def remove_if_stale(directory: Path) -> None:
             return
     except (OSError, ValueError):
         return
-    if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
+    result = build_folders.attempt_folder_removal(directory, lambda: remove_lint_dir(owner_record.repo, directory))
+    if isinstance(result, build_folders.Removed):
         print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
 
+    else:
+        build_folders.report_removal_refusal(result)
 
 def sweep_stale_lint_dirs() -> None:
     """Remove the dir and registration of each lint run that ended before its cleanup (SIGKILL, power loss).

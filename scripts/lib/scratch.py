@@ -84,7 +84,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -95,12 +95,12 @@ from threading import get_ident
 from typing import Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
-from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
+from scripts.lib import build_folder_lock, cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
 from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.build_folders import (  # noqa: E402
-    BuildFolderSpec, FolderRemovalLease, HeldFolderRemovalLease, RefusedRemovalLease, build_folder_path, collector_lease,
+    BuildFolderSpec, FolderRemovalLease, HeldFolderRemovalLease, RefusedRemovalLease, build_folder_path,
     folder_removal_lease, inherited_temporary_parent, open_busy_mark, require_no_removal_mark,
     BUSY as BUSY, REMOVAL_RECORD_PREFIX as REMOVAL_RECORD_PREFIX, REMOVAL_RECORD_SUFFIX as REMOVAL_RECORD_SUFFIX,
     removal_mark as removal_mark,
@@ -113,7 +113,7 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY_REASON = "busy: a lease or .claude-busy lock is held"
-RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
+RECORD_LOCKS: ContextVar[frozenset[build_folder_lock.FileIdentity]] = ContextVar("scratch_record_locks", default=frozenset())
 REMOVAL_VERSION = 1
 
 
@@ -125,14 +125,21 @@ class BusyMarkOwnership(Enum):
 @dataclass
 class BusyMarkScope:
     """Track the descriptors that this scope owns across related acquisitions."""
-    held: dict[Path, int] = field(default_factory=dict)
+    held: dict[Path, build_folder_lock.OpenLock] = field(default_factory=dict)
     created: set[Path] = field(default_factory=set)
+
+
+class AbsentRemovalEntry(Enum):
+    """The selected name had no entry when removal began."""
+
+    ABSENT = "absent"
 
 
 @dataclass
 class _HeldRemovalLock:
     """Permit reentry only in the owning process and thread while the locks remain held."""
     path: Path
+    identity: build_folder_lock.FileIdentity | AbsentRemovalEntry
     process: int
     thread: int
     lease: FolderRemovalLease
@@ -366,8 +373,7 @@ def directory_record_lock(path: Path, *, wait: bool,
         except FileNotFoundError as error:
             raise ScratchError(f"{path}: copy was removed before its record lock was acquired") from error
         try:
-            directory = os.fstat(descriptor)
-            identity = (directory.st_dev, directory.st_ino)
+            identity = build_folder_lock.OpenLock.read(descriptor).identity
             reentered = identity in RECORD_LOCKS.get()
             if not reentered:
                 try:
@@ -379,12 +385,11 @@ def directory_record_lock(path: Path, *, wait: bool,
                     return
             # Waiting on a removed inode does not lock a new copy at the same path.
             # Close that descriptor before retrying, including reentrant acquisitions.
-            locked = os.fstat(descriptor)
             try:
-                present = path.lstat()
+                current = identity.matches_name(path)
             except FileNotFoundError as error:
                 raise ScratchError(f"{path}: copy was removed before its record lock was acquired") from error
-            if (locked.st_dev, locked.st_ino) != (present.st_dev, present.st_ino):
+            if not current:
                 if attempt == attempts - 1:
                     raise ScratchError(f"{path}: copy kept changing while its record lock was acquired; retry")
                 continue
@@ -401,10 +406,36 @@ def directory_record_lock(path: Path, *, wait: bool,
             os.close(descriptor)
 
 
-def _held_removal_lock(path: Path) -> _HeldRemovalLock | None:
-    return next((held for held in _REMOVAL_LOCKS.get()
-                 if held.active and held.path == path.absolute()
-                 and held.process == os.getpid() and held.thread == get_ident()), None)
+def _removal_name_matches(path: Path, identity: build_folder_lock.FileIdentity | AbsentRemovalEntry) -> bool:
+    try:
+        if isinstance(identity, build_folder_lock.FileIdentity):
+            return identity.matches_name(path)
+        _ = path.lstat()
+        return False
+    except FileNotFoundError:
+        return identity is AbsentRemovalEntry.ABSENT
+    except OSError:
+        return False
+
+
+def _held_removal_lock(path: Path) -> _HeldRemovalLock | build_folder_lock.ParentChanged | None:
+    for held in _REMOVAL_LOCKS.get():
+        if (held.active and held.path == path.absolute()
+                and held.process == os.getpid() and held.thread == get_ident()):
+            return held if _removal_name_matches(path, held.identity) else build_folder_lock.ParentChanged(path)
+    return None
+
+
+def _select_removal_entry(path: Path, locks: ExitStack) -> build_folder_lock.FileIdentity | AbsentRemovalEntry:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return AbsentRemovalEntry.ABSENT
+    if stat.S_ISDIR(info.st_mode):
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        _ = locks.callback(os.close, descriptor)
+        return build_folder_lock.OpenLock.read(descriptor).identity
+    return build_folder_lock.FileIdentity.from_stat(info)
 
 
 @contextmanager
@@ -413,17 +444,24 @@ def removal_lock(path: Path) -> Generator[bool]:
     A held lease on the folder or on any folder below it is busy, and the busy mark is then
     not created."""
     key = path.absolute()
-    if _held_removal_lock(key) is not None:
-        yield True
+    reused = _held_removal_lock(key)
+    if reused is not None:
+        yield isinstance(reused, _HeldRemovalLock)
         return
-    with folder_removal_lease(path, children=True, wait=not removal_mark(path).is_file()) as lease:
+    with ExitStack() as locks:
+        try:
+            identity = _select_removal_entry(key, locks)
+        except OSError:
+            yield False
+            return
+        lease = locks.enter_context(folder_removal_lease(path, children=True, wait=not removal_mark(path).is_file()))
         free = not isinstance(lease, RefusedRemovalLease)
         marks = BusyMarkScope()
         with busy_locks(path, create=free, scope=marks) as idle:
-            if not free or not idle:
+            if not free or not idle or not _removal_name_matches(key, identity):
                 yield False
                 return
-            held = _HeldRemovalLock(key, os.getpid(), get_ident(), lease, marks)
+            held = _HeldRemovalLock(key, identity, os.getpid(), get_ident(), lease, marks)
             token = _REMOVAL_LOCKS.set((*_REMOVAL_LOCKS.get(), held))
             try:
                 yield True
@@ -433,11 +471,18 @@ def removal_lock(path: Path) -> Generator[bool]:
 
 
 @contextmanager
-def judgment_lock(path: Path, *, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL) -> Generator[bool]:
-    """Check the folder's lease lock and existing busy marks without creating metadata during a scan or dry run.
-    Leases below the folder are checked only at removal, so status reads do not walk the tree."""
-    with collector_lease(path) as free, busy_locks(path, create=False, scope=scope) as idle:
-        yield free and idle
+def content_lock(path: Path, *, removing: bool,
+                 scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL) -> Generator[bool]:
+    """Hold the root lease and busy marks while reclaiming selected output."""
+    with folder_removal_lease(path, wait=False, contents_only=True) as lease:
+        free = not isinstance(lease, RefusedRemovalLease)
+        with busy_locks(path, create=removing and free, scope=scope) as idle:
+            yield free and idle
+
+
+def judgment_lock(path: Path, *, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL) -> AbstractContextManager[bool]:
+    """Check the root lease and busy marks without creating metadata."""
+    return content_lock(path, removing=False, scope=scope)
 
 
 @contextmanager
@@ -449,7 +494,7 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
     flock with subprocess pass_fds; callers must not close them themselves.
     """
     scope = BusyMarkScope() if scope is BusyMarkOwnership.LOCAL else scope
-    held: dict[Path, int] = {}
+    held: dict[Path, build_folder_lock.OpenLock] = {}
     created: set[Path] = set()
     acquired = True
     try:
@@ -464,6 +509,7 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
                 _ = marks.setdefault(owner / BUSY, False)
             for mark, creating in marks.items():
                 if mark in scope.held:
+                    scope.held[mark].identity.require_name(mark)
                     continue
                 if not creating and not os.path.lexists(mark):
                     continue
@@ -478,21 +524,26 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
                         fd = open_busy_mark(mark, create=False)
                     else:
                         created.add(mark)
-                held[mark] = fd
+                try:
+                    held[mark] = build_folder_lock.OpenLock.read(fd)
+                except BaseException:
+                    os.close(fd)
+                    raise
                 fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                held[mark].identity.require_name(mark)
         except OSError:
             acquired = False
         if acquired:
             scope.held.update(held)
             scope.created.update(created)
             if inherited_fds is not None:
-                inherited_fds.extend(held.values())
+                inherited_fds.extend(lock.descriptor for lock in held.values())
         yield acquired
     finally:
         scope.created.difference_update(created)
-        for mark, fd in held.items():
+        for mark, lock in held.items():
             _ = scope.held.pop(mark, None)
-            os.close(fd)
+            os.close(lock.descriptor)
 
 
 def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_target: str = "",
@@ -863,8 +914,9 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     path = target(task, word, visible, scratch_settings=scratch_settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _ = shutil.move(str(source), str(path))
+    with build_folder_lock.require_mutation_lock(source, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.move(str(source), str(path))
     write_record(path, task, moment, scratch_settings=scratch_settings)
     index_in_session(path, task, scratch_settings=scratch_settings)
     return path
@@ -1337,12 +1389,23 @@ def save_cargo_outputs(path: Path) -> tuple[SavedCargoOutput, ...]:
 
 
 def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None:
-    """Run the shared guard without importing the sweep back into scratch."""
-    if not any(not item.roots.build_directory.is_relative_to(path.resolve())
+    """Run the shared guard with the current removal lock when held."""
+    resolved = path.resolve()
+    if not any(not item.roots.build_directory.is_relative_to(resolved)
                and item.roots.build_directory.exists() for item in saved):
         return
+    held = _held_removal_lock(path.absolute())
+    if isinstance(held, build_folder_lock.ParentChanged):
+        raise CargoOutputKept(f"Cargo output kept: {held.path} changed during removal")
+    if isinstance(held, _HeldRemovalLock):
+        cleanup = cast(_CargoOutputAudit, cast(object, import_module("scripts.lint.folder_audit")))
+        try:
+            cleanup.clean_checkout_cargo_output(resolved)
+        except (OSError, ValueError) as error:
+            raise CargoOutputKept(f"Cargo output kept: {error}") from error
+        return
     result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
-                             "--clean-cargo-output", str(path.resolve())],
+                             "--clean-cargo-output", str(resolved)],
                             capture_output=True, text=True, check=False)
     if result.returncode == CARGO_OUTPUT_KEPT_STATUS:
         raise CargoOutputKept(result.stderr.strip())
@@ -1401,6 +1464,12 @@ class _SweepRemoval(Protocol):
     """Use the existing sweep checks and deletion method at the module boundary."""
     def git_work(self, path: Path, *, verified_repos: tuple[Path, ...]) -> _GitWorkAssessment: ...
     def delete_tree(self, path: str) -> None: ...
+
+
+class _CargoOutputAudit(Protocol):
+    """Apply the folder audit's Cargo checks within the current removal."""
+
+    def clean_checkout_cargo_output(self, path: Path) -> None: ...
 
 
 class _WorkspaceRescue(Protocol):
@@ -1538,7 +1607,7 @@ def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkS
         if ref_change is not None:
             change = "may have changed" if recorded_refs is None else "changed"
             return ChangedRemovalRef(path, f"ambiguous source: {ref_change} {change} after removal intent")
-        busy_marks = {removal_root / mark.relative_to(path): os.fstat(scope.held[mark])
+        busy_marks = {removal_root / mark.relative_to(path): scope.held[mark].identity
                       for mark in scope.created if mark.is_relative_to(path)}
     except (OSError, git_files.UnreadableGitFiles) as error:
         return KeptFolder(path, str(error))
@@ -1548,7 +1617,7 @@ def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkS
                    if entry.path not in refs
                    and ((stat.S_ISREG(entry.status.st_mode) and entry.status.st_ctime_ns >= regular_cutoff)
                         or (stat.S_ISLNK(entry.status.st_mode) and entry.status.st_ctime_ns >= source_cutoff))
-                   and (entry.path not in busy_marks or not os.path.samestat(entry.status, busy_marks[entry.path]))),
+                   and busy_marks.get(entry.path) != build_folder_lock.FileIdentity.from_stat(entry.status)),
                   default=RemovalRetry.UNCHANGED)
     if changed is RemovalRetry.UNCHANGED:
         return RemovalRetry.UNCHANGED
@@ -1678,6 +1747,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
     scope = BusyMarkScope()
     lock = judgment_lock(path, scope=scope) if dry_run else removal_lock(path)
     with lock as idle:
+        if isinstance(_held_removal_lock(path), build_folder_lock.ParentChanged):
+            return KeptFolder(path, "the removal lock no longer matches the folder")
         if not idle:
             pending = pending_removal(path, scratch_settings=scratch_settings)
             if isinstance(pending, copy_record.Registered) and path.is_dir():
@@ -1731,6 +1802,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             if isinstance(request, SelectedCopyRemoval):
                 request.validate()
             held = _held_removal_lock(path)
+            if isinstance(held, build_folder_lock.ParentChanged):
+                return KeptFolder(path, "the removal lock no longer matches the folder")
             if held is not None:
                 scope = held.marks
             descendant_checkouts: tuple[Path, ...] = ()

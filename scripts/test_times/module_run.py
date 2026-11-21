@@ -513,7 +513,7 @@ class TimedRunner(unittest.TextTestRunner):
         return result
 
 
-def main() -> None:
+def main(run_root: Path) -> None:
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -524,13 +524,10 @@ def main() -> None:
         run_module(NoConfigReadLog())
         return
 
-    from scripts.lib import build_folders
-
-    with build_folders.tool_folder("config-reads") as temporary:
-        log = Path(temporary) / "reads"
-        log.touch()
-        with conf_reads.record_reads(log):
-            run_module(log)
+    log = run_root / "config-reads" / "reads"
+    _ = log.write_text("")
+    with conf_reads.record_reads(log):
+        run_module(log)
 
 
 def run_module(config_log: Path | NoConfigReadLog) -> None:
@@ -570,31 +567,44 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 
 
 @contextmanager
-def private_run_roots() -> Generator[Callable[[], None]]:
-    """Keep imported run roots and child processes under one private folder."""
+def private_run_roots() -> Generator[tuple[Path, Callable[[], None]]]:
+    """Keep one private folder until the runner finishes its children."""
     from scripts.lib import build_folders
 
-    names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
+    names = ("TMPDIR", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR",
+             build_folders.PRIVATE_RUN_ROOT, build_folders.SUPERVISED_RUN_ROOT)
     previous = {name: os.environ[name] for name in names if name in os.environ}
+    previous_tempdir = tempfile.tempdir
     with ExitStack() as cleanup:
-        root = cleanup.enter_context(build_folders.tool_folder("test-run-roots"))
         try:
-            os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-            yield cleanup.close
+            _ = os.environ.pop(build_folders.SUPERVISED_RUN_ROOT, None)
+            if os.environ.get("MERGE_GATE_PARENT_PID") == str(os.getppid()):
+                root = Path(os.environ["TMPDIR"]).resolve(strict=True)
+            else:
+                root = cleanup.enter_context(build_folders.temporary_build_folder(
+                    build_folders.UniqueBuildFolder("tr-", build_folders.ExplicitBuildParent(
+                        build_folders.tmpfs_temporary_parent())))).resolve()
+            (root / "config-reads").mkdir(exist_ok=True)
+            os.environ.update(TMPDIR=str(root), SCRATCH_ROOT=str(root / "scratch"),
+                              ASTRA_REVIEW_DIR=str(root / "astra"))
+            os.environ[build_folders.PRIVATE_RUN_ROOT] = str(root)
+            tempfile.tempdir = None
+            yield root, cleanup.close
         finally:
+            tempfile.tempdir = previous_tempdir
             for name in names:
                 _ = os.environ.pop(name, None)
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
+def run_with_descendant_cleanup(run_root: Path, cleanup_run_roots: Callable[[], None]) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
-    from scripts.lib import build_folders
+    from scripts.lib.build_folders import SUPERVISED_RUN_ROOT
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
-        main()
+        main(run_root)
         return
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
@@ -624,11 +634,11 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
             raise OSError(ctypes.get_errno(), "cannot set the test parent death signal")
         if os.getppid() != supervisor:
             os.kill(os.getpid(), signal.SIGKILL)
-        build_folders.leave_inherited_cleanup_to_supervisor()
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main()
+        os.environ[SUPERVISED_RUN_ROOT] = str(run_root)
+        main(run_root)
         return
     status = 0
     received = 0
@@ -684,5 +694,5 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
 
 
 if __name__ == "__main__":
-    with private_run_roots() as cleanup_run_roots:
-        run_with_descendant_cleanup(cleanup_run_roots)
+    with private_run_roots() as (run_root, cleanup_run_roots):
+        run_with_descendant_cleanup(run_root, cleanup_run_roots)

@@ -57,7 +57,8 @@ import sys
 from typing import Literal, TypedDict, cast
 
 from scripts.lib import berth_board
-from scripts.lib.build_folders import remove_build_folder
+from scripts.lib.build_folders import Removed, attempt_folder_removal, removal_refusal_detail, report_removal_refusal
+from scripts.lib.build_folder_lock import require_mutation_lock
 
 
 @dataclass(frozen=True)
@@ -507,18 +508,27 @@ def claim_folder(parent: Path, owner: int) -> Path:
     """
     parent.mkdir(parents=True, exist_ok=True)
     staged = parent / f".{COPY_NAME}-{owner}.new"
-    if not remove_build_folder(staged, wait=False):
-        raise OSError(f"{staged} is in use by another lint run")
+    result = attempt_folder_removal(staged, wait=False)
+    if not isinstance(result, Removed):
+        raise OSError(removal_refusal_detail(result))
     for name in (COPY_NAME, f"{COPY_NAME}-{owner}"):
         folder = parent / name
-        if folder.exists() and (owner_alive(folder, owner) or not remove_build_folder(folder, wait=False)):
-            continue
-        staged.mkdir()
-        _ = (staged / OWNER_NAME).write_text(str(owner), encoding="utf-8")
+        if folder.exists():
+            if owner_alive(folder, owner):
+                continue
+            result = attempt_folder_removal(folder, wait=False)
+            if not isinstance(result, Removed):
+                report_removal_refusal(result)
+                continue
         try:
-            os.rename(staged, folder)
+            with require_mutation_lock(staged, folder):
+                staged.mkdir()
+                _ = (staged / OWNER_NAME).write_text(str(owner), encoding="utf-8")
+                os.rename(staged, folder)
         except OSError:
-            if not remove_build_folder(staged, wait=False):
+            result = attempt_folder_removal(staged, wait=False)
+            if not isinstance(result, Removed):
+                report_removal_refusal(result)
                 raise
             continue
         return folder
@@ -562,7 +572,9 @@ def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
         _ = (folder / SENT_NAME).write_text(json.dumps(sent), encoding="utf-8")
     except OSError as error:
         with suppress(OSError):
-            _ = remove_build_folder(folder, wait=False)
+            result = attempt_folder_removal(folder, wait=False)
+            if not isinstance(result, Removed):
+                report_removal_refusal(result)
         return FixFailed(str(error))
     return CopyMade(folder, tree, tree / workspace.relative_to(root) / "Cargo.toml",
                     Path(metadata["target_directory"]))
@@ -614,7 +626,9 @@ def return_copy(repo_root: Path, folder: Path, board_reader: BoardReader | None 
         return FixFailed(str(error))
     finally:
         with suppress(OSError):
-            _ = remove_build_folder(folder, wait=False)
+            result = attempt_folder_removal(folder, wait=False)
+            if not isinstance(result, Removed):
+                report_removal_refusal(result)
 
 
 def report_copy(result: FixResult) -> None:

@@ -16,6 +16,7 @@ import time
 import tempfile
 import unittest
 from collections.abc import Generator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
@@ -28,8 +29,9 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import tmp_sweep, folder_audit, sweep
-from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
+from scripts.lib import build_folder_lock, build_folders, cargo_output, conf, copy_record, scratch, session_folder
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import session_send
 
@@ -200,6 +202,21 @@ class FolderAuditTests(unittest.TestCase):
                 self.assertEqual(output.parent.exists(), prefix != build)
                 self.assertEqual("Cargo mirror kept" in error.getvalue(), prefix != build)
 
+    def test_mirror_cleanup_keeps_a_parent_under_another_namespace_lock(self) -> None:
+        checkout = self.root / "job"
+        workspace = checkout / "checkout"
+        output = (self.root / "mirror").joinpath(*workspace.parts[1:])
+        output.parent.mkdir(parents=True)
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with build_folder_lock.mutation_lock(output.parent, wait=False) as held:
+                self.assertIsInstance(held, build_folder_lock.MutationLockHeld)
+                prune = worker.submit(folder_audit.remove_empty_mirror_parents, output, workspace, checkout)
+                prune.result(timeout=TEST_HANG_GUARD_SECS)
+                self.assertTrue(output.parent.is_dir(), "The mirror parent disappeared under another namespace lock.")
+        folder_audit.remove_empty_mirror_parents(output, workspace, checkout)
+        self.assertFalse(output.parent.exists())
+
     def test_external_cache_cleanup_uses_the_index_and_keeps_shared_outputs(self) -> None:
         checkout, cache = self.cargo_checkout()
         index = sweep.cargo_output_cache_path()
@@ -254,6 +271,31 @@ class FolderAuditTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "used after"):
                 folder_audit.clean_checkout_cargo_output(checkout)
         (cache / scratch.USE_STAMP).unlink()
+        folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(cache.exists())
+
+    def test_external_cache_cleanup_checks_the_root_lease(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        with cache.with_name(cache.name + ".lock").open("w") as owner:
+            fcntl.flock(owner, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(OSError, "its lease is held"):
+                folder_audit.clean_checkout_cargo_output(checkout)
+            self.assertTrue((cache / "output").is_file())
+        folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(cache.exists())
+
+    def test_external_cache_cleanup_checks_a_descendant_lease(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        nested = cache / "nested"
+        nested.mkdir()
+        with nested.with_name(nested.name + ".lock").open("w") as owner:
+            fcntl.flock(owner, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(OSError, "its lease is held"):
+                folder_audit.clean_checkout_cargo_output(checkout)
+            self.assertTrue(nested.is_dir())
+        style = cache / scratch.STYLE_TARGET_NAME
+        (style / sweep.FINGERPRINT_DIR).mkdir(parents=True)
+        (style / scratch.STYLE_LOCK_NAME).touch()
         folder_audit.clean_checkout_cargo_output(checkout)
         self.assertFalse(cache.exists())
 

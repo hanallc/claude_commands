@@ -1254,7 +1254,7 @@ for descriptor in descriptors:
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
-            if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
+            if name == namespace.name and dir_fd is not None and flags & os.O_NONBLOCK:
                 parent = namespace.parent.stat()
                 descriptor = os.fstat(dir_fd)
                 self.assertEqual((parent.st_dev, parent.st_ino), (descriptor.st_dev, descriptor.st_ino))
@@ -1287,7 +1287,7 @@ for descriptor in descriptors:
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
-            if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
+            if name == namespace.name and dir_fd is not None and flags & os.O_NONBLOCK:
                 _ = namespace.rename(moved)
                 _ = replacement.rename(namespace)
             return open_entry(name, flags, mode, dir_fd=dir_fd)
@@ -1308,7 +1308,7 @@ for descriptor in descriptors:
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
-            if name in (refs, refs.name) and flags & os.O_DIRECTORY:
+            if name in (refs, refs.name) and flags & os.O_NONBLOCK:
                 if dir_fd is not None:
                     self.assertTrue(os.path.samestat(metadata.stat(), os.fstat(dir_fd)))
                 _ = metadata.rename(moved)
@@ -1694,6 +1694,32 @@ assert scratch.removal_mark(path).is_file()
         self.assertEqual(scope.held, {})
         with scratch.busy_locks(child, create=False, scope=scope) as idle:
             self.assertTrue(idle)
+
+    def test_removal_refuses_reuse_after_the_folder_is_replaced(self) -> None:
+        path = self.base / "selected"
+        path.mkdir()
+        with scratch.removal_lock(path) as active:
+            self.assertTrue(active)
+            _ = path.rename(self.base / "retained")
+            path.mkdir()
+            _ = (path / "keep").write_text("replacement")
+            with scratch.removal_lock(path) as reused:
+                self.assertFalse(reused)
+            self.assertIsInstance(scratch.remove_folder(path), scratch.KeptFolder)
+            self.assertEqual((path / "keep").read_text(), "replacement")
+
+    def test_busy_mark_scope_refuses_reuse_after_the_mark_is_replaced(self) -> None:
+        path = self.base / "selected"
+        child = path / "child"
+        child.mkdir(parents=True)
+        scope = scratch.BusyMarkScope()
+        with scratch.busy_locks(path, create=True, scope=scope) as active:
+            self.assertTrue(active)
+            mark = scratch.busy_path(path)
+            _ = mark.rename(mark.with_name("retained-busy-mark"))
+            mark.touch()
+            with scratch.busy_locks(child, create=False, scope=scope) as reused:
+                self.assertFalse(reused)
 
     def test_task_end_keeps_the_sidecars_and_record_in_a_replacement_parent(self) -> None:
         source = self.base / "source"

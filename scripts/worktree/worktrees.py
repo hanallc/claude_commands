@@ -364,9 +364,12 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         registered = path in worktree_branches(repo)
         if local_branch_tip(repo, record.branch) != local:
             return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
-        if not build_folders.remove_build_folder(
-                path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
+        result = build_folders.attempt_folder_removal(
+            path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True)
+        if isinstance(result, build_folders.BlockedByLiveLease) and result.path == path:
             return Kept(path, "the build folder lock is held; the worktree stays")
+        if not isinstance(result, build_folders.Removed):
+            return Kept(path, build_folders.removal_refusal_detail(result))
         cargo_mark.unlink(missing_ok=True)
     if isinstance(local, CheckedLocalTip):
         deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)
@@ -458,7 +461,9 @@ def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.Staf
     try:
         write_record(record)
     except OSError:
-        _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
+        removal = build_folders.attempt_folder_removal(path, lambda: git(caller, "worktree", "remove", str(path)))
+        if not isinstance(removal, build_folders.Removed):
+            build_folders.report_removal_refusal(removal)
         _ = git(caller, "branch", "-D", branch)
         raise
     print(f"made worktree {path} on {branch}")

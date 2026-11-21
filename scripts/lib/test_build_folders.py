@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
+import errno
 import os
 import fcntl
 import json
@@ -18,10 +19,10 @@ import threading
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 
-from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
+from scripts.lib import build_folder_lock, build_folders as folders, cargo_output, conf, copy_record, scratch, unit_runs, process_group
+from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
@@ -630,33 +631,31 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
 
     @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
     def test_fork_inside_nested_contexts_keeps_each_inherited_lock(self) -> None:
-        probe = """import os, pathlib, signal
+        probe = """import os, pathlib, subprocess
+from unittest import mock
 from scripts.lib import build_folders as f
 root = pathlib.Path(os.environ['TMPDIR'])
-read, write = os.pipe()
 outer_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='outer')
 inner_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='inner')
+child = 0
 with f.temporary_build_folder(outer_spec) as outer:
     with f.temporary_build_folder(inner_spec) as inner:
         with f.temporary_build_folder(outer_spec) as shared:
             assert shared == outer
         child = os.fork()
-        if child == 0:
-            signal.alarm(3)
-            assert os.read(read, 1) == b'x'
-            assert outer.is_dir() and inner.is_dir()
-            assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
-    if child == 0:
-        assert not inner.exists() and f.build_folder_state(inner) == 'free'
-        assert outer.is_dir() and f.build_folder_state(outer) == 'held'
+        if child:
+            _, status = os.waitpid(child, 0)
+            assert os.waitstatus_to_exitcode(status) == 0, status
+        else:
+            mock.patch.object(subprocess, 'Popen', side_effect=AssertionError('the child started a worker')).start()
+        assert outer.is_dir() and inner.is_dir()
+        assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
+    assert inner.exists() == (child == 0)
+    assert outer.is_dir() and f.build_folder_state(outer) == 'held'
 if child == 0:
-    assert not outer.exists() and f.build_folder_state(outer) == 'free'
+    assert outer.exists() and inner.exists()
+    assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
     os._exit(0)
-assert outer.is_dir() and inner.is_dir()
-assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
-os.write(write, b'x')
-_, status = os.waitpid(child, 0)
-assert os.waitstatus_to_exitcode(status) == 0, status
 assert not outer.exists() and not inner.exists()
 assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'free'
 print('nested')
@@ -684,11 +683,11 @@ def interrupt():
         if stage not in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
             assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         os.kill(os.getpid(), signal.SIGINT)
-flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
-unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
+flock, mkdir, lease, fstat = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat
+unlink, rmdir = os.unlink, os.rmdir
 def lock_step(fd, mode):
     result = flock(fd, mode)
-    if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
+    if mode == fcntl.LOCK_EX | fcntl.LOCK_NB and lock.exists() and os.path.samestat(fstat(fd), lock.stat()):
         interrupt()
     return result
 def mkdir_step(name, mode=0o777, *, dir_fd=None):
@@ -703,7 +702,7 @@ def lease_step(*args):
     interrupt()
 def fstat_step(fd):
     inode = fstat(fd)
-    if stat.S_ISREG(inode.st_mode):
+    if stat.S_ISREG(inode.st_mode) and lock.exists() and os.path.samestat(inode, lock.stat()):
         descriptors.append(fd)
         interrupt()
     return inode
@@ -711,15 +710,14 @@ class PublishStep(dict):
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
         interrupt()
-def removal_step(name, *, dir_fd, onexc):
-    os.unlink(str(path / 'partial'))
-    interrupt()
-    return remove(name, dir_fd=dir_fd, onexc=onexc)
-def folder_removed(*args):
-    remove_folder(*args)
-    interrupt()
+def rmdir_step(name, *, dir_fd=None):
+    rmdir(name, dir_fd=dir_fd)
+    if stage == 'folder_removed' and name == path.name:
+        interrupt()
 def unlink_step(name, *, dir_fd=None):
     unlink(name, dir_fd=dir_fd)
+    if stage == 'removal' and name == 'partial':
+        interrupt()
     if (stage == 'lease_removed' and str(name).endswith('.lease.json')) or (stage == 'lock_removed' and str(name).endswith('.lock')):
         interrupt()
 patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
@@ -727,10 +725,10 @@ patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
            'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
            'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
            'publish': mock.patch.object(f, '_locks', PublishStep()),
-           'folder_removed': mock.patch.object(f, '_remove_folder', side_effect=folder_removed),
+           'folder_removed': mock.patch.object(os, 'rmdir', side_effect=rmdir_step),
            'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
-           'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}
+           'removal': mock.patch.object(os, 'unlink', side_effect=unlink_step)}
 with patches[stage]:
     try:
         if stage in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
@@ -758,7 +756,7 @@ for descriptor in descriptors:
     else:
         raise AssertionError('the interrupted open leaked a descriptor')
 assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
-assert f.remove_build_folder(path, lambda: shutil.rmtree(path) if path.exists() else None)
+assert isinstance(f.attempt_folder_removal(path, lambda: shutil.rmtree(path) if path.exists() else None), f.Removed)
 assert not path.exists() and not lock.exists() and not lease_path.exists()
 print('free')
 """
@@ -906,7 +904,7 @@ print('signals')
                                 self.assertEqual(made, path)
                                 _release_folder(made)
                             else:
-                                self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                                self.assertIsInstance(folders.attempt_folder_removal(path, lambda: shutil.rmtree(path)), folders.Removed)
                                 self.assertFalse(path.exists())
                                 self.assertFalse(path.with_name(path.name + ".lock").exists())
                                 self.assertFalse(path.with_name(path.name + ".lease.json").exists())
@@ -997,7 +995,7 @@ print('signals')
                                        showrunner="builds", unit="queue", work="fixed", purpose="proof")
         direct = folders.create_build_folder(spec)
         _release_folder(direct)
-        self.assertTrue(folders.remove_build_folder(direct, lambda: shutil.rmtree(direct)))
+        self.assertIsInstance(folders.attempt_folder_removal(direct, lambda: shutil.rmtree(direct)), folders.Removed)
         with folders.temporary_build_folder(spec) as path:
             self.assertEqual(path, direct)
             self.assertEqual(folders.build_folder_state(path), "held")
@@ -1061,7 +1059,8 @@ locks.probe_retry_seconds=0.005
                         folders.mark_cleanup_incomplete(lease.fileno())
                     else:
                         fcntl.flock(lease, fcntl.LOCK_EX)
-                    self.assertFalse(folders.remove_build_folder(parent, cleanup, wait=False))
+                    result = folders.attempt_folder_removal(parent, cleanup, wait=False)
+                    self.assertIsInstance(result, folders.UnsafeChild if state == "marked" else folders.BlockedByLiveLease)
                 cleanup.assert_not_called()
                 self.assertTrue(child.is_dir())
 
@@ -1071,9 +1070,10 @@ locks.probe_retry_seconds=0.005
         cleanup = mock.Mock()
         with (parent / "child.lock").open("w+b") as lease:
             fcntl.flock(lease, fcntl.LOCK_EX)
-            self.assertFalse(folders.remove_build_folder(parent, cleanup, wait=False))
+            self.assertEqual(folders.attempt_folder_removal(parent, cleanup, wait=False),
+                             folders.BlockedByLiveLease(parent / "child"))
             cleanup.assert_not_called()
-        self.assertTrue(folders.remove_build_folder(parent, wait=False))
+        self.assertIsInstance(folders.attempt_folder_removal(parent, wait=False), folders.Removed)
         self.assertFalse(parent.exists())
 
     def test_incomplete_slot_repair_keeps_a_child_lease(self) -> None:
@@ -1098,13 +1098,14 @@ locks.probe_retry_seconds=0.005
             with self.subTest(result=result):
                 cleanup = mock.Mock(return_value=result)
 
-                self.assertEqual(folders.remove_build_folder(path, cleanup), result is not False)
+                removal = folders.attempt_folder_removal(path, cleanup)
+                self.assertIsInstance(removal, folders.UnsafeChild if result is False else folders.Removed)
 
                 cleanup.assert_called_once_with()
                 self.assertFalse(path.parent.exists())
         cleanup = mock.Mock(side_effect=FileNotFoundError("cleanup failed"))
         with self.assertRaisesRegex(FileNotFoundError, "cleanup failed"):
-            _ = folders.remove_build_folder(path, cleanup)
+            _ = folders.attempt_folder_removal(path, cleanup)
         cleanup.assert_called_once_with()
         self.assertFalse(path.parent.exists())
 
@@ -1226,7 +1227,7 @@ from scripts.lib import build_folders as f
 path = Path(sys.argv[1])
 assert f.create_build_folder(f.StableOwnerFolder(path.name, f.ExplicitBuildParent(path.parent))) == path
 assert f.build_folder_state(path) == 'held'
-assert not f.remove_build_folder(path, lambda: (_ for _ in ()).throw(AssertionError('cleanup ran')))
+assert f.attempt_folder_removal(path, lambda: (_ for _ in ()).throw(AssertionError('cleanup ran'))) == f.BlockedByLiveLease(path)
 print('shared')
 """
         result = subprocess.run([sys.executable, "-c", probe, str(path)], capture_output=True, text=True, timeout=10)
@@ -1306,47 +1307,255 @@ with path.with_name(path.name + '.lock').open('a') as lock:
             lease = cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
             self.assertEqual(lease["work"], "abc")
 
-    def test_temporary_context_keeps_the_folder_while_a_child_holds_the_lock(self) -> None:
-        self.check_deferred_removal(nested=False)
+    def test_owner_waits_for_the_child_before_removing_the_folder(self) -> None:
+        configuration = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        _ = write_config_fixture(configuration, "locks.probe_wait_seconds=0.001\n")
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop("CLAUDE_SUPERVISED_RUN_ROOT", None)
+            for nested in (False, True):
+                with self.subTest(nested=nested), ExitStack() as lifetime, ExitStack() as pipes:
+                    path = lifetime.enter_context(folders.temporary_build_folder(folders.UniqueBuildFolder("child-")))
+                    held = path
+                    if nested:
+                        held = folders.create_build_folder(folders.UniqueBuildFolder(
+                            "nested-", folders.ExplicitBuildParent(path)))
+                        _ = lifetime.callback(_release_folder, held)
+                    lease = folders.build_folder_lock_fd(held)
+                    identity = os.fstat(lease)
+                    read, write = os.pipe()
+                    _ = pipes.callback(os.close, write)
+                    try:
+                        child = subprocess.Popen(
+                            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.buffer.read(1)"],
+                            pass_fds=(lease,), stdin=read, stdout=subprocess.PIPE, text=True)
+                    finally:
+                        os.close(read)
+                    with child:
+                        try:
+                            assert child.stdout is not None
+                            self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(child.stdout.readline(), "ready\n")
+                            if nested:
+                                _release_folder(held)
+                            flock = fcntl.flock
+                            joined = False
 
-    def test_deferred_removal_waits_for_an_independent_nested_lease(self) -> None:
-        self.check_deferred_removal(nested=True)
+                            def release_at_join(descriptor: int, mode: int) -> None:
+                                nonlocal joined
+                                if mode == fcntl.LOCK_EX and os.path.samestat(os.fstat(descriptor), identity):
+                                    with self.assertRaises(BlockingIOError):
+                                        flock(descriptor, mode | fcntl.LOCK_NB)
+                                    self.assertTrue(held.is_dir())
+                                    joined = True
+                                    _ = os.write(write, b"x")
+                                flock(descriptor, mode)
 
-    def check_deferred_removal(self, *, nested: bool) -> None:
-        child: subprocess.Popen[str] | None = None
-        try:
-            with ExitStack() as lifetime:
-                path = lifetime.enter_context(folders.temporary_build_folder(folders.UniqueBuildFolder("child-")))
-                held = path
-                if nested:
-                    held = folders.create_build_folder(folders.UniqueBuildFolder(
-                        "nested-", folders.ExplicitBuildParent(path)))
-                    _ = lifetime.callback(_release_folder, held)
-                child = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
-                                         pass_fds=(folders.build_folder_lock_fd(held),),
-                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-                assert child.stdout is not None
-                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
-                self.assertEqual(child.stdout.readline(), "ready\n")
-                with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as launch:
-                    lifetime.close()
-                launch.assert_called_once()
-            self.assertTrue(path.is_dir())
+                            with mock.patch.object(fcntl, "flock", side_effect=release_at_join):
+                                lifetime.close()
+                            self.assertTrue(joined)
+                            self.assertFalse(path.exists())
+                            self.assertFalse(path.with_name(path.name + ".lock").exists())
+                            self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        finally:
+                            if child.poll() is None:
+                                child.kill()
+                            if nested:
+                                _release_folder(held)
+
+    def test_collector_excludes_nested_allocation_across_system_roots(self) -> None:
+        request = folders.UniqueBuildFolder("scan-")
+        path = folders.create_build_folder(request)
+        _release_folder(path)
+        explicit_parent = path / "explicit"
+        explicit_parent.mkdir()
+        other = self.root / "other-config"
+        environment = {**os.environ, **config_environment(other)}
+        for settings, system in ((Path(os.environ["CONF_DIR"]), self.root / "parent-system"),
+                                 (other, self.root / "child-system")):
+            system.mkdir()
+            _ = write_config_fixture(settings / "build_folders.conf", f"roots.system={system}\n")
+        probe = """import fcntl, pathlib, sys
+from unittest import mock
+from scripts.lib import build_folders as folders
+flock = fcntl.flock
+def no_wait(descriptor, mode):
+    flock(descriptor, mode | fcntl.LOCK_NB)
+with mock.patch.object(fcntl, 'flock', side_effect=no_wait):
+    try:
+        folders.create_build_folder(folders.UniqueBuildFolder(
+            'late-', folders.ExplicitBuildParent(pathlib.Path(sys.argv[1]))))
+    except BlockingIOError:
+        print('blocked', flush=True)
+    else:
+        print('allocated', flush=True)
+        sys.stdin.read()
+"""
+        with folders.collector_lease(path, children=True, wait=False) as free:
+            self.assertTrue(free)
+            with subprocess.Popen([sys.executable, "-c", probe, str(explicit_parent)], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True, env=environment) as child:
+                try:
+                    assert child.stdout is not None
+                    self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertEqual(child.stdout.readline(), "blocked\n")
+                    _ = child.communicate(input="end", timeout=TEST_HANG_GUARD_SECS)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+            self.assertEqual(list(explicit_parent.iterdir()), [])
+        folders.sweep_temporary_build_folders(path.parent, wait=False)
+        self.assertFalse(path.exists())
+
+    def test_descendant_scan_keeps_the_tree_and_its_metadata(self) -> None:
+        request = folders.UniqueBuildFolder("scan-tree-")
+        with folders.temporary_build_folder(request) as path:
             lock = path.with_name(path.name + ".lock")
             lease = path.with_name(path.name + ".lease.json")
-            self.assertTrue(lock.is_file())
-            self.assertTrue(lease.is_file())
-            self.assertEqual(folders.build_folder_state(held), "held")
-            self.assertFalse(folders.remove_build_folder(path, wait=False))
-            self.assertTrue(path.is_dir() and lock.is_file() and lease.is_file())
-            _ = child.communicate(input="end", timeout=TEST_HANG_GUARD_SECS)
-            wait_until(lambda: not (path.exists() or lock.exists() or lease.exists()), path.parent)
-            self.assertEqual(folders.build_folder_state(path), "free")
-        finally:
-            if child is not None:
-                if child.poll() is None:
-                    child.kill()
-                _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            with folders.hold_descendant_leases(path) as scan:
+                self.assertIsInstance(scan, folders.DescendantLeasesHeld)
+                self.assertTrue(path.is_dir())
+                self.assertTrue(lock.is_file())
+                self.assertTrue(lease.is_file())
+
+    def test_removal_cleans_cargo_output_below_a_search_only_sibling(self) -> None:
+        checkout = self.root / "source-parent" / "checkout"
+        checkout.mkdir(parents=True)
+        _ = (checkout / "Cargo.toml").write_text("[workspace]\n")
+        sibling = self.root / "search-only"
+        output = sibling / "readable" / "cargo"
+        output.mkdir(parents=True)
+        _ = (output / "artifact").write_text("build output")
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", output)
+        self.addCleanup(sibling.chmod, stat.S_IMODE(sibling.stat().st_mode))
+        sibling.chmod(0o111)
+
+        with (mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "lint")}),
+              mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots),
+              mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
+              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([]))):
+            sweep.save_cargo_output_roots(sweep.CargoOutputIndex((roots,)))
+            self.assertEqual(scratch.remove_folder(checkout), scratch.RemovedCopy())
+        self.assertFalse(checkout.exists())
+        self.assertFalse(output.exists())
+
+    def test_cargo_reservation_refuses_a_replaced_shared_parent(self) -> None:
+        parent = self.root / "shared"
+        (parent / "checkout").mkdir(parents=True)
+        cargo = parent / "cargo"
+        cargo.mkdir()
+        with build_folder_lock.mutation_lock(parent / "checkout/target") as held:
+            self.assertIsInstance(held, build_folder_lock.MutationLockHeld)
+            _ = parent.rename(self.root / "retained-shared")
+            cargo.mkdir(parents=True)
+            with folders.reserve_cargo_output(cargo) as reservation:
+                self.assertEqual(reservation, folders.FolderChanged(parent))
+        self.assertTrue(cargo.is_dir())
+
+    def test_mutation_refuses_a_replaced_exclusive_ancestor(self) -> None:
+        parent = self.root / "exclusive"
+        parent.mkdir()
+        path = parent / "output"
+        with build_folder_lock.mutation_lock(path) as held:
+            self.assertIsInstance(held, build_folder_lock.MutationLockHeld)
+            _ = parent.rename(self.root / "retained-exclusive")
+            path.mkdir(parents=True)
+            with build_folder_lock.mutation_lock(path / "child") as reused:
+                self.assertEqual(reused, build_folder_lock.ParentChanged(parent))
+
+    def test_removal_refuses_replacement_between_parent_selection_and_acquisition(self) -> None:
+        parent = self.root / "selected"
+        path = parent / "output"
+        path.mkdir(parents=True)
+        retained = self.root / "retained-selection"
+        select_parent = cast(Callable[..., Path], getattr(build_folder_lock, "_existing_parent"))
+
+        def replace_after_selection(*arguments: object) -> Path:
+            selected = select_parent(*arguments)
+            if not retained.exists():
+                self.assertEqual(selected, parent)
+                _ = parent.rename(retained)
+                path.mkdir(parents=True)
+            return selected
+
+        with mock.patch.object(build_folder_lock, "_existing_parent", side_effect=replace_after_selection):
+            result = folders.attempt_folder_removal(path, wait=False)
+        self.assertEqual(result, folders.FolderChanged(parent))
+        self.assertTrue((retained / path.name).is_dir())
+        self.assertTrue(path.is_dir())
+
+    def test_removal_keeps_the_retained_folder_if_its_name_cannot_be_recovered(self) -> None:
+        parent = self.root / "selected"
+        parent.mkdir()
+        retained = self.root / "retained"
+        readlink = os.readlink
+
+        def lose_retained_name(name: str, *, dir_fd: int | None = None) -> str:
+            if name.startswith("/proc/self/fd/"):
+                raise FileNotFoundError(name)
+            return readlink(name, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "readlink", side_effect=lose_retained_name),
+              mock.patch.object(fcntl, "F_GETPATH", 0, create=True)):
+            with folders.temporary_build_folder(folders.UniqueBuildFolder("stage-", folders.ExplicitBuildParent(parent))) as path:
+                _ = parent.rename(retained)
+                path.mkdir(parents=True)
+        self.assertTrue((retained / path.name).is_dir())
+        self.assertTrue(path.is_dir())
+
+    def test_removal_refuses_a_parent_change_during_lock_acquisition(self) -> None:
+        original_flock = fcntl.flock
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                parent = self.root / f"parent-{replacement}"
+                path = parent / "output"
+                path.mkdir(parents=True)
+                _ = (path / "original").write_text("original")
+                moved = parent.with_name(parent.name + "-moved")
+                original_parent = parent.stat()
+                changed = False
+
+                def change_parent(descriptor: int, mode: int) -> None:
+                    nonlocal changed
+                    if not changed and mode & fcntl.LOCK_EX and os.path.samestat(os.fstat(descriptor), original_parent):
+                        _ = parent.rename(moved)
+                        if replacement:
+                            path.mkdir(parents=True)
+                            _ = (path / "replacement").write_text("replacement")
+                        changed = True
+                    original_flock(descriptor, mode)
+
+                with mock.patch.object(fcntl, "flock", side_effect=change_parent):
+                    result = folders.attempt_folder_removal(path)
+                self.assertTrue(changed)
+                self.assertEqual(result, folders.FolderChanged(parent))
+                self.assertTrue((moved / path.name / "original").is_file())
+                if replacement:
+                    self.assertTrue((path / "replacement").is_file())
+
+    def test_removal_reports_the_result_without_a_boolean_wrapper(self) -> None:
+        self.assertFalse(hasattr(folders, "remove_build_folder"))
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("tagged-")) as path:
+            self.assertEqual(folders.attempt_folder_removal(path, wait=False), folders.BlockedByLiveLease(path))
+
+    def test_removal_distinguishes_unsafe_lease_and_callback_refusal(self) -> None:
+        path = folders.create_build_folder(folders.UniqueBuildFolder("removal-"))
+        _release_folder(path)
+        child = path / "child"
+        child.mkdir()
+        with (path / "child.lock").open("wb") as lock:
+            folders.mark_cleanup_incomplete(lock.fileno())
+        result = folders.attempt_folder_removal(path, wait=False)
+        self.assertIsInstance(result, folders.UnsafeChild)
+        if isinstance(result, folders.UnsafeChild):
+            self.assertEqual(result.path, child)
+        (path / "child.lock").unlink()
+        self.assertEqual(folders.attempt_folder_removal(path, lambda: False, wait=False),
+                         folders.UnsafeChild(path, "the cleanup callback refused removal"))
+        self.assertTrue(path.is_dir())
+        with mock.patch.object(build_folder_lock, "open_lock", side_effect=OSError(errno.EIO, "fixture I/O")):
+            with self.assertRaisesRegex(OSError, "fixture I/O"):
+                _ = folders.attempt_folder_removal(path, wait=False)
 
     def test_lock_and_lease_symlinks_cannot_modify_another_file(self) -> None:
         outside = self.root / "unrelated"
@@ -1461,7 +1670,8 @@ assert not loaded, loaded
     @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
                          "the memory filesystem is unavailable")
     def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
+        with mock.patch.dict(os.environ), tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
+            _ = os.environ.pop("CLAUDE_PRIVATE_RUN_ROOT", None)
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
@@ -1490,65 +1700,46 @@ assert not loaded, loaded
 
 
     def test_cancellation_during_allocation_or_removal_keeps_any_folder_recorded(self) -> None:
-        def interrupted(number: int, frame: object) -> None:
-            del frame
-            raise KeyboardInterrupt(signal.Signals(number).name)
-
         for stage in ("allocation", "removal"):
             with self.subTest(stage=stage):
                 paths: list[Path] = []
                 allocate = folders.create_build_folder
-                remove = shutil.rmtree
-                cancel = threading.Event()
-                sent = threading.Event()
-                release = threading.Event()
-
-                def send_from_thread() -> None:
-                    if cancel.wait(10) and not release.is_set():
-                        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
-                        sent.set()
-                        _ = release.wait(10)
-
-                worker = threading.Thread(target=send_from_thread)
-                worker.start()
+                unlink = os.unlink
+                name = "owned-output"
 
                 def allocate_then_cancel(request: folders.BuildFolderRequest | folders.BuildFolderSpec) -> Path:
                     path = allocate(request)
                     paths.append(path)
                     if stage == "allocation":
-                        os.kill(os.getpid(), signal.SIGTERM)
+                        raise KeyboardInterrupt("allocation")
+                    _ = (path / name).write_text("keep until removal")
                     return path
 
-                def cancel_then_remove(path: str, *, dir_fd: int,
-                                       onexc: Callable[[Callable[..., object], str, BaseException], object]) -> None:
-                    if stage == "removal":
-                        cancel.set()
-                        self.assertTrue(sent.wait(10), "the worker did not send SIGTERM")
-                    remove(path, dir_fd=dir_fd, onexc=onexc)
+                def cancel_then_unlink(entry: str, *, dir_fd: int | None = None) -> None:
+                    if stage == "removal" and entry == name:
+                        assert dir_fd is not None
+                        self.assertTrue(os.path.samestat(os.fstat(dir_fd), paths[0].stat()))
+                        raise KeyboardInterrupt("removal")
+                    unlink(entry, dir_fd=dir_fd)
 
-                previous = signal.signal(signal.SIGTERM, interrupted)
-                try:
-                    with (mock.patch.object(folders, "create_build_folder", side_effect=allocate_then_cancel),
-                          mock.patch.object(shutil, "rmtree", side_effect=cancel_then_remove),
-                          self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM")):
-                        with folders.temporary_build_folder(folders.UniqueBuildFolder("gate-proof-")):
-                            pass
-                    self.assertEqual(len(paths), 1)
-                    path = paths[0]
-                    lock = path.with_name(path.name + ".lock")
-                    lease = path.with_name(path.name + ".lease.json")
-                    if path.exists():
-                        self.assertTrue(lock.is_file())
-                        record = cast(dict[str, object], json.loads(lease.read_text()))
-                        self.assertEqual(record["pid"], os.getpid())
-                        self.assertEqual(record["purpose"], "gate-proof-")
-                    self.assertEqual(folders.build_folder_state(path), "free")
-                finally:
-                    release.set()
-                    cancel.set()
-                    worker.join(timeout=10)
-                    _ = signal.signal(signal.SIGTERM, previous)
+                with (mock.patch.object(folders, "create_build_folder", side_effect=allocate_then_cancel),
+                      mock.patch.object(os, "unlink", side_effect=cancel_then_unlink),
+                      self.assertRaisesRegex(KeyboardInterrupt, stage)):
+                    with folders.temporary_build_folder(folders.UniqueBuildFolder("gate-proof-")):
+                        pass
 
+                self.assertEqual(len(paths), 1)
+                path = paths[0]
+                lock = path.with_name(path.name + ".lock")
+                lease = path.with_name(path.name + ".lease.json")
+                if stage == "removal":
+                    self.assertTrue((path / name).is_file())
+                if path.exists():
+                    self.assertTrue(lock.is_file())
+                    record = cast(dict[str, object], json.loads(lease.read_text()))
+                    self.assertEqual(record["pid"], os.getpid())
+                    self.assertEqual(record["purpose"], "gate-proof-")
+                self.assertEqual(folders.build_folder_state(path), "free")
 
     def test_authority_readers_follow_current_scratch_copy_and_unit_roots(self) -> None:
         for index in range(2):
@@ -1626,7 +1817,7 @@ assert not loaded, loaded
         with folders.temporary_build_folder(folders.UniqueBuildFolder(".shell-stage-")) as name:
             stage = Path(name)
             _ = (stage / "exports.sh").write_text("export FIXTURE=1\n")
-            os.replace(stage, destination)
+            folders.publish_build_folder(stage, destination)
         self.assertFalse(stage.exists())
         self.assertEqual((destination / "exports.sh").read_text(), "export FIXTURE=1\n")
 
@@ -1641,6 +1832,60 @@ assert not loaded, loaded
             _ = replacement.rename(stage)
         self.assertEqual((stage / "keep").read_text(), "unrelated output")
         self.assertEqual((published / "output").read_text(), "published output")
+
+    def test_removal_does_not_follow_a_replacement_during_deletion(self) -> None:
+        moved = self.root / "moved"
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        _ = (replacement / "keep").write_text("replacement")
+        scope = self.enterContext(ExitStack())
+        stage = scope.enter_context(folders.temporary_build_folder(folders.UniqueBuildFolder("race-")))
+        _ = (stage / "output").write_text("original")
+        original_scandir = os.scandir
+        original_rmtree = shutil.rmtree
+        identity = stage.stat()
+        scans = 0
+
+        program = """import os, sys
+assert sys.stdin.buffer.read(1) == b"x"
+os.rename(sys.argv[1], sys.argv[2])
+os.rename(sys.argv[3], sys.argv[1])
+print("moved", flush=True)
+"""
+        with subprocess.Popen([sys.executable, "-c", program, str(stage), str(moved), str(replacement)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            try:
+                def swap() -> None:
+                    assert child.stdin is not None and child.stdout is not None
+                    _ = child.stdin.write("x")
+                    child.stdin.flush()
+                    self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertEqual(child.stdout.readline(), "moved\n")
+
+                def scandir(path: int | str | os.PathLike[str]) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+                    nonlocal scans
+                    if isinstance(path, int) and os.path.samestat(os.fstat(path), identity):
+                        scans += 1
+                        if scans == 2:
+                            swap()
+                    return original_scandir(path)
+
+                def replace_before_name_lookup(
+                        path: str, *, dir_fd: int | None = None,
+                        onexc: Callable[[object, str, BaseException], None] | None = None) -> None:
+                    if path == stage.name:
+                        swap()
+                    original_rmtree(path, dir_fd=dir_fd, onexc=onexc)
+
+                with (mock.patch.object(os, "scandir", side_effect=scandir),
+                      mock.patch.object(shutil, "rmtree", side_effect=replace_before_name_lookup)):
+                    scope.close()
+                self.assertEqual(child.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+        self.assertEqual((stage / "keep").read_text(), "replacement")
+        self.assertFalse((moved / "output").exists())
 
     def test_allocation_refuses_a_repository_parent_symlink(self) -> None:
         outside = self.root / "outside"
@@ -1808,9 +2053,11 @@ assert not loaded, loaded
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "admit-test-")
-        with folders.temporary_build_folder(folders.UniqueBuildFolder("probe-", folders.SystemTemporaryParent())) as path:
-            self.assertEqual(path.parent, Path("/tmp"))
-            self.assertTrue(path.is_dir())
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop("CLAUDE_PRIVATE_RUN_ROOT", None)
+            with folders.temporary_build_folder(folders.UniqueBuildFolder("probe-", folders.SystemTemporaryParent())) as path:
+                self.assertEqual(path.parent, Path("/tmp"))
+                self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
         _ = config_environment(config.parent)

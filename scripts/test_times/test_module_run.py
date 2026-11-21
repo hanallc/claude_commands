@@ -119,39 +119,58 @@ import select
 import signal
 import sys
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from scripts.lib import build_folders
+from scripts.lib.socket_test_support import ShortUnixSocket
 
 class OrphanProcess(unittest.TestCase):
     def test_orphan(self):
-        reader, writer = os.pipe()
-        intermediate = os.fork()
-        if intermediate == 0:
-            os.close(reader)
-            if os.fork() != 0:
-                os._exit(0)
-            os.setsid()
-            os.write(writer, str(os.getpid()).encode())
+        with ExitStack() as lifetime:
+            report = os.environ.get("TEST_LEASE_ROOT_REPORT")
+            if report:
+                root = Path(os.environ["TMPDIR"])
+                outside = Path(report).parent
+                leased = lifetime.enter_context(build_folders.temporary_build_folder(
+                    build_folders.UniqueBuildFolder("orphan-", build_folders.ExplicitBuildParent(outside))))
+                listener = lifetime.enter_context(ShortUnixSocket())
+                listener.bind_socket()
+                self.assertEqual(leased.parent, root)
+                self.assertEqual(listener.path.parent.parent, root)
+                Path(report).write_text("\\n".join(map(str, (root, leased, listener.path.parent))))
+                self.assertEqual(root, Path(os.environ["SCRATCH_ROOT"]).parent)
+                self.assertEqual(root, Path(os.environ["ASTRA_REVIEW_DIR"]).parent)
+                self.assertTrue((root / "config-reads" / "reads").is_file())
+            reader, writer = os.pipe()
+            intermediate = os.fork()
+            if intermediate == 0:
+                os.close(reader)
+                if os.fork() != 0:
+                    os._exit(0)
+                os.setsid()
+                os.write(writer, str(os.getpid()).encode())
+                os.close(writer)
+                for descriptor in (0, 1, 2):
+                    os.close(descriptor)
+                while True:
+                    signal.pause()
             os.close(writer)
-            for descriptor in (0, 1, 2):
+            pid = int(os.read(reader, 32))
+            os.close(reader)
+            os.waitpid(intermediate, 0)
+            descriptor = os.pidfd_open(pid)
+            try:
+                print(pid, flush=True)
+                sys.stdin.buffer.read(1)
+                if __REAP__:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    reaped = select.poll()
+                    reaped.register(descriptor, select.POLLHUP)
+                    self.assertTrue(reaped.poll(__HANG_GUARD_MS__), "The orphan remains unreaped")
+                if __FAIL__:
+                    self.fail("fixture failure after orphan launch")
+            finally:
                 os.close(descriptor)
-            while True:
-                signal.pause()
-        os.close(writer)
-        pid = int(os.read(reader, 32))
-        os.close(reader)
-        os.waitpid(intermediate, 0)
-        descriptor = os.pidfd_open(pid)
-        try:
-            print(pid, flush=True)
-            sys.stdin.buffer.read(1)
-            if __REAP__:
-                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-                reaped = select.poll()
-                reaped.register(descriptor, select.POLLHUP)
-                self.assertTrue(reaped.poll(__HANG_GUARD_MS__), "The orphan remains unreaped")
-            if __FAIL__:
-                self.fail("fixture failure after orphan launch")
-        finally:
-            os.close(descriptor)
 '''
 
 
@@ -444,8 +463,7 @@ shutil.rmtree(path)""", []),
                               + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
                               + textwrap.indent(action, "        ") + "\n")
                     _ = (root / "tests/test_listing.py").write_text(source)
-                    entry = "import runpy, sys; runpy.run_path(sys.argv.pop(1))['main']()"
-                    result = subprocess.run([sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                    result = subprocess.run([sys.executable, str(runner), str(root / "tests"), "test_listing.py"],
                                             cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
                                             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -816,7 +834,8 @@ class InheritedSignal(unittest.TestCase):
                     timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
-    def run_orphan(self, *, fail: bool = False, terminate: bool = False, reap: bool = False) -> None:
+    def run_orphan(self, *, fail: bool = False, terminate: bool = False, reap: bool = False,
+                   lease_root: bool = False) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         processes = OwnedTestProcesses()
         self.addCleanup(processes.finish)
@@ -826,6 +845,9 @@ class InheritedSignal(unittest.TestCase):
         environment = processes.environment({**os.environ, "HOME": str(root / "home"),
             "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
             "PYTHONDONTWRITEBYTECODE": "1"})
+        report = root / "lease-root-report"
+        if lease_root:
+            environment["TEST_LEASE_ROOT_REPORT"] = str(report)
         for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
             _ = environment.pop(name, None)
         environment["PYTHONPATH"] = str(root)
@@ -851,6 +873,52 @@ class InheritedSignal(unittest.TestCase):
         observer = select.poll()
         observer.register(descriptor, select.POLLHUP)
         self.assertTrue(observer.poll(0), "The orphan remains alive or unreaped")
+        if lease_root:
+            run_root, leased, socket_folder = map(Path, report.read_text().splitlines())
+            for path in (leased, socket_folder, run_root):
+                self.assertFalse(path.exists(), path)
+                self.assertFalse(path.with_name(path.name + ".lock").exists(), path)
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists(), path)
+
+    def test_direct_runner_keeps_its_private_root_without_a_supervisor(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        report = root / "direct-root"
+        launcher = """import runpy, sys
+from unittest.mock import patch
+sys.argv = sys.argv[1:]
+with patch("scripts.lib.descendants.adopt_descendants", return_value=False):
+    runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+        _ = (root / "test_direct.py").write_text("""import os, unittest
+from pathlib import Path
+from scripts.lib import build_folders
+
+class DirectOwner(unittest.TestCase):
+    def test_private_placement(self):
+        root = Path(os.environ["TMPDIR"])
+        report = Path(os.environ["TEST_DIRECT_ROOT_REPORT"])
+        self.assertNotIn("CLAUDE_SUPERVISED_RUN_ROOT", os.environ)
+        self.assertEqual(os.environ["CLAUDE_PRIVATE_RUN_ROOT"], str(root))
+        request = build_folders.UniqueBuildFolder("direct-", build_folders.ExplicitBuildParent(report.parent))
+        with build_folders.temporary_build_folder(request) as path:
+            self.assertEqual(path.parent, root)
+            self.assertEqual(build_folders.build_folder_state(path), "held")
+        self.assertFalse(path.exists())
+        report.write_text(str(root))
+""", encoding="utf-8")
+        environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+                       "BUILDLOG_DIR": str(root / "buildlog"),
+                       "PYTHONPATH": os.pathsep.join((str(RUNNER.parents[2]), str(root))),
+                       "TEST_DIRECT_ROOT_REPORT": str(report), "CLAUDE_SUPERVISED_RUN_ROOT": str(root)}
+        _ = environment.pop("TEST_TIMES_OUT", None)
+        result = subprocess.run([sys.executable, "-c", launcher, str(RUNNER), str(root), "test_direct.py"],
+                                cwd=root, env=environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(Path(report.read_text()).exists())
+
+    def test_supervisor_removes_the_private_root_after_reaping_a_lease_holder(self) -> None:
+        self.run_orphan(lease_root=True)
 
     def test_normal_end_kills_and_reaps_a_detached_orphan(self) -> None:
         self.run_orphan()
