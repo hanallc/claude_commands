@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Iterator
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
@@ -133,7 +134,9 @@ class TmpSweepCase(unittest.TestCase):
             "patterns.legacy-stable={purpose}\nprefixes.verify-copy=verify-copy.{owner}.\n"
             + "prefixes.verify-hold=verify-hold.{owner}.\nnames.suffix_length=8\n"
             + "patterns.legacy-unique={purpose}{suffix}\n"
-            + f"removal.forms.{os.uname().nodename.partition('.')[0]}={base / 'build'}/<repo>/<unit>/<short>\n")
+            + f"roots.build={base / 'build'}\nroots.build.natedev={base / 'build'}\n"
+            + f"roots.workspace={base / 'worktrees'}\n"
+            + f"removal.path_templates.{os.uname().nodename.partition('.')[0]}={base / 'build'}/<repo>/<unit>/<short>\n")
         (base / "build").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
@@ -1620,6 +1623,27 @@ class HandCleanupTests(TmpSweepCase):
 
 
 class WorkerAndGitTests(TmpSweepCase):
+    def test_an_unreadable_legacy_pair_does_not_stop_review_in_another_root(self) -> None:
+        source_root = copy_record.worktree_root()
+        unreadable = source_root / "unreadable-pair"
+        unreadable.mkdir(parents=True)
+        other_root = self.tmp.parent / "other-root"
+        obsolete = write(other_root / "old-file")
+        roots = tmp_sweep.Roots(plain=(str(other_root),), runs=(), projects=(), copies=(str(source_root),))
+        iterdir = Path.iterdir
+
+        def entries(folder: Path) -> Iterator[Path]:
+            if folder == unreadable:
+                raise PermissionError(f"{folder}: permission denied")
+            return iterdir(folder)
+
+        with mock.patch.object(Path, "iterdir", entries):
+            result = tmp_sweep.sweep(False, roots, self.now + 8 * DAY, str(self.proc))
+        self.assertEqual(result.failed, [{"path": str(unreadable), "error": f"{unreadable}: permission denied"}])
+        self.assertEqual([entry["path"] for entry in result.deleted], [str(obsolete)])
+        self.assertTrue(unreadable.is_dir())
+        self.assertTrue(obsolete.is_file())
+
     def test_finished_detached_records_do_not_keep_a_folder_for_a_worker(self) -> None:
         self.now = time.time() + 8 * DAY
         for guard in ("paused worker", "active run"):
@@ -1638,10 +1662,11 @@ class WorkerAndGitTests(TmpSweepCase):
                 self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
                 self.assert_reviewed(folder)
 
-    def test_a_killed_fresh_gate_stays_under_tmpdir_without_a_scratch_record(self) -> None:
+    def test_a_killed_numbered_copy_stays_outside_scratch_expiry(self) -> None:
         source = self.tmp.parent / "fresh-source"
         source.mkdir()
         self.git(source, "init", "-q")
+        self.git(source, "remote", "add", "origin", str(self.tmp.parent / "unused-origin/fresh-source"))
         _ = write(source / "file", "saved\n")
         self.git(source, "add", "file")
         self.git(source, "commit", "-qm", "saved")
@@ -1672,13 +1697,13 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                         assert child.stdout is not None
                         output = cast(TextIO, child.stdout)
                         ready, _, _ = select.select([output.fileno()], [], [], 30)
-                        self.assertTrue(ready, "The child must enter the fresh gate before the kill")
+                        self.assertTrue(ready, "The child must enter the numbered copy before the kill")
                         line = output.readline().strip()
-                        self.assertTrue(line, "The child must report its fresh task folder")
+                        self.assertTrue(line, "The child must report its numbered copy")
                         folder = Path(line)
                         self.now = time.time() + 8 * DAY
                         _ = self.sweep()
-                        self.assertTrue(folder.exists(), "The busy lock must protect an expired fresh gate")
+                        self.assertTrue(folder.exists())
                     finally:
                         child.kill()
                         _, errors = child.communicate(timeout=30)
@@ -1686,8 +1711,11 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                 checkout = folder
                 self.assertEqual((checkout / "file").read_text(), "working edit\n")
                 self.assertEqual((checkout / "untracked").read_text(), "test output\n")
-                self.assertTrue(folder.is_relative_to(self.tmp.parent / "fresh-settings/slots"))
+                self.assertEqual(folder, build_folders.copy_path("fresh-source", "verify-unit", 1))
                 self.assertFalse((folder / copy_record.RECORD).exists())
+                build_unit = str(folder.parent)
+                roots = tmp_sweep.Roots((build_unit,), (), ())
+                self.assertEqual(list(roots.entries(build_unit)), [])
                 result = self.sweep()
                 self.assertTrue(folder.exists())
                 self.assertNotIn(str(folder), [entry["path"] for entry in result.deleted])

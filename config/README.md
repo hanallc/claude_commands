@@ -858,7 +858,7 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`enabled.aws-gate=off` in `build_targets.conf` sends new merge gates and targeted tests to natedev.
+`enabled.aws-gate=off` in `build_targets.conf` sends new gates and targeted tests to natedev.
 `enabled.hana-gpu=off` in that file refuses new placed Hana GPU tests.
 `enabled.hana-aws=off` refuses new placed Hana check and lint work.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.

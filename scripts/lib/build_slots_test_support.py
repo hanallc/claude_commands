@@ -25,18 +25,21 @@ class SlotTestConfiguration:
 
 
 def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
-    """Set private slot and cargo roots for the host and the default."""
+    """Set private slot, cargo, and build roots for the fixture."""
     if not settings.exists():
         _ = write_config_fixture(settings)
     lines = [line for line in settings.read_text().splitlines()
-             if not line.startswith(("roots.slots", "roots.slot_cargo"))]
+             if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.build"))]
     lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={root / 'slots'}",
-                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={root / 'cargo'}"))
+                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={root / 'cargo'}",
+                  f"roots.build={root / 'build'}"))
+    for host in sorted({"natedev", machine}):
+        lines.append(f"roots.build.{host}={root / 'build'}")
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
 def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaultMaximum = 2,
-                        default_maximum: int = 1, unused_days: int = 7) -> SlotTestConfiguration:
+                        default_maximum: int = 1) -> SlotTestConfiguration:
     """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
@@ -45,19 +48,17 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     machine = host_name()
     write_private_slot_roots(settings, root, machine)
     lines = [line for line in settings.read_text().splitlines()
-             if not line.startswith(("roots.workspace", "roots.session", "slots.", "patterns.slot="))]
+             if not line.startswith(("roots.workspace", "roots.session", "folders.unused_days=", "slots.",
+                                     "patterns.slot="))]
     lines.extend((f"roots.workspace={root / 'workspaces'}", f"roots.session={root / 'session'}",
+                  "# whole: 1..", "folders.unused_days=2",
                   "patterns.slot={repository}-slot{slot}", "# whole: 1..",
-                  f"slots.{machine}.default_max={default_maximum}", "# whole: 1..",
-                  f"slots.unused_days={unused_days}", "# range: 5e-324..", "slots.wait_seconds=30"))
+                  f"slots.{machine}.default_max={default_maximum}"))
     if isinstance(maximum, int):
         lines.extend(("# whole: 1..", f"slots.{machine}.{repository}.max={maximum}"))
     _ = settings.write_text("\n".join(lines) + "\n")
     copies = settings.with_name("copies.conf")
-    copy_lines = [line for line in copies.read_text().splitlines()
-                  if not line.startswith("remote_registry=")]
-    copy_lines.append(f"remote_registry={root / 'remote-mirrors'}")
-    _ = copies.write_text("\n".join(copy_lines) + "\n")
+    _ = write_config_fixture(copies, f"remote_registry={root / 'remote-mirrors'}\ngit_timeout_seconds=10\n")
     git_config = write_fixture_git_config(root)
     environment.update({
         "COPIES_CONFIG": str(copies), "SCRATCH_ROOT": str(root / "scratch"),

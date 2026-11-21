@@ -11,7 +11,6 @@ import io
 import os
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -32,7 +31,7 @@ from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
-from scripts.build_queue.slot_wait import NoNamedStep, SlotCaller, recorded_step
+from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.disks.slots import lease_record
@@ -42,8 +41,8 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import atomic_file, build_slots, conf, test_hang_guard
-from scripts.lib.build_slots_test_support import private_slot_config, write_private_slot_roots
+from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
+from scripts.lib.build_slots_test_support import write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -276,32 +275,32 @@ class MemoryFeedTests(unittest.TestCase):
         linked_root.symlink_to(roots["natedev"], target_is_directory=True)
         mac_home = self.root / "remote-home"
         for label, machine, folder, configured, expected in (
-            ("natedev slot", "natedev", roots["natedev"] / "hana-slot2", "machine", 2),
-            ("natedev common root", "natedev", roots["natedev"] / "hana-slot2", "common", 2),
-            ("natedev symlink root", "natedev", roots["natedev"] / "hana-slot2", "symlink", 2),
-            ("Mac host root", "mac", roots[mac_machine] / "hana-slot3", "machine", 3),
-            ("Mac tilde root", "mac", mac_home / "build/slot/hana-slot3", "~", 3),
-            ("Mac HOME root", "mac", mac_home / "build/slot/hana-slot3", "$HOME", 3),
-            ("Mac braced HOME root", "mac", mac_home / "build/slot/hana-slot3", "${HOME}", 3),
-            ("local tilde root", "natedev", Path.home() / "build/slot/hana-slot2", "~", 2),
-            ("local HOME root", "natedev", Path.home() / "build/slot/hana-slot2", "$HOME", 2),
-            ("Mac home unavailable", "mac", Path.home() / "build/slot/hana-slot3", "unknown-home", "—"),
+            ("natedev slot", "natedev", roots["natedev"] / "hana/unit/2", "machine", 2),
+            ("natedev common root", "natedev", roots["natedev"] / "hana/unit/2", "common", 2),
+            ("natedev symlink root", "natedev", roots["natedev"] / "hana/unit/2", "symlink", 2),
+            ("Mac host root", "mac", roots[mac_machine] / "hana/unit/3", "machine", 3),
+            ("Mac tilde root", "mac", mac_home / "build/hana/unit/3", "~", 3),
+            ("Mac HOME root", "mac", mac_home / "build/hana/unit/3", "$HOME", 3),
+            ("Mac braced HOME root", "mac", mac_home / "build/hana/unit/3", "${HOME}", 3),
+            ("local tilde root", "natedev", Path.home() / "build/hana/unit/2", "~", 2),
+            ("local HOME root", "natedev", Path.home() / "build/hana/unit/2", "$HOME", 2),
+            ("Mac home unavailable", "mac", Path.home() / "build/hana/unit/3", "unknown-home", "—"),
             ("outside root", "natedev", self.root / "worktree", "machine", "—"),
-            ("lookalike outside root", "natedev", self.root / "hana-slot2", "machine", "—"),
-            ("other machine root", "mac", roots["natedev"] / "hana-slot2", "machine", "—"),
-            ("nested folder", "natedev", roots["natedev"] / "hana-slot2" / "crate", "machine", "—"),
-            ("no roots", "natedev", roots["natedev"] / "hana-slot2", "none", "—"),
-            ("Mac without roots", "mac", roots[mac_machine] / "hana-slot3", "none", "—"),
+            ("lookalike outside root", "natedev", self.root / "hana/unit/2", "machine", "—"),
+            ("other machine root", "mac", roots["natedev"] / "hana/unit/2", "machine", "—"),
+            ("nested folder", "natedev", roots["natedev"] / "hana/unit/2" / "crate", "machine", "—"),
+            ("no roots", "natedev", roots["natedev"] / "hana/unit/2", "none", "—"),
+            ("Mac without roots", "mac", roots[mac_machine] / "hana/unit/3", "none", "—"),
         ):
             with self.subTest(label=label):
-                settings = ("".join(f"roots.slots.{host}={path}\n" for host, path in roots.items())
-                            if configured == "machine" else f"roots.slots={roots['natedev']}\n" if configured == "common" else "")
+                settings = ("".join(f"roots.build.{host}={path}\n" for host, path in roots.items())
+                            if configured == "machine" else f"roots.build={roots['natedev']}\n" if configured == "common" else "")
                 if configured in ("~", "$HOME", "${HOME}", "unknown-home"):
                     selected_host = mac_machine if machine == "mac" else machine
                     prefix = "~" if configured == "unknown-home" else configured
-                    settings = f"roots.slots.{selected_host}={prefix}/build/slot\n"
+                    settings = f"roots.build.{selected_host}={prefix}/build\n"
                 if configured == "symlink":
-                    settings = f"roots.slots.natedev={linked_root}\n"
+                    settings = f"roots.build.natedev={linked_root}\n"
                 _ = (self.root / "build_folders.conf").write_text(settings)
                 reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
                 step = replace(reading.view.running[0], folder=str(folder))
@@ -323,7 +322,7 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(rows[0].get("slot"), expected)
                 # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
                 self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
-                                 (folder.name, mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
+                                 ("/".join(folder.parts[-3:]), mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
                 self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
@@ -333,7 +332,7 @@ class MemoryFeedTests(unittest.TestCase):
                 # A natedev step that waits in a slot names it too; the waiting table shows no slot number.
                 in_slot = expected != "—" if machine == "natedev" else label == "other machine root"
                 self.assertEqual([(row.get("slot_folder"), row.get("slot_machine")) for row in page["waiters"]],
-                                 [(folder.name, "natedev") if in_slot else (None, None)])
+                                 [("/".join(folder.parts[-3:]), "natedev") if in_slot else (None, None)])
 
     def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
         mac_home = str(self.root / "remote-home")
@@ -1921,182 +1920,27 @@ process.stdout.write(JSON.stringify({
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 self.assertEqual(page["decoder_revision"], "after")
 
-    def test_repository_slot_wait_reaches_the_queued_table_without_memory_charge(self) -> None:
+    def test_retired_copy_wait_does_not_reach_the_queued_table(self) -> None:
         base = captured_reading()
         slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
             wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
             base.explanation.now - 60, "natedev",
             wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
-        reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-            cloud_gate_stale_pushes=3, repository_slots=(slot,))
         with mock.patch.object(admission_client, "view", return_value=base):
             before = memory_feed.reading()
-        with mock.patch.object(admission_client, "view", return_value=reading):
-            after = memory_feed.reading()
-        row, = after["waiters"]
-        self.assertEqual(row.get("kind"), "repository-slot")
-        self.assertEqual(cast(memory_feed.WaitRow, row)["why"], "build slot")
-        self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
-        self.assertEqual(row["pid"], slot.owner.pid)
-        self.assertEqual(row["since"], slot.since)
-        self.assertEqual(cast(memory_feed.WaitRow, row)["need"], 0)
-        self.assertEqual(after["reserved"], before["reserved"])
-        self.assertEqual(after["used"], before["used"])
-        self.assertEqual(after["waiting"], 1)
-        self.assertEqual(row.get("about"), "Waits for a build slot")
-
-        saved = replace(slot, identity=replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")))
-        with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(saved,))):
-            waiting, = memory_feed.reading()["waiters"]
-        self.assertEqual(waiting.get("about"), "Runs every test module")
-        self.assertEqual(waiting.get("changes"), "no branch")
-
-    def copies_slot_page(self, command: str, *, source: str, unit: str = "",
-                         worktree_owner: str = "", recorded_step: str = "bash",
-                         recorded_unit: str = "", staff_id: str = "") -> memory_feed.MemoryPage:
-        session = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
-        base = captured_reading()
-        slot = wire.RepositorySlotRow(wire.Owner(2693113, "start"),
-            wire.Identity(staff_id or session, "hana", recorded_step, "bash", recorded_unit or session),
-            base.explanation.now - 60, "natedev",
-            wire.RepositorySlotWaiting("hana", (1, 2), 2, "slots.natedev.hana.max"))
-        proc = self.root / "proc"
-        write_process(proc, slot.owner.pid, start=slot.owner.start_time)
-        arguments = ["python3", "/fixture/scripts/copies/copies.py", "run", "--repo", source,
-                     "--commit", "HEAD" if unit == "startup" else "64baa5ef66"]
-        if unit == "startup":
-            arguments.extend(("--apply-uncommitted", source))
-        arguments.extend(("--", "bash", "-c", command))
-        _ = (proc / str(slot.owner.pid) / "cmdline").write_bytes(b"\0".join(map(os.fsencode, arguments)) + b"\0")
-        reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-            cloud_gate_stale_pushes=3, repository_slots=(slot,))
-        runner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "hana", staff.StaffRoot(),
-                               current_session=staff.StaffId("showrunner-session"))
-        director = staff.StaffRow(staff.StaffId(staff_id or "director"), "unit", unit or worktree_owner,
-                                  staff.ReportsTo(runner.id), staff.PresentWorktree(slot.machine,
-                                      self.root / "other-worktree" if staff_id else Path(source)),
-                                  current_session=staff.StaffId(session if unit and not staff_id else "other-session"))
-        record = staff.StaffSnapshot((runner, director) if unit or worktree_owner else (runner,))
-
-        def labels(ids: Iterable[str], _environment: Mapping[str, str]) -> dict[str, unit_labels.UnitLabels]:
-            return unit_labels.recorded_owner_labels(set(ids), record)
-
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(staff, "snapshot", return_value=record),
-              mock.patch.object(unit_labels, "unit_labels_for", side_effect=labels)):
-            return memory_feed.reading()
-
-    def test_wrapped_copies_waiters_name_the_first_verify_step_and_unit(self) -> None:
-        verify = "bash ~/.claude/scripts/direct/verify.sh --session-dir"
-        cases = (
-            ("startup", "/home/natepiano/rust/hana_catalyst-startup",
-             f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'", "test hana"),
-            ("widget", "/home/natepiano/rust/widget-enhancements",
-             f"direnv allow . >/dev/null; direnv exec . {verify} /fixture/sessions/widget test hana_diegetic; " +
-             f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test", "test hana_diegetic"),
-        )
-        for unit, source, command, name in cases:
-            with self.subTest(unit=unit):
-                row, = self.copies_slot_page(command, source=source, unit=unit)["waiters"]
-                self.assertEqual(row["name"], name)
-                self.assertEqual(row["unit"], unit)
-                self.assertEqual(row["showrunner"], "hana")
-
-    def test_wrapped_copies_waiter_without_verify_names_the_script(self) -> None:
-        for unit, staff_id in (("row-check", "staff-row-check"), ("", "")):
-            with self.subTest(unit=unit):
-                row, = self.copies_slot_page("env MODE=check direnv exec . zsh -c 'python3 -u /fixture/check_rows.py'",
-                    source="/fixture/row-check", unit=unit, staff_id=staff_id)["waiters"]
-                self.assertEqual(row["name"], "check_rows.py")
-                self.assertEqual(row["unit"], unit)
-
-    def test_wrapped_copies_waiters_resolve_a_named_session_or_worktree(self) -> None:
-        session, = self.copies_slot_page(
-            "bash /fixture/verify.sh --session-dir /fixture/sessions/startup test --filter 'a b' hana",
-            source="/fixture/hana_catalyst-startup", unit="startup", staff_id="staff-startup")["waiters"]
-        self.assertEqual(session["name"], "test hana")
-        self.assertEqual(session["unit"], "startup")
-        worktree, = self.copies_slot_page("sh /fixture/check-rows.sh", source="/fixture/widget-enhancements",
-                                        worktree_owner="widget")["waiters"]
-        self.assertEqual(worktree["unit"], "widget")
-
-    def test_legacy_slot_commands_skip_shell_setup(self) -> None:
-        for setup in ("cd /fixture && ", "exec -a label ", "command -- ", "umask 077 && "):
-            with self.subTest(setup=setup):
-                row, = self.copies_slot_page(setup + "python3 /fixture/check.service.sh",
-                                             source="/fixture/row-check")["waiters"]
-                self.assertEqual(row["name"], "check.service.sh")
-
-    def test_legacy_slot_unit_uses_staff_when_session_dir_has_a_variable(self) -> None:
-        row, = self.copies_slot_page(
-            'bash /fixture/verify.sh --session-dir "$UNIT_SESSION_DIR" test --filter "a b" hana',
-            source="/fixture/widget-enhancements", worktree_owner="widget")["waiters"]
-        self.assertEqual(row["name"], "test hana")
-        self.assertEqual(row["unit"], "widget")
-
-    def test_slot_page_prefers_the_recorded_step_and_current_staff_name(self) -> None:
-        row, = self.copies_slot_page("python3 /fixture/unrelated.py",
-            source="/fixture/organon", unit="organon", recorded_step="test hana", staff_id="staff-organon",
-            recorded_unit="organon-unit")["waiters"]
-        self.assertEqual(row["name"], "test hana")
-        self.assertEqual(row["unit"], "organon")
-
-    def test_copies_sends_the_wrapped_step_and_staff_unit_in_the_slot_request(self) -> None:
-        from scripts.copies import copies
-
-        owner = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
-        source = self.root / "repository"
-        pool = private_slot_config(self.root / "slot-request", repository="hana")
-        runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "hana", staff.StaffRoot(),
-                               current_session=staff.StaffId("runner-session"))
-        member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
-                                current_session=staff.StaffId("startup-session"))
-        cases = (
-            ('env MODE=test bash /fixture/verify.sh test --filter "a b" hana', "test hana", GATE_JOB_NOT_RECORDED,
-             admission_records.VerifyCall("test", "verify test --filter 'a b' hana", 1, 1), "Runs the selected tests"),
-            ('env MODE=test bash /fixture/verify.sh --session-dir /fixture/session final hana --local "check local code"',
-             "final hana", GATE_JOB_NOT_RECORDED,
-             admission_records.VerifyCall("final", "verify final hana --local 'check local code'", 1, 1),
-             "Checks the workspace targets and runs the selected tests"),
-            ('python3 /fixture/merge_gate.py --tests-only --full', "test-all", StepJob("test-all"),
-             admission_records.NotVerifyCall(), "Runs every test module"),
-        )
-        for command, step, job, verify, about in cases:
-            with (self.subTest(step=step),
-                  mock.patch.dict(os.environ, {
-                      "CONF_DIR": str(pool.settings.parent), "CLAUDE_CODE_SESSION_ID": runner.current_session}),
-                  mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
-                  mock.patch.object(copies, "source_commit", return_value="abc"),
-                  mock.patch.object(copies, "slot_source", return_value=source),
-                  mock.patch.object(copies, "main_checkout", return_value=source),
-                  mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
-                  mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
-                with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
-                    with copies.command_tree(owner, source, copies.CommittedSource("HEAD"),
-                                             ["bash", "-c", f"cd . && {command}"]):
-                        self.fail("The slot is full")
-                send.assert_called_once()
-                request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
-                self.assertEqual(request.root, str(pool.slots.resolve()))
-                saved = wire.parse_request(wire.encode_request(request))
-                assert isinstance(saved, wire.RepositorySlotRequest)
-                self.assertEqual(saved.identity.step, step)
-                self.assertEqual(saved.identity.session_id, owner)
-                self.assertEqual(saved.identity.unit, "")
-                self.assertEqual(saved.identity.folder, str(source))
-                self.assertEqual(saved.identity.job, job)
-                self.assertEqual(saved.identity.verify, verify)
-                slot = wire.RepositorySlotRow(saved.owner, saved.identity, saved.since, saved.machine,
-                    wire.RepositorySlotWaiting("hana", (1,), 1, "slots.fixture.hana.max"))
-                reading = replace(cloud_reading(captured_reading()), repository_slots=(slot,), cloud=())
-                with (mock.patch.object(admission_client, "view", return_value=reading),
-                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner, member)))):
-                    row, = memory_feed.reading()["waiters"]
-                self.assertEqual(row.get("about"), about)
-                if isinstance(verify, admission_records.VerifyCall):
-                    self.assertEqual(row.get("verify"),
-                        {"verb": verify.verb, "call": verify.call, "position": 1, "total": 1, "step": step})
-
+        for identity in (
+            slot.identity,
+            replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")),
+        ):
+            with self.subTest(step=identity.step):
+                reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
+                    cloud_gate_stale_pushes=3, repository_slots=(replace(slot, identity=identity),))
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    after = memory_feed.reading()
+                self.assertEqual(after["waiters"], before["waiters"])
+                self.assertEqual(after["reserved"], before["reserved"])
+                self.assertEqual(after["used"], before["used"])
+                self.assertEqual(after["waiting"], before["waiting"])
 
     def test_queue_row_name_rejects_shell_words_and_ids_inside_names(self) -> None:
         for name in ("startup bash", "startup /bin/env", "exec -a", "startup $UNIT",
@@ -2123,8 +1967,6 @@ process.stdout.write(JSON.stringify({
             with self.subTest(program=program):
                 self.assertEqual(memory_feed.QueueRowName.recorded_program(program), program)
         self.assertIsInstance(recorded_step("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", read_step_names()), NoNamedStep)
-        row, = self.copies_slot_page("python3 -c pass", source="/fixture/hana")["waiters"]
-        self.assertEqual(row["name"], "hana build")
 
     def test_every_recorded_build_step_has_its_own_name(self) -> None:
         script = Path(__file__).resolve().parents[1] / "direct/verify.sh"
@@ -2188,28 +2030,6 @@ process.stdout.write(JSON.stringify({
                 _ = write_config_fixture(self.root / "build_steps.conf", f"names.test={text}\n")
                 self.assertEqual(recorded_step("test", read_step_names()), "test")
 
-    def test_unresolved_slot_owner_does_not_take_the_worktree_unit(self) -> None:
-        base = captured_reading()
-        source = str(self.root / "other")
-        member = staff.StaffRow(staff.StaffId("other"), "unit", "other", staff.StaffRoot(),
-            staff.PresentWorktree("fixture", Path(source)), current_session=staff.StaffId("other-session"))
-        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-            wire.Identity("missing-id", "", "check", source), base.explanation.now, "fixture",
-            wire.RepositorySlotWaiting("hana", (1,), 1, "fixture"))
-        proc = self.root / "proc"
-        write_process(proc, slot.owner.pid, start=slot.owner.start_time)
-        argv = ("python3", "/fixture/scripts/copies/copies.py", "run", "--repo", source, "--", "bash", "check.sh")
-        _ = (proc / str(slot.owner.pid) / "cmdline").write_bytes(b"\0".join(map(os.fsencode, argv)) + b"\0")
-        reading = replace(cloud_reading(base), cloud=())
-        for reference, folder, expected in (("missing-id", source, ""), ("other-session", source, ""),
-                                            ("", source, ""), ("", "bash", "other")):
-            with (self.subTest(reference=reference, folder=folder),
-                  mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,)))):
-                request = replace(slot, identity=replace(slot.identity, session_id=reference, folder=folder))
-                with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(request,))):
-                    row, = memory_feed.reading()["waiters"]
-                self.assertEqual(row["unit"], expected)
-
     def test_recorded_queue_rows_always_have_a_name(self) -> None:
         _ = write_config_fixture(self.root / "build_steps.conf", "names.test=\n")
         make = parse.step_name(["make", "-f", "/fixture/Makefile"])
@@ -2242,30 +2062,24 @@ process.stdout.write(JSON.stringify({
                 cloud = cloud_reading(replace(read, view=replace(read.view, waiting=(wait, token))))
                 cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(row.identity, step=step))
                     for row in cloud.cloud))
-                slot_step = "check" if step in (make, bash, cxx) else step
-                slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-                    wire.Identity("", "", slot_step, folder), inputs.now, "fixture",
-                    wire.RepositorySlotWaiting(repository, (1,), 1, "fixture"))
                 build = queue_view.MacBuild(90082, folder, inputs.now - 30, f"cargo {step}", repository)
-                with (mock.patch.object(admission_client, "view", return_value=replace(cloud, repository_slots=(slot,))),
+                with (mock.patch.object(admission_client, "view", return_value=cloud),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(inputs.now, (build,)))):
                     page = memory_feed.reading()
                 by_pid = {row["pid"]: row["name"] for row in (*page["walk"], *page["waiters"])
                           if isinstance(row["pid"], int)}
                 if not repository:
                     expected_names = {pid: step for pid in (50, 101, 200, 201, 900)}
-                    expected_names[slot.owner.pid] = slot_step
                     for pid, name in expected_names.items():
                         with self.subTest(pid=pid):
                             self.assertIn(pid, by_pid)
                             self.assertEqual(by_pid[pid], name)
-                self.assertTrue({50, 101, 200, 201, 900, 700001, 700002, 701001, 90082} <= by_pid.keys())
+                self.assertTrue({50, 101, 200, 201, 900, 700001, 700002, 90082} <= by_pid.keys())
                 self.assertNotIn(legacy.run.pid, by_pid)
                 shown_reserved = sum(row["reserved"] for row in page["walk"] if "reserved" in row)
                 self.assertEqual(page["reserved"], shown_reserved + legacy.bytes / gib)
                 if step == "unrecognized":
                     self.assertEqual(by_pid[101], f"{repository} build")
-                    self.assertEqual(by_pid[701001], f"{repository} build")
                 if step in ("test", "mend"):
                     self.assertEqual(by_pid[101], step)
                 for row in (*page["walk"], *page["waiters"]):
@@ -2919,15 +2733,6 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(row["name"], "devtools test all")
             self.assertEqual(row.get("about"), "Runs every test module")
 
-        source = Path("/repo/devtools")
-        caller = SlotCaller("director", "sdlc", source, copied[6:], "test-all")
-        self.assertEqual(caller.step, "test-all")
-        for step in ("merge_gate.py", "test-all"):
-            slot, = self.copies_slot_page(" ".join(caller.command), source=str(source),
-                worktree_owner="devtools", recorded_step=step)["waiters"]
-            self.assertIn(slot["title"]["step"], approved)
-            self.assertEqual(slot["name"], "test all")
-
         base = captured_reading()
         inputs = base.explanation.decided_from
         policy = admission_policy_fixture()
@@ -3037,8 +2842,7 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual((row["unit"], row.get("showrunner")), ("fixture unit", "fixture showrunner"))
                 self.assertEqual(waiting[0]["name"], "fixture unit")
                 self.assertEqual(waiting[0]["title"]["step"], "fixture unit")
-                self.assertEqual(waiting[2]["name"], "fixture unit")
-                for cloud_row in (running[0], waiting[1]):
+                for cloud_row in (running[0], *waiting[1:]):
                     self.assertEqual(cloud_row["name"], "fixture unit nextest")
                     self.assertEqual(cloud_row["title"], {"unit": "fixture unit", "step": "nextest"})
 
@@ -3076,14 +2880,16 @@ process.stdout.write(JSON.stringify({
         cloud = cloud_reading(replace(reading, view=replace(reading.view, waiting=(local,))))
         cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
             row.identity, name="recorded cloud", step="merge-gate")) for row in cloud.cloud))
-        slot = wire.RepositorySlotRow(wire.Owner(303, "303"),
-            wire.Identity("slot-session", "recorded slot", "merge-gate", "/private/widget"),
-            now - 30, "natedev", wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+        running_cloud, waiting_cloud = cloud.cloud
+        extra_wait = replace(waiting_cloud, owner=wire.Owner(303, "303"), since=now - 30,
+                             identity=wire.Identity("slot-session", "recorded slot", "merge-gate", "/private/widget"))
         if stored_caller is not None:
             cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
                 row.identity, session_id=worker.current_session, name=stored_caller, step="nextest")) for row in cloud.cloud))
-            slot = replace(slot, identity=replace(slot.identity, session_id=worker.id, name=stored_caller))
-        message = wire.encode_reply(wire.ViewReply(replace(cloud, repository_slots=(slot,))))
+            extra_wait = replace(extra_wait, identity=replace(
+                extra_wait.identity, session_id=worker.current_session, name=stored_caller, step="nextest"))
+            running_cloud, waiting_cloud = cloud.cloud
+        message = wire.encode_reply(wire.ViewReply(replace(cloud, cloud=(running_cloud, waiting_cloud, extra_wait))))
         mac = queue_view.MacBuild(304, "/private/hana", now - 45, "cargo nextest run --jobs=8", "hana",
                                    queue_view.MacTesting(305), admission_records.GIB)
 
@@ -3312,19 +3118,15 @@ process.stdout.write(JSON.stringify({
     def test_queue_views_keep_recorded_names_when_registry_labels_are_empty(self) -> None:
         base = cloud_reading(with_wait_reason(captured_reading(), admission_records.NeedsMemory()))
         waiter = replace(base.view.waiting[0], step="merge-gate", session_name="local caller name")
-        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-            wire.Identity("slot-session", "slot caller name", "merge-gate", str(self.root)),
-            base.explanation.now - 60, "natedev",
-            wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
-        reading = replace(base, view=replace(base.view, waiting=(waiter,)), repository_slots=(slot,))
+        reading = replace(base, view=replace(base.view, waiting=(waiter,)))
         labels = {session: unit_labels.UnitLabels("") for session in (
-            waiter.session_id, slot.identity.session_id, *(row.identity.session_id for row in base.cloud))}
+            waiter.session_id, *(row.identity.session_id for row in base.cloud))}
         with (mock.patch.object(admission_client, "view", return_value=reading),
               mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             page = memory_feed.reading()
         rows = {row["pid"]: row for row in (*page["walk"], *page["waiters"])}
-        for pid, name in ((waiter.pid, waiter.session_name), (slot.owner.pid, slot.identity.name),
+        for pid, name in ((waiter.pid, waiter.session_name),
                           *((row.owner.pid, row.identity.name) for row in base.cloud)):
             with self.subTest(pid=pid):
                 self.assertEqual(rows[pid]["name"], name)
@@ -4060,7 +3862,7 @@ class BuildsPageProofTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory) / "checkout"
             checkout.mkdir()
-            lease = build_slots.lease_path(checkout)
+            lease = build_folders.lease_path(checkout)
             self.assertFalse(needs_all_page_proof_views(checkout))
             _ = lease.write_text(json.dumps({"work": "test-all"}), encoding="utf-8")
             self.assertFalse(needs_all_page_proof_views(checkout))

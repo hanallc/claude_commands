@@ -211,6 +211,7 @@ class VerifyDocFixture(unittest.TestCase):
         # the real shim's cache hit instead of revalidating Python every call.
         seed_interpreter_cache(self.root / "cache")
         _ = self.git("init", "-q", "-b", "test")
+        _ = self.git("remote", "add", "origin", "https://example.invalid/workspace.git")
         _ = self.git("add", "-A")
         _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
                      "commit", "-q", "-m", "base")

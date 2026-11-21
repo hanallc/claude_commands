@@ -221,7 +221,7 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     folder_defaults = _runtime_defaults(folders, alias)
     folder_config = config_text({key: setting for key, setting in folder_defaults.items()
         if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *SLOT_PROBE_KEYS))
-        and (not key.startswith('slots.') or key in ('slots.unused_days', 'slots.wait_seconds'))})
+        and not key.startswith('slots.')})
     files = {file.path: file for file in _listed_files(checkout, RUNTIME_FILE_LIST)}
     entry = files.pop(RUNNER_ENTRY)
     return (

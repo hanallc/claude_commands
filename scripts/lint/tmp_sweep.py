@@ -100,7 +100,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -254,6 +254,10 @@ class Limit:
     folder_ctime: bool = True
 
 
+def report_unreadable_copy_folder(path: Path, error: OSError) -> None:
+    print(f"tmp sweep: cannot read {path}: {error}", file=sys.stderr)
+
+
 @dataclass(frozen=True)
 class Roots:
     """The folders whose top-level entries the sweep judges, by kind. In a temp folder only a
@@ -274,20 +278,27 @@ class Roots:
     def all(self) -> tuple[str, ...]:
         return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions + self.copies
 
-    def entries(self, root: str) -> Iterator[os.DirEntry[str]]:
+    def entries(self, root: str, *,
+        unreadable_copies: Callable[[Path, OSError], None] = report_unreadable_copy_folder,
+    ) -> Iterator[os.DirEntry[str]]:
         """The entries of root the sweep judges, without retaining the directory."""
         if root in self.copies:
-            for pair in listing(root):
-                if pair.is_dir(follow_symlinks=False):
-                    for entry in listing(pair.path):
-                        copy = scratch.removal_target(Path(entry.path))
-                        if copy is not None:
-                            removal = scratch.checked_removal(copy)
-                            if isinstance(removal, (copy_record.Registered, scratch.StaleRemoval)):
-                                continue
+            for pair in scratch.legacy_copy_pairs(Path(root), unreadable=unreadable_copies):
+                for entry in listing(str(pair), unreadable=unreadable_copies):
+                    path = Path(entry.path)
+                    copy = scratch.removal_target(path)
+                    if copy is not None:
+                        removal = scratch.checked_removal(copy)
+                        if isinstance(removal, (copy_record.Registered, scratch.StaleRemoval)) or (
+                                isinstance(removal, copy_record.NotRegistered) and not os.path.lexists(entry.path)):
+                            continue
+                    if not scratch.protected_build_path(path):
                         yield entry
             return
+        in_build_root = Path(root).resolve().is_relative_to(copy_record.build_root())
         for entry in listing(root):
+            if in_build_root and scratch.protected_build_path(Path(entry.path)):
+                continue
             if root not in self.temp or self.judged_temp(root, entry):
                 yield entry
 
@@ -496,12 +507,15 @@ def verify_running(pid: int, made: float, now: float, proc: str = PROC_DIR) -> b
     return any(os.path.basename(argument) == VERIFY_SCRIPT for argument in arguments) and start <= made + START_SLACK_SECONDS
 
 
-def listing(directory: str) -> Iterator[os.DirEntry[str]]:
+def listing(directory: str, *, unreadable: Callable[[Path, OSError], None] | None = None) -> Iterator[os.DirEntry[str]]:
     try:
         with os.scandir(directory) as entries:
             yield from entries
-    except OSError:
+    except FileNotFoundError:
         return
+    except OSError as error:
+        if unreadable is not None:
+            unreadable(Path(directory), error)
 
 
 def running_session_ids() -> frozenset[str] | None:
@@ -1041,6 +1055,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
     inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
+    unreadable_copies: Callable[[Path, OSError], None] = report_unreadable_copy_folder,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
     from scripts.production import staff
@@ -1058,7 +1073,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         paths = lsof_paths(prefix)
     if isinstance(paths, ProcessUsesUnavailable):
         for root in roots.all():
-            for entry in roots.entries(root):
+            for entry in roots.entries(root, unreadable_copies=unreadable_copies):
                 yield KeptEntry(entry.path, NO_PROC)
         return
     live = running_session_ids()
@@ -1094,10 +1109,11 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 phase_parents[str(phases)] = []
                 unreadable_phases.add(str(phases))
     judged = roots.all() + inner + temp_parents(roots, temp_live) + tuple(phase_parents)
-    pairs = tuple(pair.path for root in roots.copies for pair in listing(root) if pair.is_dir(follow_symlinks=False))
+    pairs = tuple(str(pair) for root in roots.copies
+                  for pair in scratch.legacy_copy_pairs(Path(root), unreadable=unreadable_copies))
     uses = entry_uses(paths.paths, judged + pairs)
     for root in judged:
-        for entry in roots.entries(root):
+        for entry in roots.entries(root, unreadable_copies=unreadable_copies):
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
@@ -1216,9 +1232,17 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
 ) -> Sweep:
     """Assess idle entries without removing them."""
     result = Sweep()
+    unreadable_paths: set[Path] = set()
+
+    def unreadable_copies(path: Path, error: OSError) -> None:
+        if path not in unreadable_paths:
+            unreadable_paths.add(path)
+            result.failed.append(FailedEntry(path=str(path), error=str(error)))
+
+    pane_use = read_pane_runs()
     inspection = scratch.RemoteInspection.LOCAL_ONLY if dry_run else scratch.RemoteInspection.ADVERTISE
     for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
-                               inspection=inspection):
+                               pane_use=pane_use, inspection=inspection, unreadable_copies=unreadable_copies):
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
             result.keep(path, entry.reason)
@@ -1326,6 +1350,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
     inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
+    unreadable_copies: Callable[[Path, OSError], None] = report_unreadable_copy_folder,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Keep unrecorded work until the configured folder removal age after the other checks pass."""
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -1334,7 +1359,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
     for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
-                               pane_use=pane_use, inspection=inspection):
+                               pane_use=pane_use, inspection=inspection, unreadable_copies=unreadable_copies):
         if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
             yield entry
             continue

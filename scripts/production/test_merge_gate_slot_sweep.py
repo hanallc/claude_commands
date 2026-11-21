@@ -1,10 +1,10 @@
-"""Keep nightly results when slot cleanup fails."""
+"""Keep nightly results when the build folder sweep fails."""
 from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
-import os
+from itertools import product
 from pathlib import Path
 import subprocess
 import sys
@@ -12,21 +12,74 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.lib import build_slots, scratch
-from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.production import merge_gate
+from scripts.copies import copies
+from scripts.lib import scratch
+from scripts.lint import sweep as folder_sweep
+from scripts.message import send_budget
+from scripts.production import merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 
 
 class NightlySlotSweepTests(unittest.TestCase):
+    def test_nightly_requires_a_unit_or_production_before_work_starts(self) -> None:
+        with (mock.patch.object(merge_gate, "nightly_git") as git,
+              mock.patch.object(merge_gate, "_sweep_nightly_build_folders") as sweep,
+              redirect_stderr(io.StringIO()) as output, self.assertRaises(SystemExit) as status):
+            _ = merge_gate.main(["--nightly", "--merge-branch", "fixture"])
+        self.assertEqual(status.exception.code, 2)
+        self.assertIn("--nightly needs --unit or --production", output.getvalue())
+        git.assert_not_called()
+        sweep.assert_not_called()
+
+    def test_timer_selects_a_unit_from_its_production(self) -> None:
+        with tempfile.TemporaryDirectory() as checkout:
+            production = staff.StaffId("20b0427d-945b-4c40-bb24-a6bec83dd648")
+            merge = staff.StaffId("11111111-0000-4000-8000-111111111111")
+            other_merge = staff.StaffId("22222222-0000-4000-8000-222222222222")
+            owner = staff.StaffRow(production, "showrunner", "sdlc", staff.StaffRoot(),
+                                   current_session=production)
+            direct = staff.StaffRow(staff.StaffId("direct"), "unit", "fixture-direct", staff.ReportsTo(production),
+                                    current_session=staff.StaffId("direct"), unit_type=staff.UnitDetails("direct"))
+            unit = staff.StaffRow(merge, "unit", "fixture-merge", staff.ReportsTo(production),
+                                  current_session=merge, unit_type=staff.UnitDetails("merge"))
+            other = staff.StaffRow(other_merge, "unit", "other-merge", staff.ReportsTo(production),
+                                   current_session=other_merge, unit_type=staff.UnitDetails("merge"))
+            arguments = ["--nightly", "--merge-branch", "main", "--checkout", checkout,
+                         "--production", str(production)]
+            cases = (
+                ((owner, direct, unit), 0, str(merge)),
+                ((owner, direct), 0, "nightly"),
+                ((owner, direct, unit, other), 1, ""),
+            )
+            for rows, expected_status, expected_unit in cases:
+                with (self.subTest(unit=expected_unit), staff.supplied_snapshot(staff.StaffSnapshot(rows)),
+                      mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                      mock.patch.object(merge_gate, "nightly_git") as git,
+                      mock.patch.object(merge_gate, "checked_git", return_value="fixture-commit"),
+                      mock.patch.object(copies, "standing", return_value=nullcontext(Path(checkout))) as take,
+                      mock.patch.object(merge_gate, "run_suites", return_value=merge_gate.GateRun((merge_gate.GateJobResult("test", "fixture", 0, 0, ""),), 0, 0)),
+                      mock.patch.object(merge_gate, "gate_state_dir", return_value=Path(checkout)),
+                      mock.patch.object(merge_gate, "push_nightly_result"),
+                      mock.patch.object(merge_gate, "_sweep_nightly_build_folders") as sweep,
+                      redirect_stderr(io.StringIO()) as output):
+                    self.assertEqual(merge_gate.main(arguments), expected_status)
+                    if expected_status == 0:
+                        take.assert_called_once_with(expected_unit, Path(checkout).resolve(),
+                            copies.CommittedSource("fixture-commit"), step="test-nightly")
+                    else:
+                        git.assert_not_called()
+                        take.assert_not_called()
+                        sweep.assert_not_called()
+                        self.assertIn("sdlc: the production record has multiple merge units", output.getvalue())
+
     def test_local_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_slot_config(Path(temporary), repository="fixture")
+            with self.subTest(status=status):
                 events: list[str] = []
                 notices: list[str] = []
 
-                def sweep() -> None:
+                def sweep(arguments: list[str]) -> int:
+                    self.assertEqual(arguments, ["--unused-folders"])
                     events.append("local")
                     raise ValueError("local cleanup failed")
 
@@ -38,7 +91,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                         self.assertNotIn("--manual", argv)
                         events.append("Mac")
                         self.assertEqual(list(argv[5:15]),
-                                         ["--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                         ["--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
                                           "--worktree", str(Path(merge_gate.__file__).resolve().parents[2]), "--", "/bin/zsh"])
                         # The nightly runs from $HOME; the Mac queue refuses a worktree that is not a repository.
                         self.assertTrue((Path(argv[12]) / ".git").exists())
@@ -48,22 +101,22 @@ class NightlySlotSweepTests(unittest.TestCase):
                         notices.append(argv[-1])
                     return subprocess.CompletedProcess(argv, 0, "", "")
 
-                with (mock.patch.dict(os.environ, config.environment),
+                with (mock.patch.object(send_budget, "seconds", return_value=1),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
                       mock.patch.object(merge_gate, "nightly", return_value=status),
-                      mock.patch.object(build_slots, "sweep_slots", side_effect=sweep),
+                      mock.patch.object(folder_sweep, "main", side_effect=sweep),
                       mock.patch.object(subprocess, "run", side_effect=run),
                       redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture"]), status)
+                    self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), status)
                 self.assertEqual(events, ["local", "Mac"])
                 self.assertEqual(len(notices), 1)
                 self.assertIn("natedev failed: local cleanup failed", notices[0])
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_mac_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
-        for status in (0, 1, 75):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_slot_config(Path(temporary), repository="fixture")
+        refusals = ("refused\trepo", "enabled.mac is off")
+        for status, refusal in product((0, 1, 75), refusals):
+            with self.subTest(status=status, refusal=refusal):
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -72,59 +125,47 @@ class NightlySlotSweepTests(unittest.TestCase):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
                         self.assertNotIn("--manual", argv)
-                        raise subprocess.CalledProcessError(2, argv, output="enabled.mac is off\n",
-                                                            stderr="Mac queue: Sweep Mac build slots\n")
+                        raise subprocess.CalledProcessError(2, argv, output=refusal + "\n",
+                                                            stderr="Mac queue: Sweep unused Mac build folders\n")
                     self.assertTrue(argv[1].endswith("send.py"))
                     notices.append(argv[-1])
                     return subprocess.CompletedProcess(argv, 0, "", "")
 
-                with (mock.patch.dict(os.environ, config.environment),
+                with (mock.patch.object(send_budget, "seconds", return_value=1),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
                       mock.patch.object(merge_gate, "nightly", return_value=status),
-                      mock.patch.object(build_slots, "sweep_slots") as local,
+                      mock.patch.object(folder_sweep, "main", return_value=0) as local,
                       mock.patch.object(subprocess, "run", side_effect=run),
                       redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture"]), status)
-                local.assert_called_once_with()
+                    self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), status)
+                local.assert_called_once_with(["--unused-folders"])
                 self.assertEqual(len(notices), 1)
                 self.assertIn("on Mac failed:", notices[0])
-                self.assertIn("Mac queue: Sweep Mac build slots enabled.mac is off", notices[0])
+                self.assertIn(f"Mac queue: Sweep unused Mac build folders {refusal}", notices[0])
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = private_slot_config(Path(temporary), repository="fixture")
-            events: list[str] = []
+        events: list[str] = []
 
-            def nightly(args: merge_gate.GateArguments) -> int:
-                events.append("nightly:" + args.merge_branch)
-                raise GateRefused("gate failed")
+        def nightly(args: merge_gate.GateArguments) -> int:
+            events.append("nightly:" + args.merge_branch)
+            raise GateRefused("gate failed")
 
-            def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-                self.assertTrue(options["check"])
-                events.append("Mac")
-                return subprocess.CompletedProcess(argv, 0, "", "")
+        def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(options["check"])
+            events.append("Mac")
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
-            with (mock.patch.dict(os.environ, config.environment),
-                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                  mock.patch.object(merge_gate, "nightly", side_effect=nightly),
-                  mock.patch.object(build_slots, "sweep_slots", side_effect=lambda: events.append("local")),
-                  mock.patch.object(subprocess, "run", side_effect=run),
-                  redirect_stderr(io.StringIO()) as output):
-                self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture"]), 1)
-            self.assertEqual(events, ["nightly:fixture", "local", "Mac"])
-            self.assertIn("gate failed", output.getvalue())
+        def local(arguments: list[str]) -> int:
+            self.assertEqual(arguments, ["--unused-folders"])
+            events.append("local")
+            return 0
 
-    def test_inactive_pools_start_no_mac_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = private_slot_config(Path(temporary), repository="fixture")
-            _ = config.settings.write_text("\n".join(line for line in config.settings.read_text().splitlines()
-                                                   if not line.startswith("roots.slots")) + "\n")
-            with (mock.patch.dict(os.environ, config.environment),
-                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                  mock.patch.object(merge_gate, "nightly", return_value=0),
-                  mock.patch.object(subprocess, "run") as run,
-                  redirect_stdout(io.StringIO()) as output):
-                self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture"]), 0)
-            run.assert_not_called()
-            self.assertEqual(output.getvalue(), "")
+        with (mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+              mock.patch.object(merge_gate, "nightly", side_effect=nightly),
+              mock.patch.object(folder_sweep, "main", side_effect=local),
+              mock.patch.object(subprocess, "run", side_effect=run),
+              redirect_stderr(io.StringIO()) as output):
+            self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), 1)
+        self.assertEqual(events, ["nightly:fixture", "local", "Mac"])
+        self.assertIn("gate failed", output.getvalue())
