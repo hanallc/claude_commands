@@ -984,3 +984,22 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Acceptance gate:**
   1. Each number names its command and tree.
   2. The parts add up to the measured hook cost within 0.5 ms.
+
+### Phase 414 — the programs that the tests of one gate start are ranked by CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** one list of each program that the tests of a full gate start, with its starts and its CPU, from one normal gate run. Baseline: about 33,800 Python starts and 660 CPU s of bare starts for each gate (estimate, Phase 412). Predicted saving: 0 CPU in this phase (measure); the list selects the repairs.
+- **Spec:**
+  1. Step 1, design only, no gate: find a method that reads process exit records from outside the gate processes and does not attach to them (for example kernel process accounting, taskstats exit records, an eBPF exit probe, or the cgroup of each job plus /proc reads). `task_cpu.py` uses ptrace and is not allowed on a merge gate. Say what each method needs (root, a kernel option, a package) and whether natedev has it.
+  2. Measure the method's cost on `python3 -c pass` loops and on the Phase 412 empty runner: CPU of the reader, and the change in CPU and wall time of the measured commands. Run no test module.
+  3. Give the exact command for a full gate, what it can cost the run, and how it fails safe (the reader stops; the gate continues).
+  4. natemerge picks the gate run. bob's condition: no extra run; natemerge decides after it reads the cost.
+  5. From the records: a table of program (script or module name), starts, CPU s, and the test modules that start it most. Proposal for the top programs: the test calls the function in the test process, or the program imports only what its command needs. No lazy imports.
+- **Files:** none in steps 1 to 4 (a report in the session folder).
+- **Workers:** 1 writer.
+  - impl: all steps; nothing splits.
+- **Constraints from prior phases:** Phase 412: the Python start cost is equal on old and new trees; the rise is in what started programs import. B (update_registration.py imports, owner sdlc) waits for this list.
+- **Acceptance gate:**
+  1. The reader's measured cost is stated before any gate carries it.
+  2. The table's CPU total is compared with the gate record's module CPU.
