@@ -3,9 +3,9 @@
 
 Build and list the tests before taking tokens. Limit total tokens to the
 requested width and the selected test count plus `nested_tokens`. Wait for
-up to `test_token_floor` test tokens. Also wait for nested Cargo tokens
-within that limit. Take more free tokens up to the limit. Give the nested Cargo
-tokens to a private FIFO. Give one remaining token to each test thread.
+`test_token_floor` test tokens, up to the selected test count and requested width.
+Take more free tokens up to the limit. Give nested Cargo up to `nested_tokens`
+of the tokens above the test floor. Give one remaining token to each test thread.
 Return all shared tokens when nextest exits. If a signal ends the launcher,
 steve reclaims its tokens and the step group ends the test child.
 """
@@ -298,18 +298,15 @@ def run_with_tokens(run: SizedTestRun, pool_path: Path, floor: int, width_file: 
         print(f"nextest: {run.width} test threads with no jobserver tokens: {pool_path}: {error}", flush=True)
         return run_child(run.with_threads(run.width))
     try:
-        nested = min(nested_tokens, limit - test_floor)
-        wanted = test_floor + nested
-        pool.take_free(wanted)
-        if len(pool.held) < wanted:
+        pool.take_free(test_floor)
+        if len(pool.held) < test_floor:
             # The Builds page reads this line as the token wait stage.
-            line = progress_profile.token_wait_line(wanted - len(pool.held))
-            if nested:
-                line += " (tests and nested Cargo)"
-            print(line, flush=True)
-            pool.take_waiting(wanted)
+            print(progress_profile.token_wait_line(test_floor - len(pool.held)), flush=True)
+            pool.take_waiting(test_floor)
         pool.take_free(limit)
-        threads = len(pool.held) - nested
+        held = len(pool.held)
+        nested = min(nested_tokens, held - test_floor)
+        threads = held - nested
         if width_file is not None:
             _ = width_file.write_text(f"{threads}\n", encoding="utf-8")
         if threads != run.width:

@@ -5655,7 +5655,8 @@ class QueueLeaveTests(unittest.TestCase):
                 + 'run_nextest --workspace')
 
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
-        _ = write_config_fixture(self.root / "build_admission.conf", "test_token_floor=3\nnested_tokens=3\n")
+        with (self.root / "build_admission.conf").open("a", encoding="utf-8") as configuration:
+            _ = configuration.write("\n# whole: 0..\nnested_tokens=3\n")
         for inherited_width in ("", "1"):
             with self.subTest(inherited_width=inherited_width), patch.dict(self.environment):
                 case = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
@@ -5670,12 +5671,11 @@ class QueueLeaveTests(unittest.TestCase):
         ran_args, reservation, waited = case / "args", case / "reservation", case / "waited"
         listing = case / "test-list.json"
         _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
-            f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
+            f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(3)
         }}}}), encoding="utf-8")
         os.mkfifo(pool)
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
-        # The pool holds the sum of test_token_floor and nested_tokens.
         _ = os.write(keeper, bytes(6))
         bin_dir = case / "bin"
         bin_dir.mkdir()

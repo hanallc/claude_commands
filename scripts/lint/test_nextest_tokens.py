@@ -413,20 +413,32 @@ class HolderTests(PoolCase):
         self.assertEqual(self.free_tokens(), 7)
         _ = os.write(self.keeper, compile_tokens)
 
-    def test_run_waits_for_nested_cargo_tokens_above_the_test_floor(self) -> None:
-        self.fill(7)
+    def test_the_test_floor_can_use_the_entire_pool(self) -> None:
+        self.fill(4)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_TEST": "inspect"})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertNotIn("waiting for", output)
+        self.assertNotIn("tokens for nested Cargo", output)
+        self.assertIn("free during nextest: 0\n", output)
+        self.assertEqual(self.free_tokens(), 4)
+
+    def test_run_waits_for_the_test_floor_and_gives_cargo_the_surplus(self) -> None:
+        self.fill(6)
         compile_tokens = self.take(3)
         self.configure_nested_tokens(3, test_floor=4)
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
                             extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1"})
         self.assertEqual(read_line(child), "built\n")
-        self.assertEqual(read_line(child), "nextest: waiting for 3 more jobserver tokens (tests and nested Cargo)\n")
-        _ = os.write(self.keeper, compile_tokens)
+        self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
+        _ = os.write(self.keeper, compile_tokens[:2])
         output, _ = child.communicate(timeout=30)
         self.assertEqual(child.returncode, 0, output)
         self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
-        self.assertIn("nested borrowed: 3\n", output)
-        self.assertEqual(self.free_tokens(), 7)
+        self.assertIn("nested borrowed: 1\n", output)
+        self.assertEqual(self.free_tokens(), 5)
 
     def test_two_selected_tests_limit_the_test_floor_to_two(self) -> None:
         self.fill(5)
@@ -435,7 +447,7 @@ class HolderTests(PoolCase):
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
                             extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "FAKE_SELECTION": fake_selection(2)})
         self.assertEqual(read_line(child), "built\n")
-        self.assertEqual(read_line(child), "nextest: waiting for 4 more jobserver tokens (tests and nested Cargo)\n")
+        self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
         _ = os.write(self.keeper, compile_tokens)
         output, _ = child.communicate(timeout=30)
         self.assertEqual(child.returncode, 0, output)
@@ -474,7 +486,7 @@ class HolderTests(PoolCase):
 
     def test_killed_child_gives_every_token_back(self) -> None:
         self.fill(4)
-        self.configure_nested_tokens(3, test_floor=1)
+        self.configure_nested_tokens(3)
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_TEST": "killed"})
         self.assertEqual(child.wait(timeout=30), 128 + signal.SIGKILL)
         self.assertEqual(self.free_tokens(), 4)
@@ -539,7 +551,7 @@ class ReservationTests(PoolCase):
         with mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}), \
                 mock.patch("sys.stdout", new=open(os.devnull, "w")) as quiet:
             self.addCleanup(quiet.close)
-            status = tokens.run_with_tokens(run, self.pool, 1, self.root / "width", recorded.append, nested_tokens=1)
+            status = tokens.run_with_tokens(run, self.pool, 1, self.root / "width", recorded.append, nested_tokens=3)
         self.assertEqual(status, 0)
         self.assertEqual(recorded, [1])
         self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "1\n")
