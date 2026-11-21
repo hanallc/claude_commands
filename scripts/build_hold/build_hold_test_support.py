@@ -207,7 +207,8 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             threading.Thread(target=write, name="hold-event-recorder", daemon=True).start()
             # Resolve the row and its path before the caller can change its environment or cwd.
             # Keep the module bindings unchanged while the file write continues.
-            _ = ready.wait()
+            self.assertTrue(ready.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS),
+                            "The hold event recorder did not report its path")
 
         _ = self.enterContext(mock.patch.object(record, "detach"))
         _ = self.enterContext(mock.patch.object(store, "root", root))

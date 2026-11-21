@@ -17,11 +17,12 @@ import posixpath
 import re
 import subprocess
 from collections import defaultdict
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
+import os
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
@@ -977,7 +978,8 @@ class CrateRun:
     def advance(self, package: str, planner: Planner = plan, runner: run.Runner = run.run_command,
                 available: Callable[[Path, str], None] = bulk.check_available,
                 executor: PlanExecutor | ExecutionService = ExecutionService.BULK_RUN) -> Manifest:
-        with serial(self.folder) as run_lock, self.complete_run(run_lock):
+        created_workspaces: dict[Path, os.stat_result] = {}
+        with serial(self.folder) as run_lock, self.complete_run(run_lock, created_workspaces):
             manifest = self.read()
             if package not in manifest["crates"]:
                 raise bulk.BulkRenameError("crate is not in the frozen run")
@@ -997,7 +999,7 @@ class CrateRun:
                     worker = workers.enter_context(copies.workspace(
                         self.owner, self.repo, base,
                         name=checkout.name, branch=record["branch"], task=self.task, path=legacy,
-                        run_manifest=self.path))
+                        run_manifest=self.path, on_create=created_workspaces.__setitem__))
                     if worker != checkout and stage == CrateStage.SELECTED and not checkout.exists():
                         record["checkout"] = str(worker)
                         record["intent"] = str(worker / ".git/style-batch-intent.json")
@@ -1160,8 +1162,9 @@ class CrateRun:
                 return manifest
 
     @contextmanager
-    def complete_run(self, run_lock: copies.HeldCrateRunLock) -> Generator[None]:
-        """Remove terminal copies after worker locks close and before the run lock closes."""
+    def complete_run(self, run_lock: copies.HeldCrateRunLock,
+                     created: Mapping[Path, os.stat_result]) -> Generator[None]:
+        """End terminal copy records while the run lock is held."""
         try:
             yield
         finally:
@@ -1175,7 +1178,7 @@ class CrateRun:
                     with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
                                           branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
                         pass
-            copies.end_workspaces(self.task, paths, run_lock=run_lock)
+            copies.end_workspaces(self.task, paths, run_lock=run_lock, created=created)
 
     def wait_for_reservations(self, manifest: Manifest, record: CrateRecord,
                               pending: tuple[bulk.PendingFinding, ...], refused: dict[str, str]) -> None:

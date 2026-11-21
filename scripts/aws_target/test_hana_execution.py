@@ -96,7 +96,7 @@ class HanaExecutionTests(unittest.TestCase):
         self.root = Path()
         self.key = result.HanaAttemptKey('fixture-episode', 'fixture-attempt',
             execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'), hana.HanaHostGeneration('deployment', 'start', 'boot'))
-        self.source_key = execution_identity.SourceKeyKnown('verify-source')
+        self.source_key: execution_identity.SourceKeyKnown = execution_identity.SourceKeyKnown('verify-source')
         scope = RepositoryScope('hana', 'github.com/natepiano/hana', 1)
         self.assignment = placement.PlacementAssignment(self.key.episode, self.key.attempt,
             placement.PlacementDestination('ssh', 'configured-target', 'fixture-host', scope, 1),

@@ -35,7 +35,9 @@ from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.build_targets.execution_transport import HanaGpuNextestTransport
 from scripts.lib import conf
-from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
+from scripts.build_queue.placement import (
+    MAC_RUN_KINDS, CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings,
+)
 
 CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
 
@@ -392,6 +394,11 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
     return AnyTarget()
 
 
+def mac_run_bypasses_repository_policy(target: LocalTarget | SshTarget, kind: str) -> bool:
+    """A Mac run has no repository step policy."""
+    return isinstance(target, SshTarget) and target.platform == "macos" and kind in MAC_RUN_KINDS
+
+
 def fixed_placement_constraints(
     repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
     session: SubmittingSession, source_key: str | execution_identity.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
@@ -481,7 +488,7 @@ def fixed_remote_candidates(
                 and kind in configuration.value(f"offload_exclude.{repository.name}",
                                                 eligibility.comma_values, default=set(), allow_blank=True)):
             policy = placement.FixedExclusion("offload_exclude")
-        else:
+        elif not mac_run_bypasses_repository_policy(target, kind):
             answer = eligibility.configured_step_policy(configuration, target.platform, repository, repo_root, package, kind)
             if isinstance(answer, eligibility.IneligibleMacStep):
                 policy = placement.FixedExclusion(answer.reason)

@@ -14,6 +14,8 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
 
+from scripts.direct import phase_wait_holder
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_token_wait_test_support import VERIFY, VerifyTokenWaitFixture
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows,
@@ -26,7 +28,9 @@ from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
 
 
 FIRST_SESSION = fixture_runtime_id("thread-first")
@@ -264,6 +268,116 @@ done
         self.assertEqual(calls.read_text() if calls.exists() else "", "")
         self.assertEqual((self.root / "outcomes").read_text(), "Granted|0\n")
 
+
+class VerifyRecordedTokenIdentityTests(_RecordedWaitFixture):
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        board = self.root / "token-board"
+        board.mkdir()
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            owner, = staff.initial_snapshot().find(kind="unit")
+        self.write_token_record("progress_history_state.json", {"owner_staff_id": owner.id})
+
+    def write_token_record(self, name: str, record: dict[str, object]) -> None:
+        _ = (self.root / "token-board" / name).write_text(json.dumps(record))
+
+    def worker_reference(self, name: str) -> str:
+        roster = cast(dict[str, str], json.loads(
+            (self.root / f"session/impl_worker_{name}.json").read_text()))
+        return roster["staff_id"]
+
+    def record_token_owner(self, owner: str) -> list[dict[str, object]]:
+        session = self.root / "session"
+        arguments = ["token", owner, str(self.root / "token-board"),
+                     self.environment["BUILD_HOLD_DIR"], str(self.root)]
+
+        def holder_main() -> int:
+            phase_wait_holder.main()
+            return 0
+
+        holder = invoke_cli(phase_wait_holder, holder_main, arguments, self.environment, self.root)
+        self.assertEqual(holder.returncode, 0, holder.stdout + holder.stderr)
+        recorded_count = len(wait_rows(session))
+        worker = self.environment["CODEX_THREAD_ID"]
+        start = invoke_recorder(
+            ["start-wait", "--session-dir", str(session), "--kind", "WaitingForMemoryOrSlot",
+             "--reason", "cargo token", "--worker-thread-id", worker, "--owner-session", worker,
+             *holder.stdout.splitlines()], self.environment, self.root)
+        self.assertEqual(start.returncode, 0, start.stdout + start.stderr)
+        finish = invoke_recorder(["finish-wait", "--session-dir", str(session), "--wait-id", start.stdout.strip()],
+                                 self.environment, self.root)
+        self.assertEqual(finish.returncode, 0, finish.stdout + finish.stderr)
+        return self.recorded_interval(recorded_count)
+
+    def recorded_interval(self, recorded_count: int) -> list[dict[str, object]]:
+        rows = wait_rows(self.root / "session")[recorded_count:]
+        self.assertEqual(rows[0]["event_type"], "wait_started", rows)
+        self.assertEqual(rows[-1]["event_type"], "wait_finished", rows)
+        self.assertEqual({row["wait_id"] for row in rows}, {rows[0]["wait_id"]})
+        return rows
+
+    def test_saved_worker_record_names_the_session_without_a_roster(self) -> None:
+        self.write_token_record("impl_worker_saved.json", {
+            "slot": "writer", "staff_id": self.worker_reference("fixture-first"),
+        })
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_dispatch_pass_names_the_worker_session_without_worker_files(self) -> None:
+        state = cast(dict[str, object], json.loads(
+            (self.root / "token-board/progress_history_state.json").read_text()))
+        state["pass"] = {
+            "impl": {"worker_name": "impl", "worker_id": self.worker_reference("fixture-first")}}
+        self.write_token_record("progress_history_state.json", state)
+        self.assertEqual(recorded_holders(self.record_token_owner("impl")),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_dispatch_worker_name_resolves_when_the_dispatch_slot_differs(self) -> None:
+        state = cast(dict[str, object], json.loads(
+            (self.root / "token-board/progress_history_state.json").read_text()))
+        state["pass"] = {
+            "impl": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-first")}}
+        self.write_token_record("progress_history_state.json", state)
+        self.assertEqual(recorded_holders(self.record_token_owner("impl2")),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_duplicate_dispatch_worker_names_use_the_owner_unit(self) -> None:
+        state = cast(dict[str, object], json.loads(
+            (self.root / "token-board/progress_history_state.json").read_text()))
+        state["pass"] = {
+            "impl": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-first")},
+            "test": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-second")}}
+        self.write_token_record("progress_history_state.json", state)
+        self.assertEqual(recorded_holders(self.record_token_owner("impl2")),
+                         [named_holder("slot", "cargo", "wait", unit=True)])
+
+    def test_saved_worker_stem_wins_over_a_roster_slot_match(self) -> None:
+        self.write_token_record("impl_worker_writer.json", {
+            "staff_id": self.worker_reference("fixture-first")})
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_missing_worker_staff_row_uses_the_recorded_owner_unit(self) -> None:
+        self.write_token_record("impl_worker_writer.json", {"slot": "writer", "staff_id": "missing-worker"})
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
+                         [named_holder("slot", "cargo", "wait", unit=True)])
+
+    def test_ambiguous_worker_records_do_not_choose_a_session(self) -> None:
+        self.write_token_record("impl_worker_first.json", {
+            "slot": "writer", "staff_id": self.worker_reference("fixture-first")})
+        self.write_token_record("impl_worker_second.json", {
+            "slot": "writer", "staff_id": self.worker_reference("fixture-second")})
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
+                         [named_holder("slot", "cargo", "wait", unit=True)])
+
+    def test_unknown_token_owner_records_no_holder(self) -> None:
+        for owner in ("", "unknown"):
+            with self.subTest(owner=owner):
+                rows = self.record_token_owner(owner)
+                self.assertEqual(recorded_holders(rows), [
+                    {"reason": "producer named no holder", "state": "HolderNotNamed"},
+                ])
 
 class _RecordedHoldWaitFixture(VerifyHoldWaitFixture):
     """Copy a real recorded phase before each wait test."""

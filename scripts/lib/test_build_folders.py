@@ -24,7 +24,7 @@ from contextlib import contextmanager, nullcontext, redirect_stderr
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
 
 def _release_folder(path: Path) -> None:
@@ -37,15 +37,21 @@ class BuildFolderTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        private = Path(tempfile.mkdtemp(prefix="build-folders-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, private)
+        self.root = private / "case"
+        self.root.mkdir()
+        config = Path(self.enterContext(tempfile.TemporaryDirectory(dir=private)))
+        environment = fixture_git_environment(private)
+        _ = environment.pop("STAFF_CONFIG", None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **environment,
             **config_environment(config), "TMPDIR": str(self.root), copy_record.ROOT_ENV: str(self.root / "scratch"),
             copy_record.COPIES_ENV: str(self.root / "copies"),
             scratch.HOLDS_ENV: str(self.root / "holds.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-        })))
+        }, clear=True)))
         _ = write_config_fixture(config / "build_folders.conf",
             "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
             + "patterns.standing={repository}/{owner}-gate{suffix}\npatterns.editable={repository}-{owner}/{purpose}\n"
@@ -1739,8 +1745,8 @@ assert not loaded, loaded
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:folder-test")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-        self.assertEqual(scratch.end("gate:folder-test"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:folder-test")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_cli_preserves_spaces_existing_permissions_and_the_one_path_output(self) -> None:
         parent = self.root / "shell parent"
@@ -1795,8 +1801,8 @@ assert not loaded, loaded
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:shell-folder")
-        self.assertEqual(scratch.end("gate:shell-folder"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:shell-folder")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_names_cannot_escape_the_explicit_parent(self) -> None:
         for name in ("..", "../escape", "/absolute", "bad\x00name"):

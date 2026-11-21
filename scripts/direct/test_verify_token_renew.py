@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.direct import verify_lint_scope_test_support as lint_support
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
@@ -141,7 +141,7 @@ BUILD_HELPER_ROOT=$HOME/.claude/scripts
 tree_key --with-tree-content
 ''')
             result = subprocess.run(["bash", "-e", str(script)], cwd=root, text=True, capture_output=True,
-                                    env={**os.environ, "HOME": str(root), "LINT_CONFIG_FILE": str(config)},
+                                    env={**verify_test_environment(), "HOME": str(root), "LINT_CONFIG_FILE": str(config)},
                                     timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         words = result.stdout.split("\0")[:-1]

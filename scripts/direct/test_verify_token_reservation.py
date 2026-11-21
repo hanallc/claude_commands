@@ -78,6 +78,8 @@ python3 "$TEST_WAIT_HELPER" "$TEST_OLD_RELEASE"
 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$BUILDLOG_MEM_RESERVATION"
 BUILDLOG_MEM_RESERVATION=""
 : > "$TEST_OLD_GAP"
+# Wait for the new client to take the token after the memory refund.
+python3 "$TEST_WAIT_HELPER" "$TEST_RUNNING"
 bash "$TEST_BOARD" acquire "$TEST_BOARD_DIR" old cargo --pid $$ --hold 3600 --wait 30
 trap 'bash "$TEST_BOARD" release "$TEST_BOARD_DIR" old cargo --pid $$' EXIT
 BUILDLOG_MEM_TOKEN_BACK_AT=$(python3 -c 'import time; print(time.time())')

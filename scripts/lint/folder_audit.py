@@ -97,6 +97,7 @@ HELD = "a hold keeps it"
 TOO_LARGE = "too many entries to read"
 LIVE_SOCKET = "a live process binds a socket in it"
 TARGET_REMOVED = "removed target; kept unsaved source"
+NO_SPACE_FREED = "no space freed. Unsaved source stays"
 WOULD_REMOVE_TARGET = "would remove target; keep unsaved source"
 
 
@@ -151,7 +152,7 @@ def remove_clone_targets(path: Path, removing: bool, *,
         scratch.cargo_removal_mark(path.resolve()).unlink(missing_ok=True)
     except OSError as error:
         return f"target removal failed: {error}"
-    return TARGET_REMOVED
+    return TARGET_REMOVED if targets else NO_SPACE_FREED
 
 
 @dataclass(frozen=True)

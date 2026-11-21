@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, patch
 from scripts.direct.verify_shell_test_support import verify_cancellation_functions
 from scripts.lib import process_group
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -219,7 +221,7 @@ class ProcessGroupTests(PrivateGroupFixture):
 
 class ShellProcessGroupTests(PrivateGroupFixture):
     root: Path = Path()
-    environment: dict[str, str] = {}
+    fixture_environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -234,8 +236,12 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         copy_startup(self.root)
         home = self.root / "home"
         home.mkdir()
-        self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache")}
+        self.fixture_environment = {**config_environment(self.root / "config"),
+                                    "HOME": str(home), **interpreter_cache_environment(self.root / "cache")}
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {**verify_test_environment(), **self.fixture_environment}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         board = self.root / "scripts/direct/board.sh"
@@ -291,8 +297,14 @@ final_pass_finish() { :; }
     def test_copied_verify_cancellation_uses_the_local_helper(self) -> None:
         self.fake_helper(0)
         child = self.private_child()
-        for function, status, signum in (("cancel_tree_run", 77, "KILL"), ("verify_interrupted", 143, "15")):
-            with self.subTest(function=function):
+        startup = refusing_bash_startup(self.root)
+        for function, status, signum, bash_env in (
+            ("cancel_tree_run", 77, "KILL", ""),
+            ("verify_interrupted", 143, "15", ""),
+            ("cancel_tree_run", 77, "KILL", str(startup)),
+        ):
+            with (self.subTest(function=function, caller_startup=bool(bash_env)),
+                  patch.dict(os.environ, {"BASH_ENV": bash_env})):
                 result = self.cancel_step(function, child)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import final
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP, BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
 from scripts.direct.verify_shell_test_support import verify_shell_functions
@@ -183,6 +184,7 @@ for arguments in "$@"; do
 done
 '''
             result = subprocess.run(["bash", "-e", "-c", script, "compose-test", *(shlex.join(case) for case in cases)],
+                                    env=verify_test_environment(),
                                     cwd=directory, text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         answers = result.stdout.split("\0\0")[:-1]
@@ -214,7 +216,7 @@ for selection in plain filter target; do
     printf '\0'
 done
 '''
-            result = subprocess.run(["bash", "-e", "-c", script], cwd=root,
+            result = subprocess.run(["bash", "-e", "-c", script], env=verify_test_environment(), cwd=root,
                                     text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         cases = (((), True), (("--filter", "alpha"), False), (("--test", "integration_suite"), False))
@@ -237,7 +239,7 @@ done
             with self.subTest(refused=arguments):
                 result = subprocess.run(
                     ["bash", "-e", "-c", parser, "parser-test", *arguments],
-                    text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                    env=verify_test_environment(), text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("--run-ignored only", result.stderr)

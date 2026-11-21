@@ -281,13 +281,13 @@ class TestProcesses:
     def kill(self, owner: wire.Owner) -> None:
         child = next(child for child in self.children if child.pid == owner.pid)
         child.kill()
-        _ = child.wait(timeout=2)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def close(self) -> None:
         for child in self.children:
             if child.poll() is None:
                 child.kill()
-            _ = child.wait(timeout=2)
+            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
 
 class PressureReader(Protocol):

@@ -37,7 +37,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_admit import scope_members
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 
 
 DOC_COMMAND = ("bash", str(VERIFY), "doc")
@@ -134,7 +134,7 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         admission = caller_admission(self, self.root, self.environment)
         settings = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         _ = write_config_fixture(settings, f"# whole: 1..\nslots.{admission.server.host}.workspace.max=1\n")
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_slot(
                 self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc",
                 wait_policy=wait_policy) as slot:
             yield slot.path
@@ -940,9 +940,9 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
         _ = self.enterContext(isolated_staff_file(self.root / "doc-staff.json", self.environment))
         showrunner = fixture_member("showrunner", name="builds")
         unit = fixture_member("unit", name="doc-proof", parent=showrunner.id,
-                              worktree=staff.PresentWorktree(local_machine(), registered))
-        self.environment["CLAUDE_CODE_SESSION_ID"] = unit.current_session
-        _ = self.environment.pop("CODEX_THREAD_ID", None)
+                              worktree=staff.PresentWorktree(local_machine(), registered),
+                              runtime_id=staff.caller_identity())
+        self.environment.update(build_fixture_sessions(unit.current_session))
         self.assert_doc_slot_wait_identity(showrunner, unit, session=unit.current_session, folder="")
 
     def assert_doc_slot_wait_identity(self, showrunner: staff.StaffRow, unit: staff.StaffRow, *,
@@ -1159,7 +1159,8 @@ for descriptor in (8, 74):
         self.assertFalse(call["notes_present"])
         checkout = Path(call["cwd"])
         self.assertTrue(checkout.is_relative_to(self.root / "slots"))
-        key = treekey.tree_key(str(checkout))
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            key = treekey.tree_key(str(checkout))
         assert key is not None
         self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key))
         rows = (cast(dict[str, object], json.loads(line))
@@ -1235,7 +1236,7 @@ for descriptor in (8, 74):
     @contextmanager
     def prepared_doc_slot(self) -> Generator[Path]:
         original = self.repo
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_slot(
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
             self.repo: Path = slot.path
             self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)

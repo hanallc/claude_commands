@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +9,7 @@ from typing import final
 import unittest
 
 from scripts.direct.verify_lint_scope_test_support import SCRIPTS, VERIFY
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -21,7 +21,7 @@ class InvokeOutputTests(unittest.TestCase):
         return shell_function(source, name)
 
     def shell(self, script: str, root: Path) -> subprocess.CompletedProcess[str]:
-        environment = dict(os.environ, HOME=str(root), TMPDIR=str(root))
+        environment = {**verify_test_environment(), "HOME": str(root), "TMPDIR": str(root)}
         return subprocess.run(
             ["bash", "-c", script], cwd=root, env=environment,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,

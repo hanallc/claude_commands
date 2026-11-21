@@ -444,7 +444,16 @@ elif name == 'cargo':
                 self.assertEqual(trial.comparison(flaky, candidate), 'inconclusive')
         self.assertEqual(trial.comparison(incomplete, same), 'incomplete')
 
-    def test_new_prepare_removes_previous_folders_without_following_links(self) -> None:
+    def test_nextest_worker_exit_without_manifest_keeps_the_exit_reason(self) -> None:
+        request = trial.HanaGpuNextestRequest(('--test', 'fixture'), ('g6.2xlarge',))
+        with (mock.patch.object(trial, 'prepare_locked'),
+              mock.patch.object(trial, 'start_service', return_value=7),
+              mock.patch.object(trial, 'remove_run_inputs') as remove,
+              self.assertRaisesRegex(ValueError, 'The Hana GPU worker exited with status 7 and has no result')):
+            _ = trial.run_nextest(self.root, 'a' * 40, request)
+        remove.assert_not_called()
+
+    def test_new_prepare_keeps_previous_folders_and_reports_each_one(self) -> None:
         root = trial.trial_root()
         root.mkdir(parents=True)
         outside = self.root / 'outside'
@@ -456,12 +465,18 @@ elif name == 'cargo':
             _ = (previous / 'closure.export').write_bytes(b'fixture old closure')
             (previous / 'profile').symlink_to(outside, target_is_directory=True)
         first = root / 'first'
-        with trial.new_trial(first):
-            self.assertEqual([path.name for path in root.iterdir() if path.is_dir() and not path.name.startswith('.')], ['first'])
+        with redirect_stderr(StringIO()) as output, trial.new_trial(first):
+            self.assertTrue(first.is_dir())
             _ = (first / 'manifest.json').write_text('fixture prepared')
+        self.assertEqual(output.getvalue().splitlines(), [
+            f'kept for a manual removal list: {root / name} (gpu_size_trial, earlier trial)'
+            for name in ('abandoned', 'failed', 'prepared')])
+        for name in ('prepared', 'failed', 'abandoned'):
+            self.assertEqual((root / name / 'closure.export').read_bytes(), b'fixture old closure')
+            self.assertTrue((root / name / 'profile').is_symlink())
         second = root / 'second'
         with trial.new_trial(second):
-            self.assertFalse(first.exists())
+            self.assertEqual((first / 'manifest.json').read_text(), 'fixture prepared')
             self.assertTrue(second.is_dir())
         self.assertEqual((outside / 'keep').read_text(), 'fixture outside data')
 
@@ -477,12 +492,12 @@ elif name == 'cargo':
                 with trial.new_trial(root / 'next'):
                     self.fail('A second preparation must not start')
             self.assertEqual((current / 'closure.export').read_bytes(), b'fixture held closure')
-            self.assertFalse(abandoned.exists())
+            self.assertEqual((abandoned / 'source.tar').read_bytes(), b'fixture old source')
             self.assertFalse((root / 'next').exists())
         with trial.new_trial(root / 'next'):
-            self.assertFalse(current.exists())
+            self.assertEqual((current / 'closure.export').read_bytes(), b'fixture held closure')
 
-    def test_invalid_host_folders_never_prune_or_remove_inputs(self) -> None:
+    def test_invalid_host_folders_never_remove_inputs(self) -> None:
         root = trial.trial_root()
         current = root / 'current'
         current.mkdir(parents=True)
@@ -508,7 +523,7 @@ elif name == 'cargo':
                     with trial.held_trial(folder):
                         self.fail('An invalid folder must not acquire a lock')
                 with self.assertRaisesRegex(ValueError, 'canonical direct child'):
-                    trial.remove_run_inputs(folder, 1)
+                    _ = trial.host_trial_folder(folder)
                 for command in ('prepare', 'compare'):
                     with redirect_stderr(StringIO()):
                         self.assertEqual(trial.main([command, '--trial-folder', str(folder)]), 1)
@@ -516,14 +531,88 @@ elif name == 'cargo':
                 for saved in (current, outside, nested):
                     self.assertEqual((saved / 'closure.export').read_text(), 'fixture input')
                     self.assertFalse((saved / 'inputs-removed.json').exists())
-        with self.assertRaisesRegex(ValueError, 'canonical direct child'):
-            with trial.new_trial(root / 'next'):
-                self.fail('A linked prior folder must prevent pruning')
-        self.assertEqual(set(root.iterdir()), before | {root / 'controller.lock'})
+        with redirect_stderr(StringIO()) as output, trial.new_trial(root / 'next'):
+            self.assertTrue((root / 'next').is_dir())
+        for linked in (alias, outside_alias):
+            self.assertIn(f'kept for a manual removal list: {linked} (gpu_size_trial, earlier trial)',
+                          output.getvalue().splitlines())
+        self.assertEqual(set(root.iterdir()), before | {root / 'controller.lock', root / '.locks', root / 'next'})
         self.assertTrue((current / 'closure.export').is_file())
         self.assertTrue((nested / 'closure.export').is_file())
         self.assertTrue(alias.is_symlink())
         self.assertTrue(outside_alias.is_symlink())
+
+    def test_cleanup_refuses_a_trial_under_the_destination_of_a_linked_root(self) -> None:
+        destination = self.root / 'destination'
+        folder = destination / 'trial'
+        folder.mkdir(parents=True)
+        artifact = folder / 'payload.tar'
+        _ = artifact.write_bytes(b'fixture payload')
+        root_link = self.root / 'root-link'
+        root_link.symlink_to(destination, target_is_directory=True)
+        ancestor_link = self.root / 'ancestor-link'
+        ancestor_link.symlink_to(self.root, target_is_directory=True)
+        for root in (root_link, ancestor_link / destination.name):
+            with (self.subTest(root=root), mock.patch.object(trial, 'trial_root', return_value=root),
+                  self.assertRaisesRegex(ValueError, 'GPU trial root must be canonical')):
+                _ = trial.host_trial_folder(folder)
+            self.assertEqual(artifact.read_bytes(), b'fixture payload')
+            self.assertFalse((folder / 'inputs-removed.json').exists())
+
+    def test_run_cleanup_refuses_paths_outside_the_run_or_below_a_link(self) -> None:
+        root = trial.trial_root()
+        folder = root / 'current'
+        folder.mkdir(parents=True)
+        previous = root / 'previous'
+        previous.mkdir()
+        kept = previous / 'artifact'
+        _ = kept.write_text('fixture data')
+        alias = folder / 'alias'
+        alias.symlink_to(previous, target_is_directory=True)
+        for remove in (trial.remove_trial_file, trial.remove_trial_folder):
+            for path in (folder, kept, alias / 'artifact', folder / '../previous/artifact'):
+                with (self.subTest(remove=remove.__name__, path=path),
+                      self.assertRaisesRegex(ValueError, 'expected an entry below')):
+                    remove(folder, path)
+        self.assertEqual(kept.read_text(), 'fixture data')
+        with self.assertRaisesRegex(ValueError, 'expected an owned directory'):
+            trial.remove_trial_folder(folder, alias)
+        self.assertTrue(alias.is_symlink())
+        trial.remove_trial_file(folder, alias)
+        self.assertFalse(alias.is_symlink())
+        self.assertEqual(kept.read_text(), 'fixture data')
+
+    def test_run_input_cleanup_refuses_a_payload_directory_and_removes_other_inputs_after_retry(self) -> None:
+        folder = trial.trial_root() / 'current'
+        payload = folder / 'payload.tar'
+        payload.mkdir(parents=True)
+        kept = payload / 'artifact'
+        _ = kept.write_bytes(b'fixture data')
+        trial.write_json(folder / 'manifest.json',
+                         {'trial': folder.name, 'schema': 2, 'toolchain_source': 'nix', 'state': 'prepared', 'sha256': {}})
+        identity = trial.validate_prepared(folder).identity
+        inputs = [folder / name for name in trial.RUN_INPUT_NAMES]
+        for path in inputs:
+            if path.name == 'cargo-home':
+                path.mkdir()
+            elif path != payload:
+                _ = path.write_bytes(b'fixture input')
+        with (redirect_stderr(StringIO()) as output,
+              self.assertRaisesRegex(ValueError, 'expected a regular file without links')):
+            trial.remove_run_inputs(folder, 1, identity)
+        self.assertEqual(len(output.getvalue().splitlines()), len(inputs))
+        for path in inputs:
+            self.assertTrue(path.exists())
+            self.assertIn(f'kept for a manual removal list: {path} (gpu_size_trial,', output.getvalue())
+        self.assertEqual(kept.read_bytes(), b'fixture data')
+        self.assertFalse((folder / 'inputs-removed.json').exists())
+        self.assertFalse((folder / 'inputs-removal-authorized.json').exists())
+
+        _ = payload.rename(folder / 'kept-directory')
+        trial.remove_run_inputs(folder, 2, identity)
+        self.assertTrue(all(not path.exists() for path in inputs))
+        self.assertEqual((folder / 'kept-directory/artifact').read_bytes(), b'fixture data')
+        self.assertEqual(trial.read_json(folder / 'inputs-removed.json'), {'at': 2})
 
     def test_measurement_removes_large_workspaces_on_every_exit(self) -> None:
         source = self.root / 'measurement-source'
@@ -1304,8 +1393,12 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             except (ValueError, OSError, AwsUnavailable):
                 return 1
             finally:
-                self.assertFalse((folder / 'cargo-home').exists())
-                self.assertFalse((folder / 'closure.export').exists())
+                cleanup_pending = any(isinstance(row.trial, ledger.GateTrialBudget)
+                    and row.trial.trial_id == folder.name and ledger.gate_is_open(row)
+                    for row in self.book.read_snapshot().gate_reservations)
+                self.assertEqual((folder / 'cargo-home').exists(), cleanup_pending)
+                self.assertEqual((folder / 'closure.export').exists(), cleanup_pending)
+                self.assertEqual((folder / 'inputs-removed.json').exists(), not cleanup_pending)
             return 0
 
         output, errors = StringIO(), StringIO()
@@ -1760,7 +1853,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             self.assertTrue((self.folder / 'machines' / size / '1/junit.xml').is_file())
             self.assertTrue((self.folder / 'boxes' / size / 'outcome.json').is_file())
         self.assertIn('GPU size trial', trial.compare(self.folder))
-        self.assertEqual(trial.validate_prepared(self.folder)['trial'], 'stable-fixture-trial')
+        self.assertEqual(trial.validate_prepared(self.folder).identity.trial_id, 'stable-fixture-trial')
 
     def test_invalid_online_folders_never_execute_or_remove_inputs(self) -> None:
         nested = trial.trial_root() / 'group/trial'
@@ -1802,16 +1895,228 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             self.assertFalse((self.folder / name).exists())
 
     def test_stop_cleanup_saves_an_error_and_removes_interrupted_run_inputs(self) -> None:
+        manifest = trial.read_json(self.folder / 'manifest.json')
+        manifest['tree'] = 'b' * 40
+        manifest['hana_nextest'] = {'arguments': ['--test', 'fixture'], 'instance_types': ['g6.2xlarge']}
+        trial.write_json(self.folder / 'manifest.json', manifest)
+        arguments = ['--cleanup', str(self.folder), '--directory', str(self.state), '--settings', str(self.settings)]
+        inputs = [self.folder / name for name in trial.RUN_INPUT_NAMES if name != 'payload.tar']
+        payload = self.folder / 'payload.tar'
         with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
-              mock.patch.object(trial.GpuTrialWorker, 'cleanup', return_value=True) as cleanup):
-            status = trial.online_main(['--cleanup', str(self.folder), '--directory', str(self.state),
-                                        '--settings', str(self.settings)])
-        self.assertEqual(status, 0)
-        cleanup.assert_called_once_with(self.folder)
+              mock.patch.object(trial.GpuTrialWorker, 'cleanup', side_effect=[False, True, True]) as cleanup):
+            self.assertEqual(trial.online_main(arguments), 1)
+            self.assertTrue(all(path.exists() for path in inputs))
+            self.assertFalse((self.folder / 'inputs-removed.json').exists())
+            self.assertFalse(trial.cleanup_receipt(self.folder).exists())
+            payload.mkdir()
+            with redirect_stderr(StringIO()) as errors:
+                self.assertEqual(trial.online_main(arguments), 1)
+            self.assertIn('run input cleanup refused:', errors.getvalue())
+            self.assertTrue(all(path.exists() for path in inputs))
+            self.assertFalse((self.folder / 'inputs-removed.json').exists())
+            self.assertFalse(trial.cleanup_receipt(self.folder).exists())
+            payload.rmdir()
+            self.assertEqual(trial.online_main(arguments), 0)
+        self.assertEqual(cleanup.call_args_list, [mock.call(self.folder)] * 3)
         self.assertIn('before it saved a final result', str(trial.read_json(self.folder / 'run-error.json')['reason']))
         for name in trial.RUN_INPUT_NAMES:
             self.assertFalse((self.folder / name).exists())
+        self.assertTrue((self.folder / 'inputs-removed.json').is_file())
+        self.assertEqual(trial.read_json(trial.cleanup_receipt(self.folder)), {'trial': self.folder.name})
         self.assertTrue((self.folder / 'manifest.json').is_file())
+
+    def test_worker_keeps_a_payload_file_it_did_not_create(self) -> None:
+        payload = self.folder / 'payload.tar'
+        _ = payload.write_bytes(b'fixture pre-existing payload')
+        with (redirect_stderr(StringIO()) as errors,
+              self.assertRaisesRegex(ValueError, 'no ownership evidence for the payload file')):
+            self.execute()
+        self.assertEqual(payload.read_bytes(), b'fixture pre-existing payload')
+        self.assertNotIn('put-object', self.fake.events)
+        self.assertIn(f'kept for a manual removal list: {payload} (gpu_size_trial,', errors.getvalue())
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
+
+    def test_worker_and_stop_keep_inputs_when_the_saved_trial_id_differs(self) -> None:
+        trial.write_json(self.folder / 'online.json', {'trial': 'different-trial'})
+        inputs = [self.folder / name for name in trial.RUN_INPUT_NAMES if name != 'payload.tar']
+        with (redirect_stderr(StringIO()) as worker_errors,
+              self.assertRaisesRegex(ValueError, 'The saved trial ID differs from the manifest')):
+            self.execute()
+        with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+              mock.patch.object(trial.GpuTrialWorker, 'cleanup', return_value=True) as cleanup,
+              redirect_stderr(StringIO()) as stop_errors):
+            self.assertEqual(trial.online_main(['--cleanup', str(self.folder), '--directory', str(self.state),
+                                               '--settings', str(self.settings)]), 1)
+        cleanup.assert_called_once_with(self.folder)
+        self.assertEqual(self.fake.events, [])
+        for path in inputs:
+            notice = f'kept for a manual removal list: {path} (gpu_size_trial, The saved trial ID differs from the manifest)'
+            self.assertTrue(path.exists())
+            self.assertIn(notice, worker_errors.getvalue().splitlines())
+            self.assertIn(notice, stop_errors.getvalue().splitlines())
+        self.assertFalse((self.folder / 'inputs-removal-authorized.json').exists())
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
+        self.assertFalse(trial.cleanup_receipt(self.folder).exists())
+
+    def test_stop_terminates_a_booked_instance_when_the_saved_trial_record_is_malformed(self) -> None:
+        self.fake.unconfirmed = True
+        with self.assertRaisesRegex(ValueError, 'termination remains unconfirmed'):
+            self.execute()
+        booking, = self.book.read_snapshot().gate_reservations
+        self.assertIsInstance(booking.state, ledger.GateRunning)
+        _ = (self.folder / 'online.json').write_text('malformed fixture')
+        self.fake.unconfirmed = False
+        inputs = [self.folder / name for name in trial.RUN_INPUT_NAMES if name != 'payload.tar']
+        with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(trial.online_main(['--cleanup', str(self.folder), '--directory', str(self.state),
+                                               '--settings', str(self.settings)]), 1)
+        settled, = self.book.read_snapshot().gate_reservations
+        self.assertEqual(settled.attempt, booking.attempt)
+        self.assertIsInstance(settled.state, ledger.GateTerminated)
+        self.assertEqual(set(self.fake.instances.values()), {'terminated'})
+        for path in inputs:
+            self.assertTrue(path.exists())
+            self.assertIn(f'kept for a manual removal list: {path} (gpu_size_trial, Cannot read the saved trial record:',
+                          errors.getvalue())
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
+
+    def test_stop_refuses_a_missing_input_without_matching_cleanup_authorization(self) -> None:
+        identity = trial.validate_prepared(self.folder).identity.cleanup_authorization()
+        authorization = self.folder / 'inputs-removal-authorized.json'
+        linked = self.root / 'authorization'
+        trial.write_json(linked, identity)
+        missing = self.folder / trial.RUN_INPUT_NAMES[0]
+        missing.unlink()
+        inputs = [self.folder / name for name in trial.RUN_INPUT_NAMES[1:] if name != 'payload.tar']
+        arguments = ['--cleanup', str(self.folder), '--directory', str(self.state), '--settings', str(self.settings)]
+        for case in ('empty', 'linked', 'stale trial', 'stale manifest'):
+            with self.subTest(case=case):
+                if case == 'empty':
+                    authorization.touch()
+                elif case == 'linked':
+                    authorization.symlink_to(linked)
+                elif case == 'stale trial':
+                    trial.write_json(authorization, {**identity, 'trial': 'different-trial'})
+                else:
+                    trial.write_json(authorization, {**identity, 'manifest_sha256': '0' * 64})
+                with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+                      mock.patch.object(trial.GpuTrialWorker, 'cleanup', return_value=True),
+                      redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(trial.online_main(arguments), 1)
+                self.assertIn(missing.name, errors.getvalue())
+                self.assertTrue(all(path.exists() for path in inputs))
+                self.assertFalse((self.folder / 'inputs-removed.json').exists())
+                self.assertFalse(trial.cleanup_receipt(self.folder).exists())
+                authorization.unlink()
+
+    def test_worker_keeps_inputs_if_the_manifest_is_replaced_after_validation(self) -> None:
+        path = self.folder / 'manifest.json'
+        manifest = trial.read_json(path)
+        replacement = self.folder / 'replacement-manifest.json'
+        trial.write_json(replacement, {**manifest, 'state': 'fixture replacement'})
+        inputs = [self.folder / name for name in trial.RUN_INPUT_NAMES if name != 'payload.tar']
+
+        def replace_manifest(_folder: Path, _deployment: dict[str, object], _manifest: dict[str, object]) -> None:
+            _ = replacement.replace(path)
+
+        with (mock.patch.object(self.worker, 'run_trial', side_effect=replace_manifest),
+              redirect_stderr(StringIO()) as output,
+              self.assertRaisesRegex(ValueError, 'The validated manifest changed before input removal')):
+            self.execute()
+        self.assertEqual(trial.read_json(path)['trial'], manifest['trial'])
+        for entry in inputs:
+            self.assertTrue(entry.exists())
+            self.assertIn(f'kept for a manual removal list: {entry} (gpu_size_trial,', output.getvalue())
+        self.assertFalse((self.folder / 'inputs-removal-authorized.json').exists())
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
+
+    def test_stop_refuses_a_fifo_before_reading_any_bytes_from_it(self) -> None:
+        closure = self.folder / 'closure.export'
+        closure.unlink()
+        os.mkfifo(closure)
+        arguments = ['--cleanup', str(self.folder), '--directory', str(self.state), '--settings', str(self.settings)]
+        with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+              mock.patch.object(trial.GpuTrialWorker, 'cleanup', return_value=True),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(trial.online_main(arguments), 1)
+        reason = f'{closure}: expected a regular file without links'
+        for name in trial.RUN_INPUT_NAMES:
+            path = self.folder / name
+            if name != 'payload.tar':
+                self.assertTrue(path.exists())
+            self.assertIn(f'kept for a manual removal list: {path} (gpu_size_trial, {reason})', errors.getvalue())
+        self.assertFalse((self.folder / 'inputs-removal-authorized.json').exists())
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
+
+    def test_stop_retries_after_the_second_input_removal_fails(self) -> None:
+        identity = trial.validate_prepared(self.folder).identity
+        first, second = (self.folder / name for name in trial.RUN_INPUT_NAMES[:2])
+        authorized = self.folder / 'inputs-removal-authorized.json'
+        completed = self.folder / 'inputs-removed.json'
+        arguments = ['--cleanup', str(self.folder), '--directory', str(self.state), '--settings', str(self.settings)]
+        remove_file = trial.remove_trial_file
+
+        def fail_second(folder: Path, path: Path) -> None:
+            self.assertTrue(authorized.is_file())
+            self.assertFalse(completed.exists())
+            if path == second:
+                self.assertFalse(first.exists())
+                raise OSError('fixture removal failed')
+            remove_file(folder, path)
+
+        with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+              mock.patch.object(trial.GpuTrialWorker, 'cleanup', return_value=True)):
+            with (mock.patch.object(trial, 'remove_trial_file', side_effect=fail_second),
+                  redirect_stderr(StringIO()) as errors):
+                self.assertEqual(trial.online_main(arguments), 1)
+            self.assertIn('fixture removal failed', errors.getvalue())
+            self.assertFalse(first.exists())
+            self.assertTrue(second.is_file())
+            self.assertEqual(trial.read_json(authorized), identity.cleanup_authorization())
+            self.assertFalse(completed.exists())
+            self.assertEqual(trial.online_main(arguments), 0)
+        self.assertTrue(all(not (self.folder / name).exists() for name in trial.RUN_INPUT_NAMES))
+        self.assertTrue(completed.is_file())
+        self.assertFalse(authorized.exists())
+
+    def test_upload_creation_keeps_an_existing_directory_or_link_at_the_payload_path(self) -> None:
+        payload = self.folder / 'payload.tar'
+        payload.mkdir()
+        kept = payload / 'artifact'
+        _ = kept.write_bytes(b'fixture payload directory')
+        destination = self.root / 'payload-destination'
+        _ = destination.write_bytes(b'fixture payload destination')
+        with mock.patch.object(self.worker, 'upload') as upload:
+            with self.assertRaises(FileExistsError):
+                self.worker.artifacts(self.folder, {})
+            self.assertEqual(kept.read_bytes(), b'fixture payload directory')
+            _ = payload.rename(self.folder / 'saved-payload')
+            payload.symlink_to(destination)
+            with self.assertRaises(FileExistsError):
+                self.worker.artifacts(self.folder, {})
+            upload.assert_not_called()
+        self.assertEqual(payload.readlink(), destination)
+        self.assertEqual(destination.read_bytes(), b'fixture payload destination')
+
+    def test_worker_keeps_a_replacement_payload(self) -> None:
+        payload = self.folder / 'payload.tar'
+        moved = self.folder / 'moved-payload'
+
+        def replace_payload(_bucket: str, _key: str, path: Path, _timeout: int) -> None:
+            self.assertEqual(path, payload)
+            _ = path.rename(moved)
+            _ = path.write_bytes(b'fixture replacement file')
+            raise AwsUnavailable('fixture upload failed')
+
+        with (mock.patch.object(self.worker, 'upload', side_effect=replace_payload),
+              redirect_stderr(StringIO()) as output,
+              self.assertRaisesRegex(ValueError, 'no ownership evidence for the payload file')):
+            self.execute()
+        self.assertEqual(payload.read_bytes(), b'fixture replacement file')
+        self.assertTrue(moved.is_file())
+        self.assertIn(f'kept for a manual removal list: {payload} (gpu_size_trial, payload changed)', output.getvalue())
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
 
     def test_upload_failure_removes_the_payload_and_requires_new_preparation(self) -> None:
         with mock.patch.object(self.worker, 'upload', side_effect=AwsUnavailable('fixture upload failed')):
@@ -1823,6 +2128,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             _ = trial.validate_prepared(self.folder)
 
     def test_old_preparation_requires_the_nix_toolchain_fix(self) -> None:
+        inputs = [self.folder / name for name in trial.RUN_INPUT_NAMES if name != 'payload.tar']
         manifest = trial.read_json(self.folder / 'manifest.json')
         manifest['schema'] = 1
         _ = manifest.pop('toolchain_source')
@@ -1830,6 +2136,8 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         with self.assertRaisesRegex(ValueError, 'Prepare the trial again with the Nix toolchain'):
             self.execute()
         self.assertEqual(self.fake.events, [])
+        self.assertTrue(all(path.exists() for path in inputs))
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
 
     def test_no_region_granted_stops_before_upload_or_launch(self) -> None:
         self.fake.quotas.clear()
@@ -2071,6 +2379,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             self.execute()
         self.assertEqual(len(self.fake.launches), 1)
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateRunning)
+        self.assertFalse((self.folder / 'inputs-removed.json').exists())
 
     def test_guest_program_is_standalone_and_has_no_aws_client(self) -> None:
         guest = trial.guest_program()
