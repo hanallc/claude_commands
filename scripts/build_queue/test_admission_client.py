@@ -1453,7 +1453,8 @@ class ClientTests(unittest.TestCase):
                 refresh = mock.Mock(return_value=updated)
                 self.assertEqual(client.admit(request, lambda _wait: None, refresh), GRANTED)
             self.assertEqual(refresh.call_count, 2)
-            self.assertEqual(transport.requests, [request, request, replace(request, profile=updated.profile)])
+            refreshed = replace(request, profile=updated.profile)
+            self.assertEqual(transport.requests, [request, refreshed, refreshed])
 
     def test_repeated_refresh_disconnects_stop_at_the_unreachable_limit(self) -> None:
         for read_history in (False, True):
@@ -1465,9 +1466,12 @@ class ClientTests(unittest.TestCase):
                 transport = self.use_transport(fixture, *(Exchange(reply_bytes(EXPIRED), after_send={2: history}) for _ in range(4)),
                     Exchange(reply_bytes(wire.Refused("refresh retry exceeded the fixture limit"))))
                 send = ScriptSocket.sendall
+                interrupted: list[wire.Request] = []
 
                 def close_before_refresh(connection: ScriptSocket, data: bytes) -> None:
-                    if wire.parse_request(data) == refreshed:
+                    submitted = wire.parse_request(data)
+                    if submitted == refreshed:
+                        interrupted.append(submitted)
                         raise BrokenPipeError(errno.EPIPE, "closed before the refreshed estimate")
                     send(connection, data)
 
@@ -1486,7 +1490,8 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(fixture.clock.sleeps, [])
                 self.assertEqual(fixture.clock.monotonic(), 5)
                 self.assertEqual([item for item in transport.requests if isinstance(item, wire.AdmitRequest)],
-                                 [request, request])
+                                 [request])
+                self.assertEqual(interrupted, [refreshed, refreshed])
                 self.doCleanups()
 
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:

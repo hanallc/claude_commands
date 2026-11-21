@@ -15,7 +15,7 @@ from unittest.mock import Mock, call, patch
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records as records
 from scripts.build_queue import first_step, memory_feed, placement, queue_place, queue_view, step_estimator
-from scripts.build_queue.admission_test_support import (AdmissionFixture, Exchange, GIB, ScriptedTransport,
+from scripts.build_queue.admission_test_support import (AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket,
     admitted_reply, only_admitted, reply_bytes, wait_reply)
 from scripts.build_queue.test_placement import (PlacementFixture, adopt_assignment, assignment_for, consume_permission,
     placement_request, publish_candidate)
@@ -303,6 +303,50 @@ class LandingAdmissionTests(unittest.TestCase):
             assert isinstance(initial, wire.ServiceEstimateRequest)
             self.assertEqual(initial.landing_repository, wire.LandingRepositoryNotRecorded())
             self.assertEqual(refreshed, replace(initial, landing_repository=LANDING_REPOSITORY))
+
+    def test_ci_reconnect_sends_the_landing_key_from_a_partial_refresh(self) -> None:
+        with AdmissionFixture() as fixture, patch.object(client, "CLOCK", fixture.clock):
+            timing = wire.AcquisitionTiming(silence_seconds=2, reconnect_seconds=1, unreachable_limit_seconds=9)
+            clone = local_test_clone(fixture.root)
+            source = fixture.root / "source"
+            unavailable = source.rename(fixture.root / "source-away")
+            request = replace(fixture.service_request(), argv=("cargo", "test"), cwd=str(clone))
+            expired = wait_reply(records.EstimateExpired(1), text="estimate expired")
+            grant = admitted_reply()
+            original = Exchange(reply_bytes(expired))
+            replacement = Exchange(reply_bytes(grant))
+            transport = ScriptedTransport(fixture.clock, original, replacement)
+            send = ScriptSocket.send
+            prefix = b""
+
+            def restore_origin(_reply: wire.Wait) -> None:
+                _ = unavailable.rename(source)
+
+            def write(peer: ScriptSocket, data: bytes) -> int:
+                nonlocal prefix
+                if peer.exchange is not original or peer.send_count == 0:
+                    return send(peer, data)
+                if not prefix:
+                    prefix = data[:-1]
+                    original.writable = False
+                    _ = source.rename(unavailable)
+                    return len(prefix)
+                _ = send(peer, prefix + data)
+                return len(data)
+
+            def resume_write() -> None:
+                original.writable = True
+
+            transport.on_selector_timeout = resume_write
+            with (patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
+                  patch.object(client, "DefaultSelector", side_effect=transport.selector),
+                  patch.object(ScriptSocket, "send", write), redirect_stderr(io.StringIO())):
+                self.assertEqual(client.service_admit(request, restore_origin, timing), grant)
+
+            self.assertEqual(transport.attempts, [0, 2])
+            self.assertEqual([peer.send_count for peer in transport.sockets], [2, 1])
+            refreshed = replace(request, landing_repository=LANDING_REPOSITORY)
+            self.assertEqual(transport.requests, [request, refreshed, refreshed])
 
     def test_a_refreshed_test_waits_for_the_landing_when_its_origin_becomes_readable(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture, patch.object(client, "CLOCK", fixture.clock):

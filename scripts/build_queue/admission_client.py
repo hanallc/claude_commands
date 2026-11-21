@@ -1139,7 +1139,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
     had_wait = restarted = estimate_pending = False
     waiting_callback: tuple[socket.socket, wire.Wait] | None = None
     refreshing: EstimateRefresh | None = None
-    refreshed_write: tuple[socket.socket, AdmissionRequest] | None = None
+    refreshed_write: socket.socket | None = None
     answered_expiry = -math.inf
     lookup_id = 0
     history_request = wire.BuildHistoryRequest(code_version=LOADED_ADMISSION_CODE_VERSION)
@@ -1185,12 +1185,10 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         if sockets.terminal() is None:
             sockets.drain(request)
         if refreshed_write is not None:
-            written_peer, written_request = cast(tuple[socket.socket, AdmissionRequest], refreshed_write)
-            stream = sockets.streams[written_peer]
+            stream = sockets.streams[refreshed_write]
             if not stream.outgoing:
                 assert refreshing is not None
                 answered_expiry = refreshing.estimated_at
-                request = written_request
                 refreshing = None
                 refreshed_write = None
                 checker.clear()
@@ -1375,12 +1373,13 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                 if (expired := check_failed(error)) is not None:
                     return request, expired
             else:
+                # A reconnect can send this request before the refresh write finishes.
+                request = _with_landing_repository(updated)
                 sockets.drain(request)
                 if sockets.terminal() is None and stream.error is None:
-                    updated = _with_landing_repository(updated)
-                    if (expired := sockets.send(peer, updated, deadline_limit)) is not None:
+                    if (expired := sockets.send(peer, request, deadline_limit)) is not None:
                         return request, expired
-                    refreshed_write = (peer, updated)
+                    refreshed_write = peer
                     sockets.poll(request, 0, deadline_limit)
             continue
 
