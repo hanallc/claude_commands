@@ -1185,7 +1185,7 @@ class MacPromotionPathTests(unittest.TestCase):
                         assert isinstance(pending, main_publish.PendingMacPull)
                         self.assertEqual(pending.text, text)
                         self.assertIn("Mac asleep", pending.reason)
-                        self.assertEqual(len(list((state / "zone").iterdir())), 1)
+                        self.assertEqual({path.name for path in (state / "zone").iterdir()}, {"mac.json", "mac.lock"})
                         if text:
                             self.assertEqual((pending.label, pending.since), (waiting.label, waiting.since))
                     elif text:

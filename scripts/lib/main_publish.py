@@ -1,9 +1,11 @@
 """Commit a main-checkout change, push it, and send or queue the Mac pull."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -362,6 +364,14 @@ def pull_fields(pull: QueuedMacPull) -> dict[str, str]:
     return fields
 
 
+@contextmanager
+def queue_lock(path: Path) -> Generator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def update_queue(change: Callable[[PendingMacPull | NoPendingMacPull], PendingMacPull | NoPendingMacPull]) -> None:
     path = queue_path()
     for _ in range(3):
@@ -374,13 +384,17 @@ def update_queue(change: Callable[[PendingMacPull | NoPendingMacPull], PendingMa
             contents = json.dumps(dict(zone=pending.label, text=pending.text, since=pending.since,
                                        reason=pending.reason, pulls=[pull_fields(pull) for pull in pending.pulls]), indent=2)
             with prepared_replacement(path, contents + "\n", mode=0o600) as prepared:
+                with queue_lock(path):
+                    if queue_bytes(path) == before:
+                        _ = prepared.replace(path)
+                        sync_folder(path.parent)
+                        return
+        else:
+            with queue_lock(path):
                 if queue_bytes(path) == before:
-                    _ = prepared.replace(path)
+                    path.unlink(missing_ok=True)
                     sync_folder(path.parent)
                     return
-        elif queue_bytes(path) == before:
-            path.unlink(missing_ok=True)
-            return
     raise Refusal(f"{path} changed during the Mac queue update")
 
 
@@ -390,10 +404,19 @@ def queue(change: PendingMacPull) -> None:
         return pull.mac, isinstance(pull, MacCheckoutPull)
 
     def merge(previous: PendingMacPull | NoPendingMacPull) -> PendingMacPull:
+        pulls = {} if isinstance(previous, NoPendingMacPull) else {key(pull): pull for pull in previous.pulls}
+        for pull in change.pulls:
+            previous_pull = pulls.get(key(pull))
+            if isinstance(pull, ProductionMacPull) and isinstance(previous_pull, ProductionMacPull):
+                try:
+                    order = land_main.commit_order(pull.source, previous_pull.sha, pull.sha)
+                except (land_main.LandError, OSError) as error:
+                    raise Refusal(f"mac {pull.mac}: cannot replace the queued pull: {error}") from error
+                if order == land_main.CommitOrder.REQUESTED_ANCESTOR:
+                    continue
+            pulls[key(pull)] = pull
         if isinstance(previous, NoPendingMacPull):
-            return change
-        pulls = {key(pull): pull for pull in previous.pulls}
-        pulls.update((key(pull), pull) for pull in change.pulls)
+            return replace(change, pulls=tuple(pulls.values()))
         if not change.text and previous.text:
             return replace(previous, reason=change.reason, pulls=tuple(pulls.values()))
         return replace(change, pulls=tuple(pulls.values()))

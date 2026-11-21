@@ -49,6 +49,7 @@ from scripts.production.production_lifecycle_test_support import LifecycleFixtur
 from scripts.production.merge_checkpoint_test_support import save_promotion_verdict
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.lib import land_main
 from scripts.lib.atomic_file import prepared_replacement
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
@@ -956,8 +957,8 @@ class LifecycleTests(LifecycleFixture):
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
-        for hook_fails in (False, True):
-            with self.subTest(installed="newer integration commit", hook_fails=hook_fails):
+        for hook_state in ("done", "equal pending", "newer pending", "newer completion"):
+            with self.subTest(installed="newer integration commit", hook=hook_state):
                 base = self.git("rev-parse", "HEAD", cwd=destination)
                 earlier = self.git("commit-tree", "HEAD^{tree}", "-p", base, "-m", "Requested promotion")
                 later = self.git("commit-tree", "HEAD^{tree}", "-p", earlier, "-m", "Newer integration commit")
@@ -965,7 +966,7 @@ class LifecycleTests(LifecycleFixture):
                 _ = self.git("fetch", "origin", "production", cwd=destination)
                 _ = self.git("merge", "--ff-only", later, cwd=destination)
                 hold = destination / ".git/hold-hook"
-                if hook_fails:
+                if hook_state != "done":
                     hold.touch()
                 destinations = production_doc.PromoteTo((destination,), production_doc.NoMac())
                 with (mock.patch.dict(os.environ, self.env, clear=True), production_paths(self.env),
@@ -975,21 +976,52 @@ class LifecycleTests(LifecycleFixture):
                                                          approval=publication.CollectedCi(self.doc),
                                                          label="fixture checkpoint", local_only=True)
                 self.assertIn(f"{destination} main at {earlier}; local main remains at {later}", output.getvalue())
-                if hook_fails:
-                    failure, = [line for line in output.getvalue().splitlines() if "rerun: " in line]
-                    self.assertIn("post-push hook: failed (exit 9)", failure)
-                    command = failure.split("rerun: ", 1)[1]
-                    self.assertIn(f"LANDED_SHA={earlier}", command)
-                    hold.unlink()
-                    retry = subprocess.run(["bash", "-c", command], cwd=self.checkout, env=self.env,
-                                           capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-                    self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
-                    self.assertIn("post-push hook: done", retry.stdout)
-                else:
-                    self.assertIn("post-push hook: done", output.getvalue())
-                self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], earlier)
                 self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
                 self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
+                runs = destination / ".git/hook-runs"
+                if hook_state == "done":
+                    self.assertIn("post-push hook: done", output.getvalue())
+                    self.assertEqual(runs.read_text().splitlines()[-1], earlier)
+                    continue
+                failure, = [line for line in output.getvalue().splitlines() if "rerun: " in line]
+                self.assertIn("post-push hook: failed (exit 9)", failure)
+                retry_command = failure.split("rerun: ", 1)[1]
+                self.assertIn(f"LANDED_SHA={earlier}", retry_command)
+
+                def retry() -> subprocess.CompletedProcess[str]:
+                    return subprocess.run(["bash", "-c", retry_command], cwd=self.checkout, env=self.env,
+                                          capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+
+                if hook_state == "equal pending":
+                    hold.unlink()
+                    result = retry()
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("post-push hook: done", result.stdout)
+                    self.assertEqual(runs.read_text().splitlines()[-1], earlier)
+                    completed = runs.read_bytes()
+                    result = retry()
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("post-push hook: skipped", result.stdout)
+                    self.assertEqual(runs.read_bytes(), completed)
+                    continue
+
+                record = destination / ".git/post-push-completed"
+                if hook_state == "newer pending":
+                    with mock.patch.dict(os.environ, self.env, clear=True):
+                        landed = land_main.land(destination, later)
+                    self.assertIsInstance(landed.hook, land_main.HookFailed)
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), later)
+                    refusal = f"origin/main has a newer publication {later}"
+                else:
+                    # Simulate the completion record left by a remote rewind.
+                    _ = record.write_text(later + "\n", encoding="utf-8")
+                    refusal = f"the hook completion record has a newer commit {later}"
+                hold.unlink()
+                before = runs.read_bytes(), record.read_bytes()
+                refused = retry()
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn(refusal, refused.stderr)
+                self.assertEqual((runs.read_bytes(), record.read_bytes()), before)
 
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()

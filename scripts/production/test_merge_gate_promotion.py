@@ -268,19 +268,34 @@ sys.meta_path.insert(0, NoRepositoryModules())
             landed.assert_called_once_with(self.main, self.base)
 
     def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
-        for route in ("legacy", "enrolled", "enroll-after-failure", "legacy main checkpoint"):
+        routes = ("legacy", "enrolled", "enroll-after-failure", "legacy main checkpoint",
+                  "checkpoint branch mismatch", "promote-only branch mismatch")
+        for route in routes:
             with self.subTest(route=route):
                 if route != "legacy":
                     self.restore_fixture(self.suites)
-                if route == "legacy main checkpoint":
-                    self.check_legacy_main_checkpoint()
+                if route in ("legacy main checkpoint", "checkpoint branch mismatch", "promote-only branch mismatch"):
+                    self.check_legacy_main_route(route)
                 else:
                     self.check_promotion_retry(route)
 
-    def check_legacy_main_checkpoint(self) -> None:
+    def check_legacy_main_route(self, route: str) -> None:
         _ = self.git(self.main, "switch", "--detach", "main")
         _ = self.git(self.checkout, "switch", "main")
-        result = super().run_gate("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
+        options = ("--merge-branch", "main", "--main-repo", str(self.checkout))
+        if route != "legacy main checkpoint":
+            if route == "promote-only branch mismatch":
+                result = self.run_promote_only(*options)
+            else:
+                result = super().run_gate("--promote", *options)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(f"{self.quiet_production}: expected merge branch integration", result.stderr)
+            self.assertEqual(self.git(self.checkout, "rev-parse", "refs/heads/main"), self.base)
+            self.assertEqual(self.git(self.origin, "rev-parse", "refs/heads/main"), self.base)
+            self.assertEqual(self.calls(), [])
+            return
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
+        result = super().run_gate("--promote", *options)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         tip = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)

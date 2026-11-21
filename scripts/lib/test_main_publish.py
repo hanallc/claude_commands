@@ -1,6 +1,7 @@
 """Publishing commits only its file, protects main, and preserves queued Mac pulls."""
 from __future__ import annotations
 
+import fcntl
 import os
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr
@@ -711,18 +712,72 @@ class MainPublishTests(PublicationTestCase):
             main_publish.clear_pull_only()
             self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
 
+        older = repo.head()
+        _ = (repo.checkout / "other.txt").write_text("newer\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "newer publication")
+        newer = repo.head()
+        _ = repo.git(repo.checkout, "push", "origin", "main")
+        mac = PurePosixPath("~/production")
+        old_pull = main_publish.ProductionMacPull(mac, repo.checkout, older)
+        new_pull = main_publish.ProductionMacPull(mac, repo.checkout, newer)
+        original_read = main_publish.queue_bytes
+
+        for action in ("competing writes", "clear during newer write"):
+            with self.subTest(queue=action):
+                main_publish.queue_pull_only("older", "Mac asleep", pulls=(old_pull,))
+                reads = 0
+                newer_writes = False
+
+                def read_with_competitor(path: Path) -> bytes:
+                    nonlocal reads, newer_writes
+                    content = original_read(path)
+                    if newer_writes:
+                        return content
+                    reads += 1
+                    if reads == 1:
+                        newer_writes = True
+                        try:
+                            main_publish.queue_pull_only("newer", "Mac asleep", pulls=(new_pull,))
+                        finally:
+                            newer_writes = False
+                    if reads == 2:
+                        with path.with_suffix(".lock").open("a") as contender:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return content
+
+                with mock.patch.object(main_publish, "queue_bytes", side_effect=read_with_competitor):
+                    if action == "competing writes":
+                        main_publish.queue_pull_only("older", "Retry", pulls=(old_pull,))
+                    else:
+                        main_publish.clear_mac_pull(old_pull)
+                self.assertGreaterEqual(reads, 3)
+                pending = main_publish.read_queue()
+                assert isinstance(pending, main_publish.PendingMacPull)
+                self.assertEqual(pending.pulls, (new_pull,))
+                main_publish.clear_mac_pull(new_pull)
+
         with self.subTest(queue="legacy pull with a zone notice"):
             _ = queue_path.write_text(json.dumps({
                 "zone": "America/New_York", "text": "A waiting zone notice", "since": "2026-11-01",
-                "reason": "Mac asleep", "pulls": [{"mac": "~/.claude", "source": str(repo.checkout)}],
+                "reason": "Mac asleep", "pulls": [
+                    {"mac": "~/.claude", "source": str(repo.checkout)},
+                    {"mac": str(mac), "source": str(repo.checkout), "kind": "production", "sha": newer},
+                ],
             }))
             result = zone.drain(repo.checkout, pulled=None)
             self.assertIn("record the published commit", " ".join(result))
-            self.assertFalse(repo.ssh_log.exists())
+            ssh_calls = repo.ssh_log.read_text()
+            self.assertEqual(ssh_calls.splitlines().count("mac"), 1)
+            self.assertIn(f"cd {main_publish.remote_path(mac)}", ssh_calls)
+            self.assertIn(newer, ssh_calls)
+            self.assertNotIn("broadcast.py", ssh_calls)
             pending = main_publish.read_queue()
             self.assertIsInstance(pending, main_publish.PendingMacPull)
             assert isinstance(pending, main_publish.PendingMacPull)
             self.assertEqual(pending.text, "A waiting zone notice")
+            self.assertEqual(pending.pulls, (main_publish.MacPullAwaitingPublication(
+                main_publish.DEFAULT_MAC_CHECKOUT, repo.checkout),))
 
 
 if __name__ == "__main__":

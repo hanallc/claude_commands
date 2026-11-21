@@ -162,6 +162,7 @@ class GateArguments(argparse.Namespace):
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     enrolled: bool = False
+    legacy_direct_main: bool = False
 
 
 class SuiteMode(Enum):
@@ -2062,7 +2063,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             print(land_main.hook_report(landed.hook), flush=True)
 
         try:
-            if promotion.is_main_branch(args.merge_branch) and not args.enrolled:
+            if args.legacy_direct_main:
                 published = promotion.publish_legacy_main(source, target, install)
             else:
                 document = change_review.production_doc(args.production)
@@ -2200,7 +2201,6 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused(refusal)
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
-    legacy_direct_main = promotion.is_main_branch(args.merge_branch) and not args.enrolled
     if isinstance(recovery, GateRecovery):
         recovery.rollback = baseline
         recovery.rollback_head = baseline
@@ -2251,7 +2251,7 @@ def merge_checkpoint(args: GateArguments) -> int:
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
-    if legacy_direct_main:
+    if args.legacy_direct_main:
         _ = checked_git(repo, "push", "origin", "main")
     else:
         from scripts.production.checkpoint_gate import Stop
@@ -2272,20 +2272,25 @@ def merge_checkpoint(args: GateArguments) -> int:
 
 def gate_production(args: GateArguments) -> Path:
     """Resolve the publication checkout from the exact staff document."""
-    from scripts.production.production_doc import EnrolledPaths, Refusal, production_field, resolve_production_paths
+    from scripts.production.production_doc import EnrolledPaths, LegacyProduction, Refusal, production_field, resolve_production_paths
 
     try:
         document = change_review.production_doc(args.production)
         paths = resolve_production_paths(document)
+        merge_branch = production_field(document.read_text(encoding="utf-8").splitlines(), "Merge branch")
+        if args.merge_branch != merge_branch:
+            raise GateRefused(f"{document}: expected merge branch {merge_branch}")
+        args.legacy_direct_main = isinstance(paths, LegacyProduction) and merge_branch == "main"
         if isinstance(paths, EnrolledPaths):
-            merge_branch = production_field(paths.live_doc.read_text(encoding="utf-8").splitlines(), "Merge branch")
-            if args.merge_branch != merge_branch:
-                raise GateRefused(f"{paths.live_doc}: expected merge branch {merge_branch}")
+            if promotion.is_main_branch(merge_branch):
+                raise GateRefused(f"{document}: main is not an integration branch")
             args.repo = str(paths.integration)
             args.main_repo = str(paths.main)
             args.enrolled = True
         return document
-    except (change_review.ChangeReviewError, Refusal) as error:
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
+    except Refusal as error:
         raise GateRefused(str(error)) from error
 
 

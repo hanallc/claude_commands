@@ -599,7 +599,7 @@ class MergeGateFixture(unittest.TestCase):
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
-        self.write(self.quiet_production, "# quiet\n")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `integration`\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
             _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
         _ = self.git(self.root, "init", "--bare", str(self.origin))

@@ -157,9 +157,11 @@ def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
     if isinstance(change, main_publish.NoPendingMacPull):
         return []
     ssh_program = os.environ.get("ZONE_SSH") or "ssh"
+    messages: list[str] = []
     for pull in sorted(change.pulls, key=lambda item: isinstance(item, main_publish.MacCheckoutPull)):
         if isinstance(pull, main_publish.MacPullAwaitingPublication):
-            return [f"mac {pull.mac}: rerun production promotion to record the published commit"]
+            messages.append(f"mac {pull.mac}: rerun production promotion to record the published commit")
+            continue
         if isinstance(pull, main_publish.ProductionMacPull):
             outcome = main_publish.run_mac_pull(main_publish.production_pull_command(pull), ssh_program=ssh_program)
         elif pull.mac == pulled:
@@ -168,11 +170,15 @@ def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
         else:
             source = pull.source if isinstance(pull.source, Path) else checkout
             if source is None:
-                return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
+                messages.append(f"mac: the {change.label} change waits since {change.since}; run /zone on natedev")
+                continue
             outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=ssh_program)
         if isinstance(outcome, main_publish.MacPullFailed):
-            return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
+            messages.append(f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}")
+            continue
         main_publish.clear_mac_pull(pull)
+    if messages:
+        return messages
     delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]

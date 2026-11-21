@@ -18,6 +18,7 @@ import argparse
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum, auto
 import hashlib
 import os
 from pathlib import Path
@@ -172,6 +173,32 @@ def checked_git(source: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+class CommitOrder(Enum):
+    SAME_COMMIT = auto()
+    REQUESTED_DESCENDANT = auto()
+    REQUESTED_ANCESTOR = auto()
+
+
+def commit_order(source: Path, current: str, requested: str) -> CommitOrder:
+    """Compare exact commits in one repository. Refuse unrelated histories."""
+    for sha in dict.fromkeys((current, requested)):
+        resolved = checked_git(source, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}")
+        if resolved != sha:
+            raise LandError(f"{source}: expected a full commit SHA, got {sha}")
+    if current == requested:
+        return CommitOrder.SAME_COMMIT
+    for ancestor, descendant, order in ((current, requested, CommitOrder.REQUESTED_DESCENDANT),
+                                        (requested, current, CommitOrder.REQUESTED_ANCESTOR)):
+        result = subprocess.run(["git", "-C", str(source), "merge-base", "--is-ancestor", ancestor, descendant],
+                                capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return order
+        if result.returncode != 1:
+            detail = result.stderr.strip() or f"git merge-base exited {result.returncode}"
+            raise LandError(f"{source}: {detail}")
+    raise NotFastForward(f"{source}: commits {current} and {requested} have diverged")
+
+
 @contextmanager
 def exact_hook_checkout(source: Path, sha: str, *, hook_digest: str = "") -> Generator[Path]:
     """Supply the tracked hook and files from the recorded commit."""
@@ -196,11 +223,26 @@ def exact_hook_checkout(source: Path, sha: str, *, hook_digest: str = "") -> Gen
 
 def retry_hook(source: Path, sha: str, branch: str, hook_digest: str) -> HookAbsent | HookDone | HookSkipped | HookFailed:
     with main_push_lock.main_push_lock(source):
-        if checked_git(source, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}") != sha:
-            raise LandError("hook retry requires the full published commit SHA")
         _ = checked_git(source, "fetch", "origin", f"refs/heads/{branch}")
-        _ = checked_git(source, "merge-base", "--is-ancestor", sha, "FETCH_HEAD")
+        published = checked_git(source, "rev-parse", "--verify", "FETCH_HEAD")
+        order = commit_order(source, published, sha)
+        if order == CommitOrder.REQUESTED_ANCESTOR:
+            raise LandError(f"origin/{branch} has a newer publication {published}; hook retry for {sha} refused")
+        if order == CommitOrder.REQUESTED_DESCENDANT:
+            raise LandError(f"origin/{branch} has not published {sha}; hook retry refused")
         record = Path(checked_git(source, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "post-push-completed"
+        try:
+            completed = record.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        except UnicodeError as error:
+            raise LandError(f"{record}: {error}") from error
+        else:
+            order = commit_order(source, completed, sha)
+            if order == CommitOrder.SAME_COMMIT:
+                return HookSkipped()
+            if order == CommitOrder.REQUESTED_ANCESTOR:
+                raise LandError(f"the hook completion record has a newer commit {completed}; hook retry for {sha} refused")
         with exact_hook_checkout(source, sha, hook_digest=hook_digest) as exact:
             hook = exact / HOOK_PATH
             if not hook.is_file():

@@ -456,7 +456,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
         doc = self.root / "production.md"
-        self.write(doc, "# p\n")
+        self.write(doc, "# p\n\n- **Merge branch:** `integration`\n")
         _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
         with green_ci_after_merge(self):

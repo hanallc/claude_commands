@@ -1217,8 +1217,10 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path,
         attempt += 1
         if attempt == tries:
             if result.returncode == 255 and match is None:
-                main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result),
-                                             pulls=(pull,))
+                try:
+                    main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result), pulls=(pull,))
+                except main_publish.Refusal as error:
+                    raise checkpoint_gate.Stop("promote", "held", str(error), "repair the Mac queue and retry") from error
                 _ = mac_wake.start()
                 return main_publish.MacPullPending()
             raise checkpoint_gate.Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
