@@ -8,6 +8,26 @@ Natedev's agent-notes job checks Claude and Codex weekly readings. Its notes and
 
 At 2% weekly or below, an in-use Claude account with any uncovered group sends one phone reminder per episode. Its title is “Claude work on claude3 may stop”, its body is “claude3 has 2% of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.” and its action is “In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2.” Only entries targeting another account and backed by readable role history count as coverage; entries covering every group on the account suppress it; accounts used only by ungrouped sessions send nothing. A failed delivery retries at the next check; success never repeats within the episode. Missing readings preserve the episode; known recovery or reset closes it silently.
 
+Natedev sends both Claude quota pushes.
+The quota check forecasts when each in-use Claude account will run out of weekly usage.
+It divides the weekly percentage left by the recent rate and adds that duration to the reading's time.
+The forecast needs a positive rate, a recent reading, and a known future reset.
+The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry_alert_hours` away.
+Scheduled moves suppress the push when they cover every group on that account.
+Consumed moves give no coverage.
+The push title is `<account> runs out <time>`, with the forecast time in the user's zone.
+Its action is `Type /agents move <role> <account>`, and it has no body.
+The repeat interval starts at the attempt time and uses `claude_expiry_repeat_hours`.
+Both keys are in `config/showrunners.conf`.
+The lead time is 12 hours and the repeat interval is 2 hours.
+During silence, the quota check skips the expiry push and saves no attempt.
+The first quota check after silence uses the current forecast.
+A clear send failure removes the attempt so the next check can retry.
+An unconfirmed result keeps the attempt until the repeat interval ends.
+A forecast outside the alert window, a missing reading, or scheduled coverage suppresses the push.
+The next weekly window has its own repeat interval.
+The expiry template requires current approval before sending.
+
 Claude sends no weekly session alert, 30-minute repeat, showrunner relay, `Quota restored:` notice or instruction to start no new work. `/quota_ack` and its acknowledgement state are removed. `/quota_refresh` still refreshes readings when the user reports a reset; routing restoration is recorded in the moves journal without a session notice. A scheduled move consumes its entry when its group selection is recorded, keeps the usual safe shutdown/showrunner notices, and sends no phone alert.
 
 ## Codex notices

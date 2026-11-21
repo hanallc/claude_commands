@@ -49,6 +49,31 @@ The agent-notes job runs these parts in separate processes:
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
 
+## Claude quota expiry pushes
+
+Natedev sends the Claude low quota and expiry pushes.
+The quota check uses saved weekly readings from `~/.local/state/agent-notes/readings.jsonl`.
+It divides the remaining percentage by the weighted use rate from `run_out.py`.
+It adds that duration to the time of the reading.
+The newest reading must be within the rate code's maximum gap.
+An in-use Claude account qualifies only if the forecast falls before its weekly reset and within the configured lead time.
+The lead time check uses a strict limit.
+Both pushes use the same scheduled move coverage rule.
+Role history removes consumed entries from coverage.
+The phone push title names the account and the estimated time in the user's zone, such as `claude3 runs out Sun 11-22 07:00 EST`.
+Its action is `Type /agents move <role> <account>`, and it has no body.
+
+`config/showrunners.conf` sets `claude_expiry_alert_hours=12` and `claude_expiry_repeat_hours=2`.
+Both settings require whole numbers from 1 to 168, including host overrides.
+The quota check skips expiry pushes during silence and saves no attempt.
+The first quota check after silence uses the current forecast.
+Before sending, the check saves the attempt and its weekly reset under `claude_expiry`.
+The repeat interval starts at the attempt time.
+A clear send failure removes the attempt so the next check can retry.
+An unconfirmed result keeps the attempt until the repeat interval ends.
+Changes to the forecast or scheduled coverage keep the attempt for that weekly window.
+The expiry template needs a current approval and uses the approved text without live review.
+
 ## Preventive login reminders
 
 The `Part.LOGINS` timer part calls `login_sittings.run` in its own child process.
