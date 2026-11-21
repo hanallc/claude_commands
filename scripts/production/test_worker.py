@@ -3497,13 +3497,13 @@ class WorkerCommandTests(unittest.TestCase):
                 progress_history.save_dispatch_delivery(self.run_dir, instance,
                     progress_history.DispatchDelivery("Retry the review.", instance, str(destination)))
 
-                def refuse_after_redirect() -> worker.ExitCode:
+                def refuse_after_redirect(*_args: object, **_kwargs: object) -> worker.ExitCode:
                     folder.rmdir()
                     folder.symlink_to(integration, target_is_directory=True)
                     return worker.ExitCode.REFUSED
 
                 with (patch.object(worker_panes, "observe_worker", return_value=opened),
-                      patch.object(worker, "dispatch_turn", side_effect=lambda *_args, **_kwargs: refuse_after_redirect()),
+                      patch.object(worker, "dispatch_turn", side_effect=refuse_after_redirect),
                       patch.object(worker, "_dispatch_notice"), redirect_stderr(io.StringIO()) as errors):
                     self.assertEqual(worker.finish_dispatch(owner.id, row.id, self.run_dir, instance, instance),
                                      worker.ExitCode.REFUSED)
