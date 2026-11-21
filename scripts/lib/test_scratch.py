@@ -2859,6 +2859,7 @@ print(scratch.target('gate:proof', 'tree', False))
                         peer_paths.append(path)
                         _ = (path / "peer.txt").write_text("peer output")
             kept = peer_paths[0]
+            # Task end uses the recorded paths after TMPDIR changes.
             task = scratch.worker_task(worker.id)
             output, report = io.StringIO(), io.StringIO()
             with (mock.patch.dict(os.environ, {"TMPDIR": str(self.base / "next-tmp")}),
@@ -2872,15 +2873,17 @@ print(scratch.target('gate:proof', 'tree', False))
             holds = scratch.holds()
             for path in made:
                 self.assertEqual((path / "trial.txt").read_text(), "worker output")
-                self.assertGreater(holds[str(path)]["ended"], 0)
                 record = scratch.task_of(path)
                 assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.task, task)
                 self.assertTrue(scratch.task_has_end_evidence(record))
+                self.assertEqual(holds[str(path)]["ended"], record.fields["ended"])
             self.assertEqual((kept / "peer.txt").read_text(), "peer output")
-            self.assertEqual(holds[str(kept)]["ended"], 0)
             peer_record = scratch.task_of(kept)
             assert isinstance(peer_record, copy_record.Registered)
+            self.assertEqual(peer_record.task, scratch.worker_task(peer.id))
             self.assertFalse(scratch.task_has_end_evidence(peer_record))
+            self.assertEqual(holds[str(kept)]["ended"], 0)
 
     def test_worker_creation_refuses_a_caller_without_a_worker_row(self) -> None:
         for identity in (MAKER_ID, fixture_runtime_id("unknown-worker")):
