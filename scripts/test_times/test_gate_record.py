@@ -68,6 +68,10 @@ class GateRecordTests(unittest.TestCase):
             connection.execute("""INSERT INTO gate_modules (run_id, suite, module, attempt, wall_s, status, restart)
                                 VALUES (?, ?, ?, 1, ?, ?, '')""", (run, suite, module, seconds, status)).close()
         modules = ["scripts/lib/test_a.py", "scripts/lib/test_b.py", "scripts/lib/nested/test_c.py"]
+        self.assertEqual(gate_record.passing_module_wall_medians(
+            connection, 8, [*modules, "lib/test_bad.py", "lib/test_missing.py"], 3),
+            dict(zip(modules, (8.0, 7.0, 6.0), strict=True)))
+        self.assertEqual(gate_record.passing_module_wall_medians(connection, 16, modules, 3), {modules[1]: 999.0})
         self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 2, True), gate_record.GateTimeLimit(21))
         self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 8, True), gate_record.GateTimeLimit(16))
         self.assertIsInstance(gate_record.history_time_limit(connection, 8, ["lib/test_bad.py"], 2, True), gate_record.NoGateTimeLimit)

@@ -6,10 +6,12 @@ from scripts.build_queue import queue_place
 import unittest
 import io
 import os
+import sqlite3
 import subprocess
 from typing import final
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from unittest import mock
+from scripts.buildlog import index
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, gate_suites
@@ -20,6 +22,76 @@ from pathlib import Path
 
 @final
 class MergeGateRerunsTests(GateSuitesFixture):
+    def set_module_time_history(self, rows: dict[str, tuple[float, ...]]) -> None:
+        config = Path(self.environment["CONF_DIR"])
+        _ = write_config_fixture(config / "gate.conf",
+                                 "GATE_TIME_LIMIT_FACTOR=4\nrerun_time_limit_floor_seconds=3")
+        _ = write_config_fixture(config / "test_times.conf", "TOP_RUNS=3")
+        database = index.index_path_in(Path(self.environment["BUILDLOG_DIR"]))
+        with closing(sqlite3.connect(database)) as connection, connection:
+            for name, walls in rows.items():
+                suite, module = name.split("/", 1)
+                for attempt, wall in enumerate(walls):
+                    run = f"{name}-{attempt}"
+                    connection.execute("""INSERT INTO gate_runs
+                        (id, started_at, step, vcpus, status, aborted, selection)
+                        VALUES (?, ?, 'gate', ?, 0, 0, 'full')""",
+                        (run, run, os.cpu_count() or 1)).close()
+                    connection.execute("""INSERT INTO gate_modules
+                        (run_id, suite, module, attempt, wall_s, status, restart)
+                        VALUES (?, ?, ?, 1, ?, 0, '')""", (run, suite, module, wall)).close()
+
+    @gate_suites("hooks", "lib")
+    def test_named_module_time_limits_use_the_median_floor_or_default(self) -> None:
+        self.set_module_time_history({"hooks/test_first.py": (2.0, 5.0, 20.0),
+                                      "lib/test_first.py": (0.5,)})
+        named_limits = {
+            "hooks/test_first.py": gate.MeasuredModuleTimeLimit(4, 5),
+            "lib/test_first.py": gate.FloorModuleTimeLimit(3),
+            "lib/test_second.py": gate.DEFAULT_MODULE_TIME_LIMIT,
+        }
+        named = [word for name in named_limits for word in ("--module", name)]
+        cases = (
+            ("named", named, named_limits),
+            ("full", ["--full"], dict.fromkeys(named_limits, gate.DEFAULT_MODULE_TIME_LIMIT)),
+            ("explicit", [*named, "--module-time-limit-s", "1800"],
+             dict.fromkeys(named_limits, gate.ExplicitModuleTimeLimit(1800))),
+        )
+        limits: dict[str, gate.ModuleTimeLimit] = {}
+        finish = gate.finish_gate_job
+
+        def capture_limit(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            limits[f"{job.suite}/{job.module}"] = job.time_limit
+            return finish(job, status)
+
+        with mock.patch.object(gate, "finish_gate_job", side_effect=capture_limit):
+            for label, options, expected in cases:
+                limits.clear()
+                result = self.run_gate("--tests-only", *options)
+                for name, limit in expected.items():
+                    with self.subTest(run=label, module=name):
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(limits.get(name), limit)
+
+    def test_named_module_stops_at_the_fixture_floor(self) -> None:
+        self.set_module_time_history({"hooks/test_first.py": (0.5,)})
+        self.write(self.checkout / "scripts/hooks/test_first.py", """import os
+from pathlib import Path
+import time
+import unittest
+
+
+class HangingModule(unittest.TestCase):
+    def test_hangs(self) -> None:
+        time.sleep(8)
+        (Path(os.environ["GATE_TEST_STATE"]) / "module-completed").touch()
+""")
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("hooks/test_first.py killed: still running after 3 s, "
+                      + "the module time limit (configured rerun floor)", result.stdout)
+        self.assertFalse((self.state / "module-completed").exists(), result.stdout)
+
     def test_memory_stop_with_a_tripwire_reports_failure_without_a_rerun(self) -> None:
         module = self.checkout / "scripts/hooks/test_first.py"
         self.write(module, module.read_text().replace(
@@ -54,20 +126,25 @@ class MergeGateRerunsTests(GateSuitesFixture):
 
     @gate_suites("lib", "hooks")
     def test_memory_stopped_module_passes_alone_and_messages_name_the_gate(self) -> None:
-        for mode in gate.SuiteMode:
-            with self.subTest(mode=mode):
+        cases = [(mode, True) for mode in gate.SuiteMode] + [(gate.SuiteMode.GATE, False)]
+        for mode, full in cases:
+            with self.subTest(mode=mode, full=full):
                 self.restore_fixture(("lib", "hooks"))
                 self.configure_gate("merge_gate_governor_gib=4")
+                self.set_module_time_history({"hooks/test_first.py": (2.0,)})
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        self.sampling_module_memory({"hooks/test_first.py": (5120.0, 64.0)}), redirect_stdout(output):
-                    run = gate.run_suites(self.checkout, mode=mode, full=True)
+                        self.sampling_module_memory({"hooks/test_first.py": (5120.0, 64.0)}) as started, redirect_stdout(output):
+                    run = gate.run_suites(self.checkout, mode=mode, full=full)
                 self.assertTrue(run.passed, output.getvalue())
                 attempts = [job for job in run.executions if job.suite == "hooks"]
                 self.assertEqual(len(attempts), 2)
                 self.assertNotEqual(attempts[0].returncode, 0)
                 self.assertIn("peak memory 5.000 GiB", attempts[0].killed_for)
                 self.assertEqual(attempts[1].returncode, 0)
+                retry_limit = gate.DEFAULT_MODULE_TIME_LIMIT if full else gate.MeasuredModuleTimeLimit(4, 2)
+                self.assertEqual([job.time_limit for job in started if job.suite == "hooks"],
+                                 [gate.DEFAULT_MODULE_TIME_LIMIT, retry_limit])
                 self.assertEqual([job for job in run.jobs if job.suite == "hooks"], [attempts[-1]])
                 events = self.module_events()
                 self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
@@ -169,12 +246,15 @@ class MergeGateRerunsTests(GateSuitesFixture):
     @gate_suites("lib", "hooks")
     def test_failed_modules_pass_alone_and_keep_first_output_and_times(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
+        self.set_module_time_history({"lib/test_first.py": (2.0, 5.0, 20.0), "lib/test_second.py": (0.5,)})
         self.environment["BUILDLOG_SCOPE"] = "1"
         output = io.StringIO()
         first_results: list[gate.GateJobResult] = []
+        limits: dict[str, list[gate.ModuleTimeLimit]] = {}
         finish = gate.finish_gate_job
 
         def record_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            limits.setdefault(f"{job.suite}/{job.module}", []).append(job.time_limit)
             result = finish(job, status)
             first_results.append(result)
             return result
@@ -186,6 +266,8 @@ class MergeGateRerunsTests(GateSuitesFixture):
         report = output.getvalue()
         self.assertTrue(run.passed, report)
         self.assertEqual(len(run.jobs), self.module_count + 1)
+        self.assertEqual(limits["lib/test_first.py"], [gate.DEFAULT_MODULE_TIME_LIMIT, gate.MeasuredModuleTimeLimit(4, 5)])
+        self.assertEqual(limits["lib/test_second.py"], [gate.DEFAULT_MODULE_TIME_LIMIT, gate.FloorModuleTimeLimit(3)])
         for module in ("test_first.py", "test_second.py"):
             self.assertRegex(report, rf"Rerun alone: lib/{module} passed \(first run exit 1, [\d.]+ s\)")
             self.assertIn(f"--- lib/{module} passed on rerun alone; first run exit=1 ---", report)

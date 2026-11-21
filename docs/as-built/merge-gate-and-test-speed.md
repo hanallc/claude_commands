@@ -602,7 +602,14 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Jobs killed at the module time limit and `types` do not run again.
   If more than `RERUN_LIMIT` (8) ordinary failures qualify, those failures do not run again; one line reports the count.
   Memory stops use their separate retry count even when ordinary failures exceed this limit.
-  Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, memory sampling, and time limit.
+  Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, and memory sampling.
+  On natedev, ordinary reruns, memory-stop reruns, and named module runs use passing module history from the same vCPU count.
+  The limit is the greater of the passing median wall time times `GATE_TIME_LIMIT_FACTOR` and `rerun_time_limit_floor_seconds`.
+  `config/gate.conf` sets the factor to 5.0 and the floor to 120 seconds.
+  A module without passing history uses the default limit of 1800 seconds.
+  Initial jobs, `--full` runs, and nightly runs use the default module limit.
+  An explicit `--module-time-limit-s` applies to every attempt.
+  The stop message gives the limit and its source.
   A pass replaces the first failure and prints `Rerun alone: <suite>/<module> passed (first run exit N, X s)`.
   The report retains the first output under `--- <suite>/<module> passed on rerun alone; first run exit=N ---`.
   A second failure prints both outputs in attempt order.

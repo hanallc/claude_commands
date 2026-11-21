@@ -98,7 +98,7 @@ from scripts.production.affected_modules import (  # noqa: E402
 )
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
-from scripts.buildlog import store  # noqa: E402
+from scripts.buildlog import index, store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.testing_folders import test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -157,6 +157,42 @@ os.execvp(sys.argv[1], sys.argv[1:])
 """
 
 
+@dataclass(frozen=True)
+class DefaultModuleTimeLimit:
+    seconds: float = field(default=DEFAULT_MODULE_TIME_LIMIT_S, init=False)
+    source: str = field(default="default", init=False)
+
+
+@dataclass(frozen=True)
+class ExplicitModuleTimeLimit:
+    seconds: float
+    source: str = field(default="explicit override", init=False)
+
+
+@dataclass(frozen=True)
+class MeasuredModuleTimeLimit:
+    factor: float
+    median_seconds: float
+
+    @property
+    def seconds(self) -> float:
+        return self.factor * self.median_seconds
+
+    @property
+    def source(self) -> str:
+        return f"{self.factor:g} times the passing median of {self.median_seconds:g} s"
+
+
+@dataclass(frozen=True)
+class FloorModuleTimeLimit:
+    seconds: int
+    source: str = field(default="configured rerun floor", init=False)
+
+
+type ModuleTimeLimit = DefaultModuleTimeLimit | ExplicitModuleTimeLimit | MeasuredModuleTimeLimit | FloorModuleTimeLimit
+DEFAULT_MODULE_TIME_LIMIT = DefaultModuleTimeLimit()
+
+
 @dataclass
 class GateArguments(argparse.Namespace):
     """Typed command-line boundary; merge fields are validated before use."""
@@ -175,7 +211,7 @@ class GateArguments(argparse.Namespace):
     ssh: str = ""
     mac_host: str = ""
     mac_repo: str = ""
-    module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
+    module_time_limit_s: float | None = None
     affected: bool = False
     tests_only: bool = False
     promote_only: bool = False
@@ -204,6 +240,11 @@ SHARED_MACHINE = SharedMachine()
 
 
 @dataclass(frozen=True)
+class NamedModules(SelectedModules):
+    """Run modules selected by the --module arguments."""
+
+
+@dataclass(frozen=True)
 class GateJobRequest:
     """A job to start, with its original path retained for holds and retries."""
     suite: str
@@ -229,7 +270,9 @@ class RunningGateJob:
     kind: GateJobKind = GateJobKind.TEST_MODULE
     cpu_seconds: float = 0.0
     memory_stopped: bool = False
+    time_stopped: bool = False
     folder_cleanup: ExitStack = field(default_factory=ExitStack)
+    time_limit: ModuleTimeLimit = DEFAULT_MODULE_TIME_LIMIT
 
 
 @dataclass(frozen=True)
@@ -1025,19 +1068,46 @@ def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
         kill_job_group(job)
 
 
-def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
-                    targeted: bool) -> gate_record.GateTimeLimit | gate_record.NoGateTimeLimit:
-    """Read the report index and rebuild an index without the vCPU column."""
-    from scripts.buildlog import index
-
+@contextmanager
+def gate_history() -> Generator[sqlite3.Connection]:
+    """Open the current gate index, or an empty index when no records exist."""
     path = index.index_path()
     if not path.exists() and not any(store.root().glob("*/*.jsonl")):
         with closing(sqlite3.connect(":memory:")) as connection:
             index.create_schema(connection)
-            return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
+            yield connection
+        return
     _ = index.update()
     with closing(sqlite3.connect(index.read_only_path_uri(path), uri=True)) as connection:
+        yield connection
+
+
+def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
+                    targeted: bool) -> gate_record.GateTimeLimit | gate_record.NoGateTimeLimit:
+    with gate_history() as connection:
         return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
+
+
+def read_rerun_module_time_limits(modules: Sequence[str]) -> dict[str, ModuleTimeLimit]:
+    limits: dict[str, ModuleTimeLimit] = dict.fromkeys(modules, DEFAULT_MODULE_TIME_LIMIT)
+    try:
+        count = conf.read("test_times").whole("TOP_RUNS")
+        with gate_history() as connection:
+            medians = gate_record.passing_module_wall_medians(connection, os.cpu_count() or 1, modules, count)
+        if not medians:
+            return limits
+        settings = conf.read("gate")
+        factor = settings.number("GATE_TIME_LIMIT_FACTOR")
+        floor = FloorModuleTimeLimit(settings.whole("rerun_time_limit_floor_seconds"))
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
+    except (OSError, sqlite3.Error) as error:
+        print(f"Module time limits use the default: cannot read the gate index ({error})", flush=True)
+        return limits
+    for name, median in medians.items():
+        measured = MeasuredModuleTimeLimit(factor, median)
+        limits[name] = measured if measured.seconds >= floor.seconds else floor
+    return limits
 
 
 def failure_log_tail(output: str) -> str:
@@ -1056,6 +1126,7 @@ def stop_at_time_limit(running: Sequence[RunningGateJob], failed: Sequence[GateJ
     names = ", ".join(f"{job.suite}/{job.module}" for job in running) or "(none)"
     report = f"time limit: limit {limit:g} s; elapsed {elapsed:.3f} s; running modules: {names}"
     for job in running:
+        job.time_stopped = True
         job.killed_for = report
     stop_gate_jobs(running)
     details = [f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{failure_log_tail(job.output)}"
@@ -1172,7 +1243,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    if (job.memory_stopped or job.killed_for.startswith("time limit")) and status == 0:
+    if (job.memory_stopped or job.time_stopped) and status == 0:
         status = 1
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
@@ -1425,7 +1496,7 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
 
 
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
-               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
+               module_time_limit_s: float | None = None,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
@@ -1442,7 +1513,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         raise GateRefused(str(error)) from error
     if isinstance(machine, WholeMachine):
         max_running_jobs = os.cpu_count() or 1
-    if module_time_limit_s <= 0:
+    initial_limit = (DEFAULT_MODULE_TIME_LIMIT if module_time_limit_s is None
+                     else ExplicitModuleTimeLimit(module_time_limit_s))
+    if not math.isfinite(initial_limit.seconds) or initial_limit.seconds <= 0:
         raise GateRefused("module time limit must be positive")
     if max_running_jobs <= 0:
         raise GateRefused("running job limit must be positive")
@@ -1530,6 +1603,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     history = read_history(history_path) if shared else {}
     pending = deque(GateJobRequest(suite, path, test_module_name(repo, suite, path))
                     for suite, path in (module_order(modules, timings, repo) if not reused else []))
+    use_rerun_history = module_time_limit_s is None and not full
+    rerun_time_limits: dict[str, ModuleTimeLimit] = {}
+    if use_rerun_history and isinstance(selected, NamedModules) and pending:
+        rerun_time_limits = read_rerun_module_time_limits([f"{job.suite}/{job.module}" for job in pending])
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
     executions: list[GateJobResult] = []
@@ -1609,8 +1686,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 for job in running[:]:
                     reap_gate_job(job)
                     status = job.process.returncode
-                    if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
-                        job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
+                    limit = job.time_limit
+                    if status is None and not job.killed_for and time.monotonic() - job.started >= limit.seconds:
+                        job.time_stopped = True
+                        job.killed_for = (f"killed: still running after {limit.seconds:g} s, "
+                                          f"the module time limit ({limit.source})")
                         print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                         stop_gate_jobs([job])
                         status = job.process.returncode
@@ -1750,6 +1830,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                             job = start_gate_job(suite, path, argv, repo, job_environment, log)
                         job.folder_cleanup = folder_cleanup
                         job.cpu_slot = slot
+                        job.time_limit = rerun_time_limits.get(f"{suite}/{request.module}", initial_limit)
                         running.append(job)
                         if not shared:
                             print(f"Starting module: {job.suite}/{job.module}", flush=True)
@@ -1773,6 +1854,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     for result in [*failed, *memory_failed]:
                         _ = first_runs.setdefault((result.suite, result.module), result)
                         pending.append(requests[(result.kind, result.suite, result.module)])
+                    if use_rerun_history and pending and not rerun_time_limits:
+                        rerun_time_limits = read_rerun_module_time_limits(
+                            [f"{job.suite}/{job.module}" for job in pending])
                     if pending and reservation is not None:
                         progress_total = 0
                         progress_profile.clear_counter(reservation.sidecar)
@@ -2173,7 +2257,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
-            suites = run_gate_suites(repo, module_time_limit_s=float(args.module_time_limit_s),
+            suites = run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s,
                                      source="checkpoint", full=args.full, gate_job=args.gate_job)
         finally:
             if previous_unit is None:
@@ -2796,7 +2880,8 @@ def nightly(args: GateArguments) -> int:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
-                                 module_time_limit_s=args.module_time_limit_s, full=True)
+                                 module_time_limit_s=(DEFAULT_MODULE_TIME_LIMIT_S if args.module_time_limit_s is None
+                                                      else args.module_time_limit_s), full=True)
             except (GateRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
                 run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),
@@ -2854,8 +2939,8 @@ def nightly(args: GateArguments) -> int:
 
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
-    _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
-                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
+    _ = parser.add_argument("--module-time-limit-s", type=float, default=None,
+                            help="set the time limit in seconds for every module (default for the first run: 1800)")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
                             help="run only this module, named as the gate prints it (suite/module), with no gate record")
@@ -2870,11 +2955,13 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
-                    module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
+                    module_time_limit_s: float | None = None, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    remote_limit = DEFAULT_MODULE_TIME_LIMIT_S if module_time_limit_s is None else module_time_limit_s
+
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
@@ -2885,7 +2972,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                           mode=mode, selected=SelectedModules(paths))
 
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=remote_limit,
                               selected=selection, gate_job=gate_job)
         if isinstance(outcome, str):
             print('Cloud gate uses natedev: ' + outcome, flush=True)
@@ -2948,7 +3035,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         linux_paths = tuple(path for path in assignment.paths if path in excluded)
         if mac_paths:
             with mac_gate_process.start_mac_gate(
-                    mac_module, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                    mac_module, repo, mode=mode, full=full, module_time_limit_s=remote_limit,
                     selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
                 if linux_paths or type_dirs:
                     linux = run_local_subset(linux_paths, type_dirs)
@@ -3009,13 +3096,10 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
-def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
-    """Run only the named modules, as a merge red's check on its base.
-
-    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
-    """
+def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float | None, mode: SuiteMode) -> GateRun:
+    """Run the named modules with individual limits and no whole-run deadline."""
     return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
-                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+                      selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
