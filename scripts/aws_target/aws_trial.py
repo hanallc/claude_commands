@@ -25,6 +25,7 @@ import subprocess
 import time
 from typing import Protocol, cast
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from scripts.aws_target.gate_box import (
     GUEST as GUEST, user_data as user_data,
@@ -33,7 +34,7 @@ from scripts.aws_target.gate_box import (
 )
 from scripts.aws_target import ledger, cloud_gate, run_cost
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.build_queue import snapshot_codec
@@ -115,7 +116,6 @@ def network_git(repo: Path, *arguments: str) -> str:
 
 def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
     """Resolve local commits without changing the source checkout."""
-    from urllib.parse import urlsplit
     if rounds <= 0 or not modules or len(set(modules)) != len(modules):
         raise ValueError('Use positive rounds and distinct modules')
     for module in modules:
@@ -368,7 +368,6 @@ def _start_paired_module(folder: Path, directory: Path, settings_path: Path, con
 
 def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
     """Launch all modules after every slot and cost reservation succeeds."""
-    from scripts.aws_target.aws_target import control_lock
     started_at = time.time()
     policy = conf.read(settings_path)
     book = ledger.CostLedger(directory)

@@ -70,6 +70,11 @@ def copies_root() -> Path:
     return Path(os.path.realpath(Path(configured).expanduser()))
 
 
+def unit_owner(name: str) -> str:
+    """Keep the recorded unit name and append one unit suffix."""
+    return name.removesuffix("-unit") + "-unit"
+
+
 def copy_folder(path: Path) -> Path | None:
     """The copy that contains path; convert the path boundary to no copy here."""
     base = copies_root()

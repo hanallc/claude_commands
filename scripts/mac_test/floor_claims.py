@@ -39,11 +39,17 @@ class ClaimReader(Protocol):
     def read_claims(self, paths: ClaimState) -> Sequence[HeldMacClaim]: ...
 
 
+MIRROR_LEASE_FDS_ENV = "COPIES_MIRROR_LEASE_FDS"
 MIRROR_MARK = ".mac-test-mirror"
 MIRROR_RECORD = ".copy-record.json"
 MIRROR_SESSION = ".copy-session"
 MIRROR_METADATA = (MIRROR_SESSION, MIRROR_MARK, MIRROR_RECORD)
 MIRROR_REMOVAL_SUFFIX = ".copy-removing.json"
+
+
+def inherited_mirror_descriptors() -> tuple[int, ...]:
+    """Carry the mirror lease through a remote Python entry point."""
+    return tuple(int(value) for value in os.environ.get(MIRROR_LEASE_FDS_ENV, "").split(",") if value)
 
 
 def read_mirror_record(path: Path) -> dict[str, object]:

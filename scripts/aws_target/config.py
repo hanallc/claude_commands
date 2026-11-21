@@ -14,6 +14,7 @@ from scripts.aws_target import remote
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets import target_config
+from scripts.lib.atomic_file import write_text_atomic
 
 
 def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:

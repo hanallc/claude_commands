@@ -385,11 +385,15 @@ class PairedTrialTests(CostFixture):
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
         copy_test_runner(self.repo)
-        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
-                         'scripts/aws_target/__init__.py'):
+        for relative in ('scripts/lib/process_group.py', 'scripts/test_times/gate_record.py',
+                         'scripts/aws_target/gate_box.py', 'scripts/aws_target/__init__.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
+        # The paired guest does not use the host codecs or write a gate record.
+        (self.repo / 'scripts/buildlog').mkdir()
+        for relative in ('scripts/aws_target/ledger.py', 'scripts/buildlog/record.py', 'scripts/buildlog/store.py'):
+            (self.repo / relative).touch()
         (self.repo / 'scripts/production').mkdir()
         _ = (self.repo / 'scripts/production/merge_gate.py').write_text(
             "def test_module_environment(root, environment):\n"
@@ -915,7 +919,6 @@ else:
             trial.validate_paired_result(row, request, 'i-other')
 
     def guest(self, *, limit: float | None = None) -> tuple[dict[str, object], list[dict[str, object]]]:
-        from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
         box.mkdir()
         guest_deadline_s = 600
@@ -1147,7 +1150,6 @@ print('200', end='')
         stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
 
     def test_terminal_interrupt_stops_the_owning_service(self) -> None:
-        from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
         for number in (signal.SIGINT,):
             script = '''import signal, sys
 from unittest import mock
@@ -1175,7 +1177,6 @@ with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command:
         self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
 
     def test_paired_cli_preserves_the_ordered_regional_deployment(self) -> None:
-        from scripts.aws_target import cloud_gate
         regions = [{'region': region, 'template': 'fixture-' + region} for region in ('us-east-2', 'us-west-2')]
         cloud_gate.save(self.state / 'gate-deployment.json', {'regions': regions, 'bucket': 'fixture-bucket'})
         with mock.patch.object(trial, 'paired_service', return_value=0):
@@ -1185,7 +1186,6 @@ with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command:
         self.assertEqual(cloud_gate.read(path)['regions'], regions)
 
     def test_paired_cli_uses_scaler_without_admin_or_new_settings(self) -> None:
-        from scripts.aws_target import cloud_gate
         cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
         with (mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('admin read')),
               mock.patch.object(trial, 'paired_service', return_value=0) as service):

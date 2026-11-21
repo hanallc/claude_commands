@@ -13,7 +13,7 @@ import time
 from typing import Protocol, cast
 from uuid import uuid4
 
-from scripts.aws_target import hana_guest, hana_replacement_record, hana_spend, ledger, remote
+from scripts.aws_target import hana_guest, hana_image, hana_replacement_record, hana_spend, ledger, remote
 from scripts.aws_target.hana_claim_release import HanaClaimRelease, HanaClaimReleased, HanaClaimReleaseRefused
 from scripts.aws_target.controller_lock import control_lock, hana_work_lock
 from scripts.build_queue.placement import HANA_IMAGE_STALE as HANA_IMAGE_STALE
@@ -576,10 +576,8 @@ class HanaController:
     def image_is_current(self, identity: DeploymentIdentity, *,
                          workload: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> bool:
         """Check the digest setup recorded for this instance."""
-        check = cast(Callable[[Path, str, str, Path | conf.ConfigRead], bool],
-            import_module('scripts.aws_target.hana_image').deployed_image_is_current)
         configuration = self.workload_path if isinstance(workload, conf.UseConfiguredValue) else workload
-        return check(self.directory, identity.deployment, identity.instance, configuration)
+        return hana_image.deployed_image_is_current(self.directory, identity.deployment, identity.instance, configuration)
 
     def register(self, identity: DeploymentIdentity, *, state: Lifecycle = Lifecycle.IDLE_STOPPED) -> None:
         """Register D2's approved identities without provisioning or enabling placement."""
@@ -649,16 +647,12 @@ class HanaController:
             self._bind_execution(execution)
 
     def _bind_execution(self, execution: str) -> None:
-        from importlib import import_module
-
         execution_guard_path = cast(Callable[[Path, str], Path],
             import_module('scripts.aws_target.hana_execution').execution_guard_path)
         write_text_atomic(execution_guard_path(self.directory, execution), execution + '\n', new_file_mode=0o600)
 
     def execution_bound(self, execution: str) -> bool:
         """Retain ownership unless the guard and lifecycle prove that execution never bound."""
-        from importlib import import_module
-
         execution_guard_path = cast(Callable[[Path, str], Path],
             import_module('scripts.aws_target.hana_execution').execution_guard_path)
         try:
@@ -679,8 +673,6 @@ class HanaController:
     def release(self, execution: str) -> HanaClaimRelease:
         """Keep unresolved starts owned until lifecycle recovery settles them."""
         with control_lock(self.directory):
-            from importlib import import_module
-
             module = import_module('scripts.aws_target.hana_execution')
             execution_guard_path = cast(Callable[[Path, str], Path], module.execution_guard_path)
             execution_command_settled = cast(Callable[[Path, str], bool], module.execution_command_settled)

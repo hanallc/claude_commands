@@ -26,6 +26,7 @@ from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.build_targets import target_config
 from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -815,10 +816,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
 
 def publish_configured() -> int:
     """Publish the page from the AWS target state folder; the hourly job calls this."""
-    from scripts.build_targets.target_config import ssh_target_state_directory
-
     try:
-        _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder(),
+        _ = publish(target_config.ssh_target_state_directory('aws'), int(time.time()), output_folder(),
                     settings_path=aws_config.account_settings_path())
     except PagePublicationDeferred as error:
         print(f'aws_page: {error}', file=sys.stderr)

@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
-from scripts.direct.local_release_wait import IntervalReleasePolling
+from scripts.direct.release_events import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 from scripts.production.merge_gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
 

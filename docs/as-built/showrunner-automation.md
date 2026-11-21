@@ -1171,7 +1171,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   - **Earlier lines.** Before 2026-10-12 a smaller item's outcome was written on its night's line as `; from Also found: <title> — <outcome>`. Those stay as written; every item still open then got a line of its own.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.
-  Unit names also accept the form from `copies.unit_owner`.
+  Unit names also accept the form from `copy_record.unit_owner`.
   Morty uses its staff row. Without that row, `send.py` refuses the name `morty` as it refuses each name without a row.
   Postmaster replies use explicit session addresses.
   `postmaster`, `sdlc-merge-gate`, and `natedev` have staff rows.

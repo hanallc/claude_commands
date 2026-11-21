@@ -15,10 +15,12 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, aws_target, deploy, hana_box, hana_placement, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger
+from scripts.aws_target import admin_secrets, aws_target, deploy, hana_box, hana_placement, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger, hana_execution
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
 from scripts.lib import conf, process_start
+from scripts.build_queue import placement
+from scripts.mac_test.claim_state import RepositoryScope
 
 
 IDENTITY = hana_box.DeploymentIdentity('fixture-deployment', 'fixture-instance', 'fixture-spot-request', 'us-east-2')
@@ -235,9 +237,6 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(len(self.provider.starts), 1)
 
     def test_assigned_execution_guard_keeps_a_ready_claim_until_durable_settlement(self) -> None:
-        from scripts.aws_target import hana_execution
-        from scripts.build_queue import placement
-        from scripts.mac_test.claim_state import RepositoryScope
 
         self.ready()
         self.controller.bind_execution('execution-one')
@@ -251,8 +250,6 @@ class HanaBoxTests(CostFixture):
         self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
 
     def test_missing_or_corrupt_execution_journal_keeps_the_exact_claim_after_restart(self) -> None:
-        from scripts.aws_target import hana_execution
-
         self.ready()
         self.controller.bind_execution('execution-one')
         restarted = hana_box.HanaController(self.state, self.settings, self.workload_path, self.provider, clock=self.clock)
@@ -278,8 +275,6 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(self.provider.calls, [])
 
     def test_execution_bound_retains_a_guard_with_missing_or_corrupt_journal(self) -> None:
-        from scripts.aws_target import hana_execution
-
         self.controller.bind_execution('execution-one')
         self.assertTrue(self.controller.execution_bound('execution-one'))
         _ = hana_execution.execution_path(self.state, 'execution-one').write_text('{')
