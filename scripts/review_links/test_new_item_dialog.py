@@ -376,6 +376,10 @@ async function sendSaved() {
    const fallback = ownerPosts[8].evidence;
    check(ownerPosts.length === 9 && !ownerPosts[8].capture_key && fallback.kind === 'page-data' &&
          fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.');
+   const running = fallback.sections?.find(section => section.label === 'Running');
+   check(running?.columns[0] === 'Step' && running.columns[1] === 'Stage' &&
+         running.rows.some(row => row[0] === 'hana nextest' && row[1] === 'testing'),
+         'The fallback keeps the displayed build values with their column labels.');
    check(fallback.title === emoji && fallback.rows.some(row=>row.includes(emoji)),
          'The title and rows keep an emoji at the character limit.');
    check(ownerPosts[8].page === 'builds', 'Send includes the page identity.');
@@ -390,7 +394,7 @@ async function sendSaved() {
    dialog.querySelector('[type="submit"]').click();
    await whenShown(expired);
    check(dialog.open && !checkbox.disabled && !slot.querySelector('[data-taking]').hidden && shot.hidden &&
-         dialog.querySelector('[type="submit"]').disabled, 'Expiration shows the placeholder and pauses Send.');
+         !dialog.querySelector('[type="submit"]').disabled, 'Expiration shows the placeholder and keeps Send available.');
    check(textarea.value === 'Keep these Question words after a restart.' &&
          ownerPosts.length === at + 2 && ownerPosts[at].kind === 'question' &&
          ownerPosts[at].capture_key === oldKey && ownerPosts[at].token !== ownerToken &&
@@ -412,12 +416,12 @@ async function sendSaved() {
    const beforeRestore = captureKey;
    window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted:true}));
    await discardedOnHide;
-   check(shot.hidden && send.disabled, 'Leaving the page clears the preview and pauses Send.');
+   check(shot.hidden && !send.disabled, 'Leaving the page clears the preview and keeps Send available.');
    captureKey = 'f34db33fd34db33fd34db33fd34db33f';
    previewGate = new Promise(resolve => { releasePreview = resolve; });
    window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}));
-   check(dialog.open && !slot.querySelector('[data-taking]').hidden && send.disabled,
-         'Back restores the dialog with its screenshot placeholder.');
+   check(dialog.open && !slot.querySelector('[data-taking]').hidden && !send.disabled,
+         'Back restores the screenshot placeholder and keeps Send available.');
    releasePreview();
    await whenShown(shot);
    dialog.querySelector('[name="kind"][value="bug"]').click();
@@ -447,7 +451,7 @@ async function sendSaved() {
    recipient().click();
    await trySend();
    check(dialog.open && textarea.value === 'Keep this draft and its image.' &&
-         error.textContent === 'This item was already filed as I2. Any change after that Send was not sent.',
+         error.textContent === 'This item was already filed as I2. Your edits are still in the dialog.',
          'A changed Send reports the first ID and keeps the draft open.');
    const standardRequest = ownerPosts.at(-1);
    check(!standardRequest.page && !standardRequest.capture_key && standardRequest.images[0].base64_data === png &&
@@ -467,7 +471,7 @@ async function sendSaved() {
    to()[1].click();
    await trySend();
    check(dialog.open && textarea.value === 'The replacement item.' && to()[1].checked &&
-         error.textContent === 'This item was already filed as I4. Any change after that Send was not sent.',
+         error.textContent === 'This item was already filed as I4. Your edits are still in the dialog.',
          'The notice shows the saved ID and keeps the changed words.');
    check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The retry uses the original draft ID.');
    const replacement = (await sendSaved()).detail;
@@ -522,7 +526,7 @@ async function sendSaved() {
           'The retry uses the current kind and evidence for the same draft.');
    }
    restartScenario = true;
-   const alreadyFiled = 'This item was already filed as I9. Any change after that Send was not sent.';
+   const alreadyFiled = 'This item was already filed as I9. Your edits are still in the dialog.';
    for (const changed of [false, true]) {
     await openOwner();
     await whenShown(shot);
@@ -626,13 +630,33 @@ BUG_PROBE = r"""
 const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch;
+let holdCapture = __PHOTO__;
+let releaseCapture, loseSend = false, previewPending = false, previewRequests = 0;
+const saved = {id:'I1',key:'bug/owner/I1'};
 window.fetch = async (path, options) => {
  if (!String(path).startsWith('/console/review/new-item')) return fetchHTTP(path, options);
+ if (String(path).includes('capture_key=')) {
+  previewRequests++;
+  if (previewPending) {
+   previewPending = false;
+   return Response.json({}, {status:202});
+  }
+  return new Response(new Blob(['PNG'], {type:'image/png'}));
+ }
  if (!options.body) return Response.json({token:'fixture',recipients:[{id:'owner',name:'sdlc',proposal:false}]});
  const payload = JSON.parse(options.body);
  wire.push(payload);
- if (payload.page_capture) return Response.json({error:'No Firefox.'},{status:503});
- return Response.json({id:'I1',key:'bug/owner/I1'});
+ if (payload.page_capture) {
+  if (!holdCapture) return Response.json({error:'No Firefox.'},{status:503});
+  return new Promise(resolve => {
+   releaseCapture = () => resolve(Response.json({capture_key:payload.capture_key}));
+  });
+ }
+ if (loseSend) {
+  loseSend = false;
+  throw new TypeError('The Send response was lost.');
+ }
+ return Response.json(saved);
 };
 const dialog = document.querySelector('dialog');
 const checkbox = dialog.querySelector('[name="include_page"]');
@@ -651,16 +675,19 @@ const type = text => {
  words.value = text;
  words.dispatchEvent(new Event('input', {bubbles:true}));
 };
+const whenVisible = element => {
+ if (!element.hidden) return Promise.resolve();
+ return new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (!element.hidden) { observer.disconnect(); resolve(); }
+  });
+  observer.observe(element, {attributes:true, attributeFilter:['hidden']});
+ });
+};
 const send = async () => {
  const confirmation = dialog.querySelector('#new-item-saved');
- const shown = new Promise(resolve => {
-  const observer = new MutationObserver(() => {
-   if (!confirmation.hidden) { observer.disconnect(); resolve(); }
-  });
-  observer.observe(confirmation, {attributes:true, attributeFilter:['hidden']});
- });
  dialog.querySelector('[type="submit"]').click();
- await shown;
+ await whenVisible(confirmation);
  check(dialog.open && confirmation.textContent === 'Saved I1.', 'The Bug dialog shows the saved ID.');
  dialog.querySelector('[data-done]').click();
 };
@@ -687,8 +714,8 @@ const send = async () => {
   check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
   const address = [...state.querySelectorAll('dt')].find(term => term.textContent === 'Address');
   check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
-  check(state.querySelector('[data-visible-text]').textContent === 'Visible text from this page (up to 48 rows)',
-        'The Bug block lists the visible text.');
+  check(state.querySelector('[data-visible-text]').textContent === 'Page data and visible text',
+        'The Bug block lists page data and visible text.');
   check(state.textContent.includes('2.40 s') && state.textContent.includes('Could not load …/brain.'),
         'The dialog shows the render time and the notice.');
   check(checkbox.checked && checkbox.labels[0].textContent.trim() === 'Include a screenshot',
@@ -697,9 +724,8 @@ const send = async () => {
         'Opening the Bug dialog starts the screenshot of the current page.');
   type('Review takes over two seconds with the builds filter. It also shows a load error.');
   if (__PHOTO__) {
-   const title = dialog.querySelector('h2');
-   title.tabIndex = -1;
-   title.focus();
+   check(!dialog.querySelector('[type="submit"]').disabled && !dialog.querySelector('[data-taking]').hidden,
+         'The capture is pending and Send is available.');
    const {x,y,width,height} = dialog.getBoundingClientRect();
    failures.push(JSON.stringify([x,y,width,height]));
   } else {
@@ -720,19 +746,64 @@ const send = async () => {
          && captured.script_errors.at(-1).message === 'Rejected', 'The request keeps the last twenty script errors.');
    check(dialog.open === false, 'Done closes the confirmation.');
 
+   holdCapture = true;
    await open();
-   const fallback = dialog.querySelector('[data-fallback]');
-   if (fallback.hidden) await new Promise(resolve => {
-    const observer = new MutationObserver(() => { if (!fallback.hidden) { observer.disconnect(); resolve(); } });
-    observer.observe(fallback, {attributes:true, attributeFilter:['hidden']});
-   });
-   type('Keep the visible rows when the screenshot fails.');
+   type('Keep the visible rows when a capture takes too long.');
+   if (dialog.querySelector('[type="submit"]').disabled) throw new Error('Send waited for the capture key.');
    await send();
+   check(wire.length === 4 && wire[3].capture_key === wire[2].capture_key &&
+         wire[3].capture_key.startsWith(wire[3].request_id) &&
+         wire[3].defer_capture.place === wire[2].page_capture.place && wire[3].evidence.kind === 'page-data',
+         'Send carries the draft capture key before the capture response arrives.');
    const evidence = wire[3].evidence;
    const bytes = new TextEncoder().encode(JSON.stringify(evidence)).length;
    check(bytes <= 64*1024 && evidence.rows.length < 48 &&
          evidence.rows.some(row=>row.includes('😀'.repeat(240))),
          'The fallback keeps complete rows within the UTF-8 byte budget.');
+   window.dispatchEvent(new PageTransitionEvent('pagehide'));
+   releaseCapture();
+   check(!dialog.open && wire.length === 4, 'The page leaves without making an attachment request.');
+
+   await open();
+   type('Retry the same Bug after the Send response is lost.');
+   loseSend = true;
+   dialog.querySelector('[type="submit"]').click();
+   await whenVisible(dialog.querySelector('.new-item-error'));
+   const first = wire.at(-1);
+   const beforePreview = previewRequests;
+   previewPending = true;
+   releaseCapture();
+   await whenVisible(dialog.querySelector('[data-shot]'));
+   check(previewRequests === beforePreview + 2, 'The dialog requests the preview again after a pending response.');
+   await send();
+   const retry = wire.at(-1);
+   check(JSON.stringify(retry) === JSON.stringify(first),
+         'A preview that arrives after a lost response leaves the retry unchanged.');
+
+   await window.reviewNewItem.open({page:'list',kind:'investigation'});
+   type('Keep the pending screenshot after a lost List response.');
+   loseSend = true;
+   dialog.querySelector('[type="submit"]').click();
+   await whenVisible(dialog.querySelector('.new-item-error'));
+   const listSend = dialog.querySelector('[type="submit"]');
+   if (listSend.disabled) await new Promise(resolve => {
+    const observer = new MutationObserver(() => {
+     if (!listSend.disabled) { observer.disconnect(); resolve(); }
+    });
+    observer.observe(listSend, {attributes:true, attributeFilter:['disabled']});
+   });
+   const listFirst = wire.at(-1);
+   const started = wire.length;
+   type('Keep these edits for a new Send.');
+   const listSaved = new Promise(resolve =>
+    document.addEventListener('review-item-saved', resolve, {once:true}));
+   listSend.click();
+   await listSaved;
+   check(listFirst.request_id.startsWith('r2-') && listFirst.capture_key &&
+         JSON.stringify(wire[started]) === JSON.stringify(listFirst),
+         'The List retries with the original capture key and draft ID.');
+   check(dialog.open && words.value === 'Keep these edits for a new Send.',
+         'The dialog keeps the edits after it confirms the original Send.');
   }
  } catch (error) {
   failures.push(String(error));
@@ -928,6 +999,13 @@ class NewItemDialogTests(unittest.TestCase):
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}
         self.assertEqual(new_item_dialog.read_evidence(fields),
                          new_item_dialog.PageDataEvidence("The List", (("Item", "State"), ("Console", "Open"))))
+        section = {"label": "Items", "columns": ["Item", "State"], "rows": [["Console", "Open"]]}
+        structured = new_item_dialog.read_evidence({**fields, "sections": [section]})
+        self.assertEqual(structured, new_item_dialog.PageDataEvidence(
+            "The List", (("Item", "State"), ("Console", "Open")),
+            (new_item_dialog.PageDataSection("Items", ("Item", "State"), (("Console", "Open"),)),)))
+        self.assertEqual(new_item_dialog.evidence_fields(new_item_dialog.read_evidence(fields))["rows"],
+                         (("Item", "State"), ("Console", "Open")))
         capture = {"place": "/console/list.html#show=open", "width": 1137, "height": 688, "dark": True}
         self.assertEqual(new_item_dialog.read_page_capture(capture),
                          new_item_dialog.PageCaptureRequest("/console/list.html#show=open", 1137, 688, True))

@@ -1922,6 +1922,11 @@ addEventListener('hashchange',event=>{
  watchLinkedAnswer();
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+document.addEventListener('review-item-saved',event=>{
+ if(typeof event.detail?.list_key!=='string' || !event.detail.list_key) return;
+ listSaveVersion++;
+ refreshAfterListSave(true);
+});
 document.addEventListener('review-item-created',event=>{
  if(typeof event.detail?.list_key!=='string') return;
  createdItem=event.detail.list_key;

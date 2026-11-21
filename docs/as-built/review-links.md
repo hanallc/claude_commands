@@ -536,7 +536,22 @@ The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
 A page owner's New item dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
-The dialog shows **Taking a screenshot** until the preview is available.
+The dialog keeps **Send** available while it takes the screenshot.
+Send uses page data if the preview is still pending.
+Send saves the capture intent with the native item.
+The capture key belongs to the browser draft, even when The List saves a different request ID.
+The server recreates a missing capture lookup from the native item after a restart.
+The item retains its page data if the screenshot is unavailable.
+An invalid capture object, address, or viewport makes the screenshot unavailable.
+An address for a different page also makes the screenshot unavailable.
+Send still saves the capture intent and the List draft link.
+Send rejects an invalid capture key or a key that belongs to another draft or item.
+The server attaches the screenshot when the capture finishes, even if you leave the page.
+A saved capture remains available after the preview expires.
+The server retries a failed attachment and keeps one screenshot on the item.
+After a lost response, Send retries the original payload, draft ID and capture key.
+The dialog keeps any edits for a new Send.
+Review and the List refresh the saved row and keep the current address, scroll position, and focus while the dialog holds edits.
 Select the preview to open the image at full size.
 Send saves the item with the evidence shown in the dialog.
 If the native write fails, the server discards the staged evidence.
@@ -550,9 +565,11 @@ If the content changed, the dialog shows the saved item ID and keeps the edits.
 The next Send uses a new request ID.
 When Back restores an open dialog, the dialog takes a new screenshot if the box is checked.
 Changing the type keeps the same capture.
+The server keeps the capture key and preview in its private store until they expire or the dialog discards them.
+After a restart, the dialog can request an unfinished preview with the same key and a fresh token.
 If the preview expires, the dialog keeps the draft and shows the placeholder while it takes a new screenshot.
 If the first Send fails because the preview expires, the checkbox stays available.
-Select **Send** again when the new screenshot appears.
+Select **Send** again to use the new screenshot or page data.
 Send requests a reload if a legacy request for a checked Bug lacks both a capture key and a filed match.
 A retry can recover the filed item after a restart.
 The server confirms a screenshot retry only when a held capture proves the PNG matches.
@@ -560,8 +577,10 @@ If the server cannot confirm a match, the dialog shows the filed item ID and kee
 It replaces the old screenshot when the checkbox is selected.
 The next Send uses a new request ID.
 Clear **Include a screenshot** to omit the image.
-A Bug always includes up to 48 rows of visible text from when the dialog opened.
-The Bug card shows these rows under **Page data**, including when the screenshot is unavailable.
+A Bug includes structured page sections and up to 48 rows of visible text from when the dialog opened.
+A Question or Feedback includes the same data when the requested screenshot is unavailable.
+The Review card shows the saved sections and text under **Page data**.
+Review reuses gzip bytes for an unchanged page shell with its current owner control.
 It also includes the page title, address, filters, render time, error lines, and script errors.
 For other types, Send includes visible text when the block shows the fallback notice.
 A Bug with a screenshot also includes the viewport.
