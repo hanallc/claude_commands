@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from scripts.lib.process_failure import failure_detail
-from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, git_exclude, git_files
+from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, copy_record, git_exclude, git_files, session_folder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.worktree import worktree_links
 
@@ -1697,7 +1697,19 @@ def _migration_names(trees: list[RegisteredTree], repos: dict[Path, RepositoryNa
     return names, showrunners
 
 
-def _migration_skip(path: Path, scratch: Path) -> str:
+def _migration_maker_roots(scratch: Path) -> tuple[Path, ...]:
+    # The base setting names the former scratch root, even when the host uses the build drive.
+    settings = conf.read_or_repository("build_folders").settings
+    former_scratch = copy_record.FORMER_ROOT
+    if isinstance(settings, dict) and (setting := settings.get("roots.scratch")) is not None and setting.value:
+        former_scratch = Path(setting.value).expanduser()
+    roots = (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate"), scratch.parents[1] / "slot",
+             session_folder.configured_root().resolve(), Path.home() / ".local")
+    former_scratch = former_scratch.resolve()
+    return roots if former_scratch == scratch else (*roots, former_scratch)
+
+
+def _migration_skip(path: Path, scratch: Path, maker_roots: tuple[Path, ...]) -> str:
     home = Path.home()
     if any(parts == (".claude", "worktrees") for parts in zip(path.parts, path.parts[1:])):
         return "Claude Code owns this worktree"
@@ -1705,9 +1717,7 @@ def _migration_skip(path: Path, scratch: Path) -> str:
         return "the user's worktree"
     if path == scratch / "sessionmove-bbf204":
         return "queue moves the session-folder checkout before the switch"
-    if (any(path.is_relative_to(root) for root in (
-            Path("/tmp/claude/unit"), Path("/tmp/claude/scratch"), Path("/tmp/claude/delegate"),
-            scratch.parents[1] / "slot", Path("/session"), home / ".local"))
+    if (any(path.is_relative_to(root) for root in maker_roots)
             or (path.is_relative_to(scratch) and path != scratch
                 and path.relative_to(scratch).parts[0].startswith("gate-"))
             or any(part.startswith("b44doc-") for part in path.parts)):
@@ -1804,12 +1814,13 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
 
     machine = local_machine()
     scratch = _scratch_root()
+    maker_roots = _migration_maker_roots(scratch)
     mains = _migration_main_checkouts(Path.home())
     clones: dict[Path, tuple[RegisteredTree, ...]] = {}
     skipped: dict[Path, str] = {path: "main checkout stays in place" for path in mains}
     trees: list[RegisteredTree] = []
     for path in _scratch_checkouts(scratch):
-        reason = _migration_skip(path, scratch)
+        reason = _migration_skip(path, scratch, maker_roots)
         if reason:
             skipped[path] = reason
         elif (path / ".git").is_dir():
@@ -1855,7 +1866,7 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
     former = {path for journal in journals for path in (journal.move.old, journal.source_key)}
     stale = [tree for tree in trees if not os.path.lexists(tree.path) and tree.path not in former
              and tree.path not in showrunners
-             and not _migration_skip(tree.path, scratch)]
+             and not _migration_skip(tree.path, scratch, maker_roots)]
     already_placed = {tree.path for tree in trees if tree.path in placed}
     for path in already_placed:
         skipped[path] = "already moved"
@@ -1864,7 +1875,7 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
         path = tree.path
         if path in already_placed or path in former or tree in stale:
             continue
-        reason = showrunners.get(path) or _migration_skip(path, scratch)
+        reason = showrunners.get(path) or _migration_skip(path, scratch, maker_roots)
         if reason:
             skipped[path] = reason
         elif path.is_symlink():
