@@ -332,14 +332,17 @@ Each local Promote checkout must exist before the command pushes.
      A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
      A command that cannot start on the base, and a main conflict, also leave the red with the unit.
      A resumed merge whose restored tip already holds the checkpoint runs no base check.
-     A batch stops at its first red test step and returns every row with the failed step and the row's test selection.
+     An interrupted batch follows the same test rules as a fresh batch.
+     A batch stops at its first red test step and returns every outstanding row.
+     Each report names the failed step and states whether the row selects it.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
-     A conflict with main ends a batch and sends the conflicting paths to every requester.
+     A conflict with main ends a batch and sends the conflicting paths to every outstanding requester.
+     A batch restores its starting tip and removes its record before reporting any stop before publication.
      The next queued item can proceed.
      Preparation failure restores the tip before this run when origin still has its old tip.
      An interrupted promotion and a child handoff use the same test loop.

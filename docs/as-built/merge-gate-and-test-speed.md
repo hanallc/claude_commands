@@ -743,32 +743,31 @@ A batch can contain one item.
    If the record is missing or differs, reset the merge branch to its pushed tip.
    Then start a fresh batch. Remove the record after the push or when the batch ends without unpushed merges.
    If record removal fails, report a warning and continue.
-   Resume each item that the merge branch already contains through the single command's route, in file order.
-3. Retain the starting tip and whether a merge is unfinished.
-4. Check each remaining item and make its own merge commit.
-5. Test all code paths changed from the published merge branch tip through HEAD once.
+3. Retain the starting tip and any unfinished merge that predates the batch.
+   On recovery, get the starting tip from the first parent of the first saved checkpoint merge.
+4. Retain unpublished checkpoint merges and check each item that still needs to merge.
+   Include published items whose promotion is unfinished.
+5. Test all outstanding code paths changed from the published merge branch tip through HEAD once.
 6. Use one `tested_main_push` hold, one push, and one local promotion.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
-A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
-A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
+An interrupted batch uses the same test and stop rules as a fresh batch.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's merged item retests its unpublished paths when it resumes.
-A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
 Each merge retains its own review ownership and completion record.
 
-A hold, failure, or cancellation ends the batch and returns each row to its requester.
+A hold, failure, or cancellation ends the batch and returns each outstanding row to its requester.
 A red report names the failed test step and says whether the row selects it.
 The batch stops at the first failed test command.
 The next queued item can proceed after the batch exits.
-Before publication, a hold or failure restores the starting tip.
-Reset aborts an unfinished merge only when no merge was unfinished at batch start.
+Before publication, restore the starting tip and remove the batch record before reporting the stop.
+Abort any unfinished merge that the batch started.
+A failed result write leaves the requester notices available.
 An earlier unfinished merge and its staged edits remain unchanged.
 Each run starts a fresh shared test log. Tests after main moves append to the same log.
 After publication starts, only the push rollback can restore the tip. It checks the live origin first.
@@ -776,9 +775,10 @@ After publication starts, only the push rollback can restore the tip. It checks 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
 An ancestry hold names the first unmerged commit by its short hash and subject.
-A row that repeats a checkpoint in the batch receives instructions to resume it alone.
+Every stop report names a repeated checkpoint when it is the cause.
+Only the row that repeats the checkpoint receives instructions to resume alone.
 
-`test_merge_checkpoint_batch.py` checks that a red batch reports each row and restores the starting tip.
+`test_merge_checkpoint_batch.py` checks that a stopped batch restores the starting tip and reports each row.
 `test_merge_checkpoint_rerun.py` covers shared publication and recovery after interruption.
 
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.

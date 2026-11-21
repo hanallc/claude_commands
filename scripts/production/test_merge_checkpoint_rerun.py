@@ -430,9 +430,6 @@ raise SystemExit(1)
         self.assert_handoff_promotion_recovered(True)
 
 
-if __name__ == "__main__":
-    _ = unittest.main()
-
 @final
 class BatchRecoveryTests(test_merge_checkpoint_batch.BatchFixture):
     def assert_landed(self, start: str, checkpoints: list[str]) -> list[str]:
@@ -635,9 +632,6 @@ print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "HEAD^1"), pushed)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), third)
-
-    def batch_record(self) -> Path:
-        return Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "checkpoint-batches/production"))
 
     def interrupt_batch(self, *lines: str) -> str:
         self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
@@ -864,3 +858,7 @@ print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
         self.assertIn("batch: resume — alpha phase 2 is already merged", same.stdout)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), unpublished)
         self.assertFalse(self.batch_record().exists())
+
+
+if __name__ == "__main__":
+    _ = unittest.main()
