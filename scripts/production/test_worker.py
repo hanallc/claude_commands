@@ -2314,6 +2314,7 @@ class WorkerCommandTests(unittest.TestCase):
         instance = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
             worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.prompt, kind="impl", lens="")
         for delivery in (None,
+                         pass_recorder.DispatchDelivery("", "", ""),
                          pass_recorder.DispatchDelivery("fixture prompt", "", str(self.reply)),
                          pass_recorder.DispatchDelivery("fixture prompt", instance, str(self.reply))):
             if delivery is not None:

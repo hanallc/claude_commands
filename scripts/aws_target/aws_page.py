@@ -67,6 +67,7 @@ class SnapshotLine(TypedDict):
 class RunCostData(TypedDict):
     scope: str
     label: str
+    noun: str
     explanation: str
     tables: list[TableData]
     # Keep the standard Gate table at index 0 for pages that are already open.
@@ -577,7 +578,8 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         'quota_history': quota_history_data(tables, now),
         'cached_spot_status': {read.region: 'read failed' if read.failure else 'old'
                                for read in tables.regions if read.failure or read.stale},
-        'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
+        'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'noun': costs.scope.noun,
+                  'explanation': costs.explanation,
                   'tables': [table_data(without_prices(table)) for table in costs.tables],
                   'prices': [table_rows_data(costs.gate_prices)],
                   'estimates': [{'region': entry.region, 'summary': costs.summary_of(entry)} for entry in costs.estimates],

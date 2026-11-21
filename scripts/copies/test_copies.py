@@ -402,25 +402,36 @@ source_check_seconds=1
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text().strip(), self.head)
 
-    def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:
+    def test_only_full_gate_commands_wait_for_a_standing_slot(self) -> None:
         _ = write_config_fixture(self.base / "config/build_folders.conf",
             f"# whole: 1..\nslots.{self.lease_machine()}.origin.max=1\n")
-        marker = self.base / "not-started"
-        gate = self.base / "merge_gate.py"
-        _ = gate.write_text("import sys; from pathlib import Path; Path(sys.argv[1]).touch()")
         with self.queue_service() as fixture:
             def expire_after_wait(reply: wire.Reply) -> wire.Reply:
                 if isinstance(reply, wire.RepositorySlotWaiting):
                     fixture.clock.advance(60)
                 return reply
 
-            with mock.patch.object(fixture.server, "reply_filter", side_effect=expire_after_wait):
-                with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                    result = self.run_cli(command=(sys.executable, str(gate), str(marker)))
-        self.assertEqual(result.returncode, 75, result.stderr)
-        self.assertIn("wait ended for origin", result.stderr)
-        self.assertIn("slots.", result.stderr)
-        self.assertFalse(marker.exists())
+            with (mock.patch.object(fixture.server, "reply_filter", side_effect=expire_after_wait),
+                  copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head))):
+                for index, (name, options, needs_slot) in enumerate((
+                    ("merge_gate.py", (), True),
+                    ("gate.py", (), True),
+                    ("gate.py", ("--affected",), False),
+                    ("targeted_test.py", (), False),
+                )):
+                    with self.subTest(name=name, options=options):
+                        marker = self.base / f"started-{index}"
+                        gate = self.base / name
+                        _ = gate.write_text("import sys; from pathlib import Path; Path(sys.argv[-1]).touch()")
+                        result = self.run_cli(command=(sys.executable, "-u", str(gate), *options, str(marker)))
+                        if needs_slot:
+                            self.assertEqual(result.returncode, 75, result.stderr)
+                            self.assertIn("wait ended for origin", result.stderr)
+                            self.assertIn("slots.", result.stderr)
+                            self.assertFalse(marker.exists())
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertTrue(marker.exists())
 
     def lease(self, tree: Path) -> dict[str, object]:
         return cast(dict[str, object], json.loads(tree.with_name(tree.name + ".lease.json").read_text()))

@@ -1969,7 +1969,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(after["reserved"], before["reserved"])
         self.assertEqual(after["used"], before["used"])
         self.assertEqual(after["waiting"], 1)
-        self.assertEqual(row.get("about"), "Runs a merge or test job")
+        self.assertEqual(row.get("about"), "Waits for a build slot")
 
         saved = replace(slot, identity=replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")))
         with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(saved,))):
