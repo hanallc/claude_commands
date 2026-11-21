@@ -1955,7 +1955,7 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
-            if shared:
+            if ledger is not None:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)
                 save_measures(types_peaks_path, types_peaks)

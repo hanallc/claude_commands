@@ -157,6 +157,64 @@ class MergeGateRerunsTests(GateSuitesFixture):
             self.assertEqual(len(self.gate_history()), 2)
             record.assert_not_called()
 
+    @gate_suites("hooks", "lib", "message")
+    def test_filter_keeps_history_and_reports_real_test_attempts(self) -> None:
+        self.configure_gate("merge_gate_governor_gib=4")
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "memory_stop_reruns=0")
+        self.write(self.state / "red-lib", "red")
+        self.write(self.state / "fail-first-message", "fail")
+        runner = self.state / "runner"
+        history = {
+            runner / "module_seconds.json": '{"hooks/test_first.py": 42.0}',
+            runner / "module_cpu_seconds.json": '{"hooks/test_first.py": 21.0}',
+            runner / "types_peak_mib.json": '{"scripts/production": 256.0}',
+            runner / "module_peak_mib.json": '{"hooks/test_first.py": 64.0}',
+            runner / "module_history.json": '{"hooks/test_first.py": [41.0, 42.0]}',
+        }
+        for path, data in history.items():
+            self.write(path, data)
+
+        cases = (
+            ("hooks/test_first.py", (0,), ("pass",)),
+            ("lib/test_first.py", (1, 1), ("fail", "fail")),
+            ("message/test_first.py", (1, 0), ("fail", "pass")),
+        )
+        killed = "lib/test_second.py"
+        names = tuple(name for name, _, _ in cases) + (killed,)
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment), redirect_stdout(output),
+              self.sampling_module_memory({killed: (5120.0,)})):
+            run = merge_gate.run_filter_modules(self.checkout, names)
+
+        self.assertFalse(run.passed, output.getvalue())
+        final = {f"{job.suite}/{job.module}": job for job in run.jobs}
+        self.assertCountEqual(final, names)
+        for name, exits, statuses in cases:
+            with self.subTest(module=name):
+                attempts = [job for job in run.executions if f"{job.suite}/{job.module}" == name]
+                self.assertEqual(tuple(job.returncode for job in attempts), exits, output.getvalue())
+                self.assertEqual(final[name], attempts[-1])
+                for job, status in zip(attempts, statuses, strict=True):
+                    self.assertFalse(job.killed_for)
+                    self.assertFalse(job.tripwire_tripped)
+                    times = job.times
+                    assert isinstance(times, dict), times
+                    self.assertEqual(times["tests_run"], 1)
+                    self.assertEqual(times["failures"], int(status == "fail"))
+                    self.assertEqual([(row["test"], row["status"]) for row in times["tests"]],
+                                     [("FixtureTest.test_gate_fixture", status)])
+
+        with self.subTest(module=killed):
+            job, = [job for job in run.executions if f"{job.suite}/{job.module}" == killed]
+            self.assertEqual(final[killed], job)
+            self.assertNotEqual(job.returncode, 0)
+            self.assertTrue(job.memory_stopped)
+            self.assertIn("exceeds the memory limit", job.killed_for)
+
+        for path, data in history.items():
+            with self.subTest(history=path.name):
+                self.assertEqual(path.read_bytes(), data.encode())
+
     def test_named_module_stops_at_the_fixture_floor(self) -> None:
         self.set_module_time_history({"hooks/test_first.py": (0.5,)})
         self.write(self.checkout / "scripts/hooks/test_first.py", """import os
