@@ -265,7 +265,7 @@ names.test-all=fixture all
         gate = self.read().workloads[0]
         assert isinstance(gate, machines_data.WorkloadWithoutComparison)
         self.assertEqual(gate.sentence, 'The records for fixture gate hold 3 completed runs on 2 machine sizes in this period.'
-                         ' No eligible measured choice has a saved price.')
+                         + ' No eligible measured choice has a saved price.')
 
     def test_the_gate_without_two_sizes_has_no_comparison(self) -> None:
         path = self.book.launch_history_path
