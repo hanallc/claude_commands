@@ -82,10 +82,12 @@ def review_role_refusal(owner: staff.StaffRow, role: WorkerRole | WorkerRoleUnav
     return AdmissionRefused(f"{owner.name}: only review and astra-reviewer can run here. Send write work to {route}.")
 
 
-def review_run_refusal(run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
+def review_run_refusal(owner: staff.StaffRow, run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
     root = run.resolve()
-    if not root.is_dir() or any(root.is_relative_to(tree) for tree in (paths.main, paths.integration)):
-        return AdmissionRefused("showrunner reviews require an existing run directory outside the checkouts")
+    if not isinstance(owner.run, staff.OpenRun) or root != owner.run.path.resolve() or not root.is_dir():
+        return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
+    if any(root.is_relative_to(tree) or tree.is_relative_to(root) for tree in (paths.main, paths.integration)):
+        return AdmissionRefused("the showrunner run directory overlaps a checkout")
     if any(not artifact.resolve().is_relative_to(root) for artifact in artifacts):
         return AdmissionRefused("showrunner review orders and replies must stay in the run directory")
     return None
@@ -1363,7 +1365,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
     if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), DispatchHoldsWorker):
         run = worker_run(owner, record=record, scanned=runs)
-    if isinstance(paths, EnrolledPaths) and (refusal := review_run_refusal(run, paths)):
+    if isinstance(paths, EnrolledPaths) and (refusal := review_run_refusal(owner, run, paths)):
         return refusal
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())

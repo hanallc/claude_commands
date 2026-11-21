@@ -3342,6 +3342,55 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index("--model") + 1], expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
 
+    def test_enrolled_showrunner_receives_both_design_verdicts(self) -> None:
+        main = self.fixture.root / "main"
+        integration = self.fixture.root / "integration"
+        main.mkdir()
+        integration.mkdir()
+        source = main / "design.txt"
+        _ = source.write_text("Confirm the selected panel.")
+        paths = EnrolledPaths(main, main / "production-live.md", main / "LOG.md", main / "notes", integration)
+        owner = fixture_member("showrunner", name="design-showrunner",
+                               doc=staff.LiveDoc("natedev", paths.live_doc))
+        self.fixture.parent_id = owner.id
+        _ = staff.set_run(owner.id, staff.OpenRun(self.run_dir))
+        self.fixture.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state["owner_staff_id"] = owner.id
+        atomic_file.write_text_atomic(state_path, json.dumps(state))
+        _ = self.prompt.write_text(f"Read {source.name} in main and return the design verdict.")
+        self.agent.finish_after = 1
+        families: dict[staff.WorkerRole, Literal["claude", "codex"]] = {"review": "claude", "astra-reviewer": "codex"}
+
+        def launch_policy(role: staff.WorkerRole) -> worker_panes.LaunchPolicy:
+            settings = models_registry.LaunchSettings(families[role], "fixture", "high", "")
+            return worker_panes.LaunchPolicy(settings, "read-only", "plan")
+
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}),
+              patch.object(worker_panes, "resolve_production_paths", return_value=paths),
+              patch.object(worker_panes, "launch_policy", side_effect=launch_policy)):
+            for role in families:
+                with self.subTest(role=role):
+                    reply = self.run_dir / f"{role}-verdict.md"
+                    code, output, errors = self.command("assign", role, str(self.prompt), "--to", role,
+                        "--session-dir", str(self.run_dir), "--slot", role, "--phase", "8", "--kind", "review",
+                        "--reply", str(reply), "--launcher-command", json.dumps(["assign.sh", "--role", role]))
+                    self.assertEqual((code, output), (0, "submitted\n"), errors)
+            self.assertEqual(len(self.agent.submitted), 2)
+            self.assertEqual(self.agent.notices, [])
+            for (pane, line), (role, family) in zip(self.agent.submitted, families.items(), strict=True):
+                with self.subTest(reply_from=role):
+                    self.assertIn(str(self.prompt), line)
+                    self.assertEqual(self.fixture.world.foreground[pane][1], family)
+                    checkout = Path(str(self.fixture.world.locations[pane]["cwd"]))
+                    self.agent.final = f"Design verdict: {(checkout / source.name).read_text()}"
+                    self.agent.complete(pane)
+                    self.assertEqual(self.finish(role), turn_end.TurnOutcome.DONE)
+                    reply = self.run_dir / f"{role}-verdict.md"
+                    self.assertIn("Design verdict: Confirm the selected panel.", reply.read_text())
+                    self.assertIn(f"reply {reply}", self.agent.notices[-1])
+
     def test_new_review_prompt_does_not_reuse_a_completed_predecessor(self) -> None:
         for already_completed in (False, True):
             with self.subTest(already_completed=already_completed):

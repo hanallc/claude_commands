@@ -3063,32 +3063,35 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.launches, [])
 
     def test_showrunner_can_start_a_worker(self) -> None:
-        self.parent_id = fixture_member("showrunner", name="showrunner").id
-        self.world.foreground.clear()
-        self.world.add(self.parent, "w1:p0")
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
-            code, _, errors = self.command("start-or-resume", "helper", "--role", "test")
-        self.assertEqual(code, worker_panes.ExitCode.OK, errors)
-        self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 1)
-
-    def test_enrolled_showrunner_keeps_both_reviewers_in_main(self) -> None:
         main, integration, run = (self.root / name for name in ("main", "integration", "review-run"))
         for directory in (main, integration, run):
             directory.mkdir()
         doc = main / "production-live.md"
-        log = main / "LOG.md"
-        notes = main / "notes"
-        paths = EnrolledPaths(main=main, live_doc=doc, log=log, notes=notes, integration=integration)
-        self.parent_id = fixture_member("showrunner", name="showrunner", doc=staff.LiveDoc("natedev", doc),
-                                        worktree=staff.PresentWorktree("natedev", integration)).id
-        _ = staff.set_run(self.parent.id, staff.OpenRun(run))
+        paths = EnrolledPaths(main=main, live_doc=doc, log=main / "LOG.md", notes=main / "notes", integration=integration)
+        legacy = fixture_member("showrunner", name="legacy-showrunner")
+        enrolled = fixture_member("showrunner", name="enrolled-showrunner", doc=staff.LiveDoc("natedev", doc),
+                                  worktree=staff.PresentWorktree("natedev", integration))
         self.world.foreground.clear()
-        self.world.add(self.parent, "w1:p0")
-        assignments: tuple[tuple[staff.WorkerRole, Literal["claude", "codex"]], ...] = (
-            ("review", "claude"), ("astra-reviewer", "codex"))
+        self.world.add(legacy, "w2:p0", workspace="w2", tab="w2:t0")
+        self.world.add(enrolled, "w3:p0", workspace="w3", tab="w3:t0")
+        assignments: tuple[tuple[staff.StaffRow, staff.WorkerRole, Literal["claude", "codex"]], ...] = (
+            (legacy, "test", "codex"), (enrolled, "review", "claude"), (enrolled, "astra-reviewer", "codex"))
         with patch.object(worker_panes, "resolve_production_paths", return_value=paths):
-            for role, family in assignments:
-                with self.subTest(role=role, family=family):
+            _ = staff.set_run(enrolled.id, staff.OpenRun(self.root))
+            with self.subTest(run="recorded run contains both checkouts"):
+                refused = worker_panes.start_or_resume(enrolled.id, staff.WorkerName.parse("review"), "review")
+                self.assertIsInstance(refused, worker_panes.AdmissionRefused)
+                self.assertEqual(self.world.launches, [])
+            _ = staff.set_run(enrolled.id, staff.OpenRun(run))
+            for owner, role, family in assignments:
+                with self.subTest(owner=owner.name, role=role, family=family):
+                    self.parent_id = owner.id
+                    if owner.id == legacy.id:
+                        with patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}):
+                            code, _, errors = self.command("start-or-resume", "helper", "--role", role)
+                        self.assertEqual(code, worker_panes.ExitCode.OK, errors)
+                        self.assertEqual(len(staff.snapshot().find(kind="worker", parent=owner.id)), 1)
+                        continue
                     selected = worker_panes.LaunchPolicy(models_registry.LaunchSettings(family, "fixture", "high", ""),
                                                          "read-only", "plan")
                     name = staff.WorkerName.parse(role)
@@ -3108,8 +3111,8 @@ class WorkerPaneTests(StaffTestCase):
                         self.world.foreground[opened.pane] = (pid, backend, unsafe)
                         result = worker_panes.start_or_resume(self.parent.id, name, role, policy=selected)
                         self.assertIsInstance(result, worker_panes.AdmissionRefused)
-            self.assertEqual(len(self.world.launches), 2)
-            self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 2)
+            self.assertEqual(len(self.world.launches), 3)
+            self.assertEqual(len(staff.snapshot().find(kind="worker", parent=enrolled.id)), 2)
 
     def test_unusable_configuration_opens_no_split(self) -> None:
         config = self.root / "conf/direct.conf"

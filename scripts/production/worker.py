@@ -655,7 +655,7 @@ def _require_review_order(owner: staff.StaffRow, role: WorkerRole | worker_panes
                           run: Path, *artifacts: Path) -> EnrolledPaths | worker_panes.OrdinaryWorkerOwner:
     paths = worker_panes.enrolled_worker_owner(owner)
     if isinstance(paths, EnrolledPaths):
-        refusal = worker_panes.review_role_refusal(owner, role) or worker_panes.review_run_refusal(run, paths, *artifacts)
+        refusal = worker_panes.review_role_refusal(owner, role) or worker_panes.review_run_refusal(owner, run, paths, *artifacts)
         if refusal:
             raise ValueError(refusal.reason)
     return paths
