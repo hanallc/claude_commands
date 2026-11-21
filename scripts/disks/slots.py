@@ -62,7 +62,7 @@ class SlotReport(TypedDict):
     root: str
     # The machine of the slots; a Builds page row names the slot folder and machine it runs in.
     machine: str
-    # A free slot unused this many days goes in the nightly sweep.
+    # The nightly sweep lists a free copy after this many days without use.
     unused_days: int
     groups: list[SlotGroup]
 
