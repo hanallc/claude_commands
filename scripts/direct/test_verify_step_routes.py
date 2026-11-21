@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import unittest
 from typing import cast
@@ -14,6 +16,7 @@ from scripts.build_targets import target_config
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS as TARGETS, RUNNER as RUNNER
 from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyCallShellTests(unittest.TestCase):
@@ -53,6 +56,54 @@ printf '%s\n' "$VERIFY_CALL_TEXT"
 
 
 class VerifyStepRoutesTests(VerifyStepRoutesFixture):
+    def test_verb_list_runs_in_order_with_one_run_identity(self) -> None:
+        git = shutil.which("git")
+        assert git is not None
+        stub = self.fixture.bin_directory / "git"
+        stub.unlink()
+        stub.symlink_to(git)
+        self.fixture.environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        for words in (("init", "-q", "-b", "main"), ("add", "Cargo.toml", "src"),
+                      ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")):
+            _ = subprocess.run([git, *words], cwd=self.fixture.root, env=self.fixture.environment, check=True,
+                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = (self.fixture.root / ".git/info/exclude").write_text("/*\n!/Cargo.toml\n!/src/\n")
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        previous = admission.server.handle_request
+        requests: dict[str, wire.PlacementRequest] = {}
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                _ = requests.setdefault(request.identity.step, request)
+            return previous(request, connection)
+
+        metadata = cast(dict[str, object], json.loads(self.fixture.environment["TEST_METADATA"]))
+        metadata["target_directory"] = str(self.fixture.root / "target")
+        self.fixture.environment["TEST_METADATA"] = json.dumps(metadata)
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("test,lint,doc", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(requests), ["nextest", "mend", "clippy", "doc"])
+        run = requests["nextest"].run
+        self.assertIsInstance(run, wire.RunIdentity)
+        assert isinstance(run, wire.RunIdentity)
+        self.assertEqual([requests[step].run for step in ("mend", "clippy")], [run, run])
+        # Doc executes under the run identity. Its slot request can release memory without a handoff.
+        rows = self.mac_rows()
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([row["run"] for row in rows], [f"{run.pid}:{run.start_time}"] * 4)
+        self.assert_removed()
+
+    def test_verb_list_stops_at_the_first_failure_and_returns_its_status(self) -> None:
+        self.fixture.environment.update({"TEST_MAC_ALLOWED": "0", "TEST_LOCAL_STATUS": "41"})
+        result = self.run_verify("test,lint,doc", "sample")
+        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
+        steps = [event["args"] for event in self.fixture.cargo_events()]
+        self.assertEqual(sum(args[:2] == ["nextest", "run"] for args in steps), 1)
+        self.assertTrue(all(args[0] in ("metadata", "nextest") for args in steps), steps)
+        self.assert_removed()
+
     def test_check_uses_mac_during_hold_and_removes_record(self) -> None:
         result = self.run_verify("check", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -3,6 +3,10 @@
 #
 # Usage:
 #   verify <command> [<package>] [flags]
+#   verify test,lint,doc [<package>]
+#
+# A verb list accepts test, lint, and doc in any order, with one optional package.
+# On Linux, the verbs share a run identity. The first failure ends the list.
 #
 # Commands:
 #   check [<package>]      check workspace libraries and binaries
@@ -510,6 +514,15 @@ fi
 # Read-only queries run before environment setup and build admission.
 VERIFY_QUERY_ARGS=("$@")
 [[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
+VERIFY_VERBS=()
+if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
+    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^(test|lint|doc)(,(test|lint|doc))+$ ||
+            ${#VERIFY_QUERY_ARGS[@]} -gt 2 || "${VERIFY_QUERY_ARGS[1]:-}" == -* ]]; then
+        echo 'verify.sh: a verb list accepts only test, lint, doc and one optional package. Use commas between verbs.' >&2
+        exit 2
+    fi
+    IFS=, read -r -a VERIFY_VERBS <<< "${VERIFY_QUERY_ARGS[0]}"
+fi
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final-pass ]]; then
     command_help final >&2
     exit 2
@@ -572,6 +585,29 @@ fi
 collect_child() {
     kill -s "$2" "$1" 2>/dev/null || return 0
     wait "$1" 2>/dev/null || true
+}
+
+stop_verify_verb_list() {
+    trap '' INT TERM HUP
+    local child=${!:-}
+    if [[ -n "$child" && "$child" != "$2" ]]; then collect_child "$child" TERM; fi
+    exit "$1"
+}
+
+run_verify_verbs() {
+    local verb previous_job=${!:-}
+    # Close the startup helper before the children open their own helpers.
+    exec 70>&- 71<&-
+    [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
+    # Stop the active verb on INT, which an asynchronous command can ignore.
+    trap 'stop_verify_verb_list 130 "$previous_job"' INT
+    trap 'stop_verify_verb_list 143 "$previous_job"' TERM
+    trap 'stop_verify_verb_list 129 "$previous_job"' HUP
+    for verb in "${VERIFY_VERBS[@]}"; do
+        previous_job=${!:-}
+        UNIT_DETACHED_RUN=1 bash "$VERIFY_START_DIR/verify.sh" "$verb" "$@" <&0 &
+        wait "$!" || exit "$?"
+    done
 }
 
 # One parent-owned helper serves command substitutions and cleanup traps.
@@ -1512,7 +1548,7 @@ fi
 
 CMD="${1:-}"
 case "$CMD" in
-    check|test|lint|doc|build|example|final|example-test) ;;
+    check|test|lint|doc|build|example|final|example-test|*,*) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -1545,6 +1581,10 @@ source "$VERIFY_START_DIR/../lib/buildlog_run.sh"
 buildlog_initialize_run verify_helper "$STEP_RECORD_SCRIPT"
 
 shift
+if (( ${#VERIFY_VERBS[@]} )); then
+    run_verify_verbs "$@"
+    exit 0
+fi
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
     exit 2

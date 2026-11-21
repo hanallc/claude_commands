@@ -82,7 +82,7 @@ with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: 
 from scripts.direct.step_row_test_support import read_step_row
 record = read_step_row(call_id)
 with Path(os.environ["TEST_MAC_EVENTS"]).open("a") as output:
-    output.write(json.dumps({"args": words, "record": record}) + "\n")
+    output.write(json.dumps({"args": words, "record": record, "run": os.environ.get("BUILDLOG_RUN", "")}) + "\n")
 verb = words[words.index("--verb") + 1] if "--verb" in words else "nextest"
 needs_repair = ((verb == "clippy" and os.environ.get("TEST_REQUIRE_CLIPPY_FIX") == "1")
                 or (verb == "mend-check" and os.environ.get("TEST_REQUIRE_MEND_FIX") == "1"))
