@@ -1,4 +1,4 @@
-"""Render the New item dialog shared by Review and Builds."""
+"""Render the shared New item dialog."""
 from __future__ import annotations
 
 import hmac
@@ -81,6 +81,7 @@ class MemorySegment:
     label: str
     gib: float
     tone: MemoryTone
+    text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,8 @@ class MemoryReading:
     free_for_next_gib: float | None
     queue_cap_gib: float | None
     segments: tuple[MemorySegment, ...]
+    free_text: str | None = None
+    cap_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -323,6 +326,10 @@ def _optional_gib(value: object) -> float | None:
     return None if value is None else _gib(value)
 
 
+def _optional_memory_text(value: object) -> str | None:
+    return None if value is None else _text(value, "Displayed memory", 32)
+
+
 def _time(value: str) -> datetime:
     result = datetime.fromisoformat(value)
     if result.utcoffset() is None:
@@ -373,7 +380,8 @@ def read_evidence(value: object) -> Evidence:
             memory = _mapping(data.get("memory"), "Memory reading")
             segments = tuple(
                 MemorySegment(_text(segment.get("label"), "Memory label", BUILD_EVIDENCE_LIMITS["label"]),
-                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")))
+                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")),
+                              _optional_memory_text(segment.get("text")))
                 for entry in _entries(memory.get("segments"), "Memory segments", 32)
                 for segment in (_mapping(entry, "Memory segment"),))
             return BuildStepEvidence(
@@ -382,7 +390,8 @@ def read_evidence(value: object) -> Evidence:
                 _text(data.get("owner"), "Step owner", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True), cells,
                 MemoryReading(_optional_gib(memory.get("free_for_next_gib", "")),
                               _optional_gib(memory.get("queue_cap_gib", "")),
-                              segments),
+                              segments, _optional_memory_text(memory.get("free_text")),
+                              _optional_memory_text(memory.get("cap_text"))),
                 _text(data.get("tip_title"), "Tooltip title", BUILD_EVIDENCE_LIMITS["title"]),
                 _text(data.get("tip_status"), "Tooltip status", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True),
                 tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", BUILD_EVIDENCE_LIMITS["tipEntries"])))
@@ -562,6 +571,13 @@ KINDS = ((SubmissionKind.QUESTION, "Question", "circle-help"),
          (SubmissionKind.BUG, "Bug", "bug"))
 
 
+def title_button(page: Literal["list", "review"]) -> str:
+    """Place the New item button beside the page title."""
+    label = "New item" if page == "list" else "New"
+    return (f'<button class="review-new" type="button" aria-label="New item" title="New item" data-{page}-new>'
+            + f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span></button>')
+
+
 def render() -> str:
     """Mount the shared New item dialog and its launcher API."""
     chips = "".join(
@@ -596,6 +612,7 @@ def render() -> str:
    <div class="new-item-previews" data-previews hidden></div>
   </div>
   <footer>
+   <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
    <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
   </footer>
@@ -621,6 +638,14 @@ PAGE_STATE_STYLE = '''
 
 
 STYLE = '''
+.page-heading-actions>.review-new{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;
+min-height:36px;background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--accent);
+padding:5px 14px;margin:0;flex:none;white-space:nowrap}
+.review-new>[aria-hidden]{font-size:1.2em;line-height:1}
+@media(max-width:360px){
+ .page-heading-actions>.review-new{justify-content:center;min-width:36px;padding:5px}
+ .review-new-label{display:none}
+}
 #review-new-item {
  position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
  width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
@@ -746,6 +771,7 @@ STYLE = '''
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
+#review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
 @media (max-width: 480px) {
  #review-new-item header, #review-new-item footer, #review-new-item .new-item-body { padding-inline: 16px; }
@@ -769,6 +795,7 @@ SCRIPT = r'''(() => {
  const pageCapture = dialog.querySelector('[data-page-capture]'), includePage = form.elements.include_page;
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const sendNotice = dialog.querySelector('[data-send-disabled]');
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  const drafts = new Map();
@@ -802,15 +829,14 @@ SCRIPT = r'''(() => {
   const memory = node('div', '', 'new-item-memory');
   memory.append(node('h4', 'Overall memory'));
   const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
-  const amount = gib => gib === null ? 'unavailable' : gib.toFixed(1) + ' GiB';
-  free.append(node('strong', amount(evidence.memory.free_for_next_gib)), ' Free for the next step');
-  figures.append(free, node('p', 'Queue cap ' + amount(evidence.memory.queue_cap_gib), 'new-item-cap'));
+  free.append(node('strong', evidence.memory.free_text || 'unavailable'), ' Free for the next step');
+  figures.append(free, node('p', 'Queue cap ' + (evidence.memory.cap_text || 'unavailable'), 'new-item-cap'));
   memory.append(figures);
   const bar = node('div', '', 'new-item-memory-bar');
   bar.setAttribute('aria-hidden', 'true');
   const legend = node('div', '', 'new-item-memory-legend');
   for (const segment of evidence.memory.segments) {
-   const section = node('span'), key = node('span', segment.label + ' ' + segment.gib.toFixed(1) + ' GiB');
+   const section = node('span'), key = node('span', segment.label + ' ' + (segment.text || 'unavailable'));
    section.dataset.tone = key.dataset.tone = segment.tone;
    section.style.flexGrow = String(segment.gib);
    bar.append(section);
@@ -946,7 +972,7 @@ SCRIPT = r'''(() => {
   const path = ownerPage ? endpoint + '?' + new URLSearchParams({page: ownerPage}) : endpoint;
   const response = await fetch(path, {cache: 'no-store', signal});
   const data = await responseData(response, 'Could not load recipients.');
-  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || !data.token) {
+  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
    throw new Error('Could not load recipients.');
   }
   return data;
@@ -1118,6 +1144,7 @@ SCRIPT = r'''(() => {
   setPageMode(page);
   launcher = trigger || document.activeElement;
   token = '';
+  sendNotice.hidden = true;
   draftKey = capture.kind === 'build-step' ? capture.step_id : null;
   const draft = drafts.get(draftKey);
   drafts.delete(draftKey);
@@ -1152,6 +1179,9 @@ SCRIPT = r'''(() => {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
    token = data.token;
+   sendNotice.textContent = data.send_disabled || '';
+   sendNotice.hidden = !data.send_disabled;
+   if (data.send_disabled) pageCapture.hidden = true;
    recipients = data.recipients;
    pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
    showRecipients(draft ? undefined : recipientName, sameMode ? draft.recipient : undefined);
@@ -1224,6 +1254,11 @@ SCRIPT = r'''(() => {
 
  window.reviewNewItem = {open, evidenceLimits: Object.freeze(limits.buildEvidence)};
  document.addEventListener('click', event => {
+  const listButton = event.target.closest('[data-list-new]');
+  if (listButton) {
+   void open({trigger: listButton, page: 'list'});
+   return;
+  }
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
   if (page) void open({trigger, page, kind: 'bug'});

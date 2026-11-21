@@ -1132,29 +1132,25 @@ class WaitingForAnswer:
 
 
 @dataclass(frozen=True)
-class QuestionResend:
-    question: question_record.Question
-    delivery: change_page.QuestionDeliveryView
-
-
-@dataclass(frozen=True)
-class QuestionResends:
-    questions: tuple[QuestionResend, ...]
+class QuestionAttention:
+    failed: frozenset[str] = frozenset()
 
 
 def question_visibility(keeper: staff.StaffId, item: ListItem,
-                        status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionResends:
+                        status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionAttention:
     """Read the published state of each unanswered question."""
     unanswered = tuple(question for question in item.questions if question.answer is None)
     if not unanswered:
-        return QuestionResends(())
+        return QuestionAttention()
     target = _list_question_target(keeper, item)
-    resends: list[QuestionResend] = []
+    waiting = True
+    failed: set[str] = set()
     for question in unanswered:
         delivery = change_page.published_question_delivery_view(status, target.saved(question))
-        if not delivery.state.waits:
-            resends.append(QuestionResend(question, delivery))
-    return QuestionResends(tuple(resends)) if resends else WaitingForAnswer()
+        waiting &= delivery.state.waits
+        if delivery.state is delivery_state.QuestionSendState.FAILED:
+            failed.add(question.question_id)
+    return WaitingForAnswer() if waiting else QuestionAttention(frozenset(failed))
 
 
 def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChanges) -> None:
@@ -1199,9 +1195,32 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
             _save(store, item)
 
 
+class _CreationDefaults(TypedDict):
+    unit: str
+    state: ItemState
+    next_check: NextCheck
+    eta: Eta
+    parked_until: Parking
+    blocked_by: tuple[ItemDependency, ...]
+    related_to: tuple[int, ...]
+    requested_by: RequestedBy
+    closing_words: str
+    next_step: str
+    latest_status: str
+    evidence: str
+    done_when: str
+
+
+_CREATION_DEFAULTS: _CreationDefaults = {
+    "unit": "", "state": ItemState.NEW, "next_check": NoTimestamp.UNSET, "eta": EtaStatus.NOT_ASKED,
+    "parked_until": NoTimestamp.UNSET, "blocked_by": (), "related_to": (), "requested_by": RequestedBy.NATE,
+    "closing_words": "", "next_step": "", "latest_status": "", "evidence": "", "done_when": "",
+}
+
+
 def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         changes: ItemChanges,
-        number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = RequestedBy.NATE,
+        number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = _CREATION_DEFAULTS["requested_by"],
         ) -> ListItem:
     """Create an item without reusing an existing record number."""
     store = _store(keeper)
@@ -1211,14 +1230,16 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         if store.path(identity).exists():
             raise ListError(f"{identity}: the item already exists")
         moment = now()
-        item = ListItem(chosen, title, owner, keeper, "", ItemState.NEW, NoTimestamp.UNSET, EtaStatus.NOT_ASKED,
-                        moment, NoTimestamp.UNSET, (), (), requested_by, moment, moment, NoTimestamp.UNSET, "",
-                        "", "", "", "", ())
+        defaults = _CREATION_DEFAULTS.copy()
+        defaults["requested_by"] = requested_by
+        item = ListItem(chosen, title, owner, keeper, unread_since=moment, opened=moment, updated=moment,
+                        closed=NoTimestamp.UNSET, log=(), **defaults)
         if changes:
             item = replace(item, **changes)
         initial: LogFields = {"title": item.title, "owner": item.owner, "producer": item.producer,
                                 "state": item.state, "eta": item.eta,
-                                "next_step": item.next_step, "latest_status": item.latest_status, **changes}
+                                "next_step": item.next_step, "latest_status": item.latest_status,
+                                "requested_by": item.requested_by, **changes}
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
         _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
@@ -1367,6 +1388,41 @@ def _check_producer_update_fields(fields: Iterable[str]) -> None:
 def _append_evidence(evidence: str, line: str) -> str:
     separator = "\n" if evidence and not evidence.endswith("\n") else ""
     return evidence + separator + line
+
+
+def log_field_changes(item: ListItem) -> Generator[dict[str, object]]:
+    """Replay the saved fields and yield the fields to show for each log entry."""
+    previous: dict[str, object] = {}
+    for entry in item.log:
+        event = entry.what
+        shown: dict[str, object] = {}
+        if isinstance(event, FieldChange):
+            fields: dict[str, object] = dict(event.fields)
+            if event.action == "Added":
+                previous = dict(_CREATION_DEFAULTS)
+                _ = previous.pop("requested_by")
+            if event.action == "Closed":
+                previous["state"] = ItemState.CLOSED
+            shown = fields
+            if event.action == "Updated":
+                shown = {field: value for field, value in fields.items()
+                         if field not in previous or previous[field] != value}
+                evidence, old_evidence = shown.get("evidence"), previous.get("evidence")
+                if isinstance(evidence, str):
+                    old_lines: set[str] = set(old_evidence.splitlines()) if isinstance(old_evidence, str) else set()
+                    new_lines = [line for line in evidence.splitlines() if line not in old_lines]
+                    if new_lines:
+                        shown["evidence"] = "\n".join(new_lines) or "\n"
+                    elif evidence or not old_evidence:
+                        del shown["evidence"]
+            previous.update(fields)
+        elif isinstance(event, Reopened) or event == "Reopened":
+            previous.update(state=ItemState.NEW, closing_words="", parked_until=NoTimestamp.UNSET)
+        elif isinstance(event, Unparked):
+            previous["parked_until"] = NoTimestamp.UNSET
+            if isinstance(event, UnparkedForDelivery):
+                previous["state"] = ItemState.DELIVERED
+        yield shown
 
 
 def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str, add_evidence: str = "",
@@ -1717,12 +1773,9 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
-    resend_id: str = ""
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
         current = load(self.keeper, item)
-        if self.resend_id:
-            return tuple(question for question in current.questions if question.question_id == self.resend_id)
         if isinstance(self.ask_request, PageRequest):
             # The shared allocator reserves IDs of resolved questions through its answer field.
             archived = tuple(replace(entry.what.question, answer=question_record.Answer(
@@ -1786,29 +1839,14 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
 
 
 def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
-                    status: change_page.DeliveryStatus, *, resend_request: str = "") -> change_page.MessageDelivery:
-    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status,
-                             resend_unknown=bool(questions.resend_id), resend_request=resend_request)
+                    status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
+    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status)
 
 
 def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
     owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
     return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
                                            keeper, alert_owner=owner)
-
-
-def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
-                    request: str, status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Claim delivery for the saved question with this ID."""
-    with _store(keeper).locked():
-        item = load(keeper, identity)
-        if item.state == ItemState.CLOSED:
-            return change_page.NoMessageDelivery()
-        for question in item.questions:
-            if question.question_id == question_id and question.answer is None:
-                return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words, status,
-                                       resend_request=request)
-        return change_page.NoMessageDelivery()
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
@@ -1971,8 +2009,7 @@ def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
                                      "--from", "morty", "--text", text)
     result = subprocess.run(command, capture_output=True, text=True, check=False)
-    outcome = send_result.send_outcome(result.returncode, result.stdout)
-    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ("sent", "skipped"):
+    if send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True):
         return
     raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
 

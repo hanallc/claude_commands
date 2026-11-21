@@ -111,24 +111,32 @@ __PAGE_FRAME_STYLE__
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 /* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
-#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease;
-  width: max-content; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; border-radius: 8px; }
+#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
-#tip.on.scrollable { pointer-events: auto; }
 .tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
   width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
-.tip dt { max-width: min(13rem, 51vw); text-align: left; white-space: normal; overflow-wrap: anywhere; }
-.tip dd { min-width: 0; margin: 0; padding-left: 24px; text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.tip dt { text-align: left; white-space: nowrap; }
+.tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
-#tip > .tip { min-width: min(15rem, calc(100vw - 16px)); max-width: min(24rem, calc(100vw - 16px)); }
+#tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
 .tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
+.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
+.tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; white-space: normal; }
+.tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
+#tip { width: max-content; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; border-radius: 8px; }
+#tip.on.scrollable { pointer-events: auto; }
+#tip > .tip { min-width: min(15rem, calc(100vw - 16px)); }
+.tip dt, .tip dd { white-space: normal; overflow-wrap: anywhere; }
+.tip dt { max-width: min(13rem, 51vw); }
+.tip dd { min-width: 0; }
 .tip .program-memory {
   --program-live: color-mix(in srgb, var(--accent) 72%, var(--bg));
   --program-past: color-mix(in srgb, var(--agents) 72%, var(--bg));
@@ -534,75 +542,509 @@ function partsText(parts) { return parts.map(part => part.text).join(''); }
 function groupRows(rows) {
   return rows.filter(row => row.value !== '').map((row, index) => ({...row, group: index === 0}));
 }
-function memoryTenths(bytes) {
-  return Math.sign(bytes) * Math.round(Math.abs(bytes) / GIB * 10);
-}
 function sumMemory(parts) {
   return parts.reduce((sum, bytes) => sum + (recorded(bytes) ? bytes : 0), 0);
+}
+function programReadings(memory, add) {
+  function phase(live, past, reserve) {
+    const last = live.segments.at(-1)?.at(-1);
+    const peak = past?.peak ?? live.peak;
+    const current = last && add(memoryBreakdown(last[1]));
+    const sameSample = !past?.peak && last && peak && last[0] === peak[0] && last[1] === peak[1];
+    return {current, peak: sameSample ? current : peak && add(memoryBreakdown(peak[1])),
+      reserve: reserve && add(memoryBreakdown(reserve.bytes))};
+  }
+  return {compile: phase(memory.live.compile, memory.past?.compile, memory.compile_reserve),
+    test: phase(memory.live.test, memory.past?.test, memory.test_reserve)};
 }
 const shownReadings = new WeakMap();
 function shownReading(data) {
   if (shownReadings.has(data)) return shownReadings.get(data);
   const ram = {...data.ram};
-  const reserves = reserveReadings(ram);
-  ram.unnamed_bytes = recorded(ram.unattributed_bytes) && recorded(ram.kernel_no_counter_bytes)
-    ? ram.unattributed_bytes - ram.kernel_no_counter_bytes : null;
+  const reserves = reserveReadings(ram, data);
   ram.builds_bytes = sumMemory([ram.build_tools_bytes, ram.queued_builds_bytes, ram.ci_bytes]);
   ram.outside_bytes = sumMemory([ram.desktop_bytes, ram.agents_bytes, ram.other_programs_bytes,
     ram.kernel_bytes, ram.cache_bytes, ram.unattributed_bytes]);
   const overCapBytes = hasCap(data) ? reserves.build.raw.shortfall - ram.room_bytes : 0;
-  const shown = {...data, ram, reserves, waiters:data.waiters || [], overCapBytes};
+  const memory = ramBreakdowns(ram, reserves, data, overCapBytes);
+  const shown = {...data, ram, reserves, memory, waiters: data.waiters || [], overCapBytes};
+  const roots = [memory.budget, memory.cap, memory.taken, memory.overCap, reserves.shortfall,
+    ...RESERVES.map(([key]) => reserves[key].targetAmount),
+    ...Object.values(reserves.build.basis ?? {}), ...(reserves.swap.swapIn ? [reserves.swap.swapIn] : [])];
+  function add(amount) {
+    roots.push(amount);
+    return amount;
+  }
+  shown.stepReadings = runningReadings(shown, add);
+  shown.waitReadings = waitingReadings(shown, add);
+  shown.statusCheck = statusCheck(shown, add);
+  shown.swapDisplay = swapReadings(shown, add);
+  memory.protected = add(memoryBreakdown(ram.desktop_protection_bytes));
+  memory.tokenFloor = add(memoryBreakdown(data.tokens?.memory_floor_bytes));
+  shown.leftoverReadings = new Map((data.leftovers || []).map(row => [row, add(memoryBreakdown(row.used * GIB))]));
+  shown.programReadings = new Map((data.walk || []).filter(row => row.program_memory)
+    .map(row => [row.program_memory, programReadings(row.program_memory, add)]));
+  memoryTotal(...roots);
   shownReadings.set(data, shown);
   return shown;
 }
-function memoryRows(parts) {
-  return parts.filter(([, bytes]) => recorded(bytes)).map(([label, bytes]) => field(label, ramAmount(bytes)));
+function buildToolBreakdown(ram) {
+  const parts = [['rust-analyzer', ram.rust_analyzer_bytes], ['+ sccache', ram.sccache_bytes]];
+  const {python_tests_bytes: tests, waiting_runs_bytes: waiting, other_build_tools_bytes: other} = ram;
+  const split = [tests, waiting, other].every(recorded);
+  if (split) parts.push(['+ Python tests', tests], ['+ Waiting runs', waiting]);
+  if (!split || other > 0) parts.push(['+ Other build tools', other]);
+  return memoryBreakdown(ram.build_tools_bytes, parts);
 }
-function queueCapMemory(d) {
-  return {builds:d.ram.builds_bytes,free:d.ram.room_bytes};
+function memoryBreakdown(bytes, parts = []) {
+  return {bytes, parts: parts.map(([label, value]) => [label, value?.parts ? value : memoryBreakdown(value)])};
+}
+function addMemorySum(total, ...parts) {
+  (total.sums ??= []).push(parts);
+}
+function measuredTenths(bytes, unit = GIB) {
+  return recorded(bytes) && !(unit === GIB && isSmallRamAmount(bytes)) ? bytes / unit * 10 : 0;
+}
+function nearestTenth(raw) { return Math.sign(raw) * Math.round(Math.abs(raw)); }
+function memorySums(node) {
+  const parts = node.parts.map(([, child]) => child);
+  return [parts, ...(node.sums ?? [])];
+}
+function measuredSum(node, children) {
+  return children.length && recorded(node.bytes) && Math.abs(node.bytes - sumMemory(children.map(child => child.bytes))) < 1;
+}
+function smallRange(bytes, unit) {
+  const sign = unit === GIB && isSmallRamAmount(bytes) ? Math.sign(bytes) : 0;
+  return [Math.min(0, sign), Math.max(0, sign)];
+}
+function memoryFactor(nodes, score, size = 2 ** nodes.length) {
+  return {nodes, scores: Array.from({length: size}, (_, slot) => score(slot))};
+}
+function memoryScoreBetter(a, b) {
+  if (a.breaks !== b.breaks) return a.breaks < b.breaks;
+  const difference = a.distance - b.distance;
+  return Math.abs(difference) > 1e-9 ? difference < 0 : a.choices > b.choices;
+}
+const ZERO_MEMORY_SCORE = {breaks: 0, distance: 0, choices: 0n};
+function memoryScoreAdd(a, b) {
+  return {breaks: a.breaks + b.breaks, distance: a.distance + b.distance, choices: a.choices | b.choices};
+}
+function memorySumFactor(parent, children, orderWeight, counterFactors) {
+  const shared = [parent, ...children].filter(part => part.low !== part.high && part.uses > 1);
+  const scope = shared.map(part => part.id);
+  const mixed = children.some(part => part.unit !== parent.unit);
+  const scale = part => mixed ? part.unit : 1;
+  const floorSum = children.reduce((sum, part) => sum + part.low * scale(part), 0);
+  // Mixed units can show the sum only to the precision of the coarsest amount.
+  const margin = mixed ? Math.max(parent.unit, ...children.map(part => part.unit)) / 2 : 0;
+  const min = children.reduce((sum, part) => sum + part.min * scale(part), floorSum - parent.max * scale(parent) - margin);
+  const max = children.reduce((sum, part) => sum + part.max * scale(part), floorSum - parent.min * scale(parent) + margin);
+  const bands = new Map();
+  for (const part of children) {
+    if (Number.isInteger(part.raw)) continue;
+    const key = mixed ? part.unit + ":" + Math.floor(part.raw) : Math.floor(part.raw);
+    if (!bands.has(key)) bands.set(key, []);
+    bands.get(key).push(part);
+  }
+  for (const band of bands.values()) {
+    band.sort((a, b) => b.raw - a.raw || (a.raw < 0 ? b.id - a.id : a.id - b.id));
+  }
+  const sharedChildren = children.filter(part => part.low !== part.high);
+  if (!mixed && sharedChildren.length >= 6 && sharedChildren.every(part => part.uses > 1)) {
+    const band = bands.size === 1 ? [...bands.values()][0] : [];
+    const ranked = band.filter(part => part.low !== part.high);
+    const countOrder = ranked.length === sharedChildren.length && ranked.every((part, i) => !i || part.raw < ranked[i - 1].raw);
+    const order = [...bands.values()].flatMap(band => band.flatMap((part, i) =>
+      band.slice(0, i).filter(other => other.raw > part.raw &&
+        (!countOrder || part.low === part.high || other.low === other.high)).map(other => [other, part])));
+    counterFactors(parent, countOrder ? ranked : sharedChildren, order, orderWeight, min, max, countOrder);
+    return null;
+  }
+  return memoryFactor(scope, bits => {
+    const forced = part => bits >> scope.indexOf(part.id) & 1;
+    let totals = new Map([[0, {breaks: 0, distance: 0, choices: 0n}]]);
+    let forcedHigh = 0;
+    for (const band of bands.values()) {
+      const unit = scale(band[0]);
+      const ceilings = band.map(part => {
+        if (part.low === part.high) return part.low - Math.floor(part.raw);
+        return part.uses > 1 ? forced(part) : 0;
+      });
+      for (const [i, part] of band.entries()) {
+        if (part.low !== part.high && part.uses > 1) forcedHigh += ceilings[i] * unit;
+      }
+      let score = {breaks: 0, distance: 0, choices: 0n};
+      for (const [i, part] of band.entries()) {
+        if (part.uses === 1 && part.low !== part.high) score = memoryScoreAdd(score, part.scores[0]);
+        for (let j = 0; j < i; ++j) {
+          if (band[j].raw > part.raw && !ceilings[j] && ceilings[i]) score.breaks += orderWeight;
+        }
+      }
+      const options = [score];
+      // For each ceiling count, the largest private readings give the best order and distance.
+      for (const [i, part] of band.entries()) {
+        if (part.uses > 1 || part.low === part.high) continue;
+        let breaks = score.breaks;
+        for (const [j, other] of band.entries()) {
+          if (other.raw > part.raw && !ceilings[j]) breaks += orderWeight;
+          if (other.raw < part.raw && ceilings[j]) breaks -= orderWeight;
+        }
+        ceilings[i] = 1;
+        score = {breaks, distance: score.distance - part.scores[0].distance + part.scores[1].distance,
+          choices: score.choices ^ part.bit};
+        options.push(score);
+      }
+      const combined = new Map();
+      for (const [i, left] of totals) {
+        for (const [j, right] of options.entries()) {
+          const total = i + j * unit;
+          const candidate = memoryScoreAdd(left, right);
+          const previous = combined.get(total);
+          if (!previous || memoryScoreBetter(candidate, previous)) combined.set(total, candidate);
+        }
+      }
+      totals = combined;
+    }
+    const choices = parent.low === parent.high ? [0] : parent.uses > 1 ? [forced(parent)] : [0, 1];
+    let best;
+    for (const digit of choices) {
+      const value = (parent.low + digit) * scale(parent);
+      for (const [extra, score] of totals.entries()) {
+        const ceilings = forcedHigh + extra;
+        const candidate = parent.uses === 1 && parent.low !== parent.high
+          ? memoryScoreAdd(score, parent.scores[digit]) : {...score};
+        if (value < min + ceilings || value > max + ceilings) ++candidate.breaks;
+        if (!best || memoryScoreBetter(candidate, best)) best = candidate;
+      }
+    }
+    return best;
+  });
+}
+// Keep partial ceiling counts so a large sum does not need one factor for every row combination.
+function memoryCounterFactors(factors, countNode, parent, children, order, orderWeight, min, max, countOrder) {
+  const impossible = {breaks: Infinity, distance: 0, choices: 0n};
+  const penalty = {breaks: orderWeight, distance: 0, choices: 0n};
+  for (const pair of order) {
+    const variable = pair.filter(part => part.low !== part.high);
+    factors.push(memoryFactor(variable.map(part => part.id), bits => {
+      const digit = part => part.low === part.high ? part.low - Math.floor(part.raw) : bits >> variable.indexOf(part) & 1;
+      return !digit(pair[0]) && digit(pair[1]) ? penalty : ZERO_MEMORY_SCORE;
+    }));
+  }
+  const size = children.length + 1;
+  let count = children[0].id;
+  if (countOrder) {
+    // Nearest rounding preserves order. A distinct band can keep order with one ceiling count.
+    count = countNode(size);
+    for (const [i, child] of children.entries()) {
+      factors.push(memoryFactor([child.id, count], slot =>
+        Boolean(slot % 2) === (Math.floor(slot / 2) > i) ? ZERO_MEMORY_SCORE : impossible, size * 2));
+    }
+  } else {
+    for (let i = 1; i < children.length; ++i) {
+      const width = i + 1;
+      const next = countNode(width + 1);
+      factors.push(memoryFactor([count, children[i].id, next], slot => {
+        const before = slot % width, up = Math.floor(slot / width) % 2, after = Math.floor(slot / (width * 2));
+        return before + up === after ? ZERO_MEMORY_SCORE : impossible;
+      }, width * 2 * (width + 1)));
+      count = next;
+    }
+  }
+  const sharedParent = parent.low !== parent.high && parent.uses > 1;
+  factors.push(memoryFactor(sharedParent ? [count, parent.id] : [count], slot => {
+    const added = slot % size;
+    function score(digit, base) {
+      const value = parent.low + digit;
+      return {breaks: value < min + added || value > max + added ? 1 : 0,
+        distance: base.distance, choices: base.choices};
+    }
+    if (sharedParent || parent.low === parent.high) return score(Math.floor(slot / size), ZERO_MEMORY_SCORE);
+    const low = score(0, parent.scores[0]), high = score(1, parent.scores[1]);
+    return memoryScoreBetter(high, low) ? high : low;
+  }, size * (sharedParent ? 2 : 1)));
+}
+// Keep the best choice for the removed node for each assignment of its neighbors.
+function memoryChoices(domains, factors) {
+  const adjacent = new Map([...domains.keys()].map(id => [id, new Set()]));
+  const neighbors = new Map([...domains.keys()].map(id => [id, new Set()]));
+  for (const factor of factors) {
+    for (const id of factor.nodes) {
+      adjacent.get(id).add(factor);
+      for (const other of factor.nodes) if (other !== id) neighbors.get(id).add(other);
+    }
+  }
+  let choices = 0n;
+  while (neighbors.size) {
+    let index, links, size = Infinity;
+    for (const [id, next] of neighbors) {
+      let slots = 1;
+      for (const neighbor of next) slots *= domains.get(neighbor);
+      if (slots < size) {
+        [index, links, size] = [id, next, slots];
+        if (slots === 1) break;
+      }
+    }
+    const scope = [...links], range = domains.get(index);
+    const joined = adjacent.get(index);
+    adjacent.delete(index);
+    neighbors.delete(index);
+    const sources = Array.from(joined, ({nodes, scores}) => {
+      const strides = new Map();
+      let stride = 1;
+      for (const id of nodes) {
+        strides.set(id, stride);
+        stride *= domains.get(id);
+      }
+      const slots = new Uint32Array(size);
+      let group = 1;
+      for (const id of scope) {
+        const width = group * domains.get(id), offset = strides.get(id) ?? 0;
+        if (offset) for (let slot = group; slot < width; ++slot)
+          slots[slot] = slots[slot - group] + offset;
+        else if (group > 1) for (let slot = group; slot < width; ++slot) slots[slot] = slots[slot - group];
+        group = width;
+      }
+      return {scores, digit: strides.get(index), slots};
+    });
+    const best = memoryFactor(scope, slot => {
+      let bestBreaks = Infinity, bestDistance = Infinity, bestChoices = 0n;
+      for (let value = 0; value < range; ++value) {
+        let breaks = 0, distance = 0;
+        for (const {scores, digit, slots} of sources) {
+          const score = scores[slots[slot] + digit * value];
+          breaks += score.breaks;
+          if (breaks > bestBreaks || !Number.isFinite(breaks)) break;
+          distance += score.distance;
+        }
+        if (breaks > bestBreaks || !Number.isFinite(breaks) ||
+            (breaks === bestBreaks && distance > bestDistance + 1e-9)) continue;
+        let choices = 0n;
+        for (const {scores, digit, slots} of sources) {
+          const bits = scores[slots[slot] + digit * value].choices;
+          if (bits) choices |= bits;
+        }
+        if (breaks < bestBreaks || distance < bestDistance - 1e-9 || choices > bestChoices) {
+          [bestBreaks, bestDistance, bestChoices] = [breaks, distance, choices];
+        }
+      }
+      return {breaks: bestBreaks, distance: bestDistance, choices: bestChoices};
+    }, size);
+    for (const id of scope) {
+      const pending = adjacent.get(id), links = neighbors.get(id);
+      for (const factor of joined) pending.delete(factor);
+      pending.add(best);
+      links.delete(index);
+      for (const other of scope) if (other !== id) links.add(other);
+    }
+    if (!scope.length) choices |= best.scores[0].choices;
+  }
+  return choices;
+}
+// Search floor and ceiling tenths for each reading. Keep signed small ranges and reuse shared nodes.
+// Preserve measured signs, then small amounts, shared values, part order, and matching sums.
+// Break ties by total distance from measured values, then by larger magnitude in node order.
+function memoryTotal(...roots) {
+  const readings = new Map();
+  function add(node) {
+    if (readings.has(node)) return;
+    const raw = measuredTenths(node.bytes, node.unit);
+    const fixed = node.fixed ? nearestTenth(raw) : undefined;
+    const low = fixed ?? Math.floor(raw);
+    const high = fixed ?? Math.ceil(raw);
+    const unit = node.unit ?? GIB;
+    const [min, max] = smallRange(node.bytes, unit);
+    readings.set(node, {raw, low, high, min, max, unit, id: readings.size, uses: 0});
+    for (const parts of memorySums(node)) parts.forEach(add);
+  }
+  roots.forEach(add);
+  const sums = [];
+  for (const [node, item] of readings) {
+    for (const parts of memorySums(node)) {
+      if (!measuredSum(node, parts)) continue;
+      const children = parts.map(child => readings.get(child));
+      ++item.uses;
+      for (const child of children) ++child.uses;
+      sums.push([item, children]);
+    }
+  }
+  const factors = [], domains = new Map();
+  const adjustable = [...readings.values()].filter(item => item.uses && item.low !== item.high);
+  for (const [i, item] of adjustable.entries()) {
+    item.bit = 1n << BigInt(adjustable.length - i - 1);
+    const low = {breaks: 0, distance: item.raw - item.low, choices: item.raw < 0 ? item.bit : 0n};
+    const high = {breaks: 0, distance: item.high - item.raw, choices: item.raw < 0 ? 0n : item.bit};
+    item.scores = [low, high];
+    if (item.uses === 1) continue;
+    domains.set(item.id, 2);
+    factors.push({nodes: [item.id], scores: item.scores});
+  }
+  let nextId = readings.size;
+  function countNode(size) {
+    const id = nextId++;
+    domains.set(id, size);
+    return id;
+  }
+  const addCounters = (...args) => memoryCounterFactors(factors, countNode, ...args);
+  // One-use nodes send their best scores to each shared node for both choices.
+  let choices = 0n;
+  for (const [parent, children] of sums) {
+    if ([parent, ...children].every(part => part.low === part.high)) continue;
+    // One order break costs more than all possible sum breaks.
+    const factor = memorySumFactor(parent, children, sums.length + 1, addCounters);
+    if (!factor) continue;
+    if (factor.nodes.length) factors.push(factor);
+    else choices |= factor.scores[0].choices;
+  }
+  choices |= memoryChoices(domains, factors);
+  for (const [node, {raw, low, high, bit, uses}] of readings) {
+    node.tenths = low === high ? low : !uses ? nearestTenth(raw)
+      : ((choices & bit) !== 0n) === (raw >= 0) ? high : low;
+    node.text = formatRamAmount(node.bytes, node.tenths, node.unit);
+  }
+}
+function breakdownRows(amount) {
+  return amount.parts.filter(([, child]) => recorded(child.bytes)).map(([label, child]) => field(label, child.text));
+}
+function compressedSwapNote(kernel) {
+  const [, swap] = kernel.parts[0];
+  return swap.bytes > 0 ? `Of which compressed swap: ${swap.text}.` : "";
+}
+function ramBreakdowns(ram, reserves, data, overCapBytes) {
+  const tools = buildToolBreakdown(ram);
+  const runUses = new Map();
+  function runs(bytes, include) {
+    const children = (data.walk || []).filter(row => include(row) && recorded(row.used)).map(row => {
+      const used = memoryBreakdown(row.used * GIB);
+      runUses.set(row, used);
+      return used;
+    });
+    const other = bytes - sumMemory(children.map(node => node.bytes));
+    if (children.length === 1 && other === 0) return children[0];
+    if (other >= 1) children.push(memoryBreakdown(other));
+    const total = memoryBreakdown(bytes);
+    if (children.length) addMemorySum(total, ...children);
+    return total;
+  }
+  const queued = runs(ram.queued_builds_bytes, row => row.queued && !row.ci && !macRow(row) && row.kind !== 'cloud');
+  const ci = runs(ram.ci_bytes, row => row.ci);
+  const builds = memoryBreakdown(ram.builds_bytes, [
+    ['Build tools', tools], ['+ Queued builds', queued], ['+ hana CI', ci]]);
+  const programs = memoryBreakdown(ram.other_programs_bytes, [
+    ...(ram.programs || []).map(program => [program.name, program.bytes]),
+    ...(ram.smaller_program_count ? [[`${ram.smaller_program_count} smaller programs`, ram.smaller_programs_bytes]] : [])]);
+  const kernel = memoryBreakdown(ram.kernel_bytes, [
+    ['Compressed swap (zram)', ram.compressed_swap_bytes], ['+ Slab, stacks, page tables', ram.kernel_structures_bytes],
+    ['+ Other kernel counters', ram.kernel_counters_bytes]]);
+  const unnamed = recorded(ram.unattributed_bytes) && recorded(ram.kernel_no_counter_bytes)
+    ? ram.unattributed_bytes - ram.kernel_no_counter_bytes : null;
+  const unattributed = memoryBreakdown(ram.unattributed_bytes, [
+    ['Kernel, no counter', ram.kernel_no_counter_bytes], ['+ No program name', unnamed]]);
+  const desktop = memoryBreakdown(ram.desktop_bytes), agents = memoryBreakdown(ram.agents_bytes);
+  const cache = memoryBreakdown(ram.cache_bytes);
+  const outside = memoryBreakdown(ram.outside_bytes, [
+    ['Desktop', desktop], ['+ Agents', agents], ['+ Other programs', programs],
+    ['+ Kernel', kernel], ['+ File and kernel cache', cache], ['+ Not attributed', unattributed]]);
+  const room = memoryBreakdown(ram.room_bytes);
+  const {build, system} = reserves;
+  const capAvailable = hasCap(data);
+  const cap = memoryBreakdown(capAvailable ? data.cap * GIB : null, [
+    ['Builds', builds], ['+ Build reserved', build.covered], ['+ Free', room]]);
+  const free = memoryBreakdown(ram.available_bytes, [
+    ['Build reserved', build.covered], ['+ Free', room], ['+ System reserved', system]]);
+  const budget = memoryBreakdown(ram.total_bytes, [['Builds', builds], ['+ Free RAM', free], ['+ Everything else', outside]]);
+  cap.fixed = capAvailable;
+  const fullReserve = build.short && capAvailable;
+  const reserve = fullReserve ? build.targetAmount : build.covered;
+  const taken = memoryBreakdown(sumMemory([builds.bytes, reserve.bytes]), [
+    ['Builds', builds], [fullReserve ? '+ Full reserve' : '+ Build reserved', reserve]]);
+  const overCap = memoryBreakdown(overCapBytes);
+  if (overCapBytes > 0) addMemorySum(taken, cap, overCap);
+  return {tools, queued, ci, builds, desktop, agents, programs, kernel, cache, unattributed,
+    outside, room, free, cap, taken, overCap, budget, runUses};
 }
 const RESERVES = [
   ["safety", "Safety net", "s-safety", "A fixed setting.", "safety-note"],
   ["swap", "Swap coming back", "s-swap", "RAM held for swap that comes back.", "swap-note"],
   ["build", "Build reserved", "s-reserved", "Running builds grow into it.", "reserved-note"],
 ];
-function reserveAmount(bytes) {
-  return {bytes, text:ramAmount(bytes)};
-}
-function reserveReadings(ram) {
+function gibBytes(gib) { return recorded(gib) ? gib * GIB : null; }
+function reserveReadings(ram, data) {
   const reserves = Object.fromEntries(RESERVES.map(([key]) => {
     const raw = {covered:ram[key+'_covered_bytes'], target:ram[key+'_target_bytes'],
       shortfall:ram[key+'_missing_bytes']};
-    return [key, {raw, covered:ramAmount(raw.covered), target:ramAmount(raw.target),
-      shortfall:ramAmount(raw.shortfall), short:raw.shortfall > 0}];
+    const covered = memoryBreakdown(raw.covered);
+    const missing = memoryBreakdown(raw.shortfall);
+    const targetAmount = raw.target === raw.covered ? covered : memoryBreakdown(raw.target, [
+      ['Covered', covered], ['Not covered', missing]]);
+    return [key, {raw, covered, targetAmount, missing, short:raw.shortfall > 0}];
   }));
-  reserves.system = reserveAmount(sumMemory([reserves.safety.raw.covered, reserves.swap.raw.covered]));
-  reserves.shortfall = reserveAmount(ram.shortfall_bytes);
+  reserves.system = memoryBreakdown(sumMemory([ram.safety_covered_bytes, ram.swap_covered_bytes]), [
+    ['Safety net', reserves.safety.covered], ['+ Swap coming back', reserves.swap.covered]]);
+  const basis = data.build_reserve;
+  if (recorded(basis?.share_percent)) {
+    const growth = memoryBreakdown(basis.growth_bytes);
+    const between = memoryBreakdown(basis.between_steps_bytes ?? 0);
+    const unread = memoryBreakdown(basis.unread_bytes ?? 0);
+    const held = basis.share_percent === 100 ? growth
+      : memoryBreakdown(basis.growth_kept_bytes ?? basis.growth_bytes * basis.share_percent / 100);
+    reserves.build.basis = {growth, between, unread};
+    addMemorySum(reserves.build.targetAmount, held, between, unread);
+  }
+  const swap = data.swap;
+  if (recorded(swap?.reserve_share_percent) && swap.window_seconds > 0) {
+    const swapIn = memoryBreakdown(swap.swap_in_window_bytes);
+    reserves.swap.swapIn = swapIn;
+    const held = swap.reserve_share_percent === 100 ? swapIn : memoryBreakdown(swapIn.bytes * swap.reserve_share_percent / 100);
+    addMemorySum(reserves.swap.targetAmount, held);
+  }
+  reserves.shortfall = memoryBreakdown(ram.shortfall_bytes, RESERVES.filter(([key]) => reserves[key].short)
+    .map(([key, name], index) => [(index ? '+ ' : '') + name, reserves[key].missing]));
   return reserves;
 }
-function coveredReserveRows(parts) {
-  return parts.filter(([, reserve]) => recorded(reserve.raw.covered))
-    .map(([label, reserve]) => field(label, reserve.covered));
+function runningReadings(data, add) {
+  const {runUses} = data.memory;
+  const target = data.reserves.build.targetAmount;
+  const local = row => row.queued && !macRow(row) && row.kind !== 'cloud';
+  const reserved = (data.walk || []).filter(row => local(row) && recorded(row.reserved) && row.reserved !== 0);
+  const amounts = new Map((data.walk || []).map(row => {
+    const used = runUses.get(row) ?? add(memoryBreakdown(gibBytes(row.used),
+      row.group ? (row.parts || []).map(part => ['', gibBytes(part.gib)]) : []));
+    const bytes = gibBytes(row.reserved);
+    const reserve = reserved.length === 1 && reserved[0] === row && Math.abs(bytes - target.bytes) < 1
+      ? target : add(memoryBreakdown(bytes));
+    const counted = (row.queued || row.ci) && row.reserved > 0 && recorded(used.bytes)
+      ? add(memoryBreakdown(used.bytes + reserve.bytes, [['Uses', used], ['+ Build reserved', reserve]])) : null;
+    return [row, {used, reserve, counted}];
+  }));
+  const parts = reserved.map(row => amounts.get(row).reserve);
+  if (parts.length && !parts.includes(target)) addMemorySum(target, ...parts);
+  return amounts;
 }
-const stepReserves = new WeakMap();
-function stepReserve(row) {
-  if (!stepReserves.has(row)) stepReserves.set(row, reserveAmount(row.reserved * GIB));
-  return stepReserves.get(row);
+function capUnavailableNote(d) {
+  const {build, safety, swap, shortfall} = d.reserves;
+  const reason = d.cap_text || "Cap unavailable";
+  const amounts = [
+    ['free RAM', d.memory.free], ['safety', safety.targetAmount], ['swap coming back', swap.targetAmount],
+    ['kept aside', build.targetAmount], ['room', d.memory.room], ...(shortfall.bytes > 0 ? [['shortfall', shortfall]] : []),
+  ];
+  return [reason, ...amounts.map(([label, amount]) => `${label} ${amount.text}`)].join("; ");
 }
 function reserveTargetRows(reserve) {
-  return reserve.short ? [field('Target', reserve.target)] : [];
+  return reserve.short ? [field('Target', reserve.targetAmount.text)] : [];
 }
 function reserveTip(name, caption, reserve, parts) {
-  return [field(name, reserve.covered, 'title'), field('', caption, 'caption'),
-    ...groupRows([...parts, ...(reserve.short ? [field('Not covered', reserve.shortfall)] : [])])];
+  return [field(name, reserve.covered.text, 'title'), field('', caption, 'caption'),
+    ...groupRows([...parts, ...(reserve.short ? [field('Not covered', reserve.missing.text)] : [])])];
 }
 function buildReserveRows(d) {
   const basis = d.build_reserve, reserve = d.reserves.build;
   if (!basis || !recorded(basis.share_percent) || !(reserve.raw.target > 0)) return reserveTargetRows(reserve);
-  return [field('Room to grow', ramAmount(basis.growth_bytes)), field('× Share held', formatPercent(basis.share_percent)),
-    ...(basis.between_steps_bytes > 0 ? [field('+ Between steps', ramAmount(basis.between_steps_bytes))] : []),
-    ...(basis.unread_bytes > 0 ? [field('+ Unread steps', ramAmount(basis.unread_bytes))] : []),
-    field('= Target', reserve.target)];
+  const {growth, between, unread} = reserve.basis;
+  return [field('Room to grow', growth.text), field('× Share held', formatPercent(basis.share_percent)),
+    ...(between.bytes > 0 ? [field('+ Between steps', between.text)] : []),
+    ...(unread.bytes > 0 ? [field('+ Unread steps', unread.text)] : []),
+    field('= Target', reserve.targetAmount.text)];
 }
 function swapReserveRows(d) {
   const swap = d.swap, reserve = d.reserves.swap;
@@ -610,14 +1052,14 @@ function swapReserveRows(d) {
   if (!(swap.window_seconds > 0))
     return [field('Share held', formatPercent(swap.reserve_share_percent)), ...reserveTargetRows(reserve)];
   return [field('Lookback', durationMinutes(swap.window_seconds / 60)),
-    field('Swap-in', ramAmount(swap.swap_in_window_bytes)),
-    field('× Share held', formatPercent(swap.reserve_share_percent)), field('= Target', reserve.target)];
+    field('Swap-in', reserve.swapIn.text),
+    field('× Share held', formatPercent(swap.reserve_share_percent)), field('= Target', reserve.targetAmount.text)];
 }
 function reserveAlert(d) {
   const short = RESERVES.filter(([key]) => d.reserves[key].short)
     .map(([key, name]) => {
       const reserve = d.reserves[key];
-      return `${name} holds ${reserve.covered.split(" ")[0]} of ${reserve.target}`;
+      return `${name} holds ${reserve.covered.text.split(" ")[0]} of ${reserve.targetAmount.text}`;
     });
   return short.length ? `Free RAM is short by ${d.reserves.shortfall.text}. ${short.join("; ")}.` : "";
 }
@@ -635,57 +1077,37 @@ function renderReserveStatus(d, macAlert) {
     $(note).textContent = reserveDescription(description, reserve);
   }
 }
-function legendTip(name, bytes, caption, parts = [], text = ramAmount(bytes)) {
+function legendTip(name, bytes, caption, parts, text) {
   const title = field(name, text, 'title');
   return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
 }
+function breakdownTip(name, amount, caption) {
+  return legendTip(name, amount.bytes, caption, breakdownRows(amount), amount.text);
+}
 const TIPS = {
-  'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
-    ['Build tools', d.ram.build_tools_bytes], ['+ Queued builds', d.ram.queued_builds_bytes], ['+ hana CI', d.ram.ci_bytes]])),
-  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows([
-    ['rust-analyzer', d.ram.rust_analyzer_bytes], ['+ sccache', d.ram.sccache_bytes], ['+ Other build tools', d.ram.other_build_tools_bytes]])),
-  queued: d => legendTip('Queued builds', d.ram.queued_builds_bytes, 'RAM of builds the queue started'),
-  ci: d => legendTip('hana CI', d.ram.ci_bytes, 'RAM of hana CI programs'),
-  'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', [
-    ...coveredReserveRows([['Build reserved', d.reserves.build]]),
-    ...memoryRows([['+ Free', queueCapMemory(d).free]]),
-    field('+ System reserved', d.reserves.system.text)]),
+  'g-builds': d => breakdownTip('Builds', d.memory.builds, 'RAM that builds use now'),
+  tools: d => breakdownTip('Build tools', d.memory.tools, 'RAM that build tools use now'),
+  queued: d => breakdownTip('Queued builds', d.memory.queued, 'RAM of builds the queue started'),
+  ci: d => breakdownTip('hana CI', d.memory.ci, 'RAM of hana CI programs'),
+  'g-free': d => breakdownTip('Free RAM', d.memory.free, 'RAM that no program holds'),
   reserved: d => reserveTip('Build reserved', 'Held for running builds to grow into', d.reserves.build, buildReserveRows(d)),
-  room: d => legendTip('Free', queueCapMemory(d).free, 'Where the next step can start', [
-    field('Queue cap', hasCap(d) ? ramAmount(d.cap * GIB) : 'unavailable'),
-    field('− Builds', ramAmount(queueCapMemory(d).builds)), field('− Build reserved', d.reserves.build.covered)]),
-  system: d => legendTip('System reserved', d.reserves.system.bytes, 'RAM kept outside the queue cap',
-    coveredReserveRows([['Safety net', d.reserves.safety], ['+ Swap coming back', d.reserves.swap]]),
-    d.reserves.system.text),
+  room: d => legendTip('Free', d.ram.room_bytes, 'Where the next step can start', [
+    field('Queue cap', d.memory.cap.text), field('− Builds', d.memory.builds.text),
+    field('− Build reserved', d.reserves.build.covered.text)], d.memory.room.text),
+  system: d => breakdownTip('System reserved', d.reserves.system, 'RAM kept outside the queue cap'),
   safety: d => reserveTip('Safety net', 'RAM the queue always leaves free', d.reserves.safety, reserveTargetRows(d.reserves.safety)),
   swap: d => reserveTip('Swap coming back', 'RAM held for swap that comes back', d.reserves.swap, swapReserveRows(d)),
-  shortfall: d => {
-    const short = RESERVES.filter(([key]) => d.reserves[key].short);
-    return legendTip('Shortfall', d.reserves.shortfall.bytes, 'Reserves without enough free RAM',
-      short.map(([key, name], index) => field((index ? '+ ' : '') + name, d.reserves[key].shortfall)),
-      d.reserves.shortfall.text);
-  },
-  'g-else': d => legendTip('Everything else', d.ram.outside_bytes, 'RAM used outside builds', memoryRows([
-    ['Desktop', d.ram.desktop_bytes], ['+ Agents', d.ram.agents_bytes], ['+ Other programs', d.ram.other_programs_bytes],
-    ['+ Kernel', d.ram.kernel_bytes], ['+ File and kernel cache', d.ram.cache_bytes], ['+ Not attributed', d.ram.unattributed_bytes]])),
-  desktop: d => legendTip('Desktop', d.ram.desktop_bytes, 'RAM of the desktop session',
-    memoryRows([['Protected', d.ram.desktop_protection_bytes]])),
-  agents: d => legendTip('Agents', d.ram.agents_bytes, 'RAM of agent sessions and their tools'),
-  programs: d => legendTip('Other programs', d.ram.other_programs_bytes, 'RAM of all other programs', memoryRows([
-    ...(d.ram.programs || []).map(program => [program.name, program.bytes]),
-    ...(d.ram.smaller_program_count ? [[`${d.ram.smaller_program_count} smaller programs`, d.ram.smaller_programs_bytes]] : [])])),
-  kernel: d => legendTip('Kernel', d.ram.kernel_bytes, 'RAM the kernel uses for itself', memoryRows([
-    ['Compressed swap (zram)', d.ram.compressed_swap_bytes], ['+ Slab, stacks, page tables', d.ram.kernel_structures_bytes],
-    ['+ Other kernel counters', d.ram.kernel_counters_bytes]])),
-  cache: d => legendTip('File and kernel cache', d.ram.cache_bytes, 'Estimated cache outside free RAM'),
-  unattributed: d => legendTip('Not attributed', d.ram.unattributed_bytes, 'RAM without an attribution', memoryRows([
-    ['Kernel, no counter', d.ram.kernel_no_counter_bytes], ['+ No program name', d.ram.unnamed_bytes]])),
-  cap: d => legendTip('Queue cap', hasCap(d) ? d.cap * GIB : null, 'What builds may use', [
-    ...memoryRows([['Builds', queueCapMemory(d).builds]]),
-    ...coveredReserveRows([['+ Build reserved', d.reserves.build]]),
-    ...memoryRows([['+ Free', queueCapMemory(d).free]])]),
-  budget: d => legendTip('RAM', d.ram.total_bytes, 'Memory across this machine', memoryRows([
-    ['Builds', queueCapMemory(d).builds], ['+ Free RAM', d.ram.available_bytes], ['+ Everything else', d.ram.outside_bytes]])),
+  shortfall: d => breakdownTip('Shortfall', d.reserves.shortfall, 'Reserves without enough free RAM'),
+  'g-else': d => breakdownTip('Everything else', d.memory.outside, 'RAM used outside builds'),
+  desktop: d => legendTip('Desktop', d.memory.desktop.bytes, 'RAM of the desktop session',
+    recorded(d.memory.protected.bytes) ? [field('Protected', d.memory.protected.text)] : [], d.memory.desktop.text),
+  agents: d => breakdownTip('Agents', d.memory.agents, 'RAM of agent sessions and their tools'),
+  programs: d => breakdownTip('Other programs', d.memory.programs, 'RAM of all other programs'),
+  kernel: d => breakdownTip('Kernel', d.memory.kernel, 'RAM the kernel uses for itself'),
+  cache: d => breakdownTip('File and kernel cache', d.memory.cache, 'Estimated cache outside free RAM'),
+  unattributed: d => breakdownTip('Not attributed', d.memory.unattributed, 'RAM without an attribution'),
+  cap: d => breakdownTip('Queue cap', d.memory.cap, 'What builds may use'),
+  budget: d => breakdownTip('RAM', d.memory.budget, 'Memory across this machine'),
   waiting: () => [field('Waiting step', '', 'title'), field('Dashed outline', 'memory needed'), field('End', 'queue cap')],
   progress: () => [field('Build progress', '', 'title'), field('Blue', 'building'), field('Pink', 'testing')],
   walkhead: () => [field('Running, in start order', '', 'title'), field('Blue', 'in use now'), field('Hatching', 'reserved'),
@@ -693,34 +1115,38 @@ const TIPS = {
   queuehead: d => [field('Queued', d.waiters.length, 'title'),
     ...(d.queued_priority_units?.length ? [staffField('Priority', d.queued_priority_units)] : []),
     field('Order', 'submission order')],
-  walksum: d => legendTip('Taken', hasCap(d) ? claimedBytes(d) : null, 'Memory used or held by builds', [
-    ...memoryRows([['Builds', queueCapMemory(d).builds]]),
-    field(d.reserves.build.short ? '+ Full reserve' : '+ Build reserved',
-      d.reserves.build.short ? d.reserves.build.target : d.reserves.build.covered),
-    ...(d.overCapBytes > 0 ? memoryRows([['Queue cap', d.cap * GIB], ['Over cap', d.overCapBytes]]) : [])]),
+  walksum: d => legendTip('Taken', hasCap(d) ? d.memory.taken.bytes : null, 'Memory used or held by builds', [
+    ...breakdownRows(d.memory.taken),
+    ...(d.overCapBytes > 0 ? [field('Queue cap', d.memory.cap.text), field('Over cap', d.memory.overCap.text)] : [])],
+    hasCap(d) ? d.memory.taken.text : 'unavailable'),
   tokens: d => {
     if (d.tokens?.kind !== 'TokenPool') return [field('Tokens', 'unavailable', 'title')];
     return [field('Tokens', '', 'title'), ...groupRows(tokenPoolRows(d.tokens)),
       field('Job capacity', 'one extra job per token'),
       field('Shared by', 'natedev cargo and nextest'), field('CI pool', 'separate'),
-      field('Pause below', ramAmount(d.tokens.memory_floor_bytes)),
+      field('Pause below', d.memory.tokenFloor.text),
       field('Pool', d.tokens.paused ? 'paused' : 'active'),
       field('Per-build counts', d.token_counts ? 'unavailable' : 'known'),
       ...detailRows('Because', d.token_counts)];
   },
   ticks: d => legendTip('Scale', d.ram.total_bytes, 'One scale for both charts',
-    [field('Start', '0.0 GiB'), field('Red line', hasCap(d) ? 'queue cap' : '')]),
+    [field('Start', '0.0 GiB'), field('Red line', hasCap(d) ? 'queue cap' : '')], d.memory.budget.text),
   swaphead: () => [field('Swap and pressure', '', 'title'), field('Swap', 'memory on disk'), field('Stall', 'waiting for memory')],
   pill: d => [field('Memory pressure', ({ok:'none',warn:'near a limit',hold:'queue holds',neutral:'unavailable'})[level(d)], 'title')],
   'g-some': d => pressureTip('Some tasks stall', d.psi.some, d.limits.some, 'Memory waits of at least one task'),
   'g-full': d => pressureTip('All tasks stall', d.psi.full, d.limits.full, 'Memory waits of all active tasks'),
-  'g-swap': d => legendTip('Swap used', d.swap.used_bytes, 'Memory held on disk', memoryRows([['Capacity', d.swap.capacity_bytes]])),
+  'g-swap': d => {
+    const {used, capacity} = d.swapDisplay;
+    return legendTip('Swap used', used.bytes, 'Memory held on disk',
+      recorded(capacity.bytes) ? [field('Capacity', capacity.text)] : [], used.text);
+  },
 };
 function pressureTip(name, value, limit, caption) {
   return !recorded(value) ? [field(name, 'unavailable', 'title')] : [field(name, formatPercent(value), 'title'),
     field('', caption, 'caption'), ...groupRows([field('Average over', '10 s'), field('Queue holds above', recorded(limit) ? formatPercent(limit) : '')])];
 }
 const GIB = 1024 ** 3;
+const MEMORY_UNITS = new Map([[GIB, "GiB"], [1024 ** 2, "MiB"], [1024, "KiB"], [1, "B"]]);
 const RAM_BLOCKS = [
   ["tools", "Build tools", r => r.build_tools_bytes, "builds"], ["queued", "Queued builds", r => r.queued_builds_bytes, "builds"],
   ["ci", "hana CI", r => r.ci_bytes, "builds"],
@@ -733,6 +1159,9 @@ const RAM_BLOCKS = [
 ];
 // Bar widths exclude unavailable readings and negative values.
 function shownBytes(bytes) { return recorded(bytes) ? Math.max(0, bytes) : 0; }
+function ramBlockReading(data, block, reserveKey) {
+  return reserveKey ? data.reserves[reserveKey].covered : data.memory[block];
+}
 function groupBytes(r, group) {
   return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => sum + shownBytes(block[2](r)), 0);
 }
@@ -741,41 +1170,96 @@ function tokenPoolRows(pool) {
     : [field('Status', 'unavailable')];
 }
 function isSmallRamAmount(bytes) { return bytes !== 0 && Math.abs(bytes) < GIB / 10; }
-function ramAmount(bytes) {
+function formatRamAmount(bytes, tenths, unit = GIB) {
   if (!recorded(bytes)) return "unavailable";
-  if (isSmallRamAmount(bytes)) return bytes < 0 ? "-<0.1 GiB" : "<0.1 GiB";
-  const tenths = memoryTenths(bytes);
-  return `${Object.is(tenths,-0) ? "-0.0" : f1(tenths / 10)} GiB`;
+  if (unit === GIB && isSmallRamAmount(bytes)) return bytes < 0 ? "-<0.1 GiB" : "<0.1 GiB";
+  return `${(tenths / 10).toFixed(1)} ${MEMORY_UNITS.get(unit)}`;
+}
+function waitingReadings(data, add) {
+  const {room} = data.memory;
+  return new Map(data.waiters.map(row => {
+    const need = add(memoryBreakdown(gibBytes(row.need)));
+    const terms = row.head_room?.rows || [];
+    const earlier = terms.slice(3, -1).map(term => [term.label, add(memoryBreakdown(gibBytes(term.gib)))]);
+    const head = terms.at(-1);
+    const freeBytes = gibBytes(head ? head.gib : row.free);
+    const free = !recorded(freeBytes) || freeBytes === room.bytes ? room : add(memoryBreakdown(freeBytes));
+    if (head && earlier.length) addMemorySum(room, ...earlier.map(([, amount]) => amount), free);
+    const check = row.first_in_line ? memoryCheck(need, free, head ? free : room, add) : {need, free};
+    return [row, {...check, head, earlier}];
+  }));
+}
+function memoryCheck(need, free, room, add) {
+  const difference = recorded(room.bytes) && recorded(free.bytes) ? room.bytes - free.bytes : 0;
+  const adjustment = add(memoryBreakdown(Math.abs(difference)));
+  const shortage = add(memoryBreakdown(recorded(need.bytes) && recorded(free.bytes) ? need.bytes - free.bytes : null));
+  if (difference > 0) addMemorySum(room, free, adjustment);
+  if (difference < 0) addMemorySum(free, room, adjustment);
+  if (shortage.bytes > 0) addMemorySum(need, free, shortage);
+  return {need, free, adjustment, difference, shortage};
+}
+function statusCheck(data, add) {
+  const status = data.memory_status;
+  if (!['gpu_slot', 'one_running_memory_wait'].includes(status?.code)) return null;
+  const {room} = data.memory;
+  const head = [...data.waitReadings].find(([row, check]) =>
+    row.first_in_line && check.free.bytes === status.check_room_bytes)?.[1];
+  if (head && head.need.bytes === status.next_need_bytes) return head;
+  const free = head?.free ?? (room.bytes === status.check_room_bytes ? room : add(memoryBreakdown(status.check_room_bytes)));
+  return memoryCheck(add(memoryBreakdown(status.next_need_bytes)), free, free, add);
 }
 function statusLine(d) {
-  const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
+  const status = d.memory_status, {room} = d.memory;
   const {build, safety, swap} = d.reserves;
-  const shortage = recorded(status.next_need_bytes) && recorded(status.check_room_bytes)
-    ? status.next_need_bytes - status.check_room_bytes : 0;
+  const check = d.statusCheck;
+  if (check) {
+    if (status.code === 'one_running_memory_wait')
+      return `One build runs; another needs ${check.need.text}, but free is ${check.free.text}.`;
+    return "A GPU test waits: another GPU test holds the GPU test slot." + (check.shortage.bytes > 0
+      ? ` It also needs ${check.shortage.text} more memory.` : "");
+  }
   return ({
     unavailable: "Memory reading unavailable; build capacity is unknown.",
-    gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot." + (shortage > 0
-      ? ` It also needs ${ramAmount(shortage)} more memory.` : ""),
-    pressure: `Memory pressure prevents a new start; free is ${room}.`,
+    pressure: `Memory pressure prevents a new start; free is ${room.text}.`,
     shortfall: build.short && !safety.short && !swap.short
       ? "Nothing is free: build reserved needs more than free RAM. A reserve is room a step may still grow into, not RAM in use."
       : "Nothing is free: the reserves need more than free RAM.",
     no_room: "Nothing is free: the safety net, swap coming back and build reserved use all free RAM.",
-    one_running_memory_wait: `One build runs; another needs ${ramAmount(status.next_need_bytes)}, but free is ${ramAmount(status.check_room_bytes)}.`,
   })[status.code] || "";
 }
 function swapAmount(bytes) {
-  const amount = Math.abs(bytes);
-  if (amount >= 1024 ** 3) return `${f1(bytes / 1024 ** 3)} GiB`;
-  if (amount >= 1024 ** 2) return `${f1(bytes / 1024 ** 2)} MiB`;
-  if (amount >= 1024) return `${f1(bytes / 1024)} KiB`;
-  return `${f1(bytes)} B`;
+  const unit = [...MEMORY_UNITS.keys()].find(size => Math.abs(bytes) >= size) ?? 1;
+  return {...memoryBreakdown(bytes), unit};
 }
-function signedSwap(bytes) { return `${bytes < 0 ? "−" : "+"}${swapAmount(Math.abs(bytes))}`; }
-function swapTip(row) {
+function swapReadings(d, add) {
+  const used = add(swapAmount(d.swap?.used_bytes)), capacity = add(swapAmount(d.swap?.capacity_bytes));
+  const pools = {builds_ci: add(swapAmount(d.swap?.builds_ci_bytes)), outside: add(swapAmount(d.swap?.outside_bytes))};
+  addMemorySum(used, pools.builds_ci, pools.outside);
+  const rows = new Map(), members = new Map(), groups = {builds_ci: [], outside: []};
+  for (const row of d.swap_by ?? []) {
+    const amount = row.kind === 'total' && row.bytes === used.bytes ? used : add(swapAmount(row.bytes));
+    rows.set(row, amount);
+    groups[row.pool]?.push(amount);
+    const children = (row.members ?? []).map(member => {
+      const reading = add(swapAmount(member.bytes));
+      members.set(member, reading);
+      return reading;
+    });
+    if (children.length) addMemorySum(amount, ...children);
+  }
+  for (const [pool, children] of Object.entries(groups)) {
+    if (children.length) addMemorySum(pools[pool], ...children);
+  }
+  return {used, capacity, pools, rows, members};
+}
+function swapRowAmount(row, display) {
+  const text = display.rows.get(row).text;
+  return row.kind === 'difference' ? (row.bytes < 0 ? text.replace(/^-/, '−') : '+' + text) : text;
+}
+function swapTip(row, display) {
   const captions = {total:'Swap across this machine', difference:'Group readings above the host total',
     unattributed:'Swap without a matching group', ungrouped:'Swap without a program name', smaller:'Swap of the smaller named groups'};
-  const amount = row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes);
+  const amount = swapRowAmount(row, display);
   return [row.title_kind === 'staff' ? staffTitle(row.name, amount) : field(row.name, amount, 'title'),
     field('', captions[row.kind] || 'Swap charged to this program', 'caption'),
     ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
@@ -787,10 +1271,10 @@ function capEnd(d) {
   return hasCap(d) ? d.cap * GIB / total : 0;
 }
 function poolTip(pool, d) {
-  return pool === 'builds_ci' ? [field('Builds and CI', swapAmount(d.swap.builds_ci_bytes), 'title'),
-    field('', 'Swap outside the reserve target', 'caption')] : [field('Outside builds and CI', swapAmount(d.swap.outside_bytes), 'title'),
+  return pool === 'builds_ci' ? [field('Builds and CI', d.swapDisplay.pools.builds_ci.text, 'title'),
+    field('', 'Swap outside the reserve target', 'caption')] : [field('Outside builds and CI', d.swapDisplay.pools.outside.text, 'title'),
     ...groupRows([field('Reserve share', recorded(d.swap.reserve_share_percent) ? formatPercent(d.swap.reserve_share_percent) : ''),
-      field('Swap coming back', d.reserves.swap.covered),
+      field('Swap coming back', d.reserves.swap.covered.text),
       ...reserveTargetRows(d.reserves.swap)])];
 }
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
@@ -859,10 +1343,14 @@ function routeFields(row) {
   return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
     ...(row.runs_on === 'natedev or Mac' ? [] : detailRows('Because', row.because, row.because_parts))];
 }
-function progressRows(row) {
+function progressRows(row, data) {
   const progress = row.progress;
   // The Stage column shows only "waiting"; the tooltip gives the full reason.
-  if (progress?.kind === 'TokenWaitProgress') return detailRows('Stage', progress.stage);
+  if (progress?.kind === 'TokenWaitProgress') {
+    const floor = data.memory.tokenFloor;
+    return detailRows('Stage', progress.memory_paused && recorded(floor.bytes)
+      ? `${progress.stage} (memory under ${floor.text})` : progress.stage);
+  }
   if (!progress || progress.kind !== 'RowProgress')
     return row.kind === 'cloud' && row.stage ? [field('Stage', row.stage)] : [];
   const stage = row.kind === 'cloud' ? stageText(row) : progress.phase;
@@ -870,7 +1358,7 @@ function progressRows(row) {
     field('Done', formatPercent(progress.percent ?? 100 * progress.done / progress.total, progress.done === progress.total)),
     ...(progress.unit === 'modules' ? [field('Order', 'slowest first')] : [])]);
 }
-function stepTooltip(key, data, roomBytes) {
+function stepTooltip(key, data) {
   const row = stepRow(key, data);
   if (!row) return [];
   const waiting = key.startsWith('wait:');
@@ -879,19 +1367,24 @@ function stepTooltip(key, data, roomBytes) {
   const verify = row.verify;
   const stepFields = verify ? [field('Step', verify.total > 1
     ? `${verify.step} (${verify.position} of ${verify.total})` : verify.step)] : [];
-  const callFields = verify ? [field('Call', verify.call, 'call', true)] : [];
+  const call = verify?.call || row.call;
+  const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && !recorded(row.used) && (row.used || row.program_memory))
     || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
-  if (unavailable) return [stepTitle(row, 'unavailable'), ...stepFields, ...callFields];
-  const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
-  rows.push(...detailRows('Work', row.about, row.about_parts));
+  const group = row.group ? data.stepReadings.get(row).used : null;
+  const title = group ? field(row.name, group.text, 'title')
+    : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+  const rows = [title];
+  if (row.changes && !unavailable) rows.push(...detailRows('Work', row.about, row.about_parts));
+  else if (row.about) rows.push(field('', row.about, 'caption'));
   if (row.changes) rows.push(field('Changes', row.changes));
-  if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
-    ...groupRows((row.parts || []).map(part => {
+  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  if (group) return [...rows, field('Started by', 'not the queue'),
+    ...groupRows((row.parts || []).map((part, index) => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
         .filter(Boolean).join(' · ');
       const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
-      return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
+      return {...field(partsText(parts), group.parts[index][1].text), labelParts:parts};
     }))];
   rows.push(...ownerFields(row), ...stepFields);
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
@@ -900,28 +1393,23 @@ function stepTooltip(key, data, roomBytes) {
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
-      const cap = queueCapMemory(data);
-      const terms = row.head_room?.rows;
-      const head = terms?.at(-1);
-      const free = recorded(head?.gib) ? head.gib * GIB : recorded(row.free) ? row.free * GIB : roomBytes;
-      if (terms?.length) {
-        const earlier = terms.slice(3, -1);
-        rows.push(...groupRows([field('Queue cap', ramAmount(data.cap * GIB)),
-          field('− Builds', ramAmount(cap.builds)), field('− Build reserved', data.reserves.build.covered),
-          ...earlier.map(term => field(term.label, ramAmount(term.gib * GIB))),
-          field(head.label, ramAmount(free), 'sum')]));
+      const reading = data.waitReadings.get(row);
+      const {head, earlier} = reading;
+      if (head) {
+        const {cap, builds} = data.memory;
+        rows.push(...groupRows([field('Queue cap', cap.text), field('− Builds', builds.text),
+          field('− Build reserved', data.reserves.build.covered.text),
+          ...earlier.map(([label, amount]) => field(label, amount.text)), field(head.label, reading.free.text, 'sum')]));
       }
-      const need = [field('Needs', ramAmount(row.need * GIB))];
+      const need = [field('Needs', reading.need.text)];
       // Only the next step shows the memory it can use.
       if (row.first_in_line) {
-        if (!terms?.length) {
-          need.push(field('Free', ramAmount(cap.free)));
-          const difference = roomBytes - free;
-          if (difference > 0) need.push(field('− Held elsewhere', ramAmount(difference)));
-          if (difference < 0) need.push(field('+ Released', ramAmount(-difference)));
+        if (!head) {
+          need.push(field('Free', data.memory.room.text));
+          if (reading.difference > 0) need.push(field('− Held elsewhere', reading.adjustment.text));
+          if (reading.difference < 0) need.push(field('+ Released', reading.adjustment.text));
         }
-        const shortage = row.need * GIB - free;
-        if (shortage > 0) need.push(field('Short by', ramAmount(shortage)));
+        if (reading.shortage.bytes > 0) need.push(field('Short by', reading.shortage.text));
       }
       rows.push(...groupRows(need));
     }
@@ -932,17 +1420,15 @@ function stepTooltip(key, data, roomBytes) {
       if (row.location) rows.push(field('Where', row.location));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
     } else if (macRow(row)) {
-      rows.push(...groupRows([field('Uses', ramAmount(row.used * GIB)),
+      rows.push(...groupRows([field('Uses', data.stepReadings.get(row).used.text),
         ...(row.read_at ? [field('Reading age', ago(row.read_at, data.read_at))] : []), field('In queue cap', 'no')]));
     } else {
       if (!row.queued && !row.ci) rows.push(field('Started by', 'not the queue'));
-      const memory = (row.queued || row.ci) && row.reserved > 0
-        ? [...memoryRows([['Uses', row.used * GIB]]), field('+ Build reserved', stepReserve(row).text),
-          field('= In queue cap', ramAmount((row.used + row.reserved) * GIB), 'sum')]
-        : recorded(row.used) ? [field('Uses', ramAmount(row.used * GIB))] : [];
-      rows.push(...groupRows(memory));
+      const {used, counted} = data.stepReadings.get(row);
+      if (counted) rows.push(...groupRows([...breakdownRows(counted), field('= In queue cap', counted.text, 'sum')]));
+      else if (recorded(row.used)) rows.push(...groupRows([field('Uses', used.text)]));
     }
-    rows.push(...progressRows(row));
+    rows.push(...progressRows(row, data));
   }
   rows.push(...callFields);
   return rows.filter((row, index) => row.kind === 'title' || row.kind === 'long' || row.value || rows[index+1]?.kind === 'long');
@@ -959,8 +1445,8 @@ function tipDuration(key, row, data) {
 function tooltipRows(key, rawData) {
   const data = shownReading(rawData);
   const [kind, index] = key.split(':');
-  if (kind === 'row' || kind === 'wait') return stepTooltip(key, data, rawData.ram.room_bytes);
-  if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
+  if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index], data.swapDisplay);
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
@@ -977,9 +1463,11 @@ function tipCellsHtml(rows) {
   return rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
-    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : esc(row.value)}</dd>`
-      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` +
-        `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value)}</dd>`;
+    const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
+      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
+    const cell = `<dd${attr}>${value}</dd>`;
+    return ['caption','long'].includes(row.kind) ? cell
+      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` + cell;
   }).join('');
 }
 function tipText(key, data) {
@@ -1008,10 +1496,6 @@ function renderTargets(rows) {
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
-function claimedBytes(d) {
-  const reserve = d.reserves.build;
-  return d.ram.builds_bytes + (reserve.short ? reserve.raw.target : reserve.raw.covered);
-}
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
@@ -1023,8 +1507,8 @@ function visibleDetail(row) {
   return publicText(row.detail || "");
 }
 function publicText(text) {
-  return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—"
-    && part.trim() !== "owner not recorded" && !/\.(slice|service)\b/.test(part)).join(" · "));
+  return text.split(" · ").filter(part => part.trim() && part.trim() !== "—"
+    && part.trim() !== "owner not recorded" && !/\.(slice|service)\b/.test(part)).join(" · ");
 }
 function publicParts(parts) {
   const shown = [];
@@ -1035,7 +1519,7 @@ function publicParts(parts) {
       let offset = 0;
       for (const part of parts) {
         const from = Math.max(0, start - offset), to = Math.min(part.text.length, start + segment.length - offset);
-        if (to > from) shown.push({...part, text:memoryText(part.text.slice(from, to))});
+        if (to > from) shown.push({...part, text:part.text.slice(from, to)});
         offset += part.text.length;
       }
     }
@@ -1076,12 +1560,8 @@ function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
     (row.stale ? `${row.status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
 }
-function memoryText(text) {
-  return text.replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
-    .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
-}
 function reserveDescription(description, reserve) {
-  return description + (reserve.short ? ` Needs ${reserve.target}; free RAM covers ${reserve.covered}.` : "");
+  return description + (reserve.short ? ` Needs ${reserve.targetAmount.text}; free RAM covers ${reserve.covered.text}.` : "");
 }
 function ago(then, now) {
   return durationMinutes((now - then) / 60);
@@ -1102,8 +1582,6 @@ function placeTipAt(tip, x, y) {
   tip.style.top = `${Math.max(8, top)}px`;
   tip.classList.toggle("scrollable", tip.scrollHeight > tip.clientHeight || tip.scrollWidth > tip.clientWidth);
 }
-const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
-const memoryAmount = (n) => recorded(n) ? ramAmount(n * GIB) : "use unavailable";
 // Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
 // content(key) gives the tooltip HTML, or "" for no tooltip.
 function hoverTips(tip, content) {
@@ -1141,19 +1619,19 @@ function hoverTips(tip, content) {
 const programMemoryMarkup = new WeakMap();
 function programSeconds(ms) { return `${Math.round(ms / 1000)} s`; }
 function programSwatch(series) { return `<span class="program-swatch ${series}" aria-hidden="true"></span>`; }
-function programValues(live, past, hanaDuration = null) {
+function programValues(live, past, amounts, hanaDuration = null) {
   const last = live.segments.at(-1)?.at(-1);
-  const current = last ? ramAmount(last[1]) : live.state === 'not_started' ? 'not started' : 'no samples';
+  const current = last ? amounts.current.text : live.state === 'not_started' ? 'not started' : 'no samples';
   const currentName = last && live.state !== 'sampling' ? 'Live last sample' : 'Live sample';
   return [
     [currentName, current],
-    ...(past?.peak ? [['Past peak', ramAmount(past.peak[1])]] : []),
+    ...(past?.peak ? [['Past peak', amounts.peak.text]] : []),
     ...(past?.above_half_reserve_ms != null
       ? [['Past >½ reserve', programSeconds(past.above_half_reserve_ms)]] : []),
     ...(hanaDuration != null ? [['Past hana crate', programSeconds(hanaDuration)]] : []),
   ];
 }
-function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax) {
+function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax, peakReading) {
   const plotTop = bands.length ? 20 : 9;
   const base = bands.length ? 79 : 67;
   const left = 4, right = 238;
@@ -1180,7 +1658,7 @@ function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, mem
       ? Math.max(7, Math.min(peakY, reserveY - 12))
       : Math.min(base - 1, Math.max(peakY, reserveY + 12));
     peakLabel = dot(peak, peakSeries, peakSeries === 'past' ? 1 : scale, 3) +
-      `<text class="${peakSeries}" x="245" y="${labelY}">${esc(ramAmount(peak[1]))} peak</text>`;
+      `<text class="${peakSeries}" x="245" y="${labelY}">${esc(peakReading.text)} peak</text>`;
   }
   let crateBands = '';
   if (bands.length) {
@@ -1197,13 +1675,13 @@ function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, mem
     ${lines(past, 'past', 1)}${lines(live, 'live', scale)}${peakLabel}${last ? dot(last, 'live', scale, 3.5) : ''}
   </svg>`;
 }
-function programMemoryPhase(name, live, past, reserve, bands, hanaDuration, memoryMax) {
+function programMemoryPhase(name, live, past, reserve, bands, hanaDuration, memoryMax, amounts) {
   const last = live.segments.at(-1)?.at(-1);
   const pastDuration = past?.duration_ms ?? 0;
   const scaled = name === 'Compile' && pastDuration > 0 && live.duration_ms > 0 && !!last;
   const axisEnd = (scaled ? pastDuration : Math.max(live.duration_ms, pastDuration)) || 1000;
   const scale = scaled ? axisEnd / live.duration_ms : 1;
-  const values = programValues(live, past, bands.length ? hanaDuration : null);
+  const values = programValues(live, past, amounts, bands.length ? hanaDuration : null);
   const elapsed = last ? programSeconds(live.duration_ms) : '';
   const rows = [field('Elapsed', elapsed),
     field('Axis', scaled ? 'scaled to past run' : ''),
@@ -1212,11 +1690,11 @@ function programMemoryPhase(name, live, past, reserve, bands, hanaDuration, memo
     ...values.map(([label, value]) => field(label, value))].filter(row => row.value);
   return `<dd class="program-memory group"><section class="program-phase">
     <div class="program-heading"><h2>${name}</h2></div>
-    ${programPhaseChart(name, live, past, reserve && reserveAmount(reserve.bytes), bands, axisEnd, scale, memoryMax)}
+    ${programPhaseChart(name, live, past, amounts.reserve, bands, axisEnd, scale, memoryMax, amounts.peak)}
     <div class="program-times"><span>0 s</span><span>time</span><span>${programSeconds(axisEnd)}</span></div>
   </section></dd>` + tipCellsHtml(rows);
 }
-function programMemoryHtml(memory) {
+function programMemoryHtml(memory, amounts) {
   if (programMemoryMarkup.has(memory)) return programMemoryMarkup.get(memory);
   const {live, past, compile_reserve: compileReserve, test_reserve: testReserve} = memory;
   const memoryMax = Math.max(GIB, compileReserve.bytes, testReserve?.bytes ?? 0,
@@ -1226,15 +1704,15 @@ function programMemoryHtml(memory) {
   ])) + `<dd class="program-memory">
     <div class="program-key"><span>${programSwatch('live')}This run (live)</span><span>${programSwatch('past')}Past run</span></div>
   </dd>` +
-    programMemoryPhase('Compile', live.compile, past?.compile, compileReserve, past?.hana_crate_bands ?? [], past?.hana_compile_ms, memoryMax) +
-    programMemoryPhase('Test', live.test, past?.test, testReserve, [], 0, memoryMax);
+    programMemoryPhase('Compile', live.compile, past?.compile, compileReserve, past?.hana_crate_bands ?? [], past?.hana_compile_ms, memoryMax, amounts.compile) +
+    programMemoryPhase('Test', live.test, past?.test, testReserve, [], 0, memoryMax, amounts.test);
   programMemoryMarkup.set(memory, html);
   return html;
 }
 function buildsTooltipHtml(key, data) {
   const html = tooltipHtml(key, data);
   const memory = key.startsWith('row:') && stepRow(key, data)?.program_memory;
-  return memory ? html.slice(0, -5) + programMemoryHtml(memory) + '</dl>' : html;
+  return memory ? html.slice(0, -5) + programMemoryHtml(memory, shownReading(data).programReadings.get(memory)) + '</dl>' : html;
 }
 const currentBuildsTooltip = key => latest ? buildsTooltipHtml(key, latest) : "";
 const tip = document.getElementById("tip");
@@ -1302,7 +1780,7 @@ function render(d) {
     }
   }
   renderTargets(d.targets || []);
-  const shown = shownReading(d), amounts = shown.ram;
+  const shown = shownReading(d), {memory} = shown;
   const {build, system, swap} = shown.reserves;
   const r = d.ram;
   $("ram-missing").textContent = r.missing.length ? `Missing readings: ${r.missing.join("; ")}.` : "";
@@ -1318,33 +1796,32 @@ function render(d) {
     const widthBytes = shownBytes(bytes);
     if (total) setSeg(`s-${key}`, widthBytes, total);
     $(`s-${key}`).hidden = widthBytes === 0;
-    const text = reserveKey ? shown.reserves[reserveKey].covered : ramAmount(bytes);
-    const label = reserveKey ? text : ramAmount(widthBytes);
+    const text = ramBlockReading(shown, key, reserveKey).text;
+    const label = widthBytes > 0 ? text : "";
     $(`l-${key}`).textContent = label.split(" ")[0];
     $(`v-${key}`).textContent = text;
     parts.push(`${name} ${text}`);
   }
-  $("barwrap").setAttribute("aria-label", `RAM ${ramAmount(amounts.total_bytes)}: ${parts.join(", ")}`);
+  $("barwrap").setAttribute("aria-label", `RAM ${memory.budget.text}: ${parts.join(", ")}`);
   const builds = groupBytes(r, "builds");
-  const capMemory = queueCapMemory(shown);
-  for (const [id, bytes] of [["g-builds", capMemory.builds], ["g-free", amounts.available_bytes], ["g-else", amounts.outside_bytes],
-    ["cap-builds", capMemory.builds], ["cap-room", capMemory.free]]) {
-    $(`v-${id}`).textContent = ramAmount(bytes);
+  for (const [id, text] of [["g-builds", memory.builds.text], ["g-free", memory.free.text], ["g-else", memory.outside.text],
+    ["cap-builds", memory.builds.text], ["cap-room", memory.room.text]]) {
+    $(`v-${id}`).textContent = text;
   }
-  $("v-cap-reserved").textContent = build.covered;
+  $("v-cap-reserved").textContent = build.covered.text;
   $("v-system").textContent = system.text;
-  $("v-cap").textContent = ramAmount(hasCap(d) ? shown.cap * GIB : null);
-  const compressed = recorded(r.compressed_swap_bytes) && r.compressed_swap_bytes > 0;
-  $("kernel-note").textContent = compressed ? `Of which compressed swap: ${ramAmount(amounts.compressed_swap_bytes)}.` : "";
-  $("kernel-note").hidden = !compressed;
-  $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${ramAmount(shown.cap * GIB)}`;
+  $("v-cap").textContent = memory.cap.text;
+  const kernelNote = compressedSwapNote(memory.kernel);
+  $("kernel-note").textContent = kernelNote;
+  $("kernel-note").hidden = !kernelNote;
+  $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${shown.memory.cap.text}`;
   const freeShown = groupBytes(r, "free");
   const capBytes = hasCap(d) ? d.cap * GIB : 0;
   const roomAt = builds + build.raw.covered;
   for (const [id, from, size, label] of [
-    ["builds", 0, builds, ramAmount(capMemory.builds)], ["free", builds, freeShown, ramAmount(amounts.available_bytes)],
-    ["else", builds + freeShown, groupBytes(r, "else"), ramAmount(amounts.outside_bytes)],
-    ["reserved", builds, build.raw.covered, build.covered], ["room", roomAt, r.room_bytes, ramAmount(capMemory.free)],
+    ["builds", 0, builds, memory.builds.text], ["free", builds, freeShown, memory.free.text],
+    ["else", builds + freeShown, groupBytes(r, "else"), memory.outside.text],
+    ["reserved", builds, build.raw.covered, build.covered.text], ["room", roomAt, r.room_bytes, memory.room.text],
     ["system", roomAt + r.room_bytes, system.bytes, system.text], ["cap", 0, capBytes, $("v-cap").textContent]]) {
     const brace = $(`b-${id}`);
     brace.hidden = !total || size <= 0;
@@ -1354,7 +1831,7 @@ function render(d) {
   }
   renderReserveStatus(shown, d.mac_idle_alert);
 
-  const [roomValue, roomUnit] = ramAmount(capMemory.free).split(" ");
+  const [roomValue, roomUnit] = memory.room.text.split(" ");
   $("room").textContent = roomValue;
   $("room-unit").textContent = roomUnit || "";
   const why = d.read_error ? "" : statusLine(shown);
@@ -1362,8 +1839,8 @@ function render(d) {
   $("room-why").hidden = !why;
   $("last-reading").textContent = d.read_error ? `Last reading: ${new Date(d.read_at * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}` : "";
   $("last-reading").hidden = !d.read_error;
-  $("swap-reserve").textContent = `Swap coming back: ${swap.covered}`;
-  $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
+  $("swap-reserve").textContent = `Swap coming back: ${swap.covered.text}`;
+  $("cap-reason").textContent = hasCap(d) ? "" : capUnavailableNote(shown);
   latest = d;
   setTimeout(fitLabels, 650);
 
@@ -1384,7 +1861,10 @@ function renderSwap(d) {
   const lv = level(d);
   $("pill").className = `pill ${lv}`;
   $("pill-t").textContent = ({ ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded" })[lv];
-  $("swap-sum").textContent = `${f1(d.swap.used_bytes / GIB)} / ${f1(d.swap.capacity_bytes / GIB)} GiB`;
+  const display = shownReading(d).swapDisplay;
+  const {used, capacity} = display;
+  const [usedValue, usedUnit] = used.text.split(" ");
+  $("swap-sum").textContent = `${usedUnit === capacity.text.split(" ")[1] ? usedValue : used.text} / ${capacity.text}`;
   const missing = Object.values(d.psi).filter(value => value && !recorded(value)).map(value => value.reason);
   if (d.pressure !== "none") missing.unshift(d.pressure);
   $("pressure-reason").textContent = [...new Set(missing)].join(" · ");
@@ -1403,14 +1883,14 @@ function renderSwap(d) {
   const titleHtml = row => row.title_kind === "staff" ? staffName(row.name) : esc(row.name);
   const detailHtml = row => row.detail_parts ? nameParts(publicParts(row.detail_parts)) : esc(visibleDetail(row));
   const rowHtml = ({row, index}) => `<div class="row ${row.kind}" data-tip="swap:${index}" data-pool="${row.pool}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller"
-    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${titleHtml(member)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
-    : titleHtml(row)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
+    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${titleHtml(member)}: ${display.members.get(member).text}</div>`).join("")}</div></details>`
+    : titleHtml(row)}</span><span class="v">${swapRowAmount(row, display)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
   const indexed = d.swap_by.map((row, index) => ({row, index}));
-  const pools = [["outside", "Outside builds and CI", d.swap.outside_bytes], ["builds_ci", "Builds and CI", d.swap.builds_ci_bytes]];
-  $("swaprows").innerHTML = pools.map(([pool, name, bytes]) => {
+  const pools = [["outside", "Outside builds and CI"], ["builds_ci", "Builds and CI"]];
+  $("swaprows").innerHTML = pools.map(([pool, name]) => {
     const key = `pool:${pool}`;
     const open = swapView.has(key) ? swapView.get(key) : true;
-    return `<div class="row pool" data-tip="swap-pool:${pool}"><span class="name"><button type="button" class="pool-toggle" data-owner-key="${key}" aria-expanded="${open}"><span class="chev">▶</span>${esc(name)}</button></span><span class="v">${swapAmount(bytes)}</span><small></small></div>` +
+    return `<div class="row pool" data-tip="swap-pool:${pool}"><span class="name"><button type="button" class="pool-toggle" data-owner-key="${key}" aria-expanded="${open}"><span class="chev">▶</span>${esc(name)}</button></span><span class="v">${display.pools[pool].text}</span><small></small></div>` +
       indexed.filter(({row}) => row.pool === pool).map(item => open ? rowHtml(item) : "").join("");
   }).join("") + indexed.filter(({row}) => row.pool === "all").map(rowHtml).join("");
   for (const details of document.querySelectorAll("#swaprows details")) {
@@ -1425,8 +1905,9 @@ document.addEventListener("click", (e) => {
 });
 
 function renderLeftovers(d) {
+  const {leftoverReadings} = shownReading(d);
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
-    `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
+    `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? leftoverReadings.get(scope).text : ""}</span></div>`));
   $("leftovers").hidden = rows.length === 0;
   $("leftover-rows").innerHTML = rows.join("");
 }
@@ -1503,11 +1984,13 @@ function rowAdd(name) {
 function buildStepEvidence(key, data, row, cells, tooltip, limits) {
   const gib = bytes => recorded(bytes) ? bytes / GIB : null;
   const clip = (text, limit) => text.length <= limit ? text : [...text].slice(0, limit).join('');
+  const shown = shownReading(data);
   const trace = row.program_memory;
+  const amounts = shown.programReadings.get(trace);
   const programRows = trace ? [
-    ['Compile', programValues(trace.live.compile, trace.past?.compile,
+    ['Compile', programValues(trace.live.compile, trace.past?.compile, amounts.compile,
       trace.past?.hana_crate_bands?.length ? trace.past.hana_compile_ms : null)],
-    ['Test', programValues(trace.live.test, trace.past?.test)],
+    ['Test', programValues(trace.live.test, trace.past?.test, amounts.test)],
   ].flatMap(([phase, values]) => groupRows(values.map(([label, value]) => field(`${phase} · ${label}`, value)))) : [];
   const clippedTip = [...tooltip.slice(0, limits.tipEntries + 1 - programRows.length), ...programRows].map((entry, index) => {
     const label = clip(entry.label, index ? limits.label : limits.title);
@@ -1523,11 +2006,13 @@ function buildStepEvidence(key, data, row, cells, tooltip, limits) {
     cells: cells.map(cell => ({label: clip(cell.label, limits.label), value: clip(cell.value, limits.text)})),
     memory: {
       free_for_next_gib: gib(data.ram.room_bytes), queue_cap_gib: hasCap(data) ? data.cap : null,
-      segments: RAM_BLOCKS.flatMap(([block, label, amount, group]) => {
+      free_text: shown.memory.room.text, cap_text: shown.memory.cap.text,
+      segments: RAM_BLOCKS.flatMap(([block, label, amount, group, reserveKey]) => {
         const value = gib(amount(data.ram));
         const tone = block === 'tools' ? 'tools' : group === 'builds' || block === 'reserved' ? 'build'
           : block === 'room' ? 'free' : group === 'free' ? 'system' : 'other';
-        return value > 0 ? [{label, gib: value, tone}] : [];
+        const text = ramBlockReading(shown, block, reserveKey).text;
+        return value > 0 ? [{label, gib: value, tone, text}] : [];
       }),
     },
     tip_title: title.label, tip_status: title.value,
@@ -1611,8 +2096,8 @@ function renderWalk(d) {
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
   const shown = shownReading(d);
-  $("walk-sum").textContent = !hasCap(d) ? `${ramAmount(shown.ram.builds_bytes + shown.reserves.build.raw.covered)} taken · cap unavailable`
-    : `${ramAmount(claimedBytes(shown)).split(" ")[0]} of ${ramAmount(shown.cap * GIB)} taken${shown.overCapBytes > 0 ? ` · ${ramAmount(shown.overCapBytes)} over cap` : ""}`;
+  $("walk-sum").textContent = !hasCap(d) ? `${shown.memory.taken.text} taken · cap unavailable`
+    : `${shown.memory.taken.text.split(" ")[0]} of ${shown.memory.cap.text} taken${shown.overCapBytes > 0 ? ` · ${shown.memory.overCap.text} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", shown.overCapBytes > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
   fitLabels();
@@ -1712,10 +2197,12 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   context.font = canvasFont(walk.querySelector(".amounts"));
+  const shown = shownReading(latest);
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
-    .map(row => [useValue(row) > 0 ? memoryAmount(row.used) : "", row.reserved > 0 ? stepReserve(row).text : ""].filter(Boolean));
-  amountGroups.push([memoryAmount(latest.room)], [memoryAmount(latest.ram.build_tools_bytes / GIB)],
-    ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [memoryAmount(row.need)]));
+    .map(row => [useValue(row) > 0 ? shown.stepReadings.get(row).used.text : "", row.reserved > 0 ? shown.stepReadings.get(row).reserve.text : ""].filter(Boolean));
+  const {room, tools} = shown.memory;
+  amountGroups.push([room.text], [tools.text],
+    ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [shown.waitReadings.get(row).need.text]));
   const amountWidth = Math.max(...amountGroups.map(labels => labels.reduce((sum, label) =>
     sum + context.measureText(label).width, 0) + LABEL_GAP * Math.max(0, labels.length - 1)));
   // A cloud status shows before the cap on one or two lines, so it never wraps one letter to a line.
@@ -1731,7 +2218,7 @@ function fitWalkDetails() {
     label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
-  const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
+  const roomWidth = context.measureText(`Free ${room.text}`).width + 8;
   const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text]) => {
     context.font = canvasFont(label);
     return context.measureText(text).width;
@@ -1819,7 +2306,7 @@ function placeMemoryBars(d) {
   };
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
-    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
+    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text)}</span>`).join("");
     const limit = !hasCap(d) ? width : Math.max(0, progressEnd - LABEL_GAP);
     placeBarLabels(container, limit);
   }
@@ -1827,32 +2314,32 @@ function placeMemoryBars(d) {
   const toolsRow = document.querySelector(".wrow.tools");
   if (toolsRow) {
     toolsRow.querySelector(".track").innerHTML = capBox(0, tools, "seg-tools");
-    placeAmounts(toolsRow, [{kind: "used-amount", left: 0, value: shown.ram.build_tools_bytes / GIB}]);
+    placeAmounts(toolsRow, [{kind: "used-amount", left: 0, text: shown.memory.tools.text}]);
   }
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const run = d.walk.find(run => run.key === row.dataset.run);
-    const amount = shown.walk.find(run => run.key === row.dataset.run);
+    const amount = shown.stepReadings.get(run);
     let bars = "";
     const amounts = [];
     if (macRow(run)) {
       if (run.kind === "mac-build" && recorded(run.used)) {
         const useWidth = Math.min(row.querySelector(".track").clientWidth, run.used * unit);
         bars = box(0, useWidth, "seg-remote");
-        amounts.push({kind: "used-amount", left: 0, value: amount.used});
+        amounts.push({kind: "used-amount", left: 0, text: amount.used.text});
       }
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
       bars = capBox(used, ciWidth, "seg-ci");
-      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: amount.used});
+      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, text: amount.used.text});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.max(3, useWidth) : 0;
       bars = capBox(usedAt, drawnUse, "seg-used") + capBox(reservedAt, reserveWidth, "hatch");
-      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: amount.used});
-      if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, text: stepReserve(run).text});
+      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, text: amount.used.text});
+      if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, text: amount.reserve.text});
       usedAt += useWidth;
       reservedAt += reserveWidth;
     }
@@ -1875,7 +2362,7 @@ function placeMemoryBars(d) {
     roomTrack.innerHTML = capBox(roomAt, room, "roomb");
     roomTrack.closest(".wrow").querySelector(".room-value")?.remove();
     roomTrack.closest(".wrow").querySelector(".row-heading").insertAdjacentHTML("beforeend",
-      `<span class="room-value">${memoryAmount(shown.ram.room_bytes / GIB)}</span>`);
+      `<span class="room-value">${shown.memory.room.text}</span>`);
     roomTrack.closest(".wrow").querySelector(".amounts").replaceChildren();
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
@@ -1887,7 +2374,7 @@ function placeMemoryBars(d) {
     const waitAt = !hasCap(d) ? roomAt : waitEnd - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
-    placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: stepRow(row.dataset.tip, shown).need}] : []);
+    placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, text: shown.waitReadings.get(waiter).need.text}] : []);
   }
   const roomRow = roomTrack.closest(".wrow");
   const placeDivider = (row, top) => row.style.setProperty("--divider-top", `${top - row.getBoundingClientRect().top}px`);
@@ -1991,7 +2478,7 @@ addEventListener("keydown", event => {
 });
 async function tick(supersede=false,current=()=>true) {
   if (consoleHidden() || paused) return;
-  const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
+  const r = await fetch("memory.json", { cache: "no-cache" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   if (!current() || paused) return;

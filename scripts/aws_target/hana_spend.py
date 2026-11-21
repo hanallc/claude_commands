@@ -44,18 +44,21 @@ def _positive_amount(value: str) -> Decimal:
     return amount
 
 
-def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
-                         ) -> StartPermitSettings:
-    instance_type = configuration.text('instance_type')
-
+def read_fallback_instance_types(configuration: conf.ConfigRead, instance_type: str) -> tuple[str, ...]:
     def fallback_types(value: str) -> tuple[str, ...]:
         types = tuple(item.strip() for item in value.split(','))
         if not all(types) or len(set((instance_type, *types))) != 1 + len(types):
             raise ValueError('expected distinct types and no empty items')
         return types
 
+    return configuration.value('fallback_instance_types', fallback_types)
+
+
+def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
+                         ) -> StartPermitSettings:
+    instance_type = configuration.text('instance_type')
     return StartPermitSettings(enabled, configuration.text('region'), instance_type,
-        configuration.value('fallback_instance_types', fallback_types),
+        read_fallback_instance_types(configuration, instance_type),
         configuration.value('spot_max_usd_per_hour', _positive_amount),
         configuration.value('root_gib', conf.positive_whole), configuration.value('data_gib', conf.positive_whole),
         configuration.value('daily_budget_usd', _positive_amount),
@@ -287,7 +290,8 @@ class HanaSpending[Settings: StartPermitSettings]:
         proposed = ledger.HanaComputeExposure(active[0].at if active else now, expires, generation,
             max(active[0].usd_per_hour, self.settings.spot_max_usd_per_hour) if active else self.settings.spot_max_usd_per_hour,
             instance_type=active[0].instance_type if active else self._provisioned_instance_type(),
-            region=active[0].region if active else self.settings.region)
+            region=active[0].region if active else self.settings.region,
+            observed_active=active[0].observed_active if active else False)
         compute = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureClosed)]
         storage = list(state.hana_storage)
         if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in storage):
@@ -371,7 +375,11 @@ class HanaSpending[Settings: StartPermitSettings]:
             if generation != current_generation:
                 return
             fence = state.hana_lifecycle_fence
+            active = observed in ('pending', 'running', 'stopping', 'shutting-down')
             if isinstance(fence, ledger.HanaLifecycleFence) and now <= fence.at:
+                if now == fence.at and active:
+                    state.hana_compute = [replace(row, observed_active=True)
+                        if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
                 return
             latest = max((row.at for row in (*state.hana_compute, *state.hana_storage)), default=0)
             latest = max([latest, *(row.state.at for row in (*state.hana_compute, *state.hana_storage)
@@ -384,12 +392,14 @@ class HanaSpending[Settings: StartPermitSettings]:
                     return
                 state.hana_compute = [replace(row, state=ledger.HanaExposureClosed(now))
                     if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
-            elif observed in ('pending', 'running', 'stopping', 'shutting-down'):
+            elif active:
+                state.hana_compute = [replace(row, observed_active=True)
+                    if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_compute):
                     current_generation += 1
                     state.hana_compute.append(ledger.HanaComputeExposure(now, now + self.settings.guard_grace_seconds,
                         current_generation, self.settings.spot_max_usd_per_hour,
-                        instance_type=self._provisioned_instance_type(), region=self.settings.region))
+                        instance_type=self._provisioned_instance_type(), region=self.settings.region, observed_active=True))
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_storage):
                     state.hana_storage.append(ledger.HanaStorageExposure(now, self.settings.storage_usd_per_month))
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, current_generation)

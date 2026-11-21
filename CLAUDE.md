@@ -1,8 +1,3 @@
-## communication
-
-### word list
-- The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. `/rust_style` loads it with the style guide; it is not loaded at session start. Three hooks enforce it in every session (`/banned_word_hook` turns them off and on): two PostToolUse hooks check each tool call and block on a match, and a Stop hook checks each turn's prose. Don't use those words in code, comments, or prose.
-
 ## decision criteria
 Applies to every session when coding and reviewing code. `/unit:direct` imports the same file, where it defines `<DecisionEconomy/>`.
 
@@ -24,6 +19,10 @@ Applies to every session when coding and reviewing code. `/unit:direct` imports 
 ## bevy BRP MCP
 - when the user says "launch", just launch the app directly — don't try to shut down first. The user has already shut it down.
 - when the user says "relaunch", shut down the app first, then launch it.
+
+## links in session output
+- Write each link as the full URL in plain text, for example http://100.103.14.30:8765/3be7ed/mock.html.
+- Never write a Markdown link or a wikilink. The user's terminal cannot open them.
 
 ## git
 - **`git stash` is denied outright and no flag gets past it.** `permissions.deny` carries `Bash(git stash)`, `Bash(git stash *)` and `Bash(git stash:*)`. **The `allow` entries for `git stash list` do not make the read form runnable** — `Bash(git stash *)` matches it too, and deny wins. Do not soften this into "only the mutating forms are denied": that reads as licence to check for a stash before handing off, and the check itself gets refused.

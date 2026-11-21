@@ -12,6 +12,7 @@
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
+// Use --build-tools as the third argument for the Build tools proof.
 // Use --rowask to capture the rows and the New item dialog.
 // Use <output-folder> --tip-design for the six dark tooltip captures.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
@@ -56,6 +57,8 @@ const tipDesignComparison = !gateMode && comparisonArgs[0] === '--tip-design';
 const [previousPage, comparison] = gateMode || tipDesignComparison ? [] : comparisonArgs;
 const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
+const buildToolsProof = previousPage === '--build-tools';
+const focusedProof = verifyCallProof || buildToolsProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Pid','Target','vCPU','Slot','Tokens',''];
@@ -64,11 +67,11 @@ const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(
 try {
   await mkdir(folder, {recursive:true});
   const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (verifyCallProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = verifyCallProof ? tmpdir() : fixtureOutput;
+  const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = previousPage && !verifyCallProof ? (await readFile(previousPage, 'utf8'))
+  const beforePage = previousPage && !focusedProof ? (await readFile(previousPage, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = !gateMode && process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
@@ -279,6 +282,62 @@ try {
           fitLabels();
           })()`);
         };
+        if (buildToolsProof) {
+          const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
+          const gib = 1024**3;
+          Object.assign(ram, {python_tests_bytes: 0.25*gib, waiting_runs_bytes: 0.125*gib,
+            other_build_tools_bytes: 0.125*gib});
+          servedReading = {...base, ram};
+          const views = [];
+          for (const theme of ['dark', 'light']) {
+            for (const width of [1600, 850, 390]) {
+              await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+              await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+              await navigate('memory_live.html');
+              const result = await evaluate(`(() => {
+                const row = document.querySelector('.legend [data-tip="tools"]');
+                row.scrollIntoView({block:'center'});
+                const bounds = row.getBoundingClientRect();
+                showTip('tools', (bounds.left + bounds.right) / 2, bounds.top + bounds.height / 2);
+                const box = tip.getBoundingClientRect();
+                const fields = Array.from(tip.querySelectorAll('dt')).map(label => {
+                  const value = label.nextElementSibling;
+                  const fits = cell => {
+                    const limit = cell.getBoundingClientRect();
+                    const range = document.createRange();
+                    range.selectNodeContents(cell);
+                    return Array.from(range.getClientRects()).every(rect => rect.left >= limit.left - 1
+                      && rect.right <= limit.right + 1 && rect.top >= limit.top - 1 && rect.bottom <= limit.bottom + 1);
+                  };
+                  return {label:label.textContent,value:value.textContent,fits:fits(label) && fits(value),
+                    align:getComputedStyle(value).textAlign,right:value.getBoundingClientRect().right};
+                });
+                const left = Math.max(0, Math.min(box.left, bounds.left)-4);
+                const right = Math.min(innerWidth, Math.max(box.right, bounds.right)+4);
+                const top = Math.max(0, Math.min(box.top, bounds.top)-4);
+                const bottom = Math.min(innerHeight, Math.max(box.bottom, bounds.bottom)+4);
+                return {fields,amount:document.querySelector('#v-tools').textContent,
+                  visible:[box,bounds].every(rect => rect.left >= 0 && rect.right <= innerWidth
+                    && rect.top >= 0 && rect.bottom <= innerHeight),
+                  clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+              })()`);
+              const fields = result.fields.filter(field => field.label);
+              assert.deepEqual(fields.map(({label,value}) => [label,value]), [['Build tools','2.0 GiB'],
+                ['rust-analyzer','1.0 GiB'],['+ sccache','0.5 GiB'],['+ Python tests','0.3 GiB'],
+                ['+ Waiting runs','0.1 GiB'],['+ Other build tools','0.1 GiB']]);
+              assert.equal(result.amount, fields[0].value);
+              assert.ok(result.visible && fields.every(field => field.fits && field.align === 'right'
+                && Math.abs(field.right-fields[0].right) < 1), JSON.stringify({theme,width,result}));
+              views.push({theme,width});
+              if (theme === 'dark' && width === 1600) {
+                const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:result.clip});
+                await writeFile(join(folder, 'builds-tools-split-dark.png'), Buffer.from(shot.data,'base64'));
+              }
+            }
+          }
+          console.log(JSON.stringify({pass:true,views}));
+          break browserProof;
+        }
         if (verifyCallProof) {
           servedReading = readings.verify_calls;
           const views = [];
@@ -335,12 +394,18 @@ try {
                       && staffBounds.right <= tipBounds.right && staffColor !== getComputedStyle(tooltip).color},
                   verbs:[cell('row',running).textContent,cell('row',mac).textContent,
                     waiterCell.textContent,cell('wait',direct).textContent],
+                  waitingAbout:waiting.about, waitingCaption:tooltip.querySelector('.caption')?.textContent,
+                  macAbout:mac.about,
                   macFields:tooltipRows('row:' + mac.key, latest).map(({label,value}) => [label,value]),
                   facts:waiting.verify,clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
               })()`);
               assert.deepEqual(result.headers, ['Verify','Verify']);
               assert.deepEqual(result.verbs, ['final','test','final','']);
-              assert.deepEqual(result.macFields.slice(1), [['Step','nextest'],['Call','verify test sample --no-cache']]);
+              assert.equal(result.waitingAbout, 'Checks the workspace targets and runs the selected tests');
+              assert.equal(result.macAbout, 'Runs the selected tests');
+              assert.equal(result.waitingCaption, result.waitingAbout);
+              assert.deepEqual(result.macFields.slice(1), [
+                ['',result.macAbout],['Step','nextest'],['Call','verify test sample --no-cache']]);
               const {fields, facts, staff} = result;
               assert.deepEqual([staff.title, staff.unitColumn, staff.visible], ['builder', false, true]);
               assert.equal(fields.find(field => field.label === 'Runs on').value, 'natedev only');
@@ -1284,7 +1349,7 @@ try {
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
             assert.equal(overHeader.sum,`${fields.Taken.split(' ')[0]} of ${fields['Queue cap']} taken · 4.0 GiB over cap`);
             assert.equal(fields['Over cap'],'4.0 GiB');
-            assert.equal(fields['+ Full reserve'],await evaluate("ramAmount(shownReading(latest).ram.build_target_bytes)"));
+            assert.equal(fields['+ Full reserve'],overBar.tip['Target']);
             assert.ok(!('+ Build reserved' in fields),overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
@@ -2423,7 +2488,9 @@ try {
             })()`);
             const amounts=rows=>Object.fromEntries(rows.map(row=>[row.label,row.value]));
             const builds=review['g-builds'].filter(row=>row.kind!=='caption');
-            assert.deepEqual(builds.map(row=>row.value),['3.1 GiB','1.0 GiB','1.0 GiB','1.0 GiB']);
+            const [buildsTotal, ...buildsParts] = builds.map(row=>memoryTenths(row.value));
+            assert.equal(buildsTotal,31);
+            assert.deepEqual(buildsParts.sort(),[10,10,11]);
             const wait=amounts(review['wait:fractional-wait']);
             assert.equal(wait['Short by'],'<0.1 GiB');
             const cap=amounts(review.cap);
@@ -2501,7 +2568,7 @@ try {
             const tenths=memoryTenths;
             for(const [key,rows] of Object.entries(leafProof.tips)) {
               const values=rows.filter(row=>row.value.endsWith(' GiB')).map(row=>tenths(row.value));
-              assert.ok(Math.abs(values[0]-values.slice(1).reduce((sum,value)=>sum+value,0))<=values.length/2,key);
+              assert.equal(values[0], values.slice(1).reduce((sum,value)=>sum+value,0),key);
               if(key in leafProof.legend) assert.equal(rows[0].value,leafProof.legend[key]);
             }
             assert.equal(leafProof.tips.cap[0].value,'3.1 GiB');
@@ -2613,18 +2680,6 @@ try {
           started_at:shotAt-840,used:3.2,reserved:2,counted:5.2,queued:true,machine:'natedev',
           progress:{kind:'RowProgress',phase:'testing',done:412,total:993,percent:100*412/993,unit:'tests'}}];
         await show(mockState);
-        const reserveDisplay = await evaluate(`(() => {
-          const reading=structuredClone(latest);
-          const {build,swap}=shownReading(reading).reserves;
-          build.covered='8.2 GiB';
-          swap.covered='2.2 GiB';
-          window.renderReading(reading);
-          return {
-            cap:tooltipRows('cap',reading).find(row=>row.label==='+ Build reserved').value,
-            swap:document.querySelector('#swap-reserve').textContent
-          };
-        })()`);
-        assert.deepEqual(reserveDisplay,{cap:'8.2 GiB',swap:'Swap coming back: 2.2 GiB'});
         // Compare every global legend reference in both covered and shortfall states.
         for(const state of [mockState,readings.head_memory,readings.head_shortfall,readings.head_swap_shortfall]) {
           await show(state);
@@ -2645,6 +2700,9 @@ try {
           })()`);
           for(const reference of references) assert.equal(reference.value,reference.legend,
             'A tooltip changes a legend amount: '+JSON.stringify(reference));
+          const swapNote = await evaluate("document.querySelector('#swap-reserve').textContent");
+          const swapLegend = references.find(reference=>reference.key==='swap' && reference.label==='Swap coming back');
+          assert.equal(swapNote,`Swap coming back: ${swapLegend.legend}`);
           const capSums=await evaluate(`Object.keys(TIPS).concat((latest.waiters||[]).map((row,index)=>proofTip('wait',index)))
             .map(key=>({key,rows:tooltipRows(key,latest)})).filter(tip=>tip.rows.some(row=>row.label==='Queue cap'))`);
           for(const tip of capSums) assert.ok(!tip.rows.some(row=>/Safety net|Swap coming back/.test(row.label)),
@@ -2729,7 +2787,7 @@ try {
         const gateReading=structuredClone(base);
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
-        const gateAbout='merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc';
+        const gateAbout='Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc';
         const gateRow=gateReading.walk[gateIndex];
         Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
           about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,

@@ -144,7 +144,7 @@ class OrderWasteTests(unittest.TestCase):
         self.ticket("types-1", "types", [IF_ELSE], start, types_1, at(1))
         self.ticket("types-2", "types", [INVALID_STATES], types_1, types_2, at(2))
         self.ticket("modules-1", "modules", MODULES, types_2, modules_1, at(3))
-        self.ticket("names-1", "names", [SPELL_OUT, "global:rust/forbidden-words.md"], modules_1, names_1, at(4))
+        self.ticket("names-1", "names", [SPELL_OUT, TYPE_NAMED], modules_1, names_1, at(4))
         self.ticket("values-0", "values", ["global:rust/no-magic-values.md"], names_1, names_1, at(5))
         # A dropped ticket's commits are not merged work, even where they hold another ticket's commit.
         self.ticket("dropped-1", "values", ["global:rust/no-magic-values.md", "global:rust/prefer-functional-patterns.md"],
@@ -364,7 +364,8 @@ class OrderWasteTests(unittest.TestCase):
 
         self.assertEqual(order("enums-over-option-when-none-has-meaning", "prefer-functional-patterns"), AnalysisOrder.A_FIRST_BY_EDGE)
         self.assertEqual(order("prefer-functional-patterns", "enums-over-option-when-none-has-meaning"), AnalysisOrder.B_FIRST_BY_EDGE)
-        self.assertEqual(order("forbidden-words", "dont-create-traits-for-single-implementations"), AnalysisOrder.B_FIRST_BY_POSITION)
+        self.assertEqual(order("constants-file-organization", "spell-out-names"), AnalysisOrder.B_FIRST_BY_EDGE)
+        self.assertEqual(order("spell-out-names", "dont-create-traits-for-single-implementations"), AnalysisOrder.B_FIRST_BY_POSITION)
         self.assertEqual(order("always-use-nextest", "no-magic-values"), AnalysisOrder.UNORDERED)
         self.assertEqual(order_waste.analysis_order(FamilyRead("values"), RuleFix(SPELL_OUT)), AnalysisOrder.UNORDERED)
         self.assertEqual(order_waste.analysis_order(RuleFix(IF_ELSE), RuleFix("local:docs/style/no-magic-values.md")),

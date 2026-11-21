@@ -5,12 +5,12 @@ from scripts.build_queue import admission_records
 from collections.abc import Mapping
 import json
 from html.parser import HTMLParser
-from itertools import combinations
 from pathlib import Path
 from random import Random
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 from xml.etree import ElementTree
 from typing import cast
@@ -262,7 +262,7 @@ class MemoryHoverTests(unittest.TestCase):
                           "call": "verify final demo", "position": 2, "total": 2}}],
             "waiters": [{"name": "demo clippy", "since": 100, "need": 1, "reason": "free memory",
                          "verify": {"verb": "example", "step": "clippy", "position": 1, "total": 1,
-                                    "call": "verify example demo --name sample"}},
+                                    "call": "verify example demo · 14 filters"}},
                         {"name": "rust-analyzer", "since": 100, "need": 1, "reason": "free memory"},
                         {"name": "demo check", "unit": "builder", "detail": "checkout",
                          "since": 100, "need": 1,
@@ -279,7 +279,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual([cell.text for cell in root.findall(".//th[@class='verify']")], ["Verify", "Verify"])
         for key, verb, step, call in (
             ("row:fixture-run-0", "final", "nextest (2 of 2)", "verify final demo"),
-            ("wait:fixture-wait-0", "example", "clippy", "verify example demo --name sample"),
+            ("wait:fixture-wait-0", "example", "clippy", "verify example demo · 14 filters"),
             ("wait:fixture-wait-1", "", "", ""),
             ("wait:fixture-wait-2", "check", "check", "verify check demo"),
             ("wait:fixture-wait-3", "build", "build", "verify build demo"),
@@ -288,7 +288,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(root.findtext(f".//tr[@data-tip='{key}']/td[@class='verify']"), verb)
                 tip = str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
                 grid = ElementTree.fromstring(tip)
-                labels = {cell.text: grid[index + 1].text for index, cell in enumerate(grid) if cell.tag == "dt"}
+                labels = {cell.text: "".join(grid[index + 1].itertext()) for index, cell in enumerate(grid) if cell.tag == "dt"}
                 if verb:
                     self.assertEqual(labels["Step"], step)
                     self.assertEqual(labels["Call"], call)
@@ -304,16 +304,32 @@ class MemoryHoverTests(unittest.TestCase):
             assert row is not None
             self.assertEqual(row.findtext("th[@class='step']/span"), name)
 
+    def test_cargo_and_gate_tooltips_show_a_call_without_verify(self) -> None:
+        data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,
+                          "reserved": 0, "call": "cargo nextest run -p demo"}],
+                "waiters": [{"kind": "repository-slot", "name": "demo test all", "need": 0,
+                             "call": "merge_gate.py --tests-only"}]}
+        for key, call in (("row:fixture-run-0", "cargo nextest run -p demo"),
+                          ("wait:fixture-wait-0", "merge_gate.py --tests-only")):
+            with self.subTest(key=key):
+                tip = ElementTree.fromstring(str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True)))
+                self.assertEqual(tip[-2].text, "Call")
+                self.assertEqual("".join(tip[-1].itertext()), call)
+                self.assertEqual([word.text for word in tip[-1].findall("div/span")], call.split())
+                self.assertEqual(tip[-1].get("class"), "call group")
+                self.assertNotIn("Step", [cell.text for cell in tip if cell.tag == "dt"])
+
     def test_unavailable_memory_keeps_the_verify_tooltip_fields(self) -> None:
         verify = {"verb": "final", "step": "nextest", "position": 2, "total": 2, "call": "verify final demo"}
-        data = {"walk": [{"kind": "mac-build", "name": "demo nextest", "used": {"kind": "MacMemoryUnavailable"},
-                          "verify": verify}],
-                "waiters": [{"name": "demo nextest", "head_room": {"unavailable": True}, "verify": verify}]}
+        row = {"name": "demo nextest", "about": "Checks the workspace targets and runs the selected tests", "changes": "no branch", "verify": verify}
+        data = {"walk": [{**row, "kind": "mac-build", "used": {"kind": "MacMemoryUnavailable"}}],
+                "waiters": [{**row, "head_room": {"unavailable": True}}]}
         for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
             with self.subTest(key=key):
                 rows = cast(list[dict[str, object]], self.page_expression(f"tooltipRows('{key}', data)", data))
                 self.assertEqual([(row["label"], row["value"]) for row in rows],
-                                 [("demo nextest", "unavailable"), ("Step", "nextest (2 of 2)"),
+                                 [("demo nextest", "unavailable"), ("", "Checks the workspace targets and runs the selected tests"),
+                                  ("Changes", "no branch"), ("Step", "nextest (2 of 2)"),
                                   ("Call", "verify final demo")])
 
     def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
@@ -389,7 +405,9 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(evidence.cells, (new_item_dialog.BuildCell("Pid", "123"),))
                 self.assertEqual(evidence.memory.queue_cap_gib, expected)
                 self.assertEqual(evidence.memory.free_for_next_gib, 18.0)
-                self.assertIn(new_item_dialog.MemorySegment("Build tools", 2, new_item_dialog.MemoryTone.TOOLS),
+                self.assertEqual(evidence.memory.cap_text, "31.0 GiB" if expected is not None else "unavailable")
+                self.assertEqual(evidence.memory.free_text, "18.0 GiB")
+                self.assertIn(new_item_dialog.MemorySegment("Build tools", 2, new_item_dialog.MemoryTone.TOOLS, "2.0 GiB"),
                               evidence.memory.segments)
                 expected_entry = (new_item_dialog.TipField("Work", caption) if len(caption) <= 30
                                   else new_item_dialog.TipDetail(caption[:limits["text"]]))
@@ -593,29 +611,36 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertGreaterEqual(top, 8)
                 self.assertLessEqual(bottom, 712)
 
-    def test_disks_slot_tooltip_keeps_the_shared_fields_without_program_memory(self) -> None:
+    def test_disks_slot_tooltip_reads_traced_steps_without_showing_charts(self) -> None:
         row = program_memory_row(program_memory_fixture(started=True))
         builds_source = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         disks_source = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
         shared = disks_page.shared_step_tip(builds_source)
         slot_tooltip = disks_source[disks_source.index("function slotStep("):disks_source.index("function slotsAbout(")]
-        expression = """(() => {
-          const builds = data;
+        probe = """
+          const data = null;
           const settings = {builds_max_age_seconds: 30};
           const slotReport = {machine:'natedev', groups:[{slots:[{name:'hana-slot1', used_by:{}}]}]};
-          Date.now = () => data.read_at * 1000;
+          Date.now = () => builds.read_at * 1000;
           const stepTip = (() => {
         """ + shared.script + """
-            return {tooltipHtml};
+            return {tooltipHtml, shownReading};
           })();
         """ + slot_tooltip + """
-          return [tipFor('slot:hana-slot1'), tooltipHtml('row:hana', data)];
-        })()"""
-        disks, shared_builds = cast(list[str], self.page_expression(expression, {"read_at": 400, "walk": [row]}, walk=True))
+          const amounts = stepTip.shownReading(builds).programReadings.get(builds.walk[0].program_memory);
+          return [tipFor('slot:hana-slot1'), amounts.compile.peak.text, amounts.test.current.text];
+        """
+        expression = ("[...new Function('builds', 'esc', " + json.dumps(probe)
+                      + ")(data, esc), tooltipHtml('row:hana', data)]")
+        disks, compile_peak, test_sample, shared_builds = cast(
+            list[str], self.page_expression(expression, {"read_at": 400, "walk": [row]}, walk=True))
+        self.assertEqual((compile_peak, test_sample), ("7.0 GiB", "2.0 GiB"))
         self.assertEqual(disks, shared_builds)
         self.assertIn("<dt>Runs on</dt><dd>natedev</dd>", disks)
         self.assertNotIn("program-memory", disks)
         self.assertNotIn(".program-memory", shared.style)
+        for tag in ("dt", "dd"):
+            self.assertRegex(shared.style, rf"\.tip {tag} \{{[^}}]*white-space: nowrap;")
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
@@ -687,7 +712,7 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertNotIn("not recorded", html)
 
     def test_a_gate_hover_says_what_the_job_does_and_changes_below_its_title(self) -> None:
-        about = "merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc"
+        about = "Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc"
         row = {"name": "natemerge integrate", "queued": True, "used": 1, "reserved": 0, "counted": 1,
                "showrunner": "builds", "unit": "natemerge", "runner": "unit director",
                "title": {"unit": "natemerge", "step": "integrate"},
@@ -978,7 +1003,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertNotIn("Build reserved is", hover[1])
                 self.assertNotIn("queue priority:", hover[1])
 
-    def test_fractional_memory_terms_format_raw_totals_and_shortage(self) -> None:
+    def test_fractional_memory_terms_add_shown_parts_and_keep_raw_shortage(self) -> None:
         ram = {**RAM_FIXTURE, "build_tools_bytes": 1.04 * GIB, "rust_analyzer_bytes": 1.04 * GIB,
                "sccache_bytes": 0, "other_build_tools_bytes": 0, "queued_builds_bytes": 1.04 * GIB,
                "ci_bytes": 1.04 * GIB, "build_covered_bytes": 1.04 * GIB, "build_target_bytes": 1.04 * GIB,
@@ -1007,10 +1032,10 @@ class MemoryHoverTests(unittest.TestCase):
         behind = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-1', data)", data))
         self.assertEqual([row["label"] for row in behind if str(row["value"]).endswith(" GiB")], ["Needs"])
         self.assertEqual([row["value"] for row in tips[0] if row["kind"] != "caption"],
-                         ["3.1 GiB", "1.0 GiB", "1.0 GiB", "1.0 GiB"])
+                         ["3.1 GiB", "1.1 GiB", "1.0 GiB", "1.0 GiB"])
         run = {str(row["label"]): str(row["value"]) for row in tips[1]}
         self.assertEqual((run["Uses"], run["+ Build reserved"], run["= In queue cap"]),
-                         ("1.0 GiB", "1.0 GiB", "2.1 GiB"))
+                         ("1.0 GiB", "1.1 GiB", "2.1 GiB"))
         small, short, head_wait = ({str(row["label"]): str(row["value"]) for row in tip} for tip in firsts)
         self.assertEqual(small["Short by"], "<0.1 GiB")
         self.assertEqual(short["Short by"], "<0.1 GiB")
@@ -1018,14 +1043,17 @@ class MemoryHoverTests(unittest.TestCase):
         terms = ("Queue cap", "− Builds", "− Build reserved", "= Free")
         head = {str(row["label"]): round(float(str(row["value"]).split()[0]) * 10)
                 for row in firsts[-1] if row["label"] in terms}
-        self.assertLessEqual(abs(head["Queue cap"] - head["− Builds"] - head["− Build reserved"] -
-                                 head["= Free"]), 2)
+        self.assertEqual(head["Queue cap"], head["− Builds"] + head["− Build reserved"] + head["= Free"])
         cap = cast(list[dict[str, object]], self.page_expression("tooltipRows('cap', data)", data))
         cap_fields = {str(row["label"]): str(row["value"]) for row in cap}
-        self.assertEqual(given["Free"], cap_fields["+ Free"])
+        self.assertEqual(run["+ Build reserved"], cap_fields["+ Build reserved"])
+        self.assertEqual(run["Uses"], next(row["value"] for row in tips[0] if row["label"] == "+ Queued builds"))
+        head_data = {**data, "waiters": [{**waiters[2], "key": "first", "first_in_line": True}]}
+        head_cap = cast(list[dict[str, object]], self.page_expression("tooltipRows('cap', data)", head_data))
+        head_cap_fields = {str(row["label"]): str(row["value"]) for row in head_cap}
         for head_name, cap_name in (("Queue cap", "Queue cap"), ("− Builds", "Builds"),
                                    ("− Build reserved", "+ Build reserved"), ("= Free", "+ Free")):
-            self.assertEqual(str(next(row["value"] for row in firsts[-1] if row["label"] == head_name)), cap_fields[cap_name])
+            self.assertEqual(head_wait[head_name], head_cap_fields[cap_name])
         room: dict[str, object] = {"head_room": {"rows": [
             {"label": "Queue cap", "gib": 13.049}, {"label": "− Builds", "gib": 7},
             {"label": "− Build reserved", "gib": 6}, {"label": "= Free", "gib": 0.049}]}}
@@ -1038,6 +1066,305 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertIn("Needs  <0.1 GiB", hover[1])
                 self.assertIn("Free  <0.1 GiB", hover[1])
                 self.assertIn("Short by  <0.1 GiB", hover[1])
+
+    def memory_rounding_cases(self) -> list[tuple[str, str, dict[str, object], object]]:
+        one_gib_build: dict[str, object] = {
+            **RAM_FIXTURE, "build_tools_bytes": 1.02 * GIB, "rust_analyzer_bytes": 1.02 * GIB,
+            "sccache_bytes": 0, "other_build_tools_bytes": 0, "queued_builds_bytes": 0, "ci_bytes": 0,
+            "build_covered_bytes": 1.02 * GIB, "room_bytes": 1.02 * GIB,
+        }
+
+        def head(room: float, earlier: float, free: float, need: float, used: float = 1.02,
+                 reserved: float = 1.02) -> dict[str, object]:
+            cap = used + reserved + room
+            return {"ram": {**one_gib_build, "room_bytes": room * GIB, "build_tools_bytes": used * GIB,
+                            "rust_analyzer_bytes": used * GIB, "build_covered_bytes": reserved * GIB},
+                    "cap": cap, "waiters": [
+                {"name": "build", "need": need, "first_in_line": True, "head_room": {"rows": [
+                    {"label": "Queue cap", "gib": cap}, {"label": "− Builds", "gib": used},
+                    {"label": "− Build reserved", "gib": reserved}, {"label": "− Earlier waiters", "gib": earlier},
+                    {"label": "= Head room", "gib": free},
+                ]}},
+            ]}
+
+        def outside(other: float, swap: float, adjustment: float, no_counter: float = 0) -> dict[str, object]:
+            return {"ram": {**RAM_FIXTURE, "desktop_bytes": other * GIB, "agents_bytes": other * GIB,
+                "other_programs_bytes": other * GIB, "programs": [{"name": "Editor", "bytes": other * GIB}],
+                "kernel_bytes": swap * GIB, "compressed_swap_bytes": swap * GIB,
+                "kernel_structures_bytes": 0, "kernel_counters_bytes": 0, "cache_bytes": other * GIB,
+                "unattributed_bytes": adjustment * GIB, "kernel_no_counter_bytes": no_counter * GIB}}
+
+        def shared_ram(outside_gib: float) -> dict[str, object]:
+            return {
+                **one_gib_build, "total_bytes": (1.08 + outside_gib) * GIB,
+                "available_bytes": 0.06 * GIB, "desktop_bytes": outside_gib * GIB,
+                "build_covered_bytes": 0.02 * GIB, "build_target_bytes": 0.02 * GIB,
+                "safety_covered_bytes": 0.02 * GIB, "safety_target_bytes": 0.02 * GIB,
+                "swap_covered_bytes": 0, "swap_target_bytes": 0, "room_bytes": 0.02 * GIB,
+                "agents_bytes": 0, "other_programs_bytes": 0, "programs": [], "smaller_program_count": 0,
+                "kernel_bytes": 0, "compressed_swap_bytes": 0, "kernel_structures_bytes": 0,
+                "kernel_counters_bytes": 0, "cache_bytes": 0, "unattributed_bytes": 0, "kernel_no_counter_bytes": 0,
+            }
+
+        head_values = "amounts('wait:fixture-wait-0')"
+        outside_values = "[amounts('g-else'), amounts('unattributed')]"
+        return [
+            ("cap uses shown parts", "amounts('cap')", {"ram": one_gib_build, "cap": 3.06},
+             ["3.1 GiB", "1.0 GiB", "1.0 GiB", "1.1 GiB"]),
+            ("Taken stays within the cap", "amounts('walksum')",
+             {"cap": 8.989, "ram": {**one_gib_build, "room_bytes": 0.02 * GIB,
+                                    "build_covered_bytes": 7.949 * GIB, "build_target_bytes": 7.962 * GIB,
+                                    "build_missing_bytes": 0.013 * GIB}},
+             ["9.0 GiB", "1.0 GiB", "8.0 GiB"]),
+            ("head uses shown deductions", head_values, head(1.02, 0.154, 0.866, 0.87),
+             ["3.1 GiB", "1.0 GiB", "1.0 GiB", "0.2 GiB", "0.9 GiB", "0.9 GiB", "<0.1 GiB"]),
+            ("small head room", head_values, head(0.952, 0.948, 0.004, 0.005),
+             ["3.0 GiB", "1.0 GiB", "1.0 GiB", "0.9 GiB", "<0.1 GiB", "<0.1 GiB", "<0.1 GiB"]),
+            ("signed cancellation", outside_values, outside(0.149, 0.149, -0.696),
+             [["<0.1 GiB", "0.2 GiB", "0.2 GiB", "0.1 GiB", "0.1 GiB", "0.1 GiB", "-0.7 GiB"],
+              ["-0.7 GiB", "0.0 GiB", "-0.7 GiB"]]),
+            ("signed part below the threshold",
+             "amounts('unattributed')", outside(0.149, 0.149, -0.696, -0.099),
+             ["-0.7 GiB", "-<0.1 GiB", "-0.6 GiB"]),
+            ("adjustments keep small labels",
+             "[-1, 1].map(sign => tooltipRows('unattributed', {...data, "
+             + "ram:{...data.ram,unattributed_bytes:sign * 0.099 * GIB}})[0].value)", {},
+             ["-<0.1 GiB", "<0.1 GiB"]),
+            ("Build tools keep their order", "amounts('tools')",
+             {"ram": {**RAM_FIXTURE, "build_tools_bytes": 410 * MIB, "rust_analyzer_bytes": 150 * MIB,
+                      "sccache_bytes": 0, "python_tests_bytes": 120 * MIB,
+                      "waiting_runs_bytes": 70 * MIB, "other_build_tools_bytes": 70 * MIB}},
+             ["0.4 GiB", "0.1 GiB", "0.0 GiB", "0.1 GiB", "<0.1 GiB", "<0.1 GiB"]),
+            ("compressed swap shares the Kernel reading",
+             "[amounts('kernel')[1], compressedSwapNote(shownReading(data).memory.kernel)]",
+             outside(0.146, 0.149, -0.729), ["0.2 GiB", "Of which compressed swap: 0.2 GiB."]),
+            ("head and cap share Builds",
+             "[amounts('cap'), " + head_values + "]", head(0.952, 0.948, 0.004, 0.005, 1.049, 1.051),
+             [["3.1 GiB", "1.0 GiB", "1.1 GiB", "1.0 GiB"],
+              ["3.1 GiB", "1.0 GiB", "1.1 GiB", "0.9 GiB", "<0.1 GiB", "<0.1 GiB", "<0.1 GiB"]]),
+            ("Kernel keeps its measured order beside Desktop",
+             "[amounts('g-else').slice(0, 5), amounts('kernel')]",
+             {"ram": {**RAM_FIXTURE, "desktop_bytes": 0.36 * GIB, "agents_bytes": 0,
+                      "other_programs_bytes": 0, "programs": [], "smaller_program_count": 0,
+                      "kernel_bytes": 0.41 * GIB, "compressed_swap_bytes": 0.137 * GIB,
+                      "kernel_structures_bytes": 0.137 * GIB, "kernel_counters_bytes": 0.136 * GIB,
+                      "cache_bytes": 0, "unattributed_bytes": 0}},
+             [["0.8 GiB", "0.4 GiB", "0.0 GiB", "0.0 GiB", "0.4 GiB"],
+              ["0.4 GiB", "0.2 GiB", "0.1 GiB", "0.1 GiB"]]),
+            ("Taken stays within the cap with small coverage and room",
+             "[amounts('cap'), amounts('walksum')]",
+             {"cap": 1.198, "ram": {**one_gib_build, "build_tools_bytes": 1.049 * GIB,
+                                   "rust_analyzer_bytes": 1.049 * GIB, "room_bytes": 0.079 * GIB,
+                                   "build_covered_bytes": 0.07 * GIB, "build_target_bytes": 0.119 * GIB,
+                                   "build_missing_bytes": 0.049 * GIB}},
+             [["1.2 GiB", "1.1 GiB", "<0.1 GiB", "<0.1 GiB"], ["1.2 GiB", "1.1 GiB", "0.1 GiB"]]),
+            ("small parts give the cap a range", "[amounts('cap'), capRange(), amounts('walksum')]",
+             {"cap": 1.198, "ram": {**one_gib_build, "build_tools_bytes": 1.049 * GIB,
+                                   "rust_analyzer_bytes": 1.049 * GIB, "room_bytes": 0.050 * GIB,
+                                   "build_covered_bytes": 0.099 * GIB, "build_target_bytes": 0.119 * GIB,
+                                   "build_missing_bytes": 0.020 * GIB}},
+             [["1.2 GiB", "1.1 GiB", "<0.1 GiB", "<0.1 GiB"], [11, 12, 13], ["1.2 GiB", "1.1 GiB", "0.1 GiB"]]),
+            ("Kernel stays in order with a small child", "[amounts('g-else').slice(0, 5), amounts('kernel')]",
+             {"ram": {**RAM_FIXTURE, "desktop_bytes": 0.36 * GIB, "agents_bytes": 0.12 * GIB,
+                      "other_programs_bytes": 0, "programs": [], "smaller_program_count": 0,
+                      "kernel_bytes": 0.39 * GIB, "compressed_swap_bytes": 0.30 * GIB,
+                      "kernel_structures_bytes": 0.09 * GIB, "kernel_counters_bytes": 0,
+                      "cache_bytes": 0, "unattributed_bytes": 0}},
+             [["0.9 GiB", "0.4 GiB", "0.1 GiB", "0.0 GiB", "0.4 GiB"],
+              ["0.4 GiB", "0.3 GiB", "<0.1 GiB", "0.0 GiB"]]),
+            ("status uses the displayed room", "[amounts('room')[0], statusLine(shownReading(data))]",
+             {"cap": 2.295, "ram": {**one_gib_build, "build_covered_bytes": 1.03 * GIB, "room_bytes": 0.245 * GIB},
+              "memory_status": {"code": "one_running_memory_wait", "next_need_bytes": 0.5 * GIB,
+                                "check_room_bytes": 0.245 * GIB}},
+             ["0.2 GiB", "One build runs; another needs 0.5 GiB, but free is 0.2 GiB."]),
+            ("Queued builds and Uses share the running step",
+             "[amounts('queued'), amounts('row:fixture-run-0'), amounts('cap')]",
+             {"cap": 1.321, "ram": {**one_gib_build, "build_tools_bytes": 0, "rust_analyzer_bytes": 0,
+                                   "queued_builds_bytes": 1.055 * GIB, "build_covered_bytes": 0,
+                                   "build_target_bytes": 0, "room_bytes": 0.266 * GIB},
+              "walk": [{"name": "queued", "queued": True, "used": 1.055, "reserved": 0}]},
+             [["1.0 GiB"], ["1.0 GiB"], ["1.3 GiB", "1.0 GiB", "0.0 GiB", "0.3 GiB"]]),
+            ("The step reserve shares Build reserved",
+             "[amounts('cap'), amounts('row:fixture-run-0')]",
+             {"cap": 1.282, "ram": {**one_gib_build, "build_tools_bytes": 0, "rust_analyzer_bytes": 0,
+                                   "queued_builds_bytes": 1.01 * GIB, "build_covered_bytes": 0.138 * GIB,
+                                   "build_target_bytes": 0.138 * GIB, "room_bytes": 0.134 * GIB},
+              "walk": [{"name": "run", "queued": True, "used": 1.01, "reserved": 0.138}]},
+             [["1.3 GiB", "1.0 GiB", "0.2 GiB", "0.1 GiB"], ["1.0 GiB", "0.2 GiB", "1.2 GiB"]]),
+            ("The wait shortage participates in the cap sum", "[amounts('cap'), " + head_values + "]",
+             {"cap": 1.16, "ram": {**one_gib_build, "build_covered_bytes": 0, "build_target_bytes": 0,
+                                  "room_bytes": 0.14 * GIB},
+              "waiters": [{"name": "first", "first_in_line": True, "need": 0.289, "free": 0.14}]},
+             [["1.2 GiB", "1.1 GiB", "0.0 GiB", "0.1 GiB"], ["0.3 GiB", "0.1 GiB", "0.2 GiB"]]),
+            ("Swap totals share pool and member sums",
+             "[amounts('g-swap')[0], amounts('swap-pool:builds_ci')[0], amounts('swap-pool:outside')[0], "
+             + "amounts('swap:0')[0], ...[...shownReading(data).swapDisplay.members.values()].map(node => node.text)]",
+             {"swap": {**SWAP_FIXTURE, "used_bytes": 2.28 * GIB, "builds_ci_bytes": 1.14 * GIB,
+                       "outside_bytes": 1.14 * GIB},
+              "swap_by": [{"name": "Smaller groups", "pool": "outside", "kind": "smaller", "bytes": 1.14 * GIB,
+                           "members": [{"name": "one", "bytes": 0.57 * GIB}, {"name": "two", "bytes": 0.57 * GIB}]}]},
+             ["2.3 GiB", "1.2 GiB", "1.1 GiB", "1.1 GiB", "583.7 MiB", "583.7 MiB"]),
+            ("The preview uses the displayed memory",
+             "(() => {const row = data.walk[0]; const key = 'row:fixture-run-0'; "
+             + "const {memory} = buildStepEvidence(key, data, row, [], tooltipRows(key, data), data.limits).evidence; "
+             + "return [amounts('g-builds')[0], memory.segments[0].text, memory.free_text, memory.cap_text];})()",
+             {"cap": 1.321, "read_at": 200, "limits": new_item_dialog.BUILD_EVIDENCE_LIMITS,
+              "ram": {**one_gib_build, "build_tools_bytes": 0, "rust_analyzer_bytes": 0,
+                      "queued_builds_bytes": 1.055 * GIB, "build_covered_bytes": 0, "build_target_bytes": 0,
+                      "room_bytes": 0.266 * GIB},
+              "walk": [{"name": "queued", "queued": True, "used": 1.055, "reserved": 0}]},
+             ["1.0 GiB", "1.0 GiB", "0.3 GiB", "1.3 GiB"]),
+            ("The cap note and token wait reuse displayed amounts",
+             "[capUnavailableNote(shownReading(data)), tooltipRows('row:fixture-run-0', data).at(-1).value, "
+             + "tooltipRows('tokens',data).find(row => row.label === 'Pause below').value]",
+             {"cap": None, "cap_text": "Cap unavailable", "tokens": {
+                 "kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 12.04 * GIB, "paused": True},
+              "walk": [{"name": "run", "queued": True, "used": 3, "progress": {
+                  "kind": "TokenWaitProgress", "memory_paused": True, "stage": "waiting for jobserver tokens"}}]},
+             ["Cap unavailable; free RAM 30.0 GiB; safety 4.0 GiB; swap coming back 2.0 GiB; "
+              + "kept aside 6.0 GiB; room 18.0 GiB",
+              "waiting for jobserver tokens (memory under 12.0 GiB)", "12.0 GiB"]),
+            ("Taken, Over cap and the reserve target share both sums",
+             "[amounts('walksum'), amounts('reserved'), amounts('shortfall')]",
+             {"cap": 1.126, "ram": {**one_gib_build, "build_tools_bytes": GIB, "rust_analyzer_bytes": GIB,
+                                   "build_covered_bytes": 0.126 * GIB, "build_missing_bytes": 0.126 * GIB,
+                                   "build_target_bytes": 0.252 * GIB, "shortfall_bytes": 0.126 * GIB,
+                                   "room_bytes": 0}},
+             [["1.2 GiB", "1.0 GiB", "0.2 GiB", "1.1 GiB", "0.1 GiB"],
+              ["0.1 GiB", "0.2 GiB", "0.1 GiB"], ["0.1 GiB", "0.1 GiB"]]),
+            ("Scale and RAM share the total",
+             "[amounts('ticks')[0], amounts('budget')[0]]", {"cap": 1.06, "ram": shared_ram(1.06)},
+             ["2.1 GiB", "2.1 GiB"]),
+            ("Scale uses the total that the parts require",
+             "[amounts('ticks')[0], amounts('budget')[0]]",
+             {"cap": 1.06, "ram": {**shared_ram(1.08), "total_bytes": 2.14 * GIB, "available_bytes": 0,
+                                   "build_tools_bytes": 1.06 * GIB, "rust_analyzer_bytes": 1.06 * GIB,
+                                   "build_covered_bytes": 0, "build_target_bytes": 0, "room_bytes": 0,
+                                   "safety_covered_bytes": 0, "safety_target_bytes": 0}},
+             ["2.2 GiB", "2.2 GiB"]),
+            ("Builds keeps its order beside Everything else",
+             "[amounts('cap'), amounts('budget')]", {"cap": 1.06, "ram": shared_ram(1.04)},
+             [["1.1 GiB", "1.0 GiB", "<0.1 GiB", "<0.1 GiB"],
+              ["2.1 GiB", "1.0 GiB", "<0.1 GiB", "1.0 GiB"]]),
+            ("Taken and the cap share Builds and Build reserved",
+             "[amounts('cap'), amounts('walksum')]",
+             {"cap": 1.259, "ram": {**one_gib_build, "build_covered_bytes": 0.14 * GIB,
+                                   "build_target_bytes": 0.14 * GIB, "room_bytes": 0.099 * GIB}},
+             [["1.3 GiB", "1.0 GiB", "0.2 GiB", "<0.1 GiB"], ["1.2 GiB", "1.0 GiB", "0.2 GiB"]]),
+        ]
+
+    def test_memory_rounding_preserves_measured_values_and_shown_sums(self) -> None:
+        for name, expression, data, expected in self.memory_rounding_cases():
+            with self.subTest(name=name):
+                wrapper = """(() => {
+                    const amounts = key => tooltipRows(key, data).map(row => row.value)
+                      .filter(value => String(value).endsWith(' GiB'));
+                    function capRange() {
+                      const [cap, ...parts] = amounts('cap');
+                      const small = parts.filter(value => value.startsWith('<')).length;
+                      const tenths = value => Math.round(parseFloat(value) * 10);
+                      const low = parts.filter(value => !value.startsWith('<'))
+                        .reduce((sum, value) => sum + tenths(value), 0);
+                      return [low, tenths(cap), low + small];
+                    }
+                """
+                self.assertEqual(self.page_expression(wrapper + "return " + expression + "; })()", data, walk=True), expected)
+
+    def test_memory_rounding_search_matches_exhaustive_choices(self) -> None:
+        script = """(() => {
+          function better(a, b) {
+            if (a.order !== b.order) return a.order < b.order;
+            if (a.sums !== b.sums) return a.sums < b.sums;
+            if (Math.abs(a.distance - b.distance) > 1e-9) return a.distance < b.distance;
+            const i = a.tie.findIndex((value, index) => value !== b.tie[index]);
+            return i >= 0 && a.tie[i] > b.tie[i];
+          }
+          function verify(roots) {
+            const nodes = [];
+            function visit(node) {
+              if (nodes.includes(node)) return;
+              nodes.push(node);
+              for (const [, child] of node.parts) visit(child);
+              for (const sum of node.sums ?? []) sum.forEach(visit);
+            }
+            roots.forEach(visit);
+            const units = nodes.map(node => node.unit ?? GIB);
+            const raw = nodes.map((node, i) => typeof node.bytes === 'number' ? node.bytes / units[i] * 10 : 0);
+            const ranges = raw.map((value, i) => units[i] === GIB && value && Math.abs(value) < 1
+              ? [Math.min(0, Math.sign(value)), Math.max(0, Math.sign(value))] : [0, 0]);
+            const options = raw.map((value, i) => {
+              if (ranges[i].some(Boolean)) return [0];
+              if (nodes[i].fixed) return [Math.sign(value) * Math.round(Math.abs(value))];
+              return [...new Set([Math.floor(value), Math.ceil(value)])];
+            });
+            const sums = nodes.flatMap((node, i) =>
+              [node.parts.map(([, child]) => child), ...(node.sums ?? [])].flatMap(parts => {
+                const bytes = parts.reduce((sum, child) => sum + (typeof child.bytes === 'number' ? child.bytes : 0), 0);
+                return parts.length && typeof node.bytes === 'number' && Math.abs(node.bytes - bytes) < 1
+                  ? [[i, parts.map(child => nodes.indexOf(child))]] : [];
+              }));
+            function score(values) {
+              let order = 0, badSum = 0;
+              for (const [i, children] of sums) {
+                for (const a of children) for (const b of children) {
+                  if (nodes[a].bytes < nodes[b].bytes && values[a] * units[a] > values[b] * units[b]) ++order;
+                }
+                const margin = children.some(j => units[j] !== units[i])
+                  ? Math.max(units[i], ...children.map(j => units[j])) / 2 : 0;
+                const low = children.reduce((sum, j) => sum + (values[j] + ranges[j][0]) * units[j], 0);
+                const high = children.reduce((sum, j) => sum + (values[j] + ranges[j][1]) * units[j], 0);
+                if ((values[i] + ranges[i][1]) * units[i] + margin < low ||
+                    (values[i] + ranges[i][0]) * units[i] - margin > high) ++badSum;
+              }
+              const distance = values.reduce((sum, value, i) =>
+                sum + (ranges[i].some(Boolean) ? 0 : Math.abs(value - raw[i])), 0);
+              return {order, sums: badSum, distance, tie: values.map(Math.abs)};
+            }
+            const shown = nodes.map((node, i) => {
+              if (ranges[i].some(Boolean)) return node.text === (raw[i] < 0 ? '-<0.1 GiB' : '<0.1 GiB') ? 0 : NaN;
+              return typeof node.bytes === 'number' ? Math.round(parseFloat(node.text) * 10) : 0;
+            });
+            if (shown.some((value, i) => !options[i].includes(value))) return false;
+            const actual = score(shown);
+            function search(values) {
+              if (values.length === nodes.length) return !better(score(values), actual);
+              return options[values.length].every(value => search([...values, value]));
+            }
+            return search([]);
+          }
+          const solve = memoryTotal;
+          const misses = [];
+          let name, searches = 0;
+          memoryTotal = (...roots) => {
+            ++searches;
+            const result = solve(...roots);
+            if (!verify(roots)) misses.push(name);
+            return result;
+          };
+          for (const [label, reading] of data.cases) {
+            name = label;
+            const sample = {...reading, ram: reading.ram ?? data.ram};
+            searches = 0;
+            shownReading(sample);
+            for (const row of sample.walk ?? []) tooltipRows('row:' + row.key, sample);
+            for (const row of sample.waiters ?? []) tooltipRows('wait:' + row.key, sample);
+            if (searches !== 1) misses.push(name + ' searches: ' + searches);
+          }
+          for (const [label, amounts] of [
+            ['partial ceiling counts', [0.11, 0.14, 0.17, 0.201, 0.272, 0.293]],
+            ['one ceiling count in order', [0.11, 0.14, 0.17, 0.12, 0.16, 0.13]],
+          ]) {
+            name = label;
+            const parts = amounts.map(gib => memoryBreakdown(gib * GIB));
+            const total = memoryBreakdown(sumMemory(parts.map(part => part.bytes)));
+            addMemorySum(total, ...parts);
+            const rows = parts.map(part => memoryBreakdown(part.bytes + GIB, [['Uses', part], ['Reserve', GIB]]));
+            memoryTotal(total, ...rows);
+          }
+          return misses;
+        })()"""
+        cases = [(name, data) for name, _, data, _ in self.memory_rounding_cases()]
+        self.assertEqual(self.page_expression(script, {"cases": cases}), [])
 
     def test_fractional_totals_and_negative_leaves_share_one_shown_value(self) -> None:
         ram: dict[str, object] = {**RAM_FIXTURE, "rust_analyzer_bytes": 1.02 * GIB, "sccache_bytes": 0,
@@ -1056,7 +1383,7 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(key=key):
                 amounts = [round(float(str(row["value"]).split()[0]) * 10)
                            for row in rows if str(row["value"]).endswith(" GiB")]
-                self.assertLessEqual(abs(amounts[0] - sum(amounts[1:])), len(amounts) / 2)
+                self.assertEqual(amounts[0], sum(amounts[1:]))
         self.assertEqual(tips[0][0]["value"], tips[1][2]["value"])
         self.assertEqual(tips[2][0]["value"], "3.1 GiB")
         self.assertEqual(tips[3][0]["value"], "2.0 GiB")
@@ -1112,8 +1439,8 @@ class MemoryHoverTests(unittest.TestCase):
             if sample == 6:
                 growth, share, between, unread = 7.06, 100, 0.451, 0.451
                 ram.update(build_covered_bytes=7.949 * GIB, room_bytes=0.02 * GIB)
-            if sample in (7, 8):
-                desktop, adjustment = (3.0, -0.5) if sample == 7 else (0.149, -0.696)
+            if sample in (7, 8, 9):
+                desktop, adjustment = {7: (3.0, -0.5), 8: (0.149, -0.696), 9: (0.149, -0.64)}[sample]
                 ram.update(desktop_bytes=desktop * GIB, agents_bytes=0.149 * GIB,
                            kernel_bytes=0.149 * GIB, compressed_swap_bytes=0.149 * GIB,
                            kernel_structures_bytes=0, kernel_counters_bytes=0, cache_bytes=0.149 * GIB,
@@ -1172,17 +1499,9 @@ class MemoryHoverTests(unittest.TestCase):
             })
 
         totals = {
-            "tools": ("Build tools", ("build_tools_bytes",)),
-            "g-builds": ("Builds", ("build_tools_bytes", "queued_builds_bytes", "ci_bytes")),
-            "g-free": ("Free RAM", ("available_bytes",)),
-            "system": ("System reserved", ("safety_covered_bytes", "swap_covered_bytes")),
-            "programs": ("Other programs", ("other_programs_bytes",)),
-            "kernel": ("Kernel", ("kernel_bytes",)),
-            "unattributed": ("Not attributed", ("unattributed_bytes",)),
-            "g-else": ("Everything else", ("desktop_bytes", "agents_bytes", "other_programs_bytes",
-                                          "kernel_bytes", "cache_bytes", "unattributed_bytes")),
-            "cap": ("Queue cap", ("cap_bytes",)),
-            "budget": ("RAM", ("total_bytes",)),
+            "tools": "Build tools", "g-builds": "Builds", "g-free": "Free RAM", "system": "System reserved",
+            "programs": "Other programs", "kernel": "Kernel", "unattributed": "Not attributed",
+            "g-else": "Everything else", "cap": "Queue cap", "budget": "RAM",
         }
         result = cast(tuple[
             list[tuple[dict[str, dict[str, str]], list[bool], bool, bool, str, bool, str, str,
@@ -1213,8 +1532,7 @@ class MemoryHoverTests(unittest.TestCase):
               sum.classes.has('over-cap'), sum.textContent, statusLine(shown), capture.evidence.memory, surfaces];
           }
           const shown = data.readings.map(render);
-          ramAmount = bytes => recorded(bytes) ? (bytes / GIB).toFixed(9) + ' GiB' : 'unavailable';
-          swapAmount = ramAmount;
+          formatRamAmount = bytes => recorded(bytes) ? (bytes / GIB).toFixed(9) + ' GiB' : 'unavailable';
           const raw = data.readings.map(reading => render(structuredClone(reading)).at(-1));
           return [shown, raw];
         })()""", {"readings": readings, "limits": new_item_dialog.BUILD_EVIDENCE_LIMITS}, walk=True))
@@ -1224,13 +1542,6 @@ class MemoryHoverTests(unittest.TestCase):
             if text in ("<0.1 GiB", "-<0.1 GiB"):
                 return -1 if text.startswith("-") else 1
             return round(float(text.split()[0]) * 10)
-
-        def formatted(gib: float) -> str:
-            sign = "-" if gib < 0 else ""
-            magnitude = abs(gib)
-            if 0 < magnitude < 0.1:
-                return f"{sign}<0.1 GiB"
-            return f"{sign}{int(magnitude * 10 + 0.5) / 10:.1f} GiB"
 
         amount_pattern = re.compile(r"-?<?\d+\.\d+(?= GiB| of -?<?\d+\.\d+ GiB)")
 
@@ -1244,7 +1555,7 @@ class MemoryHoverTests(unittest.TestCase):
                 return shown_value(amount.split()[0])
 
             expected = sum(map(value, parts)) - sum(map(value, subtract))
-            tolerance = 0.05 * (1 + len(parts) + len(subtract))
+            tolerance = 0.05 * sum("<" in amount for amount in (total, *parts, *subtract))
             self.assertLessEqual(abs(value(total) - expected), tolerance + 1e-9, (total, parts, subtract))
 
         for sample, (tips, marks, warning, warning_tip, warning_text, overage, summary, gpu,
@@ -1257,8 +1568,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(warning_tip, warning)
                 self.assertEqual(evidence["free_for_next_gib"], raw["room_bytes"] / GIB)
                 self.assertEqual(evidence["queue_cap_gib"], readings[sample]["cap"])
-                for key, (title, raw_keys) in totals.items():
-                    self.assertEqual(tips[key][title], formatted(raw_sum(raw, *raw_keys) / GIB), key)
+                for key, title in totals.items():
                     assert_sum(tips[key][title], *(value for label, value in tips[key].items() if label != title))
                 taken, cap = tips["walksum"], tips["cap"]
                 reserve = taken.get("+ Full reserve", taken.get("+ Build reserved", ""))
@@ -1267,25 +1577,23 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(overage, expected_overage)
                 self.assertEqual("Over cap" in taken, expected_overage)
                 cap_amount = cap["Queue cap"]
-                builds = raw_sum(raw, "build_tools_bytes", "queued_builds_bytes", "ci_bytes")
-                claimed = builds + raw["build_target_bytes" if short["build"] else "build_covered_bytes"]
-                self.assertEqual(taken["Taken"], formatted(claimed / GIB))
                 assert_sum(taken["Taken"], taken["Builds"], reserve)
                 expected_summary = f"{taken['Taken'].split()[0]} of {cap_amount} taken"
                 if expected_overage:
-                    self.assertEqual(taken["Over cap"], formatted(raw_overage))
-                    expected_summary += f" · {formatted(raw_overage)} over cap"
+                    assert_sum(taken["Taken"], cap_amount, taken["Over cap"])
+                    expected_summary += f" · {taken['Over cap']} over cap"
                 self.assertEqual(summary, expected_summary)
                 if sample == 0:
                     self.assertEqual(tips["reserved"]["= Target"], "8.1 GiB")
                 room_tip = tips["room"]
                 if sample in (2, 3):
-                    self.assertEqual(tips["reserved"]["Build reserved"], "8.0 GiB")
-                    self.assertEqual(tips["reserved"]["= Target"], "8.0 GiB")
+                    expected_reserve = "8.0 GiB" if sample == 2 else "8.1 GiB"
+                    self.assertEqual(tips["reserved"]["Build reserved"], expected_reserve)
+                    self.assertEqual(tips["reserved"]["= Target"], expected_reserve)
                     self.assertEqual(room_tip["Free"], "0.0 GiB" if sample == 2 else "<0.1 GiB")
                 if sample == 3:
                     segments = cast(list[dict[str, object]], evidence["segments"])
-                    self.assertIn({"label": "Free", "gib": 0.01, "tone": "free"}, segments)
+                    self.assertIn({"label": "Free", "gib": 0.01, "tone": "free", "text": "<0.1 GiB"}, segments)
                 assert_sum(room_tip["Free"], room_tip["Queue cap"],
                            subtract=(room_tip["− Builds"], room_tip["− Build reserved"]))
                 for key, title, input_key in (
@@ -1307,10 +1615,9 @@ class MemoryHoverTests(unittest.TestCase):
                     if raw_key != "build":
                         system_label = "+ " + title if raw_key == "swap" else title
                         self.assertEqual(tips["system"][system_label], reserve_tip[title])
-                    if short[raw_key]:
-                        self.assertEqual(shortage, formatted(raw[f"{raw_key}_missing_bytes"] / GIB))
                     self.assertEqual(shortage, tips["shortfall"].get(title, tips["shortfall"].get("+ " + title, "0")))
-                self.assertEqual(tips["shortfall"]["Shortfall"], formatted(raw["shortfall_bytes"] / GIB))
+                assert_sum(tips["shortfall"]["Shortfall"], *(value for label, value in tips["shortfall"].items()
+                                                             if label != "Shortfall"))
                 for key, before in raw_surfaces[sample].items():
                     after = surfaces[key]
                     with self.subTest(surface=key):
@@ -1322,11 +1629,11 @@ class MemoryHoverTests(unittest.TestCase):
                         for raw_value, shown_value_in_text in amounts:
                             self.assertEqual(raw_value > 0, shown_value_in_text > 0)
                             self.assertEqual(raw_value < 0, shown_value_in_text < 0)
-                        for (raw_left, shown_left), (raw_right, shown_right) in combinations(amounts, 2):
-                            if raw_left < raw_right:
-                                self.assertLessEqual(shown_left, shown_right, (before, after))
-                            elif raw_right < raw_left:
-                                self.assertLessEqual(shown_right, shown_left, (before, after))
+                        for raw_value, shown_value_in_text in amounts:
+                            if 0 < abs(raw_value) < 0.1:
+                                self.assertEqual(abs(shown_value_in_text), 0.05)
+                            else:
+                                self.assertLess(abs(raw_value - shown_value_in_text), 0.100000001)
                 if sample == 1:
                     self.assertEqual(tips["shortfall"]["Safety net"], "<0.1 GiB")
                     self.assertEqual(tips["shortfall"]["+ Swap coming back"], "<0.1 GiB")
@@ -1336,10 +1643,11 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(tips["reserved"]["= Target"], "8.5 GiB")
                     self.assertEqual(tips["swap"]["= Target"], "6.7 GiB")
                     self.assertIn("Build reserved holds 8.5 of 8.5 GiB.", warning_text)
-                if sample in (7, 8):
+                if sample in (7, 8, 9):
                     outside = tips["g-else"]
-                    self.assertEqual(outside["Everything else"], "3.1 GiB" if sample == 7 else "<0.1 GiB")
-                    self.assertEqual(outside["+ Not attributed"], "-0.5 GiB" if sample == 7 else "-0.7 GiB")
+                    expected = {7: "3.1 GiB", 8: "<0.1 GiB", 9: "0.1 GiB"}
+                    self.assertEqual(outside["Everything else"], expected[sample])
+                    self.assertEqual(outside["+ Not attributed"], tips["unattributed"]["Not attributed"])
                 run = tips["row:run"]
                 assert_sum(run["= In queue cap"], run["Uses"], run["+ Build reserved"])
                 group = tips["row:group"]
@@ -1349,17 +1657,20 @@ class MemoryHoverTests(unittest.TestCase):
                 need, free = cast(float, waiter["need"]), cast(float, waiter["free"])
                 head_terms = cast(dict[str, list[dict[str, object]]], head_waiter["head_room"])["rows"]
                 head_free = cast(float, head_terms[-1]["gib"])
-                self.assertEqual(head["= Head room"], formatted(head_free))
+                assert_sum(head["= Head room"], head["Queue cap"],
+                           subtract=(head["− Builds"], head["− Build reserved"], head["− Earlier waiters"]))
                 for tip, free_for_step in ((wait, free), (head, head_free)):
                     shortage = need - free_for_step
                     self.assertEqual(tip["Waits for"], "memory" if shortage > 0 else "its turn")
-                    self.assertEqual(tip.get("Short by"), formatted(shortage) if shortage > 0 else None)
+                    self.assertEqual("Short by" in tip, shortage > 0)
+                if "Short by" in head:
+                    assert_sum(head["Needs"], head["= Head room"], head["Short by"])
                 difference = raw["room_bytes"] / GIB - free
-                self.assertEqual(wait.get("− Held elsewhere"), formatted(difference) if difference > 0 else None)
-                self.assertEqual(wait.get("+ Released"), formatted(-difference) if difference < 0 else None)
+                self.assertEqual("− Held elsewhere" in wait, difference > 0)
+                self.assertEqual("+ Released" in wait, difference < 0)
                 gpu_reason = "A GPU test waits: another GPU test holds the GPU test slot."
                 if need > free:
-                    gpu_reason += f" It also needs {formatted(need - free)} more memory."
+                    gpu_reason += f" It also needs {wait['Short by']} more memory."
                 if sample % 3 != 2:
                     self.assertEqual(gpu, gpu_reason)
 
@@ -1507,11 +1818,13 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_equal_group_members_keep_their_process_identity(self) -> None:
         data = {"read_at": 220, "walk": [{"name": "Codex servers", "group": "codex", "used": 0.4,
+            "about": "These processes serve Codex sessions",
             "parts": [{"who": "codex", "pid": pid, "started_at": 100, "gib": 0.2} for pid in (123, 456)]}]}
         html = str(self.page_expression("tooltipHtml('row:fixture-run-0', data)", data, walk=True))
         root = ElementTree.fromstring(html)
+        self.assertEqual(root.findtext("dd[@class='caption']"), "These processes serve Codex sessions")
         self.assertEqual([cell.text for cell in root.findall("dt")][2:], ["codex · 123 · 2 min", "codex · 456 · 2 min"])
-        self.assertEqual([cell.text for cell in root.findall("dd")][2:], ["0.2 GiB", "0.2 GiB"])
+        self.assertEqual([cell.text for cell in root.findall("dd")][3:], ["0.2 GiB", "0.2 GiB"])
 
     def test_a_hidden_console_frame_reads_nothing_until_the_console_shows_it(self) -> None:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
@@ -1647,8 +1960,11 @@ function fitLabels() {}
                 if row.get("kind") != "repository-slot":
                     _ = row.setdefault("title", {"unit": "", "step": row.get("ci_label") or row["name"]})
                 _ = row.setdefault("unit", "")
-        result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload),
-            text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        with tempfile.TemporaryDirectory(prefix="memory-hover-") as directory:
+            script = Path(directory) / "fixture.cjs"
+            _ = script.write_text(javascript, encoding="utf-8")
+            result = subprocess.run([executable, str(script)], input=json.dumps(payload),
+                text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return cast(object, json.loads(result.stdout))
 
@@ -1786,6 +2102,23 @@ function fitLabels() {}
         groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(data.ram, group))", {}))
         self.assertEqual(groups, [7 * GIB, 30 * GIB, 27 * GIB])
 
+    def test_build_tool_parts_keep_the_displayed_total_and_hide_an_empty_remainder(self) -> None:
+        for remainder, python_tests, waiting_runs, expected in (
+            (0, 264, 248, ["+ Python tests  0.3 GiB", "+ Waiting runs  0.2 GiB"]),
+            (128, 136, 248, ["+ Python tests  0.1 GiB", "+ Waiting runs  0.3 GiB", "+ Other build tools  0.1 GiB"]),
+            (192, 256, 64, ["+ Python tests  0.3 GiB", "+ Waiting runs  <0.1 GiB", "+ Other build tools  0.2 GiB"]),
+            (492, 20, 0, ["+ Python tests  <0.1 GiB", "+ Waiting runs  0.0 GiB", "+ Other build tools  0.5 GiB"]),
+            (163, 155, 194, ["+ Python tests  0.1 GiB", "+ Waiting runs  0.2 GiB", "+ Other build tools  0.2 GiB"]),
+            (412, 80, 20, ["+ Python tests  <0.1 GiB", "+ Waiting runs  <0.1 GiB", "+ Other build tools  0.4 GiB"]),
+        ):
+            ram = {**RAM_FIXTURE, "python_tests_bytes": python_tests * MIB, "waiting_runs_bytes": waiting_runs * MIB,
+                   "other_build_tools_bytes": remainder * MIB}
+            with self.subTest(remainder=remainder):
+                result = self.page_expression("[tipText('tools', data), tipText('cap', data)]", {"ram": ram, "cap": 31})
+                self.assertEqual(result, [["Build tools  2.0 GiB", "\n".join([
+                    "RAM that build tools use now", "rust-analyzer  1.0 GiB", "+ sccache  0.5 GiB", *expected])],
+                    ["Queue cap  31.0 GiB", "What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB"]])
+
     def test_missing_reserves_small_amounts_and_unavailable_readings_have_their_own_text(self) -> None:
         for description, needed, covered, expected in (
                 ("Running builds grow into it.", 9, 5,
@@ -1808,7 +2141,7 @@ function fitLabels() {}
                "kernel_no_counter_bytes": 0}
         tips = cast(list[list[str]], self.page_expression(
             "[reserveAlert(shownReading(data)), tipText('reserved', data), tipText('kernel', data), tipText('tools', data)," +
-            " ramAmount(0), tipText('unattributed', data), tipText('system', data)]", {"ram": ram}))
+            " shownReading(data).memory.room.text, tipText('unattributed', data), tipText('system', data)]", {"ram": ram}))
         # The user, 11-17: one line names each reserve that free RAM does not fill.
         self.assertEqual(tips[0], "Free RAM is short by 7.0 GiB. Swap coming back holds 1.0 of 2.0 GiB; Build reserved holds 0.0 of 6.0 GiB.")
         self.assertEqual(tips[1], ["Build reserved  0.0 GiB", "Held for running builds to grow into\nTarget  6.0 GiB\nNot covered  6.0 GiB"])
@@ -1948,23 +2281,21 @@ function fitLabels() {}
         plain = str(self.page_expression("tooltipHtml('row:fixture-run-0',data)", data, walk=True))
         self.assertEqual("".join(grid.itertext()), "".join(ElementTree.fromstring(plain).itertext()))
 
-    def test_gate_and_route_text_color_only_marked_staff_parts(self) -> None:
-        data = {"waiters": [{"name": "Compile", "unit": "", "about": "Tests builder; helper stays plain",
-            "about_parts": [{"kind": "text", "text": "Tests "}, {"kind": "staff", "text": "builder"},
-                {"kind": "text", "text": "; helper stays plain"}], "runs_on": "Mac", "kind": "repository-slot",
-            "because": "Held by builder; helper stays plain", "because_parts": [
-                {"kind": "text", "text": "Held by "}, {"kind": "staff", "text": "builder"},
-                {"kind": "text", "text": "; helper stays plain"}]}]}
+    def test_captions_stay_plain_and_route_text_colors_marked_staff_parts(self) -> None:
+        about = "Runs every test module"
+        because = "Held by builder"
+        data = {"waiters": [{"name": "Compile", "unit": "", "about": about, "runs_on": "Mac",
+            "kind": "repository-slot", "because": because, "because_parts": [
+                {"kind": "text", "text": "Held by "}, {"kind": "staff", "text": "builder"}]}]}
         body = str(self.page_expression("(()=>{" + self.role_setup()
             + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
         grid = ElementTree.fromstring(body)
-        values = [cell for cell in grid if cell.tag == "dd" and "helper stays plain" in "".join(cell.itertext())]
-        self.assertEqual(len(values), 2)
-        self.assertTrue(all([span.text for span in cell.findall("span")] == ["builder"] for cell in values))
-        for field in ("about_parts", "because_parts"):
-            del data["waiters"][0][field]
-        plain = str(self.page_expression("tooltipHtml('wait:fixture-wait-0',data)", data, walk=True))
-        self.assertEqual("".join(grid.itertext()), "".join(ElementTree.fromstring(plain).itertext()))
+        caption = grid.find("dd[@class='caption']")
+        assert caption is not None
+        self.assertEqual(caption.text, about)
+        self.assertEqual(list(caption), [])
+        reason = next(cell for cell in grid if cell.tag == "dd" and "".join(cell.itertext()) == because)
+        self.assertEqual([span.text for span in reason.findall("span")], ["builder"])
 
     def test_swap_rows_use_their_own_text_and_show_one_owner_only(self) -> None:
         def row(name: str, kind: str, amount: int, **extra: object) -> dict[str, object]:

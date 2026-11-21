@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import os
 import json
 from pathlib import Path
@@ -34,8 +34,10 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import placement
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, mac_test
+from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.build_targets import build_targets
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
@@ -278,13 +280,13 @@ class TestProcesses:
     def kill(self, owner: wire.Owner) -> None:
         child = next(child for child in self.children if child.pid == owner.pid)
         child.kill()
-        _ = child.wait(timeout=2)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def close(self) -> None:
         for child in self.children:
             if child.poll() is None:
                 child.kill()
-            _ = child.wait(timeout=2)
+            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
 
 class PrivateReadings:
@@ -890,6 +892,13 @@ _caller_services: dict[str, AdmissionFixture] = {}
 PRIVATE_HOST_ALLOWED = placement.AllowedHost()
 
 
+@dataclass(frozen=True)
+class PrivateHostEvidence(placement.FreshHostEvidence):
+    """Identify the claim that supplies the holder, including a claim before adoption."""
+
+    holder_claim: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+
+
 def _register_real_ancestry(fixture: AdmissionFixture, pid: int) -> None:
     """Copy a real claim holder and its real ancestors below the test process into the private table.
 
@@ -908,18 +917,16 @@ def _register_real_ancestry(fixture: AdmissionFixture, pid: int) -> None:
 
 def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvidenceKey,
                               paths: claim_state.StatePaths,
-                              eligibility: placement.HostEligibility = PRIVATE_HOST_ALLOWED) -> placement.FreshHostEvidence:
+                              eligibility: placement.HostEligibility = PRIVATE_HOST_ALLOWED) -> PrivateHostEvidence:
     """Read only the fixture's provider records and checked local process identities."""
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
     with claim_state.locked(paths.lock):
         claims = claim_state.read_claims(paths)
-    from scripts.mac_test import mac_test
-    from scripts.build_hold import build_hold
-    from scripts.build_targets import build_targets
-
     holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
-    diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NoProviderDiagnostic()
+    holder_claim: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+    diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
+    scope = None
     if key.destination.provider == "local":
         directory = fixture.root / "build-hold"
         owner = key.local_hold_owner
@@ -940,16 +947,6 @@ def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvid
         if not isinstance(block, mac_test.NoMacBlock):
             eligibility = placement.TemporaryExclusion("blocked")
         scope = claim_state.target_claim_scope(paths, key.repository)
-        for held in claims:
-            if mac_test.scopes_overlap(held.scope, scope) and mac_test.run_is_live(held.record):
-                if isinstance(eligibility, placement.AllowedHost) and not mac_test.run_is_kept(held.record):
-                    eligibility = placement.TemporaryExclusion("busy")
-                if isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy":
-                    diagnostic = placement.BusyProviderDiagnostic(key.destination.target, held.record["what"], held.record["since"])
-                session_id = held.record.get("holder_session") or held.record["submitting_session"]
-                if session_id:
-                    holder = placement.ResourceHolderSession(session_id)
-                break
     generation = ""
     controller = paths.directory / "controller.json"
     if controller.exists():
@@ -957,10 +954,22 @@ def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvid
         generation = str(document.get("generation", ""))
     for held in claims:
         record = held.record
-        if "remote_host" not in record:
+        supplies_holder = (scope is not None and isinstance(holder_claim, placement.NoProviderClaim)
+                           and mac_test.scopes_overlap(held.scope, scope) and mac_test.run_is_live(record))
+        if not supplies_holder and "remote_host" not in record:
             continue
         reference = placement.ProviderClaimReference(key.destination.provider, key.destination.target,
             held.scope, record["claim_id"], record["episode"], record["attempt"])
+        if supplies_holder:
+            holder_claim = reference
+            if isinstance(eligibility, placement.AllowedHost) and not mac_test.run_is_kept(record):
+                eligibility = placement.TemporaryExclusion("busy")
+            if isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy":
+                diagnostic = placement.BusyProviderDiagnostic(key.destination.target, record["what"], record["since"])
+            if session_id := record.get("holder_session") or record["submitting_session"]:
+                holder = placement.ResourceHolderSession(session_id)
+        if "remote_host" not in record:
+            continue
         if record.get("cleanup_pending", False):
             cleanup.append(placement.RetainedCleanupClaim(reference, "private cleanup remains unresolved"))
             continue
@@ -973,7 +982,8 @@ def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvid
             placement.ClaimHolderIdentity(fixture.server.host, pid, record["proc_start"]),
             OwningSession(session_id) if session_id else NoOwningSession(),
             record["remote_host"], record.get("instance_generation", "")))
-    return placement.FreshHostEvidence(key, fixture.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), holder=holder, provider_diagnostic=diagnostic)
+    return PrivateHostEvidence(key, fixture.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup),
+        holder=holder, provider_diagnostic=diagnostic, holder_claim=holder_claim)
 
 
 class CallerProviderControls:

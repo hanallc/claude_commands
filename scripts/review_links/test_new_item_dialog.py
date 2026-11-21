@@ -1,6 +1,7 @@
 """Test the New item dialog against a private HTTP fixture."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -11,13 +12,13 @@ import unittest
 from dataclasses import asdict, replace, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff
-from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
+from scripts.review_links import console_theme, new_item_dialog, page_frame, review_page, review_submissions
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -137,6 +138,11 @@ function untilError() {
    const chips = [...dialog.querySelectorAll('[data-kind]')];
    check((chips[0].offsetTop !== chips[3].offsetTop) === (innerWidth < 480), 'Type chips wrap on a phone.');
    const evidence = dialog.querySelector('[data-evidence]'), tip = dialog.querySelector('.new-item-tip');
+   const memory = evidence.querySelector('.new-item-memory');
+   check(memory.querySelector('strong').textContent === '17.9 GiB' &&
+         memory.querySelector('.new-item-cap').textContent === 'Queue cap 27.9 GiB' &&
+         memory.querySelector('.new-item-memory-legend span').textContent === 'Builds 9.9 GiB',
+         'The preview uses the displayed amounts from the capture.');
    check(evidence.getBoundingClientRect().bottom < textarea.getBoundingClientRect().top, 'Evidence precedes the words.');
    check(tip.lastElementChild.textContent === __LAST_DETAIL__ && !tip.querySelector('strong strong'),
          'The final tooltip entry stays visible as text.');
@@ -398,6 +404,60 @@ function untilError() {
    await sendSaved();
    check(ownerPosts.at(-1).recipient_id === 'fixture-list-producer' &&
          ownerPosts.at(-1).page_recipient === 'list-owner', 'Send keeps the selected List owner.');
+
+   const listPosts = [];
+   let listOwner = 'first-owner';
+   window.fetch = (url, options) => {
+    if (url === '/console/review/new-item?page=list') {
+     return json({token:'list-token',recipients:[{id:listOwner,name:listOwner}]});
+    }
+    if (url === '/console/review/new-item' && options?.method === 'POST') {
+     const payload = JSON.parse(options.body);
+     if (payload.page_capture) return json({});
+     listPosts.push(payload);
+     return listOwner === 'first-owner' ? json({error:'The List link is unavailable.'}, 503) : json({id:'Q1'});
+    }
+    return originalFetch(url, options);
+   };
+   await open({page:'list'});
+   type('Keep these List words.');
+   await trySend();
+   check(error.textContent === 'The List link is unavailable.', 'The first List Send fails.');
+   dialog.querySelector('[data-cancel]').click();
+   await open({page:'list'});
+   await trySend();
+   check(listPosts[1].request_id === listPosts[0].request_id &&
+         listPosts[1].recipient_id === 'first-owner', 'The same List owner keeps the request ID.');
+   dialog.querySelector('[data-cancel]').click();
+   listOwner = 'new-owner';
+   await open({page:'list'});
+   check(to()[0].checked && to()[0].value === listOwner, 'The reopened List dialog selects the new owner.');
+   await sendSaved();
+   check(listPosts[2].request_id === listPosts[0].request_id && listPosts[2].recipient_id === listOwner &&
+         listPosts[2].words === listPosts[0].words, 'The new List owner sends the same words with the same request ID.');
+
+   window.fetch = (url, options) => {
+    if (url === '/console/review/new-item?page=list') {
+     return json({token:'', recipients:[{id:'list-staff',name:'morty'}],
+                  send_disabled:'Sending is off on a practice List.'});
+    }
+    if (url === '/console/review/new-item' && options?.method === 'POST') {
+     ownerPosts.push(JSON.parse(options.body));
+     return json({});
+    }
+    return originalFetch(url, options);
+   };
+   const beforePractice = ownerPosts.length;
+   await open({page:'list',kind:'question'});
+   const notice = dialog.querySelector('[data-send-disabled]');
+   check(dialog.open && to()[0].checked && to()[0].value === 'list-staff', 'The practice dialog shows the List owner.');
+   type('A practice item.');
+   check(!notice.hidden && notice.textContent === 'Sending is off on a practice List.',
+         'The practice dialog shows one reason.');
+   check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
+   send.click();
+   check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }
  } catch (failure) {
@@ -414,7 +474,14 @@ def fixture_page(width: int, *, photo: bool) -> bytes:
         *EVIDENCE.tip,
         *(review_submissions.TipField(f"Step detail {n}", f"Run {n}, RSS {n} GiB") for n in range(28)),
         review_submissions.TipDetail(NO_CLIP_TEXT)))
-    probe = (PROBE.replace("__CAPTURE__", json.dumps(asdict(evidence)))
+    captured = asdict(evidence)
+    captured["memory"] = {
+        "free_for_next_gib": evidence.memory.free_for_next_gib, "queue_cap_gib": evidence.memory.queue_cap_gib,
+        "free_text": "17.9 GiB", "cap_text": "27.9 GiB",
+        "segments": [{**asdict(segment), "text": text} for segment, text in zip(
+            evidence.memory.segments, ("9.9 GiB", "30.0 GiB", "2.0 GiB", "8.0 GiB", "29.0 GiB"), strict=True)],
+    }
+    probe = (PROBE.replace("__CAPTURE__", json.dumps(captured))
              .replace("__PHOTO__", json.dumps(photo)).replace("__PNG__", PNG).replace("__WIDTH__", str(width))
              .replace("__LAST_DETAIL__", json.dumps(NO_CLIP_TEXT))
              .replace("__DISPLAY_WORDS__", json.dumps(DISPLAY_WORDS)))
@@ -687,6 +754,40 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-page-capture hidden', markup)
+        buttons: tuple[tuple[Literal["review", "list"], str], ...] = (("review", "New"), ("list", "New item"))
+        for page, label in buttons:
+            with self.subTest(page=page):
+                button = new_item_dialog.title_button(page)
+                self.assertIn(f'aria-label="New item" title="New item" data-{page}-new>', button)
+                self.assertIn(f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span>', button)
+
+    def test_build_step_retry_uses_a_receipt_from_before_display_text(self) -> None:
+        fixture = DialogFixture(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        (fixture.root / "config").mkdir()
+        recipient = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        members = staff.StaffSnapshot((recipient,))
+        memory = replace(EVIDENCE.memory, queue_cap_gib=None)
+        evidence = {**asdict(EVIDENCE), "memory": {
+            "free_for_next_gib": memory.free_for_next_gib, "queue_cap_gib": memory.queue_cap_gib,
+            "segments": [{"label": segment.label, "gib": segment.gib, "tone": segment.tone}
+                         for segment in memory.segments],
+        }}
+        request = new_item_dialog.read_request({
+            "request_id": f"r1-{'a' * 32}-bug-{OWNER}", "kind": "bug", "recipient_id": OWNER,
+            "words": DISPLAY_WORDS, "evidence": evidence, "images": [],
+        })
+        legacy_hash = hashlib.sha256(json.dumps(["bug", DISPLAY_WORDS, evidence, []], sort_keys=True).encode()).hexdigest()
+        with (patch.dict(os.environ, fixture.environment()), patch.object(Path, "home", return_value=fixture.root),
+              patch.object(staff, "snapshot", return_value=members)):
+            with patch.object(review_submissions, "_submission_fingerprint", return_value=legacy_hash):
+                saved = review_submissions.submit(request, members=members)
+            receipt_path = review_submissions.image_folder(saved).parent / "receipt.json"
+            receipt = receipt_path.read_bytes()
+            fields = cast(dict[str, object], json.loads(receipt))
+            self.assertEqual(fields.get("payload_hash"), legacy_hash)
+            self.assertEqual(review_submissions.submit(request, members=members), saved)
+            self.assertEqual(receipt_path.read_bytes(), receipt)
+            self.assertEqual([item.id for item in investigation.records(OWNER)], [saved.id])
 
     def test_page_data_and_capture_size_are_checked(self) -> None:
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}
@@ -724,6 +825,18 @@ class NewItemDialogTests(unittest.TestCase):
                 self.assertEqual(fixture.results, [])
                 records = investigation.records(OWNER)
                 self.assertEqual([item.id for item in records], ["I1", "I2", "I3", "I4", "I6", "I7", "I8"])
+                saved = records[0].submission
+                assert isinstance(saved, new_item_dialog.ReviewSubmission)
+                assert isinstance(saved.evidence, new_item_dialog.BuildStepEvidence)
+                memory = saved.evidence.memory
+                self.assertEqual((memory.free_for_next_gib, memory.queue_cap_gib, memory.segments[0].gib),
+                                 (18.0, 28.0, 10.0))
+                card = review_page.submission_assets("bug/fixture/I1", saved)
+                self.assertIn("17.9 GiB free for the next step · Queue cap 27.9 GiB", card)
+                self.assertIn("Builds 9.9 GiB · Free RAM 30.0 GiB", card)
+                legacy = review_page.submission_assets("bug/fixture/I1", replace(saved, evidence=EVIDENCE))
+                self.assertIn("18 GiB free for the next step · Queue cap 28 GiB", legacy)
+                self.assertIn("Builds 10 GiB · Free RAM 30 GiB", legacy)
                 original = records[3]
                 for report, title in zip(records[-2:], ("First queue state", "Second queue state"), strict=True):
                     self.assertEqual(report.question, "Show the queue state.")

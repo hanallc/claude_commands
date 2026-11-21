@@ -657,13 +657,22 @@ class RecordedResumeTests(RestartTestCase):
                 self.assertEqual(arguments, expected)
 
     def test_claude_resume_keeps_model_plugins_and_one_current_name(self) -> None:
-        for recorded_name in ("recorded-name", ""):
-            with self.subTest(recorded_name=recorded_name):
+        home = Path(self.enterContext(tempfile.TemporaryDirectory())) / "claude account"
+        for recorded_name, turn_model, effort in (("recorded-name", "", ""), ("", "", ""),
+                                                 ("recorded-name", "claude-opus-5-5", "high")):
+            with self.subTest(recorded_name=recorded_name, turn_model=turn_model):
                 entry = self.entry("claude", "claude-model")
                 entry["name"] = recorded_name
+                entry["config_dir"] = str(home)
+                if turn_model:
+                    write_text_atomic(home / "projects/prior/current-id.jsonl",
+                        json.dumps({"type": "assistant", "message": {"model": turn_model}, "effort": effort}) + "\n")
                 arguments = self.resumed_arguments(entry)
                 expected = ["--resume", "current-id", "-n", "current-name", "--remote-control", "current-name"]
-                expected.extend(("--model", "claude-model", "--plugin-dir", "/plugins/first",
+                expected.extend(("--model", turn_model or "claude-model"))
+                if effort:
+                    expected.extend(("--effort", effort))
+                expected.extend(("--plugin-dir", "/plugins/first",
                                  "--plugin-dir", "/plugins/second plugin", "--settings", '{"disableAgentView": true}'))
                 self.assertEqual(arguments, expected)
                 names = [arguments[index + 1] for index, value in enumerate(arguments) if value in ("-n", "--name")]
@@ -775,7 +784,7 @@ class MixedRestartTests(ShutdownTestCase):
         write_text_atomic(other_run / "progress_history_state.json", json.dumps({"owner_staff_id": other.id,
             "main_agent": {"session_id": other.current_session}, "pass": {}, "events": []}))
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": owner.id,
-            "phase": {"id": "work", "instance_id": "active", "status": "active", "started_at": 1},
+            "open_phases": [{"id": "work", "instance_id": "active", "status": "active", "started_at": 1}],
             "main_agent": {"session_id": owner.current_session, "family": "claude"},
             "history_file": str(run / "history.jsonl"), "pass": {}, "events": []}))
         prompt = run / "prompt.md"
@@ -3979,8 +3988,8 @@ class RetainedSplitRestartTests(RestartTestCase):
         run = root / "run"
         write_text_atomic(run / "progress_history_state.json", json.dumps({
             "main_agent": {"session_id": str(holder.current_session)},
-            "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
-                      "started_at": 1, "status": "active"},
+            "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
+                             "started_at": 1, "status": "active"}],
             "pass": {}, "history_file": str(run / "history.jsonl")}))
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Preserve the source behavior.\n")

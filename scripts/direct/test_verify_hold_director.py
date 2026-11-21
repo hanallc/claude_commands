@@ -8,13 +8,16 @@ from typing import cast
 
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, grant_call
+from scripts.production import staff
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_director_verification_uses_its_claude_owner_and_single_active_phase(self) -> None:
         self.set_hold_routing("natedev_only")
-        history = self.record_phase()
-        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director"})
+        history = self.record_phase_for_worker("")
+        director = staff.caller_identity() or "claude-director"
+        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director,
+                                         "UNIT_PHASE_ID": ""})
         self.hold()
         process = self.start("check", "sample")
         self.wait_for_call(process)
@@ -23,17 +26,19 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(code, 0, output)
         rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         wait, = [row for row in rows if row["event_type"] == "wait_started"]
-        self.assertEqual((wait["owner_session"], wait["phase_id"]), ("claude-director", "6"))
+        self.assertEqual((wait["owner_session"], wait["phase_id"]), (director, "6"))
         self.assertNotIn("pass_instance_id", wait)
 
     def test_director_verification_with_two_active_phases_records_one_miss_for_both(self) -> None:
         self.set_hold_routing("natedev_only")
-        history = self.record_phase()
+        history = self.record_phase_for_worker("")
         session = self.fixture.environment["UNIT_RUN_DIR"]
         result = invoke_recorder(["start-phase", "--session-dir", session, "--phase-id", "7", "--phase-title", "Concurrent"],
                                  self.fixture.environment, self.fixture.root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director"})
+        director = staff.caller_identity() or "claude-director"
+        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director,
+                                         "UNIT_PHASE_ID": ""})
         self.hold()
         process = self.start("check", "sample")
         self.wait_for_call(process)
@@ -42,7 +47,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(code, 0, output)
         rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         miss, = [row for row in rows if row["event_type"] == "wait_not_recorded"]
-        self.assertEqual(miss["owner_session"], "claude-director")
+        self.assertEqual(miss["owner_session"], director)
         attribution = cast(dict[str, object], miss["wait_attribution"])
         candidates = cast(list[dict[str, object]], attribution["candidates"])
         self.assertEqual({candidate["phase_id"] for candidate in candidates}, {"6", "7"})

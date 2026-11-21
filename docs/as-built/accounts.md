@@ -207,8 +207,14 @@ Account moves use the shared stop and resume API.
 Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 Each attempt has its own move ID and cause.
 A session proved live on the target writes nothing.
+A failed live source read stops the move before it records a source or sends a signal.
+The stop checks that the live source PID and process start time still match.
+A Claude target needs a real account directory and a matching local sign-in.
+A refresh token needs a future `refreshTokenExpiresAt`.
+If only an access token is present, it needs a future `expiresAt`.
+The watcher checks the sign-in when it selects a target and again before it changes the group account.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
-All selected stops finish before the batch resumes any session.
+The batch stops the available members before it resumes them.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
 The notes timer delegates its moves through the same boundary before its part deadline can kill them.
@@ -250,8 +256,14 @@ The preview shares the move decision and lists idle panes that would close, work
 One count line covers workers with nothing to move.
 These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
-A group move validates the destination before changing the selection or stopping members.
-It selects the account for future launches and moves live members on other accounts.
+A group move validates the destination before it changes the selection for future launches.
+Staff rows define the group.
+The live registry supplies each member's account.
+A local row lock keeps an eligible member in the batch even without a local process or worktree.
+The group passes stable staff references to the batch.
+The batch saves the pending member and reports the retry command.
+The batch resolves the current conversation and reads the current group selection under the member's row lock.
+The retry command for a group move uses the current selection for that group.
 A workers swap also selects eligible Codex producers.
 A producers group move selects only eligible Claude producers.
 `eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
@@ -265,7 +277,15 @@ An empty group can still select its account.
 The preview and move report an incomplete member list when the Claude registry is unreadable.
 The move saves the group selection and limits session moves to members with live evidence.
 Each member has an independent result.
-A single-session move refuses a grouped session and names the group operation.
+The group command prints moved, pending, and failed members by staff name.
+A retry of the selected destination reuses the group transition ID.
+The refusal watcher skips members whose staff rows are busy.
+A pending refusal stays eligible until its move completes or a detached batch accepts it.
+An in-progress result from another move keeps the refusal pending.
+The watcher saves the decision ID before it requests the move.
+A retry uses that decision ID when only some members still need to move.
+A single-session move uses the explicit account.
+If the group uses a different account, the command reports the return to that account at the next resume.
 The move path creates no ready mark, conductor, follow command, or cancellation step.
 
 `TranscriptRefusal`, `ProofRefusal`, and `NoSessionRefusal` distinguish provider evidence from a test assumption and absence.
@@ -286,7 +306,18 @@ The half-point estimate uses the selected account's history, including other gro
 The default estimate is 40 minutes when no usable pace exists.
 The duration stays with the started hold rather than changing on each pass.
 
-A successful selection and journal entry precede removal of the queued entry.
+The watcher removes a Claude group's head when its target matches the current group selection.
+The rule applies before the head is due and uses the group selection as the completion condition.
+The watcher takes the group lock inside the queue lock for the selection check and queue write.
+It uses the same lock order for a match on a fallback account.
+The hold check uses the account and transition ID from the same locked snapshot.
+A new hold starts at the clock time of that snapshot.
+Pending members keep their move results and retry command.
+The watcher reports each removal after the queue write succeeds and before it saves the hold state.
+This rule also applies during replay.
+A failed removal report does not stop the move or the state save.
+It evaluates the next head on a later pass.
+An automatic move removes its own entry by ID after it saves the selection, including when it selects a fallback.
 Replay checks retain a blocked entry when history is unreadable.
 An incomplete final journal row is distinct from corruption between complete rows.
 Queue edits and execution share locks on natedev.
@@ -341,9 +372,12 @@ Normal recovery takes about two to three minutes plus reading, restoration, and 
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
 A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
-`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
-`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
-So a change of the role's assigned family never moves a worker to another family.
+The move reads the role settings for the worker's current family through `worker_panes.launch_policy(role, family)`.
+After the stop, `pane_moves._own_policy` reads the latest real Claude assistant turn for the model and effort.
+The launch record or role supplies missing settings. A turn without effort keeps the fallback effort.
+An explicit unit resume `--model` overrides the model.
+For Codex, `worker_panes.kept_settings` keeps the saved model, effort, and service tier.
+The destination and rollback use the same policy.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
@@ -398,6 +432,8 @@ The unit watchdog reads current names, parents, sessions, and folders from staff
 It reads the account from the pane launch record and checks current process liveness.
 It saves pending jobs before it starts detached recovery services.
 Each child resolves the current staff session before resume.
+The watchdog skips a member while an account move holds its row lock.
+A queued recovery holds the same row lock through its liveness check and resume.
 Historical jobs remain keyed by session id.
 Account notes keep historical rows without using them as current counts.
 A failed roster read reports one anomaly and sets the derived count to zero.

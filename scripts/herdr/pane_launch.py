@@ -1046,10 +1046,14 @@ RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 
 def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
+    return parse_claude_flags(arguments[1:])
+
+
+def parse_claude_flags(arguments: Sequence[str]) -> ClaudeArguments:
     values: dict[str, str] = {}
     prompt = False
     plugin_directories: list[str] = []
-    index = 1
+    index = 0
     while index < len(arguments):
         argument = arguments[index]
         index += 1

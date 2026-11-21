@@ -1,7 +1,7 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -29,7 +29,8 @@ from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -200,11 +201,8 @@ esac
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
         self.environment = {
+            **verify_test_environment(),
             "UNIT_DETACHED_RUN": "1",
-            **{name: value for name, value in os.environ.items()
-               if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                               "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
-               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_", "UNIT_DETACHED_"))},
             "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
@@ -289,7 +287,7 @@ esac
         """
         found: list[int] = []
         result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
-                                capture_output=True, text=True, check=True)
+                                env=verify_test_environment(), capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) != 3 or parts[2].startswith("Z"):
@@ -388,6 +386,14 @@ esac
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
         admission = caller_admission(self, self.root, self.environment)
+        runner = staff.caller_identity()
+        if runner:
+            board = Path(environment["UNIT_RUN_DIR"])
+            # Bind the runner when Verify starts. Token history can assign it to a different worker.
+            if (board / "impl_worker_fixture-impl.json").is_file():
+                record_wait_workers(self.root, board, environment, {"fixture-impl": "thread-impl"},
+                                    runtime_ids={"fixture-impl": runner})
+            environment.update(build_fixture_sessions(""))
         with admission.loop_turn():
             if not admission.server.reservations and not admission.server.slots:
                 _ = admission.occupy_host()
@@ -583,7 +589,8 @@ exit "$status"
                             + "with open(os.environ['TEST_DETACHED_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
                             + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                             + "raise SystemExit(int(os.environ['TEST_DETACHED_RUNS_STATUS']))\n")
-        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": "thread-worker", "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
+        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": staff.caller_identity() or "thread-worker",
+                "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
                 "TEST_DETACHED_RUNS_CALLS": str(self.root / "detached-runs-calls"), "TEST_DETACHED_RUNS_STATUS": str(status)}
 
     def detached_runs_calls(self) -> list[list[str]]:

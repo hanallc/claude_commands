@@ -136,8 +136,9 @@ class PaneWorld(herdr.Herdr):
                           + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
                           + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
-        write_text_atomic(config / "codex_daemon.conf", (Path(__file__).resolve().parents[2] / "config/codex_daemon.conf").read_text())
-        write_text_atomic(config / "script_prompts.conf", (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
+        write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
+                          + "agents_slice=app-agents.slice\n")
+        write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
@@ -939,8 +940,8 @@ class WorkerPaneTests(StaffTestCase):
         if not state.exists():
             run.mkdir(exist_ok=True)
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
-                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
-                          "status": "active"}, "pass": {}, "events": [],
+                "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                                 "status": "active"}], "pass": {}, "events": [],
                 "history_file": str(run / "history.jsonl"),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
@@ -1003,7 +1004,9 @@ class WorkerPaneTests(StaffTestCase):
                 _ = progress_history.begin_dispatch(run, slot="impl", phase=phase, role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
                 before = self.staff_state()
-                if operation in {"finish-phase", "finish-run"}:
+                if operation == "finish-phase":
+                    self.record_command(operation, "--phase-id", phase, "--status", "completed", at=3)
+                elif operation == "finish-run":
                     self.record_command(operation, "--status", "completed", at=3)
                 else:
                     self.record_command("finish-pass", "--status", "interrupted", "--orphaned-launcher", at=3)
@@ -2117,6 +2120,16 @@ class WorkerPaneTests(StaffTestCase):
         with patch("scripts.agents.detached_runs.live_runs", return_value=[]):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
             self.assertIsInstance(self.start(role="review"), worker_panes.StartRefused)
+
+            path = run / unit_runs.STATE_FILE
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            passes = cast(dict[str, dict[str, object]], state["pass"])
+            passes["newer-slot"] = {"worker_id": opened.row.id, "instance_id": "newer-pass",
+                                    "started_at": 1, "status": "completed"}
+            write_text_atomic(path, json.dumps(state))
+            self.reply_to_dispatch(opened.row, "newer-pass")
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+            self.assertIsInstance(self.start(role="review"), worker_panes.OpenWorker)
 
     def test_failed_unpublished_close_reports_one_anomaly(self) -> None:
         for failure in (False, OSError("TEST close failed\nsecond line")):

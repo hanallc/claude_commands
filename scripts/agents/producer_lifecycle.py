@@ -293,7 +293,7 @@ def _send(recipient: str, text: str, key: str) -> None:
         outcome = restart_support.send_message(recipient, "producer retirement", text, key=key, repeat_minutes=1440)
     except RuntimeError as error:
         raise ValueError(f"{recipient}: {error}") from error
-    if outcome["kind"] not in ("sent", "queued", "acknowledged", "window skipped"):
+    if outcome["kind"] not in ("sent", "queued", "kept", "acknowledged", "window skipped"):
         raise ValueError(f"{recipient}: handoff notice is unconfirmed: {outcome}")
 
 
