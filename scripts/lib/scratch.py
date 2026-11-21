@@ -56,7 +56,7 @@ Task end marks the hold ended and keeps the folder.
 The scratch guard hook refuses loose folders in /tmp, ~/rust, and other configured roots.
 The hook is in scripts/hooks/pre-tool-use-scratch-guard.py.
 
-Copies live at <roots.copies>/<pair>/<copy>. Their records also name source and copy commits,
+Legacy copy records also name source and copy commits,
 target mode, seed, borrowed git directory, owner and land target. Open phases and borrowed parents
 stay; an unreadable record, phase state or land target needs repair. Shared .claude-busy locks
 keep a copy while work runs or waits. Removal holds an exclusive lock through deletion.
@@ -91,7 +91,7 @@ from threading import get_ident
 from typing import Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
-from scripts.lib import cargo_output, conf, copy_record, git_files, removal_guard, session_folder, time_limit  # noqa: E402
+from scripts.lib import build_folders, cargo_output, conf, copy_record, git_files, removal_guard, session_folder, time_limit  # noqa: E402
 from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
@@ -227,7 +227,7 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
                   land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "",
                   repository_identity: str = "") -> None:
     scratch_settings = conf.read("scratch")
-    if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
+    if not copy_record.is_legacy_copy_slot(path.resolve()) or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
     def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
@@ -304,6 +304,14 @@ def busy_path(path: Path) -> Path:
 def copy_lock(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[None]:
+    """Hold a numbered copy lease or the busy mark of a legacy copy."""
+    numbered = copy_record.numbered_copy_checkout(path)
+    if isinstance(numbered, Path):
+        with build_folders.numbered_copy_use_lease(numbered) as lease:
+            if isinstance(lease, build_folders.NumberedCopyUseRefused):
+                raise ScratchError(lease.reason)
+            yield
+        return
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     folder = copy_record.copy_folder(path)
@@ -344,6 +352,8 @@ def copy_record_lock(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[None]:
     """Serialize record changes and deletion on the existing directory, without creating a file."""
+    if copy_record.is_numbered_copy_path(path):
+        raise ScratchError(f"{path}: the copy lease owns this record")
     with directory_record_lock(path, wait=True, scratch_settings=scratch_settings):
         yield
 
@@ -539,7 +549,7 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
                   *, removal: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> copy_record.Registered:
-    """The only record-write path: read, change and publish under the directory lock."""
+    """Read, change and publish a legacy task record under the directory lock."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     with copy_record_lock(path, scratch_settings=scratch_settings):
@@ -850,12 +860,13 @@ def new_worker(word: str = "", *,
 def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
-    """Move a loose folder into a scratch root and record its task. A git worktree's link moves
-    with it unrepaired: `git worktree repair` from the new place fixes it when it must work."""
+    """Move a loose folder into a scratch root and record its task."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if source.is_symlink() or not source.is_dir():
         raise ScratchError(f"{source} is no folder")
+    if protected_build_path(source) or os.path.lexists(source / ".git"):
+        raise ScratchError(f"{source}: use worktrees.py make <repo> <unit> <short-name> for editable work")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     path = target(task, word, visible, scratch_settings=scratch_settings)
@@ -952,7 +963,7 @@ def task_of(path: Path, *,
     intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     """Read folder task evidence; plain files have no task record."""
-    if os.path.isfile(path):
+    if os.path.isfile(path) or copy_record.is_numbered_copy_path(path):
         return copy_record.NotRegistered()
     record = copy_record.read_record(path / copy_record.RECORD)
     return pending_removal(path, scratch_settings=scratch_settings, intent=intent) if isinstance(record, copy_record.NotRegistered) else record
@@ -964,29 +975,129 @@ def is_throwaway(path: Path, *, intent: RemovalIntentAccess = RemovalIntentAcces
     return isinstance(record, copy_record.Registered) and record.fields.get("throwaway") is True
 
 
-def pending_copy_paths(base: Path) -> Iterator[Path]:
-    if not base.exists():
+def protected_build_path(path: Path) -> bool:
+    """Keep managed build and source paths outside legacy scratch removal."""
+    try:
+        locations = (path.parent.resolve() / path.name, path.resolve())
+    except (OSError, RuntimeError):
+        return True
+    build = copy_record.build_root()
+    workspace = copy_record.worktree_root()
+    for location in locations:
+        if location.is_relative_to(build):
+            scratch_root = copy_record.root().resolve()
+            if not (scratch_root != build and location.is_relative_to(scratch_root)
+                    or location.is_relative_to(build / "session")):
+                return True
+        if location.is_relative_to(workspace):
+            parts = location.relative_to(workspace).parts
+            if len(parts) < 2 or copy_record.copy_folder(workspace.joinpath(*parts[:2])) is None:
+                return True
+    return False
+
+
+def is_managed_worktree(path: Path) -> bool:
+    """Check for a checkout path in the configured source layout."""
+    root = copy_record.worktree_root()
+    return path.is_relative_to(root) and len(path.relative_to(root).parts) == 3
+
+
+def _raise_copy_scan_error(_path: Path, error: OSError) -> None:
+    raise error
+
+
+def _legacy_copy_entries(folder: Path, *,
+                         unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error) -> Iterator[Path]:
+    """Read a legacy copy folder. Let its caller decide how to handle access errors."""
+    try:
+        yield from folder.iterdir()
+    except FileNotFoundError:
         return
-    for pair in base.iterdir():
-        if pair.is_dir() and not pair.is_symlink():
-            yield from marked_folders(pair.iterdir())
+    except OSError as error:
+        unreadable(folder, error)
 
 
-def copy_paths() -> Iterator[Path]:
+class LegacyPairScan(Enum):
+    CLEANUP = "find legacy copy records"
+    BORROWERS = "find legacy copy records and possible Git borrowers"
+
+
+GIT_BORROWER_ENTRIES = (".git", "HEAD", "objects", "commondir")
+
+
+def _entry_exists(path: Path) -> bool:
+    """Check the entry without following a symbolic link."""
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _legacy_pair_entry(entry: Path, scan: LegacyPairScan) -> bool:
+    try:
+        mode = entry.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(mode):
+        return removal_target(entry) is not None
+    return (_entry_exists(entry / copy_record.RECORD)
+            or scan is LegacyPairScan.BORROWERS
+            and any(_entry_exists(entry / name) for name in GIT_BORROWER_ENTRIES))
+
+
+def legacy_copy_pairs(base: Path, *, scan: LegacyPairScan = LegacyPairScan.CLEANUP,
+                      unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error) -> Iterator[Path]:
+    """Find legacy copy pairs in the shared or dedicated root."""
+    try:
+        if not stat.S_ISDIR(base.lstat().st_mode) or base.resolve().is_relative_to(copy_record.build_root()):
+            return
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        unreadable(base, error)
+        return
+    shared_source_root = base == copy_record.worktree_root()
+    for pair in _legacy_copy_entries(base, unreadable=unreadable):
+        try:
+            if not stat.S_ISDIR(pair.lstat().st_mode):
+                continue
+            if shared_source_root and not any(_legacy_pair_entry(entry, scan)
+                    for entry in _legacy_copy_entries(pair, unreadable=unreadable)):
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            unreadable(pair, error)
+            continue
+        yield pair
+
+
+def pending_copy_paths(base: Path, *,
+                       unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error) -> Iterator[Path]:
+    for pair in legacy_copy_pairs(base, unreadable=unreadable):
+        try:
+            yield from marked_folders(_legacy_copy_entries(pair, unreadable=unreadable))
+        except OSError as error:
+            unreadable(pair, error)
+
+
+def copy_paths(*, scan: LegacyPairScan = LegacyPairScan.CLEANUP) -> Iterator[Path]:
     """Each pair/copy without following links. An unreadable registry fails closed."""
     base = copy_record.copies_root()
-    if not base.exists():
-        return
-    for pair in base.iterdir():
-        if pair.is_dir() and not pair.is_symlink():
-            for path in pair.iterdir():
-                if path.is_dir() and not path.is_symlink():
-                    yield path
+    for pair in legacy_copy_pairs(base, scan=scan):
+        for path in _legacy_copy_entries(pair):
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(mode):
+                yield path
 
 
 def registered_copy_paths() -> Iterator[Path]:
-    """List native copies and adopted copies from the existing holds."""
-    paths = set(copy_paths())
+    """List copies that can have legacy borrow records."""
+    paths = set(copy_paths(scan=LegacyPairScan.BORROWERS))
     for held in holds():
         path = Path(held)
         record = task_of(path)
@@ -994,6 +1105,22 @@ def registered_copy_paths() -> Iterator[Path]:
                 or isinstance(record, copy_record.Registered) and "borrows_from" in record.fields):
             paths.add(path)
     yield from sorted(paths)
+
+
+def numbered_source_lifetime(path: Path) -> Live | Ended | Unknown:
+    """Check whether removing this folder would remove a numbered copy's Git source."""
+    try:
+        root = path.resolve()
+        for record in build_folders.numbered_copy_records():
+            if isinstance(record, build_folders.UnreadableNumberedCopySource):
+                return Unknown(f"{record.path}: cannot check numbered copy source: {record.reason}")
+            copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
+            if any(folder.is_relative_to(root)
+                   for folder in (copy.source, copy.git_directory, copy.common_directory)):
+                return Live(f"borrowed: {copy.path} still uses its Git source")
+    except (OSError, ValueError, RuntimeError) as error:
+        return Unknown(f"cannot read numbered copy sources: {error}")
+    return Ended("no numbered copy uses its Git source")
 
 
 class UnregisteredBorrowCandidate(Enum):
@@ -1016,7 +1143,7 @@ def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
             _ = os.stat(".git", dir_fd=pair_fd, follow_symlinks=False)
         except FileNotFoundError:
             return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
-        for name in (".git", "HEAD", "objects", "commondir"):
+        for name in GIT_BORROWER_ENTRIES:
             try:
                 _ = os.stat(name, dir_fd=candidate_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -1700,6 +1827,19 @@ def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: 
     removal_mark(path).unlink(missing_ok=True)
 
 
+def remove_numbered_folder(path: Path, *, dry_run: bool) -> RemovedCopy | KeptFolder:
+    """Keep a numbered checkout for manual review."""
+    _ = dry_run
+    copy = build_folders.numbered_copy_record(path)
+    if isinstance(copy, build_folders.UnreadableNumberedCopySource):
+        return KeptFolder(path, copy.reason)
+    if isinstance(copy, build_folders.NoNumberedCopySource) and not os.path.lexists(path):
+        return RemovedCopy()
+    reason = "the numbered copy requires manual review"
+    report_retained_task_folder(path, reason)
+    return KeptFolder(path, reason)
+
+
 def delete_sweep_tree(path: str) -> None:
     """Remove a source owned by the legacy folder audit."""
     if os.path.islink(path) or not os.path.isdir(path):
@@ -1726,6 +1866,17 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     path = path.absolute()
+    numbered = copy_record.numbered_copy_checkout(path)
+    if isinstance(numbered, Path):
+        if isinstance(request, TaskRemoval):
+            return KeptFolder(path, NUMBERED_COPY_HOLD_REFUSAL)
+        if (source_deletion is not SourceDeletion.STANDARD or path.is_symlink()
+                or numbered.resolve() != path.resolve()
+                or isinstance(request, (SelectedCopyRemoval, ExpiredFolderRemoval))):
+            return KeptFolder(path, "the numbered copy owner handles removal")
+        return remove_numbered_folder(numbered, dry_run=dry_run)
+    if protected_build_path(path):
+        return KeptFolder(path, "the build folder owner handles removal")
     scope = BusyMarkScope()
     lock = judgment_lock(path, scope=scope) if dry_run else removal_lock(path)
     with lock as idle:
@@ -1804,6 +1955,11 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             git = git_directory(path)
             if isinstance(git, UnreadableGitDirectory):
                 return KeptFolder(path, git.reason)
+            if (isinstance(git, (GitDirectory, git_files.MissingReferencedGitDirectory))
+                    or descendant_checkouts or (path / "objects").is_dir()):
+                protection = numbered_source_lifetime(path)
+                if not isinstance(protection, Ended):
+                    return KeptFolder(path, protection.why if isinstance(protection, Live) else protection.reason)
             empty_run_worktree = source_deletion is SourceDeletion.RUN and empty_lost_worktree(path, git)
             task_request = TaskRemoval(request.expected.task, request.now) if isinstance(request, SelectedCopyRemoval) else request
             copy = (copy_record.copy_folder(path) == path.resolve()
@@ -1946,11 +2102,12 @@ def remove_marked(path: Path, *, source_deletion: SourceDeletion = SourceDeletio
 
 
 def clear_finished_copy_removals(base: Path, *, skip: Collection[Path] = (),
+    unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[KeptFolder]:
-    """Complete absent sources through the same coordinator used for task cleanup."""
+    """Finish legacy copy removals whose checkout is absent."""
     kept: list[KeptFolder] = []
-    for path in sorted(pending_copy_paths(base)):
+    for path in sorted(pending_copy_paths(base, unreadable=unreadable)):
         if path not in skip and not os.path.lexists(path):
             try:
                 result = remove_folder(path, scratch_settings=scratch_settings)
@@ -2012,12 +2169,17 @@ def locked_holds(*,
         yield holds(scratch_settings=scratch_settings)
 
 
+NUMBERED_COPY_HOLD_REFUSAL = "the numbered copy lease owns its lifetime and does not permit task holds"
+
+
 def hold(path: Path, task: str, reason: str, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
     """Hold an existing folder for `task`; return the task."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    if copy_record.is_numbered_copy_path(path):
+        raise ScratchError(f"{path}: {NUMBERED_COPY_HOLD_REFUSAL}")
     if path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path} is no folder")
     if not reason.strip():
@@ -2535,16 +2697,6 @@ def remove_task_copy_locked(path: Path, task: str, now: float, *, require_task: 
     return remove_task_copy(path, task, now, require_task=require_task, scratch_settings=scratch_settings)
 
 
-def remove_empty_copy_pairs(base: Path) -> None:
-    if base.is_dir():
-        for pair in base.iterdir():
-            if pair.is_dir() and not pair.is_symlink():
-                try:
-                    pair.rmdir()
-                except OSError:
-                    pass
-
-
 def chosen_task(arguments: argparse.Namespace) -> str:
     """The --task given, the until: task of --until, or "" for the default."""
     until = cast(str, arguments.until)
@@ -2586,6 +2738,8 @@ def main(argv: list[str]) -> int:
     try:
         if command in ("cargo-save", "cargo-clean"):
             path = Path(cast(str, arguments.path)).resolve()
+            if protected_build_path(path):
+                raise ScratchError(f"{path}: the build folder owner handles Cargo output")
             saved = save_cargo_outputs(path)
             if command == "cargo-clean":
                 clean_cargo_outputs(path, saved)
