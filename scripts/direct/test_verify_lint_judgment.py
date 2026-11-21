@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import override
 
 from scripts.direct.runner_result import KillEvidence
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_lint_diagnostics_test_support import (
@@ -38,7 +39,7 @@ class FirstJudgmentRepairTests(unittest.TestCase):
             script += '\nHOLD_LINT=$3\nRUN_LAST_ATTEMPT_KILL_EVIDENCE=$4\nfirst_judgment_permits_repair "$1" "$2"\n'
             return subprocess.run(
                 ["bash", "-c", script, "judgment", str(status), str(log), str(hold_lint), kill_evidence.value],
-                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                env=verify_test_environment(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             )
 
     def test_nonlint_status_never_permits_repair(self) -> None:
