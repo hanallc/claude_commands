@@ -1196,7 +1196,7 @@ def verify_call() -> records.VerifyStep:
 
 
 def _landing_repository_key(directory: str) -> wire.LandingRepository:
-    """Follow local origins to a repository with a remote URL.
+    """Follow the first origin URL at each checkout to a remote repository.
 
     Each send that needs a key runs Git once per checkout in the origin chain.
     """
@@ -1215,11 +1215,12 @@ def _landing_repository_key(directory: str) -> wire.LandingRepository:
             if common in seen:
                 break
             seen.add(common)
-            origin = repository.output(["git", "-C", str(root), "config", "--get", "remote.origin.url"],
-                                       str(root), repository.GIT_TIMEOUT_S)
-            if not origin or origin == "\n":
+            origins = repository.output(["git", "-C", str(root), "config", "--get-all", "remote.origin.url"],
+                                        str(root), repository.GIT_TIMEOUT_S)
+            origin = (origins or "").partition("\n")[0]
+            if not origin:
                 break
-            key = repository.remote_identity(origin.removesuffix("\n"), str(root))
+            key = repository.remote_identity(origin, str(root))
             if not Path(key).is_absolute():
                 return wire.LandingRepositoryKey(key)
             borrowed = repository.borrowed_git_dir(str(common))

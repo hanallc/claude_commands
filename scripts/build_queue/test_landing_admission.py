@@ -133,7 +133,7 @@ class LandingAdmissionTests(unittest.TestCase):
             request = client.step_request(["cargo", "test"], str(workdir), owner.owner, owner.since, "", owner.episode)
             with patch.object(repository, "output", wraps=repository.output) as lookup:
                 def check_lookup() -> None:
-                    expected = [call(["git", "-C", str(root), "config", "--get", "remote.origin.url"], str(root), 5)
+                    expected = [call(["git", "-C", str(root), "config", "--get-all", "remote.origin.url"], str(root), 5)
                                 for root in (clone, fixture.root / "source")]
                     self.assertEqual(lookup.call_args_list, expected)
                     _ = fixture.run_pass()
@@ -213,6 +213,17 @@ class LandingAdmissionTests(unittest.TestCase):
             queue_land()
             owner = fixture.request(step="test", need=GIB)
             request = client.step_request(["cargo", "test"], str(clone), owner.owner, owner.since, "", owner.episode)
+            self.assert_landing_wait(fixture, request)
+
+    def test_a_test_waits_when_the_first_of_two_origin_urls_is_landing(self) -> None:
+        with AdmissionFixture(skip_idle_spacing=True) as fixture:
+            git("init", "-q", str(fixture.root))
+            git("-C", str(fixture.root), "remote", "add", "origin", REPOSITORY.key)
+            git("-C", str(fixture.root), "remote", "set-url", "--add", "origin", "https://example.invalid/other")
+            queue_land()
+            owner = fixture.request(step="test", need=GIB)
+            request = client.step_request(["cargo", "test"], str(fixture.root), owner.owner,
+                                          owner.since, "", owner.episode)
             self.assert_landing_wait(fixture, request)
 
     def test_first_step_resends_a_placement_with_the_new_landing_key(self) -> None:
