@@ -49,6 +49,8 @@ LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/assign_gate.py"
+
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
 EARLY_REVIEW_PASS_ID=""
@@ -68,43 +70,22 @@ while [[ "${1:-}" == --* ]]; do
   shift 2
 done
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
-# Resolve the run's owner before this launcher creates any artifacts.
+# Resolve the owner before this launcher writes artifacts.
 "${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${SESSION_DIR}" <<'PYOWNER'
-import json
 import sys
 from pathlib import Path
 
 with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 
-from scripts.agents import remote
-from scripts.lib import unit_runs
+from scripts.direct import progress_history, recorder_state
 from scripts.production import staff
 
-run = Path(sys.argv[2]).resolve()
 try:
-    record = staff.initial_snapshot()
-    try:
-        fields = json.loads((run / unit_runs.STATE_FILE).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        fields = {}
-    if not isinstance(fields, dict):
-        raise ValueError(f"{run}: invalid recorder state")
-    owner = unit_runs.run_owner(fields, record)
-    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
-        owners = [row for row in record.rows if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == run]
-        if len(owners) > 1:
-            raise ValueError(f"{run}: more than one member owns the run")
-        owner = owners[0] if owners else record.owner_of(staff.runtime_id())
-    if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-        if owner.doc.machine != remote.local_machine():
-            raise ValueError(f"{owner.name}: the staff document is on {owner.doc.machine}")
-        if staff.declares_merge_checkout(owner.doc.path.read_text(encoding="utf-8").splitlines()):
-            raise SystemExit("review.sh: enrolled showrunners must use assign.sh --role review --style-since.")
-except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused) as error:
-    raise SystemExit(f"review.sh: cannot verify the run owner: {error}. Use assign.sh --role review --style-since.") from error
+    progress_history.require_ordinary_review_run(Path(sys.argv[2]))
+except (OSError, ValueError, recorder_state.OldRecorderState, staff.StaffUnreadable, staff.StaffRefused) as error:
+    raise SystemExit(f"review.sh: {error}. Use assign.sh --role review --style-since.") from error
 PYOWNER
-"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/assign_gate.py"
 
 # A named phase keeps its review files in its own directory, so two phases reviewing at once
 # never write the same pass's findings, status or log. Run-wide files stay in the session.

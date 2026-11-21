@@ -17,7 +17,7 @@ from scripts.agents import remote
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
-from scripts.production import staff, worker_admission  # noqa: E402
+from scripts.production import staff, worker, worker_admission  # noqa: E402
 from scripts.production.production_doc import EnrolledPaths
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production import test_worker as worker_tests
@@ -392,7 +392,8 @@ class AstraReviewTests(StaffTestCase):
 
     def test_staff_review_uses_its_staff_target_and_saves_the_report(self) -> None:
         ordinary_owner = self.fixture.fixture.parent
-        for scenario in ("unit", "enrolled", "final save interrupted", "release interrupted"):
+        for scenario in ("unit", "enrolled", "final save interrupted", "release interrupted",
+                         "second pass without completion", "stopped cleanup interrupted"):
             with self.subTest(scenario=scenario), contextlib.ExitStack() as context:
                 owner = ordinary_owner
                 reviewed_run = self.root / "runs" / scenario.replace(" ", "-")
@@ -446,7 +447,33 @@ class AstraReviewTests(StaffTestCase):
                         raise InterruptedError("final record interrupted")
                     save(directory, instance, saved)
 
+                def interrupt_stopped_cleanup(directory: Path, instance: str,
+                                              saved: progress_history.HookCompletion) -> None:
+                    save(directory, instance, saved)
+                    if saved.pane_closed and not saved.role_released:
+                        raise InterruptedError("stopped cleanup interrupted")
+
                 with patch.dict(os.environ, self.environment):
+                    if scenario in ("second pass without completion", "stopped cleanup interrupted"):
+                        second_name = staff.WorkerName.parse("second-review")
+                        second_reply = run / "second-review.md"
+                        prompt = run / "second-prompt.md"
+                        _ = prompt.write_text("Review the second document.\n")
+                        self.assertEqual(worker.dispatch(owner.id, second_name, "review", prompt, session_dir=run,
+                            slot=second_name.value, phase="astra-review", kind="review", launcher_command=["review"],
+                            reply=second_reply, completion_actions=progress_history.CompletionActions(finish_run=True)),
+                            worker.DispatchSubmission.SUBMITTED)
+                        second_pane = self.fixture.agent.submitted[-1][0]
+                        second = self.fixture.agent.row(second_pane)
+                        second_pass = worker_panes.worker_pass(second, run)
+                        second_id = str(second_pass["instance_id"])
+                        if scenario == "second pass without completion":
+                            progress_history.complete_dispatch(run, second_name.value, second_id, status="error")
+                            self.assertIsInstance(progress_history.hook_completion(
+                                progress_history.pass_for_finalization(run, second_id)), progress_history.NoHookCompletion)
+                        else:
+                            self.assertTrue(self.world.stop(second, self.world))
+                            self.assertEqual(progress_history.cancel_worker_passes(run, second.id), 1)
                     if scenario == "final save interrupted":
                         with (patch.object(progress_history, "save_hook_completion", side_effect=interrupt_final_save),
                               self.assertRaisesRegex(InterruptedError, "final record interrupted")):
@@ -469,6 +496,31 @@ class AstraReviewTests(StaffTestCase):
                         self.assertEqual(current.run, staff.OpenRun(run))
                     expected = turn_end.TurnOutcome.IGNORED if scenario == "release interrupted" else turn_end.TurnOutcome.DONE
                     self.assertEqual(self.fixture.finish(row.name), expected)
+                    if scenario in ("second pass without completion", "stopped cleanup interrupted"):
+                        repeated = invoke_recorder(["finish-run", "--session-dir", str(run), "--status", "completed"],
+                                                   self.environment, self.root)
+                        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                        current = staff.by_id(owner.id)
+                        assert current is not None
+                        self.assertEqual(current.run, staff.OpenRun(run))
+                        if scenario == "second pass without completion":
+                            self.fixture.agent.complete(second_pane)
+                            self.assertEqual(self.fixture.finish(second.name), turn_end.TurnOutcome.DONE)
+                        else:
+                            with (patch.object(progress_history, "save_hook_completion", side_effect=interrupt_stopped_cleanup),
+                                  self.assertRaisesRegex(InterruptedError, "stopped cleanup interrupted")):
+                                _ = self.fixture.finish(second.name, turn_end.EventKind.RUN_FINISHED)
+                            stopped = progress_history.hook_completion(progress_history.pass_for_finalization(run, second_id))
+                            assert isinstance(stopped, progress_history.HookCompletion)
+                            self.assertTrue(stopped.pane_closed)
+                            self.assertFalse(stopped.finished)
+                            self.assertEqual(staff.by_id(owner.id), current)
+                            self.assertEqual(self.fixture.finish(second.name, turn_end.EventKind.RUN_FINISHED),
+                                             turn_end.TurnOutcome.STOPPED)
+                            stopped = progress_history.hook_completion(progress_history.pass_for_finalization(run, second_id))
+                            assert isinstance(stopped, progress_history.HookCompletion)
+                            self.assertTrue(stopped.finished and stopped.role_released and stopped.recording_done)
+                            self.assertEqual(stopped.stopped_reply, progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE)
                 if scenario != "unit":
                     self.assertTrue(completion().recording_done)
                     self.assertTrue(completion().finished)
@@ -477,8 +529,8 @@ class AstraReviewTests(StaffTestCase):
                     self.assertIsInstance(current.run, staff.NoRun)
                 saved_report = self.run_script("--read", str(review), "--run-directory", str(run))
                 self.assertEqual(saved_report.returncode, 0, saved_report.stderr)
-                self.assertEqual(review.read_text().strip(), self.fixture.agent.replies[-1])
-                self.assertIn(self.fixture.agent.replies[-1], saved_report.stdout)
+                self.assertEqual(review.read_text().strip(), self.fixture.agent.last_replies[str(row.current_session)])
+                self.assertIn(self.fixture.agent.last_replies[str(row.current_session)], saved_report.stdout)
                 self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
 
     def test_read_delivers_late_done_after_launcher_error_before_the_notice_stamp(self) -> None:

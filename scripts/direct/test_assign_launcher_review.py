@@ -148,6 +148,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     write_text_atomic(enrolled_paths.live_doc, f"# Production\n- **Merge checkout:** `{project}`\n")
                     owner = fixture_member("showrunner", name="style-showrunner",
                                            doc=staff.LiveDoc(remote.local_machine(), enrolled_paths.live_doc))
+                    unit = case.fixture.parent
+                    _ = staff.clear_run(unit.id, case.run_dir)
                     owner = staff.set_run(owner.id, staff.OpenRun(case.run_dir))
                     case.fixture.parent_id = owner.id
                     self.panes.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
@@ -157,13 +159,27 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     write_text_atomic(state_path, json.dumps(state))
                     _ = self.enterContext(patch.object(worker_panes, "resolve_production_paths", return_value=enrolled_paths))
                     environment["CODEX_THREAD_ID"] = owner.current_session
-                    artifacts = set(case.run_dir.rglob("*"))
-                    refused = subprocess.run(["bash", str(ROOT / "scripts/direct/review.sh"), "--phase", "F018",
-                                              "--style-since", baseline, str(case.run_dir), str(project), str(case.prompt)],
-                                             capture_output=True, text=True, env=environment, check=False)
-                    self.assertNotEqual(refused.returncode, 0)
-                    self.assertIn("assign.sh --role review --style-since", refused.stderr)
-                    self.assertEqual(set(case.run_dir.rglob("*")), artifacts)
+                    path_bin = self.panes.root / "fixture-admission"
+                    path_bin.mkdir()
+                    ps = path_bin / "ps"
+                    write_text_atomic(ps, f"#!/bin/sh\nprintf '%s\\n' '1 python3 {ROOT}/scripts/direct/assign.py'\n")
+                    ps.chmod(0o755)
+                    invocation = ["bash", str(ROOT / "scripts/direct/review.sh"), "--phase", "F018",
+                                  "--style-since", baseline, str(case.run_dir), str(project), str(case.prompt)]
+                    admitted = {**environment, "PATH": f"{path_bin}:{environment['PATH']}"}
+                    for saved_owner, reason in ((owner.id, "enrolled showrunners"),
+                                                (unit.id, "conflicts with the run pointer")):
+                        with self.subTest(saved_owner=saved_owner):
+                            write_text_atomic(state_path, json.dumps({**state, unit_runs.OWNER_FIELD: saved_owner}))
+                            artifacts = {path: path.read_bytes() for path in case.run_dir.rglob("*") if path.is_file()}
+                            paths_before = set(case.run_dir.rglob("*"))
+                            refused = subprocess.run(invocation, capture_output=True, text=True, env=admitted, check=False)
+                            self.assertNotEqual(refused.returncode, 0)
+                            self.assertIn(reason, refused.stderr)
+                            self.assertIn("assign.sh --role review --style-since", refused.stderr)
+                            self.assertEqual(set(case.run_dir.rglob("*")), paths_before)
+                            self.assertEqual({path: path.read_bytes() for path in artifacts}, artifacts)
+                    write_text_atomic(state_path, json.dumps(state))
                 case.agent.final = ("<!-- phase-style-review:start -->\nStyle review: Pass\n"
                                     "<!-- phase-style-review:end -->\nAPPROVE")
                 arguments = ["--role", "review", "--to", name, "--lens", lens, "--pass", "1",

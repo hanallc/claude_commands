@@ -976,7 +976,9 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
     completion = progress_history.hook_completion(passed)
     active = status == "active" and bool(delivery.line)
     finished = isinstance(completion, progress_history.HookCompletion) and completion.finished
-    if active or (delivery.line and delivery.completion_id and not finished):
+    reply_ended = (isinstance(completion, progress_history.HookCompletion) and completion.outcome == "stopped"
+                   and completion.stopped_reply is progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE)
+    if active or (delivery.line and delivery.completion_id and not (finished or reply_ended)):
         evidence = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
         reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
         started_at = _pass_started_at(passed)
@@ -1045,9 +1047,11 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     elif state is ReleasedWorkerPass.ENDED:
         passed = worker_pass(worker.row, directory)
         hook = progress_history.hook_completion(passed)
-        if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
-                and isinstance(worker, OpenWorker) and not worker.status.idle):
-            return Kept(f"agent state is {worker.status.value}")
+        if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped":
+            if isinstance(worker, OpenWorker) and not worker.status.idle:
+                return Kept(f"agent state is {worker.status.value}")
+            if hook.stopped_reply is progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE:
+                return CloseAllowed()
         delivery = progress_history.dispatch_delivery(passed)
         if delivery.line:
             completion = recorded_completion_close(worker.row, directory, passed)

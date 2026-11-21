@@ -388,7 +388,7 @@ def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
 
 
 def finish_herdr_recording(run: Path, actions: progress_history.CompletionActions, *,
-                           completed: bool) -> CompletionApplied | CompletionFailed:
+                           status: Literal["completed", "stopped", "error"]) -> CompletionApplied | CompletionFailed:
     """Record the phase and run ends after the hook completes the pass."""
     commands = [["finish-phase", "--phase-id", actions.finish_phase]] if actions.finish_phase else []
     if actions.finish_run:
@@ -397,7 +397,7 @@ def finish_herdr_recording(run: Path, actions: progress_history.CompletionAction
     for arguments in commands:
         try:
             result = call([PYTHON, PROGRESS, *arguments, "--session-dir", str(run),
-                           "--status", "completed" if completed and not failures else "error"],
+                           "--status", "error" if failures and status == "completed" else status],
                           dict(os.environ), capture=True, check=False)
             if result.returncode:
                 failures.append(failure_detail(result))
