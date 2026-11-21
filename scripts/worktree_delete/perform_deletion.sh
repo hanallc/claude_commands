@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Removes a worktree and deletes its branch, locally and on origin.
+# Report a worktree and its build output for manual removal.
 # Usage: perform_deletion.sh <worktree_path> <branch_name>
-# Returns: Status of removal and branch deletion
 #
-# Cleanup deletion requires all work to satisfy the landing checks.
-# Other deletion requires the confirmation nonce from record_confirmation.sh.
+# Require the landing checks or a nonce from record_confirmation.sh.
 
 set -euo pipefail
 
