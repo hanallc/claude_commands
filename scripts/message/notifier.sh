@@ -535,6 +535,9 @@ cmd_tick() {
   for name in "${deferred_runs[@]}"; do
     run_due "$name"
   done
+  if [[ -z ${NOTIFIER_STATE_DIR:-} ]]; then
+    launch_job "unit-run-end-recovery" "$PY" "${SCRIPT:h:h}/direct/progress_history.py" recover-run-ends
+  fi
   # After the unlock, so a slow check never holds the scheduled messages back.
   local repeat_state=${NOTIFIER_REPEAT_STATE:-}
   if [[ -z $repeat_state && -z ${NOTIFIER_STATE_DIR:-} ]]; then

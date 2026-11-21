@@ -43,6 +43,7 @@ LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
 OWNER_FIELD = "owner_staff_id"
+PRIVATE_HELPER_SLOT = "private_helper_slot"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
 # UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.
@@ -76,6 +77,39 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
     return RunOwnerUnrecorded("run has no unit staff owner")
+
+
+def read_run_fields(folder: Path) -> dict[str, object]:
+    """Read the exact run record. A missing record has no run state."""
+    try:
+        value = cast(object, json.loads((folder / STATE_FILE).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{folder}: invalid recorder state")
+    return cast(dict[str, object], value)
+
+
+def terminal_run(fields: Mapping[str, object]) -> bool:
+    return fields.get("status") in ("completed", "stopped", "error") and isinstance(fields.get("finished_at"), (float, int))
+
+
+def points_to_run(row: staff.StaffRow, run: Path) -> bool:
+    from scripts.production import staff
+
+    return isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == run.resolve()
+
+
+@dataclass(frozen=True)
+class RunExecutionBlocker:
+    reason: str
+
+
+class NoRunExecutionBlocker(Enum):
+    IDLE = "no execution blocks run end"
+
+
+type RunExecutionState = RunExecutionBlocker | NoRunExecutionBlocker
 
 
 def environ(name: str) -> str:

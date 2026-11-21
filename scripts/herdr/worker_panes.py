@@ -84,8 +84,14 @@ def review_role_refusal(owner: staff.StaffRow, role: WorkerRole | WorkerRoleUnav
 
 def review_run_refusal(owner: staff.StaffRow, run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
     root = run.absolute()
-    if (not isinstance(owner.run, staff.OpenRun) or root != owner.run.path.absolute()
-            or ".." in root.parts or root.resolve() != root or not root.is_dir()):
+    if not isinstance(owner.run, staff.OpenRun) or root != owner.run.path.absolute():
+        return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
+    return review_artifact_refusal(root, paths, *artifacts)
+
+
+def review_artifact_refusal(run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
+    root = run.absolute()
+    if ".." in root.parts or root.resolve() != root or not root.is_dir():
         return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
     if any(root.is_relative_to(tree) or tree.is_relative_to(root) for tree in (paths.main, paths.integration)):
         return AdmissionRefused("the showrunner run directory overlaps a checkout")
@@ -610,6 +616,36 @@ def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
     return _evidence(parent, record, _client()).states
 
 
+def run_execution_blocker(run: Path, record: staff.StaffSnapshot, owner: StaffId,
+                          identities: frozenset[StaffId]) -> unit_runs.RunExecutionState:
+    """Check execution and launch locks without using reply evidence."""
+    for path in _worker_lock_path("").parent.glob(f"{owner}-*.lock"):
+        try:
+            with path.open("r") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return unit_runs.RunExecutionBlocker(f"{path.stem}: a worker operation is in progress")
+        except FileNotFoundError:
+            continue
+    for identity in sorted(identities):
+        row = record.by_id(identity)
+        if row is None or row.kind != "worker":
+            continue
+        parent = record.parent_of(row)
+        if parent is None:
+            return unit_runs.RunExecutionBlocker(f"{row.name}: the worker owner is unavailable")
+        if worker_run(row, record=record).resolve() != run.resolve():
+            continue
+        state = observe_worker(parent.id, row, record)
+        if isinstance(state, (ClosedWorker, StoppedWorker)):
+            continue
+        if not isinstance(state, OpenWorker) or not state.status.idle:
+            return unit_runs.RunExecutionBlocker(f"{row.name}: the worker can still be running")
+        if isinstance(locked := check_worker_lock(row), Kept):
+            return unit_runs.RunExecutionBlocker(f"{row.name}: {locked.blocker}")
+    return unit_runs.NoRunExecutionBlocker.IDLE
+
+
 def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot, *,
                     selection: SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> dict[StaffId, list[WorkerPane]]:
     """Judge the selected workers of these parents from one pane read."""
@@ -867,10 +903,15 @@ class CompletedWorkerPass:
     dispatch_id: str
 
 
+class StoppedPassCleanup(Enum):
+    COMPLETE = "no stop cleanup needs a retry"
+    RETRY = "retry the stop cleanup"
+
+
 @dataclass(frozen=True)
 class StoppedRunPassCompletion:
     outcome: str
-    send_notice: Callable[[], object]
+    send_notice: Callable[[], StoppedPassCleanup]
 
 
 class NoOwningPanePass(Enum):
@@ -1394,6 +1435,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, held.blocker)
             if not held.active or held.parent != parent or held.name != name:
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
+            if unit_runs.terminal_run(unit_runs.read_run_fields(run)):
+                return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths, keep_model=keep_model)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):

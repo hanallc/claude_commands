@@ -562,10 +562,16 @@ def save_reply(path: Path, reply: str) -> None:
     _write_ordinary_artifact(path, (reply.rstrip() + "\n").encode())
 
 
+class ReviewRunAccess(Enum):
+    RECORDED = "the record fixes the owner"
+    INITIALIZING = "initialize the current run"
+
+
 @dataclass(frozen=True)
 class CompletionArtifacts:
     owner: staff.StaffRow
     run: Path
+    access: ReviewRunAccess = ReviewRunAccess.RECORDED
 
     @cached_property
     def policy(self) -> EnrolledPaths | worker_panes.OrdinaryWorkerOwner:
@@ -582,8 +588,10 @@ class CompletionArtifacts:
     def authorized_path(self, path: Path) -> Path:
         policy = self.policy
         if isinstance(policy, EnrolledPaths):
-            if refusal := worker_panes.review_run_refusal(self.owner, self.run, policy, path):
+            if refusal := worker_panes.review_artifact_refusal(self.run, policy, path):
                 raise OSError(refusal.reason)
+            with self._directory(self.run):
+                pass
             return path.absolute()
         return path
 
@@ -600,7 +608,7 @@ class CompletionArtifacts:
             raise OSError(f"{path}: the destination must stay in the recorded run")
         policy = self.policy
         if isinstance(policy, EnrolledPaths):
-            if refusal := worker_panes.review_run_refusal(self.owner, root, policy):
+            if refusal := worker_panes.review_artifact_refusal(root, policy):
                 raise OSError(refusal.reason)
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         with ExitStack() as descriptors:
@@ -609,6 +617,8 @@ class CompletionArtifacts:
             for folder in root.parts[1:]:
                 parent = os.open(folder, flags, dir_fd=parent)
                 _ = descriptors.callback(os.close, parent)
+            if isinstance(policy, EnrolledPaths):
+                self._require_saved_run_owner(parent, policy)
             for folder in path.relative_to(root).parts:
                 if create:
                     with suppress(FileExistsError):
@@ -616,6 +626,23 @@ class CompletionArtifacts:
                 parent = os.open(folder, flags, dir_fd=parent)
                 _ = descriptors.callback(os.close, parent)
             yield parent
+
+    def _require_saved_run_owner(self, directory: int, policy: EnrolledPaths) -> None:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd = os.open(unit_runs.STATE_FILE, flags, dir_fd=directory)
+        except FileNotFoundError:
+            if self.access is ReviewRunAccess.INITIALIZING:
+                if refusal := worker_panes.review_run_refusal(self.owner, self.run, policy):
+                    raise OSError(refusal.reason) from None
+                return
+            raise
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError(f"{self.run}: expected a regular run record")
+            fields = cast(object, json.load(stream))
+        if not isinstance(fields, dict) or cast(dict[str, object], fields).get(unit_runs.OWNER_FIELD) != self.owner.id:
+            raise OSError(f"{self.run}: the saved run owner differs from {self.owner.name}")
 
     @contextmanager
     def _parent(self, path: Path, *, create: bool = False) -> Generator[int]:
@@ -713,6 +740,10 @@ class CompletionArtifacts:
             self.write(path, text.rstrip() + "\n")
         else:
             save_reply(path, text)
+
+
+def initializing_review_run_artifacts(owner: staff.StaffRow, run: Path) -> CompletionArtifacts:
+    return CompletionArtifacts(owner, run, ReviewRunAccess.INITIALIZING)
 
 
 @dataclass(frozen=True)
@@ -889,8 +920,12 @@ def _require_review_delivery(owner: staff.StaffRow, row: staff.StaffRow, run: Pa
     delivery = progress_history.dispatch_delivery(passed)
     artifacts = tuple(Path(value) for value in (passed.get("prompt_file"), delivery.reply_file, delivery.early_ready)
                       if isinstance(value, str) and value)
-    _ = _require_review_order(owner, worker_panes.dispatch_role(row), run, *artifacts, *_review_artifacts(delivery.actions))
     writer = CompletionArtifacts(owner, run)
+    if writer.protected:
+        if refusal := worker_panes.review_role_refusal(owner, worker_panes.dispatch_role(row)):
+            raise ValueError(refusal.reason)
+        for path in (*artifacts, *_review_artifacts(delivery.actions)):
+            _ = writer.authorized_path(path)
     writer.validate_status(passed)
 
 
@@ -946,6 +981,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(selection, progress_history.ActiveDispatchPromptConflict):
             return _prompt_conflict(selection)
         matched = selection.action
+        if (unit_runs.terminal_run(unit_runs.read_run_fields(session_dir))
+                and not (isinstance(matched, progress_history.MatchedDispatch)
+                         and progress_history.dispatch_completed(session_dir, selection.slot, matched.instance_id))):
+            print(f"{session_dir}: the run has ended dispatch admission", file=sys.stderr)
+            return ExitCode.REFUSED
         completion_notices = _completion_notices()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)

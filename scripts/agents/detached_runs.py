@@ -697,7 +697,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
     try:
         if _cancels_pass(record) and not record.get("delivery"):
             delivery = _complete_stopped_run(path, record)
-            if _worker_result_pending(delivery):
+            if delivery is CompletionReplay.RETRY or _worker_result_pending(delivery):
                 return CompletionReplay.RETRY
         elif _retired_worker_result(record):
             _ = deliver(record, command_result(record))
@@ -710,7 +710,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
     return CompletionReplay.HANDLED
 
 
-def _complete_stopped_run(path: Path, record: RunRecord) -> str:
+def _complete_stopped_run(path: Path, record: RunRecord) -> str | Literal[CompletionReplay.RETRY]:
     """End the proved pane pass or deliver the ordinary stopped result."""
     from scripts.herdr import worker_panes
 
@@ -745,7 +745,8 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str:
         import_module("scripts.herdr.turn_end").stop_pass)
     result = stop_pass(run, record, guard_ended)
     if isinstance(result, worker_panes.StoppedRunPassCompletion):
-        _ = result.send_notice()
+        if result.send_notice() is worker_panes.StoppedPassCleanup.RETRY:
+            return CompletionReplay.RETRY
         return _save_delivery(path, f"finished: the pane pass {result.outcome}")
     if isinstance(result, worker_panes.Kept):
         print(f"detached_runs: {record['run_id']}: kept the pane pass: {result.blocker}", file=sys.stderr)
@@ -976,6 +977,35 @@ def live_runs(runs: Path, worker: str, *, identity: str = "") -> list[RunRecord]
     return evidence.require_readable()
 
 
+def run_execution_blocker(run: Path) -> unit_runs.RunExecutionBlocker | unit_runs.NoRunExecutionBlocker:
+    """Read command execution after dispatch admission ends."""
+    runs = run / DETACHED_RUNS_DIR
+    try:
+        with (runs / ".start.lock").open("r") as admission:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return unit_runs.RunExecutionBlocker("a detached command is starting")
+            return _detached_execution_blocker(runs)
+    except FileNotFoundError:
+        return _detached_execution_blocker(runs)
+
+
+def _detached_execution_blocker(runs: Path) -> unit_runs.RunExecutionBlocker | unit_runs.NoRunExecutionBlocker:
+    for path in _run_record_paths(runs):
+        raw = worker_lifecycle.read_json_object(path)
+        if not raw and not path.exists():
+            continue
+        status = raw.get("status")
+        if status not in ("running", "finished"):
+            return unit_runs.RunExecutionBlocker(f"{path.name}: the detached command state is unavailable")
+        pid = _integer(raw.get("pid"))
+        if ((status == "running" and not _orphaned(path, raw, time.time()))
+                or (raw.get("stop_pass_requested") and not _command_has_ended(raw, pid))):
+            return unit_runs.RunExecutionBlocker(f"detached run {path.stem} can still be running")
+    return unit_runs.NoRunExecutionBlocker.IDLE
+
+
 def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
     """Read live records for fixed staff identities, including renamed members."""
     evidence = live_run_evidence_for_staff(runs, identities)
@@ -1151,6 +1181,9 @@ def command_start(args: argparse.Namespace) -> int:
     try:
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
+            if unit_runs.terminal_run(unit_runs.read_run_fields(Path(session_dir))):
+                print(f"detached_runs: {session_dir}: the run has ended dispatch admission", file=sys.stderr)
+                return 2
             reaped = _reap_orphans_locked(runs)
             if twin := live_twin(runs, name, command, tree_key):
                 started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))

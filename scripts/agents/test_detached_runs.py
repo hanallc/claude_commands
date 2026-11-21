@@ -22,6 +22,7 @@ import time
 import unittest
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
@@ -35,6 +36,7 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs, pane_record, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
+from scripts.astra import astra_roles
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
@@ -2958,9 +2960,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), before)
 
     def test_late_done_after_reassignment_uses_the_stopped_pass_receipt(self) -> None:
-        for status in ("idle", "done"):
-            with self.subTest(status=status):
-                self.check_late_done_after_reassignment(include_reply=True, pane_status=status)
+        for status, shared_role in (("idle", False), ("done", False), ("working", True)):
+            with self.subTest(status=status, shared_role=shared_role):
+                self.check_late_done_after_reassignment(include_reply=True, pane_status=status, shared_role=shared_role)
 
     def test_stop_hook_without_reply_recovers_late_done_after_reassignment(self) -> None:
         self.check_late_done_after_reassignment(include_reply=False)
@@ -2984,7 +2986,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                            replacement_reply: str = "", detached_result: bool = False,
                                            pane_status: str = "idle",
                                            archive_error: Literal["", "directory", "invalid UTF-8"] = "",
-                                           native_hook: bool = False) -> None:
+                                           native_hook: bool = False, shared_role: bool = False) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
         agent.pane_commands(self)
         row = self.fixture.worker("impl", family="codex")
@@ -2992,6 +2994,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
         old_delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        if shared_role:
+            old_delivery = replace(old_delivery, actions=progress_history.CompletionActions(held_role=row.id))
+            progress_history.save_dispatch_delivery(self.run_dir, dispatch, old_delivery)
         agent.append(pane, "user", old_delivery.line)
         path = self.create_stopped_run(row, dispatch)
         with patch.object(detached_runs, "_group_is_live", return_value=False):
@@ -3004,18 +3009,20 @@ class PaneRunDeliveryTests(unittest.TestCase):
         new_reply = reply.with_name("replacement-reply.txt")
         new_line = f"Read the unchanged prompt file {prompt}. End your final reply with DONE {replacement}."
         progress_history.save_dispatch_delivery(self.run_dir, replacement,
-            progress_history.DispatchDelivery(new_line, replacement, str(new_reply)))
+            progress_history.DispatchDelivery(new_line, replacement, str(new_reply), actions=old_delivery.actions))
         agent.append(pane, "user", new_line)
         self.fixture.world.locations[pane]["agent_status"] = pane_status
-        state_path = self.run_dir / unit_runs.STATE_FILE
-        state = state_path.read_bytes()
+        current_pass = worker_panes.worker_pass(row, self.run_dir)
         result = f"The stopped pass has a late reply.\nDONE {dispatch}"
         hook: dict[str, object] = {"hook_event_name": "Stop", "session_id": str(row.current_session)}
         if include_reply:
             hook["last_assistant_message"] = result
         event = turn_end.hook_event(hook)
         late_reply = reply.with_name(f"reply_late_{dispatch}.txt")
-        self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+        with patch.object(astra_roles, "release", wraps=astra_roles.release) as release:
+            self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+        if shared_role:
+            release.assert_not_called()
         self.assertFalse(late_reply.exists())
         agent.append(pane, "assistant", result)
         if detached_result:
@@ -3075,7 +3082,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                      for call in read_receipt.call_args_list))
                 save.assert_called_once_with(late_reply, result)
         self.assertEqual(late_reply.read_text().rstrip(), result)
-        self.assertEqual(state_path.read_bytes(), state)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir), current_pass)
+        retained = progress_history.hook_completion(progress_history.pass_for_finalization(self.run_dir, dispatch))
+        assert isinstance(retained, progress_history.HookCompletion)
+        self.assertTrue(retained.finished)
         self.assertFalse(reply.exists())
         self.assertFalse(new_reply.exists())
         self.assertEqual(len(agent.notices), 1)
@@ -3172,19 +3182,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("phase 40: stopped", agent.notices[0])
 
     def test_supervisor_recovers_a_stopped_pass_when_fresh_delivery_fails(self) -> None:
-        for delivery_exit in (0, 1):
-            with self.subTest(delivery_exit=delivery_exit):
+        for delivery_exit, retry_cleanup in ((0, False), (1, False), (1, True)):
+            with self.subTest(delivery_exit=delivery_exit, retry_cleanup=retry_cleanup):
                 self.notices.clear()
                 row = self.fixture.worker("impl", family="codex")
                 self.fixture.world.add(row, "w1:p1", family="codex")
                 dispatch, _ = self.begin_pane_pass(row)
                 path = self.create_stopped_run(row, dispatch)
+                actual_stop = turn_end.stop_pass
+
+                def stop_with_cleanup_retry(
+                    run: Path, record: detached_runs.RunRecord,
+                    guard: Callable[[], contextlib.AbstractContextManager[worker_panes.CloseAllowed | worker_panes.Kept]],
+                ) -> worker_panes.StoppedRunPassCompletion | worker_panes.Kept | worker_panes.NoOwningPanePass:
+                    completion = actual_stop(run, record, guard)
+                    if not retry_cleanup or not isinstance(completion, worker_panes.StoppedRunPassCompletion):
+                        return completion
+
+                    def send_and_retry() -> worker_panes.StoppedPassCleanup:
+                        _ = completion.send_notice()
+                        return worker_panes.StoppedPassCleanup.RETRY
+
+                    return replace(completion, send_notice=send_and_retry)
+
                 with (patch.object(detached_runs, "_run", return_value=143),
                       patch.object(detached_runs, "scope_prefix", return_value=[]),
                       patch.object(detached_runs, "_group_is_live", return_value=False),
+                      patch.object(turn_end, "stop_pass", side_effect=stop_with_cleanup_retry),
                       patch.object(detached_runs, "deliver_in_fresh_process", return_value=delivery_exit) as deliver):
-                    self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    self.assertEqual(detached_runs.main(["supervise", str(path)]), int(retry_cleanup))
                     deliver.assert_called_once_with(path)
+                if retry_cleanup:
+                    pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                    self.assertTrue(pending.get("completion_pending"))
+                    self.assertFalse(pending.get("delivery"))
+                    self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
                 record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                 self.assertEqual((record["status"], record.get("completion_pending")), ("finished", False))
                 self.assertEqual(record.get("delivery"), "finished: the pane pass stopped")
@@ -3490,7 +3522,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual(passed.get("status"), "interrupted" if phase_first else "canceled")
                 completion = progress_history.hook_completion(passed)
                 if phase_first:
-                    self.assertIs(completion, progress_history.NoHookCompletion.UNRECORDED)
+                    assert isinstance(completion, progress_history.HookCompletion)
+                    self.assertEqual(completion.outcome, "stopped")
+                    self.assertEqual(completion.details, ("The phase ended.",))
                     self.assertEqual(writes, [])
                 else:
                     assert isinstance(completion, progress_history.HookCompletion)

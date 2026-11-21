@@ -231,7 +231,10 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     owner = next((row for row in record.find(kind="showrunner") if isinstance(row.run, staff.OpenRun)
                   and row.run.path.absolute() == run), owner)
     if (owner is not None and owner.kind == "showrunner"
-            and (artifacts := staff_worker.CompletionArtifacts(owner, run)).protected):
+            and (artifacts := staff_worker.initializing_review_run_artifacts(owner, run)).protected):
+        paths = worker_panes.enrolled_worker_owner(owner)
+        if not isinstance(paths, worker_panes.OrdinaryWorkerOwner) and (refusal := worker_panes.review_run_refusal(owner, run, paths)):
+            refuse(refusal.reason)
         _ = artifacts.authorized_path(run)
     else:
         run = run.resolve()
@@ -387,9 +390,14 @@ def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
     return CompletionFailed(failure) if failure else CompletionApplied.APPLIED
 
 
-def finish_herdr_recording(run: Path, actions: progress_history.CompletionActions, *,
+def finish_herdr_recording(run: Path, instance: str, actions: progress_history.CompletionActions, *,
                            status: Literal["completed", "stopped", "error"]) -> CompletionApplied | CompletionFailed:
     """Record the phase and run ends after the hook completes the pass."""
+    if actions.finish_phase == "astra-review" and actions.finish_run:
+        slot = progress_history.pass_for_finalization(run, instance).get("team_slot")
+        private = unit_runs.read_run_fields(run).get(unit_runs.PRIVATE_HELPER_SLOT)
+        if not private or private != slot:
+            return CompletionApplied.APPLIED
     commands = [["finish-phase", "--phase-id", actions.finish_phase]] if actions.finish_phase else []
     if actions.finish_run:
         commands.append(["finish-run"])
@@ -811,7 +819,12 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                       import_module("scripts.herdr.turn_end").repeat_completion_notice)
         repeat(args.new_worker, parent, run, passed)()
         return staff_worker.DispatchSubmission.SUBMITTED
-    for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
+    state = unit_runs.read_run_fields(run)
+    start = ["start-run", "--session-dir", str(run), "--working-dir", str(cwd)]
+    if (not state and run.resolve().parent == unit_runs.ASTRA_RUN_ROOT.resolve()
+            and not any(unit_runs.points_to_run(row, run) for row in staff.initial_snapshot().rows)):
+        start += ["--private-helper", args.new_worker]
+    for arguments in (start,
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
                        "--phase-title", "Astra review"]):
         recorded = subprocess.run([PYTHON, PROGRESS, *arguments], env=env, text=True,
@@ -819,6 +832,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         if recorded.returncode:
             return recorded.returncode
     parent = worker_admission.parent(staff.snapshot(), run=run)
+    private_helper = unit_runs.read_run_fields(run).get(unit_runs.PRIVATE_HELPER_SLOT) == args.new_worker
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
     before = staff_worker.rows_before_launch()
@@ -840,7 +854,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                 session_dir=run, slot=args.new_worker, phase="astra-review", kind="astra",
                 reply=Path(args.reply_file), policy=policy, started=current,
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
-                    finish_phase="astra-review", finish_run=True),
+                    finish_phase="astra-review" if private_helper else "", finish_run=private_helper),
                 launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold, notices=notices)
             if result is staff_worker.DispatchSubmission.SUBMITTED:
                 _ = cleanup.pop_all()
