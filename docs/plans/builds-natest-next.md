@@ -434,7 +434,7 @@ Record the owner and the date with each answer. The answers are `delete`, `keep`
 - `scripts/style/style_reader_parity.py` — keep (cargo-liner, 2026-11-21). cargo-liner `crates/cargo-style/tests/refill_parity.rs` runs it.
 - `scripts/direct/phase_process.py` — keep (phases, 2026-11-21). The measure script of the sdlc-phases plan, run by hand after each step (`docs/plans/sdlc-phases.md:29`).
 - `scripts/production/roles_audit.py` — keep (sdlc, 2026-11-21). `test_roles_audit` runs its check on repository sources; `docs/as-built/roles-and-names.md`.
-- `scripts/whoami/profile_notes_pass.py` — delete (natedev, 2026-11-21). Condition: the deletion reaches main no earlier than 17:45 EST on 2026-11-21 (accounts runs it once more after maccounts).
+- `scripts/whoami/profile_notes_pass.py` — delete (natedev, 2026-11-21). natedev lifted the 17:45 condition at 17:01: the accounts Mac re-profile is finished.
 - `scripts/whoami/worker_usage.py` — keep (sdlc, 2026-11-21). Documented Codex worker measurement in `usage-ledger.md` and `long-lived-workers.md`.
 - `scripts/usage/compaction_replay.py` — delete (sdlc, 2026-11-21). One-time study tool. Remove its `usage-ledger.md` lines in the same commit.
 - `scripts/lint/gate_folders_delete.py` — delete (resources, 2026-11-21). Also remove its name from `scripts/lib/removal_guard.py` and its tests.
@@ -444,7 +444,7 @@ Record the owner and the date with each answer. The answers are `delete`, `keep`
 - `scripts/lint/package_imports.py` — delete (natedev, 2026-11-21). No command, doc or lint message names it.
 - `scripts/statusline/statusline_rows.py` — delete (natest, 2026-11-21). `statusline.sh` calls `assignment.py` directly since 79a64de8e0.
 - `scripts/aws_target/terminal_table.py` — delete (aws, 2026-11-21). Main dropped its only use in 89e5ebf9b7.
-- `scripts/nix_env/heal.py` — delete (natedev, 2026-11-21). No command, doc or nixos module names it.
+- `scripts/nix_env/heal.py` — keep. natedev answered delete, but phase 405 found a live reader: `~/.local/state/notifier/nix-heal/conf:3` calls it every five minutes.
 - `scripts/test_times/coverage_overlap.py` — keep (natest, 2026-11-21). Manual coverage reviews and Phase 392 test isolation use it.
 - `scripts/message/repeats.py` — delete (postmaster, 2026-11-21). Keep `repeat_guard.py` (send.py uses it). Same commit: remove the repeats import and its tests from `test_repeat_guard.py`, and the paragraph at `docs/as-built/message-clarity.md:421`.
 - `scripts/message/install_codex_agents.py` — keep (sdlc, 2026-11-21). devtools ran it on both machines on 2026-11-21 after the macimage merge.
