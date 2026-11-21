@@ -272,7 +272,8 @@ class LandingAdmissionTests(unittest.TestCase):
 
             grant = admitted_reply()
             expired = wait_reply(records.EstimateExpired(1), text="estimate expired")
-            transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(expired), reply_bytes(grant)))
+            transport = ScriptedTransport(fixture.clock,
+                Exchange(reply_bytes(expired), after_send={2: (reply_bytes(grant),)}))
             with (patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
                   patch.object(client, "DefaultSelector", side_effect=transport.selector)):
                 self.assertEqual(client.admit(refresh(), remove_origin, refresh), grant)
@@ -293,7 +294,8 @@ class LandingAdmissionTests(unittest.TestCase):
 
             grant = admitted_reply()
             expired = wait_reply(records.EstimateExpired(1), text="estimate expired")
-            transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(expired), reply_bytes(grant)))
+            transport = ScriptedTransport(fixture.clock,
+                Exchange(reply_bytes(expired), after_send={2: (reply_bytes(grant),)}))
             with (patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
                   patch.object(client, "DefaultSelector", side_effect=transport.selector)):
                 self.assertEqual(client.service_admit(request, restore_origin), grant)
