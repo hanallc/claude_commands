@@ -89,7 +89,7 @@ def _parse_receipt(raw: object, source: Path) -> AdmissionReceipt:
             or not machine or basis not in ("rollout inventory", "guard and document")):
         raise Refusal(f"{source}: invalid admission receipt")
     if "moved_document" not in fields:
-        return AdmissionReceipt(Path(document), machine, cast(AdmissionBasis, basis))
+        return AdmissionReceipt(Path(document), machine, basis)
     moved = fields["moved_document"]
     if basis != "rollout inventory" or not isinstance(moved, str) or not Path(moved).is_absolute():
         raise Refusal(f"{source}: invalid moved document")
