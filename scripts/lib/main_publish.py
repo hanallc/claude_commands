@@ -1,6 +1,7 @@
 """Commit a main-checkout change, push it, and send or queue the Mac pull."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
@@ -14,7 +15,7 @@ from typing import cast
 
 from scripts.lib import land_main, main_push_lock, waiting_rows
 from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
 
 
 class Refusal(Exception):
@@ -42,6 +43,26 @@ class MacCheckoutPull:
     source: Path | MacPullSourceUnrecorded
 
 
+@dataclass(frozen=True)
+class ProductionMacPull:
+    """Install an exact commit published to production main."""
+
+    mac: PurePosixPath
+    source: Path
+    sha: str
+
+
+@dataclass(frozen=True)
+class MacPullAwaitingPublication:
+    """An older production pull needs a publication with a recorded SHA."""
+
+    mac: PurePosixPath
+    source: Path
+
+
+type QueuedMacPull = MacCheckoutPull | ProductionMacPull | MacPullAwaitingPublication
+
+
 DEFAULT_MAC_CHECKOUT = PurePosixPath("~/.claude")
 _LEGACY_MAC_PULL = (MacCheckoutPull(DEFAULT_MAC_CHECKOUT, MacPullSourceUnrecorded()),)
 
@@ -52,7 +73,7 @@ class PendingMacPull:
     text: str
     since: str
     reason: str
-    pulls: tuple[MacCheckoutPull, ...] = _LEGACY_MAC_PULL
+    pulls: tuple[QueuedMacPull, ...] = _LEGACY_MAC_PULL
 
 
 @dataclass(frozen=True)
@@ -240,10 +261,27 @@ def mac_pull_command(mac: PurePosixPath, source: Path) -> str:
             "else git merge -q --ff-only \"$tip\"; fi; printf 'rc=%s\\n' \"$?\"")
 
 
+def production_pull_command(pull: ProductionMacPull) -> str:
+    url = f"natedev:{shlex.quote(str(pull.source))}"
+    sha = shlex.quote(pull.sha)
+    return (f"cd {remote_path(pull.mac)} "
+            f"&& {{ git fetch -q --no-write-fetch-head {url} {sha} "
+            f"|| git fetch -q --no-write-fetch-head {url} main; }} "
+            f"&& if git merge-base --is-ancestor {sha} HEAD; then :; "
+            "elif [ -f scripts/lib/waiting_rows.py ]; then "
+            f"scripts/lib/py scripts/lib/waiting_rows.py fast-forward {sha}; "
+            f"else git merge -q --ff-only {sha}; fi; printf 'rc=%s\\n' \"$?\"")
+
+
 def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_MAC_CHECKOUT,
              time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> MacPulled | MacPullFailed:
     """Return the completed Mac pull or its failure reason."""
-    done = ssh(mac_pull_command(mac, checkout), ssh_program=ssh_program, time_limit=time_limit)
+    return run_mac_pull(mac_pull_command(mac, checkout), ssh_program=ssh_program, time_limit=time_limit)
+
+
+def run_mac_pull(command: str, *, ssh_program: str,
+                 time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> MacPulled | MacPullFailed:
+    done = ssh(command, ssh_program=ssh_program, time_limit=time_limit)
     if isinstance(done, str):
         return MacPullFailed(done)
     match = re.search(r"(?:^|\n)rc=(\d+)", done.stdout)
@@ -258,58 +296,140 @@ def queue_path() -> Path:
     return Path(state) / "mac.json"
 
 
+def queue_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return b""
+
+
 def read_queue() -> PendingMacPull | NoPendingMacPull:
     try:
-        value = cast(object, json.loads(queue_path().read_text(encoding="utf-8")))
-    except (OSError, ValueError):
+        return parse_queue(queue_bytes(queue_path()))
+    except OSError:
+        return NoPendingMacPull()
+
+
+def parse_queue(contents: bytes) -> PendingMacPull | NoPendingMacPull:
+    try:
+        value = cast(object, json.loads(contents))
+    except ValueError:
         return NoPendingMacPull()
     if not isinstance(value, dict):
         return NoPendingMacPull()
     fields = cast(dict[str, object], value)
     if not all(isinstance(fields.get(key), str) for key in ("zone", "text", "since", "reason")):
         return NoPendingMacPull()
-    pulls: list[MacCheckoutPull] = []
-    for value in cast(list[object], fields.get("pulls", [{"mac": str(DEFAULT_MAC_CHECKOUT), "source": ""}])):
-        row = cast(dict[str, object], value)
-        source = str(row["source"])
-        pulls.append(MacCheckoutPull(PurePosixPath(str(row["mac"])), Path(source) if source else MacPullSourceUnrecorded()))
-    return PendingMacPull(cast(str, fields["zone"]), cast(str, fields["text"]),
+    label = cast(str, fields["zone"])
+    rows = fields.get("pulls", [{"mac": str(DEFAULT_MAC_CHECKOUT), "source": ""}])
+    if not isinstance(rows, list):
+        return NoPendingMacPull()
+    pulls: list[QueuedMacPull] = []
+    for raw in cast(list[object], rows):
+        if not isinstance(raw, dict):
+            return NoPendingMacPull()
+        row = cast(dict[str, object], raw)
+        mac, source = row.get("mac"), row.get("source")
+        if not isinstance(mac, str) or not mac or not isinstance(source, str):
+            return NoPendingMacPull()
+        mac_path = PurePosixPath(mac)
+        if "sha" in row:
+            sha = row["sha"]
+            if not source or not isinstance(sha, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+                return NoPendingMacPull()
+            pulls.append(ProductionMacPull(mac_path, Path(source), sha))
+        elif source and (row.get("kind") == "production" or (
+                "kind" not in row and (label.startswith("mac ") or mac_path != DEFAULT_MAC_CHECKOUT))):
+            pulls.append(MacPullAwaitingPublication(mac_path, Path(source)))
+        else:
+            pulls.append(MacCheckoutPull(mac_path, Path(source) if source else MacPullSourceUnrecorded()))
+    return PendingMacPull(label, cast(str, fields["text"]),
                           cast(str, fields["since"]), cast(str, fields["reason"]), tuple(pulls))
 
 
-def queue(change: PendingMacPull) -> None:
-    """Coalesce pulls while retaining an earlier zone notice that still needs delivery."""
-    previous = read_queue()
-    if isinstance(previous, PendingMacPull):
-        pulls = {pull.mac: pull for pull in previous.pulls}
-        pulls.update((pull.mac, pull) for pull in change.pulls)
-        change = replace(change, pulls=tuple(pulls.values()))
-        if not change.text and previous.text:
-            change = replace(change, label=previous.label, text=previous.text, since=previous.since)
-    _write_queue(change)
+def pull_fields(pull: QueuedMacPull) -> dict[str, str]:
+    fields = {"mac": str(pull.mac), "source": str(pull.source) if isinstance(pull.source, Path) else "",
+              "kind": "settings" if isinstance(pull, MacCheckoutPull) else "production"}
+    if isinstance(pull, ProductionMacPull):
+        fields["sha"] = pull.sha
+    return fields
 
 
-def _write_queue(change: PendingMacPull) -> None:
+def update_queue(change: Callable[[PendingMacPull | NoPendingMacPull], PendingMacPull | NoPendingMacPull]) -> None:
     path = queue_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps(dict(zone=change.label, text=change.text,
-                                           since=change.since, reason=change.reason,
-                                           pulls=[dict(mac=str(pull.mac), source=str(pull.source) if isinstance(pull.source, Path) else "")
-                                                  for pull in change.pulls]), indent=2) + "\n")
+    for _ in range(3):
+        before = queue_bytes(path)
+        previous = parse_queue(before)
+        pending = change(previous)
+        if pending == previous:
+            return
+        if isinstance(pending, PendingMacPull) and (pending.pulls or pending.text):
+            contents = json.dumps(dict(zone=pending.label, text=pending.text, since=pending.since,
+                                       reason=pending.reason, pulls=[pull_fields(pull) for pull in pending.pulls]), indent=2)
+            with prepared_replacement(path, contents + "\n", mode=0o600) as prepared:
+                if queue_bytes(path) == before:
+                    _ = prepared.replace(path)
+                    sync_folder(path.parent)
+                    return
+        elif queue_bytes(path) == before:
+            path.unlink(missing_ok=True)
+            return
+    raise Refusal(f"{path} changed during the Mac queue update")
 
 
-def queue_pull_only(label: str, reason: str, *, pulls: tuple[MacCheckoutPull, ...] = _LEGACY_MAC_PULL) -> None:
+def queue(change: PendingMacPull) -> None:
+    """Keep the newest pull for each purpose and retain the waiting zone notice."""
+    def key(pull: QueuedMacPull) -> tuple[PurePosixPath, bool]:
+        return pull.mac, isinstance(pull, MacCheckoutPull)
+
+    def merge(previous: PendingMacPull | NoPendingMacPull) -> PendingMacPull:
+        if isinstance(previous, NoPendingMacPull):
+            return change
+        pulls = {key(pull): pull for pull in previous.pulls}
+        pulls.update((key(pull), pull) for pull in change.pulls)
+        if not change.text and previous.text:
+            return replace(previous, reason=change.reason, pulls=tuple(pulls.values()))
+        return replace(change, pulls=tuple(pulls.values()))
+
+    update_queue(merge)
+
+
+def queue_pull_only(label: str, reason: str, *, pulls: tuple[QueuedMacPull, ...] = _LEGACY_MAC_PULL) -> None:
     """Queue a pull and retain any waiting zone notice."""
     queue(PendingMacPull(label, "", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason, pulls))
 
 
+def clear_mac_pull(pull: QueuedMacPull) -> None:
+    """Clear the completed pull if it is still queued."""
+    def clear(pending: PendingMacPull | NoPendingMacPull) -> PendingMacPull | NoPendingMacPull:
+        if isinstance(pending, NoPendingMacPull):
+            return pending
+        def completed(queued: QueuedMacPull) -> bool:
+            return queued == pull or (isinstance(pull, ProductionMacPull) and isinstance(queued, MacPullAwaitingPublication)
+                                      and queued.mac == pull.mac and queued.source == pull.source)
+
+        return replace(pending, pulls=tuple(queued for queued in pending.pulls if not completed(queued)))
+
+    update_queue(clear)
+
+
 def clear_pull_only(mac: PurePosixPath = DEFAULT_MAC_CHECKOUT, *, notice_delivered: bool = False) -> None:
-    """Clear a completed pull and retain any waiting zone notice."""
-    pending = read_queue()
-    if isinstance(pending, PendingMacPull):
-        pending = replace(pending, pulls=tuple(pull for pull in pending.pulls if pull.mac != mac),
-                          text="" if notice_delivered else pending.text)
-        if pending.pulls or pending.text:
-            _write_queue(pending)
-        else:
-            queue_path().unlink(missing_ok=True)
+    """Clear the settings pull and retain any waiting production pull."""
+    def clear(pending: PendingMacPull | NoPendingMacPull) -> PendingMacPull | NoPendingMacPull:
+        if isinstance(pending, NoPendingMacPull):
+            return pending
+        pulls = tuple(pull for pull in pending.pulls if not isinstance(pull, MacCheckoutPull) or pull.mac != mac)
+        return replace(pending, pulls=pulls, text="" if notice_delivered else pending.text)
+
+    update_queue(clear)
+
+
+def clear_zone_notice(delivered: PendingMacPull) -> None:
+    """Clear the delivered zone notice if it is still queued."""
+    def clear(pending: PendingMacPull | NoPendingMacPull) -> PendingMacPull | NoPendingMacPull:
+        if (isinstance(pending, PendingMacPull)
+                and (pending.label, pending.text, pending.since) == (delivered.label, delivered.text, delivered.since)):
+            return replace(pending, text="")
+        return pending
+
+    update_queue(clear)

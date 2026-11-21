@@ -17,6 +17,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # PUSH_TARGET_BRANCH (from validate_and_push.sh --to) names the remote branch
 # to push HEAD to; otherwise the current branch is pushed under its own name.
 BRANCH="${PUSH_TARGET_BRANCH:-$(git branch --show-current)}"
+PRODUCTION_INTEGRATION_PUSH="${PRODUCTION_INTEGRATION_PUSH:-}"
+if [ -n "$PRODUCTION_INTEGRATION_PUSH" ]; then
+  BRANCH="${BRANCH#refs/heads/}"
+fi
 DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
 DEFAULT_BRANCH="${DEFAULT_BRANCH#origin/}"
 
@@ -46,6 +50,11 @@ case "${1:-}" in
   *) echo "push_direct.sh: unknown argument: $1" >&2; exit 64 ;;
 esac
 
+if [ -n "$PRODUCTION_INTEGRATION_PUSH" ] && [ "$BRANCH" = main ]; then
+  "${SCRIPT_DIR}/../lib/py" "$PRODUCTION_INTEGRATION_PUSH" --checkout "$PWD" --commit "$SHA" --branch "$BRANCH"
+  exit 1
+fi
+
 publish_branch() {
   if [ -n "${CI_VALIDATED_BASE:-}" ]; then
     git fetch --no-tags origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
@@ -66,7 +75,12 @@ publish_branch() {
     echo "Pushing ${BRANCH} to origin..."
   fi
   PUSH_STATUS=0
-  if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+  if [ -n "$PRODUCTION_INTEGRATION_PUSH" ]; then
+    if [ "$PUSHED" = true ]; then
+      "${SCRIPT_DIR}/../lib/py" "$PRODUCTION_INTEGRATION_PUSH" \
+        --checkout "$PWD" --commit "$SHA" --branch "$BRANCH" || PUSH_STATUS=$?
+    fi
+  elif [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
     "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/land_main.py" \
       --checkout "$PWD" --commit "$SHA" --branch "$BRANCH" || PUSH_STATUS=$?
   elif [ "$PUSHED" = true ]; then
@@ -89,7 +103,7 @@ publish_branch() {
 
 if [ "$FOLLOW_PUBLISHED" = false ]; then
   export -f publish_branch
-  export SHA BRANCH PUSHED SCRIPT_DIR DEFAULT_BRANCH
+  export SHA BRANCH PUSHED SCRIPT_DIR DEFAULT_BRANCH PRODUCTION_INTEGRATION_PUSH
   publish_status=0
   if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
     publication_output="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/main_push_lock.py" \

@@ -703,7 +703,12 @@ def open_production(production: Production, lines: list[str]) -> None:
     if remote.returncode:
         raise LifecycleStop("push", "failed", remote.stderr.strip())
     if not remote.stdout.startswith(tip):
-        _ = checked(production.checkout, "push", "push", "-u", "origin", production.merge_branch)
+        if publication.is_main_branch(production.merge_branch) and isinstance(enrolled, production_doc.LegacyProduction):
+            _ = checked(production.checkout, "push", "push", "-u", "origin", "main")
+        else:
+            push_integration_tip(production, tip, "push")
+            branch = production.merge_branch.removeprefix("refs/heads/")
+            _ = checked(production.checkout, "push", "branch", "--set-upstream-to", f"origin/{branch}", branch)
         report("push", "ok", f"{production.merge_branch} at {tip}")
     else:
         report("push", "ok", f"already at {tip}")
@@ -753,6 +758,13 @@ def ci_steps(production: Production, tip: str, no_ci: bool,
                             + f"{smoke_commit.stdout.strip() or 'no commit'}, merge tip is {tip}")
     report("smoke-launch", "ok", "live smoke verdict passed")
     report("mac-run", "ok", "Mac run is recorded with the CI point")
+
+
+def push_integration_tip(production: Production, tip: str, step: str) -> None:
+    try:
+        publication.push_integration(production.checkout, tip, production.merge_branch)
+    except Stop as error:
+        raise LifecycleStop(step, error.state, error.detail) from error
 
 
 def promote_main(production: Production, lines: list[str], no_ci: bool,
@@ -820,19 +832,23 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
                     detail = f"{destination}: advanced to {result.tip}"
                 report("promote", "ok", detail)
         try:
-            publication.publish(approval, production.checkout, production.merge_branch, tip, publish_destinations)
+            if (publication.is_main_branch(production.merge_branch)
+                    and isinstance(production.merge_checkout, production_doc.LegacyProduction)):
+                published = publication.publish_legacy_main(production.checkout, tip, publish_destinations)
+            else:
+                published = publication.publish(approval, production.checkout, production.merge_branch, tip, publish_destinations)
         except land_main.LandError as error:
             raise LifecycleStop("push", "failed", str(error)) from error
         except Stop as error:
             raise LifecycleStop(error.step, error.state, error.detail) from error
     if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
-        outcome = pull_mac_checkout(promotion.mac.path, source, tip)
+        outcome = pull_mac_checkout(promotion.mac.path, source, published)
         if isinstance(outcome, main_publish.MacPullPending):
             report("promote", "ok", f"mac unreachable, pull pending: {promotion.mac.path}")
         else:
             report("promote", "ok", f"mac {promotion.mac.path} main pulled")
-    return tip
+    return published.sha
 
 
 def close_out_items(lines: list[str]) -> tuple[str, ...]:
@@ -1095,9 +1111,12 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         current = checked(production.checkout, "wrap", "rev-parse", "HEAD")
         if current != tip:
             raise LifecycleStop("wrap", "held", f"integration tip changed from {tip} to {current}")
-        if production.merge_branch != "main":
-            _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/{production.merge_branch}")
-            report("push", "ok", f"{production.merge_branch} pushed")
+        if (publication.is_main_branch(production.merge_branch)
+                and isinstance(production.merge_checkout, production_doc.LegacyProduction)):
+            _ = checked(production.checkout, "push", "push", "origin", "main")
+        else:
+            push_integration_tip(production, tip, "push")
+        report("push", "ok", f"{production.merge_branch} pushed")
         _ = checked(production.checkout, "main", "fetch", "origin", "main")
         commit_count = checked(production.checkout, "main", "rev-list", "--count", f"origin/main..{tip}")
         tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, checked_tip=CommitVerdict(tip))
@@ -1200,7 +1219,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     if remote_tip.returncode:
         raise LifecycleStop("wrap", "failed", remote_tip.stderr.strip())
     if not remote_tip.stdout.startswith(current_tip):
-        _ = checked(production.checkout, "wrap", "push", "origin", production.merge_branch)
+        if (publication.is_main_branch(production.merge_branch)
+                and isinstance(production.merge_checkout, production_doc.LegacyProduction)):
+            _ = checked(production.checkout, "wrap", "push", "origin", "main")
+        else:
+            push_integration_tip(production, current_tip, "wrap")
         report("wrap", "ok", "production doc pushed")
     else:
         report("wrap", "ok", "production doc already pushed")

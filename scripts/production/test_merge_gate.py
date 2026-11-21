@@ -20,7 +20,7 @@ from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
 from scripts.lib.git_test_support import fixture_git_environment
-from scripts.production import change_review, merge_gate, staff
+from scripts.production import change_review, merge_gate, promotion, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
@@ -138,14 +138,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertEqual(restored, [previous])
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
-        checked = merge_gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected stop before push")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration",
+                               side_effect=GateRefused("injected stop before push")):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -163,14 +157,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(self.checkout / "published.txt", "published code\n")
         published = self.commit(self.checkout, "published non-doc change")
         _ = self.git(self.checkout, "push", "origin", "integration")
-        checked = merge_gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected stop before push")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration",
+                               side_effect=GateRefused("injected stop before push")):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -186,14 +174,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
 
     def test_checkpoint_retry_refuses_a_recorded_merge_for_another_checkpoint(self) -> None:
-        checked = merge_gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected push failure")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration",
+                               side_effect=GateRefused("injected push failure")):
             stopped = self.run_gate()
         self.assertIn("injected push failure", stopped.stderr)
         merged = self.git(self.checkout, "rev-parse", "HEAD")

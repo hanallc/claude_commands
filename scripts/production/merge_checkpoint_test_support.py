@@ -68,13 +68,13 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
     promote_request = merge_checkpoint.promote
 
     def promote_after_ci(request: merge_checkpoint.MergeRequest | merge_checkpoint.ChildHandoffRequest,
-                         tip: str, *, local_only: bool = False) -> None:
+                         tip: str, *, local_only: bool = False) -> merge_checkpoint.CheckpointPublication:
         if isinstance(request.promotion, production_doc.PromoteTo):
             production = request.production
             policy = ("cargo-liner" if production.name == CARGO_LINER_PRODUCTION
                       and isinstance(production.merge_checkout, Path) else "standard")
             _ = save_promotion_verdict(Path(environment["SHOWRUNNER_STATE_DIR"]), production.doc, tip, policy)
-        promote_request(request, tip, local_only=local_only)
+        return promote_request(request, tip, local_only=local_only)
 
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,

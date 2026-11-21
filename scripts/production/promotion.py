@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
+
+import argparse
 import re
-import shutil
 import subprocess
-import tempfile
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,22 +56,15 @@ class ApprovedPromotion:
     def land(self, checkout: Path) -> land_main.Landed:
         if git(checkout, "rev-parse", "HEAD") == self.sha:
             return land_main.land(checkout, self.sha)
-        with tempfile.TemporaryDirectory(prefix="promotion-hook-") as folder:
-            exact = Path(folder) / "checkout"
-            _ = git(checkout, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(exact), self.sha)
-            try:
-                hook_path = ".claude/config/post_push.sh"
-                local_hook = checkout / hook_path
-                exact_hook = exact / hook_path
-                if not exact_hook.resolve().is_relative_to(exact.resolve()):
-                    raise land_main.LandError(f"{hook_path} resolves outside the approved checkout")
-                tracked = git(checkout, "ls-files", "--", hook_path)
-                if local_hook.is_file() and not exact_hook.exists() and not tracked:
-                    exact_hook.parent.mkdir(parents=True, exist_ok=True)
-                    _ = shutil.copyfile(local_hook, exact_hook)
-                return land_main.land(exact, self.sha)
-            finally:
-                _ = git(checkout, "worktree", "remove", "--force", str(exact))
+        with land_main.exact_hook_checkout(checkout, self.sha) as exact:
+            return land_main.land(exact, self.sha, retry_source=checkout)
+
+
+@dataclass(frozen=True)
+class PublishedMain:
+    """The approved commit and the result of publication to main."""
+
+    sha: str
 
 
 def git(checkout: Path, *arguments: str) -> str:
@@ -118,15 +116,75 @@ def require_approval(source: Path, branch: str, tip: str, approval: PromotionApp
                                        "collect CI and retry promotion")
 
 
-def publish[Result](approval: PromotionApproval, source: Path, branch: str, tip: str,
-                    destinations: Callable[[ApprovedPromotion], Result]) -> Result:
-    """Give the destinations permission to install and publish the approved commit."""
-    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", tip):
+def is_main_branch(branch: str) -> bool:
+    return branch.removeprefix("refs/heads/") == "main"
+
+
+def integration_push_script(production: production_doc.ProductionDocument) -> str:
+    if is_main_branch(production.merge_branch) and isinstance(production.merge_checkout, production_doc.LegacyProduction):
+        return ""
+    return str(Path(__file__).resolve())
+
+
+def require_exact_commit(source: Path, tip: str) -> None:
+    if (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", tip)
+            or git(source, "rev-parse", "--verify", f"{tip}^{{commit}}") != tip):
         raise checkpoint_gate.Stop("promote", "held", f"expected a full commit SHA, got {tip}",
                                    "specify the exact commit and retry promotion")
+
+
+def push_integration(source: Path, tip: str, branch: str) -> None:
+    """Push the exact commit to a named integration branch."""
+    destination = f"refs/heads/{branch.removeprefix('refs/heads/')}"
+    if is_main_branch(branch):
+        raise checkpoint_gate.Stop("push", "held", f"{destination} is not an integration branch",
+                                   "publish through production promotion")
+    try:
+        require_exact_commit(source, tip)
+        _ = git(source, "check-ref-format", destination)
+        _ = git(source, "push", "origin", f"{tip}:{destination}")
+    except checkpoint_gate.Stop as error:
+        raise checkpoint_gate.Stop("push", error.state, error.detail, "repair the integration push and retry") from error
+
+
+def publish(approval: PromotionApproval, source: Path, branch: str, tip: str,
+                    destinations: Callable[[ApprovedPromotion], None]) -> PublishedMain:
+    """Return the approved SHA after the destinations publish it."""
     with main_push_lock.main_push_lock(source):
-        if git(source, "rev-parse", "--verify", f"{tip}^{{commit}}") != tip:
-            raise checkpoint_gate.Stop("promote", "held", f"{tip} does not identify a commit",
-                                       "specify the exact commit and retry promotion")
+        require_exact_commit(source, tip)
         require_approval(source, branch, tip, approval)
-        return destinations(ApprovedPromotion(tip))
+        destinations(ApprovedPromotion(tip))
+        return PublishedMain(tip)
+
+
+def publish_legacy_main(source: Path, tip: str,
+                                destinations: Callable[[ApprovedPromotion], None]) -> PublishedMain:
+    """Complete publication for the legacy direct-main production."""
+    with main_push_lock.main_push_lock(source):
+        require_exact_commit(source, tip)
+        destinations(ApprovedPromotion(tip))
+        return PublishedMain(tip)
+
+
+class IntegrationPushArguments(argparse.Namespace):
+    checkout: Path = Path()
+    commit: str = ""
+    branch: str = ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=push_integration.__doc__)
+    _ = parser.add_argument("--checkout", type=Path, required=True)
+    _ = parser.add_argument("--commit", required=True)
+    _ = parser.add_argument("--branch", required=True)
+    args = parser.parse_args(namespace=IntegrationPushArguments())
+    try:
+        push_integration(args.checkout, args.commit, args.branch)
+    except checkpoint_gate.Stop as error:
+        print(error.detail, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

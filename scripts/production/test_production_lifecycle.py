@@ -52,6 +52,7 @@ from scripts.production.add_showrunner_test_support import write_guard_proof
 from scripts.lib.atomic_file import prepared_replacement
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 
@@ -919,7 +920,9 @@ class LifecycleTests(LifecycleFixture):
         destination = self.promotion_checkout("installed")
         hook = destination / ".claude/config/post_push.sh"
         self.write(hook, 'test "$(git rev-parse HEAD)" = "$LANDED_SHA" || exit 9\n'
-                   + 'printf "%s\\n" "$LANDED_SHA" >> "$(git rev-parse --git-common-dir)/hook-runs"\n')
+                   + 'common=$(git rev-parse --git-common-dir)\n'
+                   + 'test ! -f "$common/hold-hook" || exit 9\n'
+                   + 'printf "%s\\n" "$LANDED_SHA" >> "$common/hook-runs"\n')
         self.production_doc("running", promote=f"`{destination}`")
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "declare promotion")
@@ -953,24 +956,40 @@ class LifecycleTests(LifecycleFixture):
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
-        with self.subTest(installed="newer integration commit"):
-            earlier = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "Requested promotion")
-            later = self.git("commit-tree", "HEAD^{tree}", "-p", earlier, "-m", "Newer integration commit")
-            _ = self.git("push", "origin", f"{later}:refs/heads/production")
-            _ = self.git("fetch", "origin", "production", cwd=destination)
-            _ = self.git("merge", "--ff-only", later, cwd=destination)
-            promotion = production_doc.PromoteTo((destination,), production_doc.NoMac())
-            with (mock.patch.dict(os.environ, self.env, clear=True), production_paths(self.env),
-                  contextlib.redirect_stdout(io.StringIO()) as output):
-                _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, earlier)
-                merge_checkpoint.promote_targets(promotion, "production", earlier, source=self.checkout,
-                                                 approval=publication.CollectedCi(self.doc),
-                                                 label="fixture checkpoint", local_only=True)
-            self.assertIn(f"{destination} main at {earlier}; local main remains at {later}", output.getvalue())
-            self.assertIn("post-push hook: done", output.getvalue())
-            self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], earlier)
-            self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
-            self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
+        for hook_fails in (False, True):
+            with self.subTest(installed="newer integration commit", hook_fails=hook_fails):
+                base = self.git("rev-parse", "HEAD", cwd=destination)
+                earlier = self.git("commit-tree", "HEAD^{tree}", "-p", base, "-m", "Requested promotion")
+                later = self.git("commit-tree", "HEAD^{tree}", "-p", earlier, "-m", "Newer integration commit")
+                _ = self.git("push", "origin", f"{later}:refs/heads/production")
+                _ = self.git("fetch", "origin", "production", cwd=destination)
+                _ = self.git("merge", "--ff-only", later, cwd=destination)
+                hold = destination / ".git/hold-hook"
+                if hook_fails:
+                    hold.touch()
+                destinations = production_doc.PromoteTo((destination,), production_doc.NoMac())
+                with (mock.patch.dict(os.environ, self.env, clear=True), production_paths(self.env),
+                      contextlib.redirect_stdout(io.StringIO()) as output):
+                    _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, earlier)
+                    _ = merge_checkpoint.promote_targets(destinations, "production", earlier, source=self.checkout,
+                                                         approval=publication.CollectedCi(self.doc),
+                                                         label="fixture checkpoint", local_only=True)
+                self.assertIn(f"{destination} main at {earlier}; local main remains at {later}", output.getvalue())
+                if hook_fails:
+                    failure, = [line for line in output.getvalue().splitlines() if "rerun: " in line]
+                    self.assertIn("post-push hook: failed (exit 9)", failure)
+                    command = failure.split("rerun: ", 1)[1]
+                    self.assertIn(f"LANDED_SHA={earlier}", command)
+                    hold.unlink()
+                    retry = subprocess.run(["bash", "-c", command], cwd=self.checkout, env=self.env,
+                                           capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+                    self.assertIn("post-push hook: done", retry.stdout)
+                else:
+                    self.assertIn("post-push hook: done", output.getvalue())
+                self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], earlier)
+                self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
+                self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
 
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()
@@ -1010,7 +1029,7 @@ class LifecycleTests(LifecycleFixture):
             calls = [line for line in self.calls().splitlines() if line.startswith("ssh ")]
             self.assertEqual(len(calls), 1)
             self.assertIn("ssh mac", calls[0])
-            self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{destination} main", calls[0])
+            self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{destination} {tip}", calls[0])
         _ = (self.state / "mac-rc").write_text("1\n")
         failed = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(failed, "failed")

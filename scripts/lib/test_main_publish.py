@@ -16,7 +16,8 @@ from typing import final, override
 import unittest
 from unittest import mock
 
-from scripts.lib import land_main, main_publish, main_sync, waiting_rows
+from scripts.lib import land_main, main_publish, main_sync, waiting_rows, zone
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -54,11 +55,11 @@ class PublicationRepository:
         )
         self.ssh.chmod(0o755)
         self.env = {
-            **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
+            **fixture_git_environment(root), "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
             "XDG_STATE_HOME": str(root / "xdg"),
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(self.programs) + os.pathsep + os.environ.get("PATH", os.defpath),
         }
@@ -619,11 +620,27 @@ class MainPublishTests(PublicationTestCase):
         _ = fetch_head.write_text(fetch_text)
         refs = repo.git(mac, "show-ref")
         _ = repo.change()
-        _ = repo.git(repo.checkout, "commit", "-qam", "advance main")
+        _ = repo.git(repo.checkout, "commit", "-qam", "approve production main")
+        approved = repo.head()
+        _ = repo.git(repo.checkout, "push", "origin", approved + ":refs/heads/main")
+        _ = (repo.checkout / "other.txt").write_text("later change\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "advance local main")
         _ = (repo.root / "OFFLINE").unlink()
         _ = repo.ssh.write_text('#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n')
         with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
                                           "GIT_CONFIG_VALUE_0": "natedev:"}):
+            with self.subTest(attempt="retry an offline production pull"):
+                mac_path = PurePosixPath(str(mac))
+                settings_pull = main_publish.MacCheckoutPull(mac_path, repo.checkout)
+                main_publish.queue_pull_only("settings", "Mac asleep", pulls=(settings_pull,))
+                pull = main_publish.ProductionMacPull(mac_path, repo.checkout, approved)
+                main_publish.queue_pull_only("production", "Mac asleep", pulls=(pull,))
+                main_publish.clear_pull_only(mac_path)
+                result = zone.drain(repo.checkout, pulled=mac_path)
+                self.assertIn("took the production change", " ".join(result))
+                self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), approved)
+                self.assertEqual(fetch_head.read_text(), fetch_text)
+                self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
             for attempt in ("first pull", "repeat pull"):
                 with self.subTest(attempt=attempt):
                     pulled = main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh), mac=PurePosixPath(str(mac)))

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.production import ci_points
+from scripts.production import ci_points, promotion
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -409,6 +409,19 @@ PY
         self.assertTrue(Path(observed["directory"]).exists())
         self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
+
+        main = self.git("rev-parse", "main", cwd=self.origin)
+        for branch in ("main", "refs/heads/main"):
+            with self.subTest(integration_destination=branch):
+                result = subprocess.run(["bash", str(self.bin / "push_direct.sh"), "--publish-only", initial],
+                                        cwd=self.checkout, text=True, capture_output=True,
+                                        env={**self.env, "PUSH_TARGET_BRANCH": branch,
+                                             "PRODUCTION_INTEGRATION_PUSH": str(Path(promotion.__file__).resolve())},
+                                        timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("refs/heads/main is not an integration branch", result.stderr)
+                self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main)
+                self.assertEqual((self.stub_state / "pushes").read_text().splitlines(), pushes)
 
     def test_a_validation_fix_fast_forwards_an_unchanged_remote_branch(self) -> None:
         initial = self.git("rev-parse", "HEAD")
