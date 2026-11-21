@@ -95,6 +95,7 @@ class RegistrationFixture(unittest.TestCase):
     fixture_snapshot: ClassVar[Path]
     command_snapshot: ClassVar[Path]
     needs_command_copy: ClassVar[bool] = False
+    seed_admission: ClassVar[bool] = True
 
     @classmethod
     @override
@@ -183,8 +184,12 @@ class RegistrationFixture(unittest.TestCase):
                            worktree=staff.PresentWorktree(remote.local_machine(), alpha))
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
+        if self.seed_admission:
+            self.capture_fixture_admission()
+
+    def capture_fixture_admission(self) -> None:
         with mock.patch.dict(os.environ, self.env, clear=True):
-            _ = production_admission.capture_rollout_inventory([runner.id])
+            _ = production_admission.capture_rollout_inventory([self.owner_id])
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         process = subprocess.run(["git", *args], cwd=cwd or self.checkout, env=self.env if self.env else None,

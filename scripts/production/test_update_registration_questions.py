@@ -28,6 +28,8 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    seed_admission = False
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -307,6 +309,7 @@ class RegistrationTests(RegistrationFixture):
         owner_id = self.fixture_staff_id()
         asker_id = self.fixture_staff_id("alpha")
         _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
+        self.capture_fixture_admission()
         self.checkout = unit
         self.doc = unit / relative
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
@@ -380,6 +383,7 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
         _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
         _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
+        self.capture_fixture_admission()
         asker = staff.by_id(asker_id)
         assert asker is not None
         _ = staff.set_worktree(asker_id, staff.PresentWorktree(remote.local_machine(), unit), expected=asker.worktree)
