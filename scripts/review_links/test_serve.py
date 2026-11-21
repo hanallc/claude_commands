@@ -387,6 +387,51 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
             self.assertEqual(cache.get().records, {})
 
+    def test_new_item_options_refuse_an_unpublished_host(self) -> None:
+        host = f"other.invalid:{self.port}"
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": ""})):
+            reply = self.new_item_http(headers={"Host": host, "Origin": f"http://{host}"})
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (403, {"error": "Open the New item dialog from Review."}))
+
+    def test_new_item_options_accept_the_bound_and_published_hosts_on_the_serving_port(self) -> None:
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": "console.invalid."})):
+            for host in (self.server.bound_address, "console.invalid"):
+                with self.subTest(host=host):
+                    authority = f"{host}:{self.port}"
+                    reply = self.new_item_http(headers={"Host": authority, "Origin": f"http://{authority}"})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(cast(dict[str, object], json.loads(reply.body))["token"], self.server.new_item_token)
+                    wrong_port = f"{host}:0"
+                    self.assertEqual(self.new_item_http(headers={"Host": wrong_port}).status, 403)
+                    self.assertEqual(self.new_item_http(headers={"Host": host}).status, 403)
+
+    def test_new_item_options_accept_bare_hosts_on_port_80(self) -> None:
+        with (patch.object(self.server, "server_port", 80),
+              patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": "console.invalid."})):
+            for host in (self.server.bound_address, "console.invalid"):
+                with self.subTest(host=host):
+                    reply = self.new_item_http(headers={"Host": host, "Origin": f"http://{host}"})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(cast(dict[str, object], json.loads(reply.body))["token"], self.server.new_item_token)
+
+    def test_new_item_options_require_a_host(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True)):
+            connection.putrequest("GET", review_page.NEW_ITEM_PATH, skip_host=True)
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())),
+                             (403, {"error": "Open the New item dialog from Review."}))
+
     def test_owner_options_resolve_the_recipient_and_review_reuses_its_dialog(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
@@ -3007,16 +3052,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path).status, 404)
 
-    def post(self, path: str, body: str, *, origin: str = "") -> tuple[int, bytes]:
+    def post(self, path: str, body: str, *, origin: str = "", headers: Mapping[str, str] | None = None) -> tuple[int, bytes]:
         review_post = path == review_page.PAGE_PATH
         if review_post:
             self.review_post_done.clear()
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            sent = {"Content-Type": "application/x-www-form-urlencoded"}
             if origin:
-                headers["Origin"] = origin
-            connection.request("POST", path, body, headers)
+                sent["Origin"] = origin
+            connection.request("POST", path, body, {**sent, **(headers or {})})
             response = connection.getresponse()
             content = response.read()
             if review_post:
@@ -4187,6 +4232,23 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, content = self.post(accounts_page.PAGE_PATH, "group=producers&clear=first")
             self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
             clear.assert_called_once_with("producers", next_moves.FIRST_GROUP_POSITION)
+
+    def test_accounts_color_rejects_an_unpublished_host_before_tune(self) -> None:
+        configuration = self.root.parent / "config"
+        configuration.mkdir()
+        _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+        tune = Mock(return_value=subprocess.CompletedProcess((), 0, "", ""))
+        body = "key=role.worker&value=%23af875f"
+        host = f"other.invalid:{self.port}"
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration), "REVIEW_LINKS_HOST": ""}),
+              patch.object(accounts_page, "subprocess", Mock(wraps=subprocess, run=tune))):
+            status, _ = self.post(accounts_page.PAGE_PATH, body, headers={"Host": host, "Origin": f"http://{host}"})
+            self.assertEqual(status, 403)
+            tune.assert_not_called()
+            status, content = self.post(accounts_page.PAGE_PATH, body)
+            self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
+            tune.assert_called_once()
 
     def test_console_tune_requires_the_origin_and_token(self) -> None:
         key = "faster_box_max_cost_ratio"
