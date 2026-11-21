@@ -431,7 +431,9 @@ Its close hook stops the attempt with the script uploaded to the Mac during prep
 When a later queue run finds an ended gate, it calls the installed natedev lifecycle script.
 The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.
-It uses the saved attempt name and checkout receipt.
+It checks the saved checkout path even if the attempt folder is absent.
+For older inline checkouts without a journal, it checks for test processes before removal.
+Custom callbacks use their saved path.
 The queue removes its run record and receipt after the callback confirms cleanup.
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`

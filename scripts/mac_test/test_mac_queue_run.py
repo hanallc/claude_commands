@@ -300,6 +300,23 @@ else:
                              [f"{callback} cleanup {called}", f"{installed} cleanup-ended {called}"])
             self.assertFalse(saved.exists())
 
+    def test_ended_custom_callback_uses_its_saved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            directory = root / mac_queue_run.RUNS / "ended"
+            directory.mkdir(parents=True)
+            (directory / "lock").touch()
+            callback = root / "custom_callback"
+            write_stdlib_tool(callback, "import sys\nprint(*sys.argv[1:])\n")
+            _ = (directory / "run.json").write_text(json.dumps({"lifecycle_script": str(callback),
+                "arguments": ["fixture-argument"], "host": "fake-mac"}))
+            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"cleanup {directory / 'argv.json'} fixture-argument", result.stdout)
+            self.assertFalse(directory.exists())
+
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
                                 (False, signal.SIGINT)):

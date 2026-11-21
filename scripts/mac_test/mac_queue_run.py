@@ -260,7 +260,7 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
                     script, phase = ended_run_callback(saved["lifecycle_script"])
                     status = run_callback(str(script), phase, directory / "argv.json",
                                           saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
-                except (OSError, ValueError) as error:
+                except OSError as error:
                     print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
                     continue
                 if status:
@@ -273,14 +273,14 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
 
 
 def ended_run_callback(saved_script: str) -> tuple[Path, str]:
-    """Select the installed callback for the saved script name."""
+    """Select an installed callback for a known script name."""
     installed = Path.home() / ".claude"
     name = Path(saved_script).name
     if name == MAC_GATE_SCRIPT.name:
         return installed / MAC_GATE_SCRIPT, "cleanup-ended"
     if name == "mac_run.sh":
         return installed / "scripts/production/mac_run.sh", "cleanup"
-    raise ValueError(f"unknown lifecycle script {name!r}")
+    return Path(saved_script), "cleanup"
 
 
 class Arguments(argparse.Namespace):
