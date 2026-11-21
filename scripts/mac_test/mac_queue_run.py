@@ -616,16 +616,16 @@ def clean_ended_run(directory: Path, saved: SavedRun, environment: dict[str, str
     if "claim" not in saved:
         if isinstance(selection, AssignedRunsOnTarget):
             return QueueRunOutsideSelection()
-        return cleanup_lifecycle(directory, saved, environment)
+        return cleanup_lifecycle(directory, saved, environment, ended=True)
     assignment = read_assignment(saved["claim"]["assignment"])
     if isinstance(selection, AssignedRunsOnTarget) and assignment.destination.target != selection.target:
         return QueueRunOutsideSelection()
     _ = settle_assigned_run(directory, saved, environment, assignment, read_recoverable_claim(assignment),
-                            transport=contextlib.ExitStack())
+                            transport=contextlib.ExitStack(), ended=True)
     return 0
 
 
-def cleanup_lifecycle(directory: Path, saved: SavedRun, environment: dict[str, str]) -> int:
+def cleanup_lifecycle(directory: Path, saved: SavedRun, environment: dict[str, str], *, ended: bool = False) -> int:
     if not saved.get("lifecycle_started", True):
         return 0
     from scripts.mac_test.mac_gate import checkout_cleanup_seconds
@@ -639,7 +639,9 @@ def cleanup_lifecycle(directory: Path, saved: SavedRun, environment: dict[str, s
                 _ = leases.enter_context(creation_lease(lease, fcntl.LOCK_EX))
             except BlockingIOError as error:
                 raise ValueError("the Mac preparation command is still active") from error
-        return run_callback(saved["lifecycle_script"], "cleanup", argv_file,
+        script, phase = (ended_run_callback(saved["lifecycle_script"]) if ended
+                         else (Path(saved["lifecycle_script"]), "cleanup"))
+        return run_callback(str(script), phase, argv_file,
                             saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]}, timeout=timeout)
 
 
@@ -778,7 +780,8 @@ def settle_assigned_run(directory: Path, saved: SavedRun, environment: dict[str,
                         assignment: PlacementAssignment, claim: offload.AssignedMacClaim | offload.MacClaimSettled,
                         *, transport: contextlib.ExitStack,
                         registered: RegisteredMacRun | NoRegisteredMacRun = NO_REGISTERED_MAC_RUN,
-                        transport_pid: int = 0, recovery_locks: tuple[int, ...] = ()) -> wire.ExecutionReport | NoMacCompletionReport:
+                        transport_pid: int = 0, recovery_locks: tuple[int, ...] = (),
+                        ended: bool = False) -> wire.ExecutionReport | NoMacCompletionReport:
     """End checkout work and confirm exact release before reporting settlement."""
     from scripts.build_queue import admission_wire as wire
 
@@ -789,7 +792,7 @@ def settle_assigned_run(directory: Path, saved: SavedRun, environment: dict[str,
         if isinstance(registered, RegisteredMacRun) and not queue_creators_ended(
                 registered.owner, allowed=(os.getpid(), transport_pid)):
             raise ValueError("Mac creation processes remain active")
-        if cleanup_lifecycle(directory, saved, environment):
+        if cleanup_lifecycle(directory, saved, environment, ended=ended):
             raise ValueError("the Mac checkout cleanup remains unresolved")
         if saved.get("lifecycle_started", True):
             saved["lifecycle_started"] = False
@@ -902,7 +905,7 @@ def recover_manual_mac_run(run: ManualMacRun, environment: dict[str, str]) -> No
             latest = read_ended_manual_mac_run(paths)
             if not isinstance(latest, ManualMacRun) or not queue_creators_ended(latest.owner):
                 return
-            if not cleanup_lifecycle(paths.directory, latest.saved, environment):
+            if not cleanup_lifecycle(paths.directory, latest.saved, environment, ended=True):
                 remove_recovered_gate_plan(paths, locks)
     except (BlockingIOError, FileNotFoundError):
         return
@@ -937,7 +940,7 @@ def recover_registered_mac_run(run: RegisteredMacRun, *, service_settled: bool) 
                 raise ValueError("the registered Mac claim holder changed")
             environment = {**os.environ, "MAC_QUEUE_SESSION": claim_state.session_id(assignment.session)}
             _ = settle_assigned_run(paths.directory, run.saved, environment, assignment, claim,
-                                    transport=contextlib.ExitStack(), registered=run, recovery_locks=locks)
+                                    transport=contextlib.ExitStack(), registered=run, recovery_locks=locks, ended=True)
     except BlockingIOError:
         # A live owner or a preparation command still holds a lock.
         return
@@ -1091,6 +1094,19 @@ def run_assigned(args: Arguments, encoded: str) -> int:
             if isinstance(report, wire.ExecutionReport):
                 _ = (folder / mac_gate.ASSIGNED_COMPLETION).write_text(assignment.attempt)
         return status
+
+
+def ended_run_callback(saved_script: str) -> tuple[Path, str]:
+    """Select an installed callback for a known script name."""
+    from scripts.production.mac_gate_process import MAC_GATE_SCRIPT
+
+    installed = Path.home() / ".claude"
+    name = Path(saved_script).name
+    if name == MAC_GATE_SCRIPT.name:
+        return installed / MAC_GATE_SCRIPT, "cleanup-ended"
+    if name == "mac_run.sh":
+        return installed / "scripts/production/mac_run.sh", "cleanup"
+    return Path(saved_script), "cleanup"
 
 
 class Arguments:

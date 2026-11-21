@@ -499,8 +499,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         """Provide cleanup evidence to the admission worker after the barrier opens."""
         def cleanup(_script: str, phase: str, _argv: Path, arguments: list[str],
                     environment: dict[str, str], **_options: object) -> int:
-            if phase != "cleanup":
-                raise AssertionError("recovery tried to prepare the Mac")
+            self.assertEqual(phase, "cleanup-ended")
             folder = Path(arguments[0])
             self.assertTrue(folder.is_dir())
             self.assertTrue(environment["MAC_QUEUE_HOST"])

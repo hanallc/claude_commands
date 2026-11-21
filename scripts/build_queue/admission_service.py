@@ -225,6 +225,7 @@ class Clock(Protocol):
 class Readings(Protocol):
     def host(self) -> records.HostMemory | records.ReadingUnavailable: ...
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure: ...
+    def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold: ...
     def compilers(self) -> list[records.StepMemory]: ...
     def reservation(self, path: Path, row: records.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path, policy: records.AdmissionPolicy) -> records.StepMemory: ...
@@ -245,6 +246,19 @@ class SystemReadings:
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         return gate.read_pressure(host, policy=policy)
+
+    def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold:
+        from scripts.lib.build_slots import slot_cargo_root
+
+        try:
+            root = slot_cargo_root(conf.read("build_folders"))
+            reading = os.statvfs(root)
+        except (OSError, conf.Unusable) as error:
+            hold = records.BuildSpaceUnreadable(str(error))
+            print(f"memory admission: {records.build_space_text(hold)}", file=sys.stderr)
+            return hold
+        free = reading.f_bavail * reading.f_frsize // records.GIB
+        return records.BuildSpaceLow(free, floor) if free < floor else records.NoBuildSpaceHold()
 
     def compilers(self) -> list[records.StepMemory]:
         return gate.sccache_memory()
@@ -2415,6 +2429,8 @@ class AdmissionServer:
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
         inputs = captured.local
+        if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
+            inputs = replace(inputs, build_space=self.readings.build_space(floor))
         ci_holds = self._ci_hold_reasons()
         held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
         if held_owners:
@@ -3851,7 +3867,7 @@ done
         if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
             reason = waiting.last_reply.reason
             cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-            if isinstance(cause, placement.CargoFolderWait):
+            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired):
                 return wire.PlacementWait(request.episode, request.since, position, candidates,
                     waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
@@ -3954,6 +3970,7 @@ done
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
                     continue
                 if (initial_readiness_unchecked and destination.provider == "local"
+                        and isinstance(inputs.build_space, records.NoBuildSpaceHold)
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
