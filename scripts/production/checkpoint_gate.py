@@ -19,8 +19,9 @@ from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
-from scripts.production import staff
-from scripts.production.production_doc import ProductionDocument
+from scripts.production import showrunners, staff
+from scripts.production.production_doc import ProductionDocument, Refusal, local_production_documents, read_production
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
 
 TREE_CHANGED_STATUS = 77
 
@@ -40,6 +41,59 @@ def report(step: str, state: str, detail: str) -> None:
 
 def tool(name: str, fallback: Path, override: str) -> str:
     return os.environ.get(override) or shutil.which(name) or str(fallback)
+
+
+class CiRecord(NamedTuple):
+    merges_collected: int
+    tip: str
+    policy: Literal["cargo-liner", "standard"] = "standard"
+
+
+class NoCiRecord(NamedTuple):
+    pass
+
+
+class InvalidCiRecord(ValueError):
+    pass
+
+
+def read_ci_record(state_dir: Path) -> CiRecord | NoCiRecord:
+    path = state_dir / "ci_points.json"
+    try:
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoCiRecord()
+    if not isinstance(raw, dict):
+        raise InvalidCiRecord(f"invalid {path}")
+    fields = cast(dict[str, object], raw)
+    count, tip = fields.get("count"), fields.get("tip")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(tip, str):
+        raise InvalidCiRecord(f"invalid {path}")
+    return CiRecord(count, tip, "cargo-liner" if fields.get("policy") == "cargo-liner" else "standard")
+
+
+def require_cargo_liner_promotion_ci(main: Path, branch: str, tip: str) -> None:
+    """Require a collected cargo-liner verdict for the exact integration tip."""
+    try:
+        for row in local_production_documents():
+            if row.name != CARGO_LINER_PRODUCTION:
+                continue
+            assert isinstance(row.doc, staff.LiveDoc)
+            if not row.doc.path.resolve().is_relative_to(main):
+                continue
+            production = read_production(row)
+            if production.merge_checkout != main or branch != production.merge_branch:
+                continue
+            state_dir = showrunners.session_state_dir(row.id) / "waiting_state"
+            record = read_ci_record(state_dir)
+            refs = subprocess.run(["git", "-C", str(main), "rev-parse", "--revs-only", "--end-of-options",
+                                   f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"],
+                                  capture_output=True, text=True, check=False)
+            if (not isinstance(record, CiRecord) or record.policy != "cargo-liner" or record.tip != tip
+                    or refs.returncode or refs.stdout.splitlines() != [tip, tip]):
+                raise Refusal(f"collect cargo-liner CI on the integration tip before promoting {tip}")
+    except (OSError, Refusal, ValueError) as error:
+        raise Stop("promote", "held", str(error), "collect CI and retry promotion") from error
 
 
 class CheckpointTestStep(NamedTuple):

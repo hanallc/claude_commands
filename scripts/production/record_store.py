@@ -26,7 +26,8 @@ from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
 from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
 from scripts.production.production_doc import (
-    Refusal, legacy_document_path, production_backup_checkout, production_field,
+    Refusal, document_history_file, former_live_documents, legacy_document_path,
+    production_backup_checkout, production_field,
 )
 
 from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
@@ -358,9 +359,25 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
                         raise
             if include_history:
                 try:
-                    roots.extend(historical_issue_folders(document, sources=sources))
-                    if owner and legacy_document_path(document) != document:
-                        roots.extend(_backup_issue_folders(owner, document, sources))
+                    history: tuple[Path, ...] = ()
+                    if owner:
+                        try:
+                            checkout = git_files.locate(document.parent)
+                        except git_files.NotACheckout:
+                            pass
+                        else:
+                            history_file = document_history_file(checkout, owner)
+                            if sources is not None:
+                                sources.append(history_file)
+                            history = former_live_documents(history_file)
+                    if history and document in history:
+                        roots.extend(historical_issue_folders(history[0], sources=sources))
+                        for path in history:
+                            roots.extend(_backup_issue_folders(owner, path, sources))
+                    else:
+                        roots.extend(historical_issue_folders(document, sources=sources))
+                        if owner and legacy_document_path(document) != document:
+                            roots.extend(_backup_issue_folders(owner, document, sources))
                 except (OSError, UnicodeError):
                     if strict and require_document:
                         raise

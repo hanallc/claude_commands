@@ -21,6 +21,7 @@ from typing import NamedTuple, cast
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
 from scripts.production import merge_gate
+from scripts.production.checkpoint_gate import CiRecord as CiRecord, InvalidCiRecord, NoCiRecord, read_ci_record
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
@@ -42,15 +43,6 @@ class CiNotDue(NamedTuple):
 
 
 class CiNotUsed(NamedTuple):
-    pass
-
-
-class CiRecord(NamedTuple):
-    merges_collected: int
-    tip: str
-
-
-class NoCiRecord(NamedTuple):
     pass
 
 
@@ -102,17 +94,10 @@ def branch_tip(production: Production) -> str:
 
 
 def ci_record(state_dir: Path) -> CiRecord | NoCiRecord:
-    path = state_dir / "ci_points.json"
-    if not path.exists():
-        return NoCiRecord()
-    raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    if not isinstance(raw, dict):
-        raise PointFailure("due", f"invalid {path}")
-    fields = cast(dict[str, object], raw)
-    count, tip = fields.get("count"), fields.get("tip")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(tip, str):
-        raise PointFailure("due", f"invalid {path}")
-    return CiRecord(count, tip)
+    try:
+        return read_ci_record(state_dir)
+    except InvalidCiRecord as error:
+        raise PointFailure("due", str(error)) from error
 
 
 def due(production: Production, state_dir: Path, no_ci: bool) -> CiDue | CiNotDue | CiNotUsed:
@@ -207,7 +192,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
                 current_branch = required(git(production.checkout, "branch", "--show-current"), "validation")
                 if branch_tip(production) != tip or current_branch != production.merge_branch:
                     raise PointFailure("validation", "merge branch moved during validation")
-                _ = required(git(production.checkout, "merge", "--ff-only", validated), "validation")
+                _ = required(git(production.checkout, "merge", "--no-overwrite-ignore", "--ff-only", validated), "validation")
             published = required(command("validation", *push, "--publish-only", validated,
                                          cwd=production.checkout), "validation")
         publication = published.splitlines()[-1].split() if published else []
@@ -292,7 +277,7 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
             current = branch_tip(production)
             if current != tip:
                 raise PointFailure("ci collect", f"rerun CI on {current}: integration moved during collection")
-            write_json(state_dir / "ci_points.json", {"count": count, "tip": tip})
+            write_json(state_dir / "ci_points.json", {"count": count, "tip": tip, "policy": "cargo-liner"})
     elif not required_linux or view.get("conclusion") != "success":
         raise PointFailure("ci collect", f"rerun {'Test Suite' if not required_linux else 'CI'} on {tip}: CI ran on {ran_on} ({view.get('conclusion') or 'unfinished'})")
     else:

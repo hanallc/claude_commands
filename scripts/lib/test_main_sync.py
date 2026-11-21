@@ -12,11 +12,13 @@ import subprocess
 import tempfile
 import unittest
 import unittest.mock
-from contextlib import redirect_stdout
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from typing import override
 
 from scripts.lib import live_settings, main_sync, waiting_rows
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.message import session_send
 from scripts.agents import remote
 from scripts.production import staff
@@ -39,7 +41,10 @@ class MainSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(unittest.mock.patch.dict(os.environ, {main_sync.STATE_ENV: str(self.root / "state")}))
+        environment = fixture_git_environment(self.root)
+        self.enterContext(unittest.mock.patch.dict(os.environ, {
+            **environment, "HOME": str(self.root), "GIT_CONFIG_SYSTEM": os.devnull, main_sync.STATE_ENV: str(self.root / "state"),
+        }, clear=True))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         config = self.root / "config"
         config.mkdir()
@@ -124,6 +129,33 @@ class MainSyncTests(unittest.TestCase):
             self.assertEqual((self.checkout / "d").read_text(), "d")
             self.assertEqual((self.checkout / "session-state.json").read_text(), "{}")
 
+        with self.subTest(case="another fetch writes FETCH_HEAD"):
+            _ = git(self.writer, "switch", "-qc", "topic")
+            _ = (self.writer / "topic-only").write_text("Topic work")
+            _ = git(self.writer, "add", "topic-only")
+            _ = git(self.writer, "commit", "-qm", "Topic work")
+            topic = git(self.writer, "rev-parse", "HEAD")
+            _ = git(self.writer, "push", "-q", "origin", "topic")
+            _ = git(self.writer, "switch", "-q", "main")
+            tip = self.commit("main-only")
+            lock = waiting_rows.locked_journal
+            acquired = 0
+
+            @contextmanager
+            def fetch_topic(path: Path) -> Generator[waiting_rows.LockedJournal]:
+                nonlocal acquired
+                acquired += 1
+                if acquired == 2:
+                    _ = git(self.checkout, "fetch", "-q", "--refmap=", "origin", "refs/heads/topic")
+                with lock(path) as pending:
+                    yield pending
+
+            with unittest.mock.patch.object(waiting_rows, "locked_journal", side_effect=fetch_topic):
+                self.assertEqual(main_sync.sync(self.checkout).state, main_sync.ADVANCED)
+            self.assertEqual(git(self.checkout, "rev-parse", "FETCH_HEAD"), topic)
+            self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(), [tip, tip])
+            self.assertEqual(git(self.checkout, "for-each-ref", "refs/main-sync"), "")
+
     def test_an_advanced_checkout_cannot_move_back_during_claude_sync(self) -> None:
         older = self.commit("b")
         newer = self.commit("c")
@@ -132,7 +164,8 @@ class MainSyncTests(unittest.TestCase):
         flock = fcntl.flock
 
         def finish_newer_pull(descriptor: int, operation: int) -> None:
-            _ = git(self.checkout, "merge", "--ff-only", newer)
+            if operation == fcntl.LOCK_EX:
+                _ = git(self.checkout, "merge", "--ff-only", newer)
             flock(descriptor, operation)
 
         with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
@@ -340,7 +373,8 @@ class MainSyncTests(unittest.TestCase):
     def test_a_credential_probe_timeout_uses_the_cold_advice(self) -> None:
         results = [subprocess.CompletedProcess(["git"], 0, "main\n", ""),
                    subprocess.CompletedProcess(["git"], 0, str(self.checkout / ".git"), ""),
-                   subprocess.CompletedProcess(["git"], 1, "", "fetch refused")]
+                   subprocess.CompletedProcess(["git"], 1, "", "fetch refused"),
+                   subprocess.CompletedProcess(["git"], 0, "", "")]
         with (unittest.mock.patch.object(main_sync, "_git", side_effect=results),
               unittest.mock.patch.object(waiting_rows, "restore_live"),
               unittest.mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(

@@ -15,14 +15,15 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from enum import Enum
 
 from scripts.agents import remote
-from scripts.lib import conf
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import conf, git_files
+from scripts.lib.atomic_file import sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.production import staff
 from scripts.production.production_doc import (
     EnrolledPaths, Refusal, production_backup_checkout, production_backup_root, read_production, resolve_production_paths,
@@ -34,6 +35,8 @@ from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY, BACKU
 SNAPSHOT_FOLDERS = (BACKUP_DOCUMENT_DIRECTORY, "log", "notes")
 BACKUP_BRANCH = "refs/heads/main"
 SSH_OPTIONS = ("ssh", "-o", "BatchMode=yes")
+BACKUP_MARKER = ".production-backup"
+BACKUP_MARKER_TEXT = "production backup checkout\n"
 
 
 class NoStagedNotes(Enum):
@@ -53,16 +56,97 @@ class BackupMirror:
     maintenance: Callable[[bool], str]
 
 
-def command(*arguments: str) -> str:
-    result = subprocess.run(arguments, capture_output=True, text=True, check=False)
+def command(*arguments: str, env: Mapping[str, str] | None = None) -> str:
+    result = subprocess.run(arguments, capture_output=True, text=True, check=False, env=env)
     if result.returncode:
         raise OSError(result.stderr.strip() or f"{arguments[0]} exited with code {result.returncode}")
     return result.stdout.strip()
 
 
 def git(repository: Path, *arguments: str) -> str:
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
     return command("git", "-C", str(repository), "-c", "gc.auto=0", "-c", "core.autocrlf=false",
-                   "-c", "core.hooksPath=/dev/null", *arguments)
+                   "-c", "core.hooksPath=/dev/null", *arguments, env=environment)
+
+
+def _check_directory(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise OSError(f"{path}: expected a private backup directory")
+
+
+def _check_backup_marker(repository: Path) -> None:
+    _check_directory(repository.parent)
+    _check_directory(repository)
+    marker = repository / BACKUP_MARKER
+    if marker.is_symlink() or not marker.is_file() or marker.read_text() != BACKUP_MARKER_TEXT:
+        raise OSError(f"{repository}: no production backup marker")
+
+
+def _check_backup_checkout(repository: Path) -> None:
+    _check_backup_marker(repository)
+    git_dir = repository / ".git"
+    _check_directory(git_dir)
+    _check_directory(git_dir / "info")
+    checkout = git_files.at(repository)
+    if checkout.git_dir != git_dir.resolve() or checkout.common_dir != checkout.git_dir:
+        raise OSError(f"{repository}: expected a separate backup Git repository")
+
+
+def _prepare_backup_checkout(repository: Path) -> None:
+    _check_directory(repository.parent)
+    _check_directory(repository)
+    repository.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not any(repository.iterdir()):
+        write_text_atomic(repository / BACKUP_MARKER, BACKUP_MARKER_TEXT, new_file_mode=0o600)
+    _check_backup_marker(repository)
+    git_dir = repository / ".git"
+    _check_directory(git_dir)
+    if not git_dir.exists():
+        _ = git(repository, "init", "--initial-branch=main")
+    _check_backup_checkout(repository)
+
+
+@contextmanager
+def _backup_lock(root: Path) -> Generator[None]:
+    _check_directory(root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(root / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _copy_legacy_logs(source: Path, destination: Path) -> None:
+    if not os.path.lexists(source):
+        return
+    _check_directory(source)
+    _check_directory(destination.parent)
+    _check_directory(destination)
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    sync_folder(destination.parent.parent)
+    sync_folder(destination.parent)
+    for entry in source.iterdir():
+        target = destination / entry.name
+        if entry.is_symlink() or not entry.is_file() or target.is_symlink():
+            raise OSError(f"{entry}: legacy LOG backup must be a regular file")
+        content = entry.read_bytes()
+        if target.exists():
+            if target.is_file() and target.read_bytes() == content:
+                continue
+            raise OSError(f"{target}: legacy LOG backup differs from {entry}")
+        write_bytes_atomic(target, content)
+
+
+def preserve_legacy_logs(state: Path, owner: staff.StaffId) -> None:
+    """Save old LOG copies before cleanup removes the production state."""
+    source = state / owner / LEGACY_COPIES
+    if os.path.lexists(source):
+        root = production_backup_root()
+        with _backup_lock(root):
+            _copy_legacy_logs(source, root / owner / LEGACY_COPIES)
 
 
 def production_sources(row: staff.StaffRow, doc: Path) -> BackupSources:
@@ -84,9 +168,7 @@ def backup(sources: BackupSources, repository: Path) -> None:
             raise OSError(f"{notes}: expected a notes directory")
         if any(path.name.casefold() == ".git" for path in notes.rglob("*")):
             raise OSError(f"{notes}: nested Git metadata cannot be backed up")
-    repository.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not (repository / ".git").is_dir():
-        _ = git(repository, "init", "--initial-branch=main")
+    _prepare_backup_checkout(repository)
     # Override attributes in the snapshot so a checkout restores the same bytes.
     write_text_atomic(repository / ".git/info/attributes", "* -filter -text -ident -working-tree-encoding -crlf\n")
     for folder in SNAPSHOT_FOLDERS:
@@ -125,6 +207,7 @@ def mac_mirror(identity: staff.StaffId, peer: str) -> BackupMirror:
 
 def publish(repository: Path, mirror: BackupMirror, repack_after_commits: int) -> None:
     """Keep local history and retry the push on each run."""
+    _check_backup_checkout(repository)
     tip = git(repository, "log", "-1", "--format=%H", BACKUP_BRANCH)
     total = int(git(repository, "rev-list", "--count", tip))
     for location in ("local", "mac"):
@@ -149,11 +232,9 @@ def publish(repository: Path, mirror: BackupMirror, repack_after_commits: int) -
 
 def backup_all(root: Path, state: Path, record: staff.StaffSnapshot,
                mirror: Callable[[staff.StaffId], BackupMirror], repack_after_commits: int) -> int:
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     standard_root = production_backup_root()
     failures = 0
-    with (root / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with _backup_lock(root):
         owners = {row.id: row for row in record.find(kind="showrunner")
                   if isinstance(row.doc, staff.LiveDoc) and row.doc.machine == remote.local_machine()}
         identities = owners.keys() | {staff.StaffId(path.name) for path in root.iterdir() if path.is_dir()}
@@ -164,10 +245,7 @@ def backup_all(root: Path, state: Path, record: staff.StaffSnapshot,
             repository = root / production_backup_checkout(identity).relative_to(standard_root)
             folder = repository.parent
             try:
-                old = state / identity / LEGACY_COPIES
-                if old.is_dir():
-                    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    _ = shutil.copytree(old, folder / LEGACY_COPIES, dirs_exist_ok=True, symlinks=True)
+                _copy_legacy_logs(state / identity / LEGACY_COPIES, folder / LEGACY_COPIES)
                 owner = owners.get(identity)
                 if owner is not None and isinstance(owner.doc, staff.LiveDoc):
                     backup(production_sources(owner, owner.doc.path), repository)

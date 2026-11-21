@@ -33,12 +33,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 from scripts.lib import conf, waiting_rows
+from scripts.lib.file_lock import exclusive
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
 from scripts.production.production_doc import (
     LiveFileConflict as LiveFileConflict, ProductionPathsError, live_file_conflicts as live_file_conflicts,
+    live_paths_lock_file,
 )
 
 STATE_ENV = "MAIN_SYNC_STATE_DIR"
@@ -194,9 +197,13 @@ def sync(checkout: Path) -> Outcome:
     busy = [name for name in IN_PROGRESS if (git_dir / name).exists()]
     if busy:
         return Outcome("in-progress", f"{checkout} has a git operation in progress ({busy[0]})")
+    fetch_ref = f"refs/main-sync/{uuid4().hex}"
     try:
-        waiting_rows.restore_live(checkout)
-        fetched = _git(checkout, "fetch", "-q", "--no-tags", "--refmap=", "origin", "refs/heads/main",
+        path_lock = live_paths_lock_file(checkout)
+        with exclusive(path_lock):
+            waiting_rows.restore_live(checkout)
+        fetched = _git(checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-prune", "--refmap=",
+                       "origin", f"refs/heads/main:{fetch_ref}",
                        timeout=FETCH_TIMEOUT_SECONDS)
         if fetched.returncode:
             try:
@@ -206,8 +213,8 @@ def sync(checkout: Path) -> Outcome:
             advice = ("GitHub credentials are warm. GitHub refused the fetch. This is likely a GitHub incident; "
                       + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
             return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
-        with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
-            fetched_tip = _git(checkout, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+        with exclusive(path_lock), waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+            fetched_tip = _git(checkout, "rev-parse", "--verify", f"{fetch_ref}^{{commit}}")
             if fetched_tip.returncode:
                 return Outcome("fetch-failed", _first_line(fetched_tip))
             tip = fetched_tip.stdout.strip()
@@ -223,6 +230,8 @@ def sync(checkout: Path) -> Outcome:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
     except (OSError, UnicodeError, ValueError, ProductionPathsError) as error:
         return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
+    finally:
+        _ = _git(checkout, "update-ref", "-d", fetch_ref)
 
 
 def _advance(checkout: Path, move: waiting_rows.CheckoutMove, pending: waiting_rows.LockedJournal) -> Outcome:

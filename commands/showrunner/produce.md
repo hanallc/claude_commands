@@ -80,11 +80,13 @@ State:
   `open_for_user`. Omitting that key leaves the durable list unchanged.
   `report_to_user` is kept the same way in
   `~/.local/state/showrunner/reports/<staff id>.json`.
-- `LOG` backups — `~/.local/state/showrunner/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`,
-  `log_backup.py` copies a changed `LOG` when `production_check.sh` runs and keeps the newest 48 copies.
-  No automatic report runs this check. To create a copy, run
-  `~/.claude/scripts/lib/py ~/.claude/scripts/production/log_backup.py <staff id>`.
-  To restore `LOG`, copy the selected file over it.
+- The hourly `production-backup` job saves the document, LOG, and notes.
+  Find the local repository at `~/.local/state/production-backups/<staff-id>/backup/`.
+  The Mac mirror uses `backup.git` in the same staff folder.
+  Legacy LOG copies stay in `log-backups/` beside the local repository.
+  On natedev, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/log_backup.py` for an immediate backup.
+  To restore a LOG, run `git -C "$BACKUP" show "$REV:log/$LOG_NAME" > "$SCRATCH_LOG"`.
+  Set `BACKUP` to either repository. Check the recovered file before copying it to the live path.
 
 `<DecisionEconomy/>` is defined by this import:
 

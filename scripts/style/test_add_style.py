@@ -31,7 +31,8 @@ from scripts.herdr import herdr
 from scripts.production import change_review, production_doc, staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.add_showrunner_test_support import write_guard_proof
-from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
+from scripts.production.production_names import GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, recorded_showrunner
 
 from scripts.style.style_reader_test_support import oracle_reader
@@ -150,6 +151,7 @@ class AddStyleTests(unittest.TestCase):
         )) / "sample"
         fixture = cls(methodName="runTest")
         fixture.repo = cls.repository_seed
+        fixture.env = {**fixture_git_environment(fixture.repo.parent), "GIT_CONFIG_SYSTEM": os.devnull}
         fixture.prepare_repository()
         cls.initial_tip = fixture.initial_tip
 
@@ -186,7 +188,8 @@ class AddStyleTests(unittest.TestCase):
             _ = (self.root / name).write_text(STUB)
         (self.root / "live-sessions").mkdir()
         self.env = {
-            **os.environ,
+            **fixture_git_environment(self.root),
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "HOME": str(home),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "ledger"),
@@ -204,7 +207,7 @@ class AddStyleTests(unittest.TestCase):
             "SCRATCH_ROOT": str(self.root / "scratch"),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env, clear=True)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         self.parent = self.parent_doc("parent")
         write_guard_proof(self.root, Path(self.env["SHOWRUNNER_STATE_DIR"]), self.repo)
@@ -213,7 +216,7 @@ class AddStyleTests(unittest.TestCase):
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
-            ["git", "-C", str(self.repo), *arguments], check=True, text=True, capture_output=True,
+            ["git", "-C", str(self.repo), *arguments], check=True, text=True, capture_output=True, env=self.env,
         ).stdout.strip()
 
     def parent_doc(self, name: str, branch: str = "main", *, proposals: bool = True) -> Path:
@@ -501,6 +504,16 @@ class AddStyleTests(unittest.TestCase):
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
         self.checkout.chmod(0o700)
         self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
+        proof = Path(self.env["SHOWRUNNER_STATE_DIR"]) / GUARD_READY_FILE
+        saved = proof.read_bytes()
+        proof.unlink()
+        with self.subTest(guard_proof=False):
+            result = self.run_bootstrap_process(success=False)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(GUARD_READY_FILE, result.stderr)
+            self.assertFalse(self.doc.exists())
+            self.assertEqual(self.calls(), [])
+        _ = proof.write_bytes(saved)
         _ = self.run_bootstrap_process()
 
         self.assertEqual(stat.S_IMODE(self.checkout.stat().st_mode), 0o700)

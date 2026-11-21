@@ -19,9 +19,10 @@ from typing import cast
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
-from scripts.lib import build_folders, scratch
+from scripts.lib import build_folders, git_files, scratch
 from scripts.production import production_doc, session_staff, staff
 from scripts.agents import remote
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
 
 
 @dataclass(frozen=True)
@@ -128,13 +129,28 @@ def write_record(record: WorktreeRecord) -> None:
     write_text_atomic(path, json.dumps(asdict(record), indent=2) + "\n")
 
 
+def cargo_liner_main(repository: Path) -> Path:
+    """Require the main checkout of the local cargo-liner production."""
+    owners = [row for row in production_doc.local_production_documents() if row.name == CARGO_LINER_PRODUCTION]
+    if len(owners) != 1 or not isinstance(owners[0].doc, staff.LiveDoc):
+        raise Refused(1, "cargo-liner must have one local live production document")
+    document = owners[0].doc.path
+    lines = document.read_text(encoding="utf-8").splitlines()
+    declared = Path(production_doc.production_field(lines, "Repository")).expanduser().resolve(strict=True)
+    main = git_files.at(declared)
+    if (main.git_dir != main.common_dir or git_files.locate(document.parent).common_dir != main.common_dir
+            or main_checkout(repository) != main.toplevel):
+        raise Refused(1, f"{repository}: expected the cargo-liner production repository")
+    return main.toplevel
+
+
 def retarget_cargo_liner_records(repository: Path, integration_branch: str, receipt: Path,
                                 *, reverse: bool = False) -> int:
     """Save the original records before retargeting them. Reverse only those edits."""
-    main = main_checkout(repository)
-    if integration_branch == "main":
-        raise Refused(1, "the cargo-liner integration branch must differ from main")
-    _ = git(main, "check-ref-format", f"refs/heads/{integration_branch}")
+    expected = f"{CARGO_LINER_PRODUCTION}-merges-integration"
+    if integration_branch != expected:
+        raise Refused(1, f"the cargo-liner integration branch must be {expected}")
+    main = cargo_liner_main(repository)
     if not reverse and not receipt.exists():
         originals: list[WorktreeRecord] = []
         for path in sorted(state_folder().glob("*.json")):
@@ -539,7 +555,7 @@ def main() -> int:
             count = retarget_cargo_liner_records(
                 Path(cast(str, arguments.repository)).expanduser(), cast(str, arguments.integration_branch),
                 Path(cast(str, arguments.receipt)).expanduser(), reverse=cast(bool, arguments.reverse))
-        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+        except (Refused, production_doc.Refusal, OSError, ValueError, KeyError, TypeError) as error:
             print(str(error), file=sys.stderr)
             return 1
         print(f"updated {count} cargo-liner worktree records")

@@ -180,9 +180,10 @@ class StaffRouting:
         """Check only documents that can supply this production."""
         runner = self.runners_by_name.get(name)
         candidates: list[Path] = []
-        if (document := record_store.local_document(runner)) is not None:
+        document = record_store.local_document(runner)
+        if document is not None:
             candidates.append(document)
-        if runner is None or not isinstance(runner.doc, staff.LiveDoc):
+        if document is None or runner is None or not isinstance(runner.doc, staff.LiveDoc):
             if name in self.supplied_documents:
                 candidates.append(self.supplied_documents[name])
             candidates.extend(self.list_documents.get(name, ()))

@@ -125,7 +125,7 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 | sdlc `land.sh`, `land_mac_ok.sh`, `queue_runner.sh` | Retained merge worker |
 | `merge_checkpoint.py --production sdlc` | Merge worker |
 | `merge_gate.py --checkout . --tests-only` | Gate worker |
-| Hana gate scripts through `copies.py run --commit <sha>` | Gate worker at the recorded commit |
+| Hana gate scripts through `copies.py run --repo <integration> --commit <sha>` | Gate worker at the recorded commit |
 | `verify.sh check`, `test`, `lint` | Gate worker |
 | `cargo fmt`, `cargo test`, `cargo nextest` | Gate worker under the production's existing build rules |
 | Cargo release builds | Build worker under the production's existing build rules |
@@ -141,7 +141,7 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 
 These destinations describe jobs, not new worker roles.
 Existing wrappers retain their production rules.
-From integration, use `copies.py run --commit <sha> -- bash <absolute-smoke-script> . <sha> <absolute-log>` for Hana smoke.
+Run Hana smoke with `copies.py run --repo <integration> --commit <sha> -- bash <absolute-smoke-script> . <sha> <absolute-log>`.
 </MergeDispatch>
 
 ## Gates

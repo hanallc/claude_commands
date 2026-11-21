@@ -22,7 +22,7 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path, PurePosixPath
-from typing import cast, final
+from typing import cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.production import merge_checkpoint
@@ -31,6 +31,7 @@ from scripts.production import showrunners
 from scripts.production import production_doc
 
 from scripts.lib import main_publish, scratch
+from scripts.lib.git_test_support import fixture_git_environment
 
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, configure_test_environment,
@@ -116,14 +117,25 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    @override
+    def bind_fixture(self, root: Path) -> None:
+        super().bind_fixture(root)
+        for key in tuple(self.env):
+            if key.startswith("GIT_"):
+                del self.env[key]
+        self.env.update({key: value for key, value in fixture_git_environment(root.parent).items()
+                         if key.startswith("GIT_")})
+        self.env["GIT_CONFIG_SYSTEM"] = os.devnull
+
     def test_checkpoint_protects_enrolled_live_files_before_publication(self) -> None:
-        for path, content, allowed in (
-            ("live/ledger", "live bytes\n", False),
-            ("live/ledger", "incoming bytes\n", False),
-            ("live", "incoming ancestor\n", False),
-            ("src/alpha.txt", "ordinary checkpoint\n", True),
+        for path, content, allowed, merge_on_main in (
+            ("live/ledger", "live bytes\n", False, False),
+            ("live/ledger", "incoming bytes\n", False, False),
+            ("live", "incoming ancestor\n", False, False),
+            ("src/alpha.txt", "ordinary checkpoint\n", True, False),
+            ("live/ledger", "incoming bytes\n", False, True),
         ):
-            with self.subTest(path=path, content=content):
+            with self.subTest(path=path, content=content, merge_on_main=merge_on_main):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
@@ -137,9 +149,16 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     f"- **Showrunner checkout:** `{integration}`\n- **Merge checkout:** `{self.checkout}`").replace(
                         "- **Log:** `production.log`", "- **Log:** `live/ledger`"))
                 self.write(self.checkout, "live/ledger", "live bytes\n")
+                with (self.checkout / ".git/info/exclude").open("a", encoding="utf-8") as exclude:
+                    _ = exclude.write("\n/live/ledger\n")
                 with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-                    owner = showrunners.owner_for("example")
-                    _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), live_doc))
+                    if merge_on_main:
+                        _ = recorded_showrunner("other", live_doc)
+                        _ = self.doc.write_text(self.doc.read_text().replace(
+                            "- **Merge branch:** `production`", "- **Merge branch:** `main`"))
+                    else:
+                        owner = showrunners.owner_for("example")
+                        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), live_doc))
                 main = self.git("rev-parse", "main")
                 original_index = self.git("write-tree")
                 original_tip = self.git("rev-parse", "production", cwd=self.origin)
@@ -159,6 +178,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     self.assertEqual(log, "live bytes\n")
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
                     self.assertEqual(self.git("rev-parse", "HEAD", cwd=integration), original_tip)
+                    if merge_on_main:
+                        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main)
 
     def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
@@ -762,12 +783,14 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                       never_pushed.process.stdout)
         self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
     def test_checkpoint_on_second_origin_branch_merges_the_checkpoint_and_names_branch(self) -> None:
-        for outcome in ("live-owner", "ancestor", "equal-patch", "merge-branch", "moved", "unlanded",
+        for outcome in ("live-owner", "ancestor", "equal-patch", "merge-branch", "enrolled-merge-branch", "moved", "unlanded",
                         "delete-failed", "no-promotion"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
+                target = self.checkout
+                promote = self.promote
                 _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
                 sha = self.checkpoint(push=False)
                 # The request can name a commit before the branch tip.
@@ -789,6 +812,22 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                     doc = self.root / "other-production.md"
                     _ = doc.write_text("- **Merge branch:** alpha-phase\n")
                     _ = recorded_showrunner("other", doc)
+                if outcome == "enrolled-merge-branch":
+                    _ = self.git("switch", "--detach", "main", cwd=self.promote)
+                    _ = self.git("switch", "main")
+                    other = self.root / "other-integration"
+                    _ = self.git("worktree", "add", str(other), "alpha-phase")
+                    live = self.checkout / "docs/plans/other-production-live.md"
+                    self.write(self.checkout, str(live.relative_to(self.checkout)),
+                               f"- **Repository:** `{self.checkout}`\n- **Merge branch:** `alpha-phase`\n"
+                               + f"- **Merge checkout:** `{self.checkout}`\n- **Showrunner checkout:** `{other}`\n"
+                               + "- **Log:** `other.log`\n")
+                    _ = recorded_showrunner("other", live)
+                    target = self.root / "integration"
+                    _ = self.git("worktree", "add", str(target), "production")
+                    _ = self.doc.write_text(self.doc.read_text().replace(
+                        f"- **Showrunner checkout:** `{self.checkout}`", f"- **Showrunner checkout:** `{target}`"))
+                    promote = self.checkout
                 if outcome == "moved":
                     self.executable(self.checkout / ".git/hooks/pre-push", "#!/bin/sh\n"
                         + 'read local_ref local_sha remote_ref remote_sha\n'
@@ -801,7 +840,7 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                         + 'read old new ref\n'
                         + '[ "$new" != 0000000000000000000000000000000000000000 ]\n')
                 if outcome != "no-promotion":
-                    _ = self.doc.write_text(self.doc.read_text() + f"\n- **Promote:** {self.promote}\n")
+                    _ = self.doc.write_text(self.doc.read_text() + f"\n- **Promote:** {promote}\n")
                 _ = self.git("config", "remote.origin.fetch",
                              "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch")
                 if outcome != "no-promotion":
@@ -816,10 +855,11 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                     self.assertEqual(self.git("merge-base", "--is-ancestor", sha, "HEAD"), "")
                     self.assertNotIn(later, self.git("rev-list", "HEAD").splitlines())
                 else:
-                    self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
-                    self.assertNotEqual(self.git("rev-parse", "HEAD^2"), later)
-                self.assertEqual((self.checkout / "outside.txt").exists(), outcome == "equal-patch")
-                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
+                    self.assertEqual(self.git("rev-parse", "HEAD^2", cwd=target), sha)
+                    self.assertNotEqual(self.git("rev-parse", "HEAD^2", cwd=target), later)
+                self.assertEqual((target / "outside.txt").exists(), outcome == "equal-patch")
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin),
+                                 self.git("rev-parse", "HEAD", cwd=target))
                 remote = self.git("ls-remote", "--heads", "origin", "refs/heads/alpha-phase")
                 if outcome in ("ancestor", "equal-patch"):
                     self.assertEqual(remote, "")
@@ -832,6 +872,7 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                     expected = later if outcome in ("live-owner", "moved", "unlanded") else sha
                     self.assertEqual(remote.split()[0], expected)
                     reasons = {"live-owner": "present worktree", "merge-branch": "production merge branch",
+                               "enrolled-merge-branch": "other uses this production merge branch",
                                "moved": "delete failed or branch moved", "unlanded": "work has not reached main",
                                "delete-failed": "delete failed", "no-promotion": "no promotion configured"}
                     self.assertIn(reasons[outcome], result.process.stdout)

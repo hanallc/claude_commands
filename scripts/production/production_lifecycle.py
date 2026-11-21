@@ -47,7 +47,7 @@ from scripts.production.production_names import (
 )
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
-from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
 from scripts.worktree import worktrees
@@ -80,6 +80,9 @@ class ProductionWrapped(NamedTuple):
 
 class VerdictMissing(NamedTuple):
     pass
+
+
+VERDICT_MISSING = VerdictMissing()
 
 
 class CommitVerdict(NamedTuple):
@@ -378,9 +381,18 @@ def check_copy_target(path: Path, data: bytes) -> None:
 
 def write_move_copy(path: Path, data: bytes, mode: int) -> None:
     check_copy_target(path, data)
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_bytes_atomic(path, data, mode=mode)
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with prepared_replacement(path, data, mode=mode) as temporary:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            check_copy_target(path, data)
+            if not path.exists():
+                raise
+        else:
+            sync_folder(path.parent)
 
 
 def move_files(production: Production, lines: list[str], record: staff.StaffSnapshot, *,
@@ -580,12 +592,15 @@ def require_new_document(document: production_doc.ProductionDocument) -> None:
             raise Refusal(str(error)) from error
 
 
+def require_planned_admission(production: Production, lines: list[str], record: staff.StaffSnapshot) -> None:
+    if (staff.declares_merge_checkout(lines)
+            or isinstance(showrunners.timer_for(production.owner, record), showrunners.NoTimer)):
+        require_new_document(production)
+
+
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
     if not resume and isinstance(doc_status(lines), ProductionPlanned):
-        record = staff.snapshot()
-        if (staff.declares_merge_checkout(lines)
-                or isinstance(showrunners.timer_for(production.owner, record), showrunners.NoTimer)):
-            require_new_document(production)
+        require_planned_admission(production, lines, staff.snapshot())
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
     if scratch is not None:
@@ -634,14 +649,14 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
+    record = staff.snapshot()
+    if isinstance(status, ProductionPlanned):
+        require_planned_admission(production, lines, record)
     enrolled = production_doc.resolve_production_paths(production.doc)
-    if isinstance(status, ProductionPlanned) and isinstance(enrolled, production_doc.EnrolledPaths):
-        require_new_document(production)
     main = enrolled.main if isinstance(enrolled, production_doc.EnrolledPaths) else production.checkout
     if isinstance(enrolled, production_doc.EnrolledPaths):
         for path in (enrolled.live_doc, enrolled.log):
             require_untracked_ignored(main, path.relative_to(main).as_posix())
-    record = staff.snapshot()
     rows = tuple(record.find(kind="unit", parent=production.owner.id))
     resolver = session_staff.RowResolver(record)
     state = checkout_ready(production)
@@ -748,14 +763,19 @@ def ci_steps(production: Production, tip: str, no_ci: bool,
 def promote_main(production: Production, lines: list[str], no_ci: bool,
                  ci_green: CommitVerdict | VerdictMissing,
                  smoke_passed: CommitVerdict | VerdictMissing,
-                 verdict_checked: bool = False) -> str:
+                 checked_tip: CommitVerdict | VerdictMissing = VERDICT_MISSING) -> str:
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("promote", "held", "merge branch does not exist")
-    tip = checked(production.checkout, "promote", "rev-parse", "HEAD")
-    if not verdict_checked:
+    tip = state.tip
+    if isinstance(checked_tip, VerdictMissing):
         ci_steps(production, tip, no_ci, ci_green, smoke_passed)
+    elif checked_tip.sha != tip:
+        raise LifecycleStop("promote", "held", f"checked tip {checked_tip.sha} differs from integration tip {tip}")
     with main_push_lock.main_push_lock(production.checkout):
+        current = checked(production.checkout, "promote", "rev-parse", "HEAD")
+        if current != tip:
+            raise LifecycleStop("promote", "held", f"integration tip changed from {tip} to {current}")
         try:
             conflicts = main_sync.live_file_conflicts(main_checkout(production.checkout), tip)
         except production_doc.ProductionPathsError as error:
@@ -1062,11 +1082,14 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if merged is BranchMergeState.UNMERGED:
                 raise LifecycleStop("worktree", "held", f"{unit.name} branch {unit.branch} is not merged")
             report("worktree", "ok", f"{unit.name} clean and merged")
-        _ = checked(production.checkout, "push", "push", "origin", production.merge_branch)
+        current = checked(production.checkout, "wrap", "rev-parse", "HEAD")
+        if current != tip:
+            raise LifecycleStop("wrap", "held", f"integration tip changed from {tip} to {current}")
+        _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/{production.merge_branch}")
         report("push", "ok", f"{production.merge_branch} pushed")
         _ = checked(production.checkout, "main", "fetch", "origin", "main")
-        commit_count = checked(production.checkout, "main", "rev-list", "--count", "origin/main..HEAD")
-        tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, verdict_checked=True)
+        commit_count = checked(production.checkout, "main", "rev-list", "--count", f"origin/main..{tip}")
+        tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, checked_tip=CommitVerdict(tip))
     if isinstance(status, ProductionRunning):
         _ = capture_release(production.name, record=record)
     for item in prepared:
@@ -1120,10 +1143,15 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
         _ = command("notifier", production.checkout, str(notifier), "remove", showrunners.timer_name(production.name))
         report("notifier", "ok", "update timer removed")
-        updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
-                   for line in lines]
         with investigation.recipient_locks(runner.id):
-            write_text_atomic(production.doc, "\n".join(updated) + "\n")
+            document = production.doc.read_text(encoding="utf-8", newline="")
+            current_status = doc_status(document.splitlines())
+            if isinstance(current_status, ProductionPlanned):
+                raise LifecycleStop("wrap", "held", "production status changed to planned")
+            if isinstance(current_status, ProductionRunning):
+                updated = re.sub(r"(?m)^> \*\*Status: PRODUCTION — running\.\*\*",
+                                 "> **Status: PRODUCTION — wrapped.**", document, count=1)
+                write_text_atomic(production.doc, updated)
     doc_paths = [] if enrolled else [doc_path_in_checkout(production, production.doc)]
     archive = None if enrolled else archived_doc(production)
     if archive is not None:

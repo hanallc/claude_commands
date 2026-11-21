@@ -25,6 +25,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
 from scripts.lint.memory_test_support import config_environment
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.production.test_production_doc import enrolled_document
 
 
@@ -109,7 +110,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex"),
             **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": "/nonexistent/herdr",
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
             "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
@@ -198,8 +199,17 @@ class WorktreeLifecycleTests(unittest.TestCase):
         state = self.state / "made"
         state.mkdir(parents=True)
         other_repo = self.root / "other"
+        _ = self.git(self.root, "init", "--initial-branch=main", str(other_repo))
+        staff_file = Path(self.environment["STAFF_FILE"])
+        fields = cast(dict[str, object], json.loads(staff_file.read_text()))
+        runner = cast(list[dict[str, object]], fields["rows"])[0]
+        runner["name"] = CARGO_LINER_PRODUCTION
+        document = Path(cast(str, cast(dict[str, object], runner["doc"])["path"]))
+        _ = document.write_text(f"- **Repository:** {self.repository}\n")
+        _ = staff_file.write_text(json.dumps(fields))
+        target_branch = f"{CARGO_LINER_PRODUCTION}-merges-integration"
         for name, repository, target in (("cargo", self.repository, "main"),
-                                         ("integration", self.repository, "integration"),
+                                         ("integration", self.repository, target_branch),
                                          ("other", other_repo, "main")):
             path = self.trees / name
             _ = self.record_path(path).write_text(json.dumps({
@@ -209,16 +219,22 @@ class WorktreeLifecycleTests(unittest.TestCase):
             }))
         receipt = self.root / "retarget.json"
         python = self.home / ".claude/scripts/lib/py"
-        arguments = [str(python), str(WORKTREES), "cargo-liner-target",
-                     str(self.repository), "integration", str(receipt)]
-        for switches, target, count in (([], "integration", 1), ([], "integration", 0),
-                                         (["--reverse"], "main", 1), (["--reverse"], "main", 0)):
-            with self.subTest(reverse=bool(switches), count=count):
-                result = self.command(self.repository, arguments + switches)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f"updated {count}", result.stdout)
-                for name, expected in (("cargo", target), ("integration", "integration"), ("other", "main")):
-                    record = cast(MadeWorktree, json.loads(self.record_path(self.trees / name).read_text()))
+        arguments = [str(python), str(WORKTREES), "cargo-liner-target"]
+        for repository, switches, target, count in (
+                (other_repo, [], "main", 0),
+                (self.repository, [], target_branch, 1), (self.repository, [], target_branch, 0),
+                (self.repository, ["--reverse"], "main", 1), (self.repository, ["--reverse"], "main", 0)):
+            with self.subTest(repository=repository, reverse=bool(switches), count=count):
+                result = self.command(self.repository, arguments + [str(repository), target_branch, str(receipt)] + switches)
+                if repository == other_repo:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("expected the cargo-liner production repository", result.stderr)
+                    self.assertFalse(receipt.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"updated {count}", result.stdout)
+                for name, expected in (("cargo", target), ("integration", target_branch), ("other", "main")):
+                    record = self.record(self.trees / name)
                     self.assertEqual(record["merge_branch"], expected)
 
     def make(self, tree: Path, branch: str) -> None:
