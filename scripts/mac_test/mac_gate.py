@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass
+from enum import StrEnum
 import fcntl
 import json
 import os
@@ -48,6 +49,11 @@ RESULT_PREFIX = 'mac_gate_result='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
 MAC_TIME_LIMIT_S = 3600
+
+
+class CheckoutCleanup(StrEnum):
+    REMOVED = 'mac_gate_cleaned'
+    RETAINED = 'mac_gate_retained'
 
 
 @dataclass(frozen=True)
@@ -157,14 +163,14 @@ def read_checkout(folder: Path) -> Path:
     return path
 
 
-def stop_checkout(folder: Path) -> None:
+def stop_checkout(folder: Path) -> CheckoutCleanup:
     root = (Path.home() / REMOTE_ROOT).resolve()
     if folder.resolve() != root / attempt_name(folder):
         raise GateRefused('The folder is outside the Mac gate state directory')
     try:
         lock = (folder / 'cleanup.lock').open('a')
     except FileNotFoundError:
-        return
+        return CheckoutCleanup.REMOVED
     with lock:
         grace = conf.read('mac_gate').number('terminate_grace_seconds')
         deadline = time.monotonic() + admission_records.read_memory_config().program_stop_seconds + grace
@@ -177,15 +183,37 @@ def stop_checkout(folder: Path) -> None:
                     raise GateRefused('The Mac gate cleanup lock is held') from None
                 time.sleep(0.05)
         if not folder.exists():
-            return
-        stop_guest(folder, deadline)
+            return CheckoutCleanup.REMOVED
+        receipt = folder / 'task-ended.json'
+        cleanup_paths: dict[str, object]
+        try:
+            cleanup_paths = cloud_gate.read(receipt)
+        except FileNotFoundError:
+            stop_guest(folder, deadline)
+            # Until Mac promotion, scratch.end can return removed paths and a separate kept list.
+            ended = cast(Sequence[Path | scratch.KeptFolder], scratch.end(checkout_task(folder)))
+            legacy_kept = cast(Sequence[scratch.KeptFolder], getattr(ended, 'kept', ()))
+            for entry in legacy_kept:
+                print(f'kept for a manual removal list: {entry.path} (scratch, {entry.reason})', file=sys.stderr)
+            cleanup_paths = {str(entry): 'removed' for entry in ended if isinstance(entry, Path)}
+            cleanup_paths.update({str(entry.path): entry.reason for entry in (*ended, *legacy_kept)
+                                  if isinstance(entry, scratch.KeptFolder)})
+            cloud_gate.save(receipt, cleanup_paths)
         paths: set[Path] = {read_checkout(folder)} if (folder / 'checkout.json').exists() else set()
-        ended = scratch.end(checkout_task(folder))
-        if ended.kept:
-            raise GateRefused(f'The Mac kept {ended.kept[0].path}: {ended.kept[0].reason}')
-        for path in paths.union(ended):
-            copies.unregister_remote('localhost', str(path))
-        shutil.rmtree(folder)
+        paths.update(Path(name) for name in cleanup_paths)
+        outcome = CheckoutCleanup.REMOVED
+        for path in sorted(paths):
+            if not path.is_absolute():
+                raise GateRefused('The Mac retained folder path is not absolute')
+            try:
+                _ = path.lstat()
+            except FileNotFoundError:
+                copies.unregister_remote('localhost', str(path))
+            else:
+                outcome = CheckoutCleanup.RETAINED
+        if outcome is CheckoutCleanup.REMOVED:
+            shutil.rmtree(folder)
+        return outcome
 
 
 def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> Path:
@@ -243,15 +271,17 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
     cleanup = (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
-               f'else rm -rf -- {root}; fi')
+               f'else rm -rf -- {root} && printf "{CheckoutCleanup.REMOVED}\\n"; fi')
     if phase == 'cleanup':
-        result = subprocess.run([*ssh, cleanup + ' && printf "mac_gate_cleaned\n"'],
-                                capture_output=True, text=True, check=False)
-        if result.returncode or result.stdout.strip() != 'mac_gate_cleaned':
+        result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
+        outcome = result.stdout.strip()
+        if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
             detail = ' '.join(result.stderr.split()) or 'The Mac did not confirm checkout cleanup'
             print(f'{CLEANUP_ERROR_PREFIX}{folder.name}:{detail}', flush=True)
             return 1
-        if checkout_file.exists():
+        if result.stderr:
+            print(result.stderr, end='', file=sys.stderr)
+        if outcome == CheckoutCleanup.REMOVED and checkout_file.exists():
             copies.unregister_remote(host, checkout_file.read_text())
         return 0
 
@@ -320,6 +350,8 @@ def record_guest(folder: Path, repo: Path) -> Generator[None]:
     recovery = MacGateRecovery(folder / 'run.json', str(repo.resolve()), pid, owner.start)
     with (folder / 'cleanup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if (folder / 'task-ended.json').exists():
+            raise GateRefused('The Mac gate checkout task has ended')
         recovery.save()
     recovery_token = gate.ACTIVE_GATE_RECOVERY.set(recovery)
     try:
@@ -535,8 +567,7 @@ def main() -> int:
         elif args.action == 'guest':
             print(RESULT_PREFIX + json.dumps(run_guest(args.folder, full=args.full == '1')), flush=True)
         elif args.action == 'stop':
-            if args.folder.exists():
-                stop_checkout(args.folder)
+            print(stop_checkout(args.folder))
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
