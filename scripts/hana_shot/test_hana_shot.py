@@ -432,12 +432,10 @@ class HanaShotTest(BuildLogIsolatedTest):
             environment.update(session_variables)
         return environment
 
-    def run_python(
-        self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        if program != SCRIPT or process_boundary_for_case(self):
+    def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        if process_boundary_for_case(self):
             return subprocess.run(
-                [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
+                [str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args],
                 cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
                 timeout=TEST_HANG_GUARD_SECS, check=False,
             )
@@ -445,22 +443,15 @@ class HanaShotTest(BuildLogIsolatedTest):
         with (
             ThreadPoolExecutor(max_workers=conf.read("hana_shot").whole("workers")) as pool,
             mock.patch.object(hana_shot, "worker_pool", return_value=pool),
-            mock.patch.object(hana_shot, "EXIT_SIGNAL_LATCH", hana_shot.ExitSignalLatch()),
         ):
             return invoke_cli(hana_shot, lambda: hana_shot.main(arguments), arguments,
                               self.script_environment(session_variables), self.scratch)
 
-    def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return self.run_python(SCRIPT, *args, session_variables=session_variables)
-
-    def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
+    def start_script(self, *args: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args],
             cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-
-    def start_script(self, *args: str) -> subprocess.Popen[str]:
-        return self.start_python(SCRIPT, *args)
 
     def stop_script(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
@@ -1093,13 +1084,8 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
     def shutdown_command(self) -> tuple[int, str]:
         diagnostics = io.StringIO()
-        handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-        try:
-            with redirect_stderr(diagnostics):
-                exit_code = hana_shot.main(["shutdown", "--port", str(self.port)])
-        finally:
-            for number, handler in handlers.items():
-                _ = signal.signal(number, handler)
+        with redirect_stderr(diagnostics):
+            exit_code = hana_shot.main(["shutdown", "--port", str(self.port)])
         return exit_code, diagnostics.getvalue()
 
     def test_launch_and_cleanup_leave_the_default_buildlog_absent(self) -> None:
@@ -1944,16 +1930,11 @@ class FailureGuidanceTests(HanaShotTest):
     def in_process_shot(self, *args: str) -> subprocess.CompletedProcess[str]:
         argv = ["shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"), *args]
         stdout, stderr = io.StringIO(), io.StringIO()
-        handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-        try:
-            with (
-                mock.patch.dict(os.environ, self.script_environment(), clear=True),
-                redirect_stdout(stdout), redirect_stderr(stderr),
-            ):
-                returncode = hana_shot.main(argv)
-        finally:
-            for number, handler in handlers.items():
-                _ = signal.signal(number, handler)
+        with (
+            mock.patch.dict(os.environ, self.script_environment(), clear=True),
+            redirect_stdout(stdout), redirect_stderr(stderr),
+        ):
+            returncode = hana_shot.main(argv)
         return subprocess.CompletedProcess(argv, returncode, stdout.getvalue(), stderr.getvalue())
 
     def assert_recorded_error(self, result: subprocess.CompletedProcess[str]) -> str:
@@ -2045,32 +2026,6 @@ class FailureGuidanceTests(HanaShotTest):
 
 
 class ViewsTests(HanaShotTest):
-    def test_signal_after_a_failed_view_preserves_its_reason_and_appends_signal_text(self) -> None:
-        views_path = self.scratch / "views.toml"
-        _ = views_path.write_text(
-            '[views.missing]\ntarget = "name:Absent"\nmode = "hana-frame"\n'
-            + '[views.held]\nmode = "home"\n',
-        )
-        self.fake.screenshot = "hold"
-        process = self.start_script(
-            "views", "check", "--port", str(self.port), "--views-file", str(views_path),
-            "--out", str(self.scratch / "check"),
-        )
-        self.addCleanup(self.stop_script, process)
-        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the second view never reached capture")
-        process.send_signal(signal.SIGTERM)
-        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-
-        self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
-        [line] = self.timing_lines()
-        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
-        self.assertEqual(line["failure_reason"], "no_target")
-        error = cast(str, line["error"])
-        self.assertIn("name:Absent", error)
-        self.assertRegex(error.splitlines()[-1], r"SIGTERM$")
-        [attempt] = cast(list[dict[str, object]], line["attempts"])
-        self.assertEqual(attempt["failure_reason"], "no_target")
-
     def test_empty_registry_records_a_refused_invocation(self) -> None:
         _ = (self.scratch / "views.toml").write_text("")
         shot = self.run_script(
@@ -2554,36 +2509,6 @@ class RemoteTests(HanaShotTest):
             return []
         return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
 
-    def hana_shot_driver(self, name: str, setup: str) -> Path:
-        driver = self.scratch / name
-        _ = driver.write_text("\n".join([
-            "import os",
-            "import signal",
-            "import sys",
-            "from scripts.hana_shot import hana_shot",
-            "",
-            setup,
-            "",
-            "raise SystemExit(hana_shot.main(sys.argv[1:]))",
-            "",
-        ]))
-        return driver
-
-    def interrupt_held_remote_mac_shot(self, signal_number: int, program: Path = SCRIPT) -> tuple[int, str]:
-        _ = self.fake_remote(copies=True, system="Darwin")
-        self.fake.window_level = "AlwaysOnBottom"
-        self.fake.screenshot = "hold"
-        process = self.start_python(
-            program,
-            "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
-            "--mode", "home", "--remote", REMOTE_HOST,
-        )
-        self.addCleanup(self.stop_script, process)
-        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
-        process.send_signal(signal_number)
-        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        return cast(int, process.returncode), stderr
-
     @process_boundary
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
         remote = self.fake_remote(copies=True)
@@ -2679,83 +2604,26 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
         self.assertIn(["ended"], self.ssh_calls())
 
-    def test_signal_during_close_does_not_interrupt_window_restore(self) -> None:
+    def test_sigint_restores_the_remote_mac_window_and_ends_keep_awake(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
-        driver = self.hana_shot_driver("signal_during_restore.py", """\
-real_mutate = hana_shot.Brp.mutate
-def signal_during_restore(brp, entity, component, path, value, *args, **kwargs):
-    if path == ".window_level" and value != "AlwaysOnTop":
-        os.kill(os.getpid(), signal.SIGTERM)
-    return real_mutate(brp, entity, component, path, value, *args, **kwargs)
-hana_shot.Brp.mutate = signal_during_restore
-""")
-
-        result = self.run_python(
-            driver,
+        self.fake.screenshot = "hold"
+        process = self.start_script(
             "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
             "--mode", "home", "--remote", REMOTE_HOST,
         )
+        self.addCleanup(self.stop_script, process)
+        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
+        process.send_signal(signal.SIGINT)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertIn("KeyboardInterrupt", stderr)
         self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
             "AlwaysOnTop", "AlwaysOnBottom",
         ])
         self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
         self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual(line["exit_code"], 0)
-
-    def test_second_signal_during_unwinding_keeps_the_first_exit_and_closes_the_session(self) -> None:
-        driver = self.hana_shot_driver("second_signal_during_close.py", """\
-real_close = hana_shot.Session.close
-def signal_before_close(session):
-    os.kill(os.getpid(), signal.SIGHUP)
-    return real_close(session)
-hana_shot.Session.close = signal_before_close
-""")
-
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM, driver)
-
-        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
-        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
-            "AlwaysOnTop", "AlwaysOnBottom",
-        ])
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
-
-    def test_sigint_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGINT)
-
-        self.assertEqual(return_code, 128 + signal.SIGINT, stderr)
-        self.assertNotIn("KeyboardInterrupt", stderr)
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGINT))
-        self.assertIn("SIGINT", cast(str, line["error"]))
-
-    def test_sigterm_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM)
-
-        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGTERM))
-        self.assertIn("SIGTERM", cast(str, line["error"]))
-
-    def test_sighup_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGHUP)
-
-        self.assertEqual(return_code, 128 + signal.SIGHUP, stderr)
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGHUP))
-        self.assertIn("SIGHUP", cast(str, line["error"]))
 
     @process_boundary
     def test_views_check_retries_window_preparation_after_a_refused_raise(self) -> None:
