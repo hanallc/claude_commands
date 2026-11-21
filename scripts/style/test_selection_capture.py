@@ -16,6 +16,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.message.session_send import PYTHON_LAUNCHER
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.style import refill_measure, selection_capture, style_config, style_ledger, style_reader
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
@@ -223,7 +224,7 @@ class SelectionCaptureTests(StylePlanFixture):
                         _ = operation(folder, style_config.ReaderSource.PYTHON, self.root)
                 for command in ("replay", "measure"):
                     result = subprocess.run(
-                        [sys.executable, "-m", "scripts.style.selection_capture", command,
+                        [str(PYTHON_LAUNCHER), "-m", "scripts.style.selection_capture", command,
                          "--folder", str(folder), "--workspace", str(self.root), "--reader", "python"],
                         capture_output=True, text=True, check=False)
                     self.assertEqual(result.returncode, 2)

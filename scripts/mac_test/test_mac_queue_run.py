@@ -21,6 +21,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message.session_send import PYTHON_LAUNCHER
 
 
 QUEUE = r'''
@@ -123,7 +124,8 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
 
 class QueueRunTests(unittest.TestCase):
     def command(self, root: Path, kind: str = "shot") -> list[str]:
-        return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
+        return [str(PYTHON_LAUNCHER), "-m", "scripts.mac_test.mac_queue_run",
+                "--what", "camera shot", "--kind", kind,
                 "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",
                 "/bin/zsh", "-c", "cargo build -p hana; printf '%s' 'quoted value'"]
 

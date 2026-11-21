@@ -52,6 +52,7 @@ from scripts.mac_test.offload_test_support import (
 )
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.session_send import PYTHON_LAUNCHER
 
 RUN_SUBPROCESS = subprocess.run
 START_SUBPROCESS = subprocess.Popen
@@ -304,8 +305,9 @@ class RunnerCompletionTests(unittest.TestCase):
         reader, writer = os.pipe()
         os.close(reader)
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONUNBUFFERED"}
+        environment["CLAUDE_PYTHON"] = sys.executable
         with os.fdopen(writer, "wb") as pipe:
-            result = subprocess.run([sys.executable, "-c", program], stdout=pipe, stderr=subprocess.PIPE,
+            result = subprocess.run([str(PYTHON_LAUNCHER), "-c", program], stdout=pipe, stderr=subprocess.PIPE,
                                     cwd=Path(__file__).resolve().parents[2], env=environment, text=True,
                                     check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 7, result.stderr)

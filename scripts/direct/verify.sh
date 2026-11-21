@@ -56,8 +56,10 @@
 # A waiting local test can retry on the Mac.
 #
 # --test <name> runs one integration test target.
+# Use --package <name> or the positional package to select a package.
+# A filtered run in a workspace with multiple packages requires a package.
 # Repeat --filter <name> to select tests that contain any named text.
-# --run-ignored only selects ignored tests; with no package, all packages.
+# --run-ignored only selects ignored tests.
 # Do not combine an integration test target with --filter.
 # --features <list> enables features for the package.
 # Also add workspace.metadata.dev.features.
@@ -375,6 +377,7 @@ parse_routing_arguments() {
 # Parse the package separately from flags and their values.
 parse_command_arguments() {
     local ignored_only=0 integration_target=0
+    FILTER_RUN=0
     VERIFY_PACKAGE=""
     COMMAND_ARGS=()
     SAVED_FINAL=0
@@ -401,9 +404,16 @@ parse_command_arguments() {
                     exit 2
                 fi
                 ignored_only=1
+                FILTER_RUN=1
                 COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
+            --package)
+                if [[ "$CMD" != test || -n "$VERIFY_PACKAGE" || -z "${2:-}" || "$2" == -* ]]; then
+                    command_help "$CMD" >&2; exit 2
+                fi
+                VERIFY_PACKAGE=$2; shift 2 ;;
             --features|--filter|--bin|--example|--target|--env|--fetch|--mac|--local)
                 [[ $# -ge 2 ]] || { command_help "$CMD" >&2; exit 2; }
+                if [[ "$CMD" == test && "$1" == --filter ]]; then FILTER_RUN=1; fi
                 COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
             --*) COMMAND_ARGS+=("$1"); shift ;;
             *)
@@ -1126,7 +1136,7 @@ load_metadata() {
     [[ "$METADATA_READY" == 0 ]] || return 0
     local values features="" kind="" name="" valid=1
     local requests=() words=("${ARGS[@]:1}")
-    local package="${ARGS[0]:-}" index word
+    local package="${ARGS[0]:-}" index word test_mode=""
     if [[ "${CHECK_UNTESTED_EXAMPLES:-0}" == 1 ]]; then
         requests+=("untested-examples:$EXAMPLE_SCOPE")
     fi
@@ -1149,7 +1159,8 @@ load_metadata() {
             done
             features="$(merge_dev_features "$features")"
             features="$(qualify_features "$package" "$features")"
-            requests+=("test-targets:$package:$features")
+            if [[ "$FILTER_RUN" == 1 ]]; then test_mode=:filtered; fi
+            requests+=("test-targets:$package:$features$test_mode")
             ;;
         build)
             # Match take_build_args without emitting its usage error early:
@@ -1907,7 +1918,6 @@ TOKEN_WAIT_FILE=""
 LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
-FILTER_RUN=0
 BUILDLOG_MAC=""
 BUILDLOG_MAC_HOLDER=""
 BUILDLOG_MAC_REASON=""
@@ -1920,9 +1930,6 @@ BUILDLOG_MAC_COPY_S=""
 BUILDLOG_MAC_COPY_COUNT=""
 BUILDLOG_MAC_COPY_NATEDEV_S=""
 export BUILDLOG_TARGET=""
-if [[ "$CMD" == test && ( " ${ARGS[*]} " == *" --filter "* || " ${ARGS[*]} " == *" --run-ignored "* ) ]]; then
-    FILTER_RUN=1
-fi
 if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
     BUILDLOG_MAC=declined
     BUILDLOG_MAC_REASON=local_flag
@@ -3553,6 +3560,8 @@ if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     else
         EXAMPLE_SCOPE="${ARGS[0]:---workspace}"
     fi
+    load_metadata
+elif [[ "$CMD" == test && "$FILTER_RUN" == 1 && -z "$VERIFY_PACKAGE" ]]; then
     load_metadata
 fi
 # A test record's key reads the package's dependencies from it (tree_key).

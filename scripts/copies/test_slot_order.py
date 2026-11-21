@@ -40,6 +40,7 @@ from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
+from scripts.message.session_send import PYTHON_LAUNCHER
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, staff, waiting
@@ -146,7 +147,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
-            "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
+            "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
             "HERDR_BIN": "/nonexistent/herdr", "BUILDLOG_RUN": ""})))
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             _ = os.environ.pop(key, None)
@@ -194,15 +195,15 @@ class SlotOrderTests(unittest.TestCase):
 
     def start(self, command: tuple[str, ...], *options: str, since_age: float = 0,
               separate_command: bool = True) -> subprocess.Popen[str]:
-        launcher = [sys.executable, "-m", "scripts.copies.copies"]
+        entry = ["-m", "scripts.copies.copies"]
         if since_age:
             program = ("import sys,time; from types import SimpleNamespace; from unittest.mock import patch; "
                 + "from scripts.copies import copies; from scripts.build_queue import first_step; "
                 + f"clock=SimpleNamespace(time=lambda: time.time()-{since_age!r})\n"
                 + "with patch.object(first_step, 'time', clock): raise SystemExit(copies.main(sys.argv[1:]))\n")
-            launcher = [sys.executable, "-c", program]
+            entry = ["-c", program]
         separator = ["--"] if separate_command else []
-        process = subprocess.Popen([*launcher, "run", "--repo", str(self.source),
+        process = subprocess.Popen([str(PYTHON_LAUNCHER), *entry, "run", "--repo", str(self.source),
             "--commit", "HEAD", *options, *separator, *command], cwd=CHECKOUT, env=dict(os.environ),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.processes.append(process)
@@ -659,7 +660,8 @@ placement_once
         environment = {**tools.environment, **{key: os.environ[key] for key in (
             "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
             "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
-            "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": ""}
+            "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "LINT_SKIP_SWEEP": "1"}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
         _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
