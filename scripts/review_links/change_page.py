@@ -308,7 +308,7 @@ class QuestionAnswerRefused(question_record.AnswerRefused):
 
 
 class ChangeHandoffRefused(QuestionAnswerRefused):
-    """A showrunner already owns the next action for the change."""
+    """The change cannot accept this action in its current state."""
 
 
 class FeatureLogFailed(RuntimeError):
@@ -1497,14 +1497,13 @@ class DeliveryStatus:
                 if question.text != text or isinstance(question, OpenFeedback) != (kind == "feedback"):
                     raise question_record.AnswerRefused("this row already has an open question")
                 return NoDelivery()
-            return self.ask_locked(page, row, slots, text, recipients, kind)
+            return self.ask_locked(page, row, slots, text, recipients, kind, question_id=secrets.token_hex(4))
 
     def ask_locked(self, page: ReviewPage, row: str, slots: DeliverySlots, text: str,
                    recipients: tuple[staff.StaffId, ...], kind: Literal["question", "feedback"], *,
-                   during_validation: bool = False) -> QuestionDelivery:
+                   question_id: str, during_validation: bool = False) -> QuestionDelivery:
         reason = delivery_state.require_waiting_why(text)
         intent = DeliveryIntent(secrets.token_hex(), "question", recipients=recipients)
-        question_id = secrets.token_hex(4)
         request = OpenFeedback if kind == "feedback" else OpenQuestion
         updated = replace(slots, question=request(question_id, text, intent))
         if not during_validation:
@@ -1532,10 +1531,10 @@ class DeliveryStatus:
             completed = AnsweredQuestion
             if isinstance(question, OpenFeedback):
                 completed = CompletedFeedback
-                words = "feedback: " + question.text
                 events = review_events.decode(record.get("Review log", ""))
-                if not any(event.words.rstrip().splitlines() == words.rstrip().splitlines() for event in events):
-                    change_review.record_review_log(page.review_list, row, words, production)
+                if not any(event.matches_feedback(question.question_id, question.text) for event in events):
+                    change_review.record_review_log(page.review_list, row, "feedback: " + question.text, production,
+                                                    feedback_request_id=question.question_id)
             with change_review.clear_change_later(page.review_list, row):
                 self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)))
             return True
@@ -1946,8 +1945,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         failed = review_question_failed(delivery, page, row["#"], question)
         warning = ""
         if notice.reason and notice.row == row["#"]:
-            reason = WITH_SHOWRUNNER if not verdict and not slots.waits_for_user(False) else notice.reason
-            warning = "Not saved: " + reason
+            warning = "Not saved: " + notice.reason
         alert = f'<p role="alert">{html.escape(warning)}</p>' if warning else ""
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
         status_text = answer_status(verdict, slots)
@@ -2152,6 +2150,17 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str,
         raise FeatureLogFailed(message) from error
 
 
+def feedback_request_id(token: str, row: dict[str, str], words: str, slots: DeliverySlots) -> str:
+    """Keep the ID when a Send retries before the delivery slot changes."""
+    if isinstance(slots.question, AnsweredQuestion):
+        previous = slots.question.question_id
+    else:
+        log = review_events.decode(row.get("Review log", ""))
+        previous = next((event.time.isoformat() for event in reversed(log) if not event.feedback_request_id), "")
+    request = json.dumps((token, row["#"], words.splitlines(), previous))
+    return hashlib.sha256(request.encode()).hexdigest()[:32]
+
+
 def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
            prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS,
            feedback_closes: bool = False, defer_verdict_cleanup: bool = False) -> MessageDelivery | NoMessageDelivery:
@@ -2186,8 +2195,9 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
     recipients = owner.showrunner_recipients
     if outcome in CHANGE_HANDOFFS:
         with status.locked():
-            if answer_row(page, row_id).get("Verdict"):
-                raise question_record.AnswerRefused("this row already has a saved answer")
+            current = answer_row(page, row_id)
+            if current.get("Verdict"):
+                raise ChangeHandoffRefused("this row already has a saved answer")
             slots = status.slots(page, row_id)
             if during_validation:
                 recipients = status.validators(page, row_id)
@@ -2218,11 +2228,14 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
                 message = validation_message(message_page, row, attempt, feedback)
             else:
                 request_feedback = outcome == "feedback"
+                question_id = (feedback_request_id(token, current, fields["feedback"][0], slots)
+                               if request_feedback else secrets.token_hex(4))
                 if request_feedback:
-                    change_review.record_review_log(page.review_list, row_id, "feedback: " + feedback, message_page.production)
+                    change_review.record_review_log(page.review_list, row_id, "feedback: " + feedback,
+                                                    message_page.production, feedback_request_id=question_id)
                 intent = status.ask_locked(page, row_id, slots, feedback, recipients,
                                             "feedback" if request_feedback else "question",
-                                            during_validation=during_validation)
+                                            question_id=question_id, during_validation=during_validation)
                 attempt = intent.attempt
                 message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback,
                                            sender=sender)

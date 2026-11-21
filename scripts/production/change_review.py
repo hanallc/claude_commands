@@ -1803,7 +1803,7 @@ def _verdict_write(
             removed_image = image
             cells[IMAGE] = ""
         if superseded:
-            append_row_review_log(cells, superseded, "nate", datetime.now().astimezone(user_zone()))
+            append_row_review_log(cells, review_events.ReviewLog(datetime.now(user_zone()), "nate", superseded))
         _move_to_reviewed(path, lines, cells, verdict, day)
         return VerdictRecorded(row_merge(cells))
 
@@ -1970,9 +1970,8 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
     return snapshots
 
 
-def append_row_review_log(cells: dict[str, str], words: str, who: str, now: datetime) -> None:
+def append_row_review_log(cells: dict[str, str], event: review_events.ReviewLog) -> None:
     events = review_events.decode(_plain(cells.get("Review log", "")))
-    event = review_events.ReviewLog(now, who, words)
     cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
 
 
@@ -1987,15 +1986,16 @@ def _append_review_log(path: Path, lines: list[str], row: str, event: review_eve
         columns, first, end = _table(path, lines, section)
         index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
         cells = dict(zip(columns, _cells(lines[index])))
-        append_row_review_log(cells, event.words, event.who, event.time)
+        append_row_review_log(cells, event)
         lines[index] = _row(path, columns, cells)+"\n"
         return
 
 
-def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
+def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate", *,
+                      feedback_request_id: str = "") -> None:
     """Keep the user's Review action in the authoritative table row."""
     now = datetime.now().astimezone(user_zone())
-    event = review_events.ReviewLog(now, who, words)
+    event = review_events.ReviewLog(now, who, words, feedback_request_id)
     _edit(path, production, now.date(), lambda lines: _append_review_log(path, lines, row, event),
           lambda _: f"review {row}")
 

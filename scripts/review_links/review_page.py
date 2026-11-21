@@ -27,7 +27,7 @@ from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, review_submissions
-from scripts.review_links import question_record, review_actions, staff_names
+from scripts.review_links import question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
 
@@ -94,6 +94,26 @@ def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
     retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''),
                 assets.get('submission:'+item.key, ''))
     return hashlib.sha256(repr(retained).encode()).hexdigest()[:16]
+
+
+def _matches_feedback_retry(item: ReviewItem, assets: Mapping[str, str], revision: str, token: str, words: str) -> bool:
+    """Check the revision before the interrupted Send added its log entry."""
+    source = item.source
+    if not isinstance(source, review_items.ChangeSource) or item.state != ReviewState.OPEN:
+        return False
+    request_id = change_page.feedback_request_id(token, source.row, words, source.slots)
+    log = review_events.decode(source.row.get('Review log', ''))
+    if not log or log[-1].feedback_request_id != request_id:
+        return False
+    row = dict(source.row)
+    previous = log[:-1]
+    row['Review log'] = review_events.encode(previous) if previous else ''
+    if record_revision(replace(item, source=replace(source, row=row)), assets) == revision:
+        return True
+    if previous:
+        return False
+    del row['Review log']
+    return record_revision(replace(item, source=replace(source, row=row)), assets) == revision
 
 
 def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot) -> list[ReviewIndexEntry]:
@@ -873,8 +893,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
                 if isinstance(question, change_page.AnsweredQuestion):
                     exchange += '<section><h3>Answer from '+escaped+'</h3>'+change_browser.answer_html(question.answer)+'</section>'
         else:
-            if isinstance(question, change_page.OpenQuestion):
-                body += section('Feedback' if isinstance(question, change_page.OpenFeedback) else 'Question', question.text)
+            if isinstance(question, change_page.OpenQuestion) and not isinstance(question, change_page.OpenFeedback):
+                body += section('Question', question.text)
             elif isinstance(question, change_page.AnsweredQuestion):
                 body += answer_section(question.answer)
         if path := inputs.assets.get('image:'+item.key):
@@ -1048,7 +1068,9 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             retain_asset(current, assets)
         except FileNotFoundError:
             raise review_items.ReviewRecordMissing('This item is no longer on the list.') from None
-        if fields.get('revision', [''])[0] != record_revision(current, assets):
+        revision = fields.get('revision', [''])[0]
+        if revision != record_revision(current, assets) and not (
+                outcome == 'feedback' and _matches_feedback_retry(current, assets, revision, token, words)):
             raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         return current
 

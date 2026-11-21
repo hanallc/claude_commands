@@ -660,6 +660,7 @@ The record and the owner's production log retain the superseded wait.
 Questions archive the old followup before the new action saves.
 The Review and change pages use one server check to refuse another change action during an open hand-off.
 The refusal preserves the request and its delivery state.
+The selected Changes route shows the reason from the shared check when the change is Done or with the showrunner.
 Investigations close or replace their open request.
 Proposals replace their review mark; efficiencies also clear a deferred ledger state.
 The primary button comes first.
@@ -667,7 +668,13 @@ The shared sender handles all five types, including retries, owner alerts and st
 Send feedback sends the words to the owner.
 It finishes the item for questions, investigations, proposals and efficiencies.
 It transfers a change to the showrunner until the showrunner records what they did.
-The change log shows the feedback once and includes the showrunner's reply.
+The Review log stores feedback with its request ID.
+The Review card shows feedback in its log.
+It matches a log entry with a request ID by that ID.
+For a legacy entry without a request ID, the card matches the feedback text on the same row.
+The card uses the delivery record when no log entry matches.
+An older change with only the showrunner's reply in its log shows both the feedback and the reply.
+If a delivery slot write fails, a retry of the same Send keeps its ID and uses the existing log entry.
 Ask question sends the words to the owner.
 A question from Open moves the item to Waiting.
 The owner’s answer returns that item to Open.

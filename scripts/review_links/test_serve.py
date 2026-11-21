@@ -25,7 +25,7 @@ from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
@@ -2438,6 +2438,31 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(log.count(event), 1)
         self.assertFalse((case.fixture.repo / 'destination.log').exists())
         self.assertFalse((case.fixture.repo / 'renamed.log').exists())
+
+    def test_selected_change_returns_the_shared_handoff_refusal(self) -> None:
+        case = self.review_fixture(changes=2)
+        listing = case.fixture.review_list
+        production = case.fixture.production
+        token = 'stale-selection'
+        folder = self.root / 'z12345'
+        folder.mkdir()
+        manifest: change_page.PageManifest = {"review_list": str(listing), "production": str(production),
+                                              "rows": ["C1", "C2"], "token": token}
+        _ = (folder / change_page.MANIFEST).write_text(json.dumps(manifest), encoding='utf-8')
+        _ = change_review.record_verdict(listing, 'C1', 'works', date(2026, 11, 21), production)
+        page = change_page.page_at(self.root, '/z12345/changes.html')
+        _ = case.status.begin(page, 'C2', 'validation', 'Check the proof.')
+        claim = case.status.path(page, 'C2')
+        before = (listing.read_bytes(), claim.read_bytes(), case.fixture.messages[:])
+
+        with patch.object(self.server, 'delivery_status', case.status):
+            for row, reason in (('C1', 'this row already has a saved answer'), ('C2', change_page.WITH_SHOWRUNNER)):
+                with self.subTest(row=row):
+                    status, body = self.post('/z12345/changes.html', urlencode({
+                        'row': row, 'token': token, 'outcome': 'validate', 'feedback': ''}))
+                    self.assertEqual(status, 400, body)
+                    self.assertIn(f'<p role="alert">Not saved: {reason}</p>'.encode(), body)
+        self.assertEqual((listing.read_bytes(), claim.read_bytes(), case.fixture.messages), before)
 
     def test_review_refuses_a_verdict_while_a_change_is_validating(self) -> None:
         case = self.review_fixture(changes=1)
