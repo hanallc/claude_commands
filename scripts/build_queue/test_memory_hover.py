@@ -265,9 +265,9 @@ class MemoryHoverTests(unittest.TestCase):
         data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,
                           "reserved": 0, "call": "cargo nextest run -p demo"}],
                 "waiters": [{"kind": "repository-slot", "name": "demo test all", "need": 0,
-                             "call": "merge_gate.py --tests-only"}]}
+                             "call": "gate.py --tests-only"}]}
         for key, call in (("row:fixture-run-0", "cargo nextest run -p demo"),
-                          ("wait:fixture-wait-0", "merge_gate.py --tests-only")):
+                          ("wait:fixture-wait-0", "gate.py --tests-only")):
             with self.subTest(key=key):
                 tip = ElementTree.fromstring(str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True)))
                 self.assertEqual(tip[-2].text, "Call")
@@ -386,7 +386,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(amounts["= In queue cap"], "5.2 GiB")
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
-        row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
+        row = memory_tests.ProgressKeepAsideTests.reservation("gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True),
             progress.ProgressCounter("suites:1", 8, 10), memory_tests.ProgressKeepAsideTests.profile("suites:1", 3 * GIB // 2),
@@ -401,10 +401,10 @@ class MemoryHoverTests(unittest.TestCase):
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
         hold = room.runs[0]
         for name, counter, ordering_note in (
-            ("merge-gate", module_counter, True),
+            ("gate", module_counter, True),
             ("merge gate", module_counter, True),
             ("fixture-project merge gate", module_counter, True),
-            ("merge-gate", test_counter, False),
+            ("gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
@@ -424,7 +424,7 @@ class MemoryHoverTests(unittest.TestCase):
                               ({"used": 1, "reserved": 0, "started_at": 100}, "running 5 min")):
             with self.subTest(row=row):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
-                    "name": "merge-gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
+                    "name": "gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
                     "need": 4.0, "need_part": False, **row}]}))
                 self.assertIn(expected, hover[0])
                 if expected == "unavailable":
@@ -515,7 +515,7 @@ class MemoryHoverTests(unittest.TestCase):
                                  ("setup", progress.NoCounter("no cloud counter")), ("", progress.NoCounter("no cloud counter"))):
             with self.subTest(status=status):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"walk": [{
-                    "kind": "cloud", "machine": "aws", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
+                    "kind": "cloud", "machine": "aws", "name": "gate", "unit": "cloud-unit", "showrunner": "fixture",
                     "status": status, "activity": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
                 self.assertIn("Showrunner  fixture\nRuns on  AWS", hover[1])
                 self.assertEqual("Status  " in hover[1], bool(status))

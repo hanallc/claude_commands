@@ -24,7 +24,7 @@ from unittest import mock
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
@@ -2246,13 +2246,11 @@ assert not loaded, loaded
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
+        admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
+        self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
-            private = config.parent / source.name
-            if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
-            else:
-                self.assertEqual(private.read_bytes(), source.read_bytes())
+            if source.name != ADMISSION_CONFIG_FIXTURE.name:
+                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -2543,7 +2541,7 @@ os._exit(0)
         self.assertEqual((held / "kept").read_text(), "x")
 
     def test_an_error_in_the_tool_run_is_not_taken_as_a_name_clash(self) -> None:
-        with self.assertRaises(FileExistsError), folders.tool_folder("merge-gate"):
+        with self.assertRaises(FileExistsError), folders.tool_folder("gate"):
             raise FileExistsError("from the tool")
         self.assertEqual(list(self.root.iterdir()), [])
 
