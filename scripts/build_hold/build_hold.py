@@ -26,7 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TextIO, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
@@ -41,6 +41,7 @@ from scripts.build_hold.shared_state_defaults import (
 from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
 from scripts.message import session_send
+from scripts.message.send_result import SEND_CLOSED_EXIT
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -53,7 +54,8 @@ LOOKUP_RETRY_S = 1.0
 RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
                   "their memory gate orders them. No answer is needed.")
 
-DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
+DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "WorkerClosed", "DeliveryFailed"]
+DELIVERY_OUTCOMES = frozenset(cast(tuple[object, ...], get_args(DeliveryOutcome)))
 
 
 class ReleaseEntry(TypedDict):
@@ -165,6 +167,11 @@ class ReleaseDelivered:
 @dataclass(frozen=True)
 class ReleaseQueued:
     pass
+
+
+@dataclass(frozen=True)
+class ReleaseWorkerClosed:
+    """The sender found a closed or stopped worker with no route."""
 
 
 @dataclass(frozen=True)
@@ -1197,7 +1204,7 @@ def read_hold_cycle(path: Path) -> HoldCycle:
                 delivery = (old_delivery.get("outcome", "NotAttempted")
                             if old_delivery.get("generation") == cycle.get("holder_generation", 1)
                             else "NotAttempted")
-            if delivery not in {"NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"}:
+            if delivery not in DELIVERY_OUTCOMES:
                 raise ValueError(f"invalid delivery for entry {index}")
             normalized.append({"session_id": session_id, "name": name, "delivery": cast(DeliveryOutcome, delivery)})
         cycle["entries"] = normalized
@@ -1616,22 +1623,29 @@ def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
     return RELEASE_NOTICE + " Released holds: " + "; ".join(descriptions) + "."
 
 
-def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+ReleaseNoticeResult = ReleaseDelivered | ReleaseQueued | ReleaseWorkerClosed | ReleaseSendFailed
+
+
+def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseNoticeResult:
     """Tell a recipient to start its builds; the memory gate orders them."""
     return send_release_to(entry, f"uds:{socket}", notice)
 
 
-def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNoticeResult:
     """Send the same release text to a session socket or a Codex thread."""
     notice = f"{notice} Session {entry['session_id']}."
     try:
-        result = subprocess.run(session_send.send_argv("--to", address, "--text", notice), capture_output=True, text=True)
+        options = ("--skip-closed",) if address.startswith("codex:") else ()
+        result = subprocess.run(session_send.send_argv("--to", address, "--text", notice, *options),
+                                capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:
         return ReleaseDelivered()
     if result.returncode == 1:
         return ReleaseQueued()
+    if options and result.returncode == SEND_CLOSED_EXIT:
+        return ReleaseWorkerClosed()
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
@@ -1701,6 +1715,8 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
             entry["delivery"] = "Delivered"
         elif isinstance(result, ReleaseQueued):
             entry["delivery"] = "QueuedUnconfirmed"
+        elif isinstance(result, ReleaseWorkerClosed):
+            entry["delivery"] = "WorkerClosed"
         else:
             entry["delivery"] = "DeliveryFailed"
             if codex:
