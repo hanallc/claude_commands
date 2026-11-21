@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.agents import remote
+from scripts.agents import remote as staff_remote
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -28,11 +28,13 @@ class DeletionRerunTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        staff_file = self.root / "staff.json"
+        _ = staff_file.write_text('{"schema": 2, "rows": []}')
+        self.enterContext(isolated_staff_file(staff_file, {}))
         self.enterContext(patch.dict(os.environ, {
             **fixture_git_environment(self.root), "HOME": str(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
             "WORKTREES_STATE_DIR": str(self.root / "worktrees-state"),
-            "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_STATE_HOME": str(self.root / "state"), "GIT_ALLOW_PROTOCOL": "file",
         }, clear=True))
         source = Path(__file__).resolve().parent
         self.scripts = self.root / "scripts/worktree_delete"
@@ -45,7 +47,21 @@ class DeletionRerunTests(unittest.TestCase):
         for name in ("lib", "worktree"):
             (self.scripts.parent / name).symlink_to(source.parent / name, target_is_directory=True)
 
-    def test_protected_integration_stops_validation_and_both_deletion_routes(self) -> None:
+    def preview(self, checkout: Path, worktree: Path | str) -> dict[str, object]:
+        result = subprocess.run(["bash", str(self.scripts / "worktree_delete_validation.sh"), str(worktree)],
+                                cwd=checkout, capture_output=True, text=True, check=True)
+        return cast(dict[str, object], json.loads(result.stdout))
+
+    def confirm(self, checkout: Path, preview_id: str) -> None:
+        _ = subprocess.run(["bash", str(self.scripts / "record_confirmation.sh"), preview_id],
+                           cwd=checkout, capture_output=True, text=True, check=True)
+
+    def confirmed_preview(self, checkout: Path, worktree: Path | str) -> str:
+        preview_id = cast(str, self.preview(checkout, worktree)["preview_id"])
+        self.confirm(checkout, preview_id)
+        return preview_id
+
+    def test_protected_integration_refs_during_validation_and_deletion(self) -> None:
         repo, origin, tree = self.root / "repo", self.root / "origin.git", self.root / "integration"
         _ = subprocess.run(["git", "init", "-qb", "main", str(repo)], check=True)
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -60,34 +76,120 @@ class DeletionRerunTests(unittest.TestCase):
         _ = git(repo, "push", "-q", "origin", "main", "integration")
         doc = repo / "fixture-production-live.md"
         enrolled_document(doc, repo, tree, "integration")
-        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
-        clone = self.root / "clone"
-        clone_tree = self.root / "clone-integration"
-        _ = git(self.root, "clone", "-q", origin.as_uri(), str(clone))
-        _ = git(clone, "worktree", "add", "-qb", "integration", str(clone_tree), "origin/integration")
+        local = staff_remote.local_machine()
+        owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(local, doc))
+        other_origin = self.root / "other.git"
+        _ = git(self.root, "clone", "-q", "--bare", str(origin), str(other_origin))
+        alias = self.root / "alias.git"
+        alias.symlink_to(origin)
+
+        config = self.root / "machines"
+        config.mkdir()
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/machines.conf", config / "machines.conf")
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
+                                                 "GIT_ALLOW_PROTOCOL": "file",
+                                                 "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}))
+        other_host = staff_remote.other_machine()
+        ssh = binaries / "ssh"
+        _ = ssh.write_text("#!/bin/sh\n"
+                           + f'[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = {other_host} ] || exit 255\n'
+                           + f'[ "$4" = {shlex.quote(shlex.join(("cat", str(doc))))} ] || exit 255\n'
+                           + f'exec cat {shlex.quote(str(doc))}\n')
+        ssh.chmod(0o755)
 
         def attempt(checkout: Path, worktree: Path, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(["bash", str(self.scripts / script), str(worktree), *arguments], cwd=checkout,
                                   capture_output=True, text=True, check=False)
 
         pattern = ("for-each-ref", "--format=%(refname) %(objectname)")
-        refs = tuple(git(folder, *pattern) for folder in (repo, clone, origin))
-        for checkout, worktree, confirmed in ((repo, tree, False), (repo, tree, True),
-                                              (clone, clone_tree, False), (clone, clone_tree, True)):
-            with self.subTest(checkout=checkout, confirmed=confirmed):
+        protected_repos = (repo, origin, other_origin)
+        protected_refs = tuple(git(folder, *pattern) for folder in protected_repos)
+        staff_file = self.root / "staff.json"
+        for index, (case, confirmed, refusal) in enumerate((
+                ("local worktree", False, "protected production"),
+                ("local worktree", True, "protected production"),
+                ("local clone", False, ""),
+                ("local clone", True, ""),
+                ("missing staff record", True, "cannot read the staff record"),
+                ("unrelated repository with the same origin ref", True, ""),
+                ("different basenames", False, ""),
+                ("file and SSH access", True, ""),
+                ("HTTPS and SSH access", True, ""),
+                ("wrapped registration", True, ""),
+                ("unresolved registration", True, ""),
+                ("unresolved enrolled registration", True, ""))):
+            with self.subTest(case=case, confirmed=confirmed):
+                upstream = other_origin if case == "unrelated repository with the same origin ref" else origin
+                host = other_host if upstream == other_origin else local
+                location = staff.WrappedDoc(host, doc) if case == "wrapped registration" else staff.LiveDoc(host, doc)
+                _ = staff.set_doc(owner.id, location)
+                unresolved_id = ""
+                if case == "unresolved registration":
+                    unresolved = self.root / "unresolved.md"
+                    _ = unresolved.write_text("# Unresolved registration\n")
+                    unresolved_id = str(fixture_member("showrunner", name="unresolved", doc=staff.LiveDoc(local, unresolved)).id)
+                    _ = staff.set_doc(owner.id, staff.WrappedDoc(local, self.root / "retained.md"))
+                    _ = (self.root / "retained.md").write_text("- **Merge branch:** retained\n")
+                if case == "unresolved enrolled registration":
+                    _ = doc.write_text("\n".join(line for line in doc.read_text().splitlines()
+                                                if "Merge branch" not in line))
+                    unresolved_id = str(owner.id)
+                if case == "local worktree":
+                    checkout, worktree = repo, tree
+                else:
+                    checkout, worktree = self.root / f"clone-{index}", self.root / f"tree-{index}"
+                    _ = git(self.root, "clone", "-q", upstream.as_uri(), str(checkout))
+                    _ = git(checkout, "worktree", "add", "-qb", "integration", str(worktree), "origin/integration")
+                    if case == "different basenames":
+                        _ = git(checkout, "remote", "set-url", "--push", "origin", str(alias))
+                    if case == "HTTPS and SSH access":
+                        _ = git(repo, "remote", "set-url", "--push", "origin", f"https://candidate{origin}")
+                    if case in ("file and SSH access", "HTTPS and SSH access"):
+                        _ = git(checkout, "remote", "set-url", "--push", "origin", f"ssh://candidate{origin}")
+                staff_bytes = staff_file.read_bytes()
+                protected_preview = ""
+                if refusal and confirmed:
+                    retained_doc = self.root / "preview-retained.md"
+                    _ = retained_doc.write_text("- **Merge branch:** integration\n")
+                    _ = staff.set_doc(owner.id, staff.WrappedDoc(local, retained_doc))
+                    protected_preview = self.confirmed_preview(checkout, worktree)
+                    _ = staff_file.write_bytes(staff_bytes)
+                if case == "missing staff record":
+                    staff_file.unlink()
                 validation = attempt(checkout, worktree, "worktree_delete_validation.sh")
-                self.assertEqual(validation.returncode, 1, validation.stderr)
-                self.assertIn("protected production", validation.stdout)
-                if confirmed:
-                    result = attempt(checkout, worktree, "record_confirmation.sh", "integration")
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                kept = bool(refusal)
+                self.assertEqual(validation.returncode, int(kept), validation.stdout + validation.stderr)
+                options = [protected_preview] if protected_preview else []
+                if not kept:
+                    fields = cast(dict[str, object], json.loads(validation.stdout))
+                    preview_id = cast(str, fields["preview_id"])
+                    options.append(preview_id)
+                    if confirmed:
+                        self.confirm(checkout, preview_id)
+                    else:
+                        options.append("--automatic")
                 nonces = {path: path.read_bytes() for path in self.nonce_dir.glob("*")}
-                result = attempt(checkout, worktree, "perform_deletion.sh", "integration")
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("protected production", result.stderr)
-                self.assertTrue(worktree.is_dir())
-                self.assertEqual(tuple(git(folder, *pattern) for folder in (repo, clone, origin)), refs)
-                self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
+                result = attempt(checkout, worktree, "perform_deletion.sh", "integration", *options)
+                self.assertEqual(result.returncode, int(kept), result.stdout + result.stderr)
+                self.assertEqual(worktree.is_dir(), kept)
+                if refusal:
+                    self.assertIn(refusal, validation.stdout)
+                    self.assertIn(refusal, result.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
+                    self.assertIn("refs/heads/integration", git(checkout, "show-ref"))
+                else:
+                    self.assertIn('"keep_origin": true', validation.stdout)
+                    self.assertIn('"has_remote_branch": false', validation.stdout)
+                    self.assertIn('"cleanup": true', validation.stdout)
+                    self.assertIn("Kept origin ref refs/heads/integration", result.stdout)
+                    if unresolved_id:
+                        self.assertIn(unresolved_id, result.stdout)
+                    self.assertEqual(git(checkout, "branch", "--list", "integration"), "")
+                self.assertEqual(tuple(git(folder, *pattern) for folder in protected_repos), protected_refs)
+                if case == "missing staff record":
+                    _ = staff_file.write_bytes(staff_bytes)
 
     def test_confirmed_removal_releases_the_pair_when_the_lock_is_free(self) -> None:
         scripts = self.scripts
@@ -107,13 +209,12 @@ class DeletionRerunTests(unittest.TestCase):
                 _ = lease.write_text("{}\n")
                 lock.touch()
                 relative = os.path.relpath(tree, caller)
-                _ = subprocess.run(["bash", str(scripts / "record_confirmation.sh"), relative, "topic"],
-                                   cwd=caller, capture_output=True, text=True, check=True)
+                preview_id = self.confirmed_preview(caller, relative)
 
                 with lock.open("r+") as descriptor:
                     if held:
                         fcntl.flock(descriptor, fcntl.LOCK_EX)
-                    result = subprocess.run(["bash", str(scripts / "perform_deletion.sh"), relative, "topic"],
+                    result = subprocess.run(["bash", str(scripts / "perform_deletion.sh"), relative, "topic", preview_id],
                                             cwd=caller, capture_output=True, text=True, check=False)
 
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -138,8 +239,7 @@ class DeletionRerunTests(unittest.TestCase):
             _ = git("worktree", "add", "-qb", "topic", str(worktree))
             _ = git("push", "-q", "origin", "topic")
             scripts = self.scripts
-            _ = subprocess.run(["bash", str(scripts / "record_confirmation.sh"), str(worktree), "topic"],
-                               cwd=repo, capture_output=True, text=True, check=True)
+            preview_id = self.confirmed_preview(repo, worktree)
 
             real_git = shutil.which("git")
             assert real_git is not None
@@ -161,7 +261,7 @@ class DeletionRerunTests(unittest.TestCase):
             ]))
             shim.chmod(0o755)
             result = subprocess.run(
-                ["bash", str(scripts / "perform_deletion.sh"), str(worktree), "topic"],
+                ["bash", str(scripts / "perform_deletion.sh"), str(worktree), "topic", preview_id],
                 cwd=repo, capture_output=True, text=True, check=False,
                 env={**os.environ, "PATH": str(shim_dir) + os.pathsep + os.environ["PATH"]},
             )
@@ -173,7 +273,10 @@ class DeletionRerunTests(unittest.TestCase):
 
     def test_remote_failure_reruns_with_missing_local_branch(self) -> None:
         for state in ("confirmed-rerun", "cleanup", "unlanded", "cleanup-changed", "origin-race",
-                      "local-race", "confirmed-no-origin", "without-branch-config", "config-error"):
+                      "local-race", "confirmed-no-origin", "without-branch-config", "config-error",
+                      "protection removed after preview", "origin advanced after confirmation",
+                      "absent origin appears after confirmation", "local commit changed after confirmation",
+                      "dirty after confirmation", "push destination changed after confirmation"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 repo, remote, worktree = root / "repo", root / "remote.git", root / "topic"
@@ -207,14 +310,14 @@ class DeletionRerunTests(unittest.TestCase):
                 scripts = self.scripts
                 environment = {**os.environ, "WORKTREES_STATE_DIR": str(root / "worktrees-state")}
 
-                def attempt() -> subprocess.CompletedProcess[str]:
-                    if state in ("confirmed-rerun", "confirmed-no-origin"):
-                        _ = subprocess.run(["bash", str(scripts / "record_confirmation.sh"), str(worktree), "topic"],
-                                           cwd=repo, capture_output=True, text=True, check=True)
-                    return subprocess.run(["bash", str(scripts / "perform_deletion.sh"), str(worktree), "topic"],
+                confirmed = state in ("confirmed-rerun", "confirmed-no-origin") or " after " in state
+
+                def attempt(preview_id: str = "") -> subprocess.CompletedProcess[str]:
+                    options = [preview_id] if preview_id else []
+                    return subprocess.run(["bash", str(scripts / "perform_deletion.sh"), str(worktree), "topic", *options],
                                           cwd=repo, env=environment, capture_output=True, text=True, check=False)
 
-                if state not in ("confirmed-rerun", "confirmed-no-origin"):
+                if not confirmed:
                     validation = subprocess.run(
                         ["bash", str(scripts / "worktree_delete_validation.sh"), str(worktree)],
                         cwd=repo, env=environment, capture_output=True, text=True, check=True)
@@ -292,11 +395,49 @@ class DeletionRerunTests(unittest.TestCase):
                 _ = git("config", "--local", "branch.topic.merge", "refs/heads/topic")
                 if state == "without-branch-config":
                     _ = git("config", "--local", "--remove-section", "branch.topic")
+                preview_id = ""
+                if confirmed:
+                    staff_file = self.root / "staff.json"
+                    staff_bytes = staff_file.read_bytes()
+                    if state == "protection removed after preview":
+                        protected_doc = root / "retained.md"
+                        _ = protected_doc.write_text("- **Merge branch:** topic\n")
+                        _ = fixture_member("showrunner", name="retained",
+                                           doc=staff.WrappedDoc(staff_remote.local_machine(), protected_doc))
+                    reviewed = ""
+                    if state == "absent origin appears after confirmation":
+                        _ = git("--git-dir", str(remote), "update-ref", "-d", "refs/heads/topic")
+                    elif state == "origin advanced after confirmation":
+                        _ = git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+                        reviewed = git("commit-tree", "topic^{tree}", "-p", "topic", "-m", "Reviewed origin commit").strip()
+                        _ = git("push", str(remote), f"{reviewed}:refs/heads/topic")
+                    preview = self.preview(repo, worktree)
+                    preview_id = cast(str, preview["preview_id"])
+                    self.confirm(repo, preview_id)
+                    if state == "protection removed after preview":
+                        self.assertEqual(preview["origin_action"], "keep")
+                        _ = staff_file.write_bytes(staff_bytes)
+                    elif state == "absent origin appears after confirmation":
+                        self.assertEqual(preview["origin_action"], "absent")
+                        _ = git("push", "origin", "topic")
+                    elif state == "origin advanced after confirmation":
+                        self.assertEqual(preview["origin_commit"], reviewed)
+                        self.assertEqual(preview["remote_only_count"], 1)
+                        advanced = git("commit-tree", "topic^{tree}", "-p", reviewed, "-m", "New origin commit").strip()
+                        _ = git("push", "origin", f"{advanced}:refs/heads/topic")
+                    elif state == "local commit changed after confirmation":
+                        _ = commit_repository(worktree, "New local commit", allow_empty=True)
+                    elif state == "dirty after confirmation":
+                        _ = (worktree / "uncommitted").write_text("Keep this file.\n")
+                    elif state == "push destination changed after confirmation":
+                        peer = root / "peer.git"
+                        _ = git("clone", "--bare", str(remote), str(peer))
+                        _ = git("remote", "set-url", "--push", "origin", str(peer))
                 before_branches = git("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
                 before_origin = "" if state == "confirmed-no-origin" else git("ls-remote", "--heads", "origin")
                 before_worktrees = git("worktree", "list", "--porcelain")
 
-                first = attempt()
+                first = attempt(preview_id)
 
                 if state == "confirmed-rerun":
                     self.assertNotEqual(first.returncode, 0)
@@ -304,7 +445,8 @@ class DeletionRerunTests(unittest.TestCase):
                     self.assertEqual(git("branch", "--list", "topic", "--format=%(refname:short)").strip(), "topic")
                     self.assertIn("refs/heads/topic", git("ls-remote", "--heads", "origin", "topic"))
                     hook.unlink()
-                    second = attempt()
+                    self.assertIn("already used", attempt(preview_id).stderr)
+                    second = attempt(self.confirmed_preview(repo, worktree))
                     self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
                     self.assertFalse(worktree.exists())
                     self.assertEqual(git("branch", "--list", "topic"), "")
@@ -326,15 +468,27 @@ class DeletionRerunTests(unittest.TestCase):
                     self.assertEqual(git("branch", "--list", "topic"), "")
                     self.assertEqual(git("config", "--local", "--get", "branch.topic.merge"), "refs/heads/topic\n")
                     (root / "bin/git").unlink()
-                    _ = subprocess.run(["bash", str(scripts / "record_confirmation.sh"), str(worktree), "topic"],
-                                       cwd=repo, capture_output=True, text=True, check=True)
-
                     second = attempt()
 
                     self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
                     self.assertFalse(worktree.exists())
                     self.assertEqual(git("branch", "--list", "topic"), "")
                     self.assertEqual(git("ls-remote", "--heads", "origin", "topic"), "")
+                elif state in ("protection removed after preview", "absent origin appears after confirmation"):
+                    self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                    self.assertFalse(worktree.exists())
+                    self.assertEqual(git("ls-remote", "--heads", "origin"), before_origin)
+                elif state in ("origin advanced after confirmation", "local commit changed after confirmation",
+                               "dirty after confirmation", "push destination changed after confirmation"):
+                    self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+                    self.assertEqual(git("ls-remote", "--heads", "origin"), before_origin)
+                    self.assertEqual(git("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"), before_branches)
+                    self.assertTrue(worktree.exists())
+                    if state == "dirty after confirmation":
+                        self.assertEqual((worktree / "uncommitted").read_text(), "Keep this file.\n")
+                    if state == "push destination changed after confirmation":
+                        self.assertIn("configured push destination changed", first.stderr)
+                        self.assertIn("refs/heads/topic", git("ls-remote", "--heads", str(root / "peer.git")))
                 elif state == "cleanup-changed":
                     self.assertNotEqual(first.returncode, 0)
                     self.assertIn("the tree changed after the cleanup check", first.stdout)

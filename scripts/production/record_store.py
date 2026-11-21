@@ -378,7 +378,7 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
                         roots.extend(historical_issue_folders(document, sources=sources))
                         if owner and legacy_document_path(document) != document:
                             roots.extend(_backup_issue_folders(owner, document, sources))
-                except (OSError, UnicodeError):
+                except (OSError, UnicodeError, git_files.MissingReferencedGitDirectory):
                     if strict and require_document:
                         raise
     resolved: dict[Path, None] = {}

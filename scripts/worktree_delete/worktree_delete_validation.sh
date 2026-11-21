@@ -1,106 +1,19 @@
 #!/usr/bin/env bash
-# Validates worktree deletion target and performs safety checks
-# Usage: worktree_delete_validation.sh <worktree_path>
-# Returns: JSON with validation status and details
+# Preview the deletion and return its identifier with the loss counts.
 
-SELECTED_WORKTREE="$1"
-
-if [[ -z "$SELECTED_WORKTREE" ]]; then
-    echo '{"status": "error", "message": "No worktree path provided"}'
-    exit 1
-fi
-
-# Check if selected worktree path exists
-if [[ ! -d "$SELECTED_WORKTREE" ]]; then
-    echo '{"status": "error", "message": "Selected worktree path does not exist"}'
-    exit 1
-fi
-
-# Verify it's a git repo
-if ! git -C "$SELECTED_WORKTREE" rev-parse --show-toplevel >/dev/null 2>&1; then
-    echo '{"status": "error", "message": "Selected path is not a git repository"}'
-    exit 1
-fi
-
-# Get target branch
-TARGET_BRANCH=$(git -C "$SELECTED_WORKTREE" branch --show-current)
-if [[ -z "$TARGET_BRANCH" ]]; then
-    echo '{"status": "error", "message": "Could not determine target branch"}'
-    exit 1
-fi
-
-# Verify target branch is NOT main (protected branch)
-if [[ "$TARGET_BRANCH" == "main" ]]; then
-    echo '{"status": "error", "message": "Cannot delete main branch"}'
-    exit 1
-fi
-
-# Verify not current worktree
-CURRENT_DIR=$(pwd)
-SELECTED_ABSOLUTE=$(cd "$SELECTED_WORKTREE" && pwd)
-if [[ "$CURRENT_DIR" == "$SELECTED_ABSOLUTE" ]]; then
-    echo '{"status": "error", "message": "Cannot delete current worktree"}'
-    exit 1
-fi
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if ! PROTECTION_REASON=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
-    protect-deletion "$SELECTED_WORKTREE" "$TARGET_BRANCH" "$SELECTED_WORKTREE" 2>&1); then
-    "$SCRIPT_DIR/../lib/py" -c 'import json, sys; print(json.dumps({"status": "error", "message": sys.argv[1]}))' \
-        "$PROTECTION_REASON"
-    exit 1
-fi
-CLEANUP=false
-if CLEANUP_REASON=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" cleanup "$SELECTED_WORKTREE" 2>&1); then
-    CLEANUP=true
-fi
-CLEANUP_REASON_JSON=$("$SCRIPT_DIR/../lib/py" -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$CLEANUP_REASON")
+# shellcheck source=confirm_gate.sh
+source "$SCRIPT_DIR/confirm_gate.sh"
 
-# Check for uncommitted changes
-UNCOMMITTED=$(git -C "$SELECTED_WORKTREE" status --porcelain)
-HAS_UNCOMMITTED=false
-if [[ -n "$UNCOMMITTED" ]]; then
-    HAS_UNCOMMITTED=true
+if [[ "${1:-}" == --branch-only ]]; then
+    if [[ $# -ne 4 ]]; then
+        echo "Usage: worktree_delete_validation.sh --branch-only <worktree_path> <repository> <branch_ref>" >&2
+        exit 1
+    fi
+    wt_command branch-only-preview "$2" "$3" "$4" "$WT_CONFIRM_DIR" "$WT_CONFIRM_TTL_SECONDS"
+    exit
 fi
 
-# Check for unpushed commits, and for commits that only origin/<branch> holds:
-# deletion removes that remote branch too.
-HAS_UNPUSHED=false
-UNPUSHED_COUNT=0
-HAS_REMOTE_BRANCH=false
-HAS_REMOTE_ONLY=false
-REMOTE_ONLY_COUNT=0
-if git -C "$SELECTED_WORKTREE" remote get-url origin >/dev/null 2>&1; then
-    if git -C "$SELECTED_WORKTREE" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
-        UNPUSHED_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list '@{upstream}..HEAD' --count 2>/dev/null || echo "0")
-    else
-        # No upstream: unpushed means on no branch of origin.
-        UNPUSHED_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo "0")
-    fi
-    if [[ "$UNPUSHED_COUNT" -gt 0 ]]; then
-        HAS_UNPUSHED=true
-    fi
-    if git -C "$SELECTED_WORKTREE" rev-parse --verify -q "refs/remotes/origin/$TARGET_BRANCH" >/dev/null; then
-        HAS_REMOTE_BRANCH=true
-        # --exclude patterns for --remotes are relative to refs/remotes/.
-        REMOTE_ONLY_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list --count "refs/remotes/origin/$TARGET_BRANCH" \
-            --not --exclude="origin/$TARGET_BRANCH" --exclude=origin/HEAD --remotes=origin 2>/dev/null || echo "0")
-        if [[ "$REMOTE_ONLY_COUNT" -gt 0 ]]; then
-            HAS_REMOTE_ONLY=true
-        fi
-    fi
-fi
-
-echo "{
-  \"status\": \"success\",
-  \"worktree_path\": \"$SELECTED_WORKTREE\",
-  \"target_branch\": \"$TARGET_BRANCH\",
-  \"has_uncommitted\": $HAS_UNCOMMITTED,
-  \"has_unpushed\": $HAS_UNPUSHED,
-  \"unpushed_count\": $UNPUSHED_COUNT,
-  \"has_remote_branch\": $HAS_REMOTE_BRANCH,
-  \"has_remote_only\": $HAS_REMOTE_ONLY,
-  \"remote_only_count\": $REMOTE_ONLY_COUNT,
-  \"cleanup\": $CLEANUP,
-  \"cleanup_reason\": $CLEANUP_REASON_JSON
-}"
+wt_command deletion-preview "${1:-}" "$WT_CONFIRM_DIR" "$WT_CONFIRM_TTL_SECONDS"

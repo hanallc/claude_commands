@@ -1227,7 +1227,8 @@ class LifecycleTests(LifecycleFixture):
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             staff_bytes = self.staff.staff_file.read_bytes()
-            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled"):
+            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled", "protected local branch",
+                           "protected origin ref", "legacy branch from HEAD"):
                 with self.subTest(landed=landed):
                     shutil.rmtree(self.root)
                     _ = shutil.copytree(snapshot, self.root)
@@ -1244,6 +1245,35 @@ class LifecycleTests(LifecycleFixture):
                         _ = self.git("cherry-pick", "--no-commit", alpha)
                         _ = self.git("commit", "-m", "Copy alpha patch")
                     _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
+                    if landed == "protected local branch":
+                        _ = self.git("push", "origin", "production")
+                        document = self.root / "peer-production.md"
+                        self.write(document,
+                                   f"- **Showrunner checkout:** `{self.checkout}`\n- **Merge branch:** `alpha-branch`\n")
+                        _ = fixture_member("showrunner", name="peer", doc=staff.LiveDoc(remote.local_machine(), document))
+                        paths = (self.doc, self.log, self.staff.staff_file,
+                                 self.alpha / ".unit.toml", self.beta / ".unit.toml")
+                        before = tuple(path.read_bytes() for path in paths)
+                        local_refs = self.git("show-ref")
+                        origin_refs = self.git("show-ref", cwd=self.origin)
+                        with mock.patch.object(unit_config, "park", side_effect=AssertionError("park protected unit")):
+                            result = self.run_lifecycle("wrap", "--no-ci")
+                        self.assert_step(result, "held")
+                        self.assertIn("protected production branch alpha-branch", result.stdout)
+                        self.assertEqual(tuple(path.read_bytes() for path in paths), before)
+                        self.assertEqual(self.git("show-ref"), local_refs)
+                        self.assertEqual(self.git("show-ref", cwd=self.origin), origin_refs)
+                        continue
+                    if landed == "protected origin ref":
+                        peer = self.root / "peer"
+                        _ = self.git("clone", "-qb", "alpha-branch", str(self.origin), str(peer), cwd=self.root)
+                        document = peer / "peer-production.md"
+                        self.write(document, f"- **Showrunner checkout:** `{peer}`\n- **Merge branch:** `alpha-branch`\n")
+                        _ = fixture_member("showrunner", name="peer", doc=staff.LiveDoc(remote.local_machine(), document))
+                    if landed == "legacy branch from HEAD":
+                        _ = self.doc.write_text(self.doc.read_text().replace("- **Merge branch:** `production`\n", ""))
+                        _ = self.git("add", str(self.doc))
+                        _ = self.git("commit", "-m", "Use the legacy checkout branch")
                     if landed == "enrolled":
                         _ = self.git("push", "origin", "production")
                         live, integration = self.enroll_document()
@@ -1324,7 +1354,16 @@ class LifecycleTests(LifecycleFixture):
                     self.assert_no_ci_skips(result.stdout)
                     self.assertFalse(self.alpha.exists())
                     self.assertFalse(self.beta.exists())
-                    self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
+                    refs = self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch")
+                    if landed == "protected origin ref":
+                        self.assertEqual(refs, f"{alpha}\trefs/heads/alpha-branch")
+                        self.assertEqual(self.git("branch", "--list", "alpha-branch", "beta-branch"), "")
+                        self.assertIn("retire: kept — refs/heads/alpha-branch on origin", result.stdout)
+                    else:
+                        self.assertEqual(refs, "")
+                    if landed == "legacy branch from HEAD":
+                        self.assertIn("- **Merge branch:** `production`", self.doc.read_text())
+                        self.assertIn("recorded Merge branch production", result.stdout)
                     self.assertIn("wrapped", self.doc.read_text())
                     if landed == "equal-patch":
                         self.assertEqual(self.git("cherry", "origin/main", alpha).split()[0], "-")

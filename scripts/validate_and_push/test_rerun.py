@@ -4,11 +4,19 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+from typing import override
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 
 class ValidationRerunTests(ScriptRepositoryTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        record = self.write(self.root / "staff.json", '{"schema": 2, "rows": []}')
+        self.environment["STAFF_FILE"] = str(record)
+        self.environment["GIT_ALLOW_PROTOCOL"] = "file"
+
     def install_gh(self) -> None:
         _ = self.stub("gh", '''import subprocess, sys
 args = sys.argv[1:]
@@ -17,6 +25,10 @@ if args[:2] == ["repo", "view"]:
 elif args[:2] == ["pr", "view"]:
     if "mergeCommit" in args:
         subprocess.run(["git", "rev-parse", "main"], check=True)
+    elif "state" in args:
+        print("MERGED")
+    elif "headRefOid" in args:
+        subprocess.run(["git", "rev-parse", "refs/heads/retry-pr"], check=True)
     else:
         print(7)
 elif args[:2] == ["pr", "checks"]:

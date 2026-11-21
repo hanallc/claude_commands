@@ -105,8 +105,11 @@ class GitExcludeTests(UnitConfigFixture):
         notes = f"{NOTES_DIRECTORY}/fixture/"
         for relative in (notes, "docs/plans/fixture-production-live.md", "docs/plans/fixture-log.md",
                          "projects/sample/memory/notes.md", "plans/fixture.md", "todos/session.json",
-                         "tasks/session/task.json", "teams/session/config.json", "sessions/session.json",
-                         "state/session/session.json", "config/showrunners.json", "config/accounts.lock",
+                         "tasks/session/task.json", "teams/session/config.json",
+                         "projects/sample/session.jsonl", "projects/sample/session/tool-results/result.txt",
+                         "sessions/session.json", "state/session/session.json", "history.jsonl",
+                         "file-history/session/file", "session-env/session/file", "shell-snapshots/shell.sh",
+                         "paste-cache/file", "uploads/file", "config/showrunners.json", "config/accounts.lock",
                          "config/models.conf.tmp"):
             with self.subTest(path=relative):
                 if relative == notes:

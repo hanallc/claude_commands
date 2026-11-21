@@ -784,7 +784,7 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
     def test_checkpoint_on_second_origin_branch_merges_the_checkpoint_and_names_branch(self) -> None:
         for outcome in ("live-owner", "ancestor", "equal-patch", "merge-branch", "enrolled-merge-branch", "moved", "unlanded",
-                        "delete-failed", "no-promotion"):
+                        "delete-failed", "unresolved production", "no-promotion"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -812,6 +812,10 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                     doc = self.root / "other-production.md"
                     _ = doc.write_text("- **Merge branch:** alpha-phase\n")
                     _ = recorded_showrunner("other", doc)
+                if outcome == "unresolved production":
+                    doc = self.root / "unresolved-production.md"
+                    _ = doc.write_text("# Unresolved production\n")
+                    _ = recorded_showrunner("unresolved", doc)
                 if outcome == "enrolled-merge-branch":
                     _ = self.git("switch", "--detach", "main", cwd=self.promote)
                     _ = self.git("switch", "main")
@@ -874,7 +878,8 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                     reasons = {"live-owner": "present worktree", "merge-branch": "production merge branch",
                                "enrolled-merge-branch": "other uses this production merge branch",
                                "moved": "delete failed or branch moved", "unlanded": "work has not reached main",
-                               "delete-failed": "delete failed", "no-promotion": "no promotion configured"}
+                               "delete-failed": "delete failed", "no-promotion": "no promotion configured",
+                               "unresolved production": "no Merge branch and no checkout with an attached HEAD"}
                     self.assertIn(reasons[outcome], result.process.stdout)
 
     def test_checkpoint_on_no_origin_branch_checks_all_heads_and_still_holds(self) -> None:

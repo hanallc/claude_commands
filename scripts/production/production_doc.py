@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -162,7 +163,8 @@ def read_production(reference: str | staff.StaffRow, record: staff.StaffSnapshot
         raise Refusal(f"cannot read production doc: {error}") from error
 
 
-def read_new_production(doc: Path, name: str, *, resume_branch: str = "") -> ProductionDocument:
+def read_new_production(doc: Path, name: str, *, resume_branch: str = "",
+                        infer_legacy_branch: bool = False) -> ProductionDocument:
     """Read a new production document with its specified staff name."""
     try:
         doc = doc.expanduser().resolve(strict=True)
@@ -170,8 +172,16 @@ def read_new_production(doc: Path, name: str, *, resume_branch: str = "") -> Pro
         merge_checkout = optional_field(lines, MERGE_CHECKOUT_FIELD)
         if isinstance(merge_checkout, FieldPresent):
             return _read_enrolled(doc, name, lines, merge_checkout, resume_branch=resume_branch)
-        merge_branch = production_field(lines, "Merge branch")
+        merge_branch = _merge_branch(lines)
+        if not merge_branch and not infer_legacy_branch:
+            raise Refusal("production doc lacks Merge branch")
         checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
+        if not merge_branch:
+            head = git_files.head(git_files.at(checkout))
+            if isinstance(head, git_files.OnBranch):
+                merge_branch = head.name
+        if not merge_branch:
+            raise Refusal("production doc lacks Merge branch")
         log = Path(production_field(lines, "Log"))
         if log.is_absolute():
             raise Refusal("production Log must be relative to Showrunner checkout")
@@ -181,12 +191,10 @@ def read_new_production(doc: Path, name: str, *, resume_branch: str = "") -> Pro
 
 
 def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresent,
-                   *, resume_branch: str = "") -> ProductionDocument:
+                   *, resume_branch: str = "",
+                   identity: tuple[git_files.Checkout, git_files.Checkout] | None = None) -> ProductionDocument:
     try:
-        main_path = Path(cell_value(declared.text))
-        if not main_path.is_absolute():
-            raise Refusal(f"{MERGE_CHECKOUT_FIELD} must be absolute")
-        main = git_files.at(main_path.resolve(strict=True))
+        main, integration = identity if identity is not None else _enrolled_checkout_identity(lines, declared)
         if main.git_dir != main.common_dir or git_files.head(main) != git_files.OnBranch("main"):
             raise Refusal(f"{main.toplevel}: expected the main checkout on main")
         if not doc.is_relative_to(main.toplevel) or git_files.locate(doc.parent) != main:
@@ -195,7 +203,6 @@ def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresen
         if isinstance(repository, FieldPresent):
             if Path(cell_value(repository.text)).expanduser().resolve(strict=True) != main.toplevel:
                 raise Refusal(f"Repository must name {main.toplevel}")
-        integration = git_files.at(Path(production_field(lines, "Showrunner checkout")).expanduser().resolve(strict=True))
         branch = production_field(lines, "Merge branch")
         if integration == main or integration.common_dir != main.common_dir:
             raise Refusal("Showrunner checkout must be a separate worktree of the same repository")
@@ -413,71 +420,207 @@ def require_no_live_file_conflicts(checkout: Path, incoming: str) -> None:
         raise OSError("\n".join(str(conflict) for conflict in conflicts))
 
 
+def _registered_production_documents() -> tuple[staff.StaffRow, ...]:
+    try:
+        rows = staff.authority_snapshot().find(kind="showrunner")
+        return tuple(row for row in rows if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)))
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        raise ProductionPathsError(f"cannot read the staff record: {error}") from error
+
+
+@dataclass(frozen=True)
+class LocalProtectionHost:
+    """The current machine owns the registered paths."""
+
+
+def _protection_host(machine: str) -> LocalProtectionHost | remote.MachineAlias:
+    local = remote.local_machine()
+    if machine.casefold() == local.casefold():
+        return LocalProtectionHost()
+    try:
+        target = remote.machine_alias(machine)
+        current = remote.machine_alias(local)
+    except (OSError, ValueError) as error:
+        raise ProductionPathsError(f"cannot resolve staff machine {machine}: {error}") from error
+    if isinstance(target, remote.MachineNameRefused):
+        raise ProductionPathsError(target.reason)
+    return LocalProtectionHost() if target == current else target
+
+
 def protected_checkouts() -> frozenset[ProtectedCheckout]:
-    """Read the main and integration checkouts that the removal tools must keep."""
-    protected: set[ProtectedCheckout] = set()
-    for row in local_production_documents():
-        assert isinstance(row.doc, staff.LiveDoc)
+    """Read the registered main and integration checkouts on this host."""
+    return frozenset(checkout for row in _registered_production_documents()
+                     if isinstance(row.doc, staff.LiveDoc)
+                     and isinstance(_protection_host(row.doc.machine), LocalProtectionHost)
+                     for checkout in _local_protected_checkouts(row))
+
+
+def _merge_branch(lines: list[str]) -> str:
+    field = optional_field(lines, "Merge branch")
+    return cell_value(field.text) if isinstance(field, FieldPresent) else ""
+
+
+@dataclass(frozen=True)
+class _RemovalTarget:
+    path: Path
+    repository: Path
+
+
+def _enrolled_checkout_identity(lines: list[str], declared: FieldPresent) -> tuple[git_files.Checkout, git_files.Checkout]:
+    main = Path(cell_value(declared.text))
+    if not main.is_absolute():
+        raise ProductionPathsError(f"{MERGE_CHECKOUT_FIELD} must be absolute")
+    integration = Path(production_field(lines, "Showrunner checkout")).expanduser()
+    return git_files.at(main.resolve(strict=True)), git_files.at(integration.resolve(strict=True))
+
+
+def _overlaps(left: Path, right: Path) -> bool:
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def _local_protected_checkouts(
+    row: staff.StaffRow, *, removal: _RemovalTarget | None = None,
+) -> tuple[ProtectedCheckout, ...]:
+    assert isinstance(row.doc, staff.LiveDoc)
+    try:
+        doc = row.doc.path.resolve()
         try:
-            doc = row.doc.path.resolve()
+            lines = doc.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
+                raise
             try:
-                lines = doc.read_text(encoding="utf-8").splitlines()
-            except FileNotFoundError:
-                if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
-                    raise
-                try:
-                    parent = next(folder for folder in doc.parents if folder.is_dir())
-                    checkout = git_files.locate(parent)
-                except git_files.NotACheckout:
-                    pass
-                else:
-                    if _known_live_document(doc, row, checkout):
-                        raise
-                lines = []
-            declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
-            if isinstance(declared, FieldPresent):
-                document = _read_enrolled(doc, row.name, lines, declared)
-                main = document.merge_checkout
-                assert isinstance(main, Path)
-                repository = git_files.at(main).common_dir
-                protected.add(ProtectedCheckout(main, repository, "main"))
-                protected.add(ProtectedCheckout(document.checkout, repository, document.merge_branch))
+                parent = next(folder for folder in doc.parents if folder.is_dir())
+                checkout = git_files.locate(parent)
+            except git_files.NotACheckout:
+                pass
             else:
-                protected.update(_legacy_checkouts(row, lines))
-        except (OSError, UnicodeError, RuntimeError, ValueError) as error:
-            raise ProductionPathsError(f"{row.doc.path}: {error}") from error
-    return frozenset(protected)
+                if _known_live_document(doc, row, checkout):
+                    raise
+            lines = []
+        declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
+        if isinstance(declared, FieldPresent):
+            main, integration = _enrolled_checkout_identity(lines, declared)
+            if removal is not None and all(
+                identity.common_dir != removal.repository and not _overlaps(identity.toplevel, removal.path)
+                for identity in (main, integration)
+            ) and not _overlaps(doc, removal.path):
+                return ()
+            document = _read_enrolled(doc, row.name, lines, declared, identity=(main, integration))
+            return (ProtectedCheckout(main.toplevel, main.common_dir, "main"),
+                    ProtectedCheckout(document.checkout, main.common_dir, document.merge_branch))
+        return _legacy_checkouts(row, lines)
+    except ProductionPathsError:
+        raise
+    except (OSError, UnicodeError, RuntimeError, ValueError, Refusal) as error:
+        raise ProductionPathsError(f"{row.doc.path}: {error}") from error
+
+
+def _remote_protection_command(host: remote.MachineAlias, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", host.alias, shlex.join(args)],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, check=False)
+
+
+@dataclass(frozen=True)
+class ProtectedOriginBranches:
+    names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UnresolvedOriginProtection:
+    reason: str
+
+
+def _registered_branch_protection(row: staff.StaffRow) -> ProtectedOriginBranches | UnresolvedOriginProtection:
+    doc = row.doc
+    assert isinstance(doc, (staff.LiveDoc, staff.WrappedDoc))
+    try:
+        host = _protection_host(doc.machine)
+        if isinstance(host, remote.MachineAlias):
+            read = _remote_protection_command(host, "cat", str(doc.path))
+            if read.returncode:
+                raise ProductionPathsError("cannot read the production document")
+            lines = read.stdout.splitlines()
+        else:
+            lines = doc.path.read_text(encoding="utf-8").splitlines()
+        if branch := _merge_branch(lines):
+            return ProtectedOriginBranches(frozenset({branch}))
+        if isinstance(optional_field(lines, MERGE_CHECKOUT_FIELD), FieldPresent):
+            raise ProductionPathsError("the enrolled document has no Merge branch")
+        branches: set[str] = set()
+        for path in sorted(_legacy_checkout_paths(row, lines, host)):
+            if isinstance(host, remote.MachineAlias):
+                head = _remote_protection_command(host, "git", "-C", str(path), "symbolic-ref", "--quiet", "HEAD")
+                if head.returncode not in (0, 1):
+                    raise ProductionPathsError(f"cannot read the branch in {path}")
+                if head.returncode == 0 and head.stdout.startswith("refs/heads/"):
+                    branches.add(head.stdout.strip().removeprefix("refs/heads/"))
+            else:
+                try:
+                    local_head = git_files.head(git_files.at(path.expanduser()))
+                except git_files.NotACheckout:
+                    continue
+                if isinstance(local_head, git_files.OnBranch):
+                    branches.add(local_head.name)
+        if branches:
+            return ProtectedOriginBranches(frozenset(branches))
+        raise ProductionPathsError("no Merge branch and no checkout with an attached HEAD")
+    except (OSError, RuntimeError, ValueError, Refusal, subprocess.SubprocessError) as error:
+        return UnresolvedOriginProtection(f"staff {row.id}, document {doc.path}, host {doc.machine}: {error}")
+
+
+def origin_ref_protection(ref: str) -> str:
+    """Give the reason to retain a ref, or an empty string if no registration protects it."""
+    if ref == "refs/heads/main":
+        return "main is long-lived"
+    for row in _registered_production_documents():
+        protection = _registered_branch_protection(row)
+        if isinstance(protection, UnresolvedOriginProtection):
+            return protection.reason
+        if ref.removeprefix("refs/heads/") in protection.names:
+            return f"{row.name} uses this production merge branch"
+    return ""
 
 
 def require_removable_checkout(path: Path, repository: Path, branch: str) -> None:
-    """Keep protected checkout paths and branches that removal can delete on origin."""
+    """Check the local worktree path and the branch in its Git common directory."""
     try:
-        protected = protected_checkouts()
         candidate = path.resolve()
-        matching = [checkout for checkout in protected if branch and checkout.branch == branch]
-        if matching:
-            common = git_files.locate(repository).common_dir
-            if any(checkout.repository == common for checkout in matching):
-                raise ProductionPathsError(f"{repository}: protected production branch {branch}")
-            # A separate clone or URL can name the same origin.
-            raise ProductionPathsError(f"{repository}: protected production origin branch {branch}")
+        common = git_files.locate(repository).common_dir
+        target = _RemovalTarget(candidate, common)
+        protected = tuple(checkout for row in _registered_production_documents()
+                          if isinstance(row.doc, staff.LiveDoc)
+                          and isinstance(_protection_host(row.doc.machine), LocalProtectionHost)
+                          for checkout in _local_protected_checkouts(row, removal=target))
         for checkout in protected:
             if checkout.path.is_relative_to(candidate):
                 raise ProductionPathsError(f"{candidate}: contains protected production checkout {checkout.path}")
             if candidate.is_relative_to(checkout.path):
                 raise ProductionPathsError(f"{candidate}: inside protected production checkout {checkout.path}")
-    except (OSError, RuntimeError, ValueError) as error:
+        if branch and any(item.repository == common and item.branch == branch for item in protected):
+            raise ProductionPathsError(f"{repository}: protected production branch {branch}")
+    except ProductionPathsError:
+        raise
+    except (OSError, RuntimeError, ValueError, Refusal) as error:
         raise ProductionPathsError(f"{path}: cannot check production protection: {error}") from error
 
 
-def _legacy_checkouts(row: staff.StaffRow, lines: list[str]) -> tuple[ProtectedCheckout, ...]:
-    path_field = optional_field(lines, "Showrunner checkout")
-    branch_field = optional_field(lines, "Merge branch")
+def _legacy_checkout_paths(
+    row: staff.StaffRow, lines: list[str], host: LocalProtectionHost | remote.MachineAlias,
+) -> set[Path]:
     paths: set[Path] = set()
-    if isinstance(path_field, FieldPresent) and (path := cell_value(path_field.text)):
-        paths.add(Path(path).expanduser().resolve())
-    if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.machine == remote.local_machine():
-        paths.add(row.worktree.path.resolve())
+    field = optional_field(lines, "Showrunner checkout")
+    if isinstance(field, FieldPresent) and (path := cell_value(field.text)):
+        paths.add(Path(path))
+    if (isinstance(row.worktree, staff.PresentWorktree)
+            and _protection_host(row.worktree.machine) == host):
+        paths.add(row.worktree.path)
+    return paths
+
+
+def _legacy_checkouts(row: staff.StaffRow, lines: list[str]) -> tuple[ProtectedCheckout, ...]:
+    merge_branch = _merge_branch(lines)
+    paths = {path.expanduser().resolve() for path in _legacy_checkout_paths(row, lines, LocalProtectionHost())}
     result: list[ProtectedCheckout] = []
     for path in paths:
         try:
@@ -485,7 +628,7 @@ def _legacy_checkouts(row: staff.StaffRow, lines: list[str]) -> tuple[ProtectedC
         except git_files.NotACheckout:
             continue
         head = git_files.head(checkout)
-        branch = cell_value(branch_field.text) if isinstance(branch_field, FieldPresent) else ""
+        branch = merge_branch
         if not branch and isinstance(head, git_files.OnBranch):
             branch = head.name
         result.append(ProtectedCheckout(path, checkout.common_dir, branch))

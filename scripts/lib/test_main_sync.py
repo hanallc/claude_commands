@@ -157,20 +157,70 @@ class MainSyncTests(unittest.TestCase):
             self.assertEqual(git(self.checkout, "for-each-ref", "refs/main-sync"), "")
 
     def test_an_advanced_checkout_cannot_move_back_during_claude_sync(self) -> None:
+        base = git(self.checkout, "rev-parse", "HEAD")
         older = self.commit("b")
         newer = self.commit("c")
         _ = git(self.checkout, "fetch", "-q", "origin")
         _ = git(self.writer, "push", "-q", "--force", "origin", f"{older}:main")
         flock = fcntl.flock
+        for case, start, concurrent, expected, tip in (
+                ("behind origin", base, False, main_sync.ADVANCED, older),
+                ("ahead of origin", newer, False, "diverged", newer),
+                ("concurrent advance", base, True, "diverged", newer)):
+            with self.subTest(case=case):
+                _ = git(self.checkout, "reset", "--hard", start)
+                _ = git(self.checkout, "update-ref", "refs/remotes/origin/main", newer)
 
-        def finish_newer_pull(descriptor: int, operation: int) -> None:
-            if operation == fcntl.LOCK_EX:
-                _ = git(self.checkout, "merge", "--ff-only", newer)
-            flock(descriptor, operation)
+                def finish_newer_pull(descriptor: int, operation: int) -> None:
+                    if operation == fcntl.LOCK_EX and concurrent:
+                        _ = git(self.checkout, "merge", "--ff-only", newer)
+                    flock(descriptor, operation)
 
-        with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
-            self.assertEqual(main_sync.sync(self.checkout).state, "diverged")
-        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), newer)
+                with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
+                    self.assertEqual(main_sync.sync(self.checkout).state, expected)
+                self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(), [tip, tip])
+
+        run_git = main_sync._git  # pyright: ignore[reportPrivateUsage]
+        for race, expected in (("after fetch", "diverged"), ("before update-ref", "fetch-failed")):
+            with self.subTest(race=race):
+                _ = self.commit(f"old {race}")
+                new_tip = ""
+
+                def another_sync(checkout: Path, *arguments: str,
+                                 timeout: float = 30) -> subprocess.CompletedProcess[str]:
+                    nonlocal new_tip
+                    fetch = race == "after fetch" and arguments[0] == "fetch"
+                    replace_ref = race == "before update-ref" and arguments[:2] == ("update-ref", main_sync.TRACKING_REF)
+                    if replace_ref:
+                        new_tip = self.commit(f"new {race}")
+                        _ = git(checkout, "fetch", "-q", "origin")
+                        _ = git(checkout, "merge", "--ff-only", "-q", new_tip)
+                    result = run_git(checkout, *arguments, timeout=timeout)
+                    if fetch:
+                        new_tip = self.commit(f"new {race}")
+                        _ = git(checkout, "fetch", "-q", "origin")
+                        _ = git(checkout, "merge", "--ff-only", "-q", new_tip)
+                    return result
+
+                with unittest.mock.patch.object(main_sync, "_git", side_effect=another_sync):
+                    self.assertEqual(main_sync.sync(self.checkout).state, expected)
+                self.assertTrue(new_tip)
+                self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(), [new_tip, new_tip])
+
+        with self.subTest(race="origin replaces an unmerged tip"):
+            local = git(self.checkout, "rev-parse", "HEAD")
+            replaced = self.commit("replaced")
+            _ = git(self.checkout, "fetch", "-q", "origin")
+            self.assertEqual(git(self.checkout, "rev-parse", "origin/main"), replaced)
+            _ = git(self.writer, "reset", "--hard", local)
+            _ = (self.writer / "replacement").write_text("new origin tip")
+            _ = git(self.writer, "add", "replacement")
+            _ = git(self.writer, "commit", "-qm", "Replace the unmerged tip")
+            replacement = git(self.writer, "rev-parse", "HEAD")
+            _ = git(self.writer, "push", "--force", "origin", "HEAD:main")
+            self.assertEqual(main_sync.sync(self.checkout).state, main_sync.ADVANCED)
+            self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(),
+                             [replacement, replacement])
 
     def test_claude_sync_restores_the_accepted_save_when_head_is_current(self) -> None:
         (self.writer / "config").mkdir()
@@ -373,6 +423,7 @@ class MainSyncTests(unittest.TestCase):
     def test_a_credential_probe_timeout_uses_the_cold_advice(self) -> None:
         results = [subprocess.CompletedProcess(["git"], 0, "main\n", ""),
                    subprocess.CompletedProcess(["git"], 0, str(self.checkout / ".git"), ""),
+                   subprocess.CompletedProcess(["git"], 1, "", ""),
                    subprocess.CompletedProcess(["git"], 1, "", "fetch refused"),
                    subprocess.CompletedProcess(["git"], 0, "", "")]
         with (unittest.mock.patch.object(main_sync, "_git", side_effect=results),

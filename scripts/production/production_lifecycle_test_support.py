@@ -91,7 +91,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
@@ -190,8 +190,8 @@ class LifecycleFixture(unittest.TestCase):
                          ".claude/scripts/production/showrunners.py",
                          ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
-                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
+        self.env = {**fixture_git_environment(self.root.parent), "HOME": str(self.home),
+                    "LIFECYCLE_TEST_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
@@ -266,7 +266,7 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
-        with mock.patch.dict(os.environ, self.env):
+        with mock.patch.dict(os.environ, self.env, clear=True):
             for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
                 _ = unit_config.write(worktree, unit_config.UnitConfig(
                     unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
@@ -293,7 +293,7 @@ class LifecycleFixture(unittest.TestCase):
 
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
-        with mock.patch.dict(os.environ, self.env):
+        with mock.patch.dict(os.environ, self.env, clear=True):
             _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id))
             _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree, staff.ParkedBranch(branch)),
                                    expected=row.worktree)

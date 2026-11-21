@@ -48,6 +48,7 @@ STATE_ENV = "MAIN_SYNC_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
 SYNC_LOG = "sync.jsonl"
 FETCH_TIMEOUT_SECONDS = 120
+TRACKING_REF = "refs/remotes/origin/main"
 IN_PROGRESS = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply")
 # A job has no terminal: git and ssh must fail rather than ask.
 GIT_ENVIRONMENT = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=20"}
@@ -202,6 +203,9 @@ def sync(checkout: Path) -> Outcome:
         path_lock = live_paths_lock_file(checkout)
         with exclusive(path_lock):
             waiting_rows.restore_live(checkout)
+            before_fetch = _git(checkout, "rev-parse", "--verify", "--quiet", TRACKING_REF)
+            if before_fetch.returncode not in (0, 1):
+                return Outcome("fetch-failed", _first_line(before_fetch))
         fetched = _git(checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-prune", "--refmap=",
                        "origin", f"refs/heads/main:{fetch_ref}",
                        timeout=FETCH_TIMEOUT_SECONDS)
@@ -221,10 +225,21 @@ def sync(checkout: Path) -> Outcome:
             conflicts = live_file_conflicts(checkout, tip)
             if conflicts:
                 return Outcome("live-file-conflict", "\n".join(str(conflict) for conflict in conflicts))
-            tracked = _git(checkout, "update-ref", "refs/remotes/origin/main", tip)
+            tracking = _git(checkout, "rev-parse", "--verify", "--quiet", TRACKING_REF)
+            if tracking.returncode not in (0, 1):
+                return Outcome("fetch-failed", _first_line(tracking))
+            old_tip = tracking.stdout.strip()
+            if old_tip and old_tip != tip:
+                ancestor = _git(checkout, "merge-base", "--is-ancestor", old_tip, tip)
+                if ancestor.returncode == 1:
+                    if old_tip != before_fetch.stdout.strip():
+                        return Outcome("diverged", f"{TRACKING_REF} changed during the fetch")
+                elif ancestor.returncode:
+                    return Outcome("fetch-failed", _first_line(ancestor))
+            move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)
+            tracked = _git(checkout, "update-ref", TRACKING_REF, tip, old_tip or "0" * len(tip))
             if tracked.returncode:
                 return Outcome("fetch-failed", _first_line(tracked))
-            move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)
             return _advance(checkout, move, pending)
     except waiting_rows.Diverged:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
