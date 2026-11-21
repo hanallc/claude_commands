@@ -4190,10 +4190,12 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertIsInstance(row.parent, staff.ReportsTo)
                         assert isinstance(row.parent, staff.ReportsTo)
                         document = destination / "docs/plans/alpha.md"
-                        self.write(document, document.read_text() + "\n## Production Context\n\n"
-                                   f"- **Merge branch:** `{final_branch}`\n"
-                                   f"- **Showrunner checkout:** `{destination}`\n"
-                                   "- **Log:** `production.log`\n")
+                        self.write(document, document.read_text() + "\n".join((
+                            "", "## Production Context", "",
+                            f"- **Merge branch:** `{final_branch}`",
+                            f"- **Showrunner checkout:** `{destination}`",
+                            "- **Log:** `production.log`", "",
+                        )))
                         content = document.read_bytes()
                         promoted = staff.promote_unit(row.id, name="gamma", parent=row.parent.id,
                             doc=staff.LiveDoc("natedev", document))

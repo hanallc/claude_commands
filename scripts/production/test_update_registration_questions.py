@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.production import proposal_issue, proposals_folder, staff
@@ -28,7 +28,7 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
-    seed_admission = False
+    seed_admission: ClassVar[bool] = False
 
     @override
     def setUp(self) -> None:
