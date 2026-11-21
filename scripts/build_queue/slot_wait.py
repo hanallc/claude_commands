@@ -16,24 +16,17 @@ import subprocess
 from threading import Thread
 
 from scripts.lib import build_folders, conf
-from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
+from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_STEP_NAMES, RECORDED_VERBS,
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
                                                 GateJobNotRecorded, NotVerifyCall, VerifyCall, VerifyStep)
+from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text as public_queue_text, select_queue_name
 from scripts.message.owner_role import OwnerRole
 
 
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"})
-
-
-def public_queue_text(text: str) -> str:
-    """Return text that can appear in a queue name or owner field."""
-    text = " ".join(text.split())
-    if text in ("", "—", "owner not recorded") or "$" in text or RAW_ID.search(text):
-        return ""
-    return text
 
 
 class QueueKind(Enum):
@@ -57,8 +50,8 @@ class QueueRowName(str):
         return str.__new__(cls, kind.value)
 
     @classmethod
-    def owner_only(cls, owner: str) -> QueueRowName:
-        return str.__new__(cls, public_queue_text(owner) or "—")
+    def owner_only(cls, *candidates: object) -> QueueRowName:
+        return str.__new__(cls, select_queue_name(*candidates))
 
     @classmethod
     def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
