@@ -7617,10 +7617,14 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
         director = self.row("queue", "codex:director-thread", machine="natedev")
-        self.local = self.recipient_roster([director], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
-        for target, expected_status in (("absent here", 2), ("queue-unit", 0)):
-            with self.subTest(target=target):
+        for target, expected_status, problems in (
+            ("absent here", 2, ["worker source unreadable"]),
+            ("queue-unit", 0, ["worker source unreadable"]),
+            ("queue-unit", 0, []),
+        ):
+            with self.subTest(target=target, problems=problems):
+                self.local = self.recipient_roster([director], problems)
                 status, output, errors = self.run_main(target)
                 self.assertEqual(status, expected_status, output + errors)
                 if target == "absent here":
