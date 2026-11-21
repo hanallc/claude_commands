@@ -3110,12 +3110,13 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_for_you_count_view_sends_no_command_text(self) -> None:
         row = for_you.ForYouRow("action/fixture", "action", "Long command", "x" * 70000,
                                "mac", "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
-        with patch.object(for_you, "read", return_value=for_you.ForYouSnapshot((row,), ())) as read:
+        rebuild = replace(row, key="rebuild/mac", kind="rebuild", title="Rebuild mac", command="rebuild")
+        snapshot = for_you.ForYouSnapshot((row, rebuild), (), ("mac",))
+        with patch.object(for_you, "read", return_value=snapshot) as read:
             status, headers, body = self.head("/console/for-you.json?view=count")
         self.assertEqual(status, 200)
         self.assertEqual(headers["cache-control"], "no-store")
-        self.assertEqual(sorted(cast(dict[str, object], json.loads(body))), ["available", "count"])
-        self.assertEqual(json.loads(body), {"available": True, "count": 1})
+        self.assertEqual(json.loads(body), {"available": True, "count": 2, "other_count": 1, "rebuild_machines": ["mac"]})
         self.assertEqual(read.call_count, 1)
 
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:

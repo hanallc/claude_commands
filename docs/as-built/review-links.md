@@ -338,10 +338,11 @@ A known zero uses a quiet button and shows `No actions required.` in the panel.
 That function returns `/console/rebuilds.html`.
 `?page=rebuilds` still selects that page for commit details.
 The shell refreshes its grouped details while that page is visible.
-The status line separates session `Review:` counts from the global `For you:` action count.
-`assignment.py` reads both counts before it replaces itself with jq.
-The Mac requests `/console/for-you.json?view=count` to read the count without command text.
-The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this count.
+The status line shows session counts under `Review:`.
+It names waiting rebuilds and counts other open actions under `For you:`.
+`assignment.py` reads both rows before it replaces itself with jq.
+The Mac requests `/console/for-you.json?view=count` for the rebuild machines and counts without command text.
+The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this data.
 `tailscale ip -4` returns the peer address.
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
@@ -1378,7 +1379,8 @@ An agent deletes an image with this command:
 ### Rebuilds page
 
 `/console/rebuilds.html` lists machines that require a rebuild and shows commit details.
-The status line shows an action count or Unavailable.
+The status line names each waiting rebuild in the `For you:` row.
+The same row shows the count of other open actions or `Unavailable` when the count fails.
 Each render checks whether the rebuild cache needs a refresh.
 The page combines the cached system comparison with open rebuild needs.
 The server serves it only in a folder that holds the browser manifest.
