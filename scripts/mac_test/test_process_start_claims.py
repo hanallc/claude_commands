@@ -44,9 +44,12 @@ class ClaimProcessStartTests(unittest.TestCase):
             args.settings = str(root / "mac_test.conf")
             args.identity = True
             paths = mac_test.StatePaths(root / "provider")
+            state_environment = {"MAC_TEST_STATE_DIR": str(root / "mac-state"),
+                                 "BUILD_TARGETS_STATE_DIR": str(root / "target-state")}
             reservation = io.StringIO()
-            with mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
-                    redirect_stdout(reservation):
+            with (mock.patch.dict(os.environ, state_environment),
+                  mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")),
+                  redirect_stdout(reservation)):
                 self.assertEqual(mac_test.command_claim_wait(args, paths, session=assignment.session,
                     assignment=assignment), 0)
             exact = claim_state.reply_claim_identity(reservation.getvalue())

@@ -975,6 +975,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertIn("mac_test: not running on the Mac (state: claim child exited 12: "
                       + "cannot adopt the Mac claim: no reservation)", result.stdout)
+        self.assert_wire("declined", "state")
         self.assertEqual(self.events(), [])
 
     def test_remote_build_target_directory_reaches_the_result_file(self) -> None:

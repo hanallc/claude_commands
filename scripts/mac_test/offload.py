@@ -245,6 +245,14 @@ class DeclinedMacRun:
 
 
 @dataclass(frozen=True)
+class WaitClaimAdoptionDeclined(DeclinedMacRun):
+    """The claim child declined adoption and supplied a diagnostic."""
+
+    reason: Literal["state"] = field(default="state", init=False)
+    diagnostic: str = field(kw_only=True)
+
+
+@dataclass(frozen=True)
 class KnownMacJob:
     """The text identifies the job that holds the Mac."""
     what: str
@@ -1367,7 +1375,9 @@ def write_result(
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
         description = reason
-        if isinstance(result, DeclinedMacRun) and result.reason == "disk":
+        if isinstance(result, WaitClaimAdoptionDeclined):
+            description = result.diagnostic
+        elif isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
         elif isinstance(result, DeclinedMacRun) and result.reason in ("source_changed", "runner"):
@@ -3322,10 +3332,10 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
     if isinstance(claim, MacClaimNotConfirmed):
         if claim_from_wait and isinstance(claim, MacClaimChildStateFailure):
             check = " ".join((claim.stderr.strip() or claim.stdout.strip()).splitlines())
-            detail = f"state: claim child exited {claim.status}"
+            diagnostic = f"state: claim child exited {claim.status}"
             if check:
-                detail += f": {check}"
-            return DeclinedMacRun("state", elapsed_seconds(started), detail)
+                diagnostic += f": {check}"
+            return WaitClaimAdoptionDeclined(elapsed_seconds(started), diagnostic=diagnostic)
         if claim.reason in ("busy", "blocked"):
             controller.attempt_evidence.provider = placement.NoProviderClaim()
         if not decline_already_shown(claim.reason, request.last_decline):
