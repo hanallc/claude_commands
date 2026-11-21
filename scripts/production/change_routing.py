@@ -16,6 +16,7 @@ from scripts.lib import conf
 from scripts.production import delivery_state, record_store, staff, unrouted_alert
 from scripts.production.issues import source_paths
 from scripts.production.production_doc import Refusal, production_field
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
@@ -175,10 +176,21 @@ class StaffRouting:
         self.list_documents: dict[str, list[Path]] = {
             name: _list_document_paths(text) for name, text in lists if name not in documents}
         self.checked_paths: dict[Path, bool | ProductionPathUnreadable] = {}
+        self.legacy_paths: dict[Path, bool] = {}
+
+    def _remote_document(self, name: str) -> staff.LiveDoc | staff.WrappedDoc | None:
+        runner = self.runners_by_name.get(name)
+        if (runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                and record_store.local_document(runner) is None):
+            return runner.doc
+        return None
 
     def production(self, name: str) -> Path | None:
         """Check only documents that can supply this production."""
         runner = self.runners_by_name.get(name)
+        remote_document = self._remote_document(name)
+        if remote_document is not None and remote_document.path.name.endswith(LIVE_DOCUMENT_SUFFIX):
+            return None
         candidates: list[Path] = []
         document = record_store.local_document(runner)
         if document is not None:
@@ -198,9 +210,21 @@ class StaffRouting:
             available = self.checked_paths[path]
             if isinstance(available, ProductionPathUnreadable):
                 raise available
-            if available:
+            if available and (remote_document is None or self._is_legacy_document(path)):
                 return path
         return None
+
+    def _is_legacy_document(self, path: Path) -> bool:
+        if path not in self.legacy_paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                self.legacy_paths[path] = not staff.declares_merge_checkout(lines) and bool(
+                    production_field(lines, "Showrunner checkout"))
+            except (FileNotFoundError, Refusal):
+                self.legacy_paths[path] = False
+            except OSError as error:
+                raise ProductionPathUnreadable(path, error) from error
+        return self.legacy_paths[path]
 
     @cached_property
     def documents(self) -> dict[str, Path]:
@@ -288,12 +312,11 @@ class StaffRouting:
         """Read the producer and its showrunner's current production document."""
         name = self.list_owner(review_list)
         owner = self._staff_owner(row, review_list)
-        if isinstance(owner, UnroutedChange) or isinstance(owner.showrunner_id, MissingShowrunner):
-            document = self.production(name)
-        else:
-            document = self.production(owner.tab)
+        production_name = (name if isinstance(owner, UnroutedChange) or isinstance(owner.showrunner_id, MissingShowrunner)
+                           else owner.tab)
+        document = self.production(production_name)
         missing_owner = isinstance(owner, ShowrunnerOwnChange) and isinstance(owner.showrunner_id, MissingShowrunner)
-        if missing_owner or document is None:
+        if missing_owner or (document is None and self._remote_document(production_name) is None):
             root = self._root
             if root is not None:
                 root_document = document if document is not None else self.production(root.name)
