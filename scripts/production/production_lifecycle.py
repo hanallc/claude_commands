@@ -10,7 +10,7 @@ import argparse
 import fcntl
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -52,7 +52,7 @@ PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.p
 MOVE_RECORD = Path("item154/move.json")
 MOVE_VERSION = 1
 OFFSET_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
-                         r"(?:\.[0-9]+)?[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]")
+                         + r"(?:\.[0-9]+)?[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 class PlanLanded(NamedTuple):
@@ -244,7 +244,7 @@ def read_move_approval(path: Path) -> MoveApproval | NoMoveApproval:
 
 
 @contextmanager
-def locked_move(owner: staff.StaffRow) -> Iterator[Path]:
+def locked_move(owner: staff.StaffRow) -> Generator[Path]:
     path = showrunners.SHOWRUNNER_STATE_DIR / staff.native_id(owner.id) / MOVE_RECORD
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
