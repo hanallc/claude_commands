@@ -6,8 +6,11 @@ import unittest
 import fcntl
 
 import io
+import hashlib
+import json
 import os
 from pathlib import Path
+import shlex
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from unittest import mock
@@ -27,6 +30,51 @@ class MergeGateTests(MergeGateFixture):
         self.assertEqual(refusal.exception.code, 2)
         self.assertIn("choose --tests-only, --promote-only, or --nightly", errors.getvalue())
         self.assertEqual(self.module_events(), [])
+        self.assert_not_pushed()
+
+    def test_every_gate_form_refuses_a_saved_checkpoint_push(self) -> None:
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", self.checkpoint)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        key = json.dumps([str(self.checkout.resolve()), "checkpoint", f"origin/integration:{self.checkpoint}"])
+        self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / "gate passes")
+        path = self.state / "gate passes" / "push-recovery" / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+        record = json.dumps({"base": self.base, "commit": merged, "source_commit": self.checkpoint})
+        archive = f"mv -i -- {shlex.quote(str(path))} {shlex.quote(str(path.with_suffix('.resolved')))}"
+        forms = (
+            ["--tests-only"],
+            ["--tests-only", "--module", "hooks/test_first.py"],
+            ["--promote-only", "--merge-branch", "integration"],
+            ["--nightly", "--merge-branch", "integration", "--unit", "fixture"],
+            ["nightly-assigned", "--unit", "fixture"],
+            ["nightly-check"],
+        )
+        test_gate = mock.Mock(return_value=0)
+        other_gate = mock.Mock(side_effect=AssertionError("the gate started work"))
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.multiple(merge_gate, run_tests_only=test_gate, promote=other_gate,
+                                  nightly=other_gate, _sweep_nightly_build_folders=other_gate,
+                                  assign_nightly_red=other_gate, check_nightly_assignments=other_gate)):
+            promotion = merge_gate.promotion_record_path(self.main, "integration")
+            promotion_record = json.dumps({"base": self.base, "commit": merged, "source_commit": merged})
+            self.write(promotion, promotion_record)
+            self.assertEqual(merge_gate.main(["--tests-only"]), 0)
+            test_gate.assert_called_once()
+            test_gate.reset_mock()
+            self.write(path, record)
+            for form in forms:
+                with self.subTest(form=form), redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(merge_gate.main(form), 1)
+                    line, = errors.getvalue().splitlines()
+                    self.assertTrue(line.startswith(
+                        f"REFUSED: {path} records an unpublished checkpoint merge from the removed integrate form."))
+                    self.assertIn(f"Check whether {merged} reached the production branch.", line)
+                    self.assertIn(f"restore the original checkout to {self.base}.", line)
+                    self.assertIn(f"`{archive}`", line)
+        test_gate.assert_not_called()
+        other_gate.assert_not_called()
+        self.assertEqual(path.read_text(), record)
+        self.assertEqual(promotion.read_text(), promotion_record)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
         self.assert_not_pushed()
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:

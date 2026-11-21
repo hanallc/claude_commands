@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
 import io
 import json
 import os
@@ -111,6 +111,12 @@ class MergeGateSignalsTests(GateSuitesFixture):
         self.assertTrue(recovery.path.is_file())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), unrelated)
         self.assertEqual((self.checkout / "later.txt").read_text(), "unrelated commit\n")
+        _ = self.git(self.checkout, "reset", "--keep", merged)
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("merge undone", result.stdout)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertFalse(recovery.path.exists())
         self.assert_not_pushed()
 
     def test_saved_rollback_aborts_an_in_progress_merge_and_stops_its_hook(self) -> None:
@@ -138,7 +144,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                 self.assertNotEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
                 self.assert_process_stopped(hook_pid)
             finally:
-                if process.poll() is None:
+                with suppress(ProcessLookupError):
                     send_process_group(process.pid, signal.SIGKILL)
         self.assertFalse(recovery.path.exists())
         self.assertFalse((self.checkout / ".git/MERGE_HEAD").exists())

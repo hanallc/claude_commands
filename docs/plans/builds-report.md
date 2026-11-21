@@ -1938,7 +1938,7 @@ The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/
 
 | Step name | Description in the tooltip | Changes | Called today as |
 | --- | --- | --- | --- |
-| integrate | Merges the `<unit>` checkpoint into the `<showrunner>` branch, tests every module, then pushes `<showrunner>`. | branch `<showrunner>` | `merge_gate.py --checkpoint` |
+| integrate | Merged the checkpoint, tested the merge, and pushed the production branch. | branch `<showrunner>` | Phase 416 removed this form. |
 | test all | Tests every module of `<unit>`. | no branch | `merge_gate.py --tests-only --full` |
 | test modules | Tests `<N>` named modules of `<unit>`. | no branch | `merge_gate.py --tests-only --module X` |
 | test affected | Tests the modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
