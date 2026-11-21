@@ -152,7 +152,14 @@ def red_names(command: Sequence[str], output: str) -> frozenset[str]:
 def only_tests(command: list[str], names: frozenset[str]) -> list[str]:
     """Restrict the command to the named gate modules, or tests with verify.sh --filter or nextest -E test(=name)."""
     if runs_merge_gate(command):
-        return [*command, *(word for name in sorted(names) for word in ("--module", name))]
+        narrowed_command: list[str] = []
+        words = iter(command)
+        for word in words:
+            if word == "--module":
+                _ = next(words, "")
+            elif not word.startswith("--module="):
+                narrowed_command.append(word)
+        return [*narrowed_command, *(word for name in sorted(names) for word in ("--module", name))]
     if any(Path(word).name == "verify.sh" for word in command):
         return [*command, *(word for name in sorted(names) for word in ("--filter", name))]
     return [*command, *(word for name in sorted(names) for word in ("-E", f"test(={name})"))]

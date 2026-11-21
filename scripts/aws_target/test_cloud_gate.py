@@ -2236,14 +2236,14 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             with (self.subTest(mode=mode, full=full),
                   mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
-                  mock.patch.object(gate, 'run_suites') as local):
+                  mock.patch.object(gate, 'run_suites_with_policy') as local):
                 self.assertEqual(gate.run_gate_suites(self.root, mode=mode, full=full), remote)
             local.assert_not_called()
             self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
 
     def test_allowed_fallback_calls_the_original_local_runner(self) -> None:
         with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
-              mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
+              mock.patch.object(gate, 'run_suites_with_policy') as local, redirect_stdout(StringIO())):
             _ = gate.run_gate_suites(self.root, full=True, mode=gate.SuiteMode.TARGETED_TEST)
         self.assertTrue(local.call_args.kwargs['full'])
         self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED_TEST)
@@ -4026,7 +4026,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 place.status = 0
             return gate.GateRun((), 0, 0)
         with (mock.patch.object(cloud_gate, 'run', side_effect=route),
-              mock.patch.object(gate, 'run_suites', side_effect=local), redirect_stdout(StringIO())):
+              mock.patch.object(gate, 'run_suites_with_policy', side_effect=local), redirect_stdout(StringIO())):
             _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED_TEST)
         self.assertTrue(self.admission.callers_released())
 

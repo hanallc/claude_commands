@@ -424,6 +424,24 @@ class ReadGateTimeLimit:
 READ_GATE_TIME_LIMIT: Final = ReadGateTimeLimit()
 
 
+def passing_module_wall_medians(connection: sqlite3.Connection, vcpus: int, modules: Sequence[str],
+                                count: int) -> dict[str, float]:
+    """Return recent passing medians for modules with history on this vCPU count."""
+    medians: dict[str, float] = {}
+    for path in modules:
+        suite, module = path.removeprefix("scripts/").split("/", 1)
+        walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
+            """SELECT m.wall_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+               WHERE r.vcpus = ? AND r.status = 0 AND r.aborted = 0
+                 AND r.selection != 'reused' AND m.status = 0 AND m.restart = ''
+                 AND m.suite = ? AND m.module = ? AND m.wall_s > 0
+               ORDER BY r.started_at DESC, r.id DESC, m.attempt DESC LIMIT ?""",
+            (vcpus, suite, module, count)).fetchall())]
+        if walls:
+            medians[path] = statistics.median(walls)
+    return medians
+
+
 def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequence[str],
                        jobs: int, targeted: bool) -> GateTimeLimit | NoGateTimeLimit:
     """Use passing records from the same vCPU count and the configured history size.
@@ -443,20 +461,11 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
         if walls:
             return GateTimeLimit(factor * statistics.median(walls))
         return NoGateTimeLimit(f"no passing full gate history for {vcpus} vCPUs at {jobs} jobs")
-    medians: list[float] = []
+    medians = passing_module_wall_medians(connection, vcpus, modules, count)
     for path in modules:
-        name = path.removeprefix("scripts/")
-        suite, module = name.split("/", 1)
-        walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
-            """SELECT m.wall_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
-               WHERE r.vcpus = ? AND r.status = 0 AND r.aborted = 0
-                 AND r.selection != 'reused' AND m.status = 0 AND m.restart = ''
-                 AND m.suite = ? AND m.module = ? AND m.wall_s > 0
-               ORDER BY r.started_at DESC, r.id DESC, m.attempt DESC LIMIT ?""",
-            (vcpus, suite, module, count)).fetchall())]
-        if not walls:
+        if path not in medians:
+            name = path.removeprefix("scripts/")
             return NoGateTimeLimit(f"no passing module history for {name} on {vcpus} vCPUs")
-        medians.append(statistics.median(walls))
     if medians:
-        return GateTimeLimit(factor * max(max(medians), sum(medians) / jobs))
+        return GateTimeLimit(factor * max(max(medians.values()), sum(medians[path] for path in modules) / jobs))
     return NoGateTimeLimit(f"no passing module history for {vcpus} vCPUs")

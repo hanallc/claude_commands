@@ -70,7 +70,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             observed.append(repo)
             raise GateRefused("injected suite stop")
 
-        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+        with mock.patch.object(merge_gate, "run_suites_with_policy", side_effect=suites):
             result = self.run_gate("--tests-only", "--checkout", str(checkout))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("injected suite stop", result.stderr)
@@ -88,7 +88,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             observed.append(os.environ[admission_records.BUILDLOG_UNIT])
             return merge_gate.GateRun((), 0, 0, tests_reused=True)
 
-        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+        with mock.patch.object(merge_gate, "run_suites_with_policy", side_effect=suites):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, ["fixture"])
@@ -119,7 +119,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         finally:
                             restored.append(os.environ.get(admission_records.BUILDLOG_UNIT))
 
-                    with mock.patch.object(merge_gate, "run_suites", side_effect=suites), \
+                    with mock.patch.object(merge_gate, "run_suites_with_policy", side_effect=suites), \
                          mock.patch.object(merge_gate, "merge_checkpoint", side_effect=merge):
                         result = self.run_gate()
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
