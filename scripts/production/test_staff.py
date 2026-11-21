@@ -1210,6 +1210,18 @@ class StaffTests(StaffCommandTestCase):
                             ("--expected-path", str(initial.path))):
             self.assertEqual(command[command.index(flag) + 1], value)
 
+    def test_remote_worktree_probe_reports_locks_on_the_staff_owner(self) -> None:
+        self.staff_file.parent.mkdir(parents=True, exist_ok=True)
+        locks = (self.staff_file.with_suffix(".json.lock"), self.staff_file.with_name("operation.lock"))
+        with self.machine("mac"):
+            self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
+            self.assertTrue(all(not lock.exists() for lock in locks))
+            for path in locks:
+                with self.subTest(path=path), path.open("wb") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteLockHeld(path))
+            self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
+
     def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
         parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
