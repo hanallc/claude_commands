@@ -4274,6 +4274,10 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                if (isinstance(request.identity.landing_repository, wire.LandingRepositoryNotRecorded)
+                        and isinstance(previous.identity.landing_repository, wire.LandingRepositoryKey)):
+                    request = replace(request, identity=replace(request.identity,
+                        landing_repository=previous.identity.landing_repository))
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:

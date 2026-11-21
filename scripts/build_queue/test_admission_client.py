@@ -2249,9 +2249,9 @@ class ClientTests(unittest.TestCase):
             refresh = mock.Mock(return_value=updated)
 
             def publish_origin(_wait: wire.Wait) -> None:
-                git_directory = fixture.root / ".git"
-                git_directory.mkdir()
-                _ = (git_directory / "config").write_text(f'[remote "origin"]\nurl = {landing.key}\n')
+                _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+                _ = subprocess.run(["git", "-C", str(fixture.root), "remote", "add", "origin", landing.key],
+                                   capture_output=True, check=True)
 
             self.assertEqual(client.admit(request, publish_origin, refresh), GRANTED)
             self.assertEqual(transport.requests[1], replace(request, profile=updated.profile, fresh_test=True,

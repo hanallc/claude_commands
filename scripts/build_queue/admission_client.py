@@ -17,7 +17,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 import socket
 import subprocess
@@ -139,7 +138,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
     try:
         with _connect(_remaining_seconds(deadline)) as connection:
             connection.settimeout(_remaining_seconds(deadline))
-            _send_request(connection, request)
+            _ = _send_request(connection, request)
             line = _line(connection, bytearray(), deadline)
             reply = wire.parse_reply(line, request)
             if isinstance(reply, wire.Refused):
@@ -598,7 +597,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 send_timeout = retry.bound(timeout)
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
-                _send_request(connection, request)
+                request = _send_request(connection, request)
                 answered_expiry = -math.inf
                 pending = active_channel.pending if active_channel is not None else bytearray()
                 while True:
@@ -722,15 +721,15 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if CLOCK.monotonic() >= retry.deadline:
                         return refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
                     if isinstance(cause, records.EstimateExpired):
-                        if isinstance(first, wire.ServiceEstimateRequest):
-                            refreshed = first
+                        if isinstance(request, wire.ServiceEstimateRequest):
+                            refreshed = request
                         else:
-                            if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
+                            if refresh is None or not isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
                                 raise CheckerFailure("estimate cannot be refreshed")
                             estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
                             refresh_channel = EstimateConnection(connection, pending)
                             try:
-                                refreshed = replace(_refreshed(first, estimate, channel=refresh_channel),
+                                refreshed = replace(_refreshed(request, estimate, channel=refresh_channel),
                                                     code_version=LOADED_ADMISSION_CODE_VERSION)
                             except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
                                 raise
@@ -742,8 +741,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 request = refreshed
                                 break
                         # A new connection would end this waiter's place, and a pass could start a later step in the gap.
-                        _send_request(connection, refreshed)
-                        request = refreshed
+                        request = _send_request(connection, refreshed)
                         answered_expiry = cause.estimated_at
                         continue
         except CheckerFailure as error:
@@ -767,10 +765,10 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     return refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
                 check_unreachable()
                 print(f"memory admission check failed ({reason}); trying again, the step keeps its place", file=sys.stderr)
-                if not retry_estimator or refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
+                if not retry_estimator or refresh is None or not isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
                     break
                 try:
-                    request = replace(_refreshed(first, refresh), code_version=LOADED_ADMISSION_CODE_VERSION)
+                    request = replace(_refreshed(request, refresh), code_version=LOADED_ADMISSION_CODE_VERSION)
                     retry_estimator = False
                     break
                 except (_QueueLeft, _QueueUnreachable):
@@ -1197,26 +1195,10 @@ def verify_call() -> records.VerifyStep:
     return records.NotVerifyCall()
 
 
-_LANDING_REPOSITORY_KEYS: dict[Path, wire.LandingRepositoryKey] = {}
-
-
-def _landing_origin(common: Path) -> str:
-    in_origin = False
-    for line in (common / "config").read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if text.startswith("["):
-            in_origin = re.fullmatch(r'\[(?i:remote)[ \t]+"origin"\][ \t]*(?:[#;].*)?', text) is not None
-        elif in_origin:
-            name, separator, value = text.partition("=")
-            if separator and name.strip().lower() == "url":
-                return " ".join(shlex.split(value, comments=True))
-    return ""
-
-
 def _landing_repository_key(directory: str) -> wire.LandingRepository:
     """Follow local origins to a repository with a remote URL.
 
-    Git config includes and URL rewrites are unsupported.
+    Each send that needs a key runs Git once per checkout in the origin chain.
     """
     from scripts.buildlog import repository
     from scripts.lib import git_files
@@ -1233,10 +1215,11 @@ def _landing_repository_key(directory: str) -> wire.LandingRepository:
             if common in seen:
                 break
             seen.add(common)
-            origin = _landing_origin(common)
-            if not origin:
+            origin = repository.output(["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+                                       str(root), repository.GIT_TIMEOUT_S)
+            if not origin or origin == "\n":
                 break
-            key = repository.remote_identity(origin, str(root))
+            key = repository.remote_identity(origin.removesuffix("\n"), str(root))
             if not Path(key).is_absolute():
                 return wire.LandingRepositoryKey(key)
             borrowed = repository.borrowed_git_dir(str(common))
@@ -1248,7 +1231,7 @@ def _landing_repository_key(directory: str) -> wire.LandingRepository:
     return wire.LandingRepositoryNotRecorded()
 
 
-def _send_request(connection: socket.socket, request: wire.Request) -> None:
+def _send_request(connection: socket.socket, request: wire.Request) -> wire.Request:
     if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.PlacementRequest, wire.ServiceEstimateRequest)):
         from scripts.build_queue import landing_test_gate
 
@@ -1260,7 +1243,7 @@ def _send_request(connection: socket.socket, request: wire.Request) -> None:
         else:
             step = request.profile.step
             key = request.identity.landing_repository
-        if step in landing_test_gate.TEST_STEPS:
+        if isinstance(key, wire.LandingRepositoryNotRecorded) and step in landing_test_gate.TEST_STEPS:
             from scripts.buildlog import step_context
 
             if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest)):
@@ -1275,18 +1258,15 @@ def _send_request(connection: socket.socket, request: wire.Request) -> None:
                 else:
                     folder = request.identity.folder
                     directory = step_context.git_directory([], folder if Path(folder).is_absolute() else os.getcwd())
-            path = Path(directory)
-            if path.is_absolute():
-                if isinstance(key, wire.LandingRepositoryNotRecorded):
-                    key = _LANDING_REPOSITORY_KEYS.get(path) or _landing_repository_key(directory)
-                if isinstance(key, wire.LandingRepositoryKey):
-                    _ = _LANDING_REPOSITORY_KEYS.setdefault(path, key)
+            if Path(directory).is_absolute():
+                key = _landing_repository_key(directory)
         if isinstance(key, wire.LandingRepositoryKey):
             if isinstance(request, wire.ServiceEstimateRequest):
                 request = replace(request, landing_repository=key)
             else:
                 request = replace(request, identity=replace(request.identity, landing_repository=key))
     connection.sendall(wire.encode_request(request).encode())
+    return request
 
 
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,

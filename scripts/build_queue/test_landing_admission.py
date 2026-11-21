@@ -9,9 +9,9 @@ import io
 import os
 from pathlib import Path
 import subprocess
-from typing import override
+import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records as records
 from scripts.build_queue import first_step, memory_feed, placement, queue_place, queue_view, step_estimator
@@ -55,11 +55,6 @@ def local_test_clone(root: Path, source_name: str = "source", upstream: str = RE
 
 
 class LandingAdmissionTests(unittest.TestCase):
-    @override
-    def setUp(self) -> None:
-        memo: dict[Path, wire.LandingRepositoryKey] = {}
-        _ = self.enterContext(patch.object(client, "_LANDING_REPOSITORY_KEYS", memo, create=True))
-
     def assert_landing_wait(self, fixture: AdmissionFixture, request: wire.AdmitRequest,
                             check: Callable[[], None] = lambda: None) -> None:
         def wait(reply: wire.Wait) -> None:
@@ -127,7 +122,7 @@ class LandingAdmissionTests(unittest.TestCase):
                 self.assertEqual(reply.reason, records.WaitsForLandingTest())
                 self.assertEqual(fixture.caller_reservations(), {})
 
-    def test_a_relative_local_clone_waits_and_its_repository_is_resolved_once(self) -> None:
+    def test_a_relative_local_clone_resolves_each_origin_once_on_the_client(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
             clone = local_test_clone(fixture.root)
             self.assertFalse((clone / ".git/objects/info/alternates").exists())
@@ -136,14 +131,14 @@ class LandingAdmissionTests(unittest.TestCase):
             queue_land()
             owner = fixture.request(step="test", need=GIB)
             request = client.step_request(["cargo", "test"], str(workdir), owner.owner, owner.since, "", owner.episode)
-            with (patch.object(repository, "remote_identity", wraps=repository.remote_identity) as lookup,
-                  patch.object(repository, "output", side_effect=AssertionError("landing lookup started Git"))):
+            with patch.object(repository, "output", wraps=repository.output) as lookup:
                 def check_lookup() -> None:
-                    resolved = lookup.call_count
-                    self.assertGreater(resolved, 0)
+                    expected = [call(["git", "-C", str(root), "config", "--get", "remote.origin.url"], str(root), 5)
+                                for root in (clone, fixture.root / "source")]
+                    self.assertEqual(lookup.call_args_list, expected)
                     _ = fixture.run_pass()
                     _ = fixture.run_pass()
-                    self.assertEqual(lookup.call_count, resolved)
+                    self.assertEqual(lookup.call_args_list, expected)
 
                 self.assert_landing_wait(fixture, request, check_lookup)
 
@@ -158,6 +153,25 @@ class LandingAdmissionTests(unittest.TestCase):
             self.assert_landing_wait(fixture, request)
 
     def test_separate_placement_calls_keep_the_landing_wait_after_the_origin_disappears(self) -> None:
+        self.assert_placement_wait_survives_missing_origin(client.request_placement)
+
+    def test_fresh_placement_clients_keep_the_landing_wait_after_the_origin_disappears(self) -> None:
+        def submit(request: wire.PlacementRequest) -> wire.Reply:
+            code = (
+                "import sys\n"
+                "from scripts.build_queue import admission_client as client, admission_protocol as wire\n"
+                "request = wire.parse_request(sys.stdin.read())\n"
+                "assert isinstance(request, wire.PlacementRequest)\n"
+                "print(wire.encode_reply(client.request_placement(request)), end='')"
+            )
+            result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2],
+                input=wire.encode_request(request), capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return wire.parse_reply(result.stdout)
+
+        self.assert_placement_wait_survives_missing_origin(submit)
+
+    def assert_placement_wait_survives_missing_origin(self, submit: Callable[[wire.PlacementRequest], wire.Reply]) -> None:
         with PlacementFixture() as fixture:
             clone = local_test_clone(fixture.root)
             request = placement_request(fixture)
@@ -168,12 +182,12 @@ class LandingAdmissionTests(unittest.TestCase):
 
             with (LauncherHangGuard("Separate landing placement calls").protect(),
                   patch.object(client, "CLOCK", fixture.clock), fixture.serving()):
-                first = client.request_placement(request)
+                first = submit(request)
                 assert isinstance(first, wire.PlacementWait) and isinstance(first.wait, wire.Wait), first
                 self.assertEqual(first.wait.reason, records.WaitsForLandingTest())
 
                 _ = (fixture.root / "source").rename(fixture.root / "source-away")
-                second = client.request_placement(request)
+                second = submit(request)
                 assert isinstance(second, wire.PlacementWait) and isinstance(second.wait, wire.Wait), second
                 self.assertEqual(second.wait.reason, records.WaitsForLandingTest())
                 self.assertEqual((second.episode, second.since), (first.episode, first.since))
@@ -190,6 +204,16 @@ class LandingAdmissionTests(unittest.TestCase):
                 request = client.step_request(["cargo", "test"], str(fixture.root), owner.owner,
                                               owner.since, "", owner.episode)
                 self.assert_landing_wait(fixture, request)
+
+    def test_relative_origin_url_with_a_semicolon_comment_resolves(self) -> None:
+        with AdmissionFixture() as fixture:
+            clone = local_test_clone(fixture.root)
+            config = clone / ".git/config"
+            _ = config.write_text(config.read_text().replace("url = ../source", "url = ../source ; Source repository"))
+            queue_land()
+            owner = fixture.request(step="test", need=GIB)
+            request = client.step_request(["cargo", "test"], str(clone), owner.owner, owner.since, "", owner.episode)
+            self.assert_landing_wait(fixture, request)
 
     def test_first_step_resends_a_placement_with_the_new_landing_key(self) -> None:
         with AdmissionFixture() as fixture:
