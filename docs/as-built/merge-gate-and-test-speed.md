@@ -732,45 +732,40 @@ A batch can contain one item.
 
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
-2. Fetch the merge branch and the unit branches from origin.
-   Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
-   Resolve every item to a commit before writing the record or starting a merge.
-   Refuse the batch and name the item if it cannot resolve to a commit.
-   Record each item's argument line and resolved commit in Git's internal directory, in batch order.
-   Normalize shell quoting and keep the argument order.
-   Resume checkpoint merges only when the arguments and commits match the record and an unpushed checkpoint belongs to the batch.
-   Identify checkpoint merges by their subjects and second parents.
-   If the record is missing or differs, reset the merge branch to its pushed tip.
-   Then start a fresh batch. Remove the record after the push or when the batch ends without unpushed merges.
-   If record removal fails, report a warning and continue.
-3. Retain the starting tip and any unfinished merge that predates the batch.
-   On recovery, get the starting tip from the first parent of the first saved checkpoint merge.
-4. Retain unpublished checkpoint merges and check each item that still needs to merge.
-   Include published items whose promotion is unfinished.
-5. Test all outstanding code paths changed from the published merge branch tip through HEAD once.
-6. Use one `tested_main_push` hold, one push, and one local promotion.
-7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+2. Fetch the production tip from origin. Check for a saved batch before starting another batch.
+3. For a new batch, fetch the unit branches. Fetch all origin heads only if an item needs a commit or a fresh tracking ref.
+4. Resolve every item to a commit. Refuse the batch and name an item that fails to resolve.
+5. Refuse to start if the checkout already has an unfinished merge. Preserve the merge and its staged edits.
+6. Save the starting tip, the ordered arguments, and the resolved commits in Git's internal directory.
+7. Check and merge the rows in order. Test the code paths from the published tip through HEAD.
+8. Publish and promote the tested tip. Complete each row's records and notice before removing the batch record.
 
-An interrupted batch uses the same test and stop rules as a fresh batch.
+If the saved merges are on the fetched tip, use that tip to find each merge and finish its outstanding completion records.
+Published recovery runs no tests, push, or promotion.
+If the batch is unpublished, stop it and report that each outstanding row must be sent again.
+A new row submitted during recovery receives a notice to send it again.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
-The published tip is `origin/<merge branch>`.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
-Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
+Review-list publication, style notification, checkout announcement, and Mac promotion run once on a fresh successful batch.
 Each merge retains its own review ownership and completion record.
 
-A hold, failure, or cancellation ends the batch and returns each outstanding row to its requester.
-A red report names the failed test step and says whether the row selects it.
-The batch stops at the first failed test command.
-The next queued item can proceed after the batch exits.
-Before publication, restore the starting tip and remove the batch record before reporting the stop.
-Abort any unfinished merge that the batch started.
+A hold, failure, or cancellation stops an unpublished batch.
+A red report names the first failed test step and states whether the row selects it.
+
+1. Abort any unfinished merge that the batch started.
+2. Restore the saved starting tip.
+3. Report every outstanding row.
+4. Remove the batch record.
+
+A crash before record removal lets recovery send the reports again.
 A failed result write leaves the requester notices available.
-An earlier unfinished merge and its staged edits remain unchanged.
-Each run starts a fresh shared test log. Tests after main moves append to the same log.
-After publication starts, only the push rollback can restore the tip. It checks the live origin first.
+If a tracked edit blocks `git reset --keep`, preserve the edit and retain the record.
+Each report names the blocked files and gives the exact recovery command.
+After the owner preserves the edits, run the printed command and start the batch again to complete recovery.
+If the record is missing and unpublished checkpoint merges exist, the tool refuses to start a new batch.
 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
