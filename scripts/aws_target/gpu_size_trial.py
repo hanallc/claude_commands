@@ -2121,9 +2121,14 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
             prepare_locked(repo, commit, folder, request)
 
         def remove_unstarted_inputs() -> None:
-            if not (folder / 'online.json').exists():
-                prepared = validate_prepared(folder, allow_removed_before_upload=True)
-                remove_run_inputs(folder, datetime.now(UTC).timestamp(), prepared.identity)
+            if (folder / 'online.json').exists():
+                return
+            try:
+                _ = (folder / 'manifest.json').lstat()
+            except FileNotFoundError:
+                return
+            prepared = validate_prepared(folder, allow_removed_before_upload=True)
+            remove_run_inputs(folder, datetime.now(UTC).timestamp(), prepared.identity)
 
         def service(command: Sequence[str]) -> int:
             if isinstance(launch, AssignedHanaGpuLaunch):

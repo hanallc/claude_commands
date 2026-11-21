@@ -443,6 +443,15 @@ elif name == 'cargo':
                 self.assertEqual(trial.comparison(flaky, candidate), 'inconclusive')
         self.assertEqual(trial.comparison(incomplete, same), 'incomplete')
 
+    def test_nextest_worker_exit_without_manifest_keeps_the_exit_reason(self) -> None:
+        request = trial.HanaGpuNextestRequest(('--test', 'fixture'), ('g6.2xlarge',))
+        with (mock.patch.object(trial, 'prepare_locked'),
+              mock.patch.object(trial, 'start_service', return_value=7),
+              mock.patch.object(trial, 'remove_run_inputs') as remove,
+              self.assertRaisesRegex(ValueError, 'The Hana GPU worker exited with status 7 and has no result')):
+            _ = trial.run_nextest(self.root, 'a' * 40, request)
+        remove.assert_not_called()
+
     def test_new_prepare_keeps_previous_folders_and_reports_each_one(self) -> None:
         root = trial.trial_root()
         root.mkdir(parents=True)
