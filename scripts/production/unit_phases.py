@@ -328,8 +328,8 @@ def _director_shells(view: CensusView | census.CensusFailed, unit: live_units.Li
 
     candidates = view.sessions.get(conversation, [])
     if isinstance(generation, session_staff.ProvedProcessGeneration):
-        process = census.CensusProcessIdentity(generation.pid, generation.started)
-        matches = [row for row in candidates if row.machine == machine and row.process == process]
+        matches = [row for row in candidates
+                   if row.machine == machine and row.pid == generation.pid and row.process_start == generation.started]
         if matches:
             shells = tuple(shell for row in matches for shell in row.shells)
             if shells or _checked_activity(unit) != "shell":
