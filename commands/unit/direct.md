@@ -186,6 +186,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
   to the working branch's own name on origin, never to the default branch except <FastTrack/>.
+  A branch whose hash went to the showrunner is never amended, rebased or force-pushed.
   <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
   phases.
 - A phase reservation is released only by the successful-checkpoint path in
