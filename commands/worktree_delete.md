@@ -9,6 +9,8 @@ Track discovery, validation, change checks, confirmation, and deletion with Todo
 Set each step to `in_progress` before execution and `completed` after execution.
 
 <ExecutionSteps>
+    If the user asks to retry a local branch deletion, execute <RetryBranchDeletion/> and stop.
+
     1. Execute <DiscoverWorktrees/>.
     2. Execute <ValidateDeletionTarget/>.
     3. If `cleanup` is true, say: "This tree is cleanup; all work is on the target branch."
@@ -47,13 +49,14 @@ Set each step to `in_progress` before execution and `completed` after execution.
 </CheckUnpushedCommits>
 
 <GetFinalConfirmation>
-    Display these deletion details:
+    Display the deletion details.
 
     1. The worktree path.
-    2. The local branch name.
-    3. The `origin_action`. For `delete`, show the origin branch and `origin_commit`.
+    2. The local `branch_ref` and `local_commit`.
+    3. The `origin_action`. For `delete`, show the origin ref and `origin_commit`.
     4. The `unpushed_count` and `remote_only_count` from the same preview.
 
+    Say "Deletion removes these refs at these commits. If no other branch holds a commit, that commit is lost."
     Ask the user to enter `confirm` for deletion or `cancel` to stop.
     Wait for the response.
     If the user enters `cancel`, stop.
@@ -71,3 +74,19 @@ Set each step to `in_progress` before execution and `completed` after execution.
     Each preview permits one execution before it expires. If it expires or the files or refs change, create a new preview.
     A `keep` or `absent` preview requires a new preview and confirmation before any later origin deletion.
 </PerformDeletion>
+
+<RetryBranchDeletion>
+    Use this route if deletion stopped after the worktree was removed and the local branch remains.
+
+    1. Ask for the removed worktree path, the repository path, and the full branch ref under `refs/heads/`.
+    2. Run `bash ~/.claude/scripts/worktree_delete/worktree_delete_validation.sh --branch-only "$SELECTED_WORKTREE" "$REPOSITORY" "$BRANCH_REF"`.
+    3. If validation fails, display the message and stop.
+    4. Display the repository, the local ref, its commit, and the `local_only_count` from the preview.
+    5. Give the warning in <GetFinalConfirmation/>.
+    6. Ask the user to enter `confirm` for deletion or `cancel` to stop.
+    7. Wait for the response. If the user enters `cancel`, stop.
+    8. Record the new `PREVIEW_ID` with `bash ~/.claude/scripts/worktree_delete/record_confirmation.sh "$PREVIEW_ID"`.
+    9. If confirmation fails, display the message and stop.
+    10. Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh --branch-only "$SELECTED_WORKTREE" "$REPOSITORY" "$BRANCH_REF" "$PREVIEW_ID"`.
+    11. Report the result.
+</RetryBranchDeletion>

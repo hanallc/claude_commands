@@ -614,19 +614,28 @@ class DeletionLocalIdentity(TypedDict):
     local_commit: str
 
 
-class DeletionPreview(TypedDict):
+class DeletionApproval(TypedDict):
     local: DeletionLocalIdentity
+    created_at: int
+    expires_at: int
+
+
+class WorktreeDeletionPreview(DeletionApproval):
+    scope: Literal["worktree"]
     push_urls: list[str]
     remote_ref: str
     origin_action: Literal["keep", "absent", "delete"]
     origin_commit: str
     retention_reason: str
-    unpushed_count: int
-    remote_only_count: int
     has_uncommitted: bool
     cleanup: bool
-    created_at: int
-    expires_at: int
+
+
+class BranchOnlyDeletionPreview(DeletionApproval):
+    scope: Literal["branch-only"]
+
+
+DeletionPreview = WorktreeDeletionPreview | BranchOnlyDeletionPreview
 
 
 def deletion_local_identity(path: Path, repository: Path, branch: str) -> DeletionLocalIdentity:
@@ -645,6 +654,47 @@ def deletion_local_identity(path: Path, repository: Path, branch: str) -> Deleti
     tip = git(repository, "rev-parse", "--verify", ref).stdout.strip()
     return DeletionLocalIdentity(worktree_path=str(path), repository=str(repository),
                                  common_dir=str(local.common_dir), branch_ref=ref, local_commit=tip)
+
+
+def branch_only_identity(path: Path, repository: Path, ref: str) -> DeletionLocalIdentity:
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        path = path.resolve()
+    else:
+        raise Refused(1, f"{path}: the worktree path still exists")
+    if not ref.startswith("refs/heads/"):
+        raise Refused(1, "give the full local ref under refs/heads/")
+    repository = main_checkout(git_files.at(repository.resolve(strict=True)).toplevel)
+    _ = git(repository, "check-ref-format", ref)
+    branch = ref.removeprefix("refs/heads/")
+    default = git(repository, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+    if branch == "main" or default.stdout.strip() == f"refs/remotes/origin/{branch}":
+        raise Refused(1, f"{ref}: protected branch")
+    production_doc.require_removable_checkout(path, repository, branch)
+    if branch in worktree_branches(repository).values():
+        raise Refused(1, f"{ref}: a registered worktree holds this branch")
+    common = git_files.at(repository).common_dir
+    reject_branch_in_use(common, branch)
+    tip = git(repository, "show-ref", "--verify", "--hash", ref).stdout.strip()
+    return DeletionLocalIdentity(worktree_path=str(path), repository=str(repository),
+                                 common_dir=str(common), branch_ref=ref, local_commit=tip)
+
+
+def reject_branch_in_use(common: Path, branch: str) -> None:
+    """Check Git operations that detach HEAD while they hold a branch."""
+    try:
+        linked = tuple((common / "worktrees").iterdir())
+    except FileNotFoundError:
+        linked = ()
+    for git_dir in (common, *(path for path in linked if path.is_dir())):
+        for marker in ("rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"):
+            try:
+                saved_branch = (git_dir / marker).read_text().strip().removeprefix("refs/heads/")
+            except FileNotFoundError:
+                continue
+            if saved_branch == branch:
+                raise Refused(1, f"{branch}: a registered worktree holds this branch for a Git operation")
 
 
 def preview_origin(repo: Path, urls: tuple[str, ...], ref: str) -> tuple[
@@ -704,26 +754,47 @@ def deletion_preview(path: Path, directory: Path, ttl: int) -> dict[str, object]
     elif deletes and isinstance(checked := check_origin_landing(local_check[1], origin), Kept):
         can_clean = False
         cleanup_reason = checked.reason
-    preview_id = uuid4().hex
     now = int(time.time())
-    record = DeletionPreview(
-        local=identity, push_urls=list(urls), remote_ref=ref,
+    record = WorktreeDeletionPreview(
+        local=identity, scope="worktree", push_urls=list(urls), remote_ref=ref,
         origin_action="delete" if deletes else "keep" if retained else "absent",
         origin_commit=origin_tip, retention_reason=origin.reason if retained else "",
-        unpushed_count=unpushed, remote_only_count=remote_only, has_uncommitted=dirty,
-        cleanup=can_clean, created_at=now, expires_at=now + ttl,
+        has_uncommitted=dirty, cleanup=can_clean, created_at=now, expires_at=now + ttl,
     )
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not create_text_atomic(deletion_record(directory, preview_id, "preview"), json.dumps(record)):
-        raise Refused(1, "the preview identifier already exists")
     return {
-        "status": "success", "preview_id": preview_id, "worktree_path": str(path),
+        "status": "success", "preview_id": save_deletion_preview(directory, record), "worktree_path": str(path),
         "target_branch": head.name, "has_uncommitted": dirty, "has_unpushed": unpushed > 0,
+        "branch_ref": ref, "local_commit": identity["local_commit"],
         "unpushed_count": unpushed, "has_remote_branch": deletes, "keep_origin": retained,
         "origin_action": record["origin_action"], "origin_commit": origin_tip,
         "retention_reason": record["retention_reason"], "has_remote_only": remote_only > 0,
         "remote_only_count": remote_only, "cleanup": can_clean, "cleanup_reason": cleanup_reason,
     }
+
+
+def branch_only_preview(path: Path, repo: Path, ref: str, directory: Path, ttl: int) -> dict[str, object]:
+    identity = branch_only_identity(path, repo, ref)
+    branch = ref.removeprefix("refs/heads/")
+    local_only = int(git(Path(identity["repository"]), "rev-list", "--count", identity["local_commit"], "--not",
+                         f"--exclude={branch}", "--branches").stdout)
+    now = int(time.time())
+    record = BranchOnlyDeletionPreview(
+        local=identity, scope="branch-only", created_at=now, expires_at=now + ttl,
+    )
+    return {
+        "status": "success", "preview_id": save_deletion_preview(directory, record),
+        "worktree_path": identity["worktree_path"], "repository": identity["repository"],
+        "branch_ref": ref, "local_commit": identity["local_commit"],
+        "local_only_count": local_only,
+    }
+
+
+def save_deletion_preview(directory: Path, preview: DeletionPreview) -> str:
+    preview_id = uuid4().hex
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not create_text_atomic(deletion_record(directory, preview_id, "preview"), json.dumps(preview)):
+        raise Refused(1, "the preview identifier already exists")
+    return preview_id
 
 
 def deletion_record(directory: Path, preview_id: str, state: str) -> Path:
@@ -738,9 +809,15 @@ def deletion_record(directory: Path, preview_id: str, state: str) -> Path:
 
 def read_deletion_preview(file: Path) -> DeletionPreview:
     try:
-        preview = cast(DeletionPreview, json.loads(file.read_text()))
+        decoded = cast(object, json.loads(file.read_text()))
     except FileNotFoundError as error:
         raise Refused(1, "the deletion preview is missing or already used; create a new preview") from error
+    if not isinstance(decoded, dict):
+        raise Refused(1, "invalid deletion preview")
+    fields = cast(dict[str, object], decoded)
+    if fields.get("scope") not in ("worktree", "branch-only"):
+        raise Refused(1, "create and confirm a new deletion preview")
+    preview = cast(DeletionPreview, cast(object, fields))
     if not preview["created_at"] <= int(time.time()) < preview["expires_at"]:
         raise Refused(1, "the deletion preview expired; create a new preview")
     return preview
@@ -749,13 +826,12 @@ def read_deletion_preview(file: Path) -> DeletionPreview:
 def confirm_deletion(directory: Path, preview_id: str) -> None:
     file = deletion_record(directory, preview_id, "preview")
     preview = read_deletion_preview(file)
-    if preview["has_uncommitted"]:
+    if preview["scope"] == "worktree" and preview["has_uncommitted"]:
         raise Refused(1, "the preview shows uncommitted changes")
     _ = file.rename(deletion_record(directory, preview_id, "confirmed"))
 
 
-def consume_deletion(directory: Path, preview_id: str, path: Path, repo: Path, branch: str, *,
-                     automatic: bool) -> tuple[CheckedLocalTip, OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip]:
+def take_deletion_preview(directory: Path, preview_id: str, *, automatic: bool) -> DeletionPreview:
     file = deletion_record(directory, preview_id, "preview" if automatic else "confirmed")
     used = deletion_record(directory, preview_id, "used")
     try:
@@ -763,9 +839,27 @@ def consume_deletion(directory: Path, preview_id: str, path: Path, repo: Path, b
     except FileNotFoundError as error:
         raise Refused(1, "the deletion preview is missing or already used; create a new preview") from error
     try:
-        preview = read_deletion_preview(used)
+        return read_deletion_preview(used)
     finally:
         used.unlink()
+
+
+def delete_branch_only(directory: Path, preview_id: str, path: Path, repo: Path, ref: str) -> None:
+    preview = take_deletion_preview(directory, preview_id, automatic=False)
+    if preview["scope"] != "branch-only":
+        raise Refused(1, "create and confirm a branch-only preview")
+    identity = branch_only_identity(path, repo, ref)
+    if preview["local"] != identity:
+        raise Refused(1, "the local branch identity changed after preview")
+    _ = git(Path(identity["repository"]), "update-ref", "--no-deref", "-d", ref, identity["local_commit"])
+    print(f"Deleted local ref {ref}.")
+
+
+def consume_deletion(directory: Path, preview_id: str, path: Path, repo: Path, branch: str, *,
+                     automatic: bool) -> tuple[CheckedLocalTip, OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip]:
+    preview = take_deletion_preview(directory, preview_id, automatic=automatic)
+    if preview["scope"] == "branch-only":
+        raise Refused(1, "use the branch-only deletion command")
     identity = deletion_local_identity(path, repo, branch)
     if preview["local"] != identity or preview["remote_ref"] != identity["branch_ref"]:
         raise Refused(1, "the local worktree identity changed after preview")
@@ -817,6 +911,18 @@ def main() -> int:
     _ = preview.add_argument("path", type=Path)
     _ = preview.add_argument("directory", type=Path)
     _ = preview.add_argument("ttl", type=int)
+    branch_preview = commands.add_parser("branch-only-preview")
+    _ = branch_preview.add_argument("path", type=Path)
+    _ = branch_preview.add_argument("repository", type=Path)
+    _ = branch_preview.add_argument("ref")
+    _ = branch_preview.add_argument("directory", type=Path)
+    _ = branch_preview.add_argument("ttl", type=int)
+    branch_delete = commands.add_parser("delete-branch-only")
+    _ = branch_delete.add_argument("directory", type=Path)
+    _ = branch_delete.add_argument("preview_id")
+    _ = branch_delete.add_argument("path", type=Path)
+    _ = branch_delete.add_argument("repository", type=Path)
+    _ = branch_delete.add_argument("ref")
     confirm = commands.add_parser("confirm-deletion")
     _ = confirm.add_argument("directory", type=Path)
     _ = confirm.add_argument("preview_id")
@@ -836,11 +942,17 @@ def main() -> int:
     _ = retarget.add_argument("--reverse", action="store_true")
     arguments = parser.parse_args()
     command = cast(str, arguments.command)
-    if command in ("deletion-preview", "confirm-deletion", "consume-deletion"):
+    if command in ("deletion-preview", "branch-only-preview", "confirm-deletion", "consume-deletion", "delete-branch-only"):
         try:
             directory = cast(Path, arguments.directory)
             if command == "deletion-preview":
                 print(json.dumps(deletion_preview(cast(Path, arguments.path), directory, cast(int, arguments.ttl))))
+            elif command == "branch-only-preview":
+                print(json.dumps(branch_only_preview(cast(Path, arguments.path), cast(Path, arguments.repository),
+                                                     cast(str, arguments.ref), directory, cast(int, arguments.ttl))))
+            elif command == "delete-branch-only":
+                delete_branch_only(directory, cast(str, arguments.preview_id), cast(Path, arguments.path),
+                                   cast(Path, arguments.repository), cast(str, arguments.ref))
             elif command == "confirm-deletion":
                 confirm_deletion(directory, cast(str, arguments.preview_id))
                 print("Confirmation recorded.")
@@ -850,7 +962,7 @@ def main() -> int:
                                                  cast(str, arguments.branch), automatic=cast(bool, arguments.automatic))
                 print_retirement(local, origin)
         except (Refused, production_doc.ProductionPathsError, OSError, ValueError, KeyError, TypeError) as error:
-            if command == "deletion-preview":
+            if command in ("deletion-preview", "branch-only-preview"):
                 print(json.dumps({"status": "error", "message": str(error)}))
             else:
                 print(str(error), file=sys.stderr)

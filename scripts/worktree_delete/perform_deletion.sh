@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 # Remove a worktree after verification of its cleanup or confirmation.
 # Usage: perform_deletion.sh <worktree_path> <branch_name> [<preview_id> [--automatic]]
+#        perform_deletion.sh --branch-only <worktree_path> <repository> <branch_ref> <preview_id>
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=confirm_gate.sh
+source "$SCRIPT_DIR/confirm_gate.sh"
+
+if [[ "${1:-}" == --branch-only ]]; then
+    if [[ $# -ne 5 ]]; then
+        echo "Usage: perform_deletion.sh --branch-only <worktree_path> <repository> <branch_ref> <preview_id>" >&2
+        exit 1
+    fi
+    wt_command delete-branch-only "$WT_CONFIRM_DIR" "$5" "$2" "$3" "$4"
+    exit
+fi
 
 WORKTREE_PATH="${1:-}"
 BRANCH_NAME="${2:-}"
@@ -17,10 +31,6 @@ fi
 
 BRANCH_REF="refs/heads/$BRANCH_NAME"
 git check-ref-format "$BRANCH_REF"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=confirm_gate.sh
-source "$SCRIPT_DIR/confirm_gate.sh"
 
 CALLER=$(pwd -P)
 if [[ "$WORKTREE_PATH" != /* ]]; then
