@@ -6,10 +6,23 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
+
+
+class ValidationFixtureTests(unittest.TestCase):
+    def test_the_repository_fixture_uses_a_private_cache(self) -> None:
+        caller_cache = self.enterContext(tempfile.TemporaryDirectory())
+        fixture = ScriptRepositoryTestCase()
+        self.addCleanup(fixture.doCleanups)
+        with patch.dict(os.environ, XDG_CACHE_HOME=caller_cache):
+            fixture.setUp()
+
+        self.assertEqual(fixture.environment["XDG_CACHE_HOME"], str(fixture.home / ".cache"))
 
 
 class ValidationRerunTests(ScriptRepositoryTestCase):
@@ -119,8 +132,16 @@ if sys.argv[1] == "fmt":
         calls = self.root / "ci-steps"
         record = f'''import json, os, sys
 from pathlib import Path
+sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
+from scripts.lib.process_start import Started, proc_table_start
+
+owner = os.getppid()
+start = proc_table_start(owner, Path("/proc"))
+if not isinstance(start, Started):
+    raise SystemExit("Cannot read the parent process start")
+parent_run = f"{{owner}}:{{start.start}}"
 with Path({str(calls)!r}).open("a") as log:
-    log.write(json.dumps([Path(sys.argv[0]).name, sys.argv[1:], os.getppid(),
+    log.write(json.dumps([Path(sys.argv[0]).name, sys.argv[1:], parent_run,
                           os.environ.get("BUILDLOG_RUN", "")]) + "\\n")
 '''
         lint = self.stub("lint", record)
@@ -135,11 +156,12 @@ with Path({str(calls)!r}).open("a") as log:
         _ = self.write(self.repo / ".claude/config/local_ci.sh", "record-ci-step first\nrecord-ci-step second\n")
         self.seed()
         _ = self.environment.pop("BUILDLOG_RUN", None)
+        _ = self.environment.pop("VERIFY_PROC_ROOT", None)
 
         result = self.script("validate_and_push/validate_ci.sh")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        rows = [cast(tuple[str, list[str], int, str], json.loads(line)) for line in calls.read_text().splitlines()]
+        rows = [cast(tuple[str, list[str], str, str], json.loads(line)) for line in calls.read_text().splitlines()]
         self.assertEqual([(tool, args) for tool, args, _, _ in rows], [
             ("lint", ["mend", "--workspace", "--fix"]),
             ("lint", ["fmt"]),
@@ -152,9 +174,8 @@ with Path({str(calls)!r}).open("a") as log:
             ("record-ci-step", ["first"]),
             ("record-ci-step", ["second"]),
         ])
-        _, _, owner, run = rows[0]
-        self.assertRegex(run, rf"^{owner}:[0-9]+$")
-        self.assertEqual({step_run for _, _, _, step_run in rows}, {run})
+        _, _, validation_run, _ = rows[0]
+        self.assertEqual({step_run for _, _, _, step_run in rows}, {validation_run})
 
     def test_a_synced_default_branch_retries_its_failed_post_push_hook(self) -> None:
         hook = '''#!/usr/bin/env bash
