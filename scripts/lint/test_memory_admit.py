@@ -2741,11 +2741,15 @@ class ServicePriorityRepairTests(unittest.TestCase):
 
     def test_unassigned_waiter_never_gets_placeholder_priority(self) -> None:
         with AdmissionFixture() as fixture:
-            fixture.free(0)
+            fixture.hold_starts()
             request = fixture.request()
             self.labels[request.identity.session_id] = UnitLabels("unassigned")
-            _ = fixture.server.handle_request(request)
-            fixture.server.priority = admission_records.QueuePriority(({'unit': UnitLabels("").unit, 'why': "old wire value", 'set_at': fixture.clock.now(), 'set_by': "director"},), admission_records.SettledPriority())
+            fixture.server.priority = admission_records.QueuePriority((
+                {"unit": UnitLabels("").unit, "why": "old wire value",
+                 "set_at": fixture.clock.now(), "set_by": "director"},
+            ), admission_records.SettledPriority())
+            wait, = fixture.server.handle_request(request)
+            self.assertIsInstance(wait, wire.Wait)
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             self.assertEqual(admission_records.waiter_priority(view.reading.ordered[0][1]), admission_records.NormalOrder())
