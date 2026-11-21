@@ -2749,6 +2749,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         agent = test_worker.DispatchAgent(self.fixture)
         agent.pane_commands(self)
         cases = ((True, ""), (False, ""), (False, "new prompt"), (False, "new DONE"), (False, "detached result"),
+                 (False, "slot cleared"),
                  (False, "assign after result"), (False, "retry after result"), (False, "retry after reassignment"),
                  (False, "assign during retry"))
         for before_stop, later in cases:
@@ -2771,6 +2772,21 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 if not before_stop:
                     agent.append(pane, "assistant", result)
                     late_reply = reply.with_name(f"reply_late_{dispatch}.txt")
+                    if later == "slot cleared":
+                        passed = worker_panes.worker_pass(row, self.run_dir)
+                        state = unit_runs.read_run_fields(self.run_dir)
+                        state["finishing_passes"] = {dispatch: passed}
+                        state["pass"] = {}
+                        write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps(state))
+                        self.fixture.world.locations[pane]["agent_status"] = "done"
+                        self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, row.id),
+                                         worker.CompletionRecovery.RECOVERED)
+                        self.assertNotIn(pane, self.fixture.world.locations)
+                        self.assertEqual(late_reply.read_text().rstrip(), result)
+                        saved = progress_history.hook_completion(progress_history.pass_for_finalization(self.run_dir, dispatch))
+                        assert isinstance(saved, progress_history.HookCompletion)
+                        self.assertTrue(saved.finished)
+                        continue
                     if later in ("detached result", "assign after result"):
                         write_text_atomic(late_reply, result)
                         finished = self.record(row, "late-result")

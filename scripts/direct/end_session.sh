@@ -81,20 +81,13 @@ while IFS= read -r run; do
 done <<< "${HELD}"
 
 if (( ${#RUNS[@]} > 0 )); then
-  ENDED_RUNS=()
   for run in "${RUNS[@]}"; do
-    if "$PY" -c 'from scripts.direct import progress_history; progress_history.main()' \
+    if ! "$PY" -c 'from scripts.direct import progress_history; progress_history.main()' \
       finish-run --session-dir "${run}" --status stopped; then
-      ENDED_RUNS+=("${run}")
-    else
-      echo "end_session: run end remains pending for ${run}." >&2
-      STATUS=1
+      echo "end_session: run end failed for ${run}. If work still runs, run end_session.sh again after it stops." >&2
+      exit 1
     fi
   done
-  RUNS=("${ENDED_RUNS[@]}")
-fi
-
-if (( ${#RUNS[@]} > 0 )); then
   REMOVE_ARGS=()
   for run in "${RUNS[@]}"; do
     REMOVE_ARGS+=(--session-dir "${run}")

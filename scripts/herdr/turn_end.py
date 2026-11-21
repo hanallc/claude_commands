@@ -891,7 +891,11 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
             state = worker_panes.observe_worker(parent.id, current, record)
             receipt = progress_history.stopped_pass_receipt(run, passed)
             delivery = progress_history.dispatch_delivery(passed)
-            pane, ownership = _stopped_pane_use(current, run, receipt, delivery, record)
+            use = _stopped_pane_use(current, run, receipt, passed, record)
+            if isinstance(use, worker.DispatchEvidenceUnknown):
+                _ = after_unlock.callback(report, use.reason)
+                return TurnOutcome.RETRY_EVIDENCE if event_kind == EventKind.RUN_FINISHED else None
+            pane, ownership = use
             def report_after_unlock(reason: str) -> None:
                 _ = after_unlock.callback(report, reason)
 
@@ -911,17 +915,28 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
 
 
 def _stopped_pane_use(row: staff.StaffRow, run: Path, receipt: progress_history.StoppedPassReceipt,
-                      delivery: progress_history.DispatchDelivery,
-                      record: staff.StaffSnapshot,
-                      ) -> tuple[worker.CloseCompletedPane | worker.ReuseCompletedPane, StoppedPassPane]:
-    current_run = worker_panes.worker_run(row, record=record)
-    current = worker_panes.worker_pass(row, current_run, record=record)
-    if ((not receipt.worker_session or receipt.worker_session == row.current_session)
-            and current_run.resolve() == run.resolve() and current.get("instance_id") == receipt.instance_id):
-        return worker.CloseCompletedPane.CLOSE, StoppedPassPane.CURRENT
-    # A newer pass can hold the same Astra role key for this worker.
-    held = progress_history.dispatch_delivery(current).actions.held_role if current else delivery.actions.held_role
-    return worker.ReuseCompletedPane(held), StoppedPassPane.REPLACED
+                      stopped: dict[str, object], record: staff.StaffSnapshot,
+                      ) -> tuple[worker.CloseCompletedPane | worker.ReuseCompletedPane, StoppedPassPane] | worker.DispatchEvidenceUnknown:
+    try:
+        current_run = worker_panes.worker_run(row, record=record)
+        current = worker_panes.worker_pass(row, current_run, record=record)
+        current_instance = current.get("instance_id")
+        current_start, stopped_start = current.get("started_at"), stopped.get("started_at")
+        if (isinstance(current_instance, str) and current_instance and current_instance != receipt.instance_id
+                and isinstance(current_start, (int, float)) and isinstance(stopped_start, (int, float))
+                and current_start > stopped_start):
+            held = progress_history.dispatch_delivery(current).actions.held_role
+            return worker.ReuseCompletedPane(held), StoppedPassPane.REPLACED
+        if (current_run.resolve() == run.resolve() and current_instance == receipt.instance_id
+                and (not receipt.worker_session or receipt.worker_session == row.current_session)):
+            return worker.CloseCompletedPane.CLOSE, StoppedPassPane.CURRENT
+        if not current and receipt.worker_session and receipt.worker_session == row.current_session:
+            last = progress_history.last_dispatch(row.id)
+            if isinstance(last, progress_history.RecordedDispatch) and last.instance_id == receipt.instance_id:
+                return worker.CloseCompletedPane.CLOSE, StoppedPassPane.CURRENT
+    except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+        return worker.DispatchEvidenceUnknown(str(error))
+    return worker.DispatchEvidenceUnknown("the saved session and dispatch do not confirm pane ownership")
 
 
 def recover_stopped_in_run(run: Path, identity: staff.StaffId, *,
@@ -952,7 +967,10 @@ def recover_stopped_in_run(run: Path, identity: staff.StaffId, *,
                     or completion.outcome != TurnOutcome.STOPPED):
                 continue
             delivery = progress_history.dispatch_delivery(passed)
-            pane, ownership = _stopped_pane_use(current, run, receipt, delivery, record)
+            use = _stopped_pane_use(current, run, receipt, passed, record)
+            if isinstance(use, worker.DispatchEvidenceUnknown):
+                return worker.CompletionRecovery.PENDING_CLOSE
+            pane, ownership = use
             state = worker_panes.observe_worker(parent.id, current, record)
             if (ownership is StoppedPassPane.CURRENT and not completion.pane_closed
                     and isinstance(state, worker_panes.OpenWorker) and not state.status.idle):

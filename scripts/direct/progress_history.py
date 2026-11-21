@@ -35,7 +35,7 @@ from scripts.agents import remote, worker_lifecycle  # noqa: E402
 from scripts.direct import phase_table, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.lib import conf_reads, git_files, models_registry, unit_runs  # noqa: E402
-from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -471,6 +471,7 @@ class OrdinaryRecorderRun(Enum):
 
 _recorder_artifacts: ContextVar[RunArtifactWriter | OrdinaryRecorderRun] = ContextVar(
     "recorder_artifacts", default=OrdinaryRecorderRun.UNPROTECTED)
+_NO_PREPARED_OWNER = unit_runs.RunOwnerUnrecorded("no prepared run end")
 
 
 def _run_owner(session_dir: Path, state: dict[str, object], record: staff.StaffSnapshot, *,
@@ -514,20 +515,29 @@ def require_ordinary_review_run(session_dir: Path) -> None:
             raise ValueError(f"{owner.name}: enrolled showrunners must use the assigned review launcher")
 
 
-def _protected_recorder(session_dir: Path, *, director: str = "") -> RunArtifactWriter | OrdinaryRecorderRun:
+def _protected_recorder(
+    session_dir: Path, *, director: str = "",
+    prepared_owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded = _NO_PREPARED_OWNER,
+) -> RunArtifactWriter | OrdinaryRecorderRun:
     owner = _read_run_owner(session_dir, starting_director=director)
+    ending_prepared_run = isinstance(prepared_owner, staff.StaffRow)
+    if ending_prepared_run and (not isinstance(owner, staff.StaffRow) or owner.id != prepared_owner.id):
+        raise ValueError(f"{session_dir}: prepared run owner changed")
     if (not isinstance(owner, staff.StaffRow) or owner.kind != "showrunner"
             or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))):
         return OrdinaryRecorderRun.UNPROTECTED
     worker = cast(RunArtifactFactory, cast(object, import_module("scripts.production.worker")))
-    artifacts = (worker.initializing_review_run_artifacts(owner, session_dir) if director
+    artifacts = (worker.initializing_review_run_artifacts(owner, session_dir) if director or ending_prepared_run
                  else worker.CompletionArtifacts(owner, session_dir))
     return artifacts if artifacts.protected else OrdinaryRecorderRun.UNPROTECTED
 
 
 @contextmanager
-def _recorder_lock(session_dir: Path, *, create_run: bool = False, director: str = "") -> Generator[TextIO]:
-    artifacts = _protected_recorder(session_dir, director=director)
+def _recorder_lock(
+    session_dir: Path, *, create_run: bool = False, director: str = "",
+    prepared_owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded = _NO_PREPARED_OWNER,
+) -> Generator[TextIO]:
+    artifacts = _protected_recorder(session_dir, director=director, prepared_owner=prepared_owner)
     if isinstance(artifacts, OrdinaryRecorderRun):
         if create_run:
             session_dir.mkdir(parents=True, exist_ok=True)
@@ -603,7 +613,7 @@ def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
                                         pass_agents=pass_agents)
 
 
-def _write_state(session_dir: Path, state: dict[str, object]) -> None:
+def _write_state(session_dir: Path, state: dict[str, object], *, create_only: bool = False) -> None:
     stored = _stored_fields(state)
     if state.get(unit_runs.OWNER_FIELD):
         for key in ("production", "unit", "branch", "working_dir", "worktree", "owner_session", "director_session"):
@@ -615,9 +625,13 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
         "called_agent": {key: value for key, value in (_object_dict(passed.get("called_agent")) or {}).items()
                          if key not in ("family", "session_id")}
     } if passed.get("worker_id") else {})} for slot, passed in _pass_slots(state).items()}
-    _write_run_artifact(
-        _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
-    )
+    path = _state_path(session_dir)
+    text = json.dumps(stored, indent=2, sort_keys=True) + "\n"
+    if create_only and isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
+        if not create_text_atomic(path, text):
+            raise FileExistsError(f"{path}: the recorder state already exists")
+    else:
+        _write_run_artifact(path, text)
 
 
 def move_run(_history_file: Path, _old: Path, _new: Path, _new_branch: str) -> list[Path]:
@@ -7589,6 +7603,23 @@ def _run_end_stamp(state: dict[str, object]) -> RunEndStamp:
     return RunEndStamp(_string(state.get("run_end_instance")), _number(state.get("finished_at")))
 
 
+def _record_prepared_run_end(session_dir: Path, owner: staff.StaffRow, request: RunEndRequested) -> None:
+    path = _state_path(session_dir)
+    current = _run_pointer(session_dir, staff.initial_snapshot())
+    if path.exists(follow_symlinks=False):
+        return
+    if not isinstance(current, staff.StaffRow) or current.id != owner.id:
+        raise ValueError(f"{session_dir}: prepared run owner changed")
+    _write_state(session_dir, {
+        "schema_version": SCHEMA_VERSION,
+        unit_runs.OWNER_FIELD: owner.id,
+        "run_id": session_dir.name,
+        "status": request.outcome,
+        "finished_at": plan_history.now_epoch(),
+        "run_end_instance": str(uuid.uuid4()),
+    }, create_only=True)
+
+
 def end_run(session_dir: Path, request: RunEndRequested | RetryRunEnd,
             ) -> RunEndSettled | unit_runs.RunExecutionBlocker:
     """Fence dispatches, check execution outside the run lock, then release."""
@@ -7596,12 +7627,18 @@ def end_run(session_dir: Path, request: RunEndRequested | RetryRunEnd,
     record = staff.initial_snapshot()
     if isinstance(request, RetryRunEnd) and not unit_runs.terminal_run(state):
         return RunEndSettled.OPEN
-    if (not state or unit_runs.terminal_run(state)) and not isinstance(_run_pointer(session_dir, record), staff.StaffRow):
+    pointer = _run_pointer(session_dir, record)
+    if (not state or unit_runs.terminal_run(state)) and not isinstance(pointer, staff.StaffRow):
         return RunEndSettled.CLOSED
 
+    prepared_owner = (pointer if not state and isinstance(pointer, staff.StaffRow)
+                      and pointer.kind in ("unit", "showrunner")
+                      and not _state_path(session_dir).exists(follow_symlinks=False) else _NO_PREPARED_OWNER)
     passes = InterruptedWorkerPasses(session_dir)
-    with _recorder_lock(session_dir) as lock:
+    with _recorder_lock(session_dir, prepared_owner=prepared_owner) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if isinstance(request, RunEndRequested) and isinstance(prepared_owner, staff.StaffRow):
+            _record_prepared_run_end(session_dir, prepared_owner, request)
         state = _read_state(session_dir, resolve_staff=False)
         if not unit_runs.terminal_run(state):
             if isinstance(request, RetryRunEnd):

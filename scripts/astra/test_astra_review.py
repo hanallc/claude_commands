@@ -392,7 +392,7 @@ class AstraReviewTests(StaffTestCase):
 
     def test_staff_review_uses_its_staff_target_and_saves_the_report(self) -> None:
         ordinary_owner = self.fixture.fixture.parent
-        for scenario in ("unit", "enrolled", "recover after release", "release interrupted",
+        for scenario in ("unit", "enrolled", "end prepared run", "recover after release", "release interrupted",
                          "concurrent reviewers", "run end while a reviewer runs", "capacity stop"):
             with self.subTest(scenario=scenario), contextlib.ExitStack() as context:
                 owner = ordinary_owner
@@ -412,6 +412,20 @@ class AstraReviewTests(StaffTestCase):
                     _ = context.enter_context(patch.object(astra_review, "run_folder", return_value=reviewed_run))
                 self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
                 self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
+                if scenario == "end prepared run":
+                    self.assertFalse((reviewed_run / unit_runs.STATE_FILE).exists())
+                    ended = invoke_recorder(["finish-run", "--session-dir", str(reviewed_run), "--status", "stopped"],
+                                            self.environment, self.root)
+                    self.assertEqual(ended.returncode, 0, ended.stderr)
+                    current = staff.by_id(owner.id)
+                    assert current is not None
+                    self.assertIsInstance(current.run, staff.NoRun)
+                    state = unit_runs.read_run_fields(reviewed_run)
+                    self.assertTrue(unit_runs.terminal_run(state))
+                    self.assertEqual(state[unit_runs.OWNER_FIELD], owner.id)
+                    self.assertEqual(state["run_id"], reviewed_run.name)
+                    self.assertTrue(state["run_end_instance"])
+                    continue
                 self.fixture.agent.without_done = False
                 self.fixture.agent.finish_after = 1
                 with self.world.process_starts():
