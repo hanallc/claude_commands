@@ -967,7 +967,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. Each number names its tree and its command.
   2. The report says which part of the 407 rise the start cost explains.
 
-### Phase 413 — the repository Python start hook has a measured cost for each part  · status: todo
+### Phase 413 — the repository Python start hook has a measured cost for each part  · status: done (no change; measure)
+
+**As built:** no code change. The hook adds 4.42 CPU ms for each Python start (natedev, main 262952c406, 200 starts). `from typing import cast` at its two call sites is 2.85 ms; the chained hook lookup is 1.08 ms; the rest is under 0.5 ms each. Phase 415 removes the runtime casts. A separate start entry for confirmed checkouts reaches 0.37 ms but can break external hooks, coverage and Mac Python: not planned.
 **Depends on:** none
 
 #### Work Order
@@ -1003,3 +1005,22 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Acceptance gate:**
   1. The reader's measured cost is stated before any gate carries it.
   2. The table's CPU total is compared with the gate record's module CPU.
+
+### Phase 415 — the Python start hook does not import typing  · status: todo
+**Depends on:** Phase 355
+
+#### Work Order
+- **Goal:** `scripts/lib/python_startup/sitecustomize.py` imports no `typing` at run time, so each Python start in the repository uses about 2.85 CPU ms less. Predicted saving: about 96 CPU s for each full gate (computed: 2.85 ms times 33,800 starts, natedev estimate), and the same cut for each Python start outside the gate.
+- **Spec:**
+  1. Remove the two `from typing import cast` imports (lines 264 and 283 on main 262952c406) and their `cast` calls. Give the two values their types without a run-time import: an annotated local with an `isinstance` or `callable` narrowing that is already true for the value, or a `TYPE_CHECKING` block at module scope. Add no line-level type ignore unless no typed form exists; then give the cause.
+  2. Change no hook behavior and remove no check (condition from bob, 11-21). If the saving needs either, stop and report.
+  3. Proof row, failing first: a test starts `python3 -c "import sys; print('typing' in sys.modules)"` with the repository hook and expects `False`. Put it in the existing test module for the hook.
+  4. Measure 200 starts before and after with the Phase 413 probe; give CPU ms for each.
+- **Files:** `scripts/lib/python_startup/sitecustomize.py`; the hook's existing test module.
+- **Workers:** 1 writer.
+  - impl: all; nothing splits.
+- **Constraints from prior phases:** Phase 355 changes this file: the branch starts at the 355 tip a85f760649 and its hash goes to builds after 355 is on main. Phase 413 holds the probe in /tmp/tmp.g47POH4T8s.
+- **Acceptance gate:**
+  1. The proof row fails on the base and passes on the fix.
+  2. The hook's test module passes; basedpyright zero errors and warnings on changed files.
+  3. Measured CPU ms for each start before and after.
