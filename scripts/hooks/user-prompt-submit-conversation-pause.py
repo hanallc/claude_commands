@@ -140,12 +140,20 @@ def main() -> None:
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt, record)
         reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
+        mac_context = ""
+        if source is conversation_pause.PromptSource.TYPED and "/Users/" in prompt:
+            try:
+                from scripts.hooks import mac_files
+
+                mac_context = mac_files.context(prompt)
+            except (OSError, ValueError, KeyError):
+                pass
         emitted = False
 
         def emit(held_messages: str = "") -> None:
             nonlocal emitted
             pause_context = "" if reply is conversation_pause.NoReply.NOTHING else reply.context
-            context = "\n\n".join(filter(None, (pause_context, held_messages)))
+            context = "\n\n".join(filter(None, (pause_context, held_messages, mac_context)))
             if not context:
                 return
             result: dict[str, object] = {

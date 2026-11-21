@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
@@ -146,7 +147,7 @@ def sample_anon_once(sidecar: Path, maximum: Path) -> subprocess.CompletedProces
     program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
     return subprocess.run(["bash", "-c", "buildlog_sample_anon() {" + program +
         '\n}\nsleep() { exit 0; }\nbuildlog_sample_anon "$1" "$2" "$$"',
-        "sampler-test", str(sidecar), str(maximum)], capture_output=True, text=True,
+        "sampler-test", str(sidecar), str(maximum)], env=verify_test_environment(), capture_output=True, text=True,
         timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 
 
@@ -1798,15 +1799,19 @@ class RepositoryHistoryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temporary.cleanup)
         cls.repository_seed = Path(temporary.name)
+        environment = verify_test_environment()
         for arguments in (("init", "-q"), ("config", "user.email", "test@example.org"),
                           ("config", "user.name", "Test"), ("config", "commit.gpgSign", "false"),
                           ("config", "core.hooksPath", "/dev/null")):
-            _ = subprocess.run(["git", "-C", str(cls.repository_seed), *arguments], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(cls.repository_seed), *arguments], env=environment,
+                               check=True, capture_output=True)
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
+        self.enterContext(patch.dict(os.environ, {
+            **verify_test_environment(), **fake_memory_readings(self.root),
+        }, clear=True))
         self.admission = self.root / "admission"
         self.admission.mkdir()
 
@@ -4071,6 +4076,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, verify_test_environment(), clear=True)))
         super().setUp()
         self.record = self.root / "expected-live-memory-reads.jsonl"
         (self.root / "proc").mkdir()
@@ -5161,6 +5167,7 @@ class ShellTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, verify_test_environment(), clear=True)))
         self.admission = self.enterContext(AdmissionFixture())
         self.admission.clock.epoch = time.time()
         _ = self.enterContext(self.admission.serving())
@@ -5515,14 +5522,13 @@ class QueueLeaveTests(unittest.TestCase):
         _ = (scripts / "buildlog/step_context.py").write_text((scripts / "buildlog/record.py").read_text())
         config = self.root / "config.sh"
         _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
-        self.environment = {**os.environ, **gate_isolation_environment(self.root),
+        self.environment = {**verify_test_environment(), **gate_isolation_environment(self.root),
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
                             "LINT_CONFIG_READER": str(config),
                             # No jobserver pool unless a case makes one: test runs take no tokens.
                             "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}"}
-        _ = self.environment.pop("LINT_QUEUE_LEAVE_HOOK", None)
         from scripts.build_queue.admission_test_support import caller_admission
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission.configure(wait_reply_seconds=0.1, running_pass_seconds=5)

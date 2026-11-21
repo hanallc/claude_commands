@@ -12,6 +12,7 @@ import sys
 from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_queue import admission_protocol as wire, placement
@@ -31,7 +32,8 @@ mac_test = eligibility_support.mac_test
 class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()
-        with subprocess.Popen(["true"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+        with subprocess.Popen(["true"],
+                             env=verify_test_environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
              mock.patch.object(self, "start_verify", return_value=process), \
              self.assertRaisesRegex(self.failureException, "verify exited"):
             _ = self.verify("test", "sample", "--no-cache")

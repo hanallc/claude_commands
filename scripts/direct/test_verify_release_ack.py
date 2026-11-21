@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import admission_records
 
 import json
@@ -70,9 +71,7 @@ PY
         sweep.chmod(0o755)
         (holders / "holder").unlink()
         self.environment = {
-            **{name: value for name, value in os.environ.items()
-               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID"}
-               and not name.startswith("UNIT_DETACHED_")},
+            **verify_test_environment(),
             "HOME": str(self.root), **interpreter_cache_environment(self.root / "cache"),
             "PATH": tool_path,
             "TMPDIR": str(self.root),
