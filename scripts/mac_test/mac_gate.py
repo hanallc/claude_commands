@@ -12,6 +12,7 @@ import os
 import re
 from pathlib import Path
 import select
+from selectors import DefaultSelector, EVENT_READ
 import shlex
 import shutil
 import signal
@@ -45,9 +46,21 @@ MODULE_LIST = Path('config/mac_gate_modules.txt')
 MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
 REMOTE_ROOT = '.local/state/mac-gate'
 RESULT_PREFIX = 'mac_gate_result='
+TESTS_STARTED_PREFIX = 'mac_gate_tests_started='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
-MAC_TIME_LIMIT_S = 3600
+QUEUE_WAIT_LIMIT_KEY = 'time_limit.queue_wait_seconds'
+TEST_RUN_LIMIT_KEY = 'time_limit.test_run_seconds'
+
+
+@dataclass(frozen=True)
+class MacGateTimes:
+    queue_wait_seconds: float
+    test_run_seconds: float
+
+
+class MacGateTimeout(GateRefused):
+    """The Mac queue wait or test run reached its bound."""
 
 
 @dataclass(frozen=True)
@@ -298,6 +311,7 @@ def stage_checkout(folder: Path, full: str) -> None:
         _ = gate.checked_git(repo, 'update-ref', 'refs/remotes/origin/main', base)
         _ = gate.checked_git(repo, 'checkout', '-q', '--detach', commit)
         shim = str(repo / 'scripts/lib/py')
+        print('\n' + TESTS_STARTED_PREFIX + attempt_name(folder), flush=True)
         os.execv(shim, [shim, str(repo / 'scripts/mac_test/mac_gate.py'), 'guest', str(folder), full])
 
 
@@ -349,6 +363,67 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
     return {'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'gate': gate_box.encode_run(run)}
 
 
+def wait_for_queue_exit(pid: int, deadline: float) -> bool:
+    """Detect exit by the deadline and keep the PID reserved for group cleanup.
+
+    Cleanup after the kill is outside this deadline.
+    """
+    while (remaining := deadline - time.monotonic()) > 0:
+        status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if (status is not None and status.si_pid == pid
+                and status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)):
+            return True
+        time.sleep(min(0.01, remaining))
+    return False
+
+
+def capture_queue(process: subprocess.Popen[bytes], requested_at: float, attempt: str, *,
+                  queue_wait_limit: int, test_run_limit: int) -> tuple[str, MacGateTimes]:
+    """Capture queue output and change the deadline when the Mac starts its tests."""
+    assert process.stdout is not None
+    fd = process.stdout.fileno()
+    output = bytearray()
+    start_line = (TESTS_STARTED_PREFIX + attempt + '\n').encode()
+    line_start = scanned = 0
+    test_started: float | None = None
+    deadline = requested_at + queue_wait_limit
+    expired_bound = f'{QUEUE_WAIT_LIMIT_KEY} ({queue_wait_limit}s)'
+    exited = False
+    with DefaultSelector() as readable:
+        _ = readable.register(fd, EVENT_READ)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not readable.select(remaining):
+                continue
+            chunk = os.read(fd, 65536)
+            received_at = time.monotonic()
+            output.extend(chunk)
+            if received_at >= deadline:
+                break
+            if not chunk:
+                exited = wait_for_queue_exit(process.pid, deadline)
+                break
+            if test_started is None:
+                while (newline := output.find(b'\n', scanned)) != -1:
+                    if output.startswith(start_line, line_start):
+                        test_started = received_at
+                        deadline = test_started + test_run_limit
+                        expired_bound = f'{TEST_RUN_LIMIT_KEY} ({test_run_limit}s)'
+                        break
+                    line_start = scanned = newline + 1
+                scanned = len(output)
+    finished = time.monotonic()
+    times = MacGateTimes((finished if test_started is None else test_started) - requested_at,
+                         0.0 if test_started is None else finished - test_started)
+    text = output.decode('utf-8', errors='replace')
+    if not exited or finished >= deadline:
+        detail = '\n' + text if text else ''
+        raise MacGateTimeout(
+            f'The Mac gate exceeded {expired_bound}. '
+            + f'Queue wait {times.queue_wait_seconds:.3f}s. Test run {times.test_run_seconds:.3f}s.'
+            + detail)
+    return text, times
+
+
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                selected: gate.AllModules | gate.TreeSelection,
                cancellation: MacGateCancellation | UseCallerProcessLifetime,
@@ -357,6 +432,8 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
     from scripts.production.gate_routes import MacGateCancellation
 
     try:
+        if not hasattr(os, 'waitid'):
+            raise GateRefused('The Mac gate requires Python 3.13 or newer with os.waitid')
         repo = repo.resolve()
         with ExitStack() as cleanup:
             if isinstance(cancellation, MacGateCancellation):
@@ -382,18 +459,27 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                        '--lifecycle-script', str(Path(__file__).resolve()),
                        '--', str(folder), str(int(full))]
             command[2:2] = ['--caller-fd', str(caller)]
+            settings = conf.read('mac_gate')
+            queue_wait_limit = settings.whole(QUEUE_WAIT_LIMIT_KEY)
+            test_run_limit = settings.whole(TEST_RUN_LIMIT_KEY)
             if cancelled.poll(0):
                 return 'The Mac gate was cancelled'
+            requested_at = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, encoding='utf-8', errors='replace', start_new_session=True,
-                                       pass_fds=(caller,))
+                                       start_new_session=True, pass_fds=(caller,))
             with process:
+                owns_queue_pid = True
                 try:
-                    output, _ = process.communicate(timeout=MAC_TIME_LIMIT_S)
-                except BaseException:
-                    with suppress(ProcessLookupError):
-                        process_group.send_process_group(process.pid, signal.SIGKILL)
-                    raise
+                    output, times = capture_queue(process, requested_at, attempt_name(folder),
+                                                  queue_wait_limit=queue_wait_limit,
+                                                  test_run_limit=test_run_limit)
+                except ChildProcessError:
+                    owns_queue_pid = False
+                    raise GateRefused('The Mac queue exit is unknown') from None
+                finally:
+                    if owns_queue_pid:
+                        with suppress(ProcessLookupError):
+                            process_group.send_process_group(process.pid, signal.SIGKILL)
             lines = output.splitlines()
             was_cancelled = bool(cancelled.poll(0))
             status = process.returncode
@@ -406,9 +492,11 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             row = ledger.mapping(cast(object, json.loads(results[0])))
             run = cloud_gate.decode_requested_run(row, request)
             cloud_gate.validate_run_modules(run, request)
+            row['queue_wait_seconds'] = times.queue_wait_seconds
+            row['test_run_seconds'] = times.test_run_seconds
             return MacGateResult(row, run)
-    except subprocess.TimeoutExpired:
-        return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
+    except MacGateTimeout as error:
+        return str(error)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         return f'The Mac gate could not finish: {error}'
 

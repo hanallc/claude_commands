@@ -1,15 +1,21 @@
 """Exercise the Mac gate route and the module list with private fixtures."""
 from __future__ import annotations
 
+from contextlib import redirect_stdout, suppress
 from dataclasses import replace
+from io import StringIO
 import json
 import os
+import select
+from selectors import DefaultSelector, SelectorKey
 import signal
 import shutil
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
 from typing import cast, final, override
 import unittest
 from unittest import mock
@@ -20,7 +26,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib import scratch
+from scripts.lib import process_group, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
@@ -32,7 +38,7 @@ from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
 
 FAKE_QUEUE = """\
-import json, os, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -45,7 +51,12 @@ assert (folder / 'source.bundle').is_file() == bool(request['source_key'])
 case = os.environ['MAC_GATE_CASE']
 if case != 'cleanup-refused':
     assert '--no-wait' not in args
-if case == 'timeout':
+marker = 'mac_gate_tests_started=' + folder.name
+if case in ('other-start', 'late-start'):
+    record = marker if case == 'late-start' else marker + '-other'
+    os.write(1, f'mac_gate_tests_started\\n{record}\\n'.encode())
+if case in ('wait-timeout', 'other-start', 'late-start'):
+    print('The placement is still queued', flush=True)
     time.sleep(60)
 if case == 'lost':
     sys.exit(0)
@@ -61,6 +72,18 @@ if case == 'cleanup-refused':
     print('mac queue: the Mac run may still be live', flush=True)
     print('  ', flush=True)
     sys.exit(2)
+
+if case == 'descendant':
+    payload = Path(os.environ['MAC_GATE_RESULT'])
+    with payload.with_suffix('.fifo').open('wb', buffering=0) as witness:
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                 stdin=witness, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        payload.with_suffix('.pid').write_text(str(child.pid))
+
+print(marker, flush=True)
+if case == 'run-timeout':
+    print('The guest started a test module', flush=True)
+    time.sleep(60)
 
 row = {key: request[key] for key in ('attempt', 'tree', 'commit')}
 row['gate'] = json.loads(Path(os.environ['MAC_GATE_RESULT']).read_text())
@@ -254,31 +277,152 @@ class MacGateTests(unittest.TestCase):
         path.parent.mkdir(exist_ok=True, parents=True)
         _ = path.write_text('# fixture\n')
 
-    def run_case(self, case: str, job: gate.GateJobResult) -> gate.GateRun | str:
+    def run_case(self, case: str, job: gate.GateJobResult) -> mac_gate.MacGateResult | str:
         command = self.root / 'queue.py'
         _ = command.write_text(FAKE_QUEUE)
         payload = self.root / 'gate.json'
         _ = payload.write_text(json.dumps(gate_box.encode_run(gate.GateRun((job,), 1, 0))))
-        timeout = 0.2 if case == 'timeout' else 15.0
-        with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload)}),
-              mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command))),
-              mock.patch.object(mac_gate, 'MAC_TIME_LIMIT_S', timeout)):
+        config = self.root / 'queue-config'
+        queue_seconds = 1 if case in ('wait-timeout', 'other-start', 'late-start') else 15
+        run_seconds = 1 if case in ('run-timeout', 'other-start', 'late-start', 'late-exit') else 15
+        _ = write_config_fixture(config / 'mac_gate.conf', f'time_limit.queue_wait_seconds={queue_seconds}\n'
+                                 + f'time_limit.test_run_seconds={run_seconds}\n')
+        with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload),
+                                          'CONF_DIR': str(config)}),
+              mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command)))):
             selection = gate.TreeSelection((module_path(job),), self.tree)
-            return mac_gate.route(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
-                                  module_time_limit_s=30, selected=selection)
+            return mac_gate.run_remote(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                                       module_time_limit_s=30, selected=selection,
+                                       cancellation=mac_gate.USE_CALLER_PROCESS_LIFETIME)
 
     def test_returns_pass_and_test_failure(self) -> None:
         for status in (0, 1):
             with self.subTest(status=status):
                 job = module_job('one', status=status)
                 result = self.run_case('completed', job)
-                assert isinstance(result, gate.GateRun), result
-                self.assertEqual(result.jobs, (job,))
-                self.assertEqual(result.passed, status == 0)
+                assert isinstance(result, mac_gate.MacGateResult), result
+                self.assertEqual(result.run.jobs, (job,))
+                self.assertEqual(result.run.passed, status == 0)
+
+    def test_wait_timeout_keeps_queue_output(self) -> None:
+        result = self.run_case('wait-timeout', module_job('one'))
+        assert isinstance(result, str), result
+        self.assertIn('The placement is still queued', result)
+        self.assertIn('exceeded time_limit.queue_wait_seconds (1s)', result)
+        self.assertRegex(result, r'Queue wait \d+\.\d{3}s\. Test run 0\.000s\.')
+
+    def test_run_timeout_keeps_test_output(self) -> None:
+        result = self.run_case('run-timeout', module_job('one'))
+        assert isinstance(result, str), result
+        self.assertIn('The guest started a test module', result)
+        self.assertIn('exceeded time_limit.test_run_seconds (1s)', result)
+        self.assertRegex(result, r'Queue wait \d+\.\d{3}s\. Test run [1-9]\d*\.\d{3}s\.')
+
+    def test_wait_ignores_a_start_marker_for_another_attempt(self) -> None:
+        result = self.run_case('other-start', module_job('one'))
+        assert isinstance(result, str), result
+        self.assertIn('exceeded time_limit.queue_wait_seconds (1s)', result)
+        self.assertIn('Test run 0.000s.', result)
+
+    def test_wait_rejects_a_start_marker_received_after_the_deadline(self) -> None:
+        with DefaultSelector() as selector:
+            select_ready = selector.select
+            offset = 0.0
+
+            def receive_after_deadline(timeout: float | None = None) -> list[tuple[SelectorKey, int]]:
+                nonlocal offset
+                ready = select_ready(timeout)
+                if ready:
+                    offset = 2.0
+                return ready
+
+            clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset)
+            with (mock.patch.object(mac_gate, 'DefaultSelector', return_value=selector),
+                  mock.patch.object(selector, 'select', side_effect=receive_after_deadline),
+                  mock.patch.object(mac_gate, 'time', clock)):
+                result = self.run_case('late-start', module_job('one'))
+        assert isinstance(result, str), result
+        self.assertIn('exceeded time_limit.queue_wait_seconds (1s)', result)
+        self.assertIn('Test run 0.000s.', result)
+        self.assertIn('mac_gate_tests_started=mac-gate-', result)
+
+    def test_wait_rejects_a_queue_exit_observed_after_the_deadline(self) -> None:
+        waitid = os.waitid
+        offset = 0.0
+
+        def report_late_exit(idtype: int, pid: int, options: int) -> os.waitid_result | None:
+            nonlocal offset
+            status = waitid(idtype, pid, options)
+            if status is not None:
+                offset = 2.0
+            return status
+
+        clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset, sleep=time.sleep)
+        with (mock.patch.object(os, 'waitid', side_effect=report_late_exit),
+              mock.patch.object(mac_gate, 'time', clock)):
+            result = self.run_case('late-exit', module_job('one'))
+        assert isinstance(result, str), result
+        self.assertIn('exceeded time_limit.test_run_seconds (1s)', result)
+        self.assertIn('mac_exit=0', result)
+
+    def test_wait_requires_a_terminal_status_for_the_queue_pid(self) -> None:
+        pid = os.getpid()
+        statuses = [
+            SimpleNamespace(si_pid=pid, si_code=os.CLD_STOPPED),
+            SimpleNamespace(si_pid=pid, si_code=os.CLD_CONTINUED),
+            SimpleNamespace(si_pid=pid + 1, si_code=os.CLD_EXITED),
+            SimpleNamespace(si_pid=pid, si_code=os.CLD_EXITED),
+        ]
+        with mock.patch.object(os, 'waitid', side_effect=statuses) as waitid:
+            self.assertTrue(mac_gate.wait_for_queue_exit(pid, time.monotonic() + TEST_HANG_GUARD_SECS))
+        self.assertEqual(waitid.call_count, len(statuses))
+
+    def test_queue_exit_is_unknown_when_the_gate_loses_the_child(self) -> None:
+        with (mock.patch.object(os, 'waitid', side_effect=ChildProcessError()),
+              mock.patch.object(process_group, 'send_process_group',
+                                wraps=process_group.send_process_group) as stop):
+            result = self.run_case('completed', module_job('one'))
+        stop.assert_not_called()
+        self.assertEqual(result, 'The Mac gate could not finish: The Mac queue exit is unknown')
+
+    def test_successful_queue_exit_stops_its_descendant_without_a_pidfd(self) -> None:
+        witness = self.root / 'gate.fifo'
+        os.mkfifo(witness)
+        with os.fdopen(os.open(witness, os.O_RDONLY | os.O_NONBLOCK), 'rb') as reader:
+            child_file = self.root / 'gate.pid'
+            try:
+                with (mock.patch.object(process_group, 'send_process_group',
+                                        wraps=process_group.send_process_group) as stop,
+                      mock.patch.object(os, 'pidfd_open', create=True) as pidfd):
+                    delattr(os, 'pidfd_open')
+                    try:
+                        result = self.run_case('descendant', module_job('one'))
+                    finally:
+                        setattr(os, 'pidfd_open', pidfd)
+                ready, _, _ = select.select([reader], [], [], TEST_HANG_GUARD_SECS)
+            finally:
+                if child_file.exists():
+                    try:
+                        _ = os.read(reader.fileno(), 1)
+                    except BlockingIOError:
+                        with suppress(ProcessLookupError):
+                            os.kill(int(child_file.read_text()), signal.SIGKILL)
+            stop.assert_called_once()
+            assert isinstance(result, mac_gate.MacGateResult), result
+            self.assertTrue(result.run.passed)
+            self.assertTrue(ready, 'The queue descendant is still running')
+            self.assertEqual(reader.read(), b'')
+
+    def test_result_records_wait_and_run_times(self) -> None:
+        result = self.run_case('completed', module_job('one'))
+        assert isinstance(result, mac_gate.MacGateResult), result
+        for field in ('queue_wait_seconds', 'test_run_seconds'):
+            seconds = result.row[field]
+            assert isinstance(seconds, float), seconds
+            self.assertGreater(seconds, 0)
 
     def test_queue_failure_uses_natedev(self) -> None:
-        for case, reason in (('status', 'status 23'), ('timeout', 'exceeded'),
-                             ('lost', 'no unique gate result')):
+        for case, reason in (('status', 'status 23'), ('lost', 'no unique gate result')):
             with self.subTest(case=case):
                 result = self.run_case(case, module_job('one'))
                 assert isinstance(result, str), result
@@ -334,9 +478,7 @@ class MacGateTests(unittest.TestCase):
                 folder = self.root / f'mac-gate-{kind}'
                 if kind == 'dirty':
                     _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# dirty fixture\n')
-                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
-                cloud_gate.save(folder / 'request.json', request)
-                cloud_gate.save(folder / 'checkout.json', {'path': str(clone)})
+                request = self.prepare_stage(folder, clone)
                 _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# fixture\n')
                 _ = self.exercise_bundle(clone, folder, request, expected=kind != 'current')
 
@@ -346,12 +488,28 @@ class MacGateTests(unittest.TestCase):
                     self.assertIn(str(request['commit']), heads)
                     self.assertIn(base, heads)
                     self.assertIn(old, gate.checked_git(clone, 'bundle', 'verify', str(bundle)))
-                with mock.patch.object(os, 'execv') as start_guest:
+                with mock.patch.object(os, 'execv') as start_guest, redirect_stdout(StringIO()):
                     mac_gate.stage_checkout(folder, '1')
                 start_guest.assert_called_once()
                 self.assertEqual(gate.checked_git(clone, 'rev-parse', 'HEAD'), request['commit'])
                 self.assertEqual(gate.checked_git(clone, 'rev-parse', 'origin/main'), base)
                 self.assertEqual(gate.checked_git(clone, 'remote', 'get-url', 'origin'), origin)
+
+    def prepare_stage(self, folder: Path, checkout: Path) -> dict[str, object]:
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        cloud_gate.save(folder / 'request.json', request)
+        cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
+        return request
+
+    def test_stage_starts_the_marker_on_a_fresh_line(self) -> None:
+        folder = self.root / 'mac-gate-fixture'
+        _ = self.prepare_stage(folder, self.repo)
+        with redirect_stdout(StringIO()) as output, mock.patch.object(os, 'execv') as start_guest:
+            _ = output.write('Unfinished output')
+            mac_gate.stage_checkout(folder, '1')
+        self.assertEqual(output.getvalue().splitlines(),
+                         ['Unfinished output', f'mac_gate_tests_started={folder.name}'])
+        start_guest.assert_called_once()
 
     def test_remote_commands_set_pythonpath_in_zsh(self) -> None:
         folder = self.root / 'mac-gate-fixture'
