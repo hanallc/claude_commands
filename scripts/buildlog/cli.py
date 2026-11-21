@@ -239,7 +239,7 @@ def aws_snapshot() -> int:
     from scripts.build_targets.target_config import ssh_target_state_directory
     from scripts.lib import conf
 
-    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'))
+    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'), allow_aws_unavailable=True)
 
 
 def aws_page() -> int:

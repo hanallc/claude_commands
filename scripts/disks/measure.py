@@ -153,7 +153,7 @@ def run_command(argv: Sequence[str], timeout_seconds: int) -> subprocess.Complet
 
 def dust_command(mount: str, settings: MeasureSettings) -> list[str]:
     """Walk one filesystem with dust under a memory cap at the lowest CPU priority."""
-    return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={settings.memory_max}", "--",
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", f"MemoryMax={settings.memory_max}", "--",
             "nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
             "-z", str(settings.keep_bytes - 1),  # Dust keeps sizes above this value, so include the floor.
             "-d", str(settings.max_depth), "-n", str(settings.max_lines),

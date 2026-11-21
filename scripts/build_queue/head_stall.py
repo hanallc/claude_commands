@@ -75,6 +75,7 @@ class HeadStall:
     quiet: float
     holders: tuple[Holder, ...]
     compiler_scan: CompilerScan
+    build_space: records.BuildSpaceHold | records.NoBuildSpaceHold = records.NoBuildSpaceHold()
 
 
 @dataclass(frozen=True)
@@ -159,11 +160,20 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
 def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
     inputs = snapshot.inputs
     running = tuple(step for step in inputs.running if step.promise > 0)
-    if not inputs.ordered or not running:
-        return NoStall()
-    _, head = inputs.ordered[0]
+    ordered = inputs.ordered
+    disk_hold = inputs.build_space
+    if isinstance(disk_hold, records.BuildSpaceHold):
+        local = gate.first_queued_waiter((row for _, row in ordered if gate.can_use_natedev(row)
+            and records.waiter_owner(row) not in inputs.pending_remote_starts), frozenset())
+        if not isinstance(local, gate.QueuedWaiter):
+            return NoStall()
+        head = local.waiter
+    else:
+        if not ordered or not running:
+            return NoStall()
+        _, head = ordered[0]
     waited = now - head["since"]
-    last_start = max(admitted, *(step.started_at for step in running))
+    last_start = max((admitted, *(step.started_at for step in running))) or head["since"]
     quiet = now - last_start
     if waited < limit or quiet < limit:
         return NoStall()
@@ -172,7 +182,7 @@ def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: floa
                            max(0.0, now - step.started_at) if step.started_at > 0 else HolderAdmissionUnavailable())
                     for _, step, attributed in gate.attributed_step_uses(inputs) if step.promise > 0)
     return HeadStall(last_start, head.get("step", "step"), head.get("folder", ""),
-                     head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running))
+                     head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running), disk_hold)
 
 
 def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) -> HeadStall | NoStall:
@@ -189,6 +199,9 @@ def _folder_name(folder: str) -> str:
 def builds_text(stall: HeadStall) -> str:
     lines = [f"The build queue head has waited {stall.waited / 60:.0f} min. No step started for {stall.quiet / 60:.0f} min.",
              f"Head: {stall.step} in {_folder_name(stall.folder)} (pid {stall.pid}) needs {gib(stall.need)}."]
+    if isinstance(stall.build_space, records.BuildSpaceHold):
+        lines.append(records.build_space_text(stall.build_space) + ".")
+        return "\n".join(lines)
     scan = stall.compiler_scan
     if isinstance(scan, UnreadableCompilers):
         compilers = "compiler" if scan.count == 1 else "compilers"
