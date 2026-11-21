@@ -529,7 +529,7 @@ class HeadStartsAt:
 @dataclass(frozen=True)
 class HeadStillHeld:
     decision: AdmissionDecision
-    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing"], ...]
+    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing", "build space"], ...]
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
@@ -2025,7 +2025,9 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
                                if isinstance(slot, ContinuationSlot) and slot.owner in held_owners)
         inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
             if not isinstance(slot, ContinuationSlot) or slot.owner not in held_owners))
-    totals = AdmissionDecision("admit" if isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold) else "hold",
+    clear = (isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold)
+             and isinstance(inputs.build_space, records.NoBuildSpaceHold))
+    totals = AdmissionDecision("admit" if clear else "hold",
         kept + safety, kept, safety, used, inputs.pressure, used + kept)
     return HeadPolicy(tuple(admissions), queued_head, totals, room, frozenset(returned_claims))
 
@@ -2068,6 +2070,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
+    disk_allows_start = isinstance(inputs.build_space, records.NoBuildSpaceHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
     local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
@@ -2116,7 +2119,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         spacing = (inputs.spacing.at if isinstance(inputs.spacing, NextStartAt) and not due else
                    next_start.at if new_started and now < next_start.at else 0.0)
         wait = inputs.local_waits.get(owner)
-        ready = (local and wait is None and not remote_start_pending and fresh
+        ready = (local and disk_allows_start and wait is None and not remote_start_pending and fresh
                  and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
@@ -2210,8 +2213,12 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason: WaitReason = entry.state
         else:
-            if isinstance(entry.cargo_folder, placement.CargoFolderWait):
-                cause: HeadCause = entry.cargo_folder
+            if (not remote_start_pending and can_use_natedev(row)
+                    and isinstance(inputs.build_space, records.BuildSpaceLow)):
+                cause: HeadCause = (queue_order_reason(decision, RecordedQueueIdentities())
+                                    if isinstance(decision.order_hold, HeldBehindHead) else inputs.build_space)
+            elif isinstance(entry.cargo_folder, placement.CargoFolderWait):
+                cause = entry.cargo_folder
             elif isinstance(resolved.room, ReadingUnavailable) and not within:
                 cause = resolved.room
             elif isinstance(decision.order_hold, HeldBehindHead):
@@ -2487,6 +2494,8 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         return HeadStartsAt(cause.at, ended, charge_drop, freed, growth_drop)
     if isinstance(cause, NeedsMemory):
         return HeadStillHeld(decision, ("free memory",))
+    if isinstance(cause, records.BuildSpaceLow):
+        return HeadStillHeld(decision, ("build space",))
     if isinstance(cause, GpuSlotWait):
         return HeadStillHeld(decision, ("GPU test slot",))
     if isinstance(cause, (MemoryPressure, PressureUnavailable)):

@@ -1570,7 +1570,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
 
 
 WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder"]
+                    "AWS slot", "build hold", "Mac", "build space", "the build in the same Cargo folder"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1588,6 +1588,8 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "memory pressure"
         case placement.CargoFolderWait():
             return "the build in the same Cargo folder"
+        case admission_records.BuildSpaceLow():
+            return "build space"
         case admission_records.GpuSlotWait():
             return "GPU slot"
         case admission_records.EstimateExpired():

@@ -310,6 +310,10 @@ class PrivateReadings:
         self.counts["pressure"] += 1
         return gate.read_pressure(host, policy=policy)
 
+    def build_space(self, floor: int) -> records.BuildSpaceLow | records.NoBuildSpaceHold:
+        self.counts[f"build_space:{floor}"] += 1
+        return records.NoBuildSpaceHold()
+
     def compilers(self) -> list[records.StepMemory]:
         self.counts["compilers"] += 1
         return gate.sccache_memory()
