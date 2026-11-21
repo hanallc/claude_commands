@@ -2744,12 +2744,13 @@ class ServicePriorityRepairTests(unittest.TestCase):
             fixture.hold_starts()
             request = fixture.request()
             self.labels[request.identity.session_id] = UnitLabels("unassigned")
+            wait, = fixture.server.handle_request(request)
+            self.assertIsInstance(wait, wire.Wait)
             fixture.server.priority = admission_records.QueuePriority((
                 {"unit": UnitLabels("").unit, "why": "old wire value",
                  "set_at": fixture.clock.now(), "set_by": "director"},
             ), admission_records.SettledPriority())
-            wait, = fixture.server.handle_request(request)
-            self.assertIsInstance(wait, wire.Wait)
+            _ = fixture.server.run_pass()
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             self.assertEqual(admission_records.waiter_priority(view.reading.ordered[0][1]), admission_records.NormalOrder())
