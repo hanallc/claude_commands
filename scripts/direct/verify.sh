@@ -2852,13 +2852,15 @@ placement_once() {
     local lint_refusal_returns_to_queue=0
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
+    local parent_run=${BUILDLOG_RUN:-}
     # A step with its own slot can leave its grant without a memory handoff.
-    local BUILDLOG_RUN=${BUILDLOG_RUN:-}
-    if [[ -n "${COPIES_STEP_SOURCE:-${VERIFY_SLOT_SOURCE:-}}" ]]; then BUILDLOG_RUN=""; fi
+    local BUILDLOG_RUN=$parent_run
+    if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
-        PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+        local step_id="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+        PLACEMENT_EPISODE=$step_id
         PLACEMENT_OWNER_PID=$$
         if [[ "$refresh_source" == 0 ]]; then
             PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$PLACEMENT_EPISODE}"
@@ -2874,8 +2876,10 @@ placement_once() {
             key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$repository") || return $?
         fi
         VERIFY_SLOT_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_SLOT_HEAD=$head
-        PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
-        PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
+        # A step can still clean up after a new call reuses the wait directory.
+        local placement_path="$HOLD_WAIT_DIR/placement-$step_id"
+        PLACEMENT_ASSIGNMENT_FILE="$placement_path.json"
+        PLACEMENT_GRANT_FILE="$placement_path.sh"
         if [[ "$refresh_source" == 0 && -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
             mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
             LINT_MEMORY_WAIT_FILE=""
@@ -2909,7 +2913,7 @@ placement_once() {
         PLACEMENT_ASSIGNMENT_FILE="$BUILDLOG_FIRST_STEP_ASSIGNMENT"
         IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
             PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$BUILDLOG_FIRST_STEP_ROUTE"
-        PLACEMENT_OWNER_PID="${BUILDLOG_RUN%%:*}"
+        PLACEMENT_OWNER_PID="${parent_run%%:*}"
         PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
         export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
         unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
@@ -3086,7 +3090,7 @@ wait_for_step_folder() {
 }
 
 route_test() {
-    local last_decline="" wait_reason="" name eligibility reason settings platform refresh_source=0
+    local last_decline="" wait_reason="" wait_holder="" name eligibility reason settings platform refresh_source=0
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -3233,6 +3237,11 @@ route_test() {
         fi
         if [[ "$MAC_ONLY" == 1 && "${LAST_TARGET_REASON:-}" != busy ]]; then
             mac_only_refuse "${LAST_TARGET_REASON:-runner}"
+        fi
+        if [[ "$STEP_ASSIGNED_PLATFORM" == macos && "$last_decline" == busy \
+                && -n "$BUILDLOG_MAC_HOLDER" && "$BUILDLOG_MAC_HOLDER" != "$wait_holder" ]]; then
+            printf 'verify.sh: Mac holder: %s.\n' "$BUILDLOG_MAC_HOLDER" >&2
+            wait_holder=$BUILDLOG_MAC_HOLDER
         fi
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
