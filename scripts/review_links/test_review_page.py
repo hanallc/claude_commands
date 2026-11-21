@@ -376,9 +376,12 @@ window.fetch=(url,options)=>{
             "http://127.0.0.1/console/review.html#owner=builds", new_item_dialog.PageViewport(1280, 800, True),
             2.4, ("Could not load brain.",), (), "Type All · State Open · Owner <builds>", True)
         request = self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
-        created = cache.create_submission(replace(request, page="review", evidence=evidence, page_state=state))
-        self.assertNotIn(b"Screenshot of Review", cache.get().body(created.key))
-        self.assertTrue(cache.attach_page_screenshot(created.saved, base64.b64decode(PNG)))
+        viewport = new_item_dialog.PageViewport(1280, 800, True)
+        created = cache.create_submission(
+            replace(request, page="review", evidence=evidence, page_state=state),
+            screenshot=new_item_dialog.PageScreenshot(base64.b64decode(PNG), viewport))
+        self.assertIn(b"Screenshot of Review", cache.get().body(created.key))
+        self.assertEqual(created.saved.details.evidence, evidence)
         snapshot = review_page.build_snapshot(self.root)
         self.assertEqual(snapshot.records[created.key].state, review_items.ReviewState.WAITING)
         card = snapshot.body(created.key).decode()
@@ -1239,8 +1242,8 @@ window.fetch=(url,options)=>{
             with self.assertRaises(LookupError):
                 _ = snapshot.body('page-owner/C1')
         self.assertNotRegex(shell, r'<form[^>]*\bdata-review-form\b')
-        self.assertRegex(shell, r'<dialog id="review-new-item"[^>]*>\s*<form>')
-        self.assertEqual(len(re.findall(r'<form\b', shell)), 1)
+        self.assertNotIn('<dialog id="review-new-item"', shell)
+        self.assertNotRegex(shell.split('<script>')[0], r'<form\b')
         self.assertNotIn('<tbody data-list-item', shell.split('<script>')[0], 'The browser mounts summaries from the index.')
         self.assertIn('data-review-index', shell)
         self.assertIn('Which layout gives each review card enough space for its controls?', card)
@@ -3188,12 +3191,11 @@ window.fetch=async(url,options)=>{
   const labels=groups.map(group=>group.previousElementSibling);
   const words=search.getBoundingClientRect(),typeRow=groups[0].parentElement.getBoundingClientRect();
   const line=document.querySelector('[data-page-status]').getBoundingClientRect();
-  const newButton=document.querySelector('[data-review-new]').getBoundingClientRect();
   const stacked=matchMedia('(max-width:800px)').matches;
   check(words.bottom<=typeRow.top && Math.abs(words.right-typeRow.right)<1,
    'The search input is above Type and ends at the right edge.');
   check(stacked ? words.top>=line.bottom && Math.abs(words.left-typeRow.left)<1 :
-   words.left>=line.right && Math.abs(words.right-newButton.right)<1 &&
+   words.left>=line.right &&
    Math.abs((words.top+words.bottom)-(line.top+line.bottom))<2,
    'The search input shares the status row on desktop and spans the row below the status on a phone.');
   check(labels.map(label=>label.textContent).join('|')==='Type|State|Owner' &&
@@ -4677,10 +4679,12 @@ window.fetch=async(url,options={})=>{
  const route=new URL(url,location.href);
  if(route.pathname==='/console/review/new-item'){
   if(options.method==='POST'){
+   if(JSON.parse(options.body).page_capture) return Response.json({});
    sent=true;
    return Response.json({id:fixture.id,key:fixture.key,version:fixture.snapshot.version});
   }
-  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner',proposal:true}]});
+  return Response.json({token:'fixture',page_owner:fixture.owner,
+   recipients:[{id:fixture.owner,name:'page-owner',proposal:true}]});
  }
  if(sent && route.searchParams.has('body')) return new Response(fixture.body,{
   headers:{'X-Review-Version':fixture.snapshot.version}
@@ -4705,15 +4709,27 @@ window.fetch=async(url,options={})=>{
    });
    observer.observe(recipients,{childList:true});
   });
-  document.querySelector('[data-review-new]').click();
-  if(!dialog.open) throw new Error('New must open the dialog.');
+  document.querySelector('[data-owner-new]').click();
+  if(!dialog.open) throw new Error('The owner button must open the dialog.');
+  dialog.querySelector('[name="include_page"]').click();
   dialog.querySelector('[name="kind"][value="'+fixture.kind+'"]').click();
   (await ready).click();
   const words=dialog.querySelector('[name="words"]');
   words.value=fixture.words;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
+  const confirmation=dialog.querySelector('#new-item-saved');
+  const confirmed=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(!confirmation.hidden){observer.disconnect();resolve();}
+   });
+   observer.observe(confirmation,{attributes:true,attributeFilter:['hidden']});
+  });
   dialog.querySelector('[type="submit"]').click();
+  await confirmed;
+  check(dialog.open && confirmation.textContent==='Saved '+fixture.id+'.',
+        'The shared dialog shows the saved ID.');
+  dialog.querySelector('[data-done]').click();
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -4735,14 +4751,15 @@ window.fetch=async(url,options={})=>{
    }
   }else{
    check(!row && history.length===previous,'Send keeps a hidden item outside the view.');
-   check(review.querySelector('[data-review-notice]').textContent==='Saved '+fixture.id+'.',
-         'A hidden item has a save confirmation.');
+   check(review.querySelector('[data-review-notice]').textContent==='The current filters hide '+fixture.id+'.',
+         'Review explains why the saved item is hidden.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        markup = before.render().decode().replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        return markup.encode()
+        markup = page_frame.with_owner(before.render(), 'review', owner, staff.StaffSnapshot((owner,)),
+                                       new_item_dialog.render)
+        return markup.replace(b'<head>', b'<head>'+setup.encode(), 1).replace(b'</body>', probe.encode()+b'</body>', 1)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_items_keep_every_review_filter(self) -> None:
@@ -4991,32 +5008,7 @@ window.fetch=async(url)=>{
         self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_new_button_aligns_with_the_review_title_at_desktop_width(self) -> None:
-        markup = review_page.build_snapshot(self.root).page.decode()
-        probe = r'''<script>
-(async()=>{
- const failures=[];
- frameElement.style.width='1280px';
- await document.fonts.ready;
- const group=document.querySelector('[role="group"][aria-label="Type"]');
- const button=document.querySelector('[data-review-new]');
- const heading=document.querySelector('h1.page-title'),label=document.createRange();
- label.selectNodeContents(heading);
- const bounds=button.getBoundingClientRect(),title=heading.getBoundingClientRect();
- const table=document.querySelector('.list-table').getBoundingClientRect();
- if(innerWidth!==1280 || bounds.width===0 || bounds.left<label.getBoundingClientRect().right ||
-    Math.abs((bounds.top+bounds.bottom)-(title.top+title.bottom))>2 || Math.abs(bounds.right-table.right)>1){
-  failures.push('The New button must align with the title at the right edge at 1280 px.');
- }
- if(group.contains(button)) failures.push('The Type chips must exclude the New button.');
- await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();
-</script>'''
-        markup = markup.replace('</body>', probe + '</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
-
-    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_review_owner_and_new_share_the_title_line(self) -> None:
+    def test_review_owner_button_is_the_only_title_action(self) -> None:
         owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
         markup = page_frame.with_owner(review_page.build_snapshot(self.root).page, 'review', owner,
                                        staff.StaffSnapshot((owner,)), new_item_dialog.render)
@@ -5026,27 +5018,22 @@ window.fetch=async(url)=>{
  try{
   const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
   const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
-  const button=document.querySelector('[data-review-new]');
   const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
   await document.fonts.ready;
   for(const width of [1280,390,320]){
    frameElement.style.width=width+'px';
-   const t=bounds(title), n=bounds(name), o=bounds(owner), b=bounds(button), r=bounds(row);
-   const beside=Math.abs(center(t)-center(b))<=1;
-   if(innerWidth!==width || !row.contains(owner) || !row.contains(button) ||
-      Math.abs(center(o)-center(b))>1 || Math.abs(center(n)-center(b))>1 ||
-      Math.abs((o.left-n.right)-(b.left-o.right))>1 || o.left<n.right+4 ||
-      n.left<r.left-1 || Math.abs(b.right-r.right)>1 ||
-      (beside ? n.left<t.right+4 : width===1280 || b.top<t.bottom+4)){
-    failures.push('The title and both controls must fit at '+width+' px.');
+   const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
+   const beside=Math.abs(center(t)-center(o))<=1;
+   if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
+      Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
+      n.left<r.left-1 || Math.abs(o.right-r.right)>1 ||
+      (beside ? n.left<t.right+4 : width===1280 || o.top<t.bottom+4)){
+    failures.push('The owner button is the only title action and fits at '+width+' px.');
    }
    if(width===320 && Math.abs(t.height-parseFloat(getComputedStyle(title).lineHeight))>1){
     failures.push('The Review title fits on one line at 320 px.');
    }
-   if(width===320 && (button.innerText.trim()!=='+' || button.getAttribute('aria-label')!=='New item' ||
-                     button.title!=='New item')){
-    failures.push('The narrow New item button shows only + and keeps its name.');
-   }
+
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});

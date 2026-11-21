@@ -85,16 +85,35 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Hana console
 
-Review and The List open an item in a dialog.
-Both pages use the New item frame.
-Close or Esc closes the dialog.
-A click on the backdrop also closes the dialog.
-The item stays in the table while its dialog is open.
+Each control has one name across the console.
+Use one shared function for a control that appears on multiple pages.
+A console phase reads this section before it starts.
+
+Review and The List open a record in a dialog.
+The record dialog and the New item dialog use the same frame.
+Select **Close**, press Esc, or select the backdrop to close the dialog.
+The record stays in the table while its dialog is open.
 
 Staff names use the current role colors from the Accounts reader.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
 The shared renderer escapes unknown names and free text without a role color.
+The owner corner shows the active unit, showrunner, or producer set in `page.<page>.owner`.
+It uses the owner's staff color.
+If the configured owner is unavailable, the corner shows the default recipient.
+An item for a unit goes to its showrunner.
+Showrunner and producer owners receive their items directly.
+The page owner button names the default recipient and opens one shared dialog.
+The dialog offers Bug, Question, Feedback, Proposal, and Investigation.
+For a new draft, the **To** row selects the page owner or the showrunner who receives items for that unit.
+The row offers the full set of recipients from the shared staff reader.
+If the page has no default recipient, the button opens the dialog with no recipient selected.
+Select a recipient to enable Send.
+You can select a different recipient.
+Proposal limits the row to recipients with a native proposal folder.
+When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
+Changing the type or reopening a kept draft preserves this empty selection.
+Feedback uses the native Investigation record.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
 List delivery notices color morty and the recorded showrunner through the same page renderer.
 They keep the notice words and time.
@@ -120,7 +139,7 @@ Empty target role labels use the recorded holder. Only the holder name can have 
 Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
 Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
 Its existing Builds refresh updates the name spans without a new timer.
-AWS and the console navigation show no staff name fields.
+The AWS data and the console navigation show no staff name fields.
 The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
 
 Saved role colors apply after the next page render or Builds data reading.
@@ -416,7 +435,7 @@ These questions have the state Open and retain their previous count totals.
 They have no answer control until an owner becomes available.
 
 The page shows Questions, Responses, Changes, Investigations, Proposals, Efficiencies and Bugs.
-Only an answered Question from New item appears as a Response.
+Only a Question filed through the dialog appears as a Response after an answer.
 The Response uses the Question's existing key, owner, exchanges and log.
 The Question stays in its native store during the complete exchange.
 Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the owner is the production's showrunner.
@@ -518,8 +537,43 @@ Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
-A new item opens when it matches the current filters.
-Review shows a save confirmation when the current filters hide the new item.
+The page owner dialog lists the evidence under **Sent with your words**.
+The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
+The dialog shows **Taking a screenshot** until the preview is available.
+Select the preview to open the image at full size.
+Send saves the item with the evidence shown in the dialog.
+If the native write fails, the server discards the staged evidence.
+The server holds the preview for the retry.
+If Cancel discards the preview during filing, the server releases it when filing ends.
+The draft stays available for edits after a failed Send.
+Send publishes the saved item and delivers its message before it confirms success.
+A retry with the same request ID resumes publication and delivery of the saved item.
+If the content matches, the retry returns the saved item.
+If the content changed, the dialog shows the saved item ID and keeps the edits.
+The next Send uses a new request ID.
+When Back restores an open dialog, the dialog takes a new screenshot if the box is checked.
+Changing the type keeps the same capture.
+If the preview expires, the dialog keeps the draft and shows the placeholder while it takes a new screenshot.
+If the first Send fails because the preview expires, the checkbox stays available.
+Select **Send** again when the new screenshot appears.
+Send requests a reload if a legacy request for a checked Bug lacks both a capture key and a filed match.
+A retry can recover the filed item after a restart.
+The server confirms a screenshot retry only when a held capture proves the PNG matches.
+If the server cannot confirm a match, the dialog shows the filed item ID and keeps the edits.
+It replaces the old screenshot when the checkbox is selected.
+The next Send uses a new request ID.
+Clear **Include a screenshot** to omit the image.
+A Bug always includes up to 48 rows of visible text from when the dialog opened.
+The Bug card shows these rows under **Page data**, including when the screenshot is unavailable.
+It also includes the page title, address, filters, and render time.
+The dialog shows Error lines and Script errors when the page has those errors.
+For other types, Send includes visible text when the block shows the fallback notice.
+A Bug with a screenshot also includes the viewport.
+The dialog shows the saved item ID after Send on Review and the other pages outside The List.
+Select **Done** to close the confirmation.
+Review starts its refresh when Send succeeds.
+When the confirmation closes, Review opens the new item if it matches the current filters.
+Review tells you when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
 If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.
@@ -826,13 +880,15 @@ If the item leaves The List, the dialog keeps the last detail and disables the a
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
-The **+ New item** button beside the title opens the shared New item dialog.
-The **To** field selects the List page owner from `page.list.owner` in `config/console.conf`.
-**Send** saves the native Review item and a linked List row for the recipient shown in **To**.
-The dialog keeps the draft key when it reopens after a failed send.
-A retry reuses the newest saved item whose original or current owner appears in **To**.
-For a different owner, the server uses the draft key and that owner to save a separate item once.
-The List refreshes and opens the new row after the server confirms the save.
+The page owner button opens the shared New item dialog.
+For a new draft, **To** selects the owner configured in `page.list.owner`.
+**Send** saves a Review item and a linked List row for the selected recipient.
+The browser stores the recipient selection with the draft ID and restores both after a reload.
+The user can edit the draft before a retry.
+Each draft ID can file one Review item.
+A retry of a filed draft returns the original item ID and restores a missing List row.
+A retry can use a new screenshot if the first screenshot expires before filing.
+After the server confirms the save, The List closes the dialog, refreshes, and opens the new row.
 If a row save is in progress, the List refreshes when that save ends.
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
@@ -1808,11 +1864,11 @@ The setting starts at 8765.
 `--port` overrides the setting for one server run.
 
 Use `--list-fixture FOLDER` to serve a private List from an existing folder.
-The practice List opens the New item dialog with Send disabled.
+The page owner button on the practice List opens the shared dialog with Send disabled.
 The server reads List records from `FOLDER/records` and staff records from `FOLDER/staff.json`.
 Open `/console/list.html` on the fixture port.
 Remove uses the normal List save path in the fixture store.
-The fixture serves the List page and reads its New item recipients.
+The fixture reads dialog recipients from the private staff file.
 Remove is the only action that the fixture accepts.
 The fixture omits counts from other pages.
 It skips message delivery, recovery, snapshot sweeps, and code restarts.

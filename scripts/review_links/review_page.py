@@ -305,13 +305,17 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
                 +f'Queue cap {memory.queue_cap_gib:g} GiB</p><p>'+html.escape(segments)
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
-    if origin.page_state is not None and (page_data := origin.bug_page_data) is not None:
+    page_data = origin.bug_page_data
+    if origin.page_state is not None:
         screenshot = review_submissions.PAGE_SCREENSHOT
-        body += bug_page_state_box(key, origin.page_state, page_data.title, screenshot in images)
+        title = origin.page_state.title or (page_data.title if page_data else origin.page)
+        body += bug_page_state_box(key, origin.page_state, title, screenshot in images)
         images = tuple(image for image in images if image != screenshot)
     elif isinstance(evidence, new_item_dialog.PageDataEvidence):
-        data = json.dumps({'title': evidence.title, 'rows': evidence.rows}, ensure_ascii=False, indent=2)
-        body = '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
+        page_data = evidence
+    if page_data is not None:
+        data = json.dumps({'title': page_data.title, 'rows': page_data.rows}, ensure_ascii=False, indent=2)
+        body += '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
     if images:
         links: list[str] = []
         for at, image in enumerate(images, 1):
@@ -635,7 +639,13 @@ class ReviewSnapshotCache:
             item = ReviewRecordNotPublished()
         return self.publish_item(current, key, item, members), item
 
-    def create_submission(self, request: new_item_dialog.NewItemRequest) -> PublishedSubmission:
+    def create_submission(
+        self, request: (new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
+                        | review_submissions.ListDraftSend), *,
+        screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
+        capture_requested: bool = False,
+        refusal: new_item_dialog.SubmissionError | None = None,
+    ) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
         _ = self.get()
         with self._save_lock:
@@ -643,7 +653,8 @@ class ReviewSnapshotCache:
             remote_staff = not staff.is_owner()
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
-                saved = review_submissions.submit(request, members=members)
+                saved = review_submissions.submit(request, members=members, screenshot=screenshot,
+                                                  capture_requested=capture_requested, refusal=refusal)
             if not remote_staff:
                 members = staff.snapshot()
             path = saved.path
@@ -1044,7 +1055,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
-        +page_frame.title('Review', 'review', action=new_item_dialog.title_button('review'))
+        +page_frame.title('Review', 'review')
         +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
         +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
         +'<div class="review-queue">'
@@ -1062,7 +1073,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +CARD_COLUMNS+'<thead><tr>'+headers+'</tr></thead>'
         +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
         +'</table><p data-empty hidden>No items in this view.</p></div></div></div>'
-        +record_table.render_dialog()+new_item_dialog.render()+'<script>'+SCRIPT+'</script>')
+        +record_table.render_dialog()+'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
@@ -1252,7 +1263,7 @@ QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
 STYLE = '<style>' + QUESTION_COLOR_RULE + '''
 main:has(>[data-review]){max-width:1124px}
 [data-review]{display:flex;flex-wrap:wrap;align-items:center;column-gap:16px}
-[data-review]>:is(.page-heading,.review-queue){flex:0 0 100%;min-width:0}
+[data-review]>:is(.page-title,.page-heading,.review-queue){flex:0 0 100%;min-width:0}
 [data-review]>:is(.page-status,.record-filter-words){margin:0}
 [data-review]>.page-status{flex:1 1 0;min-width:0}
 [data-review]>.page-status>[data-status-reason]{white-space:normal;overflow-wrap:anywhere;min-width:0}
@@ -1678,7 +1689,7 @@ const pendingSaves=new Map(),recovering=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 let focusAfterLoad=null,firstRequest=firstReviewCard;
-let deferredLink=null,revealCreated=null;
+let deferredLink=null,revealCreated=null,newItemRefresh;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
@@ -2044,7 +2055,7 @@ function revealNewItem(){
  revealCreated=null;
  if(view.revealMatchingItem(key)) return true;
  const notice=content.querySelector('[data-review-notice]');
- notice.textContent='Saved '+id+'.';notice.hidden=false;
+ notice.textContent='The current filters hide '+id+'.';notice.hidden=false;
  return false;
 }
 async function refresh(_supersede=false,current=()=>true){
@@ -2157,16 +2168,19 @@ function applyReviewIndex(payload){
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 setInterval(()=>updateHandoffAges(content),5000);
-document.querySelector('[data-review-new]').addEventListener('click',event=>{
- window.reviewNewItem.open({trigger:event.currentTarget});
+document.addEventListener('review-item-saved',()=>{
+ const notice=content.querySelector('[data-review-notice]');
+ notice.textContent='';notice.hidden=true;
+ newItemRefresh=pageRefresh.refresh(true);
 });
 document.addEventListener('review-item-created',event=>{
  const {key,id}=event.detail ?? {};
  if(typeof key!=='string' || typeof id!=='string') return;
- const notice=content.querySelector('[data-review-notice]');
- notice.textContent='';notice.hidden=true;
  revealCreated={key,id};
- void pageRefresh.refresh(true);
+ revealNewItem();
+ void newItemRefresh?.then(()=>{
+  if(revealCreated?.key===key) void pageRefresh.refresh(true);
+ });
 });
 function followItemLink(options){
  const applyLink=unappliedOnly=>view.followItemLink({...options,unappliedOnly,beforeJump:key=>{

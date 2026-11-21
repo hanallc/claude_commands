@@ -1,6 +1,7 @@
 """Render the shared New item dialog."""
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import math
@@ -21,6 +22,7 @@ MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PAGE_DATA_BYTES = 64 * 1024
+MAX_PAGE_ROWS = 48
 MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
@@ -34,6 +36,25 @@ class SubmissionConflict(SubmissionError):
     """The request ID already names different item data."""
 
     status: Literal[409] = 409
+
+
+class SubmissionScreenshotExpired(SubmissionConflict):
+    """A new Send needs a fresh screenshot."""
+
+    def __init__(self) -> None:
+        super().__init__("The screenshot expired.")
+
+
+class SubmissionScreenshotReload(SubmissionConflict):
+    """An unfiled Send needs a reload to include the screenshot."""
+
+
+@dataclass(frozen=True)
+class UnverifiedDraftRetry:
+    """A Send with a draft ID and fields that cannot be used to file."""
+
+    request_id: str
+    error: SubmissionError
 
 
 class SubmissionKind(StrEnum):
@@ -155,6 +176,32 @@ class PageViewport:
 
 
 @dataclass(frozen=True)
+class PageScreenshot:
+    png: bytes
+    viewport: PageViewport
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.png).hexdigest()
+
+
+@dataclass(frozen=True)
+class FiledPageScreenshot:
+    """The digest of a screenshot that Send already filed."""
+
+    digest: str
+
+
+@dataclass(frozen=True)
+class NoPageScreenshot:
+    pass
+
+
+NO_PAGE_SCREENSHOT = NoPageScreenshot()
+type SubmissionScreenshot = PageScreenshot | FiledPageScreenshot | NoPageScreenshot
+
+
+@dataclass(frozen=True)
 class PageScriptError:
     message: str
     source: str
@@ -166,12 +213,13 @@ class PageScriptError:
 @dataclass(frozen=True)
 class BugPageState:
     url: str
-    viewport: PageViewport
+    viewport: PageViewport | None
     render_seconds: float | None
     notices: tuple[str, ...]
     script_errors: tuple[PageScriptError, ...]
     filters: str
     include_screenshot: bool
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -189,6 +237,7 @@ class ImageReference:
 class PageRecipient(StrEnum):
     PAGE_OWNER = "page-owner"
     LIST_OWNER = "list-owner"
+    SELECTED = "selected"
 
 
 @dataclass(frozen=True)
@@ -259,7 +308,7 @@ def check_recipient_id(recipient: staff.StaffId) -> None:
 
 
 def request_recipient(kind: SubmissionKind, request_id: str) -> staff.StaffId:
-    binding = re.fullmatch(r"r(?:[12]-[0-9a-f]{32}|[3-5]-[0-9a-f]{64})-(.+)", request_id)
+    binding = re.fullmatch(r"r(?:[126]-[0-9a-f]{32}|[3-5]-[0-9a-f]{64})-(.+)", request_id)
     if binding is None:
         raise SubmissionError("Invalid request ID.")
     prefix = f"{kind}-"
@@ -355,7 +404,7 @@ def read_evidence(value: object) -> Evidence:
         case "page-data":
             rows = tuple(tuple(_text(cell, "Page value", 240, allow_empty=True)
                                for cell in _entries(row, "Page row", 16))
-                         for row in _entries(data.get("rows"), "Page rows", 48))
+                         for row in _entries(data.get("rows"), "Page rows", MAX_PAGE_ROWS))
             return PageDataEvidence(_text(data.get("title"), "Page title", 240), rows)
         case "build-step":
             captured_at = _text(data.get("captured_at"), "Capture time", 80)
@@ -429,29 +478,36 @@ def read_bug_page_state(value: object) -> BugPageState | None:
     reported_url = row.get("url")
     url = reported_url[:MAX_PAGE_URL_LENGTH] if isinstance(reported_url, str) else ""
     url = url.encode("utf-8", errors="replace").decode("utf-8")
-    viewport = _mapping(row.get("viewport"), "Page viewport")
-    dark, screenshot = viewport.get("dark"), row.get("include_screenshot")
-    if not isinstance(dark, bool) or not isinstance(screenshot, bool):
+    viewport = None
+    if row.get("viewport") is not None:
+        display = _mapping(row["viewport"], "Page viewport")
+        dark = display.get("dark")
+        if not isinstance(dark, bool):
+            raise SubmissionError("Invalid page display settings.")
+        viewport = PageViewport(_page_integer(display.get("width"), "viewport width", 1),
+                                _page_integer(display.get("height"), "viewport height", 1), dark)
+    screenshot = row.get("include_screenshot", False)
+    if not isinstance(screenshot, bool):
         raise SubmissionError("Invalid page display settings.")
     seconds = row.get("render_seconds")
     if seconds is not None and (
             type(seconds) not in (int, float) or not 0 <= cast(float, seconds) <= 1_000_000):
         raise SubmissionError("Invalid page render time.")
     return BugPageState(
-        url, PageViewport(_page_integer(viewport.get("width"), "viewport width", 1),
-                          _page_integer(viewport.get("height"), "viewport height", 1), dark),
+        url, viewport,
         cast(float | None, seconds),
         tuple(_text(line, "Notice", 512) for line in _entries(row.get("notices"), "Notices", 48)),
         tuple(_script_error(error) for error in _entries(row.get("script_errors"), "Script errors", 20)),
-        _text(row.get("filters", ""), "Page filters", 1024, allow_empty=True), screenshot and url == reported_url)
+        _text(row.get("filters", ""), "Page filters", 1024, allow_empty=True), screenshot,
+        _text(row.get("title", ""), "Page title", 240, allow_empty=True))
 
 
 def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
-    """Decode the JSON fields after the route checks its form token."""
+    """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind = read_kind(data.get("kind"))
-    if page and (page not in page_frame.OWNER_PAGES or kind == SubmissionKind.PROPOSAL):
+    if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
         page_recipient = PageRecipient(data.get("page_recipient", PageRecipient.PAGE_OWNER))
@@ -467,7 +523,8 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         evidence = NoEvidence()
     page_state = read_bug_page_state(data.get("page_state"))
     if page_state is not None and (
-            not page or kind != SubmissionKind.BUG or has_capture or not isinstance(evidence, PageDataEvidence)):
+            not page or kind != SubmissionKind.BUG or
+            not (isinstance(evidence, PageDataEvidence) or isinstance(evidence, NoEvidence) and page_state.title)):
         raise SubmissionError("Send page state from a console Bug dialog.")
     if page_state is not None and len(
             json.dumps(asdict(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PAGE_DATA_BYTES:
@@ -550,21 +607,15 @@ def read_words(value: object, label: str) -> str:
 
 
 
-KINDS = ((SubmissionKind.QUESTION, "Question", "circle-help"),
+KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
+         (SubmissionKind.QUESTION, "Question", "circle-help"),
+         ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
-         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
-         (SubmissionKind.BUG, "Bug", "bug"))
-
-
-def title_button(page: Literal["list", "review"]) -> str:
-    """Place the New item button beside the page title."""
-    label = "New item" if page == "list" else "New"
-    return (f'<button class="review-new" type="button" aria-label="New item" title="New item" data-{page}-new>'
-            + f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span></button>')
+         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"))
 
 
 def render() -> str:
-    """Mount once and open with window.reviewNewItem.open({trigger, kind, evidence})."""
+    """Render the dialog that the page owner button opens."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
         + f'<span data-button-face>{page_frame.icon_svg(icon)}<span data-kind-label>{label}</span></span></label>'
@@ -572,37 +623,49 @@ def render() -> str:
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
+                         "pageRows": MAX_PAGE_ROWS,
                          "pageUrlLength": MAX_PAGE_URL_LENGTH})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset><legend>To</legend><p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
-   <section data-evidence aria-labelledby="new-item-evidence-title" hidden>
-    <h3 id="new-item-evidence-title">Evidence</h3>
-    <div class="new-item-evidence"></div>
-   </section>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
-   <label class="new-item-page-capture" data-page-capture hidden>
-    <input type="checkbox" name="include_page" checked><span>Include a screenshot of this page</span>
-   </label>
-   <section class="page-state-box" data-bug-page-state aria-labelledby="bug-page-state-title" hidden>
-    <h4 id="bug-page-state-title">Page state to send</h4><dl class="page-state"></dl>
+   <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
+    <h4 id="sent-details-title">Sent with your words</h4>
+    <div data-bug-page-state hidden>
+     <dl class="page-state"></dl>
+     <p data-visible-text>Visible text from this page (up to {MAX_PAGE_ROWS} rows)</p>
+    </div>
+    <label class="new-item-page-capture">
+     <input type="checkbox" name="include_page" checked><span>Include a screenshot</span>
+    </label>
+    <div class="capture-slot" data-capture-slot hidden>
+     <a data-shot target="_blank" rel="noopener" hidden>
+      <img alt="Screenshot of this page">
+      <span>Open full size ↗</span>
+     </a>
+     <div data-taking role="status"><span class="capture-spinner" aria-hidden="true"></span>Taking a screenshot</div>
+    </div>
+    <p data-capture-expired role="status" hidden>The screenshot expired. A new one is being taken. Send again when it shows.</p>
+    <p data-fallback role="status" hidden>Screenshot unavailable. Visible text from this page goes instead (up to {MAX_PAGE_ROWS} rows).</p>
+    <div class="new-item-previews" data-previews hidden></div>
    </section>
-   <div class="new-item-previews" data-previews hidden></div>
 '''
     footer = '''
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
-   <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <p id="new-item-saved" role="status" hidden></p>
+   <div data-send-controls><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
                                        footer=footer, form=True, body_class='new-item-body')
-    return (f'<style>{page_frame.CONSOLE_DIALOG_STYLE}{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
-            f'<script>{page_frame.CONSOLE_DIALOG_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
+    return (f'<style>{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
+            f'<script>{SCRIPT.replace("__LIMITS__", limits)}</script>')
 
 
 PAGE_STATE_STYLE = '''
@@ -622,19 +685,11 @@ PAGE_STATE_STYLE = '''
 
 
 STYLE = '''
-.page-heading-actions>.review-new{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;
-min-height:36px;background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--accent);
-padding:5px 14px;margin:0;flex:none;white-space:nowrap}
-.review-new>[aria-hidden]{font-size:1.2em;line-height:1}
-@media(max-width:360px){
- .page-heading-actions>.review-new{justify-content:center;min-width:36px;padding:5px}
- .review-new-label{display:none}
-}
-#review-new-item button:not([data-close]) { font: inherit; cursor: pointer; }
+#review-new-item button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
 #review-new-item button:disabled { opacity: .55; cursor: default; }
 #review-new-item button:focus-visible, #review-new-item textarea:focus-visible,
 #review-new-item input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
-#review-new-item .new-item-body {
+#review-new-item .new-item-body:not([hidden]) {
  display: grid; align-content: start; gap: 18px;
 }
 #review-new-item fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
@@ -654,7 +709,9 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
  font-size: 14px; overflow-wrap: anywhere; cursor: pointer;
 }
 #review-new-item .new-item-chip input:checked + span,
-#review-new-item button[type="submit"] { background: #2670c5; color: white; border-color: transparent; }
+#review-new-item button[type="submit"], #review-new-item [data-done] {
+ background: #2670c5; color: white; border-color: transparent;
+}
 #review-new-item .new-item-chip svg { width: 16px; height: 16px; flex: none; }
 #review-new-item .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
 #review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
@@ -663,7 +720,7 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 #review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item textarea {
- display: block; width: 100%; min-width: 0; padding: 10px 12px; resize: vertical;
+ display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
  background: var(--bg, #121211); color: inherit; font: 16px/1.45 system-ui, sans-serif;
 }
@@ -671,46 +728,31 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
 #review-new-item[data-page-bug] textarea { resize: none; }
 #review-new-item .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
 #review-new-item .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
-#review-new-item .new-item-evidence {
- background: #141413; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
- padding: 10px; font-size: 12px; min-width: 0; overflow-wrap: anywhere;
+#review-new-item h2:focus { outline: none; }
+#review-new-item .sent-details h4 { margin: 0 0 11px; }
+#review-new-item [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
+#review-new-item [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
+#review-new-item .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
+#review-new-item .sent-details .new-item-page-capture { font-size: 14px; }
+#review-new-item .sent-details .new-item-previews { margin-top: 10px; }
+#review-new-item .capture-slot {
+ position: relative; width: min(320px, 100%); aspect-ratio: 1440 / 1000; margin-top: 10px;
+ overflow: hidden; background: var(--card); border-radius: 7px; border: 1px solid var(--line);
 }
-#review-new-item .new-item-evidence h4 { font-size: inherit; margin: 0 0 4px; }
-#review-new-item .new-item-evidence-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 8px; }
-#review-new-item .new-item-muted { color: #c3c2b7; }
-#review-new-item .new-item-cells {
- display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 10px; margin: 7px 0 10px;
+#review-new-item .capture-slot a, #review-new-item [data-taking] { position: absolute; inset: 0; }
+#review-new-item .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
+#review-new-item .capture-slot a span {
+ position: absolute; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;
+ border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--ink);
 }
-#review-new-item .new-item-cells div { min-width: 0; max-width: 100%; }
-#review-new-item .new-item-cells dt { font-weight: 600; color: #c3c2b7; }
-#review-new-item .new-item-cells dd, #review-new-item .new-item-tip dd { margin: 0; white-space: pre-wrap; }
-#review-new-item .new-item-memory { padding: 8px 0; border-block: 1px solid #34332f; margin-bottom: 8px; }
-#review-new-item .new-item-memory p { margin: 0; }
-#review-new-item .new-item-memory strong { font-size: 16px; }
-#review-new-item .new-item-cap { color: #ef7372; font-weight: 650; }
-#review-new-item .new-item-memory-bar { display: flex; height: 12px; margin: 6px 0; }
-#review-new-item .new-item-memory-bar span { min-width: 0; background: var(--segment); border-radius: 2px; }
-#review-new-item .new-item-memory-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; color: #c3c2b7; }
-#review-new-item .new-item-memory-legend span::before {
- content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 4px;
- border-radius: 2px; background: var(--segment);
+#review-new-item .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
+#review-new-item [data-taking]:not([hidden]) {
+ display: flex; justify-content: center; align-items: center; gap: 9px; color: var(--ink-2); font-size: 14px;
 }
-#review-new-item [data-tone="build"] { --segment: #3987e5; }
-#review-new-item [data-tone="free"] { --segment: #199e70; }
-#review-new-item [data-tone="tools"] { --segment: #c98500; }
-#review-new-item [data-tone="system"] { --segment: #9585e0; }
-#review-new-item [data-tone="other"] { --segment: #6c6b66; }
-#review-new-item .new-item-tip {
- background: #242422; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
- padding: 10px 12px; font-size: .85rem; line-height: 1.45;
+#review-new-item .capture-spinner {
+ width: 14px; height: 14px; border: 2px solid var(--line);
+ border-top-color: var(--accent); border-right-color: var(--accent); border-radius: 50%;
 }
-#review-new-item .new-item-tip dl { margin: 0; }
-#review-new-item .new-item-tip dl > div {
- display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px;
-}
-#review-new-item .new-item-tip dd { text-align: right; font-variant-numeric: tabular-nums; }
-#review-new-item .new-item-tip p { margin: 3px 0; color: #c3c2b7; white-space: pre-wrap; }
-#review-new-item .new-item-tip h4 { font-weight: 700; }
 #review-new-item .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
 #review-new-item .new-item-preview {
  position: relative; border: 1px solid var(--line, #34332f); border-radius: 7px;
@@ -732,10 +774,10 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
 }
 #review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
+#review-new-item #new-item-saved { margin: 0 0 12px; }
 @media (max-width: 480px) {
  #review-new-item footer { padding-bottom: 14px; }
  #review-new-item .new-item-body { gap: 14px; }
- #review-new-item .new-item-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(42px, 1fr)); }
 }
 '''
 
@@ -744,20 +786,32 @@ SCRIPT = r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const dialog = document.querySelector('#review-new-item');
+ const heading = dialog.querySelector('#new-item-title');
+ heading.tabIndex = -1;
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
- const evidenceSection = dialog.querySelector('[data-evidence]');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
- const pageCapture = dialog.querySelector('[data-page-capture]'), includePage = form.elements.include_page;
+ const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
+ const slot = dialog.querySelector('[data-capture-slot]'), shot = slot.querySelector('[data-shot]');
+ const preview = shot.querySelector('img'), taking = slot.querySelector('[data-taking]');
+ const fallback = sentDetails.querySelector('[data-fallback]');
+ const fallbackText = fallback.textContent;
+ const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
  const sendNotice = dialog.querySelector('[data-send-disabled]');
+ const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
+ const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
- let launcher, opening, evidence, token, recipients, images = [], sending = false;
- let draft, keepDraft = false, ownerPage = '', pageOwnerId = '';
- let captureSession, bugPageState;
+ const listSendKey = 'console.list.pending-send';
+ const listDraftId = /^r6-[0-9a-f]{32}$/;
+ let launcher, opening, token, recipients, images = [], sending = false;
+ let draftId, keepDraft = false, ownerPage = '';
+ // Null means the user must choose again. An empty string means the page has no default.
+ let selectedRecipient = '';
+ let captureSession, pageContext, savedItem;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -766,95 +820,55 @@ SCRIPT = r'''(() => {
   return element;
  }
 
- function captionAndValue(label, value) {
-  const row = node('div');
-  row.append(node('dt', label), node('dd', value));
-  return row;
- }
-
- function showEvidence() {
-  const box = evidenceSection.querySelector('.new-item-evidence');
-  box.replaceChildren();
-  evidenceSection.hidden = evidence.kind !== 'build-step';
-  if (evidenceSection.hidden) return;
-  const heading = node('div', '', 'new-item-evidence-heading');
-  heading.append(node('h4', evidence.title), node('span', evidence.owner, 'new-item-muted'));
-  const cells = node('dl', '', 'new-item-cells');
-  for (const cell of evidence.cells) cells.append(captionAndValue(cell.label, cell.value));
-
-  const memory = node('div', '', 'new-item-memory');
-  memory.append(node('h4', 'Overall memory'));
-  const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
-  free.append(node('strong', evidence.memory.free_for_next_gib.toFixed(1) + ' GiB'),
-              ' Free for the next step');
-  figures.append(free, node('p', 'Queue cap ' + evidence.memory.queue_cap_gib.toFixed(1) + ' GiB', 'new-item-cap'));
-  memory.append(figures);
-  const bar = node('div', '', 'new-item-memory-bar');
-  bar.setAttribute('aria-hidden', 'true');
-  const legend = node('div', '', 'new-item-memory-legend');
-  for (const segment of evidence.memory.segments) {
-   const section = node('span'), key = node('span', segment.label + ' ' + segment.gib.toFixed(1) + ' GiB');
-   section.dataset.tone = key.dataset.tone = segment.tone;
-   section.style.flexGrow = String(segment.gib);
-   bar.append(section);
-   legend.append(key);
-  }
-  if (legend.childElementCount) memory.append(bar, legend);
-
-  const tip = node('div', '', 'new-item-tip'), tipHeading = node('div', '', 'new-item-evidence-heading');
-  tipHeading.append(node('h4', evidence.tip_title), node('strong', evidence.tip_status));
-  tip.append(tipHeading);
-  let table = null;
-  for (const entry of evidence.tip) {
-   if (entry.kind === 'field') {
-    if (!table) { table = node('dl'); tip.append(table); }
-    table.append(captionAndValue(entry.label, entry.value));
-   } else {
-    table = null;
-    tip.append(node('p', entry.text));
-   }
-  }
-  box.append(heading, cells, memory, tip);
- }
-
  function setError(reason) {
   error.textContent = reason;
   error.hidden = !reason;
  }
 
  function updateSend() {
-  send.disabled = sending || !token || !recipientChips.querySelector('input:checked') ||
+  send.disabled = !!savedItem || sending || (!slot.hidden && !taking.hidden) || !token || !recipientChips.querySelector('input:checked') ||
                   !words.value.trim() || words.value.length > words.maxLength;
  }
 
  function showRecipients() {
   if (!recipients) return;
-  const selected = recipientChips.querySelector('input:checked')?.value;
-  const available = recipients.filter(recipient => form.elements.kind.value !== 'proposal' || recipient.proposal);
-  const choice = available.some(recipient => recipient.id === selected) ? selected : pageOwnerId;
+  const proposal = form.elements.kind.value === 'proposal';
+  const available = recipients.filter(recipient => !proposal || recipient.proposal);
+  if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
+   selectedRecipient = null;
+   storeListDraft();
+  }
   recipientChips.replaceChildren();
   for (const recipient of available) {
    const chip = node('label', '', 'new-item-chip'), input = node('input');
    input.type = 'radio';
    input.name = 'recipient_id';
    input.value = recipient.id;
-   input.checked = recipient.id === choice;
+   input.checked = recipient.id === selectedRecipient;
    const face = node('span', recipient.name);
    face.setAttribute('data-button-face', '');
    chip.append(input, face);
    recipientChips.append(chip);
   }
-  recipientStatus.textContent = available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !!available.length;
+  recipientStatus.textContent = selectedRecipient === null
+   ? 'The recipient you chose is not available. Choose a recipient.'
+   : available.length ? '' : 'No recipients are available.';
+  recipientStatus.hidden = !recipientStatus.textContent;
  }
 
  function editDraft(event) {
+  if (sending) return;
   if (event?.target.name === 'kind') {
    showRecipients();
    showBugPage();
-   if (isPageBug()) discardCapture();
-   else startCapture();
   }
+  if (event?.target.name === 'recipient_id') {
+   selectedRecipient = event.target.value;
+   storeListDraft();
+   recipientStatus.hidden = true;
+  }
+  if (event?.target === includePage) startCapture();
+  showSentDetails();
   setError('');
   updateSend();
  }
@@ -870,6 +884,7 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
+  if (sending) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -881,6 +896,11 @@ SCRIPT = r'''(() => {
       files.some(file => !file.size || file.size > limits.imageBytes)) {
    setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
+  addImagePreviews(files);
+  editDraft();
+ });
+
+ function addImagePreviews(files) {
   for (const file of files) {
    const row = node('div', '', 'new-item-preview'), photo = node('img');
    const url = URL.createObjectURL(file);
@@ -895,9 +915,8 @@ SCRIPT = r'''(() => {
    images.push(image);
    previews.append(row);
   }
-  previews.hidden = false;
-  editDraft();
- });
+  previews.hidden = !images.length;
+ }
 
  function pastedData(file) {
   return new Promise((resolve, reject) => {
@@ -915,19 +934,33 @@ SCRIPT = r'''(() => {
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
+   failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
+   if (response.status === 409 && data?.code === 'already_filed' &&
+       typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id)) {
+    failure.filedId = data.id;
+   }
    throw failure;
   }
   return data;
  }
 
  async function loadOptions(signal) {
-  const path = ownerPage ? endpoint + '?' + new URLSearchParams({page: ownerPage}) : endpoint;
+  const path = endpoint + '?' + new URLSearchParams({page: ownerPage});
   const response = await fetch(path, {cache: 'no-store', signal});
   const data = await responseData(response, 'Could not load recipients.');
   if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
    throw new Error('Could not load recipients.');
   }
   return data;
+ }
+
+ function setOptions(data) {
+  token = data.token;
+  sendNotice.textContent = data.send_disabled || '';
+  sendNotice.hidden = !data.send_disabled;
+  includePage.closest('label').hidden = !sendNotice.hidden;
+  recipients = data.recipients;
+  showRecipients();
  }
 
  async function post(payload, keepalive = false) {
@@ -959,7 +992,7 @@ SCRIPT = r'''(() => {
    bytes += encoder.encode(JSON.stringify(cells)).length + (data.rows.length ? 1 : 0);
    if (bytes > limits.pageDataBytes) break;
    data.rows.push(cells);
-   if (data.rows.length === 48) break;
+   if (data.rows.length === limits.pageRows) break;
   }
   return data;
  }
@@ -971,7 +1004,7 @@ SCRIPT = r'''(() => {
   return {width: innerWidth, height: innerHeight, dark};
  }
 
- function collectBugPage() {
+ function collectPageContext() {
   const filters = [];
   for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
@@ -994,10 +1027,12 @@ SCRIPT = r'''(() => {
   }
   const status = document.querySelector('[data-page-status]');
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
+  const data = visiblePageData();
   return {
-   data: visiblePageData(),
-   // Keep one extra character so the server can detect a long URL.
-   state: {url: clip(location.href, limits.pageUrlLength + 1), viewport: viewport(),
+   place: location.pathname + location.search + location.hash,
+   viewport: viewport(),
+   data,
+   state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
            filters: clip(filters.join(' · '), 1024),
            render_seconds: Number.isFinite(seconds) && seconds >= 0 ? seconds : null,
            notices: [...notices], script_errors: (window.consoleScriptErrors || []).slice()}
@@ -1005,7 +1040,7 @@ SCRIPT = r'''(() => {
  }
 
  function isPageBug() {
-  return ownerPage && form.elements.kind.value === 'bug';
+  return form.elements.kind.value === 'bug';
  }
 
  function showBugPage() {
@@ -1013,62 +1048,138 @@ SCRIPT = r'''(() => {
   dialog.toggleAttribute('data-page-bug', Boolean(bug));
   words.rows = bug ? 3 : 4;
   bugStateBox.hidden = !bug;
-  pageCapture.querySelector('span').textContent = bug ? 'Include a screenshot' : 'Include a screenshot of this page';
-  if (!bug || !bugPageState) return;
-  const {data, state} = bugPageState;
+  fallback.textContent = bug ? 'Screenshot unavailable.' : fallbackText;
+  if (!bug || !pageContext) return;
+  const {state} = pageContext;
   const rows = [
-   ['Page', data.title],
+   ['Page', state.title],
+   ['Address', state.url],
    ['Filters', state.filters || 'None'],
-   ['Render time', state.render_seconds === null ? 'Unavailable' : state.render_seconds.toFixed(2) + ' s'],
-   ['Error lines', state.notices.join('\n') || 'None', state.notices.length],
-   ['Script errors', state.script_errors.map(error => error.message).join('\n') || 'None', state.script_errors.length]
+   ['Render time', state.render_seconds === null ? 'Unavailable' : state.render_seconds.toFixed(2) + ' s']
   ];
+  if (state.notices.length) rows.push(['Error lines', state.notices.join('\n'), true]);
+  if (state.script_errors.length) rows.push(['Script errors', state.script_errors.map(error => error.message).join('\n'), true]);
   bugStateBox.querySelector('dl').replaceChildren(...rows.flatMap(([label, value, failed]) =>
    [node('dt', label), node('dd', value, failed ? 'error-line' : '')]));
  }
 
- function startCapture() {
-  if (!ownerPage || isPageBug() || !includePage.checked || !token || captureSession) return;
-  const place = location.pathname + location.search + location.hash;
-  const captureToken = token;
-  const key = post({token: captureToken, page_capture: {place, ...viewport()}})
-   .then(result => result.capture_key || '', () => '');
-  captureSession = {key, token: captureToken};
+ function hasCaptureSpace(image) {
+  return images.length < limits.images &&
+         images.reduce((total, entry) => total + entry.file.size, image?.size ?? 0) <= limits.totalImageBytes;
  }
 
- function discardCapture() {
+ function showSentDetails() {
+  const image = captureSession?.image;
+  const include = includePage.checked && sendNotice.hidden;
+  const unavailable = include && (image === null || !hasCaptureSpace(image));
+  slot.hidden = !include || unavailable;
+  taking.hidden = !!image;
+  shot.hidden = !image;
+  fallback.hidden = !unavailable;
+  expired.hidden = slot.hidden || taking.hidden || !captureSession?.renewed;
+  if (image && shot.href !== image.url) {
+   shot.href = preview.src = image.url;
+  }
+  updateSend();
+ }
+
+ function startCapture(renewed = false) {
+  if ((savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
+  const {place, viewport} = pageContext;
+  const session = {token, renewed, controller: new AbortController()};
+  captureSession = session;
+  showSentDetails();
+  session.key = post({token, page_capture: {place, ...viewport}})
+   .then(result => result.capture_key || '', () => '');
+  void session.key.then(async key => {
+   if (!key || captureSession !== session) return null;
+   const response = await fetch(endpoint + '?' + new URLSearchParams({capture_key: key}),
+    {cache: 'no-store', headers: {'X-Review-Token': session.token}, signal: session.controller.signal});
+   if (!response.ok) return null;
+   const blob = await response.blob();
+   return captureSession === session ? {key, size: blob.size, blob, url: URL.createObjectURL(blob)} : null;
+  }).catch(() => null).then(image => {
+   if (captureSession !== session) return null;
+   session.image = image;
+   showSentDetails();
+   return image;
+  });
+ }
+
+ async function renewCapture() {
+  if (!pageContext || !includePage.checked) return;
+  const signal = opening.signal;
+  const fresh = await loadOptions(signal).catch(() => null);
+  if (signal.aborted) return;
+  if (fresh) setOptions(fresh);
+  startCapture(true);
+  showSentDetails();
+ }
+
+ function discardCapture(used = false) {
   const session = captureSession;
   captureSession = undefined;
-  if (session) {
+  if (!session) return;
+  session.controller.abort();
+  clearCapturePreview(session);
+  showSentDetails();
+  if (!used) {
    void session.key.then(key => key && post({token: session.token, discard_capture: key}, true)).catch(() => {});
   }
  }
 
- function setPageMode(page) {
-  pageCapture.hidden = !page;
-  const bug = form.querySelector('[data-kind="bug"]');
-  if (page) bug.parentElement.prepend(bug);
-  else bug.parentElement.append(bug);
-  for (const label of form.querySelectorAll('[data-kind]')) {
-   const input = label.querySelector('input');
-   const hidden = page ? input.value === 'proposal' : false;
-   label.hidden = hidden;
-   input.disabled = hidden;
-   if (input.value === 'investigation') {
-    // Feedback uses the native investigation record and its reply.
-    label.querySelector('[data-kind-label]').textContent = page ? 'Feedback' : 'Investigation';
-   }
+ function clearCapturePreview(session) {
+  if (session.image) URL.revokeObjectURL(session.image.url);
+  shot.removeAttribute('href');
+  preview.removeAttribute('src');
+  session.image = null;
+ }
+
+ function storedListDraft() {
+  try {
+   const stored = sessionStorage.getItem(listSendKey);
+   if (!stored) return null;
+   if (listDraftId.test(stored)) return {id: stored, recipient: null};
+   const draft = JSON.parse(stored);
+   if (typeof draft?.id !== 'string' || !listDraftId.test(draft.id)) return null;
+   const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
+   return {id: draft.id, recipient};
+  } catch (_) { return null; }
+ }
+
+ function storeListDraft() {
+  if (ownerPage !== 'list' || !draftId) return;
+  try {
+   sessionStorage.setItem(listSendKey, JSON.stringify({id: draftId, recipient: selectedRecipient}));
+  } catch (_) {}
+ }
+
+ function finishDraft() {
+  draftId = undefined;
+  if (ownerPage === 'list') {
+   try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
  }
 
- function close({sent = false, usedCapture = false} = {}) {
+ function showConfirmation(item) {
+  savedItem = item;
+  const saved = Boolean(item);
+  confirmation.textContent = saved ? 'Saved ' + item.id + '.' : '';
+  confirmation.hidden = savedControls.hidden = !saved;
+  body.hidden = sendControls.hidden = saved;
+  updateSend();
+  if (saved) done.focus();
+ }
+
+ function close({sent = false} = {}) {
   if (!dialog.open || sending) return;
-  if (usedCapture) captureSession = undefined;
-  else discardCapture();
+  const result = savedItem;
+  discardCapture();
   opening.abort();
   dialog.close();
-  keepDraft = !sent && Boolean(words.value || images.length);
+  keepDraft = !sent && !result && Boolean(words.value || images.length);
   if (!keepDraft) {
+   if (ownerPage !== 'list') draftId = undefined;
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -1076,6 +1187,10 @@ SCRIPT = r'''(() => {
   }
   if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
+  if (result) {
+   showConfirmation();
+   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+  }
  }
 
  function setSending(value) {
@@ -1086,122 +1201,144 @@ SCRIPT = r'''(() => {
   updateSend();
  }
 
- async function open({trigger, kind = 'question', evidence: capture = {kind: 'none'}, page = ''} = {}) {
+ async function open(trigger, page) {
   if (dialog.open || sending) return;
-  const changedMode = ownerPage !== page;
   ownerPage = page;
-  bugPageState = page ? collectBugPage() : undefined;
-  setPageMode(page);
-  launcher = trigger || document.activeElement;
+  pageContext = collectPageContext();
+  launcher = trigger;
   token = '';
-  sendNotice.hidden = true;
-  if (!keepDraft) form.reset();
-  if (!keepDraft || changedMode) {
-   evidence = structuredClone(capture);
-   recipients = null;
-   includePage.checked = includePage.defaultChecked;
-   setError('');
-   recipientChips.replaceChildren();
-   const kinds = [...form.querySelectorAll('input[name="kind"]:not(:disabled)')];
-   if (!keepDraft || !kinds.some(input => input.checked)) {
-    (kinds.find(input => input.value === kind) || kinds[0]).checked = true;
+  if (ownerPage === 'list' && !draftId) {
+   const stored = storedListDraft();
+   if (stored) {
+    draftId = stored.id;
+    selectedRecipient = stored.recipient;
    }
-   showEvidence();
+  }
+  const newDraft = !keepDraft && !draftId;
+  if (newDraft) selectedRecipient = '';
+  sendNotice.hidden = true;
+  includePage.closest('label').hidden = false;
+  recipients = null;
+  recipientChips.replaceChildren();
+  if (!keepDraft) {
+   form.reset();
+   setError('');
+   form.elements.kind.value = 'bug';
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
   showBugPage();
+  showSentDetails();
   updateSend();
   const controller = new AbortController();
   opening = controller;
   dialog.showModal();
-  const focus = keepDraft ? words : form.querySelector('input[name="kind"]:checked');
+  const focus = keepDraft ? words : heading;
   focus.focus({preventScroll: true});
   body.scrollTop = 0;
   try {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   token = data.token;
-   sendNotice.textContent = data.send_disabled || '';
-   sendNotice.hidden = !data.send_disabled;
-   if (data.send_disabled) pageCapture.hidden = true;
-   recipients = data.recipients;
-   pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
-   showRecipients();
+   if (newDraft) selectedRecipient = data.page_owner || '';
+   setOptions(data);
    startCapture();
-   updateSend();
+   showSentDetails();
   } catch (failure) {
    if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
   }
  }
 
  form.addEventListener('input', editDraft);
- includePage.addEventListener('change', startCapture);
  window.addEventListener('pagehide', () => { if (!sending) discardCapture(); });
- bindConsoleDialog(dialog,close);
- dialog.querySelector('[data-cancel]').addEventListener('click',()=>close());
+ window.addEventListener('pageshow', event => {
+  if (event.persisted && dialog.open) startCapture();
+ });
+ bindConsoleDialog(dialog, close);
+ for (const control of dialog.querySelectorAll('[data-cancel], [data-done]')) {
+  control.addEventListener('click', () => close());
+ }
  form.addEventListener('submit', async event => {
   event.preventDefault();
   if (send.disabled) return;
-  const kind = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
-  if (!draft) {
-   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-                            byte => byte.toString(16).padStart(2, '0')).join('');
-   draft = 'r2-' + nonce;
-  }
-  const payload = {request_id: draft, kind, recipient_id: recipient.value,
-                   words: words.value, ...(ownerPage && {page: ownerPage,
-                    ...(recipient.value !== pageOwnerId && {page_recipient: 'list-owner'})})};
+  const onList = ownerPage === 'list';
+  let saved, captureKey = '';
   setError('');
   setSending(true);
-  let saved, usedCapture;
   try {
+   const type = form.elements.kind.value, selected = recipientChips.querySelector('input:checked');
+   const kind = type === 'feedback' ? 'investigation' : type;
+   if (!selected) throw new Error('Select a recipient.');
+   if (!draftId) {
+    draftId = 'r6-' + Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                                byte => byte.toString(16).padStart(2, '0')).join('');
+   }
+   storeListDraft();
+   const screenshot = slot.hidden || shot.hidden ? null : captureSession?.image;
+   captureKey = screenshot?.key || '';
+   const bug = isPageBug();
+   const evidence = bug || !fallback.hidden ? pageContext.data : {kind: 'none'};
    const files = await Promise.all(images.map(image => pastedData(image.file)));
-   const include = ownerPage && includePage.checked;
-   const pageBug = isPageBug() && bugPageState;
-   const data = pageBug ? pageBug.data : include ? visiblePageData() : evidence;
-   const state = pageBug && {...pageBug.state, include_screenshot: includePage.checked};
-   const key = !pageBug && include && files.length < limits.images ? await captureSession?.key : '';
+   const item = {request_id: draftId, kind, recipient_id: selected.value, words: words.value,
+                 page: ownerPage, page_recipient: 'selected', evidence, images: files,
+                 ...(captureKey && {capture_key: captureKey}), ...(bug && {page_state: pageContext.state})};
+   const sendItem = () => post({...item, token});
    let result;
-   for (let attempt = 0; ; attempt += 1) {
-    try {
-     result = await post({...payload, evidence: data, images: files, token, ...(key && {capture_key: key}),
-                          ...(state && {page_state: state})});
-     usedCapture = Boolean(key);
-     break;
-    } catch (failure) {
-     if (attempt || !failure.staleToken) throw failure;
-     const fresh = await loadOptions(opening.signal);
-     token = fresh.token;
-    }
+   try {
+    result = await sendItem();
+   } catch (failure) {
+    if (onList || !failure?.staleToken) throw failure;
+    const fresh = await loadOptions(opening.signal);
+    setOptions(fresh);
+    if (selectedRecipient !== selected.value) return;
+    result = await sendItem();
    }
    if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
     throw new Error('The server did not return a saved item ID.');
    }
    saved = result;
   } catch (failure) {
-   setError(failure.message);
+   if (failure?.filedId) {
+    finishDraft();
+    setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
+    discardCapture();
+    void renewCapture();
+   } else {
+    setError(failure?.message || 'Could not send this item.');
+    if (failure?.screenshotExpired && includePage.checked) {
+     discardCapture(!onList);
+     void renewCapture();
+    } else if (onList && failure?.staleToken) {
+     discardCapture();
+     const signal = opening.signal;
+     const fresh = await loadOptions(signal).catch(() => null);
+     if (!signal.aborted && fresh) {
+      setOptions(fresh);
+      if (selectedRecipient === null) setError('');
+      startCapture(true);
+     }
+    }
+   }
   } finally {
    setSending(false);
   }
   if (saved) {
-   draft = undefined;
-   close({sent: true, usedCapture});
-   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+   finishDraft();
+   discardCapture(Boolean(captureKey));
+   if (onList) {
+    close({sent: true});
+    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+   } else {
+    showConfirmation(saved);
+    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+   }
   } else {
    send.focus();
   }
  });
 
- window.reviewNewItem = {open};
  document.addEventListener('click', event => {
-  const listButton = event.target.closest('[data-list-new]');
-  if (listButton) {
-   void open({trigger: listButton, page: 'list'});
-   return;
-  }
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
-  if (page) void open({trigger, page, kind: 'bug'});
+  if (page) void open(trigger, page);
  });
 })();'''

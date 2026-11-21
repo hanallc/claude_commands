@@ -22,25 +22,44 @@ TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
 
 
-def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.StaffSnapshot,
-               dialog: Callable[[], str]) -> bytes:
+class OwnerNewItem(StrEnum):
+    FOR_SHOWN_OWNER = "shown"
+    CHOOSE_RECIPIENT = "choose-recipient"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class NoShownOwner:
+    """There is no staff name to show in the page heading."""
+
+
+def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
+               dialog: Callable[[], str], *,
+               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
     """Add the shared owner control to one served console document."""
     from scripts.review_links import staff_names
 
     main = re.search(rb"<main(?=[\s>])[^>]*>", content)
     if main is None or b'data-page-owner="' in content:
         return content
-    name = staff_names.StaffNames(members).html(owner.id, owner.name)
-    label = html.escape(f"New item for {owner.name}", quote=True)
-    control = (f'<div class="page-owner" data-page-owner="{page}"><span class="page-owner-name">{name}</span>'
-               + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
-               + icon_svg("message-circle-question") + '</button></div>').encode()
+    name = ""
+    if isinstance(owner, staff.StaffRow):
+        rendered = staff_names.StaffNames(members).html(owner.id, owner.name)
+        name = f'<span class="page-owner-name">{rendered}</span>'
+    button = ""
+    if recipient is not OwnerNewItem.UNAVAILABLE:
+        label = "New item"
+        if recipient is OwnerNewItem.FOR_SHOWN_OWNER and isinstance(owner, staff.StaffRow):
+            label = f"New item for {owner.name}"
+        elif not isinstance(recipient, OwnerNewItem):
+            label = f"New item for {recipient}"
+        label = html.escape(label, quote=True)
+        button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+                  + icon_svg("message-circle-question") + '</button>')
+    control = (f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>').encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
-    if heading is not None and content.startswith(actions, heading.end()):
-        at = heading.end() + len(actions)
-        content = content[:at] + control + content[at:]
-    elif heading is not None:
+    if heading is not None:
         row = b'<div class="page-heading">' + heading[0] + actions + control + b'</div></div>'
         content = content[:heading.start()] + row + content[heading.end():]
     else:
@@ -55,17 +74,18 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
     if row_style not in content:
         style = b'<style>' + row_style + b'</style>' + style
     content = content.replace(b'</head>', style + b'</head>', 1)
-    if b'id="review-new-item"' not in content:
-        content = content.replace(b'</body>', dialog().encode() + b'</body>', 1)
+    if button:
+        markup = dialog()
+        if CONSOLE_DIALOG_ASSETS.encode() in content:
+            markup = markup.replace(CONSOLE_DIALOG_ASSETS, '', 1)
+        content = content.replace(b'</body>', markup.encode() + b'</body>', 1)
     return content
 
 
 HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
                  + '.page-heading>h1{margin:0}'
                  + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
-                 + 'max-width:100%;margin-inline-start:auto}'
-                 + '@media(max-width:360px){.page-heading-compact{flex-wrap:nowrap;column-gap:8px}'
-                 + '.page-heading-compact>.page-heading-actions{min-width:0;gap:6px}}')
+                 + 'max-width:100%;margin-inline-start:auto}')
 
 
 OWNER_STYLE = """<style>
@@ -105,8 +125,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, action: str = "", compact_actions: bool = False) -> str:
-    """Build the title and refresh status with an optional action beside the title."""
+def title(text: str, page: str) -> str:
+    """Build the title and refresh status."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -117,9 +137,6 @@ def title(text: str, page: str, *, action: str = "", compact_actions: bool = Fal
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
-    if action:
-        layout = "page-heading page-heading-compact" if compact_actions else "page-heading"
-        heading = f'<div class="{layout}">{heading}{HEADING_ACTIONS}{action}</div></div>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -330,14 +347,15 @@ class ReturningActionHeading(StrEnum):
 
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
-    """Render the frame and the scrollable body of a console dialog."""
+    """Render a console dialog with its shared assets."""
     wrapper = 'form' if form else 'div'
-    return (f'<dialog id="{dialog_id}" aria-labelledby="{title_id}" data-console-dialog>'
-            f'<{wrapper} class="console-dialog-frame"><header><h2 id="{title_id}">{title}</h2>'
-            '<button type="button" data-close aria-label="Close">×</button></header>'
-            f'{before_body}'
-            f'<div class="console-dialog-body{(" " + body_class) if body_class else ""}">'
-            f'{body}</div>{footer}</{wrapper}></dialog>')
+    markup = (f'<dialog id="{dialog_id}" aria-labelledby="{title_id}" data-console-dialog>'
+              f'<{wrapper} class="console-dialog-frame"><header><h2 id="{title_id}">{title}</h2>'
+              '<button type="button" data-close aria-label="Close">×</button></header>'
+              f'{before_body}'
+              f'<div class="console-dialog-body{(" " + body_class) if body_class else ""}">'
+              f'{body}</div>{footer}</{wrapper}></dialog>')
+    return CONSOLE_DIALOG_ASSETS + markup
 
 
 CONSOLE_DIALOG_STYLE = '''
@@ -386,6 +404,9 @@ function bindConsoleDialog(dialog,close){
  });
 }
 '''
+
+
+CONSOLE_DIALOG_ASSETS = f'<style>{CONSOLE_DIALOG_STYLE}</style><script>{CONSOLE_DIALOG_SCRIPT}</script>'
 
 
 def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,

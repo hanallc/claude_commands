@@ -7,10 +7,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -40,8 +41,14 @@ from scripts.review_links.new_item_dialog import (
 )
 
 DRAFT_ID = re.compile(r"r2-[0-9a-f]{32}")
+BROWSER_DRAFT_ID = re.compile(r"r6-[0-9a-f]{32}")
 LEGACY_DRAFT_BINDING = re.compile(r"(r2-[0-9a-f]{32})-.+")
+BROWSER_DRAFT_BINDING = re.compile(r"(r6-[0-9a-f]{32})-.+")
 PAGE_SCREENSHOT = ImageReference("000000000000", "image.png")
+
+
+def is_draft_id(value: object) -> bool:
+    return isinstance(value, str) and BROWSER_DRAFT_ID.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -138,7 +145,31 @@ class SavedSubmission(NativeSubmissionDestination):
 
 
 @dataclass(frozen=True)
+class EditedSubmission(SavedSubmission):
+    """The draft already names a saved item."""
+
+
+@dataclass(frozen=True)
+class ListDraftFiling:
+    """The fields and capture prepared for the first filing of a List draft."""
+
+    request: NewItemRequest
+    screenshot: new_item_dialog.SubmissionScreenshot
+    capture_requested: bool
+    refusal: SubmissionError | None = None
+
+
+@dataclass(frozen=True)
+class ListDraftSend:
+    """A List draft with fields to read only if no saved item exists."""
+
+    request_id: str
+    prepare: Callable[[], ListDraftFiling]
+
+
+@dataclass(frozen=True)
 class _ImageUpload:
+    reference: ImageReference
     extension: str
     data: bytes
 
@@ -163,7 +194,8 @@ def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
         total += len(data)
         if total > MAX_TOTAL_IMAGE_BYTES:
             raise SubmissionError("The pasted images must total at most 12 MiB.")
-        uploads.append(_ImageUpload(extension, data))
+        reference = ImageReference(f"{len(uploads) + 1:012x}", f"image.{extension}")
+        uploads.append(_ImageUpload(reference, extension, data))
     return tuple(uploads)
 
 
@@ -187,15 +219,19 @@ def _validate_image(upload: _ImageUpload) -> None:
         raise SubmissionError("The pasted image does not match its type or exceeds the image limits.")
 
 
-def _request_folder(request_id: str) -> Path:
+def _attachment_root() -> Path:
     snapshot_root = review_link.review_root().resolve()
     configured = conf.read_or_repository("review_links").text("review_attachments_root")
     root = (snapshot_root.parent / Path(configured).expanduser()).resolve()
     if root.is_relative_to(snapshot_root) or root.is_relative_to(record_store.state_root().resolve()):
         raise OSError("The Review attachment root must be outside the snapshot and staff state roots.")
+    return root
+
+
+def _request_folder(request_id: str) -> Path:
     identity = read_request_id(request_id)
-    draft = LEGACY_DRAFT_BINDING.fullmatch(identity)
-    return root / (draft[1] if draft else identity)
+    draft = LEGACY_DRAFT_BINDING.fullmatch(identity) or BROWSER_DRAFT_BINDING.fullmatch(identity)
+    return _attachment_root() / (draft[1] if draft else identity)
 
 
 def image_folder(item: SavedSubmission | ReviewSubmission) -> Path:
@@ -203,13 +239,8 @@ def image_folder(item: SavedSubmission | ReviewSubmission) -> Path:
     return _request_folder(item.request_id) / "images"
 
 
-def _image_references(uploads: tuple[_ImageUpload, ...]) -> tuple[ImageReference, ...]:
-    return tuple(ImageReference(f"{number:012x}", f"image.{upload.extension}")
-                 for number, upload in enumerate(uploads, 1))
-
-
 def _save_images(folder: Path, request: NewItemRequest, uploads: tuple[_ImageUpload, ...]) -> tuple[ImageReference, ...]:
-    references = _image_references(uploads)
+    references = tuple(upload.reference for upload in uploads)
     if not references:
         return references
     images = folder / "images"
@@ -224,7 +255,8 @@ def _save_images(folder: Path, request: NewItemRequest, uploads: tuple[_ImageUpl
         workspace = Path(temporary)
         stage = workspace / "images"
         for reference, upload in zip(references, uploads, strict=True):
-            _validate_image(upload)
+            if reference != PAGE_SCREENSHOT:
+                _validate_image(upload)
             source = workspace / reference.file
             atomic_file.write_bytes_atomic(source, upload.data, mode=0o600)
             _ = image_store.register_file(source, stage, owner=request.recipient_id,
@@ -287,7 +319,7 @@ def _read_request_file(path: Path, request_id: str) -> RequestFile:
                         check_recipient_id(staff.StaffId(recipient))
                     except SubmissionError as error:
                         raise OSError(f"Cannot read the Review request file at {path}.") from error
-                    if DRAFT_ID.fullmatch(request_id):
+                    if DRAFT_ID.fullmatch(request_id) or BROWSER_DRAFT_ID.fullmatch(request_id):
                         request_id = f"{request_id}-{kind}-{recipient}"
                     return NativeSubmissionDestination(identity, kind, staff.StaffId(recipient), request_id,
                                                        payload_hash, Path(native_path), Path(original_path), filing_owner)
@@ -315,7 +347,7 @@ def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[
     payload: list[object] = [request.kind, words, asdict(request.evidence), _image_fingerprints(uploads)]
     if request.page:
         payload.append(request.page)
-    if request.page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
+    if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
     return _fingerprint(payload)
 
@@ -545,7 +577,7 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
     marker = f"page-{page}"
     if list_recipient is not None:
         marker += f"-{list_recipient}"
-    elif page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
+    elif page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         marker += f"-recipient-{address.recipient_id}"
     page_marker = folder / marker
     standard = _draft_address(address.kind, address.recipient_id, fingerprint)
@@ -762,14 +794,15 @@ def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
             == (saved.address, saved.id, saved.owner, saved.payload_hash))
 
 
-def _complete_receipt(folder: Path, saved: NativeSubmissionDestination,
-                      hint: RequestFile, record: NativeSubmittedRecord, *, first_send: bool = False) -> SavedSubmission:
+def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: RequestFile,
+                      record: NativeSubmittedRecord, *, first_send: bool = False, edited: bool = False) -> SavedSubmission:
     """Complete the receipt before a retry can return the native result."""
+    receipt = folder / "receipt.json"
     try:
-        if (folder / "receipt.json").is_file():
+        if receipt.is_file():
             if hint != saved:
                 atomic_file.sync_folder(saved.path.parent)
-                _write_location(folder / "receipt.json", saved)
+                _write_location(receipt, saved)
             else:
                 atomic_file.sync_folder(folder)
         else:
@@ -781,8 +814,9 @@ def _complete_receipt(folder: Path, saved: NativeSubmissionDestination,
             raise
         words = " ".join(str(error).splitlines())
         print(f"Review receipt for {saved.id}: {words}", file=sys.stderr)
-    return SavedSubmission(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
-                           saved.path, saved.original_path, saved.owner, record)
+    result = EditedSubmission if edited else SavedSubmission
+    return result(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
+                  saved.path, saved.original_path, saved.owner, record)
 
 
 def _recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
@@ -833,15 +867,41 @@ def _submission_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapsho
 
 @dataclass(frozen=True)
 class PageOwnerUnavailable:
-    """The configured production has no active recipient."""
+    """This page owner is unavailable."""
 
 
-def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    """Resolve the page owner from retained staff state on either machine."""
+@dataclass(frozen=True)
+class PageOwners:
+    shown: staff.StaffRow | PageOwnerUnavailable
+    route: staff.StaffRow | PageOwnerUnavailable
+
+
+def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> bool:
+    return (row.id not in members.pending_retire and not isinstance(row.exited, staff.Exited)
+            and not isinstance(row.doc, staff.WrappedDoc) and not isinstance(row.worktree, staff.RemovedWorktree)
+            and (row.kind != "showrunner" or isinstance(row.doc, staff.LiveDoc)))
+
+
+def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
+    """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
     values = settings.values(key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
+    route = _page_owner_route(designated, default, members)
+    shown = members.rows_by_id.get(designated)
+    if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
+        return PageOwners(shown, route)
+    return PageOwners(route, route)
+
+
+def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
+    """Resolve the recipient for new items from a console page."""
+    return page_owners(page, settings, members).route
+
+
+def _page_owner_route(designated: staff.StaffId, default: staff.StaffId,
+                      members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     for identity in (designated, default):
         for candidate in investigation.owner_chain(identity, members):
             row = _available_page_owner(candidate, members, allow_producer=candidate == designated)
@@ -853,11 +913,8 @@ def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapsho
 def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot, *,
                           allow_producer: bool) -> staff.StaffRow | PageOwnerUnavailable:
     row = members.rows_by_id.get(identity)
-    if row is None or identity in members.pending_retire or isinstance(row.exited, staff.Exited):
-        return PageOwnerUnavailable()
-    if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
-        return PageOwnerUnavailable()
-    if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc) or row.kind == "producer" and allow_producer:
+    if row is not None and _page_owner_is_active(row, members) and (
+            row.kind == "showrunner" or row.kind == "producer" and allow_producer):
         return row
     return PageOwnerUnavailable()
 
@@ -868,9 +925,7 @@ def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> st
     if isinstance(configured, conf.UnavailableValue):
         return PageOwnerUnavailable()
     row = members.rows_by_id.get(staff.StaffId(configured.value))
-    if (row is None or row.kind != "producer" or row.id in members.pending_retire
-            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
-            or isinstance(row.worktree, staff.RemovedWorktree)):
+    if row is None or row.kind != "producer" or not _page_owner_is_active(row, members):
         return PageOwnerUnavailable()
     return row
 
@@ -884,6 +939,14 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         if isinstance(producer, staff.StaffRow) and producer.id == address.recipient_id:
             return producer
         raise SubmissionConflict("The List owner is unavailable. Open New item again.")
+    if choice == new_item_dialog.PageRecipient.SELECTED:
+        row = _recipient(address.recipient_id, members)
+        settings = conf.read_or_repository("console")
+        owner = page_owner(page, settings, members)
+        producer = list_producer(settings, members)
+        if not _is_recipient_choice(row, members, owner=owner, producer=producer):
+            raise SubmissionConflict(f"{row.name} is unavailable. Choose another recipient.")
+        return row
     if page == "list":
         recipient = _available_page_owner(address.recipient_id, members, allow_producer=True)
     else:
@@ -932,17 +995,39 @@ def proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
     return NoNativeFolder(SubmissionKind.PROPOSAL)
 
 
-def recipient_options(members: staff.StaffSnapshot) -> list[RecipientOption]:
-    """List active recipients and indicate who can receive proposals."""
-    options: list[RecipientOption] = []
+def _is_recipient_choice(row: staff.StaffRow, members: staff.StaffSnapshot, *,
+                         owner: staff.StaffRow | PageOwnerUnavailable,
+                         producer: staff.StaffRow | PageOwnerUnavailable) -> bool:
+    return (_page_owner_is_active(row, members)
+            and (row == owner or row == producer or _submission_owner_is_active(row, members)))
+
+
+_NO_PAGE_OWNER = PageOwnerUnavailable()
+
+
+def _recipient_choices(members: staff.StaffSnapshot, *,
+                       owner: staff.StaffRow | PageOwnerUnavailable = _NO_PAGE_OWNER
+                       ) -> Iterable[staff.StaffRow]:
     producer = list_producer(conf.read_or_repository("console"), members)
     for row in (*staff.active(members, "showrunner"), *staff.active(members, "producer")):
         try:
-            active = row == producer or _submission_owner_is_active(row, members)
+            if _is_recipient_choice(row, members, owner=owner, producer=producer):
+                yield row
         except OSError:
             continue
-        if not active:
-            continue
+
+
+def has_recipient_choice(members: staff.StaffSnapshot) -> bool:
+    """Check whether the dialog has a recipient without reading Proposal folders."""
+    return any(_recipient_choices(members))
+
+
+def recipient_options(members: staff.StaffSnapshot, *,
+                      owner: staff.StaffRow | PageOwnerUnavailable = _NO_PAGE_OWNER
+                      ) -> list[RecipientOption]:
+    """List active recipients and indicate who can receive proposals."""
+    options: list[RecipientOption] = []
+    for row in _recipient_choices(members, owner=owner):
         try:
             can_receive_proposals = isinstance(proposal_folder(row), Path)
         except OSError:
@@ -1005,30 +1090,219 @@ def _prepare_request_folder(request_id: str) -> tuple[Path, bool]:
     return folder, False
 
 
-def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = None) -> SavedSubmission:
-    """Validate and file the item once in its native store."""
+@contextmanager
+def _locked_browser_request(address: SubmissionAddress, members: staff.StaffSnapshot | None, *,
+                            page: str, page_recipient: new_item_dialog.PageRecipient,
+                            refusal: SubmissionError | None) -> Generator[SubmissionLookup]:
+    if refusal is not None:
+        folder = _request_folder(address.request_id)
+        if not folder.is_dir():
+            raise refusal
+    else:
+        folder, _ = _prepare_request_folder(address.request_id)
+    with exclusive(folder / ".lock"):
+        with _locked_filed_draft(folder, address.request_id, members) as lookup:
+            if isinstance(lookup, SubmissionLookup):
+                yield lookup
+                return
+        if refusal is not None:
+            raise refusal
+        with _locked_browser_recipient(address, page, page_recipient) as lookup:
+            yield lookup
+
+
+@contextmanager
+def _locked_browser_recipient(address: SubmissionAddress, page: str, page_recipient: new_item_dialog.PageRecipient
+                              ) -> Generator[SubmissionLookup]:
+    owners = {address.recipient_id}
+    while True:
+        with investigation.recipient_locks(*owners):
+            current = staff.snapshot()
+            recipient = _send_recipient(address, page, current, page_recipient)
+            if recipient.id not in owners:
+                owners.add(recipient.id)
+                continue
+            target = SubmissionAddress(address.kind, recipient.id, f"{address.request_id}-{address.kind}-{recipient.id}")
+            yield SubmissionLookup(_request_hint(target), NoNativeSubmission(), current, target, recipient)
+            return
+
+
+@contextmanager
+def _locked_filed_draft(folder: Path, request_id: str, members: staff.StaffSnapshot | None
+                        ) -> Generator[SubmissionLookup | NoNativeSubmission]:
+    hint = _read_request_file(folder / "receipt.json", request_id)
+    if isinstance(hint, NoRequestFile):
+        hint = _read_request_file(folder / "pending.json", request_id)
+    if isinstance(hint, NativeSubmissionDestination):
+        with _locked_request(hint.address, members) as lookup:
+            if _saved_draft(lookup) is not None:
+                yield lookup
+                return
+    yield NoNativeSubmission()
+
+
+def _recover_unverified_draft(request_id: str, members: staff.StaffSnapshot | None,
+                              error: SubmissionError) -> SavedSubmission:
+    if is_draft_id(request_id):
+        folder = _request_folder(request_id)
+        if folder.is_dir():
+            with exclusive(folder / ".lock"), _locked_filed_draft(folder, request_id, members) as lookup:
+                if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
+                    item = lookup.native
+                    return _complete_receipt(folder, item.destination, lookup.hint, item.record, edited=True)
+    raise error
+
+
+def _discard_unfiled_send(folder: Path) -> None:
+    images = folder / "images"
+    if images.is_dir():
+        shutil.rmtree(images)
+    (folder / "pending.json").unlink(missing_ok=True)
+    atomic_file.sync_folder(folder)
+
+
+def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None) -> SavedSubmission:
+    if not is_draft_id(send.request_id):
+        raise SubmissionError("Invalid List draft ID.")
+    folder, _ = _prepare_request_folder(send.request_id)
+    with exclusive(folder / ".lock"):
+        with _locked_filed_draft(folder, send.request_id, members) as lookup:
+            if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
+                item = lookup.native
+                if item.details.page != "list":
+                    raise SubmissionConflict("This draft belongs to another page.")
+                return _complete_receipt(folder, item.destination, lookup.hint, item.record, edited=True)
+        alias = folder / "list-receipt-key"
+        try:
+            key = alias.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        else:
+            with scoped_submission(read_submission_key(key), members=members) as item:
+                saved = item.destination
+                return _complete_receipt(_request_folder(saved.request_id), saved, _request_hint(saved.address),
+                                         item.record, edited=True)
+        filing = send.prepare()
+        request = filing.request
+        if request.page != "list" or request.request_id != send.request_id:
+            raise SubmissionError("Invalid List draft request.")
+        return _submit(request, members=members, screenshot=filing.screenshot,
+                       capture_requested=filing.capture_requested, refusal=filing.refusal)
+
+
+def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
+                      members: staff.StaffSnapshot | None) -> SavedSubmission | None:
+    """Recover old List filings when the original words, kind, images and recipient match."""
+    legacy_id = "r2-" + address.request_id[3:]
+    fingerprint = _fingerprint([legacy_id, address.kind, words, _image_fingerprints(uploads)])
+    folder = _request_folder(f"r4-{fingerprint}")
+    if not folder.is_dir():
+        return None
+    address = replace(address, request_id=legacy_id)
+    with exclusive(folder / ".lock"):
+        for candidate in _list_draft_candidates(folder, address, fingerprint):
+            with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
+                item = _saved_draft(lookup, list_recipient=address.recipient_id)
+                if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
+                    continue
+                saved = item.destination
+                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
+    return None
+
+
+def submit(
+    request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry | ListDraftSend, *, members: staff.StaffSnapshot | None = None,
+    screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
+    capture_requested: bool = False, refusal: SubmissionError | None = None,
+) -> SavedSubmission:
+    """Save the native item or recover the first Send for this draft."""
+    if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
+        return _recover_unverified_draft(request.request_id, members, request.error)
+    if isinstance(request, ListDraftSend):
+        return _submit_list_draft(request, members)
+    if request.page == "list":
+        if BROWSER_DRAFT_ID.fullmatch(request.request_id):
+            filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
+            return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members)
+        return _submit(request, members=members, screenshot=screenshot,
+                       capture_requested=capture_requested, refusal=refusal)
+    try:
+        return _submit(request, members=members, screenshot=screenshot,
+                       capture_requested=capture_requested, refusal=refusal)
+    except SubmissionError as error:
+        return _recover_unverified_draft(request.request_id, members, error)
+
+
+def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
+            screenshot: new_item_dialog.SubmissionScreenshot, capture_requested: bool,
+            refusal: SubmissionError | None) -> SavedSubmission:
     check_recipient_id(request.recipient_id)
     request_id = read_request_id(request.request_id)
     kind = read_kind(request.kind)
-    if request.page and (request.page not in page_frame.OWNER_PAGES or kind == SubmissionKind.PROPOSAL):
+    if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         raise SubmissionError("Select a recipient from the New item dialog.")
-    is_draft = DRAFT_ID.fullmatch(request_id) is not None
-    if request_id.startswith(("r2-", "r3-", "r4-", "r5-")) and not is_draft:
+    if request.page and kind == SubmissionKind.PROPOSAL:
+        request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
+    legacy_draft = DRAFT_ID.fullmatch(request_id) is not None
+    browser_draft = BROWSER_DRAFT_ID.fullmatch(request_id) is not None
+    list_draft = browser_draft and request.page == "list"
+    if request_id.startswith(("r2-", "r3-", "r4-", "r5-", "r6-")) and not (legacy_draft or browser_draft):
         raise SubmissionError("Invalid draft request ID.")
-    address = (SubmissionAddress(kind, request.recipient_id, request_id) if is_draft
+    address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
                else _request_address(kind, request.recipient_id, request_id))
     words = read_words(request.words, "Your words")
     evidence = read_evidence(asdict(request.evidence))
     uploads = _decode_images(request.images)
-    request = replace(request, kind=kind, evidence=evidence)
-    payload_hash = _fingerprint([request_id, kind, words, _image_fingerprints(uploads)]) if is_draft else ""
-    folder = None
+    if list_draft:
+        previous = _legacy_list_draft(address, words, uploads, members)
+        if previous is not None:
+            alias = _request_folder(request_id) / "list-receipt-key"
+            atomic_file.write_text_atomic(alias, previous.key, new_file_mode=0o600)
+            atomic_file.sync_folder(alias.parent)
+            return previous
+    state = request.page_state
+    missing_capture = capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot)
+    unverified = refusal is not None or missing_capture
+    if refusal is None and (missing_capture or isinstance(screenshot, new_item_dialog.FiledPageScreenshot)):
+        refusal = new_item_dialog.SubmissionScreenshotExpired()
+    if refusal is not None and (list_draft or not (legacy_draft or browser_draft)):
+        raise refusal
+
+    payload_hash = ""
+    if browser_draft:
+        digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
+        payload_hash = _fingerprint([kind, request.recipient_id, words, asdict(evidence), _image_fingerprints(uploads),
+                                     request.page, request.page_recipient, asdict(state) if state else None, digest])
+    elif legacy_draft:
+        payload_hash = _fingerprint([request_id, kind, words, _image_fingerprints(uploads)])
+    else:
+        payload_hash = _submission_fingerprint(replace(request, kind=kind, evidence=evidence), words, uploads)
+    if isinstance(screenshot, new_item_dialog.PageScreenshot):
+        total = len(screenshot.png) + sum(len(upload.data) for upload in uploads)
+        if len(uploads) >= MAX_IMAGES or total > MAX_TOTAL_IMAGE_BYTES:
+            raise SubmissionError("The screenshot and pasted images exceed the attachment limits.")
+        uploads = (*uploads, _ImageUpload(PAGE_SCREENSHOT, "png", screenshot.png))
+        if kind != SubmissionKind.BUG and isinstance(evidence, new_item_dialog.PageDataEvidence):
+            evidence = NoEvidence()
+        if state is not None:
+            state = replace(state, viewport=screenshot.viewport, include_screenshot=True)
+    elif state is not None and not (legacy_draft or list_draft):
+        state = replace(state, viewport=None, include_screenshot=False)
+    request = replace(request, kind=kind, evidence=evidence, page_state=state)
+    folder: Path | None = None
     request_exists = False
     try:
-        if not is_draft:
-            payload_hash = _submission_fingerprint(request, words, uploads)
+        if list_draft:
+            locked = _locked_browser_recipient(address, request.page, request.page_recipient)
+        elif browser_draft:
+            locked = _locked_browser_request(address, members, page=request.page,
+                                             page_recipient=request.page_recipient, refusal=refusal)
+        elif legacy_draft:
+            locked = _locked_draft_request(address, members, page=request.page, fingerprint=payload_hash,
+                                           page_recipient=request.page_recipient)
+        else:
             folder, request_exists = _prepare_request_folder(request_id)
             if request_exists:
                 # Only a receipt proves the first writer finished publication.
@@ -1042,63 +1316,81 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
                     _check_same_request(receipt, request, payload_hash)
                     _check_same_request(found.destination, request, payload_hash)
                     return _complete_receipt(folder, found.destination, receipt, found.record)
+            locked = _locked_request(address, members, for_send=True, page=request.page,
+                                     page_recipient=request.page_recipient)
 
-        locked = (_locked_draft_request(address, members, page=request.page, fingerprint=payload_hash,
-                                       page_recipient=request.page_recipient)
-                  if is_draft else _locked_request(address, members, for_send=True, page=request.page,
-                                                  page_recipient=request.page_recipient))
         with locked as lookup:
             hint, located, current = lookup.hint, lookup.native, lookup.members
-            if is_draft:
-                address = lookup.address
-                request_id = address.request_id
-                request = replace(request, request_id=request_id, recipient_id=address.recipient_id)
+            address = lookup.address
+            request_id = address.request_id
+            request = replace(request, request_id=request_id, recipient_id=address.recipient_id)
+            if legacy_draft or browser_draft:
                 folder, request_exists = _prepare_request_folder(request_id)
             assert folder is not None
             if isinstance(located, LocatedSubmission):
                 saved = located.destination
-                _check_same_request(saved, request, payload_hash, draft=is_draft)
-                completed = _complete_receipt(folder, saved, hint, located.record)
-                return replace(completed, reused=True) if is_draft else completed
+                if not browser_draft:
+                    _check_same_request(saved, request, payload_hash, draft=legacy_draft)
+                edited = browser_draft and (unverified or saved.payload_hash != payload_hash)
+                completed = _complete_receipt(folder, saved, hint, located.record, edited=edited)
+                return replace(completed, reused=True) if legacy_draft else completed
+            if refusal is not None:
+                raise refusal
             if (folder / "receipt.json").is_file():
                 raise OSError(f"Cannot find the native record for request {request_id}.")
             if isinstance(hint, UnreadableRequestFile):
                 raise hint.error
-            if not isinstance(hint, NoRequestFile):
-                _check_same_request(hint, request, payload_hash, draft=is_draft)
+            if not browser_draft and not isinstance(hint, NoRequestFile):
+                _check_same_request(hint, request, payload_hash, draft=legacy_draft)
 
             assert current is not None
-            members = current
             recipient = lookup.recipient
             if recipient is None and not request.page:
-                recipient = _active_recipient(request.recipient_id, members)
+                recipient = _active_recipient(request.recipient_id, current)
             if recipient is None:
                 raise SubmissionConflict("The page owner is unavailable. Open New item again.")
             destination = proposal_folder(recipient) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
             if kind == SubmissionKind.PROPOSAL and isinstance(destination, NoNativeFolder):
                 raise SubmissionError("Select a recipient with a native proposal folder.")
+            if browser_draft and (not isinstance(hint, NoRequestFile) or (folder / "images").exists()):
+                _discard_unfiled_send(folder)
+            if legacy_draft and request.page == "list" and (folder / "images").is_dir():
+                # The draft fingerprint excludes the page screenshot.
+                shutil.rmtree(folder / "images")
             pending_file = folder / "pending.json"
-            if isinstance(hint, NoRequestFile):
+            if not browser_draft and isinstance(hint, NoRequestFile):
                 _write_request_file(pending_file, {"payload_hash": payload_hash})
-            atomic_file.sync_folder(folder.parent)
-            atomic_file.sync_folder(folder.parent.parent)
-            images = _save_images(folder, request, uploads)
-            details = ReviewSubmission(request_id, payload_hash, evidence, images, new_reply_token(),
-                                       page=request.page, page_state=request.page_state)
-            title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
             destinations: list[NativeSubmissionDestination] = []
 
             def before_write(identity: str, path: Path) -> None:
                 path = path.resolve()
-                saved = NativeSubmissionDestination(identity, kind, address.recipient_id, request_id, payload_hash, path, path,
-                                                    recipient.id)
+                saved = NativeSubmissionDestination(identity, kind, address.recipient_id, request_id,
+                                                    payload_hash, path, path, recipient.id)
                 _write_location(pending_file, saved)
                 destinations[:] = [saved]
 
-            record = _file(kind, recipient, title, words, details, members, destination, before_write)
+            try:
+                atomic_file.sync_folder(folder.parent)
+                atomic_file.sync_folder(folder.parent.parent)
+                images = _save_images(folder, request, uploads)
+                details = ReviewSubmission(request_id, payload_hash, evidence, images, new_reply_token(),
+                                           page=request.page, page_state=request.page_state)
+                title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+                record = _file(kind, recipient, title, words, details, current, destination, before_write)
+            except Exception:
+                if not browser_draft:
+                    raise
+                if destinations:
+                    saved = destinations[0]
+                    found = _read_native_submission(address, saved.path, saved.owner)
+                    if isinstance(found, LocatedSubmission):
+                        _check_same_request(found.destination, request, payload_hash, draft=legacy_draft)
+                        return _complete_receipt(folder, found.destination, saved, found.record, first_send=True)
+                _discard_unfiled_send(folder)
+                raise
             saved, = destinations
-            return _complete_receipt(folder, saved, saved, record,
-                                     first_send=(is_draft or not request_exists) and isinstance(hint, NoRequestFile))
+            return _complete_receipt(folder, saved, saved, record, first_send=browser_draft or (
+                (legacy_draft or not request_exists) and isinstance(hint, NoRequestFile)))
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure,
             update_registration.InputError, Refusal) as error:
         raise SubmissionError(str(error)) from error
@@ -1183,7 +1475,7 @@ def attach_page_screenshot(key: str, image: bytes) -> bool:
     return True
 
 
-def save_bug_page_state(saved: SavedSubmission, item_key: str, request: NewItemRequest,
+def save_bug_page_state(saved: SavedSubmission, item_key: str, request: NewItemRequest | None,
                         screenshot: Callable[[str, new_item_dialog.BugPageState], bool]) -> bool:
     """Create one case record and report whether a replay adds state to the Bug."""
     folder = review_link.review_root() / "page-states"
@@ -1200,12 +1492,17 @@ def save_bug_page_state(saved: SavedSubmission, item_key: str, request: NewItemR
             assert isinstance(details, ReviewSubmission)
             added = details.page_state is None
             if added:
-                if request.page_state is None or not isinstance(request.evidence, new_item_dialog.PageDataEvidence):
+                if request is None or request.page_state is None:
                     return False
-                details = replace(details, page=request.page, page_state=request.page_state, page_state_data=request.evidence)
+                page_data = request.evidence
+                if not isinstance(page_data, new_item_dialog.PageDataEvidence):
+                    if not request.page_state.title:
+                        return False
+                    page_data = new_item_dialog.PageDataEvidence(request.page_state.title, ())
+                details = replace(details, page=request.page, page_state=request.page_state, page_state_data=page_data)
                 _write_investigation_submission(located, details)
         state, data = details.page_state, details.bug_page_data
-        assert state is not None and data is not None
+        assert state is not None
         captured = PAGE_SCREENSHOT in details.images
         attached = False
         capture_error: OSError | ValueError | RuntimeError | None = None
@@ -1217,10 +1514,11 @@ def save_bug_page_state(saved: SavedSubmission, item_key: str, request: NewItemR
         record = {
             "request_id": saved.request_id, "item_key": item_key,
             "filed_at": datetime.fromisoformat(report.filed).astimezone(user_zone()).isoformat(timespec="seconds"),
-            "machine": this_machine(), "page": details.page, "url": state.url, "viewport": asdict(state.viewport),
+            "machine": this_machine(), "page": details.page, "url": state.url,
+            **({"viewport": asdict(state.viewport)} if state.viewport is not None else {}),
             "render_seconds": state.render_seconds, "notices": state.notices,
             "script_errors": [asdict(error) for error in state.script_errors],
-            "page_data": {"title": data.title, "rows": data.rows},
+            "page_data": {"title": state.title or (data.title if data else details.page), "rows": data.rows if data else ()},
             "screenshot": PAGE_SCREENSHOT.id if captured or attached else None, "words": report.question,
         }
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)

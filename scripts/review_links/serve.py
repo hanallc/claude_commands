@@ -26,7 +26,7 @@ import tempfile
 import time
 import threading
 from collections.abc import Callable, Generator, Mapping
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -41,6 +41,7 @@ from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
+from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions, staff_names
@@ -52,6 +53,8 @@ LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 # Allow page state and rows in addition to the existing words and image budget.
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
                      + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
+SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
+STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
@@ -95,9 +98,17 @@ def owned_document(content: bytes, page: str) -> bytes:
     """Read the current owner when serving a console document."""
     try:
         members = staff.local_snapshot()
-        owner = review_submissions.page_owner(page, conf.read_or_repository("console"), members)
-        if isinstance(owner, staff.StaffRow):
-            return page_frame.with_owner(content, page, owner, members, new_item_dialog.render)
+        owners = review_submissions.page_owners(page, conf.read_or_repository("console"), members)
+        if isinstance(owners.route, staff.StaffRow):
+            recipient = owners.route.name
+        elif review_submissions.has_recipient_choice(members):
+            recipient = page_frame.OwnerNewItem.CHOOSE_RECIPIENT
+        elif isinstance(owners.shown, staff.StaffRow):
+            recipient = page_frame.OwnerNewItem.UNAVAILABLE
+        else:
+            return content
+        shown = owners.shown if isinstance(owners.shown, staff.StaffRow) else page_frame.NoShownOwner()
+        return page_frame.with_owner(content, page, shown, members, new_item_dialog.render, recipient=recipient)
     except (OSError, ValueError):
         pass
     return content
@@ -124,13 +135,27 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
     return image
 
 
+PAGE_CAPTURE_TTL_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class PageCapturePending:
+    pass
+
+
+@dataclass(frozen=True)
+class PageCaptureForSavedItem:
+    saved: review_submissions.SavedSubmission
+
+
 @dataclass
 class PageCapture:
-    """Hold an image or its destination until both are available."""
-
     expires: float
-    image: bytes | None = None
-    saved: review_submissions.SavedSubmission | None = None
+    state: (PageCapturePending | PageCaptureForSavedItem | new_item_dialog.PageScreenshot
+            | new_item_dialog.FiledPageScreenshot) = field(default_factory=PageCapturePending)
+    completed: threading.Event = field(default_factory=threading.Event)
+    filing: bool = False
+    discard_after_filing: bool = False
 
 
 class PageCaptures:
@@ -138,49 +163,135 @@ class PageCaptures:
         self._lock: threading.Lock = threading.Lock()
         self._sessions: dict[str, PageCapture] = {}
 
+    def _remove(self, key: str) -> None:
+        self._sessions.pop(key).completed.set()
+
+    def _active(self, key: str) -> PageCapture | None:
+        capture = self._sessions.get(key)
+        if capture is not None and not capture.filing and capture.expires <= time.monotonic():
+            self._remove(key)
+            return None
+        return capture
+
     def start(self) -> str:
         """Reserve space for a dialog capture."""
         with self._lock:
             now = time.monotonic()
-            self._sessions = {key: capture for key, capture in self._sessions.items() if capture.expires > now}
+            for key in tuple(self._sessions):
+                _ = self._active(key)
             if len(self._sessions) >= 8:
-                return ""
+                filed = next((key for key, capture in self._sessions.items()
+                              if not capture.filing and isinstance(capture.state, new_item_dialog.FiledPageScreenshot)), "")
+                if not filed:
+                    return ""
+                self._remove(filed)
             key = secrets.token_hex(16)
-            self._sessions[key] = PageCapture(now + 600)
+            self._sessions[key] = PageCapture(now + PAGE_CAPTURE_TTL_SECONDS)
             return key
 
     def discard(self, key: str) -> None:
         with self._lock:
             capture = self._sessions.get(key)
-            if capture is not None and capture.saved is None:
-                del self._sessions[key]
+            if capture is None or isinstance(capture.state, PageCaptureForSavedItem):
+                return
+            if capture.filing:
+                capture.discard_after_filing = True
+            else:
+                self._remove(key)
 
-    def file(self, key: str, saved: review_submissions.SavedSubmission) -> bytes | None:
+    def mark_filed(self, key: str, image: new_item_dialog.PageScreenshot) -> None:
+        """Keep only the digest for a retry of Send."""
+        filed = new_item_dialog.FiledPageScreenshot(image.digest)
+        with self._lock:
+            capture = self._sessions.get(key)
+            if capture is not None and capture.state is image:
+                capture.state = filed
+
+    def file(self, key: str, saved: review_submissions.SavedSubmission, *, allow_pending: bool = False
+             ) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
         """Claim a finished image or reserve the pending image for this item."""
         with self._lock:
-            capture = self._sessions.get(key)
-            if capture is None or capture.saved is not None:
-                return None
-            if capture.expires <= time.monotonic():
-                del self._sessions[key]
-                return None
-            if capture.image is not None:
-                del self._sessions[key]
-                return capture.image
-            capture.saved = saved
-            return None
+            capture = self._active(key)
+            if capture is None or not capture.filing or (allow_pending and capture.discard_after_filing):
+                return new_item_dialog.NO_PAGE_SCREENSHOT
+            state = capture.state
+            if isinstance(state, new_item_dialog.PageScreenshot):
+                capture.state = new_item_dialog.FiledPageScreenshot(state.digest)
+                return state
+            if allow_pending and isinstance(state, PageCapturePending):
+                capture.state = PageCaptureForSavedItem(saved)
+            return new_item_dialog.NO_PAGE_SCREENSHOT
 
-    def complete(self, key: str, image: bytes | None) -> review_submissions.SavedSubmission | None:
-        """Keep an unused image in memory or return the item that needs it."""
+    def preview(self, key: str) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
+        """Return the held PNG after the capture completes."""
         with self._lock:
-            capture = self._sessions.get(key)
+            capture = self._active(key)
+            if capture is None:
+                return new_item_dialog.NO_PAGE_SCREENSHOT
+        _ = capture.completed.wait(max(0, capture.expires - time.monotonic()))
+        with self._lock:
+            current = self._active(key)
+            if current is not None and isinstance(current.state, new_item_dialog.PageScreenshot):
+                return current.state
+        return new_item_dialog.NO_PAGE_SCREENSHOT
+
+    @contextmanager
+    def for_filing(self, key: str, *, allow_pending: bool = False
+                   ) -> Generator[new_item_dialog.SubmissionScreenshot | PageCapturePending | PageCaptureForSavedItem]:
+        """Reserve the capture while Send files the item."""
+        screenshot: (new_item_dialog.SubmissionScreenshot | PageCapturePending
+                     | PageCaptureForSavedItem) = new_item_dialog.NO_PAGE_SCREENSHOT
+        with self._lock:
+            capture = self._active(key)
+            if capture is not None and (
+                    isinstance(capture.state, new_item_dialog.PageScreenshot)
+                    or (allow_pending and isinstance(capture.state, PageCapturePending))):
+                if capture.filing:
+                    raise new_item_dialog.SubmissionConflict("This screenshot is in use. Try Send again.")
+                screenshot = capture.state
+                capture.filing = True
+            else:
+                if capture is not None and isinstance(capture.state, (
+                        new_item_dialog.FiledPageScreenshot, PageCaptureForSavedItem)):
+                    screenshot = capture.state
+                capture = None
+
+        if capture is None:
+            yield screenshot
+            return
+
+        try:
+            yield screenshot
+        finally:
+            with self._lock:
+                if capture.discard_after_filing:
+                    self._remove(key)
+                else:
+                    capture.expires = time.monotonic() + PAGE_CAPTURE_TTL_SECONDS
+                    capture.filing = False
+
+    def complete(self, key: str, image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot
+                 ) -> review_submissions.SavedSubmission | None:
+        """Hold the finished image or return the item that needs it."""
+        with self._lock:
+            capture = self._active(key)
             if capture is None:
                 return None
-            if image is not None and capture.saved is None:
-                capture.image = image
+            if isinstance(image, new_item_dialog.NoPageScreenshot):
+                if capture.filing:
+                    capture.discard_after_filing = True
+                    capture.completed.set()
+                else:
+                    self._remove(key)
                 return None
-            del self._sessions[key]
-            return capture.saved
+            if isinstance(capture.state, PageCaptureForSavedItem):
+                saved = capture.state.saved
+                capture.state = new_item_dialog.FiledPageScreenshot(image.digest)
+                capture.completed.set()
+                return saved
+            capture.state = image
+            capture.completed.set()
+            return None
 
 
 @dataclass
@@ -488,8 +599,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
         if route.path == review_page.NEW_ITEM_PATH:
-            self.new_item_options()
-            return None
+            return self.new_item_options()
         if route.path == review_page.ATTACHMENT_PATH:
             return self.review_attachment(route.query)
         if route.path == review_page.PAGE_PATH:
@@ -967,46 +1077,62 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         host = self.headers.get("Host", "")
         return not origins or bool(host and origins == [f"http://{host}"])
 
-    def new_item_options(self) -> None:
+    def valid_new_item_token(self, token: object) -> bool:
+        expected = cast(ReviewLinksServer, self.server).new_item_token
+        return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, expected)
+
+    def new_item_options(self) -> BinaryIO | None:
         """Return a New item token and current recipients."""
         server = cast(ReviewLinksServer, self.server)
         if self.command != "GET":
             self.send_error(405)
-            return
+            return None
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(query) == {"capture_key"} and len(query["capture_key"]) == 1:
+            return self.new_item_preview(query["capture_key"][0])
         selected = query.get("page", [])
         if query and (set(query) != {"page"} or len(selected) != 1 or selected[0] not in page_frame.OWNER_PAGES):
-            self.json_response(400, {"error": "Open the New item dialog from Review."})
-            return
+            self.json_response(400, {"error": "Open the dialog from a console page owner."})
+            return None
         refusal = self.tailscale_refusal()
         if refusal or not self.same_origin():
-            self.json_response(403, {"error": refusal or "Open the New item dialog from Review."})
-            return
+            self.json_response(403, {"error": refusal or "Open the dialog from a console page owner."})
+            return None
         try:
             fields: dict[str, object] = {"token": server.new_item_token}
-            if selected:
-                with server.list_store_access():
-                    settings = conf.read_or_repository("console")
-                    members = staff.local_snapshot()
-                    owner = review_submissions.page_owner(selected[0], settings, members)
-                    producer = review_submissions.list_producer(settings, members)
-                recipients: list[review_submissions.RecipientOption] = []
-                fields["page_owner"] = ""
-                if isinstance(owner, staff.StaffRow):
-                    recipients.append({"id": owner.id, "name": owner.name, "proposal": False})
-                    fields["page_owner"] = owner.id
-                if isinstance(producer, staff.StaffRow) and producer != owner:
-                    recipients.append({"id": producer.id, "name": producer.name, "proposal": False})
-            else:
-                with server.staff_read_scope():
-                    recipients = review_submissions.recipient_options(staff.snapshot())
+            with server.list_store_access(), server.staff_read_scope():
+                members = staff.snapshot()
+                if selected:
+                    owner = review_submissions.page_owner(selected[0], conf.read_or_repository("console"), members)
+                    fields["page_owner"] = owner.id if isinstance(owner, staff.StaffRow) else ""
+                    recipients = review_submissions.recipient_options(members, owner=owner)
+                else:
+                    recipients = review_submissions.recipient_options(members)
         except (OSError, ValueError) as error:
             print(f"review-links New item recipients: {error}", file=sys.stderr)
             self.json_response(503, {"error": "The recipients are unavailable."})
-            return
+            return None
         if server.mode is ServerMode.LIST_FIXTURE:
             fields.update(token="", send_disabled="Sending is off on a practice List.")
         self.json_response(200, {**fields, "recipients": recipients})
+        return None
+
+    def new_item_preview(self, capture_key: str) -> BinaryIO | None:
+        tokens = self.headers.get_all("X-Review-Token", [])
+        if (len(tokens) != 1 or not self.valid_new_item_token(tokens[0])
+                or not self.same_origin() or self.tailscale_refusal()):
+            self.json_response(403, {"error": "The capture preview is not authorized."})
+            return None
+        try:
+            key = new_item_dialog.read_capture_key(capture_key)
+        except new_item_dialog.SubmissionError:
+            self.json_response(404, {"error": "The page screenshot is unavailable."})
+            return None
+        capture = cast(ReviewLinksServer, self.server).page_captures.preview(key)
+        if isinstance(capture, new_item_dialog.PageScreenshot):
+            return self.attachment_response(capture.png, "image/png")
+        self.json_response(404, {"error": "The page screenshot is unavailable."})
+        return None
 
     def new_item_post(self) -> None:
         """File and publish a native record before sending its message."""
@@ -1032,8 +1158,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise new_item_dialog.SubmissionError("Invalid New item request.")
             fields = cast(dict[str, object], payload)
             token = fields.get("token")
-            if not isinstance(token, str) or not token.isascii() or not secrets.compare_digest(token, server.new_item_token):
-                self.json_response(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
+            valid_token = self.valid_new_item_token(token)
+            draft = fields.get("request_id")
+            list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
+                             and review_submissions.is_draft_id(draft) else "")
+            browser_draft = fields.get("page") != "list" and review_submissions.is_draft_id(draft)
+            # The browser draft ID can recover an existing Send after a restart.
+            if not valid_token and (
+                    "capture_key" not in fields or "page_capture" in fields or "discard_capture" in fields
+                    or not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token)
+                    or not browser_draft):
+                self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                 return
             if "page_capture" in fields:
                 self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]))
@@ -1042,11 +1177,39 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.page_captures.discard(new_item_dialog.read_capture_key(fields["discard_capture"]))
                 self.json_response(200, {})
                 return
-            key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-            request = new_item_dialog.read_request(fields, has_capture=bool(key))
-            if key and (not request.page or not isinstance(
-                    request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
-                raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
+            key = ""
+            refusal: new_item_dialog.SubmissionError | None = None
+            if not valid_token:
+                refusal = new_item_dialog.SubmissionScreenshotExpired()
+            request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry | None = None
+
+            def read_submission() -> new_item_dialog.NewItemRequest:
+                nonlocal key
+                try:
+                    key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
+                    item = new_item_dialog.read_request(fields, has_capture=bool(key))
+                except new_item_dialog.SubmissionError:
+                    raise
+                except (ValueError, RecursionError) as error:
+                    raise new_item_dialog.SubmissionError("Invalid New item JSON.") from error
+                if key and (not item.page or not isinstance(
+                        item.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
+                    raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
+                return item
+
+            if not list_draft_id:
+                try:
+                    request = read_submission()
+                    if not key and request.page_state is not None and request.page_state.include_screenshot:
+                        if browser_draft:
+                            refusal = new_item_dialog.SubmissionScreenshotExpired()
+                        elif not review_submissions.DRAFT_ID.fullmatch(request.request_id):
+                            refusal = new_item_dialog.SubmissionScreenshotReload()
+                except new_item_dialog.SubmissionError as error:
+                    if not browser_draft or not isinstance(draft, str):
+                        raise
+                    request = new_item_dialog.UnverifiedDraftRetry(draft, error)
+                    key = ""
         except (ValueError, RecursionError) as error:
             reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
@@ -1054,21 +1217,82 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
+        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and request.page != "list"
+                             and review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None)
         try:
-            created = server.review_cache.create_submission(request)
-            response = {"id": created.saved.id, "key": created.key, "version": created.version}
-            if request.page == "list":
-                response["list_key"] = list_page.add_submission(created).key
-            details = created.saved.details
-            evidence_url = ""
-            if key or details.images or request.page_state is not None or isinstance(
-                    details.evidence, new_item_dialog.PageDataEvidence):
-                site = f"http://{server.bound_address}:{server.server_port}"
-                fragment = urlencode({"item": created.key})
-                evidence_url = site + review_page.PAGE_PATH + "#" + fragment
-            delivery = review_actions.prepare_submission_delivery(
-                created.saved, created.saved.words if created.saved.reused else request.words,
-                server.delivery_status, evidence_url=evidence_url)
+            with ExitStack() as captures:
+                screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
+                pending = False
+                if list_draft_id:
+                    def prepare_list_draft() -> review_submissions.ListDraftFiling:
+                        nonlocal request, screenshot
+                        item = read_submission()
+                        request = item
+                        if not key and item.page_state is not None and item.page_state.include_screenshot:
+                            raise new_item_dialog.SubmissionScreenshotExpired()
+                        capture = captures.enter_context(server.page_captures.for_filing(key))
+                        if isinstance(capture, (new_item_dialog.PageScreenshot, new_item_dialog.FiledPageScreenshot)):
+                            screenshot = capture
+                        return review_submissions.ListDraftFiling(item, screenshot, bool(key))
+
+                    created = server.review_cache.create_submission(
+                        review_submissions.ListDraftSend(list_draft_id, prepare_list_draft))
+                else:
+                    assert request is not None
+                    capture = captures.enter_context(server.page_captures.for_filing(
+                        key if valid_token else "", allow_pending=legacy_page_draft))
+                    pending = isinstance(capture, PageCapturePending)
+                    claimed = isinstance(capture, PageCaptureForSavedItem)
+                    if not isinstance(capture, (PageCapturePending, PageCaptureForSavedItem)):
+                        screenshot = capture
+                    capture_requested = bool(key) and (not legacy_page_draft or claimed)
+                    created = server.review_cache.create_submission(
+                        request, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal)
+                saved = created.saved
+                details = saved.details
+                edited = isinstance(saved, review_submissions.EditedSubmission)
+                response = {"id": saved.id, "key": created.key, "version": created.version}
+                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
+                if on_list:
+                    response["list_key"] = list_page.add_submission(created).key
+                if list_draft_id and edited:
+                    request = None
+                    screenshot = new_item_dialog.NO_PAGE_SCREENSHOT
+                if (key and not edited and isinstance(screenshot, new_item_dialog.PageScreenshot)
+                        and review_submissions.PAGE_SCREENSHOT in details.images):
+                    server.page_captures.mark_filed(key, screenshot)
+                main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
+                    request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
+                evidence_url = ""
+                if ((legacy_page_draft and key) or details.images or details.page_state is not None
+                        or (main_request is not None and main_request.page_state is not None)
+                        or isinstance(details.evidence, new_item_dialog.PageDataEvidence)):
+                    site = f"http://{server.bound_address}:{server.server_port}"
+                    evidence_url = site + review_page.PAGE_PATH + "#" + urlencode({"item": created.key})
+                status = server.delivery_status
+                # Concurrent Sends wait for the delivery of the same item.
+                with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
+                    delivery = review_actions.prepare_submission_delivery(
+                        saved, saved.words, status, evidence_url=evidence_url)
+                    if not on_list and main_request is None:
+                        self.deliver_review(server, delivery)
+                        path, row = saved.original_path, saved.request_id
+                        message = status.metadata_page(change_page.ReviewPage(path, path.parent, (row,), ""))
+                        if not isinstance(message, change_page.ReviewMessagePage) or not message.saved.get("submission_delivered"):
+                            self.json_response(503, {"error": "Could not deliver the item. Try Send again."})
+                            return
+                if pending or (main_request is not None and main_request.page == "list"
+                               and isinstance(screenshot, new_item_dialog.PageScreenshot)):
+                    if review_submissions.PAGE_SCREENSHOT not in details.images:
+                        screenshot = server.page_captures.file(key, saved, allow_pending=pending)
+                    elif pending:
+                        server.page_captures.discard(key)
+        except new_item_dialog.SubmissionScreenshotReload:
+            self.json_response(409, {"code": "reload_page", "error": SCREENSHOT_RELOAD})
+            return
+        except new_item_dialog.SubmissionScreenshotExpired as error:
+            self.json_response(409, {"code": "screenshot_expired", "error": str(error)})
+            return
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
@@ -1079,18 +1303,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links New item Send: {error}", file=sys.stderr)
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
+        if edited:
+            response.update(code="already_filed",
+                            error=f"This item was already filed as {saved.id}. Any change after that Send was not sent.")
+        respond_first = on_list or main_request is not None
         try:
-            self.json_response(200, response)
+            if respond_first:
+                self.json_response(409 if edited else 200, response)
         finally:
-            self.deliver_review(server, delivery)
-            if key:
-                if review_submissions.PAGE_SCREENSHOT in details.images:
-                    server.page_captures.discard(key)
-                elif (image := server.page_captures.file(key, created.saved)) is not None:
-                    server.attach_page_screenshot(created.saved, image)
-            if created.saved.kind == new_item_dialog.SubmissionKind.BUG and (
-                    request.page_state is not None or details.page_state is not None):
-                server.finish_bug_evidence(created, request, self.headers.get("Host", ""))
+            if respond_first:
+                self.deliver_review(server, delivery)
+                if ((pending or on_list) and isinstance(screenshot, new_item_dialog.PageScreenshot)
+                        and review_submissions.PAGE_SCREENSHOT not in details.images):
+                    server.attach_page_screenshot(saved, screenshot.png)
+            if saved.kind == new_item_dialog.SubmissionKind.BUG and (
+                    details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
+                server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
+        if not respond_first:
+            self.json_response(409 if edited else 200, response)
 
     def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest) -> None:
         """Start a screenshot only for a known page on this server."""
@@ -1146,6 +1376,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (KeyError, OSError, ValueError):
             self.send_error(404)
             return None
+        return self.attachment_response(content, media)
+
+    def attachment_response(self, content: bytes, media: str) -> BinaryIO:
         self.send_response(200)
         self.send_header("Content-Type", media)
         self.send_header("Content-Length", str(len(content)))
@@ -1636,24 +1869,34 @@ class ReviewLinksServer(ThreadingHTTPServer):
         return list_page.LinkedReviewRead.FROM_DISK
 
     def capture_page(self, key: str, firefox: str, url: str, capture: new_item_dialog.PageCaptureRequest) -> None:
-        image = None
+        image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
         try:
-            image = page_screenshot(firefox, url, capture)
+            png = page_screenshot(firefox, url, capture)
+            image = new_item_dialog.PageScreenshot(png, new_item_dialog.PageViewport(capture.width, capture.height, capture.dark))
         except (OSError, subprocess.SubprocessError):
             pass
         finally:
-            saved = self.page_captures.complete(key, image)
             self.capture_slot.release()
-        if saved is not None and image is not None:
-            self.attach_page_screenshot(saved, image)
+            saved = self.page_captures.complete(key, image)
+        if saved is not None and isinstance(image, new_item_dialog.PageScreenshot):
+            self.attach_page_screenshot(saved, image.png)
 
-    def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest,
-                            host: str) -> None:
+    def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
+                            host: str, screenshot: new_item_dialog.SubmissionScreenshot) -> None:
         """Save the evidence after the response and delivery."""
         saved = created.saved
+        if (request is not None and request.page_state is not None
+                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
+            request = replace(request, page_state=replace(
+                request.page_state, viewport=screenshot.viewport, include_screenshot=True))
+
+        def capture(page: str, state: new_item_dialog.BugPageState) -> bool:
+            if isinstance(screenshot, new_item_dialog.PageScreenshot):
+                return self.review_cache.attach_page_screenshot(saved, screenshot.png)
+            return request is not None and self.capture_bug_screenshot(saved, page, state, host)
+
         try:
-            if review_submissions.save_bug_page_state(
-                    saved, created.key, request, lambda page, state: self.capture_bug_screenshot(saved, page, state, host)):
+            if review_submissions.save_bug_page_state(saved, created.key, request, capture):
                 self.review_cache.publish_submission_evidence(saved.request_id)
         except Exception as error:
             self.review_cache.invalidate()
@@ -1662,6 +1905,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def capture_bug_screenshot(self, saved: review_submissions.SavedSubmission, page: str,
                                state: new_item_dialog.BugPageState, host: str) -> bool:
         """Capture the reported viewport before the case record becomes visible."""
+        if state.viewport is None:
+            return False
         try:
             address = urlsplit(state.url)
             if (address.scheme not in ("http", "https") or not address.hostname or address.username is not None
