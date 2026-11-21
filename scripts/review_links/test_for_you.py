@@ -14,7 +14,7 @@ from unittest.mock import patch
 from scripts.for_you.action import ActionStore
 from scripts.production import staff
 from scripts.rebuild import need
-from scripts.review_links import for_you
+from scripts.review_links import change_browser, for_you
 from scripts.statusline import rebuild_row
 
 
@@ -203,7 +203,14 @@ class ForYouTests(unittest.TestCase):
         row, = self.read().rows
         self.assertEqual(row.reason, "The running system has local changes on 03c7c81. "
                          + "It differs from the configured revision 87bbeb2.")
-        self.assertEqual(rebuild_row.read_changes(self.config)["natedev"], ())
+
+    def test_rebuilds_lists_changes_after_a_dirty_switch(self) -> None:
+        self.refresh_with_revision_history(
+            f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f", dirty=True)
+        body = change_browser.rebuild_list(rebuild_row.read(self.config), rebuild_row.read_changes(self.config),
+                                           staff.snapshot())
+        self.assertIn('<article data-machine="natedev"><h2>Rebuild natedev</h2>', body)
+        self.assertIn("<dd>Update the editor</dd>", body)
 
     def test_old_change_cache_cannot_prove_the_running_revision_is_clean(self) -> None:
         self.refresh_with_revision_history("")

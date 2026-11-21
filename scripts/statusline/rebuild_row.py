@@ -335,10 +335,6 @@ def machine_changes(settings: RebuildSettings, command: list[str], known: dict[s
     commit = revision.removesuffix("-dirty")
     if not REVISION.fullmatch(commit):
         return None
-    if configured and revision != commit:
-        if matching and system_path(running):
-            return ComparedChanges(running, revision, configured, ())
-        return ()
     listing = run(["git", "-C", str(settings.repo), "log",
                    "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
                    f"{commit}..{configured or settings.ref}"])
