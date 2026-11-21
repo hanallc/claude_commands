@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 
@@ -13,10 +14,12 @@ import unittest
 from unittest.mock import patch
 
 from scripts.agents import remote
-from scripts.production import log_backup, staff
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.production import log_backup, staff, tidy_wrapped
 from scripts.production.production_doc import production_backup_checkout, production_backup_root
 from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY, LEGACY_COPIES
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.update_registration import QuestionStaff
 
 
 class LogBackupTests(unittest.TestCase):
@@ -38,9 +41,10 @@ class LogBackupTests(unittest.TestCase):
                         self.assertFalse(production_backup_root().exists())
 
     def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
-        with (TemporaryDirectory() as folder,
-              patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})):
+        with TemporaryDirectory() as folder:
             root = Path(folder)
+            _ = self.enterContext(patch.dict(os.environ, {**fixture_git_environment(root),
+                "GIT_CONFIG_SYSTEM": os.devnull}, clear=True))
             state = root / "staff-state"
             checkout = root / "worktree"
             checkout.mkdir()
@@ -78,6 +82,16 @@ class LogBackupTests(unittest.TestCase):
                 backup_root = production_backup_root()
                 repository = production_backup_checkout(owner.id)
                 with patch.object(log_backup, "staged_notes_directory", return_value=notes):
+                    protected = checkout / "document" / "live.md"
+                    protected.parent.mkdir()
+                    _ = protected.write_bytes(b"Live document\n")
+                    _ = log_backup.git(checkout, "init", "--initial-branch=main")
+                    repository.parent.mkdir(parents=True)
+                    with self.subTest(destination="link to production checkout"):
+                        repository.symlink_to(checkout, target_is_directory=True)
+                        self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 1)
+                        self.assertEqual(protected.read_bytes(), b"Live document\n")
+                        repository.unlink()
                     displaced = mirror.with_name("unavailable.git")
                     _ = mirror.rename(displaced)
                     self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 1)
@@ -85,6 +99,18 @@ class LogBackupTests(unittest.TestCase):
                     mirror = displaced.rename(mirror)
                     for item in (document, log):
                         item.unlink()
+                    with self.subTest(wrap="new legacy copy before the next backup"):
+                        late = legacy / "log-before-wrap.md"
+                        _ = late.write_bytes(b"Late LOG copy\r\n")
+                        wrapped_owner = replace(owner, doc=staff.WrappedDoc(remote.local_machine(), document))
+                        identities = QuestionStaff.for_record(staff.StaffSnapshot((wrapped_owner,)))
+                        with (patch.object(tidy_wrapped, "STATE_DIR", state),
+                              patch.object(tidy_wrapped.copies, "remove_trees"),
+                              patch.object(tidy_wrapped.record_store, "staff_store_folders", return_value=())):
+                            _ = tidy_wrapped.tidy(owner.name, identities=identities)
+                        self.assertFalse(legacy.exists())
+                        self.assertEqual((backup_root / owner.id / LEGACY_COPIES / late.name).read_bytes(),
+                                         b"Late LOG copy\r\n")
                     wrapped = staff.StaffSnapshot(())
                     self.assertEqual(log_backup.backup_all(backup_root, state, wrapped, destination, 1), 0)
                     self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), first)
