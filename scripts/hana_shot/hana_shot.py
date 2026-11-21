@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import secrets
 import shutil
 import signal
 import socket
@@ -403,6 +404,11 @@ class AbsentLaunchRecord:
 
 
 @dataclass(frozen=True)
+class IncompleteLaunchRecord:
+    reason: str
+
+
+@dataclass(frozen=True)
 class UnreadableLaunchRecord:
     reason: str
 
@@ -412,7 +418,7 @@ class WholeLaunchRecord:
     state: LaunchState
 
 
-LaunchRecord = AbsentLaunchRecord | UnreadableLaunchRecord | WholeLaunchRecord
+LaunchRecord = AbsentLaunchRecord | IncompleteLaunchRecord | UnreadableLaunchRecord | WholeLaunchRecord
 
 
 Vec3 = tuple[float, float, float]
@@ -2226,27 +2232,27 @@ def _write_launch_state(state_path: Path, state: LaunchState) -> None:
 
 
 def _read_launch_state(state_path: Path) -> LaunchRecord:
-    """Distinguish absent, unreadable and whole shutdown metadata."""
+    """Read the launch record for shutdown."""
     try:
         value = cast(object, json.loads(state_path.read_text()))
     except FileNotFoundError:
         return AbsentLaunchRecord()
-    except json.JSONDecodeError as error:
-        return UnreadableLaunchRecord(f"invalid JSON: {error}")
-    except (OSError, ValueError) as error:
+    except ValueError as error:
+        return IncompleteLaunchRecord(f"invalid JSON: {error}")
+    except OSError as error:
         return UnreadableLaunchRecord(str(error))
     if not isinstance(value, dict):
-        return UnreadableLaunchRecord("expected a JSON object")
+        return IncompleteLaunchRecord("expected a JSON object")
     fields = cast(dict[str, object], value)
     missing = [key for key in ("pid", "binary", "log", "scratch") if key not in fields]
     if missing:
-        return UnreadableLaunchRecord(f"missing {', '.join(missing)}")
+        return IncompleteLaunchRecord(f"missing {', '.join(missing)}")
     pid = fields["pid"]
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return UnreadableLaunchRecord("pid must be a positive integer")
+        return IncompleteLaunchRecord("pid must be a positive integer")
     for key in ("binary", "log", "scratch"):
         if not isinstance(fields[key], str) or not fields[key]:
-            return UnreadableLaunchRecord(f"{key} must be a nonempty string")
+            return IncompleteLaunchRecord(f"{key} must be a nonempty string")
     return WholeLaunchRecord(cast(LaunchState, cast(object, fields)))
 
 
@@ -2374,8 +2380,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
         except staff.StaffUnreadable:
             pass
     with ExitStack() as cleanup:
-        # The app reads this folder after launch returns, so it must outlive this process.
-        # shutdown removes it; the deadline bounds a forgotten app.
+        # Keep the folder after a successful launch. Hana still reads it.
         launch_folder = scratch.new(word=f"hana-shot-{port}")
         _ = cleanup.callback(shutil.rmtree, launch_folder, ignore_errors=True)
         config = launch_folder / "config"
@@ -2420,7 +2425,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             return state, process
         except BaseException:
             if process is not None:
-                shutdown(port, process, hana_shot_settings=hana_shot_settings)
+                shutdown(port, process, owned_folder=launch_folder, hana_shot_settings=hana_shot_settings)
             raise
 
 
@@ -2477,10 +2482,46 @@ def same_binary(pid: int, binary: str) -> bool:
         return False
 
 
+def report_retained_launch_folder(path: Path, reason: str) -> None:
+    print(f"kept for a manual removal list: {path} (hana_shot, {reason})", file=sys.stderr)
+
+
+def retained_launch_path(state_path: Path) -> Path:
+    """Choose a record path outside the active launch lookup."""
+    retained = state_path.parent / "retained"
+    retained.mkdir(mode=0o700, exist_ok=True)
+    return retained / f"{state_path.stem}-{secrets.token_hex(8)}.json"
+
+
+def clean_temporary_launch_records(state_path: Path, launch_record: LaunchRecord) -> None:
+    """Retire temporary records after shutdown."""
+    reported: set[Path] = set()
+    expired: list[Path] = []
+    for path in sorted(state_path.parent.glob(f".{state_path.name}.*.tmp")):
+        candidate = _read_launch_state(path)
+        if isinstance(candidate, IncompleteLaunchRecord):
+            expired.append(path)
+        elif isinstance(candidate, WholeLaunchRecord):
+            folder = Path(candidate.state["scratch"])
+            if isinstance(launch_record, WholeLaunchRecord) and folder == Path(launch_record.state["scratch"]):
+                expired.append(path)
+            else:
+                _ = path.rename(retained_launch_path(state_path))
+                if folder not in reported:
+                    report_retained_launch_folder(folder, "temporary launch record kept")
+                    reported.add(folder)
+        elif isinstance(candidate, UnreadableLaunchRecord):
+            print(f"hana_shot: kept unreadable temporary launch record {path}: {candidate.reason}", file=sys.stderr)
+    # Keep the active fallback until every other complete record is archived.
+    for path in expired:
+        path.unlink(missing_ok=True)
+
+
 def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
+    owned_folder: Path | Literal["saved_launch"] = "saved_launch",
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
-    """Stop a launched Hana, show any panic lines from its log, and remove its scratch."""
+    """Stop Hana and show any panic lines. Keep folders from saved launch records."""
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
@@ -2547,7 +2588,10 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
             print(f"hana_shot: Hana on port {port} logged a panic:", file=sys.stderr)
             for line in lines:
                 print(f"  {line}", file=sys.stderr)
-        shutil.rmtree(state["scratch"], ignore_errors=True)
+        folder = Path(state["scratch"])
+        if folder != owned_folder:
+            _write_launch_state(retained_launch_path(state_path), state)
+            report_retained_launch_folder(folder, "Hana shut down")
     else:
         deadline = time.monotonic() + shutdown_seconds
         while port_answers(port, hana_shot_settings=hana_shot_settings):
@@ -2557,10 +2601,9 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
                     + next_step(f"run shutdown again on port {port} after the launch finishes starting"),
                 )
             time.sleep(poll_seconds)
+    clean_temporary_launch_records(state_path, launch_record)
     state_path.unlink(missing_ok=True)
-    for temporary_path in state_path.parent.glob(f".{state_path.name}.*.tmp"):
-        temporary_path.unlink(missing_ok=True)
-    if isinstance(record, UnreadableLaunchRecord):
+    if isinstance(record, (IncompleteLaunchRecord, UnreadableLaunchRecord)):
         print(
             f"hana_shot: launch record {state_path} is unreadable ({record.reason}); "
             + f"asked Hana on port {port} to stop and removed the record; "
@@ -2584,14 +2627,19 @@ def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str 
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
-    process: subprocess.Popen[bytes] | None = None
-    if launch_first:
-        _, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
-    try:
-        yield Brp(port, settings=hana_shot_settings)
-    finally:
-        if shutdown_after:
-            shutdown(port, process, hana_shot_settings=hana_shot_settings)
+    with ExitStack() as cleanup:
+        process: subprocess.Popen[bytes] | None = None
+        owned_folder: Path | Literal["saved_launch"] = "saved_launch"
+        if launch_first:
+            state, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
+            if shutdown_after:
+                owned_folder = Path(state["scratch"])
+                _ = cleanup.callback(shutil.rmtree, owned_folder, ignore_errors=True)
+        try:
+            yield Brp(port, settings=hana_shot_settings)
+        finally:
+            if shutdown_after:
+                shutdown(port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
 
 
 # ---------------------------------------------------------------------------
