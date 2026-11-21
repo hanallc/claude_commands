@@ -33,7 +33,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast, override
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
@@ -43,7 +43,7 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
-from scripts.production import change_routing, change_review, staff
+from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
@@ -1627,6 +1627,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             preview_key = key if valid_token and not has_deferred else ""
             capture_target = (server.page_captures.target(key) if valid_token and len(key) > 32
                               else new_item_dialog.NoBoundCaptureTarget.UNBOUND)
+            site = f"http://{server.bound_address}:{server.server_port}"
+            evidence = fields.get("evidence")
+            has_evidence = (key or fields.get("images") or fields.get("page_state")
+                            or isinstance(evidence, dict) and cast(dict[str, object], evidence).get("kind") == "page-data")
+            initial_delivery = review_submissions.InitialDelivery(site if has_evidence else "")
             with ExitStack() as captures:
                 screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
                 pending = False
@@ -1644,7 +1649,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
                     submission = review_submissions.ListDraftSend(list_draft_id, prepare_list_draft)
                     created = server.review_cache.create_submission(
-                        submission, capture_intent=deferred, capture_target=capture_target)
+                        submission, capture_intent=deferred, capture_target=capture_target,
+                        initial_delivery=initial_delivery)
                 else:
                     assert request is not None
                     capture = captures.enter_context(
@@ -1658,7 +1664,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                           if authorization is not None else nullcontext()):
                         created = server.review_cache.create_submission(
                             request, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal,
-                            capture_intent=deferred, capture_target=capture_target)
+                            capture_intent=deferred, capture_target=capture_target, initial_delivery=initial_delivery)
                 saved = created.saved
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
@@ -1674,21 +1680,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     server.page_captures.mark_filed(key, screenshot)
                 main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
                     request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
-                evidence_url = ""
-                if ((legacy_page_draft and key) or details.images or details.page_state is not None
-                        or (main_request is not None and main_request.page_state is not None)
-                        or isinstance(details.evidence, new_item_dialog.PageDataEvidence)):
-                    site = f"http://{server.bound_address}:{server.server_port}"
-                    evidence_url = site + review_page.PAGE_PATH + "#" + urlencode({"item": created.key})
+                has_saved_evidence = ((legacy_page_draft and key) or details.images or details.page_state is not None
+                                      or (main_request is not None and main_request.page_state is not None)
+                                      or isinstance(details.evidence, new_item_dialog.PageDataEvidence)
+                                      or isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent))
+                evidence_page = site + review_page.PAGE_PATH if has_saved_evidence else ""
                 status = server.delivery_status
                 # Concurrent Sends wait for the delivery of the same item.
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
                     delivery = review_actions.prepare_submission_delivery(
-                        saved, saved.words, status, evidence_url=evidence_url)
+                        saved, saved.words, status, evidence_page=evidence_page)
                     if not on_list and main_request is None:
                         self.deliver_review(server, delivery)
-                        path, row = saved.original_path, saved.request_id
-                        message = status.metadata_page(change_page.ReviewPage(path, path.parent, (row,), ""))
+                        if isinstance(delivery, change_page.MessageDelivery):
+                            page = delivery.page
+                        else:
+                            path, row = saved.original_path, saved.request_id
+                            if path == saved.path and saved.owner != saved.recipient_id:
+                                path = status.previous_submission_source(row, path)
+                            page = change_page.ReviewPage(path, path.parent, (row,), "")
+                        message = status.metadata_page(page)
                         if not isinstance(message, change_page.ReviewMessagePage) or not message.saved.get("submission_delivered"):
                             self.json_response(503, {"error": "Could not deliver the item. Try Send again."})
                             return
@@ -2221,6 +2232,11 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self._staff_snapshot_lock: threading.Lock = threading.Lock()
         self._staff_snapshot: StaffSnapshotAttempt | StaffSnapshotUnloaded = StaffSnapshotUnloaded()
+        if mode is ServerMode.LIVE:
+            try:
+                tidy_wrapped.recover_review_moves(self.root)
+            except (OSError, ValueError) as error:
+                print(f"review-links move recovery: {error}", file=sys.stderr)
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.review_cache: review_page.ReviewSnapshotCache = ConsoleReviewSnapshotCache(
             self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
@@ -2247,6 +2263,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
         def recover_pending() -> None:
             try:
                 recover_changes(self.delivery_status)
+                review_actions.recover_submission_deliveries(self.delivery_status, review_page.PAGE_PATH)
+            except (OSError, ValueError) as error:
+                print(f"review-links delivery recovery: {error}", file=sys.stderr)
             finally:
                 self.delivery_status.startup_recovery_pending.clear()
             recover_list()

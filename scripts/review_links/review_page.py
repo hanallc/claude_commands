@@ -645,6 +645,8 @@ class ReviewSnapshotCache:
         capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
         capture_target: new_item_dialog.ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
         = new_item_dialog.NoBoundCaptureTarget.UNBOUND,
+        initial_delivery: review_submissions.InitialDelivery | review_submissions.NoInitialDelivery
+        = review_submissions.NO_INITIAL_DELIVERY,
     ) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
         _ = self.get()
@@ -655,7 +657,8 @@ class ReviewSnapshotCache:
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
                 saved = review_submissions.submit(request, members=members, screenshot=screenshot,
                                                   capture_requested=capture_requested, refusal=refusal,
-                                                  capture_intent=capture_intent, capture_target=capture_target)
+                                                  capture_intent=capture_intent, capture_target=capture_target,
+                                                  initial_delivery=initial_delivery)
             if not remote_staff:
                 members = staff.snapshot()
             path = saved.path

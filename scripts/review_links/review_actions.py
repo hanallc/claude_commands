@@ -4,11 +4,13 @@ from __future__ import annotations
 import re
 import secrets
 import shlex
+import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
 
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
@@ -251,37 +253,69 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
 
 
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
-                                status: change_page.DeliveryStatus, *, evidence_url: str = ""
+                                status: change_page.DeliveryStatus, *, evidence_page: str = ""
                                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Claim the first message for a published native request."""
-    row = saved.request_id
-    path = saved.original_path
-    evidence = f"\n\nEvidence in Review\n{evidence_url}" if evidence_url else ""
-    message = (f'New {saved.kind} {saved.id} from Review.\n\n{words}{evidence}\n\n'
-               + change_page.reply_command(saved.key, saved.reply_token))
-    record: change_page.StoredReviewMessage = {
-        'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
-        'message': message, 'submission_request': row,
-    }
-    page = change_page.ReviewMessagePage(path, path.parent, (row,), '', record)
-    with status.locked():
+    return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+
+
+def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,
+                               words: str = "", evidence_page: str = ""
+                               ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    with status.locked(), review_submissions.submission_for_delivery(address) as located:
+        if isinstance(located, review_submissions.NoNativeSubmission):
+            return change_page.NoMessageDelivery()
+        saved = located.saved()
+        row, path = saved.request_id, saved.original_path
+        if path == saved.path and saved.owner != saved.recipient_id:
+            path = status.previous_submission_source(row, path)
+        evidence = ""
+        if evidence_page:
+            key = review_items.submission_item(saved, staff.snapshot()).key
+            evidence = "\n\nEvidence in Review\n" + evidence_page + '#' + urlencode({'item': key})
+        message = (f'New {saved.kind} {saved.id} from Review.\n\n{words or saved.words}{evidence}\n\n'
+                   + change_page.reply_command(saved.key, saved.reply_token))
+        record: change_page.StoredReviewMessage = {
+            'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
+            'message': message, 'submission_request': row,
+        }
+        page = change_page.ReviewMessagePage(path, path.parent, (row,), '', record)
         stored = status.metadata_page(page)
         slots = status.slots(page, row)
         if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
-            page = stored
-            if page.saved.get('submission_delivered'):
+            if stored.saved.get('submission_delivered'):
+                review_submissions.clear_initial_delivery(address)
                 return change_page.NoMessageDelivery()
         intent = slots.verdict
         if isinstance(intent, change_page.DeliveryIntent):
+            if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
+                page = stored
             if status.owns_live_claim(page, row, intent.attempt):
+                review_submissions.clear_initial_delivery(address)
                 return change_page.NoMessageDelivery()
         else:
-            recipient = staff.StaffId(page.saved['owner'])
-            intent = change_page.DeliveryIntent(secrets.token_hex(), 'verdict', recipients=(recipient,))
+            atomic_file.sync_folder(saved.path.parent)
+            intent = change_page.DeliveryIntent(secrets.token_hex(), 'verdict', recipients=(saved.owner,))
             status.write_slots(page, row, slots.updated('verdict', intent))
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
+        review_submissions.clear_initial_delivery(address)
     return change_page.MessageDelivery(page, row, intent.recipients, page.saved['message'], intent.attempt,
                                        (staff.StaffId(page.saved['owner']),))
+
+
+def recover_submission_deliveries(status: change_page.DeliveryStatus, review_path: str) -> None:
+    """Claim the first messages that were interrupted before the claim saved."""
+    for pending in review_submissions.pending_initial_deliveries(status.root):
+        try:
+            page = pending.evidence_origin + review_path if pending.evidence_origin else ""
+            delivery = _claim_submission_delivery(pending.address, status, evidence_page=page)
+            try:
+                change_page.deliver(delivery, status)
+            finally:
+                if isinstance(delivery, change_page.MessageDelivery):
+                    status.release_recovery_claims((delivery.attempt,))
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"Review first message {pending.address.request_id}: {error}", file=sys.stderr)
 
 
 def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestionPage, owner: staff.StaffId,

@@ -3063,6 +3063,29 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(send.call_count, 4)
         address.assert_called_once_with()
 
+    def test_restart_recovers_a_new_item_when_the_first_claim_write_fails(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "send_to_staff") as send):
+            with patch.object(case.status, "write_slots", side_effect=OSError("The claim write failed.")):
+                reply = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(reply.status, 503, reply.body)
+            self.assertEqual(len(cache.get().records), 1)
+            send.assert_not_called()
+            for _ in range(2):
+                restarted = change_page.DeliveryStatus(case.root)
+                change_page.recover_pending(restarted)
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[0], owner.id)
+            self.assertIn(request.words, cast(str, send.call_args.args[2]))
+            self.assertEqual(len(investigation.records(owner.id, include_read=True)), 1)
+
     def test_sent_proposal_key_survives_a_rebuild_with_a_symlinked_folder(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
