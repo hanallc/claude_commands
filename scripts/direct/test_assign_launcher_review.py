@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import cast, final, override
 from unittest.mock import patch
 from scripts.agents import codex_test_support as codex_fixture
+from scripts.agents import remote
 from scripts.astra import astra_roles
 from scripts.astra.design_role_test_support import HeldRolePaneCase
 from scripts.direct import assign, progress_history, recorder_state
@@ -144,8 +145,9 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     integration.mkdir()
                     enrolled_paths = EnrolledPaths(project, project / "production.md", project / "LOG.md",
                                                   project / "notes", integration)
+                    write_text_atomic(enrolled_paths.live_doc, f"# Production\n- **Merge checkout:** `{project}`\n")
                     owner = fixture_member("showrunner", name="style-showrunner",
-                                           doc=staff.LiveDoc("natedev", enrolled_paths.live_doc))
+                                           doc=staff.LiveDoc(remote.local_machine(), enrolled_paths.live_doc))
                     owner = staff.set_run(owner.id, staff.OpenRun(case.run_dir))
                     case.fixture.parent_id = owner.id
                     self.panes.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
@@ -155,6 +157,13 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     write_text_atomic(state_path, json.dumps(state))
                     _ = self.enterContext(patch.object(worker_panes, "resolve_production_paths", return_value=enrolled_paths))
                     environment["CODEX_THREAD_ID"] = owner.current_session
+                    artifacts = set(case.run_dir.rglob("*"))
+                    refused = subprocess.run(["bash", str(ROOT / "scripts/direct/review.sh"), "--phase", "F018",
+                                              "--style-since", baseline, str(case.run_dir), str(project), str(case.prompt)],
+                                             capture_output=True, text=True, env=environment, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("assign.sh --role review --style-since", refused.stderr)
+                    self.assertEqual(set(case.run_dir.rglob("*")), artifacts)
                 case.agent.final = ("<!-- phase-style-review:start -->\nStyle review: Pass\n"
                                     "<!-- phase-style-review:end -->\nAPPROVE")
                 arguments = ["--role", "review", "--to", name, "--lens", lens, "--pass", "1",
