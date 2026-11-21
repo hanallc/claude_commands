@@ -63,6 +63,8 @@ Use a detached run for this wait.
 Release removes the caller's holder file before recording delivery state.
 Another holder keeps the target held.
 The enforcer exits after the last holder file disappears.
+Release skips a recipient when it confirms that both the staff row and the session are absent.
+Release lists a missing session with a staff row under `Not reached`.
 The sender skips closed Codex workers with no route. Their next assignment resumes them.
 On `No hold cycle: broadcast this release to every session.`, use `/notify_top_level --here`.
 On `Not reached, tell them yourself: ...`, tell each named session.

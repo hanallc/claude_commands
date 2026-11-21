@@ -126,6 +126,9 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
 - After the last holder file is gone, release sends each live recipient one notice.
+  It records a confirmed missing session as `RecipientGone`.
+  If the staff row is also absent, it removes the recipient from the cycle's recipient list.
+  Release omits that recipient from `Not reached` and skips it on retry.
   It records `WorkerClosed` when the sender finds a closed Codex worker with no route.
   The next assignment resumes a closed worker.
   The notice names each hold, its purpose, and its start time in the user zone.
