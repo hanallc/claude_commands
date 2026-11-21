@@ -16,7 +16,7 @@ class GateRunPricingTests(ledger_test_support.CostFixture):
             + 'gate_wait_usd_per_minute=0.06\n'
             + 'region_extra_gate_seconds={"us-west-2":60}\n'
             + 'unmeasured_region_extra_seconds={"us-east-2":120}\n')
-        size, home, west, mode = 'c7a.4xlarge', 'us-east-2', 'us-west-2', 'merge-gate'
+        size, home, west, mode = 'c7a.4xlarge', 'us-east-2', 'us-west-2', 'gate'
         seconds = [Decimal(600)]
         evidence = run_cost.RunEvidence({(size, west, mode): seconds}, {(size, mode): seconds}, {mode: seconds},
                                         {(size, west, mode): 2}, {(size, west, mode): 1}, Decimal(30))
