@@ -1157,7 +1157,13 @@ def _acquire(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
     return refuse(str(cause) or "checker returned an error", checker=True)
 
 
-def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: AdmissionRequest,
+@dataclass(frozen=True)
+class RefreshedWrite:
+    peer: socket.socket
+    request: AdmissionRequest
+
+
+def _wait_for_admission_reply(sockets: AcquisitionSockets, request: AdmissionRequest,
                               on_wait: Callable[[wire.Wait], None],
                               refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
                               attempt: Callable[[], None], retry: AcquisitionRetry, checker: CheckerRetry,
@@ -1165,7 +1171,6 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                               ) -> tuple[AdmissionRequest, AdmissionCompletion]:
     from scripts.build_queue import admission_records as records
 
-    request: AdmissionRequest = initial_request
     interval = configuration.reconnect_seconds
     silence = configuration.silence_seconds
     retry.start_leave_schedule(configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig) else interval)
@@ -1176,7 +1181,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
     had_wait = restarted = estimate_pending = False
     waiting_callback: tuple[socket.socket, wire.Wait] | None = None
     refreshing: EstimateRefresh | None = None
-    refreshed_write: tuple[socket.socket, AdmissionRequest] | None = None
+    refreshed_write: RefreshedWrite | None = None
     answered_expiry = -math.inf
     lookup_id = 0
     history_request = wire.BuildHistoryRequest(code_version=LOADED_ADMISSION_CODE_VERSION)
@@ -1221,13 +1226,12 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         checker_due = False
         if sockets.terminal() is None:
             sockets.drain(request)
-        if refreshed_write is not None:
-            written_peer, written_request = cast(tuple[socket.socket, AdmissionRequest], refreshed_write)
-            stream = sockets.streams[written_peer]
+        if isinstance(refreshed_write, RefreshedWrite):
+            stream = sockets.streams[refreshed_write.peer]
             if not stream.outgoing:
                 assert refreshing is not None
                 answered_expiry = refreshing.estimated_at
-                request = written_request
+                request = refreshed_write.request
                 refreshing = None
                 refreshed_write = None
                 checker.clear()
@@ -1431,7 +1435,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                 if sockets.terminal() is None and stream.error is None:
                     if (expired := sockets.send(peer, updated, deadline_limit)) is not None:
                         return request, expired
-                    refreshed_write = (peer, updated)
+                    refreshed_write = RefreshedWrite(peer, updated)
                     sockets.poll(request, 0, deadline_limit)
             continue
 
