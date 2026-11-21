@@ -826,7 +826,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                         self.assertEqual(state.get("no_worker_mode", False), setting == "off")
         self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]] * 2)
         self.assertEqual(self.broadcasts.fyi, [(producer, f"FYI, no action: {text}")
-                                               for text in expected for producer in ("morty", "dwight")])
+                                               for text in expected for producer in support.FYI_ROUTES])
         self.swap.assert_not_called()
 
     def test_credits_off_with_room_on_another_account_moves_the_workers_and_stops_none(self) -> None:

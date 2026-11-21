@@ -36,7 +36,7 @@ class ReportProcessIdentity:
     """A process identity recovered only for the units report."""
 
     native_id: str
-    is_morty: bool
+    is_list_producer: bool
 
 
 @dataclass
@@ -62,7 +62,7 @@ class AnomalyReport:
             if entry not in self.entries:
                 self.entries.append(entry)
             return
-        if check_identity and self.process(pid, "").is_morty:
+        if check_identity and self.process(pid, "").is_list_producer:
             return
         if pid in self.reported:
             return
@@ -1024,7 +1024,7 @@ def _group_labeled_sessions(marked: SessionLabelObservations | Iterable[LabeledS
     for unit in labels:
         if not isinstance(unit.identity, UnprovedPaneIdentity):
             identity = report_process(process_pid(unit), unit.identity.id if isinstance(unit.identity, LiveSession) else "")
-            if identity.is_morty:
+            if identity.is_list_producer:
                 continue
             if identity.native_id and isinstance(unit.identity, NoSession) and not isinstance(unit.claude, ClaudeUnknown):
                 unit = replace(unit, identity=LiveSession(identity.native_id))

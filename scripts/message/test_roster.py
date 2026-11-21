@@ -1898,7 +1898,7 @@ class RosterTests(unittest.TestCase):
         for owned in (False, True):
             with self.subTest(native_reviewer_owned=owned):
                 if owned:
-                    _ = fixture_member("producer", name="Staff reviewer", runtime_id=identity)
+                    _ = fixture_member("producer", name="staff-reviewer", runtime_id=identity)
                 with mock.patch.object(session_records, "running_session", side_effect=fixture_running):
                     found = roster.roster(os.environ, roster.ThisMachine())
                 reviewers = [entry for entry in found.entries
@@ -1906,7 +1906,7 @@ class RosterTests(unittest.TestCase):
                              and entry.assignment.slot in ("adversary", "review")]
                 self.assertEqual(len(reviewers), 2)
                 self.assertEqual([entry.name for entry in reviewers],
-                                 ["Staff reviewer", "Staff reviewer"] if owned else ["", ""])
+                                 ["staff-reviewer", "staff-reviewer"] if owned else ["", ""])
 
     def test_the_roster_recognizes_the_simplify_status_writer(self) -> None:
         from scripts.lib.atomic_file import write_text_atomic

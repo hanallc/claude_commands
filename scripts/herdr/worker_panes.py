@@ -1317,6 +1317,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             return checked
         policy = checked.launch
     try:
+        if existing is None:
+            staff.require_no_producer_rename(name.value)
         with ExitStack() as operations:
             held = operations.enter_context(worker_lock(parent, name, blocking=existing is None)) if isinstance(lock, WorkerLockAtUse) else lock
             if isinstance(held, Kept):

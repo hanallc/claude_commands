@@ -21,14 +21,15 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 OLD_PANE = "w1:p7"
-OLD_SESSION = staff.native_id(fixture_runtime_id("previous-dwight"))
+OLD_SESSION = staff.native_id(fixture_runtime_id("previous-cedar"))
 
 
 class TransferFixture:
     """One live caller in its pane, and the calls that reach outside the transfer."""
 
-    def __init__(self, world: ProducerAdmissionWorld) -> None:
+    def __init__(self, world: ProducerAdmissionWorld, profile: str) -> None:
         self.world: ProducerAdmissionWorld = world
+        self.profile: str = profile
         self.steps: list[str] = []
         self.old_panes: list[str] = [OLD_PANE]
         self.stops: bool = True
@@ -47,8 +48,8 @@ class TransferFixture:
         """The staff record and the registry: a refused or repeated transfer leaves both unchanged."""
         return (self.staff_file.read_bytes() if self.staff_file.exists() else b"", self.registry.read_bytes())
 
-    def settings(self) -> str:
-        return models_registry.parse_registry(self.registry.read_text())["producers"]["dwight"]
+    def settings(self, member_id: staff.StaffId) -> str:
+        return models_registry.parse_registry(self.registry.read_text())["producers"][member_id]
 
     def row_panes(self, rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
         del client
@@ -75,19 +76,21 @@ class TransferFixture:
 
     def restart(self, *, stop_all: bool, only: tuple[str, ...], why: str) -> int:
         row = staff.initial_snapshot().by_id(staff.StaffId(only[0]))
-        assert stop_all and row is not None and "transfer dwight" in why
+        assert stop_all and row is not None and "transfer cedar" in why
         self.locked_at_restart = "STAFF_ROW_FD_" + row.id in os.environ
         self.steps.append(f"restart {row.current_session}")
         return 0
 
     def producer(self, session: str = OLD_SESSION) -> staff.StaffRow:
-        return fixture_member("producer", name="dwight", runtime_id=session,
-                              doc=staff.LiveDoc(remote.local_machine(), self.world.folder / "current.md"))
+        row = fixture_member("producer", name="cedar", runtime_id=session,
+                             doc=staff.LiveDoc(remote.local_machine(), self.world.folder / "current.md"))
+        _ = write_registry(self.registry, {"producers": {row.id: self.profile}}, update=True)
+        return row
 
     def transfer(self, model: str = "", effort: str = "") -> str:
         output = io.StringIO()
         with redirect_stdout(output):
-            code = producer_transfer.transfer("dwight", model=model, effort=effort)
+            code = producer_transfer.transfer("cedar", model=model, effort=effort)
         assert code == 0
         return output.getvalue()
 
@@ -96,8 +99,7 @@ class TransferFixture:
 def transfer_fixture(kind: Literal["claude", "codex"], settings: str) -> Generator[TransferFixture]:
     with producer_first_fixture(kind) as world, ExitStack() as scope:
         case = world.case
-        fixture = TransferFixture(world)
-        _ = write_registry(fixture.registry, {"producers": {"dwight": settings}}, update=True)
+        fixture = TransferFixture(world, settings)
         world.active = True
         world.environment = {"HERDR_SESSION": "agents", "HERDR_PANE_ID": world.pane,
                              "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME": str(world.home)}
@@ -136,26 +138,26 @@ class ProducerTransferTests(unittest.TestCase):
                 moved = replace(row, current_session=staff.native_id(world.identity), home=staff.SessionHome(world.home),
                                 worktree=staff.PresentWorktree(remote.local_machine(), world.folder))
                 self.assertEqual(staff.initial_snapshot().by_id(row.id), moved)
-                self.assertEqual(fixture.steps, ["panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}", "title dwight",
+                self.assertEqual(fixture.steps, ["panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}", "title cedar",
                                                  f"restart {world.identity}"])
                 self.assertFalse(fixture.locked_at_restart)
-                self.assertEqual(fixture.settings(), f"{kind}:{model}:{effort}")
+                self.assertEqual(fixture.settings(row.id), f"{kind}:{model}:{effort}")
                 binding = pane_record.read("agents")[world.pane]
                 self.assertEqual((binding.get("staff_id"), binding.get("producer_binding", False)), (row.id, True))
                 resumed = restart.producer_resume(moved, binding)[2]
                 if kind == "claude":
-                    self.assertEqual(resumed[resumed.index("--remote-control") + 1], "dwight")
+                    self.assertEqual(resumed[resumed.index("--remote-control") + 1], "cedar")
                 else:
                     self.assertNotIn("--remote-control", resumed)
                 self.assertEqual([tab["staff_id"] for space in herdr.saved_layout("agents")["workspaces"]
                                   for tab in space["tabs"]], [row.id])
-                self.assertEqual(output, "dwight: the old conversation stopped; read it with: "
+                self.assertEqual(output, "cedar: the old conversation stopped; read it with: "
                                  + f"~/.claude/scripts/lib/py ~/.claude/scripts/agents/catch_up.py {OLD_SESSION}\n"
-                                 + f"dwight: session {world.identity} holds the role; {kind}:{model}:{effort}, folder {world.folder}\n")
+                                 + f"cedar: session {world.identity} holds the role; {kind}:{model}:{effort}, folder {world.folder}\n")
                 before = fixture.state()
                 fixture.steps.clear()
                 _ = fixture.transfer()
-                self.assertEqual(fixture.steps, ["title dwight", f"restart {world.identity}"])
+                self.assertEqual(fixture.steps, ["title cedar", f"restart {world.identity}"])
                 self.assertEqual(fixture.state(), before)
 
     def test_a_refused_transfer_changes_nothing(self) -> None:
@@ -176,7 +178,7 @@ class ProducerTransferTests(unittest.TestCase):
                 if case != "absent":
                     _ = fixture.producer()
                 if case == "member":
-                    _ = fixture_member("producer", name="brain", runtime_id=world.identity)
+                    _ = fixture_member("producer", name="maple", runtime_id=world.identity)
                 fixture.stops, fixture.closes = case != "stop", case != "close"
                 before = fixture.state()
                 with ExitStack() as scope:
@@ -190,14 +192,13 @@ class ProducerTransferTests(unittest.TestCase):
 
     def test_transfer_refuses_the_reserved_suffix_before_stopping_the_producer(self) -> None:
         with transfer_fixture("claude", "codex:gpt-test:high") as fixture:
-            name = "dwight-unit"
+            name = "cedar-unit"
             _ = staff.rename(fixture.producer().id, name)
-            _ = write_registry(fixture.registry, {"producers": {name: "codex:gpt-test:high"}}, update=True)
             before = fixture.state()
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
                 code = shutdown.main(["transfer", name, "--model", "opus", "--effort", "high"])
             self.assertEqual((code, output.getvalue(), error.getvalue()),
-                             (2, "", "shutdown: StaffRefused: unit name 'dwight-unit' must not end in -unit\n"))
+                             (2, "", "shutdown: StaffRefused: unit name 'cedar-unit' must not end in -unit\n"))
             self.assertEqual(fixture.state(), before)
             self.assertEqual(fixture.steps, [])
 
@@ -222,14 +223,14 @@ class ProducerTransferTests(unittest.TestCase):
                 _ = fixture.transfer("opus", "high")
                 self.assertEqual(first + fixture.steps, {
                     "close": ["panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}",
-                              "panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}", "title dwight", f"restart {world.identity}"],
+                              "panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}", "title cedar", f"restart {world.identity}"],
                     "staff": ["panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}",
-                              "panes", f"stop {OLD_SESSION}", "title dwight", f"restart {world.identity}"],
-                    "publication": ["panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}", "title dwight", f"restart {world.identity}"],
+                              "panes", f"stop {OLD_SESSION}", "title cedar", f"restart {world.identity}"],
+                    "publication": ["panes", f"stop {OLD_SESSION}", f"close {OLD_PANE}", "title cedar", f"restart {world.identity}"],
                 }[stage])
                 moved = staff.initial_snapshot().by_id(row.id)
                 assert moved is not None
-                self.assertEqual((moved.current_session, fixture.settings()), (world.identity, "claude:opus:high"))
+                self.assertEqual((moved.current_session, fixture.settings(row.id)), (world.identity, "claude:opus:high"))
                 self.assertTrue(pane_record.read("agents")[world.pane].get("producer_binding", False))
 
 

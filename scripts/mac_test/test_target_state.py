@@ -17,8 +17,7 @@ from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
-from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, fixture_rename_producer, isolated_staff_file
 
 import unittest
 from unittest import mock
@@ -216,7 +215,7 @@ class TargetStateTests(IsolatedTargetState):
         with isolated_staff_file(self.root / "staff.json", {}):
             member = fixture_member("producer", name="before-rename")
             self.assertEqual(self.block("mac", member.id).returncode, 0)
-            member = staff.rename(member.id, "after-rename")
+            member = fixture_rename_producer(member, "after-rename")
             status = self.invoke_mac(["status", "--target", "mac"])
             self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
             self.assertIn("blocked by after-rename since ", status.stdout)

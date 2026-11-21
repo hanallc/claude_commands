@@ -1,9 +1,9 @@
 # Local operations
 
-State root: `~/rust/hanadocs/morty`.
+Use the List producer's recorded document folder. Resolve the staff ID from `page.list.owner`.
 Write List items through `the_list.py`.
 The assigned producer writes the latest status, next step, and ETA.
-Morty keeps add, close, park, and reassign for all items.
+The List producer keeps add, close, park, and reassign for all items.
 Read status for items assigned to another producer from The List.
 `checkins.json` holds the current schedule, outstanding inquiries, and the active timer. Keep only its latest state.
 
@@ -45,7 +45,7 @@ Use the current AGENTS.md messaging rules. Resolve live addresses with:
 Filter output to the needed owners. Do not load worker rosters for a showrunner inquiry.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to <address> --from morty --text <message>
+~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to <address> --from <current-producer-name> --text <message>
 ```
 
 Check the result. Queued is not delivered; delivered is not read. Report failures without inventing a fallback.
@@ -54,15 +54,15 @@ Send at most one pending inquiry per item. Save the expected reply time before s
 
 ## Scheduling
 
-Use `send_later.py` to wake morty, not to send an automatic demand to a showrunner.
+Use `send_later.py` to wake the List producer. Route the wake to its staff ID.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Load /producer:produce, then /producer:morty. Read The List records and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
+~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to staff:<id> --from <current-producer-name> --text 'Load /producer:produce, then the List skill. Read The List records and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
 ```
 
 Read back the timer with `systemctl --user show <timer> -p NextElapseUSecRealtime`.
 Save its name and actual due time. Do not claim a schedule exists before this succeeds.
-Before replacing it, inspect the current recorded timer. Stop only morty's superseded status timers.
+Before replacing it, inspect the current recorded timer. Stop only the List producer's superseded status timers.
 If a timer already fired, process its message once. Do not create a second wake for the same checkpoint.
 Schedule the minimum of the next two-hour round and any earlier due item.
 A round does not move a later owner-promised checkpoint earlier without a reason.

@@ -115,8 +115,8 @@ class UpkeepTests(unittest.TestCase):
         _ = staff.set_hold(str(rows["paused"].id), staff.Paused("now", "user", "keep stopped"))
         _ = staff.set_hold(str(rows["exited"].id), staff.Exited("now", "user", "keep stopped"))
         _ = write_registry(case.root / "configuration/models.conf", {"producers": {
-            name: "codex:gpt-test:high" if name == "own-codex" else
-                  "invalid" if name == "invalid" else "claude:opus:max" for name in rows}})
+            row.id: "codex:gpt-test:high" if name == "own-codex" else
+                    "invalid" if name == "invalid" else "claude:opus:max" for name, row in rows.items()}})
         ready = False
         restores: list[str] = []
         attempts: list[str] = []

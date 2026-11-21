@@ -2400,13 +2400,15 @@ def settings_report_scope() -> Generator[None]:
 
 def producer_settings(member: staff.StaffRow) -> models_registry.LaunchSettings | InvalidProducerSettings:
     """Read one producer's settings and exclude it when its settings are invalid."""
+    from scripts.production import staff
+
     resolved = _scoped_producer_settings.get({})
     if member.id in resolved:
         return resolved[member.id]
     try:
         settings: models_registry.LaunchSettings | InvalidProducerSettings = (
-            models_registry.launch_settings("producers", member.name))
-    except ValueError as error:
+            models_registry.launch_settings("producers", staff.native_id(member.id)))
+    except (ValueError, staff.StaffRefused) as error:
         account_anomaly(f"{member.name}: {error}")
         settings = InvalidProducerSettings()
     resolved[member.id] = settings

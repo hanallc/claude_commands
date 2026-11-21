@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
+from scripts.message import morty_identity as list_identity
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
@@ -49,7 +50,7 @@ HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
 class ListChip(StrEnum):
     ALL = "all"
     NEEDS_ME = "needs-me"
-    MORTY_ANSWERING = "morty-answering"
+    AWAITING_ANSWER = "awaiting-answer"
     WORKING = "working"
     BLOCKED = "blocked"
     PARKED = "parked"
@@ -76,7 +77,7 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
         return ListChip.PARKED
     if unread_delivery:
         return ListChip.NEEDS_ME
-    return ListChip.MORTY_ANSWERING if open_question else chip
+    return ListChip.AWAITING_ANSWER if open_question else chip
 
 
 def has_open_question(item: the_list.ListItem) -> bool:
@@ -200,6 +201,11 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
     if field in ("owner", "producer"):
         owner = cast(the_list.ItemOwner, value)
         return names.html(owner, owner_name(names.members, owner))
+    if field == "requested_by":
+        requester = cast(the_list.ListRequester, value)
+        if isinstance(requester, the_list.RequestedBy):
+            return html.escape(requester)
+        return names.html(requester, staff.producer_name(requester, members=names.members) or requester)
     if field == "eta":
         return html.escape(eta_text(cast(the_list.Eta, value), today))
     if field == "parked_until":
@@ -252,7 +258,7 @@ def log_field_html(field: str, value: object, today: datetime, names: staff_name
 
 
 def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
-                   fields: Mapping[str, object], evidence_id: str) -> str:
+                   fields: Mapping[str, object], evidence_id: str, keeper_name: str) -> str:
     content = change.what
     by = log_source_html(the_list.source_without_clock(change.source), names)
     question: Literal["Question", "Answer"] | None = None
@@ -264,9 +270,9 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
                 f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
                 for field, value in fields.items()) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
-        label = {"pending": "Feedback for morty", "sent": "Feedback sent to morty",
-                 "alerted": "Feedback could not reach morty"}[content.state]
-        body = label + by + change_browser.question_paragraphs(content.words)
+        label = {"pending": "Feedback for ", "sent": "Feedback sent to ",
+                 "alerted": "Feedback could not reach "}[content.state]
+        body = label + html.escape(keeper_name) + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
         body = " to question " + html.escape(content.question_id) + by
@@ -300,6 +306,7 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
 def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffNames,
                   unread_answers: frozenset[str]) -> str:
     item = record.item
+    keeper_name = staff.producer_name(record.keeper, members=names.members) or "the List producer"
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
@@ -310,7 +317,7 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
             rows.append((change.time, log_entry_html(change, index, today, names, fields,
-                                                    f"list-evidence-{row_id}-{index}")))
+                                                    f"list-evidence-{row_id}-{index}", keeper_name)))
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
@@ -392,7 +399,8 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
-def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") -> str:
+def feedback_form(entry: ListRecord, secret: str, keeper_name: str, *, parking_label: str = "") -> str:
+    sender = html.escape(keeper_name, quote=True)
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
@@ -406,10 +414,10 @@ def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") ->
             + '<button type="submit" name="action" value="park-until-delivered" data-later-preset>Until delivered</button>'
             + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
-            + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
+            + f'placeholder="Your words for {sender} about this item" aria-label="Your words for {sender} about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
-            + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
+            + f'<button name="action" value="tell" disabled>Tell {sender}</button></div></form>')
 
 
 def review_card_link(key: str, label: str) -> str:
@@ -473,12 +481,11 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], secret: str) -> str:
+                 unread_answers: frozenset[str], secret: str, can_read: bool) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     read = ''
-    keeper = names.members.by_id(entry.keeper)
-    if unread_answers and keeper is not None and keeper.kind == "producer" and keeper.name == "morty":
+    if unread_answers and can_read:
         request, token = signed_item_request(entry, secret)
         read = f' data-open-read-request="{request}" data-open-read-token="{token}"'
     return (f'<div class="list-panel"{read}><div>' + sections
@@ -561,20 +568,20 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
-                    reviews: ReviewDisplay, parking_label: str) -> str:
+                    reviews: ReviewDisplay, parking_label: str, can_read: bool) -> str:
     sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
-    return detail_panel(entry, sections, today, names, unread_answers, secret)
+    return detail_panel(entry, sections, today, names, unread_answers, secret, can_read)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-            unread_answers: frozenset[str], *, parking_label: str) -> str:
+            unread_answers: frozenset[str], *, parking_label: str, keeper_name: str, can_read: bool) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
-        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label)
+        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, can_read)
     status_time = item.latest_status_time
     status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
     sections = ''.join(
@@ -589,17 +596,21 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     sections += review_links(item, reviews, today)
     questions = panel_questions(item, today, unread_answers, visibility.failed)
-    form = feedback_form(entry, secret, parking_label=parking_label)
+    form = feedback_form(entry, secret, keeper_name, parking_label=parking_label)
     return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, secret)
+        entry, sections + questions + form, today, names, unread_answers, secret, can_read)
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, parked: bool, open_question: bool,
-              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str]) -> str:
+              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str],
+              can_read: bool) -> str:
     item = entry.item
     owner = owner_name(names.members, item.owner)
     producer = owner_name(names.members, item.producer)
+    keeper = staff.producer_name(entry.keeper, members=names.members)
+    keeper_name = keeper or "the List producer"
+    question_label = f"{keeper} answering" if keeper is not None else "Answer pending"
     unread = isinstance(item.unread_since, datetime)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
     due = the_list.eta_due(item.eta)
@@ -610,6 +621,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     attributes = {"key": entry.key, "number": str(item.number), "owner": str(item.owner), "producer": item.producer,
                   "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
+                  "keeper-name": keeper_name, "question-label": question_label,
                   "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
                   "unread-answer": str(bool(unread_answers)).lower(),
@@ -630,7 +642,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
-        state += '<small data-open-question-note>Morty answering</small>'
+        state += '<small data-open-question-note>' + html.escape(question_label) + '</small>'
     state += check_row_html(item.next_check, today, parked=parked)
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
@@ -642,10 +654,10 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         else:
             state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
-    sent = the_list.sent_to_morty(item)
+    sent = the_list.sent_to_list_producer(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        notice = "sent to " + names.html("morty")
+        notice = "sent to " + names.html(entry.keeper, keeper_name)
         if feedback.state == "alerted":
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
@@ -665,7 +677,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     return (f'<tbody data-list-item{attrs}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
-            + details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label)
+            + details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
+                      keeper_name=keeper_name, can_read=can_read)
             + '</td></tr></tbody>')
 
 
@@ -752,6 +765,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     if waiting:
         members = staff.snapshot()
         names = staff_names.StaffNames(members)
+        list_producer = list_identity.list_producer(members)
         reviews: ReviewRecords = {}
         if item.reviews:
             try:
@@ -763,7 +777,8 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
             saved["review_summary_html"] = review_summary(item, reviews, today)
         saved["waiting_details_html"] = waiting_details(
             ListRecord(owner, item), local_today, names, unread_answers,
-            form_secret(reading.root), reviews, parked_until)
+            form_secret(reading.root), reviews, parked_until,
+            list_producer is not None and list_producer.id == owner)
     return saved
 
 
@@ -777,7 +792,7 @@ def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
 
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None) -> ListActionSubmission:
-    """Accept signed item actions and save their notices for morty."""
+    """Accept signed item actions and save their notices for the List producer."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
@@ -791,25 +806,25 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, prefix.format())
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
-    morty = staff.snapshot().by_id(staff.StaffId(keeper))
-    if morty is None or morty.kind != "producer" or morty.name != "morty":
-        raise question_record.AnswerRefused("the item has no morty producer")
+    producer = list_identity.list_producer(staff.snapshot())
+    if producer is None or producer.id != keeper:
+        raise question_record.AnswerRefused("the item does not belong to the List producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
     if action == "read":
-        _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
+        _ = the_list.mark_read(producer.id, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
-    item = the_list.load(morty.id, identity)
+    item = the_list.load(producer.id, identity)
     if action == "question":
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
+        question = the_list.ask_question(producer.id, identity, the_list.PageRequest(request, "question", words), status)
         if isinstance(question, change_page.MessageDelivery):
-            _mark_seen_update_read(morty.id, item, prefix.seen_update)
+            _mark_seen_update_read(producer.id, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
         notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
-        changed = the_list.close(morty.id, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
+        changed = the_list.close(producer.id, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
@@ -817,19 +832,19 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         assert parked_until is not the_list.NoTimestamp.UNSET
         label = parking_notice_label(parked_until, user_zone())
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
-        changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
+        changed = the_list.park(producer.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
-        changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice).item
+        changed = the_list.unpark(producer.id, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "tell" and words and len(words) <= 10000:
-        saved = the_list.save_feedback(morty.id, identity,
+        saved = the_list.save_feedback(producer.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
-        _mark_seen_update_read(morty.id, item, saved.read_update)
-        return ListFeedbackDelivery(morty.id, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
+        _mark_seen_update_read(producer.id, item, saved.read_update)
+        return ListFeedbackDelivery(producer.id, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
-        raise question_record.AnswerRefused("enter words for morty")
+        raise question_record.AnswerRefused("enter words for the List producer")
     saved_notice = the_list.feedback_requests(changed).get(request)
-    delivery = (ListFeedbackDelivery(morty.id, identity, request)
+    delivery = (ListFeedbackDelivery(producer.id, identity, request)
                 if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
@@ -953,6 +968,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
            review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
+    list_producer = list_identity.list_producer(members)
     names = staff_names.StaffNames(members)
     items: list[ListRecord] = []
     closed_keys: list[str] = []
@@ -997,9 +1013,12 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         rows.append(
             item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                      open_question=open_question, visibility=visibility, unread_answers=unread_answers))
+                      open_question=open_question, visibility=visibility, unread_answers=unread_answers,
+                      can_read=list_producer is not None and entry.keeper == list_producer.id))
+    answering = f"{html.escape(list_producer.name)} answering" if list_producer is not None else "Answer pending"
     shows = [record_table.Chip("all", "All", len(items)),
-             *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
+             *(record_table.Chip(chip.value, answering if chip == ListChip.AWAITING_ANSWER
+                                 else chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
@@ -1341,6 +1360,7 @@ const tableView=createRecordTable({content:()=>content,
  defaultShow:'all',
  place:params=>{
   const show=params.get('show');
+  if(show==='morty-answering') params.set('show','awaiting-answer');
   if(show==='unread'){params.set('show','all');params.set('unread','1');}
   const state=params.get('state'),stateChip=chipsByState[state];
   if(show==='done' || show==='closed' || state==='Closed') params.set('show','all');
@@ -1490,7 +1510,7 @@ function bindFeedbackForm(form){
     if(!questionNote){
      const note=document.createElement('small');
      note.dataset.openQuestionNote='';
-     note.textContent='Morty answering';
+     note.textContent=item.dataset.questionLabel;
      state.after(note);
     }
    }else questionNote?.remove();
@@ -1610,7 +1630,7 @@ function bindFeedbackForm(form){
      action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') :
      action==='read' ? (unread ? 'Update remains unread' : 'Marked read') :
      asksQuestion ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
-     action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
+     'sent to '+item.dataset.keeperName+(unread ? '; update remains unread' : '');
     if(usesWords && words.value===data.get('words')) words.value='';
     if(unparked) until.value='';
     if(action==='unpark' || parkForDelivery){

@@ -2133,8 +2133,8 @@ class SettledChargeWatchTests(CostFixture):
         with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'cost_explorer_watch_days'):
             _ = config.read_settings(self.settings)
         self.replace('cost_explorer_watch_days', '45')
-        self.replace('cost_explorer_change_recipient', 'user')
-        with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'cost_explorer_change_recipient'):
+        self.replace('cost_explorer_change_recipient_id', 'user')
+        with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'cost_explorer_change_recipient_id'):
             _ = config.read_settings(self.settings)
 
     def test_notice_batches_unsent_changes_and_retries_the_full_message(self) -> None:
@@ -2177,7 +2177,7 @@ class SettledChargeWatchTests(CostFixture):
         self.assertEqual(first, retry)
         for command in (first, new):
             self.assertEqual(Path(command[1]).name, 'send.py')
-            self.assertEqual(command[command.index('--to') + 1], 'bob')
+            self.assertEqual(command[command.index('--to') + 1], 'staff:00000000-0000-4000-8000-000000000007')
         self.assertEqual(first[first.index('--text') + 1].splitlines(), [
             '2026-01-15 changed from USD 7.73 to USD 7.81 (+0.08).',
             '2026-01-16 changed from USD 7.73 to USD 7.90 (+0.17).',

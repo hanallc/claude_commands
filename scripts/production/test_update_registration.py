@@ -21,7 +21,7 @@ from scripts.agents import shutdown
 from scripts.agents import remote
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
-from scripts.production.staff_test_support import fixture_member, showrunner_relationship
+from scripts.production.staff_test_support import fixture_member, fixture_rename_producer, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, registration
 
 from scripts.production import footer_counts
@@ -42,7 +42,7 @@ class ProducerQuestionTests(RegistrationFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.producer = fixture_member("producer", name="dwight")
+        self.producer = fixture_member("producer", name="fixture-planner")
         listing = self.root / "reviews/change-review - example.md"
         _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
         config = self.root / "config"
@@ -61,11 +61,11 @@ class ProducerQuestionTests(RegistrationFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_producers_file_reviewed_questions_without_a_production(self) -> None:
-        for name in ("dwight", "morty", "brain"):
+        for name in ("fixture-planner", "fixture-keeper", "fixture-organizer"):
             with self.subTest(name=name):
                 self.producer = fixture_member("producer", name=name)
-                self.env.update({"CLAUDE_CODE_SESSION_ID": "" if name == "brain" else self.producer.current_session,
-                                 "CODEX_THREAD_ID": self.producer.current_session if name == "brain" else ""})
+                self.env.update({"CLAUDE_CODE_SESSION_ID": "" if name == "fixture-organizer" else self.producer.current_session,
+                                 "CODEX_THREAD_ID": self.producer.current_session if name == "fixture-organizer" else ""})
                 self.file_question(name)
                 identities = registration.QuestionStaff.read()
                 records = registration.question_records_for_document(self.producer, identities)
@@ -98,10 +98,10 @@ class ProducerQuestionTests(RegistrationFixture):
         status = change_page.DeliveryStatus(self.root / "links")
         browser = change_page.ReviewBrowser("producer-test", kind="questions")
         prepared = change_browser.prepare(browser, status)
-        self.assertEqual([question.tab for question in prepared.questions], ["dwight"])
+        self.assertEqual([question.tab for question in prepared.questions], ["fixture-planner"])
         body = change_browser.render(browser, status).decode()
-        self.assertIn('data-tab="dwight"', body)
-        self.assertIn('value="dwight">dwight (1)</option>', body)
+        self.assertIn('data-tab="fixture-planner"', body)
+        self.assertIn('value="fixture-planner">fixture-planner (1)</option>', body)
         self.assertIn('name="outcome" value="answer"', body)
         self.assertNotIn("No showrunner owns this question.", body)
         instance = self.state / "notifier" / f"showrunner-{self.producer.id}"
@@ -110,8 +110,8 @@ class ProducerQuestionTests(RegistrationFixture):
         question = prepared.questions[0].record
         self.assertIn(question.path, sources)
         self.assertIn("Choose the next project?", next_item.show("question", urgency.URGENT, None))
-        _ = staff.rename(self.producer.id, "renamed-dwight")
-        self.assertEqual([question.tab for question in change_browser.prepare(browser, status).questions], ["renamed-dwight"])
+        _ = fixture_rename_producer(self.producer, "renamed-fixture-planner")
+        self.assertEqual([question.tab for question in change_browser.prepare(browser, status).questions], ["renamed-fixture-planner"])
 
     def test_producer_answers_retry_the_current_session_and_recover_after_restart(self) -> None:
         for recovery in (False, True):

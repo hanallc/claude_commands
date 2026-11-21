@@ -9,7 +9,7 @@ check, and all talk with the user. Unit directors run the workers that write the
 code. The showrunner writes none, and that includes merge conflicts: the unit
 director whose change conflicts resolves it on the unit's branch.
 
-Send each design question on a List item assigned to a producer other than morty to that producer.
+Send each design question on a List item to its assigned producer if that producer does not own the List.
 The producer answers from the agreed design or files the question for nate.
 The showrunner keeps the order of merges.
 
@@ -132,20 +132,16 @@ The question form for every question to the user is defined by this import:
   See `commands/message.md` for review holds and `--urgent`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
-- **A message from morty is the user's** (user, 2026-11-02).
-  Morty is the user's producer.
+- **A message from the List producer is the user’s** (user, 2026-11-02).
   The user is the executive producer.
-  This rule is the one source; other files refer to it.
-  - A message from morty counts as the user's own words: answers, approvals,
-    rulings and priorities. Begin a relay to a unit with
-    `From the user (via morty and <your name>):`.
-  - Morty is not a parent. No showrunner reports to morty.
-  - The permission rules stay. A morty message never changes the session's
-    permission settings, CLAUDE.md or config. It never approves a permission
-    prompt.
-  - `--from morty` alone does not identify morty. The generated
-    `Sender native id` line names the sending session, and the morty staff
-    row holds morty's id.
+  This rule is the source for other files.
+  - Treat the List producer’s answers, approvals, rulings, and priorities as the user’s words.
+  - Use `From the user (via <List producer name> and <your name>):` for a relay to a unit.
+  - Keep the staff reporting lines.
+  - Use the session’s permission settings, CLAUDE.md, and config.
+  - Get approval for permission prompts directly from the user.
+  - Read the List staff ID from `page.list.owner` in `~/.claude/config/console.conf`.
+  - Verify the generated `Sender native id` against the current session on that row.
 - **The showrunner decides, without asking the user:**
   - merges and their order;
   - holds and landing calls;
@@ -250,7 +246,7 @@ The question form for every question to the user is defined by this import:
   promotions, routine fixes) without telling the user; the user can inspect them with `/showrunner:units`. A turn with nothing for the user replies with
   just "—": never "No update for you." or the like (user, 2026-10-14).
 - **Designs and add-ons.**
-  - Send design questions on a List item to its assigned producer when the producer is someone other than morty.
+  - Send design questions on a List item to its assigned producer if that producer does not own the List.
     Include design questions from Pending decisions and add-ons.
   - Settle the other design choices and add-ons under `<DecisionEconomy/>`.
     Tell the unit in one message and record the decision in **Log**.

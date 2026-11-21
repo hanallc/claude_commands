@@ -354,7 +354,7 @@ It keeps foreign panes and live agents.
 herdr removes a tab when its last pane closes.
 Retirement cannot find an idle shell whose launch record was lost before this fix.
 
-Producers use their current `[producers]` model and effort through the shared launch code.
+The shared launch code reads each producer profile from `[producers]` by staff ID.
 Codex producers select the workers account; Claude producers select the producers account, or the showrunners account while the producers group has no selection.
 An explicit target account overrides that selection.
 The [producer admission contract](shutdown-and-restart.md#producer-launch-and-admission) defines first start and interrupted admission recovery.

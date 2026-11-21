@@ -1,7 +1,7 @@
 # cargo-style: the move and the direction for speed
 
 Status: reviewed by dwight, 2026-11-16 (review 2 passed). Phases start in the order sdlc sets, after the main-red repair, which merged to main as 01a2815b0 on 2026-11-16.
-Owner: style-unit (production sdlc). dwight guides and reviews. sdlc and cargo-liner keep each operations decision.
+Owner: style-unit (production sdlc). The production producer guides and reviews. sdlc and cargo-liner keep each operations decision.
 
 ## Source
 
@@ -236,7 +236,7 @@ Source: nate, 2026-11-17, through dwight: "At some point can we retire the pytho
 6. S7 gives an inventory: each Python file in `scripts/style` that remains after S8, with its line count and its test count. On 2026-11-17 the folder has about 41,300 lines of code and 45,500 lines of tests.
 7. The unit moves from sdlc to the cargo-liner showrunner after M3 and before S3 (nate, 2026-11-17: "Later."). M2 and M3 do not change.
 
-## Milestones (messages to dwight)
+## Milestones (messages to the production producer)
 
 1. The draft plan is ready for review.
 2. S1: today's times are measured; a target is set for each use.
@@ -246,7 +246,7 @@ Source: nate, 2026-11-17, through dwight: "At some point can we retire the pytho
 6. S2: the API design for speed is ready for review.
 7. S3 to S8: each speed step that reaches or misses its target.
 
-Outside the milestones, style-unit writes to dwight only for a decision nate must take, a block, or an ETA change of more than one hour.
+Outside the milestones, style-unit writes to the production producer only for a decision nate must take, a block, or an ETA change of more than one hour.
 
 ## Work order across units (sdlc's call)
 

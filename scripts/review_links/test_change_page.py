@@ -297,9 +297,9 @@ class ReviewTextTests(unittest.TestCase):
         self.assertIn(block, change_page.review_text_html(command_line, inline=True))
 
     def test_shared_inline_markdown_renders_bold_headings_and_lists(self) -> None:
-        text = '## Heading\n**Field:** <script> & ready\n- **Owner:** morty\n1. **Next:** `run`'
+        text = '## Heading\n**Field:** <script> & ready\n- **Owner:** keeper\n1. **Next:** `run`'
         expected = ('<h2>Heading</h2><p><strong>Field:</strong> &lt;script&gt; &amp; ready</p>'
-                    + '<ul><li><strong>Owner:</strong> morty</li></ul>'
+                    + '<ul><li><strong>Owner:</strong> keeper</li></ul>'
                     + '<ol><li><strong>Next:</strong> <code>run</code></li></ol>')
         self.assertEqual(change_page.review_text_html(text, inline=True), expected)
         self.assertEqual(change_browser.question_paragraphs(text), expected)
@@ -2144,11 +2144,11 @@ class ChangePageTests(unittest.TestCase):
             self.assertNotIn("Second answer", self.messages[-1][2])
 
     def test_failed_question_answer_alerts_the_tab_showrunner(self) -> None:
-        producer = fixture_member("producer", name="bob")
+        producer = fixture_member("producer", name="editor")
         showrunner = showrunners.owner_for("page-owner")
         _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=page-owner\n")
         showrunner_key = self.file_user_question(asker=producer)
-        path = record_store.default_question_folder(producer.id) / "question-from-bob.md"
+        path = record_store.default_question_folder(producer.id) / "question-from-editor.md"
         path.parent.mkdir(parents=True)
         question = update_registration.OutstandingItem(
             since="2026-11-12T12:00", text="Which timestamps should we use?",
@@ -2180,7 +2180,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn("Use the tool clock.", alert)
 
     def test_recovery_reuses_the_alert_key_after_the_clear_write_fails(self) -> None:
-        producer = fixture_member("producer", name="bob")
+        producer = fixture_member("producer", name="editor")
         showrunner = showrunners.owner_for("page-owner")
         status = change_page.DeliveryStatus(self.root)
         path = status.closeout_path(self.page, "C1")

@@ -17,6 +17,7 @@ from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
+from uuid import UUID
 
 from scripts.lib import build_folders
 from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
@@ -168,6 +169,17 @@ def parse_producer_profile(value: str) -> ProducerProfile:
             raise ValueError("expected <family>:<model>:<effort>")
 
 
+def producer_profile(staff_id: str) -> ProducerProfile:
+    """Read the producer profile for a staff ID."""
+    path = registry_path()
+    profiles = parse_registry(registry_text(path)).get("producers", {})
+    try:
+        _validate_producer_id(staff_id)
+        return parse_producer_profile(profiles.get(staff_id, ""))
+    except ValueError as error:
+        raise ValueError(f"{path}: producers.{staff_id}: {error}") from error
+
+
 def producer_defaults() -> ProducerProfile:
     """Read and validate the default profile for a new producer."""
     path = registry_path()
@@ -193,6 +205,8 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
     resolver = 'agents_resolve "$2.$3"' if family == "assigned" else '_agents_resolve_in_family "$2.$3" "$4"'
     resolver_arguments: list[str] = [] if family == "assigned" else [family]
     if section in ("producers", "producer_defaults"):
+        if section == "producers":
+            _validate_producer_id(key)
         value = next((row.value for row in reversed(configuration.rows)
                       if row.section == section and row.key == key), "")
         try:
@@ -533,48 +547,66 @@ def save_registry(registry: Path, before: str, after: str, description: str, *,
     return SavedRegistry(result, changed, RegistryPublication.SHARED)
 
 
-def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
+def _validate_producer_id(staff_id: str) -> None:
+    try:
+        if str(UUID(staff_id)) == staff_id:
+            return
+    except ValueError:
+        pass
+    raise ValueError(f"{staff_id!r}: expected a canonical producer staff ID")
+
+
+def pending_producer_settings(profile: ProducerProfile) -> LaunchSettings:
+    """Validate the saved profile without writing a producer key."""
+    configuration = launch_configuration(os.environ)
+    text = registry_rows.replay(configuration.text, [
+        registry_rows.RowChange("producer_defaults", "model", f"model={profile.value()}")], False)
+    return launch_settings("producer_defaults", "model", configuration=LaunchModelConfiguration(
+        configuration.path, text, tuple(registry_rows.records(text))))
+
+
+def _producer_candidate(staff_id: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
+    _validate_producer_id(staff_id)
     path = registry_path()
     before = registry_text(path)
-    after = registry_rows.replay(before, [registry_rows.RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
-    settings = launch_settings("producers", name,
+    after = registry_rows.replay(before, [
+        registry_rows.RowChange("producers", staff_id, f"{staff_id}={family}:{model}:{effort}")], False)
+    settings = launch_settings("producers", staff_id,
                                configuration=LaunchModelConfiguration(path, after, tuple(registry_rows.records(after))))
     return path, before, after, settings
 
 
-def producer_settings(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+def producer_settings(staff_id: str, family: str, model: str, effort: str) -> LaunchSettings:
     """Validate one producer's candidate settings without a write."""
-    return _producer_candidate(name, family, model, effort)[3]
+    return _producer_candidate(staff_id, family, model, effort)[3]
 
 
-def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSettings:
-    """Validate one producer's settings, then publish its row; an equal row changes nothing."""
-    path, before, after, settings = _producer_candidate(name, family, model, effort)
-    _ = store_registry(path, before, after, f"{name} producer uses {family}:{model}:{effort}")
+def store_producer(staff_id: str, family: str, model: str, effort: str, *,
+                   preserve_existing: bool = False) -> LaunchSettings:
+    """Publish a producer profile under its staff ID."""
+    path, before, after, settings = _producer_candidate(staff_id, family, model, effort)
+    profile = f"{family}:{model}:{effort}"
+    if preserve_existing:
+        existing = parse_registry(before).get("producers", {}).get(staff_id)
+        if existing is not None and existing != profile:
+            raise ValueError(f"{staff_id}: its producer key has another profile")
+    saved = store_registry(path, before, after, f"{staff_id} producer uses {profile}",
+                           preserve_producer_rows=preserve_existing)
+    if preserve_existing and parse_registry(saved).get("producers", {}).get(staff_id) != profile:
+        raise ValueError(f"{staff_id}: its producer key has another profile")
     return settings
 
 
-def rename_producer(old: str, new: str, profile: ProducerProfile, *, keep_old: bool = False) -> None:
-    """Publish the new producer key and remove the old key when permitted."""
-    path = registry_path()
-    before = registry_text(path)
-    rows = parse_registry(before).get("producers", {})
-    if (not keep_old and old in rows and rows[old] != profile.value()) or (new in rows and rows[new] != profile.value()):
-        raise ValueError(f"{path}: producer settings changed during rename")
-    edits = [] if keep_old else [registry_rows.RowChange("producers", old, "")]
-    edits.append(registry_rows.RowChange("producers", new, f"{new}={profile.value()}"))
-    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"rename producer {old} to {new}")
-
-
-def remove_producer(name: str, profile: ProducerProfile) -> None:
+def remove_producer(staff_id: str, profile: ProducerProfile) -> None:
     """Remove the key after the lifecycle operation saves its value."""
+    _validate_producer_id(staff_id)
     path = registry_path()
     before = registry_text(path)
     rows = parse_registry(before).get("producers", {})
-    if name in rows and rows[name] != profile.value():
+    if staff_id in rows and rows[staff_id] != profile.value():
         raise ValueError(f"{path}: producer settings changed during retirement")
-    edits = [registry_rows.RowChange("producers", name, "")]
-    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"retire producer {name}")
+    edits = [registry_rows.RowChange("producers", staff_id, "")]
+    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"retire producer {staff_id}")
 
 
 @final

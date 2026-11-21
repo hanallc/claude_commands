@@ -955,7 +955,7 @@ The AWS page shows how many recorded days still match their first settled amount
 It shows the date of the newest read in UTC and lists each day with a different current amount.
 The history keeps earlier differences when the newest read returns to the first settled amount.
 The watch sends one message for each read that finds changes that it has yet to report.
-The message goes to the session in `cost_explorer_change_recipient=bob`.
+The watch sends the message to the staff ID in `cost_explorer_change_recipient_id`.
 It uses the page wording and includes one line for each changed day.
 It checks all saved days, including days outside the query range.
 After a successful send, each charge file records the reported amount.
@@ -1219,10 +1219,10 @@ Without a bill read, the recorded and reserved hours count every day in the wind
 `buildlog hourly` and `aws_target.py snapshot` both call it.
 The notices and the table use the same list of gate types and Hana's primary and fallback types.
 If the Hana region or type settings are unavailable, both use the gate types and a zero Hana allowance.
-For each type, region, and UTC day above the limit, the check sends a message to bob's fixed staff ID.
+For each type, region, and UTC day above the limit, the check sends a message to `cost_explorer_change_recipient_id`.
 The message gives the billed hours, ledger hours, gap, and limit.
 The message includes exposure hours for the region and day when a Hana allowance applies.
-It asks bob to file an investigation and add it to the list.
+It asks the recipient to file an investigation and add it to the List.
 The check saves the key `aws-hours-gap:<type>:<region>:<day>` in `hours-gap-notices.json` after `SENT`, `SKIPPED`, or `QUEUED`.
 After a failure or timeout, the next hourly run tries again.
 The check uses the sender's full time budget for the subprocess.

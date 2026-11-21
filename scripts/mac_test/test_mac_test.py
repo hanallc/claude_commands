@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, fixture_rename_producer, fixture_runtime_id, isolated_staff_file
 from scripts.mac_test import mac_test
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
@@ -1663,7 +1663,7 @@ for arguments in (
             result = self.command("block", "--holder", member.id, "--for", "staff hold")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(self.block_state()["holder"], member.id)
-            member = staff.rename(member.id, "after-rename")
+            member = fixture_rename_producer(member, "after-rename")
             status = self.command("status")
             self.assertIn("blocked by after-rename since ", status.stdout)
             self.assertNotIn(member.id, status.stdout)
@@ -2894,10 +2894,10 @@ subprocess.run = expire_gh
         (self.state_directory / "block.json").unlink()
         child = self.start_child()
         self.claim(child)
-        pending = self.command("block", "--holder", "bob", "--for", "local work")
+        pending = self.command("block", "--holder", "fixture_builder", "--for", "local work")
         self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
         status = self.command("status")
-        self.assertIn("block pending for bob (a test is running), lifts ", status.stdout)
+        self.assertIn("block pending for fixture_builder (a test is running), lifts ", status.stdout)
 
     def test_status_reports_pending_ci_job_and_unknown_ci(self) -> None:
         self.gh["variable"] = "false"

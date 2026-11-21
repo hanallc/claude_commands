@@ -475,7 +475,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(listed_after_answer.stdout.strip(), "no open questions")
 
     def test_producer_closes_its_own_questions_without_a_production(self) -> None:
-        producer = fixture_member("producer", name="dwight")
+        producer = fixture_member("producer", name="fixture-planner")
         environment = {**self.env, "CLAUDE_CODE_SESSION_ID": producer.current_session, "CODEX_THREAD_ID": ""}
         showrunner = staff.snapshot().by_id(self.owner_id)
         assert showrunner is not None
@@ -501,7 +501,7 @@ class RegistrationTests(RegistrationFixture):
 
                 closed = run(action, "--item", title)
                 self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
-                self.assertIn(f"{action}: ok — dwight: {title}", closed.stdout)
+                self.assertIn(f"{action}: ok — fixture-planner: {title}", closed.stdout)
                 listed_after_close = run("questions-table")
                 self.assertEqual(listed_after_close.returncode, 0, listed_after_close.stdout + listed_after_close.stderr)
                 self.assertNotIn(title, listed_after_close.stdout)

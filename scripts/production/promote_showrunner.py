@@ -337,6 +337,8 @@ def _main(argv: list[str]) -> int:
     unit_name = cast(str, args.unit)
     child_name = cast(str, args.production) or unit_name
     staff.validate_unit_name_for_write(child_name)
+    staff.validate_name("showrunner", child_name)
+    staff.require_no_producer_rename(child_name)
     record = staff.snapshot()
     document = cast(Path | ProductionDocumentDefault, args.doc)
     model = cast(str, args.model)
@@ -378,6 +380,7 @@ def _main(argv: list[str]) -> int:
     if parent_row is None:
         print(f"promote_showrunner: {promotion.parent.name}: native showrunner identity is missing", file=sys.stderr)
         return 2
+    staff.require_no_producer_rename(child_name)
     _ = staff_sources.ensure_staff_showrunner(promotion.parent, runtime_id=parent_row.current_session)
     was_pending = pending.exists()
     if not was_pending:

@@ -364,24 +364,28 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(grouped.units, {"show": {row.name: replace(agent, unit=row.name)}})
 
-    def test_morty_without_environment_identity_never_uses_the_retained_unit_launch(self) -> None:
+    def test_keeper_without_environment_identity_never_uses_the_retained_unit_launch(self) -> None:
         row = unit_membership("show", "unit")
         place = labels.Place("agents", "w2C")
         launch = pane_launch.NativePaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
         unknown = labels.LabeledSession("", labels.ClaudeUnknown("no identity"), place,
                                         labels.ObservedProcess(198033, "codex"))
-        morty = fixture_runtime_id("retained-pane-morty")
-        _ = fixture_member("producer", name="morty", runtime_id=morty)
+        keeper = fixture_runtime_id("retained-pane-keeper")
+        producer = fixture_member("producer", name="keeper", runtime_id=keeper)
+        config = self.root / "config"
+        config.mkdir(exist_ok=True)
+        _ = (config / "console.conf").write_text(f"page.list.owner={producer.id}\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
         from scripts.message import codex_daemon
 
-        sessions = [codex_daemon.DaemonSession(morty, str(self.root), "idle")]
+        sessions = [codex_daemon.DaemonSession(keeper, str(self.root), "idle")]
 
         with (mock.patch.object(herdr, "shared_session", return_value=place.session),
               mock.patch.object(herdr, "process_environment", return_value={}),
               mock.patch.object(herdr, "herdr_place_of", return_value=place),
               mock.patch.object(herdr.Herdr, "result", return_value={
-                  "pane": {"terminal_title_stripped": "morty | idle"},
+                  "pane": {"terminal_title_stripped": "keeper | idle"},
                   "process_info": {"foreground_processes": [{"pid": 198033, "argv": ["codex"]}]}}),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=sessions),
               labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):

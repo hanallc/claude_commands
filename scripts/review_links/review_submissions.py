@@ -21,6 +21,7 @@ from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
+from scripts.message import morty_identity as list_identity
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
@@ -864,15 +865,8 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
 
 def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Find the active producer that owns the List."""
-    configured = settings.origin("page.list.owner", str)
-    if isinstance(configured, conf.UnavailableValue):
-        return PageOwnerUnavailable()
-    row = members.rows_by_id.get(staff.StaffId(configured.value))
-    if (row is None or row.kind != "producer" or row.id in members.pending_retire
-            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
-            or isinstance(row.worktree, staff.RemovedWorktree)):
-        return PageOwnerUnavailable()
-    return row
+    row = list_identity.list_producer(members, settings)
+    return row if row is not None else PageOwnerUnavailable()
 
 
 def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,

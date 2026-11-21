@@ -24,7 +24,7 @@ from scripts.whoami.note_file import note_name
 from scripts.agents import inventory
 from scripts.message import sessions
 from scripts.production import showrunners
-from scripts.production.staff_test_support import fixture_member, recorded_showrunner
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
@@ -320,7 +320,7 @@ class AccountMoveTests(ShutdownTestCase):
             with self.subTest(state=state):
                 self.moves.calls.clear()
                 identity = staff.StaffId("stopped-producer")
-                row = staff.StaffRow(staff.StaffId("producer-row"), "producer", "producer-retry", staff.STAFF_ROOT,
+                row = staff.StaffRow(staff.StaffId(fixture_runtime_id("producer-row")), "producer", "producer-retry", staff.STAFF_ROOT,
                     current_session=identity, home=staff.HomeUnknown() if state == "unknown home" else staff.SessionHome(self.root / ".claude1"),
                     doc=staff.LiveDoc("mac" if state == "control remote" else "natedev", self.root / "plan.md"),
                     paused=staff.Paused("now", "user", "hold") if state == "control paused" else staff.Active())
@@ -332,7 +332,7 @@ class AccountMoveTests(ShutdownTestCase):
                     row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude3"))
                     self.moves.failures[row.id] = "live process account is unreadable"
                 family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
-                registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
+                registry = write_registry(self.root / "producer-models.conf", {"producers": {row.id: family}})
                 live = [accounts.LiveGroupMember(identity, row.name, "producers", self.root / ".claude1")] if state == "interrupted" else []
                 move = self.moves.move
                 def start(session: str, target: str, *, why: str) -> stop_resume.MoveResult:

@@ -1,27 +1,28 @@
 ---
-description: Ask morty to track an item; also applies when a prompt ends with the word "recall".
+description: Ask the List producer to track an item. Also applies when a prompt ends with "recall".
 ---
 
-Send an item to morty's tracking list.
+Send an item to the List producer.
 
 **Usage:** `/recall [park <when>] [item]`
 
 1. **Item.** Take the item from `$ARGUMENTS`.
    With no item text, or when "recall" ends a prompt, use that prompt and the current conversation.
-   Write one or two sentences that morty can track without this conversation.
+   Write one or two sentences that the List producer can track without this conversation.
    Include what to track, the owner when known, and the result that closes the item.
 
 2. **Park.** Copy any park words, such as `park till tuesday`, exactly as written.
-   Do not parse or convert them; morty applies its own park terms.
-   Park only hides the item from the user's list until morty unparks it. It never stops, delays or reorders any work.
+   The List producer applies the park terms.
+   Park hides the item from the user’s list until the List producer unparks it.
 
 3. **Send.** Replace `<item>` with the item from step 1.
    Replace `<park words>` with the words from step 2, or omit it when absent.
    Write the whole message on one line. Replace line breaks in the item and the park words with spaces.
-   Send one message. The quoted heredoc passes the text to morty unchanged:
+   Read the List staff ID from `page.list.owner` in `~/.claude/config/console.conf`.
+   Replace `<List staff ID>` and send one message.
 
    ```bash
-   python3 ~/.claude/scripts/message/send.py --to morty <<'RECALL_MESSAGE'
+   ~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to "staff:<List staff ID>" <<'RECALL_MESSAGE'
    Add this item to your tracking list: <item> <park words>
    RECALL_MESSAGE
    ```
@@ -31,4 +32,4 @@ Send an item to morty's tracking list.
    Do not send the message again after a non-zero exit.
 
 When "recall" ends a prompt that requests other work, do that work too.
-`/recall` only adds the tracking. It never changes the work, its owner or its timing.
+`/recall` adds a tracking item.

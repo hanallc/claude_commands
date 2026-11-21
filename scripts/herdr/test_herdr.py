@@ -1030,7 +1030,7 @@ class CodexAnomalyNameTests(StaffTestCase):
                 placement.return_value = herdr.HerdrPlace("agents", "w1:p1")
                 result.side_effect = [{"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}]},
                     {"tabs": [{"tab_id": "w1:t2", "label": "other-tab", "workspace_id": "w1"},
-                              {"tab_id": "w1:t1", "label": "morty", "workspace_id": "w1"}]},
+                              {"tab_id": "w1:t1", "label": "fixture_keeper", "workspace_id": "w1"}]},
                     {"workspaces": [{"workspace_id": "w1", "label": "agents"}]}]
             else:
                 placement.return_value = herdr.UnprovedHerdrPlacement("placement is unavailable")
@@ -1039,7 +1039,7 @@ class CodexAnomalyNameTests(StaffTestCase):
             with self.assertRaisesRegex(herdr.CodexPaneStarting, "Codex launch identity is unavailable"):
                 _ = herdr.native_process(pid, "codex", "")
             self.assertEqual(herdr.running_codex_threads(thread_host=lambda _argv: False), set())
-            name = {"tab": "morty", "registry": "registry-name", "pid": f"pid {pid}"}[source]
+            name = {"tab": "fixture_keeper", "registry": "registry-name", "pid": f"pid {pid}"}[source]
             self.assertEqual(output.getvalue(), f"anomaly: {name} (Codex thread unknown); not blocking\n")
             placement.assert_called_once_with(pid)
             if source == "tab":

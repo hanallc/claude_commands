@@ -31,7 +31,7 @@ Code uses `UnitDetails` for a unit and `NotUnit` for other members.
 Promotion removes the type; demotion selects an explicit type, default `direct`.
 New and changed unit rows write the type explicitly.
 The type selects the unit command for launch, resume, account move, rename, and compaction.
-Morty, brain, and dwight use kind `producer`.
+Producer rows use kind `producer`.
 Each keeps its own command under `commands/producer/` and its own job.
 The [staff contract](../as-built/staff-accessors.md#producer-rows-and-commands) defines the current producer rows.
 
@@ -59,7 +59,7 @@ Historical identities, roles, folders, and branches describe past events only.
 
 Displays (the herdr tab label, the Claude session title) show `name`. Rename sets them. No code reads them back.
 
-Producer launches select their family from `[producers]` in `config/models.conf`.
+Producer launches read the family from `[producers]` in `config/models.conf` by staff ID.
 The native session supplies evidence of the running backend.
 
 ## 3. The operations
@@ -70,7 +70,7 @@ Each operation is a short list of plain steps. A rerun with nothing to change pr
 2. **Start:** resume `current_session` in the staff folder through the shared resume path.
    Claude uses `--resume <id>`.
    Codex uses `resume <id>`.
-   Producers use their configured family, model, and effort from `[producers]` in `config/models.conf`.
+   Producers use the family, model, and effort for their staff ID.
    Codex producers use the workers account; Claude producers use the showrunners account.
    Each producer uses its own tab in `PRODUCER_WORKSPACE`, normally `producers`.
    A configured producer without a row uses the shared first-admission path.

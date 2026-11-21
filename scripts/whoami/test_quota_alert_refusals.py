@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.lint.memory_test_support import write_config_fixture
 
 import os
 import fcntl
@@ -27,10 +28,14 @@ setUpModule = support.setUpModule
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_no_capacity_announces_once_after_a_zero_episode_without_holding_the_state_lock(self) -> None:
-        for hostname, enabled in ((role_map.ROLE_MAP_HOST + ".local", True), ("other-host.local", False)):
-            with self.subTest(hostname=hostname):
+        local = role_map.ROLE_MAP_HOST + ".local"
+        for hostname, enabled, routes in ((local, True, support.FYI_ROUTES), (local, True, ()),
+                                          ("other-host.local", False, support.FYI_ROUTES)):
+            with self.subTest(hostname=hostname, routes=routes):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.seed, self.root)
+                if not routes:
+                    _ = write_config_fixture(self.root / "config/accounts.conf", "no_worker_mode_fyi_staff_ids=\n")
                 self.credits.add("codex1")
                 notes: Notes = [self.note("codex1.md", "active", "0")]
                 _ = self.alert(notes, self.now)
@@ -65,7 +70,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                     self.assertIn("Send no assign.", calls[0][3])
                     self.assertEqual(calls[0][3], calls[0][5])
                     self.assertEqual(copies, [["--to", producer, "--from", "quota-alert", "--text", f"FYI, no action: {calls[0][3]}"]
-                                              for producer in ("morty", "dwight")])
+                                              for producer in routes])
                     with quota_alert.state_file() as state:
                         self.assertTrue(state.get("no_worker_mode", False))
                     self.assertEqual(len(calls), 1)
@@ -95,10 +100,11 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 with redirect_stdout(output), mock.patch("scripts.whoami.quota_alert.subprocess.run", side_effect=fail_start) as start:
                     log = self.block(notes, self.now)
                     _ = self.block(notes, self.now + timedelta(minutes=1))
-                self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: no-worker mode broadcast failed: {detail}",
-                                                                  f"quota-alert: no-worker mode FYI to morty failed: {detail}",
-                                                                  f"quota-alert: no-worker mode FYI to dwight failed: {detail}",
-                                                                  f"quota-alert: Codex worker stop failed: {detail}"])
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"quota-alert: no-worker mode broadcast failed: {detail}",
+                    *(f"quota-alert: no-worker mode FYI to {route} failed: {detail}" for route in support.FYI_ROUTES),
+                    f"quota-alert: Codex worker stop failed: {detail}",
+                ])
                 self.assertEqual(start.call_count, 4)
                 self.assertIn("quota status codex1: Codex refused work on codex1. No credit balance is reported for codex1. "
                               + "New work moved to Claude, the other coding assistant.", log)

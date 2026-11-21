@@ -23,7 +23,7 @@ The fixed `id` identifies a member across session changes.
 `Kind` is `Literal["showrunner", "unit", "worker", "producer"]`.
 A producer has `StaffRoot` as its parent.
 It can hold both a worktree and a document.
-It can start a staff path, such as `morty`.
+It can start a staff path, such as a producer name.
 `staff_sources` includes producers when it reads active root members.
 Restart, shutdown selection, and message routing recognize the same kind.
 
@@ -44,12 +44,12 @@ Each producer loads the common command and reads its job and current work from i
 
 | Staff name | Kind | Command | Job contract |
 |---|---|---|---|
-| `morty` | `producer` | `/producer:produce`, then `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
-| `brain` | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items. |
-| `dwight` | `producer` | `/producer:produce` | Manages its assigned productions. |
+| List producer | `producer` | `/producer:produce`, then the List skill | Tracks the user's items and coordinates their showrunners. |
+| Vault producer | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items. |
+| Production producer | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
-Morty's operations document is `docs/producer/morty-operations.md`.
+The List producer's operations document is `docs/producer/morty-operations.md`.
 The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
@@ -231,7 +231,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
-| `scripts/message/morty_identity.py` | read | snapshot; holder returns the current_session of the producer row named morty |
+| `scripts/message/morty_identity.py` | read | snapshot; holder returns the current_session of the producer row in `page.list.owner` |
 | `scripts/message/postmaster.py` | read | snapshot, StaffSnapshot, by_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
@@ -282,7 +282,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
-| `scripts/agents/producer_lifecycle.py` | read | initial_snapshot, slot_operation, validate_name; StaffRow, StaffSnapshot, LiveDoc and PresentWorktree types; add-producer checks the name and the free row before first start |
+| `scripts/agents/producer_lifecycle.py` | write | `rename` commits producer renames. `set_producer_retirement` records retirement and restore. `add-producer` uses `initial_snapshot`, `slot_operation`, and `validate_producer_name` to check the name and staff rows before the first start. |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
@@ -330,7 +330,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
-| `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
+| `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate the List producer, resolve the alert showrunner, and supply identities to the shared count readers |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -371,7 +371,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-222 accessor rows: 41 write, 180 read, 1 owner.
+227 accessor rows: 42 write, 184 read, 1 owner.
 
 ## Approved copies
 

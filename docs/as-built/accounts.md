@@ -151,7 +151,7 @@ Claude groups can share an account.
 Codex producers use the workers account.
 Claude producers use the producers account when it has a selection.
 They use the showrunners account until the first producers selection.
-`[producers]` in `config/models.conf` selects each producer's family, model, and effort.
+`[producers]` in `config/models.conf` uses staff IDs to select each producer's family, model, and effort.
 An explicit move saves a group selection.
 Status, launch, and preview reads never create a selection.
 
@@ -339,7 +339,8 @@ The credits-off path uses the same capacity rule.
 A failed move does not start no-worker mode while another account has allowance or permitted credits.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
-Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.
+Each staff ID in `no_worker_mode_fyi_staff_ids` receives one copy of each notice through `send.py`.
+An empty list sends zero copies.
 The copy begins `FYI, no action:`; producers direct no workers.
 The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
 Successful Codex recovery clears the flag and broadcasts OFF after the workers account and assignment restoration succeed.

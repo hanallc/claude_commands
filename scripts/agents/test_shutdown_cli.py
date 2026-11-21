@@ -76,17 +76,17 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
 
 class AgentsUsageTests(unittest.TestCase):
-    def test_resume_dwight_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
+    def test_resume_fixture_planner_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
         with (mock.patch.object(test_stop_resume, "write_config_fixture", write_pinned_fixture_setting),
               mock.patch.object(test_stop_resume, "write_machine_config", shutdown_fixture_configuration),
               test_stop_resume.producer_first_fixture("claude") as world):
             for attempt in range(2):
                 with self.subTest(attempt=attempt):
-                    code, output, errors = self.invoke(["resume", "dwight"])
+                    code, output, errors = self.invoke(["resume", "fixture-planner"])
                     self.assertEqual(code, 0, errors + output)
                     self.assertIn(world.identity, output)
             row = staff.initial_snapshot().rows[0]
-            self.assertEqual((row.name, row.kind, row.current_session), ("dwight", "producer", world.identity))
+            self.assertEqual((row.name, row.kind, row.current_session), ("fixture-planner", "producer", world.identity))
             self.assertEqual(len(world.arguments), 1)
             self.assertEqual(world.openings, [herdr.NoOpeningPrompt()])
 
@@ -152,14 +152,14 @@ class AgentsUsageTests(unittest.TestCase):
 
     def test_transfer_gives_the_name_and_settings_to_the_producer_transfer(self) -> None:
         with mock.patch.object(producer_transfer, "transfer", return_value=0) as transfer:
-            self.assertEqual(self.invoke(["transfer", "morty", "--model", "opus", "--effort", "high"])[0], 0)
-            self.assertEqual(self.invoke(["transfer", "brain"])[0], 0)
-        self.assertEqual(transfer.call_args_list, [mock.call("morty", model="opus", effort="high"),
-                                                   mock.call("brain", model="", effort="")])
-        with mock.patch.object(producer_transfer, "transfer", side_effect=ValueError("morty: no producer row")):
-            code, output, errors = self.invoke(["transfer", "morty"])
+            self.assertEqual(self.invoke(["transfer", "fixture_keeper", "--model", "opus", "--effort", "high"])[0], 0)
+            self.assertEqual(self.invoke(["transfer", "fixture_organizer"])[0], 0)
+        self.assertEqual(transfer.call_args_list, [mock.call("fixture_keeper", model="opus", effort="high"),
+                                                   mock.call("fixture_organizer", model="", effort="")])
+        with mock.patch.object(producer_transfer, "transfer", side_effect=ValueError("fixture_keeper: no producer row")):
+            code, output, errors = self.invoke(["transfer", "fixture_keeper"])
         self.assertEqual((code, output), (2, ""))
-        self.assertIn("morty: no producer row", errors)
+        self.assertIn("fixture_keeper: no producer row", errors)
 
     def test_help_option_prints_the_same_public_usage(self) -> None:
         option = self.invoke(["--help"])
@@ -3484,6 +3484,26 @@ class UnitRenameTests(UnitRenameFixture):
         self.assert_ok(result)
         self.assertEqual(self.git("branch", "--show-current", cwd=folder), branch)
         self.assertEqual(staff.by_id(row.id), row)
+
+    def test_unit_rename_refuses_a_reserved_name_before_changing_files_or_displays(self) -> None:
+        unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        producer = fixture_member("producer", name="fixture-producer")
+        plan = staff.ProducerRename("1" * 32, producer, replace(producer, name="gamma"))
+        with mock.patch.object(staff, "producer_creation_registry",
+                               return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+            staff.reserve_producer_rename(plan)
+        try:
+            before = file_versions(self.root)
+            with mock.patch.object(worker_panes, "rename_workers") as displays:
+                result = self.rename()
+            self.assertEqual((result.returncode, result.stdout), (2, ""))
+            self.assertIn("finish the producer rename to gamma", result.stderr)
+            displays.assert_not_called()
+            self.assertEqual(file_versions(self.root), before)
+            self.assertEqual(staff.by_id(unit.id), unit)
+            self.assertIsNone(unit_move.pending_rename(unit.id))
+        finally:
+            staff.release_producer_rename(plan.operation)
 
     def test_rename_replaces_the_old_suffix_when_it_also_matches_the_new_name(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")

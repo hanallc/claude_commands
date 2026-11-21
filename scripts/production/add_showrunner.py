@@ -286,6 +286,8 @@ def _main(argv: list[str]) -> int:
         doc = cast(Path | None, args.doc)
         existing = any(row.kind == "showrunner" and (row.name == name or row.id == name) for row in record.rows)
         child = read_new_production(doc, name) if doc and not existing else read_production(name, record=record)
+        staff.validate_name("showrunner", child.name)
+        staff.require_no_producer_rename(child.name)
         where = cwd or child.checkout
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
         identity = ShowrunnerLaunch(resume or "", selected.dir, datetime.now(UTC))

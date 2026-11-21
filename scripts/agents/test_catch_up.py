@@ -52,7 +52,7 @@ CLAUDE_RECORDS: list[dict[str, object]] = [
     claude_record(4, "assistant", [{"type": "thinking", "thinking": "private"},
                                    {"type": "text", "text": "I will read the row."},
                                    {"type": "tool_use", "name": "Bash", "input": {"command": "staff.py show"}}]),
-    claude_record(5, "user", [{"type": "tool_result", "content": [{"type": "text", "text": "morty row"}]}]),
+    claude_record(5, "user", [{"type": "tool_result", "content": [{"type": "text", "text": "fixture_keeper row"}]}]),
     claude_record(6, "assistant", [{"type": "text", "text": "A helper answer."}], isSidechain=True),
     {"timestamp": "2026-11-13T22:07:00.000Z", "type": "system", "subtype": "compact_boundary"},
     claude_record(8, "assistant", [{"type": "text", "text": "The row is correct."}]),
@@ -110,7 +110,7 @@ class CatchUpTests(unittest.TestCase):
             ("user", "Continue the transfer."),
             ("assistant", "I will read the row."),
             ("tool Bash", '{"command": "staff.py show"}'),
-            ("result", "morty row"),
+            ("result", "fixture_keeper row"),
             ("assistant", "The row is correct."),
         ])
 

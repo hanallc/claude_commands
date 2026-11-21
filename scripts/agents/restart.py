@@ -32,7 +32,7 @@ from scripts.production import staff, session_staff, worker_admission
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.transcripts import codex_transcript_homes, open_transcript, transcript_paths
+from scripts.lib.transcripts import codex_transcript_homes, open_transcript, prepare_claude_resume, transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
 from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.agents.codex_trust import trust_arguments
@@ -423,9 +423,9 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
     return kind, environment, arguments
 
 
-def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
-    """Select the configured producer settings without a resume identity."""
-    settings = models_registry.launch_settings("producers", name)
+def producer_first_arguments(name: str, settings: models_registry.LaunchSettings
+                             ) -> tuple[Literal["claude", "codex"], list[str]]:
+    """Build launch arguments without a resume identity."""
     if settings.kind == "codex":
         arguments = ["--model", settings.model,
                      "-c", f'model_reasoning_effort="{settings.effort}"']
@@ -440,14 +440,15 @@ def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], lis
 
 def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Resume the producer's current conversation with its configured settings."""
-    kind, arguments = producer_first_arguments(row.name)
+    settings = models_registry.launch_settings("producers", row.id)
+    kind, arguments = producer_first_arguments(row.name, settings)
     return kind, {}, ["resume" if kind == "codex" else "--resume", str(row.current_session), *arguments]
 
 
 def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
                     ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Keep saved launch options with the producer's current model settings; a Claude producer runs with Remote Control."""
-    settings = models_registry.launch_settings("producers", row.name)
+    settings = models_registry.launch_settings("producers", row.id)
     if settings.kind == "claude":
         entry = entry.copy()
         entry["remote_control"] = True
@@ -552,6 +553,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
               success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
     with operation_deadline.within(deadline):
+        if row.kind == "producer":
+            staff.require_no_producer_rename(row.id)
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
         if isinstance(live, herdr.LiveConversation):
@@ -599,6 +602,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
         expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(folder), selected_home)
         if row.kind == "producer":
+            if kind == "claude":
+                prepare_claude_resume(selected_home, folder, row.current_session)
             environment = expectation.environment(environment)
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)

@@ -543,14 +543,14 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 ### The List: `the_list.py`
 
-The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
+The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<List producer staff ID>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
 The CLI requires a producer staff row for the current session.
-Morty's fixed staff ID selects the folder for every caller.
+`page.list.owner` selects the staff ID for every caller.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
-Old records without the field default to morty.
+Old records without the field default to the List producer.
 `record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -604,17 +604,17 @@ The List page and the command show the saved update time beside the latest statu
 They include the date for updates from another day.
 The page shows the time of each log entry beside its source.
 The command refuses a `--source` that ends with a clock time.
-Morty can use every command.
+The List producer can use every command.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
 They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
+Only the List producer can close an item.
 Their updates use the caller's staff name as the log source.
 
-Morty uses `--producer <name or staff id>` on add or update to assign an item.
-New items default to morty.
-Changing the producer to someone other than morty sends two notices after the save.
+The List producer uses `--producer <name or staff id>` on add or update to assign an item.
+New items default to the List producer.
+Changing the producer to someone other than the List producer sends two notices after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
 The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
@@ -624,9 +624,9 @@ The showrunner gets a notice that the saved assignment needs a new producer.
 When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
 When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
 The CLI exits nonzero if a notice fails. The saved assignment stays in place.
-An unchanged producer or an assignment to morty sends no notice.
+An unchanged producer or an assignment to the List producer sends no notice.
 
-Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
+Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by` with `nate` or the configured requester producer.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
@@ -662,7 +662,7 @@ Removed items become Closed records with their recorded removal times and words.
 A completed apply run records source and record hashes; an exact rerun prints `unchanged`.
 A partial apply run refuses another apply run.
 The converter reads question counts but does not create items from them.
-Morty writes items only through `the_list.py`; the old source files remain read-only.
+The List producer writes items only through `the_list.py`; the old source files remain read-only.
 The page and feedback delivery belong to later phases.
 
 ### Investigations: `investigation.py`
@@ -980,7 +980,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.
-    `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
+    `scripts/message/morty_identity.py` reads the current native ID for `page.list.owner`.
     `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
@@ -1175,7 +1175,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.
   Unit names also accept the form from `copies.unit_owner`.
-  Morty uses its staff row. Without that row, `send.py` refuses the name `morty` as it refuses each name without a row.
+  The List producer uses its staff row. Route messages to `staff:<id>` from `page.list.owner`.
   Postmaster replies use explicit session addresses.
   `postmaster`, `sdlc-merge-gate`, and `natedev` have staff rows.
 

@@ -1,0 +1,562 @@
+[
+  {
+    "path": "docs/as-built/buildlog-memory-stalls.md",
+    "line": "Baseline before the 128G cache (bob, 2026-11-19 about 11:37 EST, server up 4 d 16 h 45 min): Rust hits 76,653, misses 101,899, hit rate 42.93%.",
+    "reason": "Keep the dated attribution. Base line 124."
+  },
+  {
+    "path": "docs/as-built/builds-aws-target.md",
+    "line": "The check keeps the two claims from the old phone route, which bob tracks in investigation I7.",
+    "reason": "Keep the investigation attribution. Base line 1230."
+  },
+  {
+    "path": "docs/as-built/showrunner-automation.md",
+    "line": "    `scripts/message/morty_identity.py` reads the current native ID for `page.list.owner`.",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/as-built/staff-accessors.md",
+    "line": "The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/as-built/staff-accessors.md",
+    "line": "The List producer's operations document is `docs/producer/morty-operations.md`.",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/as-built/staff-accessors.md",
+    "line": "| `docs/producer/morty-operations.md` | read | staff.json (shell) |",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/as-built/staff-accessors.md",
+    "line": "| `scripts/message/morty_identity.py` | read | snapshot; holder returns the current_session of the producer row in `page.list.owner` |",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/plans/builds-natest.md",
+    "line": "- Checkpoint `b69fac85d`. Read-only answers to item 80 A, B and C; report at `phases/179/gate_size_questions.md`. A: 338 of 414 slow verify tests start the full `verify.sh` (496 launches); at least 32 tests need the real process path. B: no full-folder `coverage_overlap.py` run exists; `scripts/direct` would cost about 2,545 CPU s and 52 serial minutes (estimate). C: a gate with only tests below 0.5 s keeps 604 of 757 modules, about 1,408 CPU s and 60 s wall (estimate; measured full gate 4,827 CPU s, 204 s). dwight: 5 of 43 failed trees (about 12%, a low estimate) fail only on slow tests.",
+    "reason": "Keep the recorded attribution. Base line 3175."
+  },
+  {
+    "path": "docs/plans/builds-queue-view-boards.html",
+    "line": "  border:1px solid var(--border); border-radius:6px; font:15px/1.35 ui-monospace, \"JetBrains Mono\", \"DejaVu Sans Mono\", Menlo, monospace;",
+    "reason": "Keep the font family. Base line 12."
+  },
+  {
+    "path": "docs/plans/builds-queue.md",
+    "line": "User 2026-11-13 (item 35, via morty and builds): \"hold | drain are two alternatives. hold clears the waiting queue immediately and enters the held state. drain finishes existing queued and running work, then enters the held state. Both prevent new natedev work from running until explicit release. Do not use hold --drain as the new interface. Fast-track this through queue. Update commands, documentation and tests consistently. Preserve the existing immediate hold behavior for running work; report any ambiguity before changing it. Keep the live proof as a separate user-approved step.\" Proposal: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/proposals/drain_hold.md`.",
+    "reason": "Keep the recorded attribution. Base line 2446."
+  },
+  {
+    "path": "docs/plans/builds-report.md",
+    "line": "The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/morty/gate-tooltip-mockup-v2.png`). Use \"integrate\" for \"land\" and \"test nightly\" for \"nightly\". Promote gets no step.",
+    "reason": "Keep the recorded attribution. Base line 1937."
+  },
+  {
+    "path": "docs/plans/builds-resources.md",
+    "line": "**Decision (item 88, bob, producer, 2026-11-18 19:35 EST; the user can reverse it):** `tmp_sweep.py` becomes alarm only. The floor take on Cargo build output under `/build/cargo` and `/build/paths` stays. Removal of that floor take needs a bounding rule for each kind of Cargo output outside slots; that is a later decision for bob.",
+    "reason": "Keep the recorded attribution. Base line 2570."
+  },
+  {
+    "path": "docs/plans/builds-resources.md",
+    "line": "**Source:** item 88, bob (producer) go 2026-11-18 19:40 EST, through builds. On 11-18, 18 folders under `/build/cargo` had no workspace (89.2 GiB) while the floor take cut live worktree output by last use.",
+    "reason": "Keep the recorded attribution. Base line 2925."
+  },
+  {
+    "path": "docs/plans/cargo-style-api.md",
+    "line": "> Review: dwight, 2026-11-16 (`~/rust/hanadocs/dwight/cargo-style-api-review-2026-11-16.md`). All six points are answered below; dwight accepted the answers.",
+    "reason": "Keep the recorded attribution. Base line 4."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "**Repo:** design document, reviewed by dwight. **Depends on:** S1.",
+    "reason": "Keep the recorded attribution. Base line 178."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB). Done 2026-11-18 (nate's go through dwight: \"delete\").",
+    "reason": "Keep the recorded attribution. Base line 122."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "Design: `docs/plans/cargo-style-api.md` (2026-11-16). dwight reviewed it; all six points are answered. nate approved the five subcommand names on 2026-11-16.",
+    "reason": "Keep the recorded attribution. Base line 185."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "Inputs: dwight's brief `~/rust/hanadocs/dwight/cargo-style-brief-2026-11-16.md`, the facts file beside it, the cargo-liner showrunner's workspace needs, and the builds (aws-unit) answer on slots, install and leftovers.",
+    "reason": "Keep the recorded attribution. Base line 14."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "Source: nate, 2026-11-17, through dwight: \"At some point can we retire the python code around style mgmt?\" Answer: yes. No plan holds this work yet. These rules keep S3 to S8 from making it harder.",
+    "reason": "Keep the recorded attribution. Base line 225."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "Status: reviewed by dwight, 2026-11-16 (review 2 passed). Phases start in the order sdlc sets, after the main-red repair, which merged to main as 01a2815b0 on 2026-11-16.",
+    "reason": "Keep the recorded attribution. Base line 3."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "Working choices, taken by dwight on 2026-11-16: N1-A and N2-A. dwight reported both to nate, who can overrule them. The removal of the stand-in and of the parity tests in S8 needs nate's go, with the S8 switch.",
+    "reason": "Keep the recorded attribution. Base line 48."
+  },
+  {
+    "path": "docs/plans/cargo-style.md",
+    "line": "nate to dwight, 2026-11-16, 10:15 to 10:30 EST:",
+    "reason": "Keep the recorded attribution. Base line 8."
+  },
+  {
+    "path": "docs/plans/gate-rename.md",
+    "line": "> **Request:** #108 part B, the user via morty and builds, 2026-11-16. Plan written by the verify unit.",
+    "reason": "Keep the recorded attribution. Base line 5."
+  },
+  {
+    "path": "docs/plans/gate-rename.md",
+    "line": "> **Status: APPROVED 2026-11-16 — sdlc agreed. The user (through morty and builds) gave the go on the plan, the conf rename and \"the gate\" (13:47), the trial branch prefix `aws-trial` (15:49), and the stored names `gate` and `test-affected`, the mode `gate.py --affected` and the box user `gate-box` (17:23). natest starts chunk 1 after its phase 315 work.** Seven chunks. Each chunk merges alone as a builds item and needs no quiet time.",
+    "reason": "Keep the recorded attribution. Base line 3."
+  },
+  {
+    "path": "docs/plans/gate-rename.md",
+    "line": "Three corrections from the user (via morty and builds, 2026-11-16):",
+    "reason": "Keep the recorded attribution. Base line 12."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "+LEGACY_RECEIPT = \"bob\"",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "-    # An old key covers builds only. It cannot confirm delivery to bob.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "- Font declaration in `docs/plans/builds-queue-view-boards.html` line 12. Match `  border:1px solid var(--border); border-radius:6px; font:15px/1.35 ui-monospace, \"JetBrains Mono\", \"DejaVu Sans Mono\", Menlo, monospace;`.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "- Legacy `scripts/production/the_list.py` lines 50 and 204. Match `LEGACY_RECEIPT = \"bob\"` in `scripts/build_queue/head_stall.py`.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "- Legacy feedback input in `scripts/review_links/test_list_page.py` line 1679. Match the full input line that contains `Feedback to morty:`.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "-ALERT_RECIPIENTS: tuple[AlertRecipient, ...] = (\"builds\", \"bob\")",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "-cost_explorer_change_recipient=bob",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "-type AlertRecipient = Literal[\"builds\", \"bob\"]",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "Refuse unrecorded source, destination, or row states. Keep the journal for a retry after changes start. The vault scan found 49 text lines and zero folder-prefixed Obsidian links. Preserve `~/rust/hanadocs/morty/checkins.json` at its original or moved location. The rename command moves the folder and rewrites links with Obsidian closed. It uses no Obsidian command-line tool. List item 177 tracks Git for the producer folders. The producer brain owns it. The phase that reaches main second, prodnames or vaultsave, implements the media rule integration. Write relative media rules to the producer folder's `.gitignore` during creation. Preserve one copy of each rule on creation retries.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "The Morty row records the absent `morty/current.md` as its doc and `~` as its worktree. Other rows use their folder for both paths. Git tracks files in `morty`. The other three folders are untracked. The non-producer folders are `.claude`, `.git`, `.obsidian`, `.ok`, `.trash`, `agents`, `archive`, `as-built`, `change-review`, `conf`, `diary`, `feature-log`, `home-base`, `issues`, `machines`, `poc`, `showrunners`, `topics`, and `ux`.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "Track the guard inputs in `scripts/production/producer_name_guard_names.txt` and `scripts/production/producer_name_guard_exceptions.json`. Exclude both inputs from the scan by exact path. Scan for rollout names `morty`, `brain`, `dwight`, and `bob`. Add later names through normal code changes. Split identifiers at underscores and lower-to-upper case changes. Match whole tokens case-insensitively. Include possessive name tokens such as `bobs`. Report file and line.",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| Staff registry | `rows[].name` = `morty`, `brain`, `dwight`, `bob` on their producer rows | Same fields and values at rollout. Change the selected name through `agents rename`. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `bob` | `a898cb38-dbac-4751-b72b-d0b14ab9c38d` | `-home-natepiano-rust-hanadocs-bob` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `brain` | `01a19d07-c162-7b43-bb48-3ee6c913b3f0` | `-home-natepiano-rust-hanadocs-brain` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `commands/producer/morty.md` | 19 | Use the role and resolve current paths and routes |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `config/accounts.conf` | `no_worker_mode_fyi=morty dwight` | `no_worker_mode_fyi_staff_ids=01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a 920b0a64-6eee-479e-8c07-e03e4dcd4ef6` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `config/aws_target.conf` | `cost_explorer_change_recipient=bob` | `cost_explorer_change_recipient_id=a898cb38-dbac-4751-b72b-d0b14ab9c38d` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `config/models.conf` | `[producers].morty=claude:fable:high`<br>`[producers].brain=claude:fable:high`<br>`[producers].dwight=claude:fable:high`<br>`[producers].bob=claude:fable:high` | `[producers].01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a=claude:fable:high`<br>`[producers].01a19d07-c162-7b43-bb48-3ee6c913b3f0=claude:fable:high`<br>`[producers].920b0a64-6eee-479e-8c07-e03e4dcd4ef6=claude:fable:high`<br>`[producers].a898cb38-dbac-4751-b72b-d0b14ab9c38d=claude:fable:high` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `docs/producer/morty-operations.md` | 6 | Use the role and resolve current paths and routes |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `dwight` | `920b0a64-6eee-479e-8c07-e03e4dcd4ef6` | `-home-natepiano-rust-hanadocs-dwight` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `morty` | `01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` | `-home-natepiano` |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `scripts/message/morty_identity.py` | 9 | Identify the List producer by ID |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `scripts/message/test_morty_identity.py` | 13 | Use synthetic names or staff IDs |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/.codex/skills/generated-from-claude/producer-morty/SKILL.md` | 23 | Regenerate from the command |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/bob/README.md` | 41 | Use the role and update current paths |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/brain/README.md` | 12 | Use the role and update current paths |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/README.md` | 11 | Use the role and update current paths. Include the timer restore instruction on line 27. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/nate-interview.md` | 1 | Use the role on line 3. Preserve stored attribution in dated entries. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/open-for-nate.md` | 1 | Use the role in the timer reporting rule on line 109. Preserve attribution in dated watch entries. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/tools/a.py` | 1 | Outside the repo. Dwight changes the fixed Claude scratch import. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/tools/b.py` | 1 | Outside the repo. Dwight changes the fixed Claude scratch import. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/tools/c.py` | 1 | Outside the repo. Dwight changes the fixed Claude scratch import. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/tools/d.py` | 1 | Outside the repo. Dwight changes the fixed Claude scratch import. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/dwight/tools/k.py` | 1 | Preserve the stored attribution on line 7. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/morty/README.md` | 18 | Outside the repo. Morty changes the name and tool references. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/morty/counts_refresh.py` | 1 | Outside the repo. Morty uses the script folder for its outputs. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/morty/tools/README.md` | 4 | Outside the repo. Morty documents how to read the name from staff. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/prodnames-design.md",
+    "line": "| `~/rust/hanadocs/morty/tools/question_rotation.py` | 3 | Outside the repo. Morty changes it to read the name from staff. |",
+    "reason": "Keep the approved migration plan."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "  - Config changes are limited to the `[producers]` value and the removal of `MORTY_NATIVE_ID` (sdlc).",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "  - `scripts/message/morty_identity.py` — the current native ID for `page.list.owner`.",
+    "reason": "Keep the established file, skill, or retired setting name."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "  It returns `NoMortyHolder()` when the record is unreadable or absent, or when the row count is not one.",
+    "reason": "Keep the recorded attribution. Base line 42."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "  `session_staff.morty_thread` is deleted.",
+    "reason": "Keep the recorded attribution. Base line 49."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "  and does not stop at it. (The first plan started at the last compaction; that gave 14 minutes of morty's Codex conversation.)",
+    "reason": "Keep the recorded attribution. Base line 86."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "### Phase 1 — Morty authority from the staff row  · status: done",
+    "reason": "Keep the recorded attribution. Base line 34."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "**Acceptance gate:** `test_morty_identity.py`, `test_send.py`, `test_session_staff.py`, `test_staff_sources.py` and `test_staff_accessors.py` pass.",
+    "reason": "Keep the recorded attribution. Base line 69."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "**Goal:** Morty's identity comes from the producer row named `morty`; `MORTY_NATIVE_ID` and the authority mark are gone.",
+    "reason": "Keep the recorded attribution. Base line 38."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- Delete `MORTY_NATIVE_ID` from `config/send.conf`.",
+    "reason": "Keep the recorded attribution. Base line 50."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- The reader reads from the end of the file in windows that double. It does not read a large transcript in full (morty's is 138 MB).",
+    "reason": "Keep the recorded attribution. Base line 88."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `commands/agents.md`, `commands/producer/morty.md`, `commands/producer/brain.md`, `commands/producer/dwight.md`.",
+    "reason": "Keep the recorded attribution. Base line 137."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `commands/producer/morty.md`, `brain.md` and `dwight.md` each have a `Transfer` section.",
+    "reason": "Keep the recorded attribution. Base line 128."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `commands/showrunner/produce.md` keeps the rule \"A message from morty is the user's\" without the mark.",
+    "reason": "Keep the recorded attribution. Base line 47."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `morty_identity.holder()` reads the one producer row named `morty` from `staff.snapshot()` and returns `MortyHolder(native)`.",
+    "reason": "Keep the recorded attribution. Base line 41."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `scripts/message/morty_identity.py` — staff read in place of the config read.",
+    "reason": "Keep the recorded attribution. Base line 54."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `scripts/message/test_send.py`, `scripts/message/test_morty_identity.py`, `scripts/production/test_session_staff.py` — staff fixtures.",
+    "reason": "Keep the recorded attribution. Base line 58."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `send.py` drops the `--to morty` native-address exception. Without a row, `morty` is refused as any other name.",
+    "reason": "Keep the recorded attribution. Base line 46."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `send.py` generates no `Authority: morty (speaks for the user)` line (user, 2026-11-13). The first form of this phase",
+    "reason": "Keep the recorded attribution. Base line 43."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "- `send.py` has no stderr note for a `--from morty` sender and quotes only caller lines that start with `Sender native id:`.",
+    "reason": "Keep the recorded attribution. Base line 45."
+  },
+  {
+    "path": "docs/plans/producer-transfer.md",
+    "line": "The checkpoint gate passes. basedpyright reports zero errors and zero warnings. No file outside this plan names `MORTY_NATIVE_ID`.",
+    "reason": "Keep the recorded attribution. Base line 70."
+  },
+  {
+    "path": "scripts/build_queue/head_stall.py",
+    "line": "    # An old key covers builds only. It cannot confirm delivery to bob.",
+    "reason": "Keep the frozen Builds watcher until its rollout. Base line 233."
+  },
+  {
+    "path": "scripts/build_queue/head_stall.py",
+    "line": "ALERT_RECIPIENTS: tuple[AlertRecipient, ...] = (\"builds\", \"bob\")",
+    "reason": "Keep the frozen Builds watcher until its rollout. Base line 30."
+  },
+  {
+    "path": "scripts/build_queue/head_stall.py",
+    "line": "type AlertRecipient = Literal[\"builds\", \"bob\"]",
+    "reason": "Keep the frozen Builds watcher until its rollout. Base line 29."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "                self.assertEqual(self.sent_recipients(), [\"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 372."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        (builds, builds_message), (bob, bob_message) = self.sent[2:]",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 339."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual([command[command.index(\"--to\") + 1] for command, _ in self.sent], [\"builds\", \"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 325."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(attempts, [[\"builds\"], [\"builds\", \"bob\"]])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 405."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(bob, [*builds[:recipient], \"bob\", *builds[recipient + 1:]])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 342."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(bob_message, builds_message)",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 344."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(json.loads(self.paths.state.read_text())[\"alerted\"], {\"builds\": last_start, \"bob\": last_start})",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 354."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(json.loads(self.paths.state.read_text())[\"alerted\"], {\"builds\": last_start, \"bob\": last_start})",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 383."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(self.sent_recipients(), [\"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 382."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(self.sent_recipients(), [\"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 385."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\", \"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 285."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\", \"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 304."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\", \"builds\", \"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 313."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\"])",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 293."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "    def test_a_legacy_delivery_record_still_allows_bobs_first_alert(self) -> None:",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 377."
+  },
+  {
+    "path": "scripts/build_queue/test_head_stall.py",
+    "line": "    def test_four_heads_in_one_stall_alert_builds_and_bob_once(self) -> None:",
+    "reason": "Keep the frozen Builds fixture until its rollout. Base line 315."
+  },
+  {
+    "path": "scripts/message/test_morty_identity.py",
+    "line": "from scripts.message import morty_identity as list_identity",
+    "reason": "Keep the module path."
+  },
+  {
+    "path": "scripts/production/staff_sources.py",
+    "line": "from scripts.message import morty_identity as list_identity  # noqa: E402",
+    "reason": "Keep the module path."
+  },
+  {
+    "path": "scripts/production/test_the_list.py",
+    "line": "        _ = path.write_text(path.read_text().replace(OTHER.id, \"dwight\"))",
+    "reason": "Test an old List record."
+  },
+  {
+    "path": "scripts/production/the_list.py",
+    "line": "    LEGACY_PRODUCER = \"dwight\"",
+    "reason": "Read old List records."
+  },
+  {
+    "path": "scripts/production/the_list.py",
+    "line": "_LEGACY_FEEDBACK = \"Feedback to morty: \"",
+    "reason": "Read old List records."
+  },
+  {
+    "path": "scripts/production/the_list.py",
+    "line": "from scripts.message import morty_identity as list_identity",
+    "reason": "Keep the module path."
+  },
+  {
+    "path": "scripts/review_links/list_page.py",
+    "line": "  if(show==='morty-answering') params.set('show','awaiting-answer');",
+    "reason": "Read old List links."
+  },
+  {
+    "path": "scripts/review_links/list_page.py",
+    "line": "from scripts.message import morty_identity as list_identity",
+    "reason": "Keep the module path."
+  },
+  {
+    "path": "scripts/review_links/review_submissions.py",
+    "line": "from scripts.message import morty_identity as list_identity",
+    "reason": "Keep the module path."
+  },
+  {
+    "path": "scripts/review_links/test_list_page.py",
+    "line": "            \"- 2026-11-16 18:10:00+00:00 Feedback to morty: \" + row + \" — nate via List\" for row in rows))",
+    "reason": "Read old List records."
+  }
+]

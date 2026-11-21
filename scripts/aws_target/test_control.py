@@ -1420,6 +1420,8 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.other, '2.0', '1.0', '+1.0', '—'])
 
     def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
+        recipient_id = '00000000-0000-4000-8000-000000000008'
+        text_setting(self.settings, 'cost_explorer_change_recipient_id', recipient_id)
         one = self.day(1)
         self.gate(self.size, self.home, one, 3600)
         self.gate(self.size, self.other, one, 3600)
@@ -1428,7 +1430,7 @@ class HoursCheckTests(CostFixture):
         day = one.date().isoformat()
         self.assertEqual(len(self.notice_commands), 1)
         self.assertEqual(self.notice_commands[0][2:], (
-            '--to', 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d', '--from', 'AWS hours check',
+            '--to', f'staff:{recipient_id}', '--from', 'AWS hours check',
             '--timeout', '5', '--text',
             'AWS Spot hours differ from the cost ledger.\n'
             + f'On {day} UTC, AWS billed 1.30 h of {self.size} Spot in {self.home}.\n'

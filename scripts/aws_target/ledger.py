@@ -1494,7 +1494,7 @@ def send_settled_changes(settings: SpendingSettings, changes: Sequence[_UnsentSe
     message = '\n'.join(notice.change.display_line(notice.day) for notice in changes)
     try:
         result = subprocess.run(session_send.send_argv(
-            '--to', settings.cost_explorer_change_recipient, '--from', 'aws-settled-watch',
+            '--to', f'staff:{settings.cost_explorer_change_recipient_id}', '--from', 'aws-settled-watch',
             '--key', key, '--repeat-minutes', str(repeat_minutes), '--text', message),
             capture_output=True, text=True, timeout=settings.notification_timeout_s, check=False)
     except (OSError, subprocess.SubprocessError):

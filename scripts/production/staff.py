@@ -7,6 +7,7 @@ try:
 except FileNotFoundError:
     pass
 
+import errno
 import fcntl
 import json
 import os
@@ -14,7 +15,7 @@ import re
 import shlex
 import sys
 import time
-from collections.abc import Mapping, Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -34,6 +35,7 @@ if __name__ == "__main__":
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
     import argparse
+    from scripts.lib.conf import ConfigRead
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
@@ -867,7 +869,7 @@ def _row_lock(key: str) -> tuple[Path, str]:
 
 
 @contextmanager
-def row_operation(reference: str) -> Generator[None]:
+def row_operation(reference: str, *, rename_operation: str = "") -> Generator[None]:
     """Lock one staff row across lifecycle commands and inherited children."""
     if _joined_operation(*_row_lock(reference)):
         yield
@@ -881,6 +883,8 @@ def row_operation(reference: str) -> Generator[None]:
         yield
         return
     with slot_operation(str(row.id), row.name):
+        if row.kind == "producer":
+            require_no_producer_rename(row.id, operation=rename_operation)
         yield
 
 
@@ -1103,6 +1107,13 @@ def validate_name(kind: Kind, name: str) -> None:
         raise StaffRefused(f"invalid short staff name: {name!r}")
     if kind == "worker":
         _ = WorkerName.parse(name)
+
+
+def validate_producer_name(name: str) -> None:
+    """Check a new producer name before it enters staff or a path."""
+    if re.fullmatch(r"[a-z0-9-]+", name) is None:
+        raise StaffRefused(f"invalid producer name {name!r}: use lower-case letters, digits, and hyphens")
+    validate_name("producer", name)
 
 
 def validate_unit_name_for_write(name: str) -> None:
@@ -1330,7 +1341,7 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
                          all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))))
 
 
-def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
+def _remote(arguments: list[str], *, input_text: str | None = None, machine: str = OWNER_MACHINE) -> object:
     # Direct worker writers run inside the caller's membership lock. Match the
     # local API's row transaction without entering the outer lifecycle operation.
     import shlex
@@ -1341,10 +1352,12 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
         arguments = [*arguments, "--row-write"]
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
+    json_position = arguments.index("--") if "--" in arguments else len(arguments)
+    arguments = [*arguments[:json_position], "--json", *arguments[json_position:]]
     timeout = _wait_seconds("REMOTE_SECONDS")
-    command = ["ssh", "-o", "BatchMode=yes", OWNER_MACHINE,
+    command = ["ssh", "-o", "BatchMode=yes", machine,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
-               + shlex.join([*arguments, "--json"])]
+               + shlex.join(arguments)]
     try:
         done = subprocess.run(command, stdin=subprocess.DEVNULL if input_text is None else None,
                               input=input_text, capture_output=True,
@@ -1352,10 +1365,10 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     except (OSError, subprocess.TimeoutExpired) as error:
         if time.monotonic() >= worker_lifecycle.effective_deadline():
             raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
-        raise StaffUnreadable(f"{OWNER_MACHINE} not reached") from error
+        raise StaffUnreadable(f"{machine} not reached") from error
     reason = done.stderr.strip()
     if done.returncode != 0 and (done.returncode == 255 or not reason):
-        raise StaffUnreadable(f"{OWNER_MACHINE} not reached")
+        raise StaffUnreadable(f"{machine} not reached")
     if done.returncode == 1 and reason.startswith("staff member not found: "):
         raise StaffNotFound(StaffId(reason.removeprefix("staff member not found: ")))
     if done.returncode == 2:
@@ -1416,6 +1429,8 @@ def _read_remote_producer_creation(name: str) -> RecordedProducerCreation | Prod
 def producer_creation_registry(action: str, name: str, marker: str = "",
                                profile: str = "") -> RecordedProducerCreation | ProducerCreationRegistryStatus:
     """Use the staff owner for shared producer creation marker operations."""
+    if action == "claim":
+        validate_producer_name(name)
     if not is_owner():
         if action == "read":
             return _read_remote_producer_creation(name)
@@ -1427,6 +1442,12 @@ def producer_creation_registry(action: str, name: str, marker: str = "",
     edit = cast(Callable[[str, str, str, str], RecordedProducerCreation | ProducerCreationRegistryStatus],
                 import_module("scripts.agents.producer_creation").owner_registry_action)
     try:
+        if action == "claim":
+            with _record_lock():
+                rename_plan = _read_producer_rename()
+                if rename_plan is not None and name.casefold() in rename_plan.names():
+                    raise StaffRefused(f"{name}: a producer rename reserves this name")
+                return edit(action, name, marker, profile)
         return edit(action, name, marker, profile)
     except ValueError as error:
         raise StaffRefused(str(error)) from error
@@ -1533,6 +1554,12 @@ def _lookup(rows: list[StaffRow], target: str) -> StaffRow | None:
 
 def by_id(staff_id: StaffId) -> StaffRow | None:
     return snapshot().by_id(staff_id)
+
+
+def producer_name(staff_id: StaffId, *, members: StaffSnapshot | None = None) -> str | None:
+    """Read the current name of a producer from its staff row."""
+    row = (snapshot() if members is None else members).by_id(staff_id)
+    return row.name if row is not None and row.kind == "producer" else None
 
 
 def by_current_session(session_id: str) -> StaffRow | None:
@@ -1644,21 +1671,314 @@ mv -f "$temporary" "$directory/staff.json"
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
 
-def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
+@dataclass(frozen=True)
+class ProducerRename:
+    operation: str
+    before: StaffRow
+    after: StaffRow
+    paths: tuple[Path, ...] = ()
+
+    def names(self) -> frozenset[str]:
+        return frozenset((self.before.name.casefold(), self.after.name.casefold()))
+
+    def to_json(self) -> dict[str, object]:
+        return {"operation": self.operation, "before": self.before.to_json(),
+                "after": self.after.to_json(), "paths": [str(path) for path in self.paths]}
+
+    @classmethod
+    def from_json(cls, value: object) -> Self:
+        if not isinstance(value, dict):
+            raise StaffUnreadable("invalid producer rename reservation")
+        fields = cast(dict[str, object], value)
+        operation, paths = fields.get("operation"), fields.get("paths")
+        if (not isinstance(operation, str) or re.fullmatch(r"[0-9a-f]{32}", operation) is None
+                or not isinstance(paths, list)):
+            raise StaffUnreadable("invalid producer rename reservation")
+        values = cast(list[object], paths)
+        if any(not isinstance(path, str) or not Path(path).is_absolute() for path in values):
+            raise StaffUnreadable("invalid producer rename paths")
+        return cls(operation, StaffRow.from_json(fields.get("before")), StaffRow.from_json(fields.get("after")),
+                   tuple(Path(path) for path in cast(list[str], values)))
+
+
+def _rename_fields(row: StaffRow) -> tuple[object, ...]:
+    return row.name, row.worktree, row.doc, row.current_session
+
+
+def _rename_slot() -> Path:
+    path = _file()
+    return path.with_name(f"{path.name}.producer-rename")
+
+
+def _read_producer_rename() -> ProducerRename | None:
+    try:
+        return ProducerRename.from_json(_decode(_rename_slot().read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return None
+
+
+def require_no_producer_rename(identity: str, *, operation: str = "") -> None:
+    if not is_owner():
+        if _remote(["producer-rename", "check", f"--operation={operation}", "--", identity]) is not None:
+            raise StaffUnreadable("invalid producer rename response")
+        return
+    plan = _read_producer_rename()
+    if (plan is not None and plan.operation != operation
+            and (identity in (plan.before.id, plan.before.current_session) or identity.casefold() in plan.names())):
+        raise StaffRefused(f"{plan.before.name}: finish the producer rename to {plan.after.name}")
+
+
+def reserve_producer_rename(plan: ProducerRename) -> None:
+    """Claim the rename slot only if the planned producer still matches."""
+    validate_producer_name(plan.after.name)
+    if not is_owner():
+        _ = _remote(["producer-rename", "claim", plan.operation], input_text=json.dumps(plan.to_json()))
+        return
     from scripts.lib import atomic_file
+
+    with _record_lock() as path:
+        atomic_file.sync_folder_ancestry(path.parent)
+        active = _read_producer_rename()
+        if active is not None:
+            if active.to_json() == plan.to_json():
+                atomic_file.sync_folder(_rename_slot().parent)
+                return
+            raise StaffRefused(f"{active.before.name}: finish the producer rename to {active.after.name}")
+        before, after = plan.before, plan.after
+        record = _load(initial=True)
+        row = record.by_id(before.id)
+        if (row is None or row.kind != "producer" or isinstance(row.retirement, RetiredProducer)
+                or _rename_fields(row) != _rename_fields(before)):
+            raise StaffRefused(f"{before.name}: producer changed before the rename reservation")
+        if (after.kind != "producer" or before.id != after.id or before.current_session != after.current_session):
+            raise StaffRefused("invalid producer rename changes")
+        for name in (before.name, after.name):
+            if isinstance(producer_creation_registry("read", name), RecordedProducerCreation):
+                raise StaffRefused(f"{name}: a producer creation reserves this name")
+        others = [row for row in record.all_rows if row.id != before.id]
+        if any(row.name.casefold() == after.name.casefold() for row in others):
+            raise StaffRefused(f"{after.name}: another staff row has this name")
+        other = _rename_path_user(plan, record.all_rows)
+        if other is not None:
+            if other.id == before.id:
+                raise StaffRefused(f"{before.name}: an unplanned producer location uses a producer rename path")
+            raise StaffRefused(f"{other.name}: another staff row uses a producer rename path")
+        rows_directory = path.parent / "rows"
+        if rows_directory.is_dir():
+            atomic_file.sync_folder_ancestry(rows_directory)
+        atomic_file.write_text_atomic(_rename_slot(), json.dumps(plan.to_json()) + "\n")
+
+
+def release_producer_rename(operation: str) -> None:
+    """Release only the named operation's reservation."""
+    if not is_owner():
+        _ = _remote(["producer-rename", "release", operation])
+        return
+    from scripts.lib import atomic_file
+
+    with _record_lock():
+        plan = _read_producer_rename()
+        if plan is None or plan.operation == operation:
+            _rename_slot().unlink(missing_ok=True)
+            atomic_file.sync_folder(_rename_slot().parent)
+
+
+@dataclass(frozen=True)
+class RenamePathTrace:
+    """Record the path prefixes that resolution visits, including symlink targets."""
+
+    prefixes: tuple[Path, ...]
+
+    @property
+    def destination(self) -> Path:
+        return self.prefixes[-1]
+
+    def to_json(self) -> list[str]:
+        return [str(prefix) for prefix in self.prefixes]
+
+    @classmethod
+    def from_json(cls, value: object) -> RenamePathTrace:
+        paths = _checked_rename_paths(value)
+        if not paths:
+            raise StaffUnreadable("empty producer rename path trace")
+        return cls(tuple(paths))
+
+
+def _trace_rename_path(path: Path) -> RenamePathTrace:
+    prefixes: list[Path] = []
+    active_links: set[Path] = set()
+
+    def resolve(target: Path, parent: Path) -> Path:
+        if target.is_absolute():
+            parent = Path("/")
+        for name in target.parts[1:] if target.is_absolute() else target.parts:
+            parent = parent.parent if name == ".." else parent / name
+            prefixes.append(parent)
+            if name == "..":
+                continue
+            try:
+                link = parent.readlink()
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.EINVAL):
+                    raise
+                continue
+            if parent in active_links:
+                raise StaffRefused(f"{parent}: symlink loop in a producer rename path")
+            active_links.add(parent)
+            end = resolve(link, parent.parent)
+            active_links.remove(parent)
+            parent = end
+        return parent
+
+    try:
+        end = resolve(path, Path("/"))
+    except (OSError, RecursionError) as error:
+        raise StaffRefused(f"cannot resolve a producer rename path: {error}") from error
+    if not prefixes or prefixes[-1] != end:
+        prefixes.append(end)
+    return RenamePathTrace(tuple(prefixes))
+
+
+def _rename_path_traces(value: object) -> list[RenamePathTrace]:
+    if not isinstance(value, list):
+        raise StaffUnreadable("invalid producer rename path traces")
+    return [RenamePathTrace.from_json(item) for item in cast(list[object], value)]
+
+
+def _normalized_rename_path(path: Path) -> Path:
+    return Path(os.path.normpath("/" + str(path).lstrip("/")))
+
+
+def _moved_producer_doc(doc: LiveDoc | WrappedDoc, source: Path, destination: Path,
+                        trace: RenamePathTrace) -> LiveDoc | WrappedDoc:
+    if trace.destination.is_relative_to(source):
+        return replace(doc, path=destination / trace.destination.relative_to(source))
+    if any(prefix.is_relative_to(source) for prefix in trace.prefixes):
+        raise StaffRefused(f"{doc.path}: the producer document path leaves the moved folder")
+    return doc
+
+
+def plan_producer_rename_doc(doc: LiveDoc | WrappedDoc, source: Path, destination: Path) -> LiveDoc | WrappedDoc:
+    """Plan the document path on the machine that moves the folder."""
+    return _moved_producer_doc(doc, _trace_rename_path(source).destination, destination,
+                               _trace_rename_path(doc.path))
+
+
+def _rename_path_user(plan: ProducerRename, rows: Sequence[StaffRow]) -> StaffRow | None:
+    from scripts.agents import remote
+
+    if not plan.paths or not rows:
+        return None
+    machine = worktree_machine(plan.before)
+    alias = remote.machine_alias(machine)
+    known = [(row, location) for row in rows for location in (row.worktree, row.doc)
+             if isinstance(location, (PresentWorktree, RemovedWorktree, LiveDoc, WrappedDoc))]
+    matches = {machine}
+    if isinstance(alias, remote.MachineAlias):
+        candidates = {location.machine for _, location in known} - matches
+        matches.update(candidate for candidate in candidates if remote.machine_alias(candidate) == alias)
+    locations = [(row, location) for row, location in known if location.machine in matches]
+    if not locations:
+        return None
+    paths = tuple(dict.fromkeys((*plan.paths, *(location.path for _, location in locations))))
+    if isinstance(alias, remote.MachineAlias) and alias.alias != remote.this_machine():
+        result = _remote(["resolve-rename-paths"], input_text=json.dumps(list(map(str, paths))), machine=alias.alias)
+        resolved = _rename_path_traces(result)
+        if len(resolved) != len(paths):
+            raise StaffUnreadable("invalid resolved producer rename path count")
+    elif machine == remote.local_machine() or isinstance(alias, remote.MachineAlias):
+        resolved = [_trace_rename_path(path) for path in paths]
+    else:
+        raise StaffRefused(f"{machine}: unknown producer rename machine")
+
+    by_path = dict(zip(paths, resolved, strict=True))
+    reserved = {path for original in plan.paths
+                for path in (_normalized_rename_path(original), by_path[original].destination)}
+    before, after = plan.before.worktree, plan.after.worktree
+    for row, location in locations:
+        path = location.path
+        if (row.id == plan.before.id and isinstance(before, PresentWorktree)
+                and isinstance(after, PresentWorktree) and before != after
+                and before.path in plan.paths and after.path in plan.paths):
+            if location == before:
+                continue
+            if isinstance(location, (LiveDoc, WrappedDoc)):
+                expected = _moved_producer_doc(location, by_path[before.path].destination, after.path, by_path[path])
+                if expected != plan.after.doc:
+                    raise StaffRefused(f"{path}: the producer document path changed before rename")
+                if expected != location:
+                    continue
+        candidates = (*by_path[path].prefixes, _normalized_rename_path(path))
+        if any(candidate.is_relative_to(root) for candidate in candidates for root in reserved):
+            return row
+    return None
+
+
+def _checked_rename_paths(value: object) -> list[Path]:
+    if not isinstance(value, list):
+        raise StaffUnreadable("invalid producer rename paths")
+    paths = cast(list[object], value)
+    if any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths):
+        raise StaffUnreadable("invalid producer rename paths")
+    return [Path(path) for path in cast(list[str], paths)]
+
+
+def _check_rename_writes(original: StaffSnapshot, rows: list[StaffRow],
+                         pending: set[StaffId], operation: str) -> None:
+    plan = _read_producer_rename()
+    if plan is None:
+        return
+    identity = plan.before.id
+    previous = {row.id: row for row in original.all_rows}
+    current = {row.id: row for row in rows}
+    old, new = previous.get(identity), current.get(identity)
+    if (old is None or new is None or old.kind != new.kind or old.retirement != new.retirement
+            or (identity in original.pending_retire) != (identity in pending)):
+        raise StaffRefused(f"{plan.before.name}: retirement or role change conflicts with producer rename")
+    if _rename_fields(old) != _rename_fields(new):
+        if operation != plan.operation or _rename_fields(new) != _rename_fields(plan.after):
+            raise StaffRefused(f"{plan.before.name}: protected fields belong to the producer rename")
+    changed_locations: list[StaffRow] = []
+    for row in rows:
+        if row.id == identity:
+            continue
+        old = previous.get(row.id)
+        if (old is None or (old.name, old.kind) != (row.name, row.kind)) and row.name.casefold() in plan.names():
+            raise StaffRefused(f"{row.name}: a producer rename reserves this name")
+        if old is None or (old.worktree, old.doc) != (row.worktree, row.doc):
+            changed_locations.append(row)
+            if old is not None:
+                changed_locations.append(old)
+    user = _rename_path_user(plan, changed_locations)
+    if user is not None:
+        raise StaffRefused(f"{user.name}: a producer rename reserves this path")
+
+
+@contextmanager
+def _record_lock() -> Generator[Path]:
     from scripts.agents import worker_lifecycle
 
     path = _file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        worker_lifecycle.acquire_flock(lock)
+        yield path
+
+
+def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result],
+                        *, rename_operation: str = "") -> _Result:
+    from scripts.lib import atomic_file
+    from scripts.agents import worker_lifecycle
+
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
-            worker_lifecycle.acquire_flock(lock)
+        with _record_lock() as path:
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
             original = _load(initial=True)
             proposed = list(original.all_rows)
             pending = set(original.pending_retire)
             result = edit(proposed, pending)
+            _check_rename_writes(original, proposed, pending, rename_operation)
             if path.resolve() == _default_file().resolve():
                 previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
@@ -1685,8 +2005,8 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
         raise StaffUnreadable(f"cannot write staff record: {error}") from error
 
 
-def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
-    return _record_transaction(lambda rows, pending: edit(rows))
+def _transaction(edit: Callable[[list[StaffRow]], _Result], *, rename_operation: str = "") -> _Result:
+    return _record_transaction(lambda rows, pending: edit(rows), rename_operation=rename_operation)
 
 
 def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
@@ -1724,6 +2044,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
         return admitted
     if kind == "unit":
         validate_unit_name_for_write(name)
+    if kind == "producer":
+        validate_producer_name(name)
     if not runtime_id:
         raise StaffRefused(f"{kind} {name}: native runtime identity is not proved")
     staff_id = native_id(runtime_id)
@@ -1975,25 +2297,36 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
     return _record_transaction(edit)
 
 
-def rename(staff_id: StaffId, new_name: str) -> StaffRow:
+def rename(staff_id: StaffId, new_name: str, *, operation: str = "") -> StaffRow:
     if not is_owner():
-        renamed = _remote_row(["rename", staff_id, f"--name={new_name}"])
+        renamed = _remote_row(["rename", staff_id, f"--name={new_name}",
+                               *([f"--operation={operation}"] if operation else [])])
     else:
         def edit(rows: list[StaffRow]) -> StaffRow:
             row = _required(rows, staff_id)
             if row.kind == "unit":
                 validate_unit_name_for_write(new_name)
             if row.kind == "producer":
-                validate_name(row.kind, new_name)
-                if row.name.casefold() == "morty" or isinstance(row.retirement, RetiredProducer):
+                if row.name != new_name or operation:
+                    validate_producer_name(new_name)
+                if isinstance(row.retirement, RetiredProducer):
                     raise StaffRefused(f"{row.name}: this producer cannot be renamed")
                 if any(other.id != row.id and other.name.casefold() == new_name.casefold() for other in rows):
                     raise StaffRefused(f"{new_name}: another staff row has this name")
-            renamed = replace(row, name=new_name)
+            if row.kind == "producer" and (row.name != new_name or operation):
+                plan = _read_producer_rename()
+                if (plan is None or plan.operation != operation or plan.before.id != row.id
+                        or plan.after.name != new_name):
+                    raise StaffRefused(f"{row.name}: producer rename requires its reservation")
+                if _rename_fields(row) not in (_rename_fields(plan.before), _rename_fields(plan.after)):
+                    raise StaffRefused(f"{row.name}: producer changed during rename")
+                renamed = replace(row, name=new_name, worktree=plan.after.worktree, doc=plan.after.doc)
+            else:
+                renamed = replace(row, name=new_name)
             rows[rows.index(row)] = renamed
             return renamed
 
-        renamed = _transaction(edit)
+        renamed = _transaction(edit, rename_operation=operation)
     if renamed.kind == "worker":
         herdr = import_module("scripts.herdr.herdr")
         herdr_types = import_module("scripts.herdr.herdr_types")
@@ -2134,16 +2467,43 @@ def require_stopped(identity: StaffId) -> None:
     check(record, identity)
 
 
+def configured_staff_id(settings: ConfigRead, key: str) -> StaffId | None:
+    """Read a canonical staff ID from configuration."""
+    from scripts.lib import conf
+
+    def parse(value: str) -> StaffId:
+        if str(UUID(value)) != value:
+            raise ValueError("Expected a canonical staff ID.")
+        return StaffId(value)
+
+    configured = settings.origin(key, parse)
+    return None if isinstance(configured, conf.UnavailableValue) else configured.value
+
+
+def list_producer_id(settings: ConfigRead | None = None) -> StaffId | None:
+    """Read the staff ID that owns the List."""
+    from scripts.lib import conf
+
+    return configured_staff_id(settings if settings is not None else conf.read_or_repository("console"),
+                               "page.list.owner")
+
+
 def set_producer_retirement(identity: StaffId, state: RetiredProducer | Active) -> StaffRow:
     """Change a producer's retirement mark and preserve its identity and locations."""
     if not is_owner():
         profile = state.profile if isinstance(state, RetiredProducer) else ""
         return _remote_row(["set-producer-retirement", identity, f"--profile={profile}"])
 
+    keeper = list_producer_id()
+    if isinstance(state, RetiredProducer) and keeper is None:
+        raise StaffRefused("The List owner is unavailable.")
+
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
-        if row.kind != "producer" or row.name.casefold() == "morty":
-            raise StaffRefused(f"{row.name}: retirement requires a producer other than morty")
+        if row.kind != "producer":
+            raise StaffRefused(f"{row.name}: retirement requires a producer")
+        if row.id == keeper and isinstance(state, RetiredProducer):
+            raise StaffRefused(f"{row.name}: the List producer cannot retire")
         changed = replace(row, retirement=state)
         rows[rows.index(row)] = changed
         return changed
@@ -2231,6 +2591,12 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
         raise StaffRefused(f"{row.name}: keep the retired producer's identity")
     if row.kind not in ("worker", "producer"):
         raise StaffRefused("retire requires a worker or producer; retain units and showrunners with their location state")
+    if row.kind == "producer":
+        keeper = list_producer_id()
+        if keeper is None:
+            raise StaffRefused("The List owner is unavailable.")
+        if row.id == keeper:
+            raise StaffRefused(f"{row.name}: the List producer cannot retire")
     rows.remove(row)
     return row
 
@@ -2395,6 +2761,8 @@ class _MoveCommand(Protocol):
 
 class _Arguments:
     creation_action: str = ""
+    rename_action: str = ""
+    operation: str = ""
     marker: str = ""
     profile: str = ""
     hold_record: str = ""
@@ -2495,6 +2863,13 @@ def _parser() -> argparse.ArgumentParser:
     _ = creation.add_argument("--marker", default="")
     _ = creation.add_argument("--profile", default="")
     _ = creation.add_argument("--json", action="store_true")
+    resolve_paths = verbs.add_parser("resolve-rename-paths", help=argparse.SUPPRESS)
+    _ = resolve_paths.add_argument("--json", action="store_true")
+    reservation = verbs.add_parser("producer-rename", help=argparse.SUPPRESS)
+    _ = reservation.add_argument("rename_action", choices=("claim", "release", "check"))
+    _ = reservation.add_argument("target")
+    _ = reservation.add_argument("--operation", default="")
+    _ = reservation.add_argument("--json", action="store_true")
     for command in ("promote-unit", "demote-showrunner"):
         director = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = director.add_argument("target")
@@ -2512,6 +2887,7 @@ def _parser() -> argparse.ArgumentParser:
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
+    _ = rename_parser.add_argument("--operation", default="")
     move_parser = verbs.add_parser("move", help="move a unit and its live tab to another showrunner")
     _ = move_parser.add_argument("target", help="<showrunner production_name>/<unit>")
     _ = move_parser.add_argument("destination", nargs="?", help="new showrunner production_name")
@@ -2619,7 +2995,7 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "restore-unit":
         return restore_unit(StaffId(arguments.target), PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "rename":
-        return rename(StaffId(arguments.target), arguments.name)
+        return rename(StaffId(arguments.target), arguments.name, operation=arguments.operation)
     if arguments.verb == "move":
         return move(StaffId(arguments.target), _parent(arguments.parent))
     if arguments.verb == "apply-seed":
@@ -2631,6 +3007,24 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "resolve-rename-paths":
+        paths = _checked_rename_paths(_decode(sys.stdin.read()))
+        print(json.dumps([_trace_rename_path(path).to_json() for path in paths]))
+        return 0
+    if arguments.verb == "producer-rename":
+        if not is_owner():
+            raise StaffRefused("producer rename reservation requires the staff authority")
+        if arguments.rename_action == "claim":
+            plan = ProducerRename.from_json(_decode(sys.stdin.read()))
+            if plan.operation != arguments.target:
+                raise StaffRefused("producer rename operation ID differs from the plan")
+            reserve_producer_rename(plan)
+        elif arguments.rename_action == "release":
+            release_producer_rename(arguments.target)
+        else:
+            require_no_producer_rename(StaffId(arguments.target), operation=arguments.operation)
+        print("null")
+        return 0
     if arguments.verb == "producer-creation":
         action = arguments.creation_action
         creation = producer_creation_registry("read" if action == "read-named" else action,

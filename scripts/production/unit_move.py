@@ -34,7 +34,7 @@ from scripts.herdr import herdr  # noqa: E402
 from scripts.agents import pane_record, detached_run_process  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf, git_files, unit_runs  # noqa: E402
+from scripts.lib import conf, git_files, transcripts, unit_runs  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -224,7 +224,7 @@ def copy_trust(path: Path, old: str, new: str) -> None:
 
 def project_folder(worktree: str) -> str:
     """The folder name Claude keeps a worktree's transcripts under."""
-    return re.sub(r"[^A-Za-z0-9]", "-", worktree)
+    return transcripts.claude_project_key(worktree)
 
 
 def move_configs(old: str, new: str) -> None:
@@ -812,6 +812,13 @@ def worktree_busy(row: staff.StaffRow, record: staff.StaffSnapshot, folder: Path
     return bool(running_work(row, record, folder, folder_move_runs(row, record), processes))
 
 
+def _require_unit_folder_paths(source: Path, destination: Path) -> None:
+    root = Path(conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")).expanduser().resolve()
+    for path in (source, destination):
+        if path.is_relative_to(root):
+            raise RenameRefused(f"{path}: unit moves cannot use the producer folder root {root}")
+
+
 def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch) -> bool:
     """Move a rename's folder and branch without any session lifecycle operation."""
     destination = destination.expanduser().resolve()
@@ -830,6 +837,7 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
             if destination != pending.destination or branch != pending.branch or row.name != pending.name:
                 raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         old = location.path.expanduser().resolve()
+        _require_unit_folder_paths(old, destination)
         folder = rename_observation(record, row, pending)[0] if pending is not None else old if old.exists() else destination
         require_move_destination(record, row, destination)
         if worktree_busy(row, record, folder):
@@ -922,6 +930,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         if location.machine != remote.local_machine():
             raise ValueError(f"{unit}: run move-folder on {location.machine}")
         old = location.path.expanduser().resolve()
+        _require_unit_folder_paths(old, destination)
         require_move_destination(record, row, destination)
         folder = old if old.exists() else destination
         runs = folder_move_runs(row, record)

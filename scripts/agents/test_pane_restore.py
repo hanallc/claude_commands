@@ -31,6 +31,7 @@ from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib.transcripts import claude_project_key
 from scripts.agents import pane_record as restart_records
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
@@ -63,14 +64,22 @@ def fixture_launch_transcript(root: Path, entry: pane_launch.PaneLaunch, record:
         home = root / (".codex2" if kind == "codex" else ".claude3")
     for opposite in root.glob((".claude*" if kind == "codex" else ".codex*") + "/**/*" + identity + ".jsonl"):
         opposite.unlink()
+    folder = (owner.worktree.path if owner is not None and isinstance(owner.worktree, staff.PresentWorktree)
+              else Path(entry.get("cwd", root)))
     target = (home / "sessions" / f"rollout-{identity}.jsonl" if kind == "codex" else
-              home / "projects/fixture" / f"{identity}.jsonl")
+              home / "projects" / claude_project_key(folder) / f"{identity}.jsonl")
     process = root / "proc/123/cmdline"
     if process.exists() and Path(process.read_text().split("\0")[0]).name != kind:
         write_text_atomic(process, "\0".join([kind, "resume" if kind == "codex" else "--resume", identity]) + "\0")
     if not target.exists():
         write_text_atomic(target, json.dumps({"type": "session_meta", "payload": {"id": identity, "cwd": str(entry.get("cwd", root))}}) + "\n"
             if kind == "codex" else "")
+    if kind == "claude":
+        for account in root.glob(".claude*"):
+            if account.is_dir() and account != home:
+                sibling = account / target.relative_to(home)
+                if not sibling.exists():
+                    write_text_atomic(sibling, target.read_text())
 
 
 @contextmanager
@@ -258,7 +267,7 @@ class PaneRestoreTests(unittest.TestCase):
             _ = write_config_fixture(configuration / source.name)
         write_machine_config(configuration)
         _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
-        registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
+        registry = write_registry(configuration / "models.conf", {"producers": {self.row.id: "claude:opus:max"}})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
         for pid in (123, 4242):
             self.native_processes[pid] = herdr.NativeAgentProcess(herdr.EnvironmentThread(self.row.current_session),
@@ -318,7 +327,7 @@ class PaneRestoreTests(unittest.TestCase):
     def entry(self, **changes: object) -> None:
         kind = cast(Literal["claude", "codex"], changes.get("kind", "claude"))
         _ = write_registry(self.root / "configuration/models.conf", {"producers": {
-            "alpha": "codex:gpt-test:high" if kind == "codex" else "claude:opus:max"}}, update=True)
+            self.row.id: "codex:gpt-test:high" if kind == "codex" else "claude:opus:max"}}, update=True)
         if kind == "codex":
             changes = {"config_dir": str(self.root / ".codex2"),
                        "environment": {"CODEX_HOME": str(self.root / ".codex2")}, **changes}

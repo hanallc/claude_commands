@@ -1037,7 +1037,7 @@ The last admission or step start with a memory need above zero must also be at l
 Merge gates and targeted tests start with a memory need of zero.
 The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
 
-The watch sends one alert per stall to each of the `builds` and `bob` sessions.
+The watch sends one alert per stall to each of the Builds session and the Builds producer.
 The alert names the head and lists each holder's time since admission, memory promise, and memory use.
 It adds a note when an incomplete sccache scan can make the use values too low.
 The stall key is the most recent admission or step start with a memory need above zero.

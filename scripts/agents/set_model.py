@@ -550,8 +550,8 @@ def run(role_name: str, model: str, effort: str) -> int:
     results = _update_sessions(rows, target, _checks(settings))
     if role.kind == "producer":
         profiles = models_registry.parse_registry(after).get("producers", {})
-        missing = [_change("producers", row.name, f"{target.kind}:{model}:{target.effort}") for row in rows
-                   if row.name not in profiles and results[row.id].state == SessionState.CONFIRMED]
+        missing = [_change("producers", staff.native_id(row.id), f"{target.kind}:{model}:{target.effort}")
+                   for row in rows if row.id not in profiles and results[row.id].state == SessionState.CONFIRMED]
         if missing:
             _, profiles_ok = _save(path, after, registry_rows.replay(after, missing, False),
                                    description, "producer profiles", preserve_producer_rows=True)

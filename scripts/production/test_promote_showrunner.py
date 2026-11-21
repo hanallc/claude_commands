@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, cast, final, override
@@ -769,6 +770,26 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertIn("accounts.py move showrunners <claudeN>", error)
         self.assert_nothing_stopped()
         self.assertFalse(accounts.groups_file().exists())
+
+    def test_promotion_refuses_a_reserved_name_before_saving_or_stopping(self) -> None:
+        unit = self.staff_unit()
+        producer = fixture_member("producer", name="fixture-producer")
+        plan = staff.ProducerRename("1" * 32, producer, replace(producer, name="child"))
+        with mock.patch.object(staff, "producer_creation_registry",
+                               return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+            staff.reserve_producer_rename(plan)
+        try:
+            with (mock.patch.object(promote_showrunner, "save_promotion") as save,
+                  mock.patch.object(promote_showrunner, "stop") as stop):
+                code, output, errors = self.run_main()
+            self.assertEqual((code, output), (2, ""))
+            self.assertIn("finish the producer rename to child", errors)
+            save.assert_not_called()
+            stop.assert_not_called()
+            self.assert_nothing_stopped()
+            self.assertEqual(staff.by_id(unit.id), unit)
+        finally:
+            staff.release_producer_rename(plan.operation)
 
     def test_promotion_uses_showrunners_group_instead_of_retained_unit_account(self) -> None:
         selected = self.ready_showrunner_account()

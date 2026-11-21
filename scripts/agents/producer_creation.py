@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 from contextlib import contextmanager, suppress
@@ -36,6 +37,47 @@ def read_record(path: Path) -> dict[str, object]:
 def write_record(path: Path, record: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_file.write_text_atomic(path, json.dumps(record, sort_keys=True) + "\n")
+
+
+def _completed_lookup(name: str, row: staff.StaffRow) -> dict[str, object]:
+    saved = read_record(record_path(name))
+    if not saved:
+        return {}
+    if (saved.get("staff", row.id) != row.id
+            or "staff" not in saved and not isinstance(saved.get("opening_confirmed"), str)):
+        raise ValueError(f"{name}: the creation record is not complete for this producer")
+    return {**saved, "staff": row.id}
+
+
+def _receipt_path(row: staff.StaffRow) -> Path:
+    return pane_record.record_directory() / f".producer-created-{row.id}"
+
+
+def plan_completed_record(name: str, row: staff.StaffRow) -> dict[str, object]:
+    """Record the creation evidence that the rename must preserve."""
+    saved = _completed_lookup(name, row)
+    receipt = read_record(_receipt_path(row))
+    if receipt and (receipt.get("staff") != row.id or saved and receipt != saved):
+        raise ValueError(f"{name}: completed creation evidence differs")
+    return saved or receipt
+
+
+def retain_completed_record(name: str, row: staff.StaffRow, expected: dict[str, object]) -> None:
+    """Verify the planned receipt before clearing the creation lookup."""
+    path = record_path(name)
+    receipt_path = _receipt_path(row)
+    saved = _completed_lookup(name, row)
+    receipt = read_record(receipt_path)
+    if (saved or receipt) != expected or (receipt and receipt != expected):
+        raise ValueError(f"{name}: completed creation evidence differs")
+    if saved:
+        if not receipt:
+            write_record(receipt_path, expected)
+        else:
+            atomic_file.sync_folder(receipt_path.parent)
+        path.unlink()
+    if path.parent.exists():
+        atomic_file.sync_folder(path.parent)
 
 
 @contextmanager
@@ -93,12 +135,19 @@ def claim(name: str, marker: Marker, profile: models_registry.ProducerProfile) -
     _ = staff.producer_creation_registry("claim", name, marker.value(), profile.value())
 
 
-def sync_profile(name: str) -> None:
-    """Fetch the shared profile after a claim or on retry."""
-    if not staff.is_owner():
-        path = models_registry.registry_path()
-        before = models_registry.registry_text(path)
-        _ = models_registry.store_registry(path, before, before, f"read producer profile for {name}")
+def saved_profile(record: Mapping[str, object]) -> models_registry.ProducerProfile | None:
+    if not record:
+        return None
+    profile = record.get("profile")
+    if not isinstance(profile, str):
+        raise ValueError("the creation record has no profile")
+    return models_registry.parse_producer_profile(profile)
+
+
+def publish_profile(row: staff.StaffRow, profile: models_registry.ProducerProfile) -> None:
+    """Publish the saved profile before the pane binds to the staff row."""
+    _ = models_registry.store_producer(row.id, *profile, preserve_existing=True)
+    _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
 
 
 def finish(name: str, marker: Marker) -> None:
@@ -132,12 +181,8 @@ def owner_registry_action(action: str, name: str, value: str,
             with suppress(staff.StaffAbsent):
                 if any(row.name.casefold() == key for row in staff.authority_snapshot().all_rows):
                     raise ValueError(f"{name}: a staff row already has this name")
-            checked = models_registry.parse_producer_profile(profile)
-            registered = registry.get("producers", {}).get(name)
-            if registered is not None and registered != checked.value():
-                raise ValueError(f"{name}: its producer settings changed during creation")
-            edits = [registry_rows.RowChange("producers", name, f"{name}={checked.value()}"),
-                     registry_rows.RowChange(SECTION, name, f"{name}={marker.value()}")]
+            _ = models_registry.parse_producer_profile(profile)
+            edits = [registry_rows.RowChange(SECTION, name, f"{name}={marker.value()}")]
         elif action == "finish":
             edits = [registry_rows.RowChange(SECTION, marker_name, "")]
         else:

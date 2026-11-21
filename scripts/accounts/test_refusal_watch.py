@@ -2509,7 +2509,7 @@ class RefusalWatchTests(unittest.TestCase):
             member = staff_test_support.fixture_member("producer", name="old-probe")
             owner = self.owner(str(member.current_session))
             owner["name"] = "old-probe"
-            _ = staff.rename(member.id, "renamed-probe")
+            _ = staff_test_support.fixture_rename_producer(member, "renamed-probe")
             current = staff.native_id(staff_test_support.fixture_runtime_id("renamed-proof-current"))
             _ = staff.update_current_session(member.current_session, current)
             _ = self.owner(str(current))

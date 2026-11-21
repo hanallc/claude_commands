@@ -26,7 +26,7 @@ from typing import cast, final
 from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
-from scripts.aws_target.config import read_settings
+from scripts.aws_target.config import cost_explorer_change_recipient_id, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
@@ -48,7 +48,6 @@ SNAPSHOT_ERROR_PATTERNS = (
 SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
-HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
 
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
@@ -313,9 +312,9 @@ def hours_gap_message(day: str, size: str, region: str, check: run_cost.HoursChe
     ))
 
 
-def send_hours_gap(message: str, delivery_timeout: float) -> bool:
-    """Check whether send.py confirms delivery or accepts the message for bob's queue."""
-    command = send_argv('--to', HOURS_GAP_RECIPIENT, '--from', 'AWS hours check',
+def send_hours_gap(recipient_id: str, message: str, delivery_timeout: float) -> bool:
+    """Check if send.py accepts the notice."""
+    command = send_argv('--to', f'staff:{recipient_id}', '--from', 'AWS hours check',
                         '--timeout', f'{delivery_timeout:g}', '--text', message)
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False,
@@ -327,13 +326,14 @@ def send_hours_gap(message: str, delivery_timeout: float) -> bool:
 
 
 def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time) -> int:
-    """Send bob one message per type, region, and UTC day above the gap limit."""
+    """Send one notice per type, region, and UTC day above the gap limit."""
     configuration = conf.read(settings_path)
     limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
     end = datetime.fromtimestamp(clock(), UTC)
     days = configuration.whole('run_cost_days')
     start = end - timedelta(days=days)
     try:
+        recipient_id = cost_explorer_change_recipient_id(configuration)
         scope = hours_check_scope(conf.read_or_repository('cloud_gate'))
         checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
                                            configuration.text('instance_type'), scope, limit)
@@ -353,7 +353,7 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
         if not check.hours_gap_over or key in claimed:
             continue
         message = hours_gap_message(day, size, region, check, limit)
-        if send_hours_gap(message, configuration.number('snapshot_notification_timeout_s')):
+        if send_hours_gap(recipient_id, message, configuration.number('snapshot_notification_timeout_s')):
             claimed.add(key)
             save()
         else:

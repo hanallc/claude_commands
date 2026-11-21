@@ -128,11 +128,11 @@ class RepeatGuardTests(unittest.TestCase):
 
         _ = self.enterContext(patch.object(guard, "Popen", launch))
 
-    def attempt(self, text: str = "Morty: worker stopped", *, at: float = 1,
-                receiver: str = "session:morty", protected: bool = False) -> guard.Attempt:
+    def attempt(self, text: str = "Fixture_keeper: worker stopped", *, at: float = 1,
+                receiver: str = "session:fixture_keeper", protected: bool = False) -> guard.Attempt:
         return guard.Attempt("watchdog", receiver, text, "fixture-host", at, protected)
 
-    def apply(self, text: str = "Morty: worker stopped", *, at: float = 1) -> guard.Decision:
+    def apply(self, text: str = "Fixture_keeper: worker stopped", *, at: float = 1) -> guard.Decision:
         return guard.transition(self.state, self.attempt(text, at=at), self.limits)
 
     def persist(self, attempt: guard.Attempt) -> guard.Decision:
@@ -193,7 +193,7 @@ def slow_start(*args, **kwargs):
     return launch(*args, **kwargs)
 with patch.object(guard, 'Popen', slow_start):
     held = [guard.check(Path(sys.argv[1]), guard.Attempt(
-        'watchdog', 'session:morty', 'stopped', 'fixture-host', at)).held for at in range(3)]
+        'watchdog', 'session:fixture_keeper', 'stopped', 'fixture-host', at)).held for at in range(3)]
 print(json.dumps(held))
 """
         child = subprocess.run([sys.executable, "-c", program, str(self.root / "child")],
@@ -257,7 +257,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             f"with open({str(loaded)!r}, 'w') as marker: marker.write('loaded')\n")
         with patch.dict(os.environ, {"PYTHONPATH": str(site), "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))}):
             held = [guard.check(self.root, self.attempt(at=at)).held for at in range(3)]
-            guard.transport_result("watchdog", "session:morty", "stopped", "delivered")
+            guard.transport_result("watchdog", "session:fixture_keeper", "stopped", "delivered")
         self.assertEqual(held, [False, False, True])
         self.assertEqual(len((self.root.parent / "transports.jsonl").read_text().splitlines()), 1)
         self.assertFalse(loaded.exists())
@@ -386,7 +386,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual(errors.getvalue(), "")
         migrated = guard.decode(path.read_text())
         self.assertEqual(migrated.notices, [])
-        self.assertEqual(migrated.rates["session:morty"].count, 1)
+        self.assertEqual(migrated.rates["session:fixture_keeper"].count, 1)
         saved = cast(dict[str, object], json.loads(path.read_text()))
         self.assertNotIn("rate_first", saved)
         self.assertNotIn("rate_count", saved)
@@ -427,14 +427,14 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             self.assertFalse(guard.transition(self.state, self.attempt(f"result {index}", at=index), limits).held)
         self.assertEqual([notice.kind for notice in self.state.notices], ["owner"])
         self.assertEqual(self.state.notices[0].receivers, 1)
-        self.assertEqual(self.state.rates["session:morty"].count, 4)
+        self.assertEqual(self.state.rates["session:fixture_keeper"].count, 4)
         self.assertEqual(len(self.state.receivers), 2)
         self.assertEqual(len(self.state.floods), 2)
 
     def test_person_messages_and_phone_questions_never_enter_guard_state(self) -> None:
         self.assertEqual([self.apply(at=index).held for index in range(3)], [False, False, True])
         before = asdict(self.state)
-        for receiver in ("session:morty", "user"):
+        for receiver in ("session:fixture_keeper", "user"):
             for index in range(6):
                 decision = guard.transition(self.state, self.attempt(at=index, receiver=receiver,
                     protected=receiver != "user"), self.limits)
@@ -443,19 +443,19 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
 
     def test_window_expiry_and_a_changed_message_resume_delivery(self) -> None:
         self.assertEqual([self.apply(at=index).held for index in range(3)], [False, False, True])
-        self.assertFalse(self.apply("Morty: recovered", at=3).held)
-        self.assertFalse(self.apply("Morty: recovered", at=4).held)
+        self.assertFalse(self.apply("Fixture_keeper: recovered", at=3).held)
+        self.assertFalse(self.apply("Fixture_keeper: recovered", at=4).held)
         self.assertFalse(self.apply(at=self.limits.window_seconds + 4).held)
 
     def test_interleaving_distinct_notices_does_not_reset_a_repeated_texts_count(self) -> None:
-        self.assertFalse(self.apply("Morty stopped", at=0).held)
+        self.assertFalse(self.apply("Fixture_keeper stopped", at=0).held)
         self.assertFalse(self.apply("Berth stopped", at=1).held)
-        self.assertFalse(self.apply("Morty stopped", at=2).held)
+        self.assertFalse(self.apply("Fixture_keeper stopped", at=2).held)
         self.assertFalse(self.apply("Berth recovered", at=3).held)
-        self.assertTrue(self.apply("Morty stopped", at=4).held)
+        self.assertTrue(self.apply("Fixture_keeper stopped", at=4).held)
 
     def test_one_owner_notice_covers_all_receivers_of_a_flood(self) -> None:
-        for receiver in ("session:morty", "session:berth"):
+        for receiver in ("session:fixture_keeper", "session:berth"):
             for index in range(5):
                 _ = self.persist(self.attempt(at=index, receiver=receiver))
         sink: list[tuple[str, int, int]] = []
@@ -469,12 +469,12 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual(sink, [("owner", 10, 2)])
 
     def test_different_texts_have_separate_episodes_and_expire_after_inactivity(self) -> None:
-        for text in ("Morty stopped", "Berth stopped"):
+        for text in ("Fixture_keeper stopped", "Berth stopped"):
             for at in range(3):
                 _ = guard.transition(self.state, self.attempt(text, at=at), self.limits)
         self.assertEqual([notice.kind for notice in self.state.notices].count("owner"), 2)
         for at in range(self.limits.window_seconds + 5, self.limits.window_seconds + 8):
-            _ = guard.transition(self.state, self.attempt("Morty stopped", at=at), self.limits)
+            _ = guard.transition(self.state, self.attempt("Fixture_keeper stopped", at=at), self.limits)
         self.assertEqual([notice.kind for notice in self.state.notices].count("owner"), 3)
 
     def test_held_flood_notifies_only_the_owner_and_cannot_feed_the_guard(self) -> None:
@@ -502,7 +502,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertIn("watchdog", owner_sink[0])
         self.assertIn("4 copies", owner_sink[0])
         self.assertIn("1 sessions", owner_sink[0])
-        self.assertIn("Morty: worker stopped", owner_sink[0])
+        self.assertIn("Fixture_keeper: worker stopped", owner_sink[0])
         self.assertEqual(len(list(self.root.glob("*.json"))), 1)
 
     def test_saved_phone_notices_are_dropped_without_rejecting_owner_work(self) -> None:
@@ -523,7 +523,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
 
     def test_concurrent_processes_admit_on_contention_and_keep_valid_state(self) -> None:
         program = ("import sys; from pathlib import Path; from scripts.message import repeat_guard as g; "
-                   + "print(g.check(Path(sys.argv[1]), g.Attempt('watchdog','morty','stopped','fixture-host',float(sys.argv[2]))).held)")
+                   + "print(g.check(Path(sys.argv[1]), g.Attempt('watchdog','fixture_keeper','stopped','fixture-host',float(sys.argv[2]))).held)")
         def attempt(index: int) -> bool:
             result = subprocess.run([sys.executable, "-c", program, str(self.root), str(index)],
                 capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
@@ -538,7 +538,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         # Once contention ends, durable counting still enforces the threshold.
         self.assertEqual([attempt(index) for index in range(8, 11)], [False, False, True])
         state = guard.decode(next(self.root.glob("*.json")).read_text())
-        self.assertEqual(state.rates["morty"].count, 3)
+        self.assertEqual(state.rates["fixture_keeper"].count, 3)
         self.assertEqual(state.holds, [10])
 
     def test_missing_or_invalid_config_fails_open_and_prints_one_error(self) -> None:
@@ -571,7 +571,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual(list(self.root.glob("*.json")), [])
 
     def test_replay_is_pure_and_counts_no_distinct_or_protected_holds(self) -> None:
-        rows: list[dict[str, object]] = [{"from": "watchdog", "to": "morty", "text": text,
+        rows: list[dict[str, object]] = [{"from": "watchdog", "to": "fixture_keeper", "text": text,
             "time": f"2026-10-31T01:00:0{index}+00:00", "machine": "fixture-host",
             "safety": "distinct" if text == "recovered" else "repeat"}
             for index, text in enumerate(("stopped", "stopped", "stopped", "recovered"))]
@@ -626,7 +626,7 @@ def stalled(path, text):
     Path(sys.argv[2]).write_text(str(path) + "\\n" + text)
     threading.Event().wait()
 g.write_text_atomic = stalled
-print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog','session:morty','Morty: worker stopped','fixture-host',4)))))
+print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog','session:fixture_keeper','Fixture_keeper: worker stopped','fixture-host',4)))))
 """
         start = time.monotonic()
         with patch.dict(os.environ, {"PYTHONPATH": str(Path(guard.__file__).parent)}):
@@ -634,7 +634,7 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
         self.assertLess(time.monotonic() - start, DEADLINE_CEILING_FACTOR)
         self.assertIn(str(path), marker.read_text())
         published = cast(dict[str, dict[str, dict[str, object]]], json.loads(marker.read_text().split("\n", 1)[1]))
-        self.assertEqual(published["rates"]["session:morty"]["count"], 4)
+        self.assertEqual(published["rates"]["session:fixture_keeper"]["count"], 4)
 
     def assert_notice(self, state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> None:
         self.assertTrue(any(item.id == notice.id for item in state.notices))
@@ -648,7 +648,7 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
         def failed(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
             self.assert_notice(state, notice, limits)
             calls.append(notice.kind)
-            return "failed" if notice.text == "Morty: worker stopped" else "queued"
+            return "failed" if notice.text == "Fixture_keeper: worker stopped" else "queued"
         guard.drain(self.root, failed, 3)
         def delivered(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
             self.assert_notice(state, notice, limits)
@@ -972,7 +972,7 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
         completed: list[str] = []
         def deliver(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
             self.assert_notice(state, notice, limits)
-            clock[0] += 60 if notice.text == "Morty: worker stopped" else 45
+            clock[0] += 60 if notice.text == "Fixture_keeper: worker stopped" else 45
             if notice.text == "other flood":
                 completed.append(notice.text)
                 return "delivered"
@@ -981,7 +981,7 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
             guard.drain(self.root, deliver, 3, cleanup_seconds=20)
             self.assertEqual(completed, [])
             state = guard.decode(next(self.root.glob("*.json")).read_text())
-            self.assertEqual([notice.text for notice in state.notices], ["other flood", "Morty: worker stopped"])
+            self.assertEqual([notice.text for notice in state.notices], ["other flood", "Fixture_keeper: worker stopped"])
             guard.drain(self.root, deliver, 4, cleanup_seconds=20)
             self.assertEqual(completed, ["other flood"])
 

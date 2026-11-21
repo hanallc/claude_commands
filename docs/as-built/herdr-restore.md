@@ -63,7 +63,7 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   A saved pane without a staff row uses its saved identity, account, and folder.
   Both routes send no opening prompt.
   They preserve the saved Remote Control setting and `disableAgentView`.
-  Producers use the current `[producers]` model and effort.
+  Producers read their current `[producers]` profile by staff ID.
   Other Claude resumes use the model and effort from the latest real assistant turn.
   A saved-pane resume or worker account move uses the saved model when there is no usable turn.
   A worker account move uses the role model if the saved model is empty.
@@ -163,7 +163,8 @@ One `accounts.settings_report_scope()` covers the operation.
 Invalid producer settings exclude that producer and produce one warning per operation.
 
 Each producer has its own tab in the configured `PRODUCER_WORKSPACE`, normally `producers`.
-Resume uses its current conversation, current `[producers]` settings, and family account.
+Resume uses the current conversation and the `[producers]` profile for its staff ID.
+It selects the account for that profile family.
 A live producer starts nothing.
 A paused producer stays stopped.
 An exit request also excludes the producer from upkeep.
