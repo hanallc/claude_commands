@@ -2157,6 +2157,9 @@ class NoExpectedDocument:
     """The caller did not supply a prior binding."""
 
 
+NO_EXPECTED_DOCUMENT = NoExpectedDocument()
+
+
 def _doc_arguments(doc: LiveDoc | WrappedDoc | DocUnfilled, prefix: str = "") -> list[str]:
     if isinstance(doc, DocUnfilled):
         return [f"--{prefix}state", "unfilled"]
@@ -2188,7 +2191,7 @@ def _require_document_change(row: StaffRow, destination: LiveDoc | WrappedDoc | 
 
 
 def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc, *,
-            expected: LiveDoc | WrappedDoc | DocUnfilled | NoExpectedDocument = NoExpectedDocument()) -> StaffRow:
+            expected: LiveDoc | WrappedDoc | DocUnfilled | NoExpectedDocument = NO_EXPECTED_DOCUMENT) -> StaffRow:
     """Set the document through the authority and verify admitted changes on the document machine."""
     if not is_owner():
         arguments = ["set-doc", showrunner, *_doc_arguments(doc)]
@@ -2667,7 +2670,8 @@ def _expected_document(arguments: _Arguments) -> LiveDoc | WrappedDoc | DocUnfil
             return WrappedDoc(arguments.expected_machine, Path(arguments.expected_path))
         case "unfilled":
             return DOC_UNFILLED
-    return NoExpectedDocument()
+        case _:
+            return NO_EXPECTED_DOCUMENT
 
 
 def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:

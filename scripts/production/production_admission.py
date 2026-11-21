@@ -134,7 +134,8 @@ def _parse_binding(raw: object, machine: str, source: Path) -> DocumentBinding:
             return staff.LiveDoc(machine, path)
         case "wrapped":
             return staff.WrappedDoc(machine, path)
-    raise Refusal(f"{source}: invalid document state")
+        case _:
+            raise Refusal(f"{source}: invalid document state")
 
 
 def _parse_renames(raw: object, source: Path) -> tuple[DocumentRename, ...]:
@@ -142,9 +143,12 @@ def _parse_renames(raw: object, source: Path) -> tuple[DocumentRename, ...]:
         raise Refusal(f"{source}: expected document renames")
     renames: list[DocumentRename] = []
     for item in cast(list[object], raw):
-        if not isinstance(item, list) or len(item) != 3:
+        if not isinstance(item, list):
             raise Refusal(f"{source}: invalid document rename")
-        admitted, before, after = cast(list[object], item)
+        paths = cast(list[object], item)
+        if len(paths) != 3:
+            raise Refusal(f"{source}: invalid document rename")
+        admitted, before, after = paths
         renames.append(DocumentRename(_absolute_path(admitted, source), _absolute_path(before, source),
                                       _absolute_path(after, source)))
     return tuple(renames)
