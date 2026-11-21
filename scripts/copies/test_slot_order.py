@@ -32,11 +32,11 @@ from scripts.build_targets import target_config
 from scripts.copies import copies
 from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_slot
 from scripts.build_queue import step_estimator
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import eligibility
 from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
-from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
+from scripts.lib import build_folders, build_slots, conf
 from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1210,33 +1210,6 @@ placement_once
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["open", "dispatch", "close"])
 
-    def assert_ssh_source(self, source: Path, caller: Path, revision: str, scenario: str) -> None:
-        with copies.requested_source(source, copies.WorktreeSource("HEAD", str(source)),
-                                     copies.MergeRevision(revision)) as snapshot:
-            self.assertEqual((snapshot / "src/lib.rs").read_text(), "pub fn changed() {}\n")
-            self.assertEqual((snapshot / "src/merged.rs").read_text(), "pub fn merged() {}\n")
-            self.assertFalse((source / "src/merged.rs").exists())
-            if scenario != "clean-linux":
-                _ = (snapshot / "src/main.rs").write_text("fn main() { let _ = 1; }\n")
-            tree = copies.staged_tree(snapshot, include_worktree=True)
-            trust = copies.SshSourceTrust(offload.trusted_linux_source, nix_env.trusted_root, nix_env.registered_worktree)
-            trusted = scenario in ("clean-linux", "trusted-linux", "trusted-envrc")
-            self.assertEqual(offload.trusted_linux_source(caller), trusted or scenario == "mismatched-linux")
-            with copies.remote_step_source(snapshot, tree, caller, trust) as checkout:
-                self.assertEqual(checkout.parent, copy_record.root().resolve())
-                record = copy_record.read_record(checkout / copy_record.RECORD)
-                self.assertIsInstance(record, copy_record.Registered)
-                assert isinstance(record, copy_record.Registered)
-                self.assertEqual("generated_source" in record.fields, trusted)
-                self.assertEqual(offload.trusted_linux_source(checkout), trusted)
-                if scenario in ("trusted-envrc", "untrusted-envrc"):
-                    self.assertIsNotNone(copy_record.record_path(checkout))
-                    self.assertEqual(record.fields.get("source_commit"), copies.commit_at(source, "HEAD") if trusted else None)
-                self.assertEqual((checkout / "src/lib.rs").read_text(), "pub fn changed() {}\n")
-                self.assertEqual((checkout / "src/merged.rs").read_text(), "pub fn merged() {}\n")
-                self.assertEqual(treekey.tree_key(str(checkout)), treekey.committed_tree_key(tree.encode("ascii")))
-            self.assertFalse(self.slot_root.exists())
-
     def test_remote_grant_source_key_matches_the_prepared_slot(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
@@ -1298,6 +1271,10 @@ placement_once
                         isinstance(record, copy_record.Registered) and "generated_source" in record.fields,
                     ]
                     observed.with_suffix(".trust").write_text(json.dumps(evidence))
+                    observed.with_suffix(".record").write_text(json.dumps([
+                        copy_record.record_path(repo) is not None,
+                        record.fields.get("source_commit") if isinstance(record, copy_record.Registered) else None,
+                    ]))
                     if request.verb == "doc":
                         observed.with_suffix(".doc").write_text(json.dumps([
                             str(repo), isinstance(request.source, offload.StagedDocSnapshot),
@@ -1367,10 +1344,6 @@ placement_once
                     case_environment.update(HOME=str(self.root), TMPDIR=str(remote_tmp),
                                             TEST_TRUST_CALLER=str(other if mismatch else tools.root))
                     ready.touch()
-                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux"):
-                    with locked_environment({**os.environ, **case_environment}, self.queue.loop_access):
-                        self.assert_ssh_source(tools.root, other if mismatch else tools.root, revision, scenario)
-                    continue
                 if scenario == "retry":
                     case_environment.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75",
                         TEST_RUNNER_REASON="source_changed", TEST_PROVIDER_ALLOW_RUNNER_REFUSALS="1",
@@ -1440,6 +1413,11 @@ placement_once
                         self.assertEqual(runner_trusted, trusted, "Linux source approval changed in the copy")
                         self.assertTrue(under_scratch and registered, "The SSH checkout needs a scratch record")
                         self.assertEqual(marked, trusted)
+                        if envrc:
+                            record_found, pinned = cast(
+                                tuple[bool, str | None], json.loads(observed.with_suffix(".record").read_text()))
+                            self.assertTrue(record_found, "The envrc proof needs a discoverable clone record")
+                            self.assertEqual(pinned, copies.commit_at(tools.root, "HEAD") if trusted else None)
                         self.assertEqual(process.returncode, 0 if trusted else 2, stdout + stderr)
                         if not trusted:
                             self.assertIn("target peer refused: repo", stderr)
