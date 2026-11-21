@@ -602,6 +602,8 @@ If the settings are invalid or unreadable, restart reports the role error and le
 Restart checks the worker's current role under its row lock. If the role changed, restart leaves the worker running.
 Other selected rows continue through stop and restart.
 Worker restore uses the checked policy if the role still matches.
+A role write between the last restart check and restore can make restore refuse and leave the worker stopped.
+If this rare race occurs, a later restore recovers the worker when its role and the role's settings are valid.
 
 `agents restart ACCOUNT --all` selects live rows on that Claude or Codex account.
 It reads the account from each observed process environment.
