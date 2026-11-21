@@ -131,7 +131,6 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     argv = [command, *arguments]
     cwd = os.getcwd()
     repository, worktree = step_estimator.git_identity(argv, cwd)
-    landing_repository = client.landing_repository_key(parse.cargo_subcommand(arguments), repository, argv, cwd)
     width = records.test_threads(argv)
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
     prefix = f"build-admission-ci-{os.getuid()}-"
@@ -148,7 +147,7 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), cwd,
             client.CLOCK.now(), str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
-            route=records.direct_cargo_route(), landing_repository=landing_repository)
+            route=records.direct_cargo_route())
         with ExitStack() as reservation:
             try:
                 held = reservation.enter_context(queue_place.held_reservation(request))

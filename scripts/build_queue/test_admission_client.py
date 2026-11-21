@@ -2239,15 +2239,21 @@ class ClientTests(unittest.TestCase):
 
     def test_estimate_refresh_changes_only_profile_freshness_and_landing_key(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(since=fixture.clock.now() - 700)
+            request = fixture.request(step="nextest", since=fixture.clock.now() - 700)
             landing = wire.LandingRepositoryKey("https://github.com/natepiano/claude_commands")
             updated = replace(request, episode="must-not-replace", since=fixture.clock.now(),
-                owner=wire.Owner(1, "wrong"), identity=replace(request.identity, unit="wrong", landing_repository=landing),
+                owner=wire.Owner(1, "wrong"), identity=replace(request.identity, unit="wrong"),
                 profile=replace(request.profile,
                     peak=records.ExpectedPeak(2 * GIB, "measured", 9)), fresh_test=True)
             transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
             refresh = mock.Mock(return_value=updated)
-            self.assertEqual(client.admit(request, lambda _wait: None, refresh), GRANTED)
+
+            def publish_origin(_wait: wire.Wait) -> None:
+                git_directory = fixture.root / ".git"
+                git_directory.mkdir()
+                _ = (git_directory / "config").write_text(f'[remote "origin"]\nurl = {landing.key}\n')
+
+            self.assertEqual(client.admit(request, publish_origin, refresh), GRANTED)
             self.assertEqual(transport.requests[1], replace(request, profile=updated.profile, fresh_test=True,
                 identity=replace(request.identity, landing_repository=landing)))
             self.assertEqual(refresh.call_count, 1)

@@ -138,7 +138,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
     try:
         with _connect(_remaining_seconds(deadline)) as connection:
             connection.settimeout(_remaining_seconds(deadline))
-            connection.sendall(wire.encode_request(request).encode())
+            _send_request(connection, request)
             line = _line(connection, bytearray(), deadline)
             reply = wire.parse_reply(line, request)
             if isinstance(reply, wire.Refused):
@@ -349,15 +349,13 @@ def _refreshed(first: wire.AdmitRequest | wire.LaunchRequest,
         updated = refresh()
     finally:
         _ESTIMATE_CONNECTION.reset(token)
-    # Keep the original queue place and refresh the landing key with the estimate.
+    # Keep the original queue place when the estimate changes.
     if isinstance(first, wire.AdmitRequest) and isinstance(updated, wire.AdmitRequest):
-        identity = replace(first.identity, landing_repository=updated.identity.landing_repository)
         if isinstance(first.place, wire.CloudPlace):
-            return replace(first, identity=identity)
-        return replace(first, identity=identity, profile=updated.profile, fresh_test=updated.fresh_test)
+            return first
+        return replace(first, profile=updated.profile, fresh_test=updated.fresh_test)
     if isinstance(first, wire.LaunchRequest) and isinstance(updated, wire.LaunchRequest):
-        identity = replace(first.identity, landing_repository=updated.identity.landing_repository)
-        return replace(first, identity=identity, profile=updated.profile)
+        return replace(first, profile=updated.profile)
     raise CheckerFailure("refresh changed request kind")
 
 
@@ -374,11 +372,14 @@ class _QueueLeft(Exception):
 class AcquisitionRetry:
     deadline: float
     launch_without_wait: bool = False
+    launching: bool = False
+    launch_directory: str = ""
     next_leave: float = float("inf")
     last_outage_line: float = float("-inf")
     leave_interval: float = float("inf")
     unreachable_deadline: float = float("inf")
     estimate_refresh_pending: bool = False
+    landing_keys: dict[tuple[str, wire.Owner | placement.SubmittingOwner], wire.LandingRepositoryKey] = field(default_factory=dict)
 
     def start_leave_schedule(self, interval: float) -> None:
         self.leave_interval = interval
@@ -597,7 +598,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 send_timeout = retry.bound(timeout)
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
-                connection.sendall(wire.encode_request(request).encode())
+                _send_request(connection, request)
                 answered_expiry = -math.inf
                 pending = active_channel.pending if active_channel is not None else bytearray()
                 while True:
@@ -741,7 +742,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 request = refreshed
                                 break
                         # A new connection would end this waiter's place, and a pass could start a later step in the gap.
-                        connection.sendall(wire.encode_request(refreshed).encode())
+                        _send_request(connection, refreshed)
                         request = refreshed
                         answered_expiry = cause.estimated_at
                         continue
@@ -824,7 +825,7 @@ def _first_request_wait[Request, Reply](launching: bool, refresh: Callable[[], R
     """Build the first request inside the retry schedule that its refreshes use."""
     limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
     token = _ACQUISITION_RETRY.set(AcquisitionRetry(CLOCK.monotonic() + limit if launching and limit > 0 else float("inf"),
-                                                    launch_without_wait=launching and limit == 0))
+                                                    launch_without_wait=launching and limit == 0, launching=launching))
     try:
         try:
             request = refresh()
@@ -1196,31 +1197,91 @@ def verify_call() -> records.VerifyStep:
     return records.NotVerifyCall()
 
 
-def landing_repository_key(step: str, source: records.Repository, argv: list[str], cwd: str) -> wire.LandingRepository:
-    """Resolve the test repository without changing its history key."""
-    from scripts.build_queue import admission_records as records, landing_test_gate
-    from scripts.buildlog import repository, step_context, store
+def _landing_origin(common: Path) -> str:
+    in_origin = False
+    for line in (common / "config").read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if text.startswith("["):
+            in_origin = text == '[remote "origin"]'
+        elif in_origin:
+            name, separator, value = text.partition("=")
+            if separator and name.strip().lower() == "url":
+                return " ".join(shlex.split(value, comments=True))
+    return ""
+
+
+def _landing_repository_key(directory: str) -> wire.LandingRepository:
+    """Follow local origins to a repository with a remote URL."""
+    from scripts.buildlog import repository
     from scripts.lib import git_files
 
-    if step not in landing_test_gate.TEST_STEPS:
-        return wire.LandingRepositoryNotRecorded()
-    directory = step_context.git_directory(argv, cwd)
-    key = source.key if isinstance(source, records.RepositoryIdentity) else repository.repository_key(directory)
+    folder = Path(directory)
     seen: set[Path] = set()
-    while Path(key).is_absolute():
-        try:
-            checkout = git_files.locate(Path(directory))
-            common = checkout.common_dir
-            origin = Path(repository.source_git_dir(str(common)))
-            root = checkout.toplevel if origin == common else origin.parent
-            if root in seen:
-                return wire.LandingRepositoryNotRecorded()
-            seen.add(root)
-            key = repository.repository_key(str(root))
-            directory = key if Path(key).is_dir() else key + ".git"
-        except (OSError, ValueError):
-            return wire.LandingRepositoryNotRecorded()
-    return wire.LandingRepositoryNotRecorded() if key == store.UNKNOWN_IDENTITY else wire.LandingRepositoryKey(key)
+    try:
+        while folder.is_dir():
+            if (folder / "HEAD").is_file() and (folder / "config").is_file():
+                root = common = folder.resolve()
+            else:
+                checkout = git_files.locate(folder)
+                root, common = checkout.toplevel, checkout.common_dir
+            if common in seen:
+                break
+            seen.add(common)
+            origin = _landing_origin(common)
+            if not origin:
+                break
+            key = repository.remote_identity(origin, str(root))
+            if not Path(key).is_absolute():
+                return wire.LandingRepositoryKey(key)
+            borrowed = repository.borrowed_git_dir(str(common))
+            folder = Path(borrowed or key)
+            if not folder.is_dir() and not borrowed:
+                folder = Path(key + ".git")
+    except (OSError, ValueError):
+        pass
+    return wire.LandingRepositoryNotRecorded()
+
+
+def _send_request(connection: socket.socket, request: wire.Request) -> None:
+    if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.PlacementRequest, wire.ServiceEstimateRequest)):
+        from scripts.build_queue import landing_test_gate
+
+        retry = _ACQUISITION_RETRY.get()
+        episode_owner = request.episode, request.owner
+        if isinstance(request, wire.ServiceEstimateRequest):
+            from scripts.buildlog import parse
+
+            step = parse.cargo_subcommand(request.argv[1:])
+            key = request.landing_repository
+        else:
+            step = request.profile.step
+            key = request.identity.landing_repository
+        if isinstance(key, wire.LandingRepositoryNotRecorded) and retry is not None:
+            key = retry.landing_keys.get(episode_owner, key)
+        if isinstance(key, wire.LandingRepositoryNotRecorded) and step in landing_test_gate.TEST_STEPS:
+            from scripts.buildlog import step_context
+
+            if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest)):
+                directory = step_context.git_directory(list(request.argv), request.cwd)
+            elif isinstance(request, wire.PlacementRequest):
+                directory = (step_context.git_directory(list(request.local.argv), request.local.cwd)
+                             if isinstance(request.local, wire.LocalAdmissionContext) else request.constraints.repository)
+            else:
+                if retry is not None and retry.launch_directory:
+                    directory = retry.launch_directory
+                else:
+                    folder = request.identity.folder
+                    directory = step_context.git_directory([], folder if Path(folder).is_absolute() else os.getcwd())
+            if Path(directory).is_absolute():
+                key = _landing_repository_key(directory)
+        if isinstance(key, wire.LandingRepositoryKey):
+            if retry is not None:
+                retry.landing_keys[episode_owner] = key
+            if isinstance(request, wire.ServiceEstimateRequest):
+                request = replace(request, landing_repository=key)
+            else:
+                request = replace(request, identity=replace(request.identity, landing_repository=key))
+    connection.sendall(wire.encode_request(request).encode())
 
 
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
@@ -1244,8 +1305,12 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
         records.UnspecifiedTestWidth() if request_profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = replace(step_identity(request_profile.step, request_profile.worktree), verify=verify_call(),
-        landing_repository=landing_repository_key(request_profile.step, request_profile.repository, argv, cwd))
+    identity = replace(step_identity(request_profile.step, request_profile.worktree), verify=verify_call())
+    retry = _ACQUISITION_RETRY.get()
+    if retry is not None and retry.launching:
+        from scripts.buildlog import step_context
+
+        retry.launch_directory = step_context.git_directory(argv, cwd)
     if isinstance(request_profile, records.ProgramProfile):
         identity = replace(identity, folder=request_profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
@@ -1537,7 +1602,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                     cause = cause.cause
                 if isinstance(cause, records.EstimateExpired):
                     local = cast(wire.AdmitRequest, _refreshed(local, refresh_local))
-                    request = replace(request, identity=local.identity, profile=local.profile,
+                    request = replace(request, profile=local.profile,
                         local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                             local.test_width, local.fresh_test, local.token_back_at))
                     continue

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import nullcontext, redirect_stderr
 from dataclasses import replace
 import io
@@ -9,11 +10,12 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records as records
 from scripts.build_queue import first_step, memory_feed, placement, queue_place, queue_view, step_estimator
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
+from scripts.build_queue.admission_test_support import (AdmissionFixture, Exchange, GIB, ScriptedTransport,
+    admitted_reply, only_admitted, reply_bytes, wait_reply)
 from scripts.build_queue.test_placement import (PlacementFixture, adopt_assignment, assignment_for, consume_permission,
     placement_request, publish_candidate)
 from scripts.buildlog import repository
@@ -28,6 +30,10 @@ REPOSITORY = records.RepositoryIdentity("https://github.com/natepiano/claude_com
 LANDING_REPOSITORY = wire.LandingRepositoryKey(REPOSITORY.key)
 COMMIT = "a" * 40
 WAIT_TEXT = "waits for the merge test"
+
+
+class LandingWaitObserved(Exception):
+    """End the client call after the service sends a landing wait."""
 
 
 def queue_land() -> None:
@@ -48,6 +54,16 @@ def local_test_clone(root: Path, source_name: str = "source", upstream: str = RE
 
 
 class LandingAdmissionTests(unittest.TestCase):
+    def assert_landing_wait(self, fixture: AdmissionFixture, request: wire.AdmitRequest,
+                            check: Callable[[], None] = lambda: None) -> None:
+        def wait(reply: wire.Wait) -> None:
+            self.assertEqual(reply.reason, records.WaitsForLandingTest())
+            check()
+            raise LandingWaitObserved()
+
+        with LauncherHangGuard("Landing wait").protect(), fixture.serving(), self.assertRaises(LandingWaitObserved):
+            _ = client.admit(request, wait, lambda: request)
+
     def test_a_copy_first_step_has_the_landing_reference_before_its_child_starts(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
             fixture.configure(**{"program_first_peak_gib.merge-gate": 4.0})
@@ -113,16 +129,17 @@ class LandingAdmissionTests(unittest.TestCase):
             workdir.mkdir()
             queue_land()
             owner = fixture.request(step="test", need=GIB)
-            with patch.object(repository, "repository_key", wraps=repository.repository_key) as lookup:
-                request = client.step_request(["cargo", "test"], str(workdir), owner.owner, owner.since, "", owner.episode)
-                resolved = lookup.call_count
-                self.assertGreater(resolved, 0)
-                wait, = fixture.connect(request).replies()
-                assert isinstance(wait, wire.Wait)
-                self.assertEqual(wait.reason, records.WaitsForLandingTest())
-                _ = fixture.run_pass()
-                _ = fixture.run_pass()
-                self.assertEqual(lookup.call_count, resolved)
+            request = client.step_request(["cargo", "test"], str(workdir), owner.owner, owner.since, "", owner.episode)
+            with (patch.object(repository, "remote_identity", wraps=repository.remote_identity) as lookup,
+                  patch.object(repository, "output", side_effect=AssertionError("landing lookup started Git"))):
+                def check_lookup() -> None:
+                    resolved = lookup.call_count
+                    self.assertGreater(resolved, 0)
+                    _ = fixture.run_pass()
+                    _ = fixture.run_pass()
+                    self.assertEqual(lookup.call_count, resolved)
+
+                self.assert_landing_wait(fixture, request, check_lookup)
 
     def test_a_relative_origin_can_name_a_checkout_with_a_dot_git_suffix(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
@@ -132,10 +149,81 @@ class LandingAdmissionTests(unittest.TestCase):
             owner = fixture.request(step="test", need=GIB)
             request = client.step_request(["cargo", "test"], str(clone), owner.owner,
                                           owner.since, "", owner.episode)
-            wait, = fixture.connect(request).replies()
-            self.assertIsInstance(wait, wire.Wait)
-            assert isinstance(wait, wire.Wait)
-            self.assertEqual(wait.reason, records.WaitsForLandingTest())
+            self.assert_landing_wait(fixture, request)
+
+    def test_first_step_resends_a_placement_with_the_new_landing_key(self) -> None:
+        with AdmissionFixture() as fixture:
+            clone = local_test_clone(fixture.root)
+            source = fixture.root / "source"
+            unavailable = source.rename(fixture.root / "source-away")
+            request = placement_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            request = replace(request, local=replace(request.local, cwd=str(clone)))
+            assignment = placement.PlacementAssignment(request.episode, "first-step", request.constraints.candidates[0].destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            expired = wire.PlacementWait(request.episode, request.since, 1, (),
+                wait_reply(records.EstimateExpired(1), text="estimate expired"))
+            transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(expired)),
+                Exchange(reply_bytes(wire.Assignment(assignment))), Exchange(reply_bytes(wire.Ok())))
+
+            def restore_origin(_reply: wire.Wait) -> None:
+                _ = unavailable.rename(source)
+
+            with (patch.object(client, "CLOCK", fixture.clock),
+                  patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
+                  patch.object(client.WaitOutput, "__call__", side_effect=restore_origin),
+                  patch.object(first_step, "_verify_request", return_value=request),
+                  patch.object(first_step, "local_release_waiter", return_value=nullcontext(Mock())),
+                  patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.temporary))):
+                with first_step.admitted_run(("bash", "/fixture/verify.sh", "test"), clone) as run:
+                    self.assertEqual(run.grant, wire.Assignment(assignment))
+            initial, refreshed, _ = transport.requests
+            assert isinstance(initial, wire.PlacementRequest) and isinstance(refreshed, wire.PlacementRequest)
+            self.assertEqual(initial.identity.landing_repository, wire.LandingRepositoryNotRecorded())
+            self.assertEqual(refreshed.identity.landing_repository, LANDING_REPOSITORY)
+            self.assertEqual((refreshed.episode, refreshed.owner, refreshed.since),
+                             (initial.episode, initial.owner, initial.since))
+
+    def test_an_admission_refresh_keeps_the_landing_key_after_the_origin_disappears(self) -> None:
+        with AdmissionFixture() as fixture, patch.object(client, "CLOCK", fixture.clock):
+            clone = local_test_clone(fixture.root)
+            seed = fixture.request(step="test")
+
+            def refresh() -> wire.AdmitRequest:
+                return client.step_request(["cargo", "test"], str(clone), seed.owner, seed.since, "", seed.episode)
+
+            def remove_origin(_reply: wire.Wait) -> None:
+                _ = (fixture.root / "source").rename(fixture.root / "source-away")
+
+            grant = admitted_reply()
+            expired = wait_reply(records.EstimateExpired(1), text="estimate expired")
+            transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(expired), reply_bytes(grant)))
+            with patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket):
+                self.assertEqual(client.admit(refresh(), remove_origin, refresh), grant)
+            initial, refreshed = transport.requests
+            assert isinstance(initial, wire.AdmitRequest) and isinstance(refreshed, wire.AdmitRequest)
+            self.assertEqual(initial.identity.landing_repository, LANDING_REPOSITORY)
+            self.assertEqual(refreshed.identity, initial.identity)
+
+    def test_ci_resends_an_estimate_request_with_the_new_landing_key(self) -> None:
+        with AdmissionFixture() as fixture, patch.object(client, "CLOCK", fixture.clock):
+            clone = local_test_clone(fixture.root)
+            source = fixture.root / "source"
+            unavailable = source.rename(fixture.root / "source-away")
+            request = replace(fixture.service_request(), argv=("cargo", "test"), cwd=str(clone))
+
+            def restore_origin(_reply: wire.Wait) -> None:
+                _ = unavailable.rename(source)
+
+            grant = admitted_reply()
+            expired = wait_reply(records.EstimateExpired(1), text="estimate expired")
+            transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(expired), reply_bytes(grant)))
+            with patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket):
+                self.assertEqual(client.service_admit(request, restore_origin), grant)
+            initial, refreshed = transport.requests
+            assert isinstance(initial, wire.ServiceEstimateRequest)
+            self.assertEqual(initial.landing_repository, wire.LandingRepositoryNotRecorded())
+            self.assertEqual(refreshed, replace(initial, landing_repository=LANDING_REPOSITORY))
 
     def test_a_refreshed_test_waits_for_the_landing_when_its_origin_becomes_readable(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture, patch.object(client, "CLOCK", fixture.clock):
@@ -186,7 +274,9 @@ class LandingAdmissionTests(unittest.TestCase):
             owner = fixture.request(step="nextest", need=GIB)
             request = client.step_request(argv, str(clone), owner.owner, owner.since, "", owner.episode)
             self.assertEqual(request.profile.repository, source)
-            grant = only_admitted(fixture.connect(request).replies())
+            with LauncherHangGuard("Unrelated test admission").protect(), fixture.serving():
+                grant = client.admit(request, lambda reply: self.fail(str(reply.reason)), lambda: request)
+            assert isinstance(grant, wire.Admitted), grant
             self.assertEqual(fixture.server.waiters, {})
             fixture.release(grant)
 
@@ -211,6 +301,7 @@ class LandingAdmissionTests(unittest.TestCase):
 
     def test_four_older_tests_wait_and_keep_their_order_after_the_land(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
+            clone = local_test_clone(fixture.root)
             queue_land()
             requests: list[wire.AdmitRequest] = []
             for index, step in enumerate(("merge-gate", "targeted-test", "test", "t")):
@@ -238,14 +329,18 @@ class LandingAdmissionTests(unittest.TestCase):
                     request = fixture.request(need=GIB, step="merge-gate")
                     sizing = records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now())
                     profile = records.ProgramProfile("merge-gate", "fixture", request.cwd, sizing)
+                    transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(admitted_reply())))
                     with (patch.object(client, "CLOCK", fixture.clock),
-                          patch.object(repository, "repository_key", return_value=REPOSITORY.key)):
-                        landing = client.step_request(["merge-gate"], request.cwd, request.owner, request.since,
+                          patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket)):
+                        landing = client.step_request(["merge-gate"], str(clone), request.owner, request.since,
                                                       "", request.episode, profile)
+                        _ = client.admit(landing, lambda reply: self.fail(str(reply.reason)), lambda: landing)
+                    sent, = transport.requests
+                    assert isinstance(sent, wire.AdmitRequest)
                     self.assertEqual(landing.profile, profile)
-                    self.assertEqual(landing.identity.landing_repository, LANDING_REPOSITORY)
+                    self.assertEqual(sent.identity.landing_repository, LANDING_REPOSITORY)
                     self.assertEqual(landing.identity.landing_test, land_runs.test_reference())
-                    grant = only_admitted(fixture.connect(landing).replies())
+                    grant = only_admitted(fixture.connect(sent).replies())
                     self.assertEqual(list(fixture.caller_reservations()), [landing.episode])
                     fixture.release(grant)
                     _ = fixture.run_pass()
