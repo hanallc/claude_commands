@@ -1261,6 +1261,7 @@ def call(args: list[str]) -> None:
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
+        "run_id": os.environ.get("BUILDLOG_RUN") or None,
         "command": " ".join([verb, *words]),
         "verb": verb,
         "package": selection.name if isinstance(selection, NamedPackage) else "workspace",

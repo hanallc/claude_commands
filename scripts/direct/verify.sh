@@ -5,7 +5,7 @@
 #   verify <command> [<package>] [flags]
 #   verify test,lint,doc [<package>]
 #
-# A verb list accepts test, lint, and doc in any order.
+# A verb list accepts test, lint, and doc once each, in any order.
 # Give one package or omit it for the workspace.
 # On Linux, the verbs share a run identity. The first failure ends the list.
 #
@@ -517,12 +517,21 @@ VERIFY_QUERY_ARGS=("$@")
 [[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
 VERIFY_VERBS=()
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
-    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^(test|lint|doc)(,(test|lint|doc))+$ ||
+    verify_list_verbs='test|lint|doc'
+    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^($verify_list_verbs)(,($verify_list_verbs))+$ ||
             ${#VERIFY_QUERY_ARGS[@]} -gt 2 || "${VERIFY_QUERY_ARGS[1]:-}" == -* ]]; then
         echo 'verify.sh: a verb list accepts only test, lint, doc and one optional package. Use commas between verbs.' >&2
         exit 2
     fi
     IFS=, read -r -a VERIFY_VERBS <<< "${VERIFY_QUERY_ARGS[0]}"
+    seen_verbs=,
+    for verb in "${VERIFY_VERBS[@]}"; do
+        if [[ "$seen_verbs" == *",$verb,"* ]]; then
+            printf 'verify.sh: repeated verb: %s\n' "$verb" >&2
+            exit 2
+        fi
+        seen_verbs+="$verb,"
+    done
 fi
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final-pass ]]; then
     command_help final >&2
@@ -588,27 +597,33 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
-# shellcheck disable=SC2329 # The signal traps call this function.
-stop_verify_verb_list() {
-    trap '' INT TERM HUP
-    local child=${!:-}
-    if [[ -n "$child" && "$child" != "$2" ]]; then collect_child "$child" TERM; fi
-    exit "$1"
+finish_verify_verb_list() {
+    local status=$1 child=${!:-}
+    # Use the interrupted status when Bash reports no signal status to EXIT.
+    if (( status == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then status=128; fi
+    if [[ -n "$child" && "$child" != "$VERIFY_VERB_PREVIOUS_JOB" ]]; then collect_child "$child" TERM; fi
+    finish_verify_run "$status"
+    exit "$status"
 }
 
 run_verify_verbs() {
-    local verb previous_job=${!:-}
+    local verb status
     # Close the startup helper before the children open their own helpers.
     exec 70>&- 71<&-
+    unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
-    # Stop the active verb on INT, which an asynchronous command can ignore.
-    trap 'stop_verify_verb_list 130 "$previous_job"' INT
-    trap 'stop_verify_verb_list 143 "$previous_job"' TERM
-    trap 'stop_verify_verb_list 129 "$previous_job"' HUP
+    VERIFY_VERB_PREVIOUS_JOB=${!:-}
+    trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
     for verb in "${VERIFY_VERBS[@]}"; do
-        previous_job=${!:-}
-        UNIT_DETACHED_RUN=1 bash "$VERIFY_START_DIR/verify.sh" "$verb" "$@" <&0 &
-        wait "$!" || exit "$?"
+        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 bash "$VERIFY_START_DIR/verify.sh" "$verb" "$@" <&0 &
+        status=0
+        wait "$!" || status=$?
+        VERIFY_VERB_PREVIOUS_JOB=$!
+        (( status == 0 )) || exit "$status"
+        # A request probe prepares only the first step for its caller.
+        [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || break
+        unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
+        unset BUILDLOG_FIRST_STEP_EPISODE BUILDLOG_FIRST_STEP_PID
     done
 }
 

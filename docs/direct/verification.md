@@ -5,6 +5,7 @@ Rust workers run only exact prompt lines with this form:
 `bash ~/.claude/scripts/direct/verify.sh <command> [<package>] [flags]`.
 Omit the package for the whole workspace. Give at most one positional word after the command.
 To prove a phase with one call, use `bash ~/.claude/scripts/direct/verify.sh test,lint <package>` when the prompt lists it.
+Use `test`, `lint`, and `doc` at most once each in a comma list.
 
 | Intent | Command |
 | --- | --- |

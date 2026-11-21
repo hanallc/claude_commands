@@ -68,6 +68,16 @@ class VerifyVerbTests(VerifyLintCacheFixture):
                 self.assertIn(form, result.stderr)
                 self.assertEqual(self.cargo_calls(), [])
 
+    def test_repeated_verbs_are_refused_before_repository_setup(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        for verbs, duplicate in (("test,test", "test"), ("test,lint,test", "test"),
+                                 ("doc,lint,lint", "lint")):
+            with self.subTest(verbs=verbs):
+                result = self.invoke_verify(verbs, cwd=outside)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr.splitlines(), [f"verify.sh: repeated verb: {duplicate}"])
+
     def test_missing_or_unknown_help_command_keeps_the_usage_error(self) -> None:
         usage = self.invoke_verify(cwd=self.root).stderr
         for arguments in (("help",), ("help", "fmt"), ("help", "test", "sample")):

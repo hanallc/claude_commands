@@ -61,6 +61,7 @@ NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
+    "BUILDLOG_RUN",
     "BUILDLOG_LOCAL_REASON",
     "BUILDLOG_MAC_HOLDER",
     "BUILDLOG_MAC_COPY",
@@ -1444,13 +1445,14 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
-            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": session, **board},
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "BUILDLOG_RUN": "123:456", "CLAUDE_CODE_SESSION_ID": session, **board},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
         expected: Record = {
             "kind": "call",
             "id": CALL_ID,
+            "run_id": "123:456",
             "tool": "verify.sh",
             "command": "test hana",
             "verb": "test",
@@ -1482,6 +1484,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
+        self.assertIsNone(record["run_id"])
 
     def test_call_records_cargo_token_wait_separately_from_total_wait(self) -> None:
         result = self.record(
