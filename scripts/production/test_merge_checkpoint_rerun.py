@@ -20,11 +20,9 @@ from unittest.mock import patch
 
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
-from scripts.lib import atomic_file
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import land_runs, staff, test_merge_checkpoint_batch, unit_lookup
+from scripts.production import land_runs, staff, unit_lookup
 from scripts.production.cli_fixture import process_boundary
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment,
 )
@@ -123,7 +121,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.assert_review_recovered("record_publication_changes")
 
     @process_boundary
-    def test_interrupted_batch_checks_publication_without_retrying_validation(self) -> None:
+    def test_interrupted_batch_push_recovers_validation_evidence(self) -> None:
         for interruption in ("unpublished shared file", "published before validator exit", "before beta merge",
                              "beta already published", "rollback fails"):
             with self.subTest(interruption=interruption):
@@ -197,10 +195,15 @@ if not {partial!r} and not first_attempt.is_file():
                        check=True, timeout=TEST_HANG_GUARD_SECS)
         print("publication finished", flush=True)
         print({cause!r}, file=sys.stderr, flush=True)
+    os.kill(os.getppid(), signal.SIGKILL)
+else:
     if {rollback_fails!r}:
         Path({path!r}).write_text({formatter_edit!r})
-    os.kill(os.getppid(), signal.SIGKILL)
-raise AssertionError("the interrupted batch ran validation again")
+    print("=== STEP: taplo ===", flush=True)
+    print("error: invalid TOML", file=sys.stderr, flush=True)
+    print("  ┌─ {path}:2:5", file=sys.stderr, flush=True)
+    print("!!! VALIDATION FAILED at step: taplo !!!", flush=True)
+raise SystemExit(1)
 """)
                 args = ["--production", "example", "--batch", str(batch)]
                 interrupted = self.invoke(args)
@@ -211,7 +214,8 @@ raise AssertionError("the interrupted batch ran validation again")
                 batch_record = Path(self.git("rev-parse", "--path-format=absolute", "--git-path",
                                              "checkpoint-batches/production"))
                 saved_record = batch_record.read_bytes() if rollback_fails else b""
-                self.assertIn(beta, batch_record.read_text())
+                if partial:
+                    self.assertIn(beta, batch_record.read_text())
                 with patch.dict("os.environ", self.env):
                     results_before = land_runs.last_results()
                 result = self.invoke(args)
@@ -220,34 +224,42 @@ raise AssertionError("the interrupted batch ran validation again")
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(len(self.events("validate_and_push.sh")), 1)
                     self.assertIn(f"publication finished\n{cause}\n", push_log.read_text())
-                    self.assertFalse(batch_record.exists())
-                    self.assertEqual(self.events("checkpoint-test"), [[]])
-                    self.assertEqual(result.stdout.count("merged and pushed as"), 2)
                 else:
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                    self.assertEqual(len(self.events("validate_and_push.sh")), 0 if partial else 1)
+                    self.assertEqual(len(self.events("validate_and_push.sh")), 1 if partial else 2)
+                    self.assertIn(f"error: invalid TOML — log {push_log}", result.stdout)
                     notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
-                    recipients = ("alpha",) if beta_already_published else ("alpha", "beta")
-                    self.assertEqual([line.split(":", 1)[0] for line in notices],
-                                     [f"send {unit}" for unit in recipients])
-                    for notice in notices:
-                        self.assertIn("the batch was interrupted; send the row again", notice)
                     if beta_already_published:
+                        self.assertEqual(notices, [
+                            f"send alpha: repair the push failure in {path} and send a new checkpoint",
+                        ])
                         with patch.dict("os.environ", self.env):
                             beta_land = land_runs.last_results()[beta]
                         self.assertTrue(results_before[beta]["landed"])
                         self.assertEqual(beta_land, results_before[beta])
+                        self.assertFalse(batch_record.exists())
+                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                    elif partial:
+                        self.assertEqual(notices, [
+                            f"send alpha: repair the push failure in {path} and send a new checkpoint",
+                            "send beta: nothing was pushed; the push failed in alpha's change; "
+                            + "send this checkpoint again after that repair",
+                        ])
+                        with patch.dict("os.environ", self.env):
+                            beta_land = land_runs.last_results()[beta]
+                        self.assertEqual((beta_land["unit"], beta_land["landed"], beta_land["step"], beta_land["state"]),
+                                         ("beta", False, "push", "failed"))
+                        self.assertFalse(batch_record.exists())
+                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                    else:
+                        self.assertEqual(notices, [f"send {unit}: the showrunner will inspect the failed command"
+                                                   for unit in ("alpha", "beta")])
                     if rollback_fails:
-                        self.assertIn(f"preserve the edits in {path}", result.stdout)
+                        self.assertIn("rollback failed", result.stdout)
                         self.assertEqual((self.checkout / path).read_text(), formatter_edit)
                         self.assertEqual(self.git("rev-parse", "HEAD"), combined)
                         self.assertTrue(batch_record.exists())
                         self.assertEqual(batch_record.read_bytes(), saved_record)
-                    else:
-                        self.assertFalse(batch_record.exists())
-                        if partial:
-                            self.assertIn("the checkout moved after the interruption", result.stdout)
-                        self.assertEqual(self.git("rev-parse", "HEAD"), combined if partial else start)
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
 
     def test_review_rows_written_before_receipt_are_not_duplicated(self) -> None:
@@ -414,491 +426,6 @@ raise AssertionError("the interrupted batch ran validation again")
 
     def test_handoff_failed_promotion_retries_before_acknowledgment(self) -> None:
         self.assert_handoff_promotion_recovered(True)
-
-
-@final
-class BatchRecoveryTests(test_merge_checkpoint_batch.BatchFixture):
-    def assert_landed(self, start: str, checkpoints: list[str]) -> list[str]:
-        tip = self.git("rev-parse", "HEAD")
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
-        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
-        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
-        merges = self.git("rev-list", "--reverse", "--first-parent", "--merges", start + ".." + tip).splitlines()
-        self.assertEqual([self.git("rev-parse", merge + "^2") for merge in merges], checkpoints)
-        self.assertEqual([line.split()[2] for line in (self.state / "pushed-refs").read_text().splitlines()],
-                         ["refs/heads/production", "refs/heads/main"])
-        receipts = self.receipts()
-        self.assertEqual([(row["merge_commit"], row["source_checkpoint"]) for row in receipts],
-                         list(zip(merges, checkpoints)))
-        self.assertEqual(len(self.events("style_sync.py")), 1)
-        return merges
-
-    def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for outcome in ("shared list", "push failure", "one unit push failure", "unmatched push failure",
-                        "earlier step push failure",
-                        "separate lists", "second list fails", "second directory sync fails",
-                        "unrelated branch renamed", "unpublished main integration"):
-            with self.subTest(outcome=outcome):
-                shutil.rmtree(self.root)
-                _ = shutil.copytree(self.fixture_snapshot, self.root)
-                self.bind_fixture(self.root)
-                self.push = "git"
-                self.promotions = str(self.promote)
-                review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
-                self.production_doc(change_review=review)
-                beta_review = review
-                beta_log = self.log
-                if outcome in ("separate lists", "second list fails", "second directory sync fails"):
-                    other_checkout = self.root / "other-production"
-                    _ = self.git("init", "-b", "main", str(other_checkout))
-                    other_doc = self.root / "other-production.md"
-                    beta_review = review.with_name("change-review - other.md")
-                    beta_log = other_checkout / "production.log"
-                    _ = other_doc.write_text(f"- **Repository:** `{other_checkout}`\n"
-                                           + f"- **Showrunner checkout:** `{other_checkout}`\n"
-                                           + "- **Merge branch:** main\n- **Log:** production.log\n"
-                                           + f"- **Change review:** `{beta_review}`\n")
-                    owner = recorded_showrunner("other", other_doc)
-                    beta = unit_membership("example", "beta")
-                    _ = staff.move(beta.id, staff.ReportsTo(owner.id))
-                    if outcome == "second list fails":
-                        beta_review.parent.mkdir(parents=True, exist_ok=True)
-                        _ = beta_review.write_text("# Incomplete list\n")
-                start = self.git("rev-parse", "HEAD")
-                if outcome == "unrelated branch renamed":
-                    _ = self.git("update-ref", "refs/remotes/origin/topic", start)
-                    _ = self.git("update-ref", "refs/heads/topic/rework", start, cwd=self.origin)
-                if outcome == "unpublished main integration":
-                    published = start
-                    main = self.push_main_change("docs/main-fix.md", "Main fix\n")
-                    _ = self.git("fetch", "--no-write-fetch-head", "--refmap=", "origin", "refs/heads/main")
-                    _ = self.git("merge", "--no-ff", "-m", "Merge origin/main into production", main)
-                    start = self.git("rev-parse", "HEAD")
-                    self.assertEqual(self.git("rev-parse", "HEAD^2"), main)
-                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-                    record = self.checkout / self.git("rev-parse", "--git-path", "checkpoint-batches/production")
-                    self.assertFalse(record.exists())
-                first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
-                                        + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
-                file_diagnostic = outcome in ("one unit push failure", "unmatched push failure", "earlier step push failure")
-                beta_path = "src/beta.toml" if file_diagnostic else "src/beta.txt"
-                second = self.beta_checkpoint(beta_path, "beta batch change\n", visible=True)
-                push_failed = outcome.endswith("push failure")
-                if push_failed:
-                    self.push = "validate_and_push"
-                    self.production_doc(change_review=review)
-                    if outcome == "push failure":
-                        failure_command = """
-import subprocess
-origin = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True,
-                        text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
-subprocess.run(["git", "push", origin, "HEAD:refs/heads/production"],
-               check=True, timeout=TEST_HANG_GUARD_SECS)
-"""
-                    else:
-                        failed_file = f"outside/{beta_path}" if outcome == "unmatched push failure" else beta_path
-                        failure_command = ""
-                        if outcome == "earlier step push failure":
-                            failure_command = """
-print("=== STEP: cargo-mend autofix ===", flush=True)
-print("error: recovered compiler error", file=sys.stderr, flush=True)
-print(" --> src/alpha.txt:2:5", file=sys.stderr, flush=True)
-"""
-                        failure_command += f"""
-print("=== STEP: taplo ===", flush=True)
-print("error: invalid TOML", file=sys.stderr, flush=True)
-print({f"  ┌─ {self.checkout / failed_file}:2:5"!r}, file=sys.stderr, flush=True)
-print("!!! VALIDATION FAILED at step: taplo !!!", flush=True)
-print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
-"""
-                    self.executable(self.bin / "validate_and_push.sh", STUB + failure_command + "raise SystemExit(1)\n")
-                sync_folder = atomic_file.sync_folder
-
-                def sync(folder: Path) -> None:
-                    if (folder == beta_review.parent and beta_review.is_file()
-                            and "Beta changes" in beta_review.read_text()):
-                        raise OSError("fixture directory sync failed")
-                    sync_folder(folder)
-
-                batch = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)]
-                if outcome == "second directory sync fails":
-                    with patch.object(atomic_file, "sync_folder", side_effect=sync):
-                        result = self.land_batch(batch)
-                else:
-                    result = self.land_batch(batch)
-                if push_failed:
-                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                    tip = self.git("rev-parse", "production", cwd=self.origin)
-                    if outcome == "push failure":
-                        self.assertNotEqual(tip, start)
-                        self.assertEqual(self.git("rev-parse", "HEAD"), tip)
-                        self.assertEqual([self.git("rev-parse", "HEAD~1^2"), self.git("rev-parse", "HEAD^2")],
-                                         [first, second])
-                        self.assertEqual([line.split()[2] for line in (self.state / "pushed-refs").read_text().splitlines()],
-                                         ["refs/heads/production"])
-                        push_log = self.state / f"merge_{first[:7]}_push.log"
-                        self.assertIn(f"no clear failure line (exit 1) — log {push_log}", result.stdout)
-                    else:
-                        self.assertEqual(tip, start)
-                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
-                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), start)
-                    self.assertEqual(self.events("checkpoint-test"), [[]])
-                    self.assertEqual(len(self.events("validate_and_push.sh")), 1)
-                    self.assertNotIn("batch: retry", result.stdout)
-                    notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
-                    if outcome in ("one unit push failure", "earlier step push failure"):
-                        self.assertEqual(notices, [
-                            "send alpha: nothing was pushed; the push failed in beta's change; "
-                            + "send this checkpoint again after that repair",
-                            f"send beta: repair the push failure in {beta_path} and send a new checkpoint",
-                        ])
-                        self.assertNotIn("the showrunner will inspect the failed command", result.stdout)
-                    else:
-                        suffix = "; the published tip changed; rerun the batch to check publication" if outcome == "push failure" else ""
-                        self.assertEqual(notices, [f"send {unit}: the showrunner will inspect the failed command{suffix}"
-                                                   for unit in ("alpha", "beta")])
-                    self.assertIn("push: failed", result.stdout)
-                    if outcome == "earlier step push failure":
-                        self.assertIn("error: invalid TOML", result.stdout)
-                        self.assertNotIn("recovered compiler error", result.stdout)
-                else:
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    merges = self.assert_landed(start, [first, second])
-                    self.assertEqual(self.events("checkpoint-test"), [[]])
-                    for unit, merge in zip(("alpha", "beta"), merges):
-                        self.assertEqual(result.stdout.count(f"send {unit}: phase 2 merged and pushed as {merge};"), 1)
-                    self.assertEqual([call[call.index("--unit") + 1] for call in self.events("review_regime.py")],
-                                     ["alpha", "beta"])
-                    self.assertIn("Alpha changes", review.read_text())
-                    if outcome == "second list fails":
-                        self.assertEqual(beta_review.read_text(), "# Incomplete list\n")
-                        self.assertIn(f"1 row(s) added to {review}; | C1 | Alpha changes |", result.stdout)
-                        self.assertIn(f"change review: failed — {beta_review} not written:", result.stdout)
-                        self.assertNotIn(f"{review} not written", result.stdout)
-                    else:
-                        self.assertIn("Beta changes", beta_review.read_text())
-                    self.assertIn("alpha phase 2", self.log.read_text())
-                    self.assertIn("beta phase 2", beta_log.read_text())
-                    if outcome == "second directory sync fails":
-                        self.assertIn(f"change review: warning — {beta_review}: durability unconfirmed", result.stdout)
-                        self.assertIn("fixture directory sync failed", result.stdout)
-                        self.assertNotIn(f"{beta_review} not written", result.stdout)
-                    if outcome in ("separate lists", "second directory sync fails"):
-                        lines = [line for line in result.stdout.splitlines() if "row(s) added to" in line]
-                        self.assertEqual(len(lines), 2, result.stdout)
-                        for path, change in ((review, "Alpha changes"), (beta_review, "Beta changes")):
-                            self.assertTrue(any(f"1 row(s) added to {path}; | C1 | {change} |" in line
-                                                for line in lines), lines)
-
-    def test_published_recovery_completes_records_and_a_new_batch_promotes(self) -> None:
-        self.promotions = str(self.promote) + " — live checkout"
-        self.production_doc()
-        start = self.git("rev-parse", "HEAD")
-        marker = self.root / "reject-main"
-        _ = marker.touch()
-        self.executable(self.origin / "hooks/pre-receive", "#!/bin/sh\nwhile read old new ref; do\n"
-                        + f'  if [ "$ref" = "refs/heads/main" ] && [ -e "{marker}" ]; then exit 1; fi\n'
-                        + "done\nexit 0\n")
-        first = self.checkpoint(content="alpha batch change\n")
-        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)]
-        failed = self.land_batch(lines)
-        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
-        self.assertIn("promote: failed", failed.stdout)
-        self.assertTrue(self.batch_record().exists())
-        pushed = self.git("rev-parse", "production", cwd=self.origin)
-        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), start)
-        rerun = self.land_batch(lines)
-        self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
-        self.assertIn(f"already pushed at {pushed}", rerun.stdout)
-        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), start)
-        self.assertEqual(self.events("checkpoint-test"), [[]])
-        self.assertFalse(self.batch_record().exists())
-        marker.unlink()
-        third = self.checkpoint("src/third.txt", "later alpha change\n")
-        rerun = self.land_batch([self.batch_line("alpha", "3", third)])
-        self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
-        self.assertNotIn("resume it alone with the single command", rerun.stdout)
-        tip = self.git("rev-parse", "production", cwd=self.origin)
-        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
-        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
-        self.assertEqual(self.git("rev-parse", "HEAD^1"), pushed)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), third)
-
-    def assert_batch_requires_reset(self, result: subprocess.CompletedProcess[str], published: str, unpublished: str) -> None:
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("reset the merge branch to its pushed tip, then start a fresh batch", result.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), unpublished)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-
-    def test_an_interrupted_code_row_keeps_its_identity_when_resubmitted_as_shrink(self) -> None:
-        published = self.git("rev-parse", "HEAD")
-        commit = self.checkpoint(content="alpha batch change\n")
-        _ = self.interrupt_batch(self.batch_line("alpha", "2", commit))
-        result = self.land_batch([self.batch_line("alpha", "2", commit, "--shrink")])
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.count("the batch was interrupted; send the row again"), 1)
-        self.assertEqual(result.stdout.count("the previous batch required recovery; send this row again"), 1)
-        self.assertEqual(self.git("rev-parse", "HEAD"), published)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-        self.assertFalse(self.batch_record().exists())
-
-    def test_an_interrupted_batch_reports_the_saved_hash_when_a_ref_moves(self) -> None:
-        published = self.git("rev-parse", "HEAD")
-        first = self.checkpoint(content="alpha batch change\n")
-        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        ref = "refs/tags/beta-checkpoint"
-        _ = self.git("update-ref", ref, second, cwd=self.other)
-        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
-        unpublished = self.interrupt_batch(*lines)
-        self.assertEqual(self.git("rev-parse", f"{unpublished}^2"), second)
-        self.assertEqual(self.git("rev-parse", f"{unpublished}^1^2"), first)
-
-        moved = self.beta_checkpoint("src/beta.txt", "later beta change\n")
-        _ = self.git("update-ref", ref, moved, second, cwd=self.other)
-        result = self.land_batch(lines)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"send beta: phase 2 ({second[:12]})", result.stdout)
-        self.assertNotIn(moved[:12], result.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), published)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-        self.assertFalse(self.batch_record().exists())
-
-    def test_an_interrupted_batch_reports_the_saved_hash_when_an_unmerged_ref_moves(self) -> None:
-        published = self.git("rev-parse", "HEAD")
-        first = self.checkpoint(content="alpha batch change\n")
-        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        ref = "refs/remotes/origin/beta-branch"
-        _ = self.git("update-ref", "-d", ref)
-        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
-        merge = merge_checkpoint.merge
-
-        def stop_after_first_merge(request: merge_checkpoint.MergeRequest, *,
-                                   merging: Callable[[], None], merged: Callable[[str], None]) -> str:
-            self.assertEqual(request.commit, first)
-            _ = merge(request, merging=merging, merged=merged)
-            raise KeyboardInterrupt
-
-        with (patch.object(merge_checkpoint, "merge", side_effect=stop_after_first_merge),
-              self.assertRaises(KeyboardInterrupt)):
-            _ = self.land_batch(lines)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), first)
-
-        moved = self.beta_checkpoint("src/beta.txt", "later beta change\n")
-        result = self.land_batch(lines)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"send beta: phase 2 ({second[:12]})", result.stdout)
-        self.assertNotIn(moved[:12], result.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), published)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-        self.assertFalse(self.batch_record().exists())
-
-    def test_an_interrupted_batch_reports_the_peeled_tag_hash(self) -> None:
-        start = self.git("rev-parse", "HEAD")
-        commit = self.checkpoint(content="alpha batch change\n")
-        _ = self.git("tag", "-a", "-m", "Checkpoint", "alpha-checkpoint", commit, cwd=self.unit)
-        tag = self.git("rev-parse", "refs/tags/alpha-checkpoint", cwd=self.unit)
-        self.assertNotEqual(tag, commit)
-        line = self.batch_line("alpha", "2", tag)
-        unpublished = self.interrupt_batch(line)
-        self.assertEqual(self.git("rev-parse", f"{unpublished}^2"), commit)
-
-        result = self.land_batch([line])
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"send alpha: phase 2 ({commit[:12]})", result.stdout)
-        self.assertIn("the batch was interrupted; send the row again", result.stdout)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-        self.assertEqual(self.git("rev-parse", "HEAD"), start)
-        self.assertFalse(self.batch_record().exists())
-
-    def test_an_unresolvable_item_refuses_the_batch_before_any_merge(self) -> None:
-        published = self.git("rev-parse", "HEAD")
-        first = self.checkpoint(content="alpha batch change\n")
-        missing = "refs/tags/absent-beta-checkpoint"
-        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", missing)]
-
-        with patch.object(merge_checkpoint, "merge", wraps=merge_checkpoint.merge) as merge:
-            result = self.land_batch(lines)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, rf"input: failed.*beta phase 2.*{missing}")
-        merge.assert_not_called()
-        self.assertEqual(self.git("rev-parse", "HEAD"), published)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-        self.assertFalse(self.batch_record().exists())
-
-    def test_a_batch_saves_fetched_checkpoint_hashes_before_merging(self) -> None:
-        phase_refs = ("refs/remotes/origin/beta-phase", "origin/beta-phase")
-        unit_revisions = ("remotes/origin/beta-branch", "refs/remotes/origin/beta-branch~1")
-        for case in ("unit branch hash", "unit branch ref", "phase branch only", "unit branch missing",
-                     *phase_refs, *unit_revisions):
-            with self.subTest(case=case):
-                shutil.rmtree(self.root)
-                _ = shutil.copytree(self.fixture_snapshot, self.root)
-                self.bind_fixture(self.root)
-                published = self.git("rev-parse", "HEAD")
-                first = self.checkpoint(content="alpha batch change\n")
-                _ = self.git("update-ref", "refs/heads/alpha-checkpoint", first, cwd=self.origin)
-                _ = self.git("update-ref", "refs/heads/alpha-branch", published, cwd=self.origin)
-                writer = self.root / "beta-writer"
-                _ = self.git("clone", "-b", "beta-branch", str(self.origin), str(writer))
-                self.write(writer, "src/beta.txt", "beta batch change\n")
-                _ = self.git("add", "src/beta.txt", cwd=writer)
-                _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m",
-                             "beta work\n\nChange-Review: none — fixture code only", cwd=writer)
-                second = self.git("rev-parse", "HEAD", cwd=writer)
-                if case == "refs/remotes/origin/beta-branch~1":
-                    _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                                 "commit", "--allow-empty", "-m", "Later beta checkpoint", cwd=writer)
-                phase_branch = case in ("phase branch only", "unit branch missing", *phase_refs)
-                target = "HEAD:refs/heads/beta-phase" if phase_branch else "beta-branch"
-                _ = self.git("push", "origin", target, cwd=writer)
-                if case == "unit branch missing":
-                    _ = self.git("update-ref", "-d", "refs/heads/beta-branch", cwd=self.origin)
-                if case == "refs/remotes/origin/beta-phase":
-                    _ = self.git("update-ref", case, published)
-                if case in unit_revisions:
-                    _ = self.git("update-ref", "-d", "refs/remotes/origin/beta-branch")
-                    self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/beta-branch"), "")
-                absent = subprocess.run(["git", "cat-file", "-e", f"{second}^{{commit}}"], cwd=self.checkout,
-                                        env=self.env, capture_output=True, text=True, check=False,
-                                        timeout=TEST_HANG_GUARD_SECS)
-                self.assertNotEqual(absent.returncode, 0)
-                checkpoint = "refs/remotes/origin/beta-branch" if case == "unit branch ref" else second
-                if case in (*phase_refs, *unit_revisions):
-                    checkpoint = case
-                lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", checkpoint)]
-
-                if phase_branch:
-                    result = self.land_batch(lines)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), second)
-                    self.assertEqual(self.git("rev-parse", "production^1^2", cwd=self.origin), first)
-                    continue
-
-                _ = self.interrupt_batch(*lines)
-                self.assertEqual(self.git("rev-parse", "HEAD^2"), second)
-                self.assertEqual(self.git("rev-parse", "HEAD^1^2"), first)
-                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-                path = self.batch_record()
-                saved = merge_checkpoint.read_batch_record(path, path.read_text(encoding="utf-8"))
-                first_merge = self.git("rev-parse", "HEAD^1")
-                second_merge = self.git("rev-parse", "HEAD")
-
-                result = self.land_batch(lines)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertEqual(saved.start_tip, published)
-                self.assertEqual(saved.checkout_tip, second_merge)
-                self.assertEqual(saved.in_progress, merge_checkpoint.NoRowInProgress())
-                self.assertEqual([(row.notice.commit, row.arguments, row.merge) for row in saved.rows],
-                                 [(first, lines[0], merge_checkpoint.RowMerge(first_merge)),
-                                  (second, lines[1], merge_checkpoint.RowMerge(second_merge))])
-                for unit, commit in (("alpha", first), ("beta", second)):
-                    self.assertIn(f"send {unit}: phase 2 ({commit[:12]})", result.stdout)
-                self.assertEqual(result.stdout.count("the batch was interrupted; send the row again"), 2)
-                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-                self.assertEqual(self.git("rev-parse", "HEAD"), published)
-                self.assertFalse(self.batch_record().exists())
-
-    def test_a_batch_record_unlink_error_warns_and_allows_promotion(self) -> None:
-        self.promotions = str(self.promote)
-        self.production_doc()
-        published = self.git("rev-parse", "HEAD")
-        commit = self.checkpoint(content="alpha batch change\n")
-        record = self.batch_record()
-        real_unlink = Path.unlink
-
-        def refuse_record(path: Path, missing_ok: bool = False) -> None:
-            if path == record:
-                raise PermissionError("fixture cannot remove the batch record")
-            real_unlink(path, missing_ok=missing_ok)
-
-        with patch.object(Path, "unlink", refuse_record):
-            result = self.land_batch([self.batch_line("alpha", "2", commit)])
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"batch: warning — {record}", result.stdout)
-        self.assertEqual(result.stdout.count("fixture cannot remove the batch record"), 1)
-        self.assertTrue(record.is_file())
-        _ = self.assert_landed(published, [commit])
-
-    def test_a_published_batch_retires_its_record_and_a_new_batch_runs(self) -> None:
-        commit = self.checkpoint(content="alpha batch change\n")
-        result = self.land_batch([self.batch_line("alpha", "2", commit)])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.batch_record().exists())
-        beta = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        fresh = self.land_batch([self.batch_line("beta", "2", beta)])
-        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
-        self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), beta)
-
-    def test_unpushed_merges_without_a_batch_record_require_a_reset(self) -> None:
-        published = self.git("rev-parse", "HEAD")
-        commit = self.checkpoint(content="alpha batch change\n")
-        line = self.batch_line("alpha", "2", commit)
-        unpublished = self.interrupt_batch(line)
-        self.batch_record().unlink()
-        result = self.land_batch([line])
-        self.assert_batch_requires_reset(result, published, unpublished)
-        self.assertFalse(self.batch_record().exists())
-        _ = self.git("reset", "--keep", published)
-        fresh = self.land_batch([line])
-        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
-        self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), commit)
-
-    def test_recovery_reports_the_saved_batch_before_new_rows_can_start(self) -> None:
-        start = self.git("rev-parse", "HEAD")
-        first = self.checkpoint(content="alpha batch change\n")
-        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        original = self.batch_line("alpha", "2", first)
-        _ = self.interrupt_batch(original)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), first)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-
-        equivalent = "  " + original.replace("alpha 2", "'alpha' 2", 1)
-        new_row = self.batch_line("beta", "2", second)
-        recovered = self.land_batch([equivalent, new_row])
-        self.assertEqual(recovered.returncode, 1, recovered.stdout + recovered.stderr)
-        self.assertEqual(recovered.stdout.count("the batch was interrupted; send the row again"), 1)
-        self.assertEqual(recovered.stdout.count("the previous batch required recovery; send this row again"), 1)
-        self.assertEqual(self.git("rev-parse", "HEAD"), start)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-        self.assertFalse(self.batch_record().exists())
-
-        fresh = self.land_batch([new_row])
-        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
-        self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), second)
-
-    def test_published_recovery_uses_remote_merges_and_retries_the_unfinished_review_record(self) -> None:
-        start = self.git("rev-parse", "HEAD")
-        alpha = self.checkpoint(content="alpha batch change\n")
-        beta = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        lines = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
-        review = self.bin / "review_regime.py"
-        self.executable(review, STUB + 'raise SystemExit(int("--unit" in args and args[args.index("--unit") + 1] == "beta"))\n')
-        first = self.land_batch(lines)
-        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-        self.assertIn("send alpha: phase 2 merged and pushed", first.stdout)
-        self.assertEqual(first.stdout.count("send alpha:"), 1)
-        self.assertNotIn("send beta: phase 2 merged and pushed", first.stdout)
-        self.assertNotIn(f"({beta}) merged as", self.log.read_text())
-        self.assertTrue(self.batch_record().is_file())
-        tip = self.git("rev-parse", "production", cwd=self.origin)
-        self.assertEqual(self.git("rev-parse", f"{tip}^2"), beta)
-
-        self.executable(review, STUB)
-        _ = self.git("reset", "--keep", start)
-        rerun = self.land_batch(lines)
-
-        self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
-        self.assertIn(f"send beta: phase 2 merged and pushed as {tip};", rerun.stdout)
-        self.assertNotIn("send alpha:", rerun.stdout)
-        self.assertIn(f"({beta}) merged as {tip}", self.log.read_text())
-        self.assertEqual(self.git("rev-parse", "HEAD"), start)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
-        self.assertEqual(self.events("checkpoint-test"), [[]])
-        self.assertEqual(len(self.events("style_sync.py")), 1)
-        self.assertEqual([row["source_checkpoint"] for row in self.receipts()], [alpha, beta])
-        self.assertFalse(self.batch_record().exists())
 
 
 if __name__ == "__main__":

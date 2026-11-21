@@ -606,8 +606,8 @@ notice to the unit director before any merge command runs:
    in a detached clone in the background; red goes to the unit and the
    showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
    and `--from-child`. The script checks ancestry, origin, scope, conflicts, and overlaps before it merges.
-   A single checkpoint reruns red packages. The first hold, failure, or cancellation stops a batch.
-   Return every outstanding row to its requester. Proceed with the next queued item.
+   A single checkpoint reruns red packages. The first hold or failure stops a batch.
+   Return every stopped row to its requester. Proceed with the next queued item.
    Send each final `send <unit>:` message to its unit director.
    A `merge director:` line names red tests or modules that are red on the
    base without the checkpoint. It goes to the merge director, who repairs

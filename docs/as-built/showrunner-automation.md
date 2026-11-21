@@ -332,21 +332,15 @@ Each local Promote checkout must exist before the command pushes.
      A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
      A command that cannot start on the base, and a main conflict, also leave the red with the unit.
      A resumed merge whose restored tip already holds the checkpoint runs no base check.
-     Recovery completes each saved row whose recorded merge is an ancestor of the fetched tip.
-     It returns every other saved row to its requester.
-     Recovery runs no tests, push, or promotion.
-     A batch stops at its first red test step and returns every outstanding row.
-     Each report names the failed step and states whether the row selects it.
+     A batch stops at its first red test step and returns every row with the failed step and the row's test selection.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
-     A conflict with main ends a batch and sends the conflicting paths to every outstanding requester.
-     An unpublished batch restores its starting tip before reporting a stop.
-     It removes its record after the reports.
-     If tracked edits block restoration, the reports give the recovery command and the record stays.
+     A conflict with main ends a batch and sends the conflicting paths to every requester.
+     The next queued item can proceed.
      Preparation failure restores the tip before this run when origin still has its old tip.
      An interrupted promotion and a child handoff use the same test loop.
      Each caller retains its own rollback rule for a failed push.
