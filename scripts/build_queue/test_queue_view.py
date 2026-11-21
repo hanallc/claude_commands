@@ -90,9 +90,6 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     for step in (waiter, running):
                         expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT, ran_by)
                         self.assertEqual(queue_evidence.step_labels(step, labels), expected)
-                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
-                    self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
-                                     expected)
 
     def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
         from scripts.build_queue import admission_client
@@ -101,7 +98,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                                          "BUILDLOG_OWNER_STAFF_ID": "other-owner"}):
             self.assertEqual(admission_client.step_identity("nextest", "").session_id, "live-session")
 
-    def test_missing_owner_records_have_explicit_labels_on_every_destination(self) -> None:
+    def test_missing_owner_records_have_explicit_labels_in_queue_evidence(self) -> None:
         from scripts.build_queue import admission_client
         from scripts.production.staff_test_support import isolated_staff_file
 
@@ -117,9 +114,6 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     for step in (model.reading.view.waiting[0], model.reading.view.running[0]):
                         label = queue_evidence.step_labels(replace(step, session_id="", session_name="", unit=""), {})
                         self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
-                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
-                    label = queue_view.cloud_step_labels(cloud, replace(model, labels={}))
-                    self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
 
 
 def with_converted_executions(reading: admission_records.QueueRead) -> admission_records.QueueRead:
@@ -564,20 +558,13 @@ class CloudQueueViewTests(unittest.TestCase):
                 waiting = queue_view.waiting_builds(replace(model, reading=replace(reading, cloud=(single, grouped))))
                 self.assertEqual([row for row in waiting if isinstance(row, wire.CloudRow)], [grouped, single])
 
-    def test_cloud_rows_use_session_owner_labels(self) -> None:
-        model, _fixture = self.cloud_model()
-        reading = model.reading
-        assert isinstance(reading, wire.CloudQueueRead)
-        row = reading.cloud[0]
-        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
-        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
-        for owner in (director, runner, UnitLabels("worker", "sdlc", "panes")):
-            with self.subTest(owner=owner):
-                labeled = replace(model, labels={row.identity.session_id: owner})
-                self.assertEqual(queue_view.cloud_step_labels(row, labeled), owner)
-        missing = replace(model, labels={})
-        self.assertEqual(queue_view.cloud_step_labels(row, missing), UnitLabels(
-            row.identity.name, unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED))
+    def test_owner_templates_keep_the_step_name_and_prose(self) -> None:
+        model = self.cloud_model()[0]
+        settings = dict(model.names.settings)
+        settings["owned.targeted-test"] = "targeted for {unit}"
+        configured = replace(model, names=type(model.names)(settings))
+        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
+        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

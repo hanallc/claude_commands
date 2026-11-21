@@ -812,12 +812,6 @@ def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     return (Span(cloud_failed_modules(work)),)
 
 
-def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
-    identity = row.identity
-    return model.cloud_labels.get(identity.session_id,
-        UnitLabels(identity.name, unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED))
-
-
 @dataclass(frozen=True)
 class WaitingBuild:
     position: int

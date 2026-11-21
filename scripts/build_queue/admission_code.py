@@ -1,6 +1,7 @@
 """Hash the admission sources without importing admission code."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 import hashlib
 from pathlib import Path
 import sys
@@ -24,10 +25,23 @@ ADMISSION_CODE_PATHS = (
 )
 
 
+RELOAD_SOURCE_SUFFIX = ".py"
+
+
 def admission_code_version(scripts: Path | None = None) -> str:
     root = scripts if scripts is not None else Path(__file__).resolve().parents[1]
+    return _source_hash(root, ADMISSION_CODE_PATHS)
+
+
+def reload_source_version(root: Path) -> str:
+    """Hash the Python source files that the watch can see."""
+    paths = sorted(str(path.relative_to(root)) for path in root.rglob(f"*{RELOAD_SOURCE_SUFFIX}") if path.is_file())
+    return _source_hash(root, paths)
+
+
+def _source_hash(root: Path, paths: Iterable[str]) -> str:
     digest = hashlib.sha256()
-    for relative in ADMISSION_CODE_PATHS:
+    for relative in paths:
         try:
             content = (root / relative).read_bytes()
         except OSError:

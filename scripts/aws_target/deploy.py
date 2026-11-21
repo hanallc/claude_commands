@@ -2487,8 +2487,14 @@ class Deployment:
                 with step('remove-images', 'removing the old image permission', self.settings_path,
                           hint='can take several minutes'):
                     self._gate_change(api, stack_id, template, changes)
-            with step('remove-images', 'deleting the gate image and its snapshot', self.settings_path):
-                removed = teardown.remove_gate_images(api, self.directory, self.clock)
+            try:
+                with step('remove-images', 'deleting the gate image and its snapshot', self.settings_path):
+                    removed = teardown.remove_gate_images(api, self.directory, self.clock)
+                    if isinstance(removed, teardown.GateImageRemovalRefused):
+                        raise DeploymentRefused(removed.reason)
+            except DeploymentRefused as error:
+                print('remove-images: refused: ' + self.admin.redact(str(error)))
+                return False
             with step('remove-images', 'deleting the former builder image and its snapshot', self.settings_path):
                 removed = teardown.remove_builder_image(api, self.directory) or removed
         print('remove-images: done; gates boot from the official image and no saved image remains' if removed

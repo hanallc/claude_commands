@@ -21,6 +21,7 @@ from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_VERBS,
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
+from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -29,6 +30,7 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
+from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
@@ -644,6 +646,7 @@ class Waiter(TypedDict):
     session_id: NotRequired[str]
     session_name: NotRequired[str]
     unit: NotRequired[str]
+    ci_runner: NotRequired[str]
     step: NotRequired[str]
     folder: NotRequired[str]
     token_left_at: NotRequired[float]
@@ -777,7 +780,7 @@ class EndedStepFactNotRecorded:
 
 @dataclass(frozen=True)
 class EndedStepFacts:
-    """The reservation's work and staff facts survive until the hold ends."""
+    """The reservation's caller, work, and staff facts survive until the hold ends."""
 
     step: str | EndedStepFactNotRecorded
     package: str | PackageNotRecorded
@@ -785,6 +788,7 @@ class EndedStepFacts:
     folder: str | EndedStepFactNotRecorded
     staff_id: StaffId | NoEndedStepStaff
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    caller_name: str | EndedStepFactNotRecorded = field(default_factory=EndedStepFactNotRecorded, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1040,7 +1044,7 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
     if isinstance(cause, EstimateExpired):
         return "head: estimate expired"
     if isinstance(cause, BehindHead):
-        return "head: behind " + cause.head_name
+        return "head: behind " + select_queue_name(cause.head_name)
     if isinstance(cause, GpuSlotWait):
         return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
@@ -1073,6 +1077,7 @@ class WaitingStep:
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1096,6 +1101,7 @@ class RunningStep:
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1593,14 +1599,56 @@ class FreshTest:
 BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
 
-def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
-    from scripts.production import staff
+@dataclass(frozen=True)
+class QueueCaller:
+    session_id: str
+    name: str
+    unit: str
 
+
+@dataclass(frozen=True)
+class StaffLookupSkipped:
+    """The caller has no staff reference to resolve."""
+
+
+NO_STAFF_LOOKUP = StaffLookupSkipped()
+type QueueStaff = staff.StaffSnapshot | staff.StaffUnreadable | StaffLookupSkipped
+
+
+def queue_staff() -> QueueStaff:
+    try:
+        return staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        return error
+
+
+def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
+                 worktree: str, *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
+    """Resolve the caller name and its unit for queue priority."""
+    reference = session_id or staff_id
+    staff_name = ""
+    if isinstance(members, staff.StaffSnapshot) and reference and (member := members.by_member_reference(reference)):
+        if not unit:
+            owner = members.parent_of(member) if member.kind == "worker" else member
+            unit = owner.name if owner is not None and owner.kind == "unit" else ""
+        session_id = session_id or member.current_session
+        staff_name = member.name
+    folder = public_queue_text(Path(worktree).name) if not reference else ""
+    name = select_queue_name(staff_name, exported_name, Path(session_folder).name,
+                             f"terminal · {folder}" if folder else "")
+    return QueueCaller(session_id, name, unit)
+
+
+def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = staff.caller_identity()
-    identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-                                "step": step, "folder": os.getcwd() if worktree else ""}
-    if unit := os.environ.get(BUILDLOG_UNIT):
-        identity["unit"] = unit
+    reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
+    caller = queue_caller(session, reference, os.environ.get("CLAUDE_SESSION_NAME", ""),
+        os.environ.get("CLAUDE_SESSION_FOLDER", ""), worktree or os.getcwd(),
+        members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=os.environ.get(BUILDLOG_UNIT, ""))
+    identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,
+        "step": step, "folder": os.getcwd() if worktree else ""}
+    if caller.unit:
+        identity["unit"] = caller.unit
     return identity
 
 
