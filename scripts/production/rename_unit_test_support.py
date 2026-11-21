@@ -1,7 +1,7 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -9,9 +9,10 @@ import shutil
 import shlex
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Generator, Iterable
-from contextlib import AbstractContextManager, closing, contextmanager
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
@@ -24,12 +25,14 @@ from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import shutdown
-from scripts.shutdown import pane_record
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.agents import shutdown
+from scripts.agents import pane_record
 from scripts.style import style_ledger
 
-SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 SLUG = "demo"
 
 
@@ -67,8 +70,8 @@ class UnitRenameFixture(StaffTestCase):
         super().setUp()
         # Git worktrees and production docs embed absolute paths. Each independent
         # copy returns to the seed's original path, with its own refs and origin.
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {SLUG: ("alpha", "mul_add")},
                            locations={(SLUG, "alpha"): self.rust / "claude-demo-alpha",
@@ -104,9 +107,8 @@ class UnitRenameFixture(StaffTestCase):
             "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
-            "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
@@ -115,19 +117,20 @@ class UnitRenameFixture(StaffTestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
         })
 
     def build_fixture(self) -> None:
-        for path in (self.checkout, self.home / ".claude", self.root / "state/sessions", self.root / "scratch"):
+        for path in (self.checkout, self.home / ".claude", self.root / "state/sessions", self.root / "scratch",
+                     self.root / "proc"):
             path.mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
                    json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0}}))
         _ = self.git("init", "--bare", str(self.origin))
         _ = self.git("init", "-b", SLUG)
         for key, value in (("user.name", "Unit Rename Test"), ("user.email", "rename@example.invalid"),
-                           ("gc.auto", "0"), ("maintenance.auto", "false")):
+                           ("gc.auto", "0")):
             _ = self.git("config", key, value)
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())
@@ -217,7 +220,13 @@ class UnitRenameFixture(StaffTestCase):
 
         # These values are normally bound at interpreter startup. Rebind them for
         # each invocation, including tests that change the shutdown stand-in.
-        with mock.patch.object(subprocess, "run", run):
+        with mock.patch.object(subprocess, "run", run), ExitStack() as children:
+            # Keep real child processes visible in the private process directory.
+            if sys.platform != "darwin":
+                for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split():
+                    process = Path(self.env["HERDR_PROC"]) / pid
+                    process.symlink_to(Path("/proc") / pid, target_is_directory=True)
+                    _ = children.callback(process.unlink)
             return invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                               self.env, cwd or self.checkout, production_state=True)
 
@@ -266,6 +275,53 @@ class UnitRenameFixture(StaffTestCase):
         return worktree, plan, database
 
 
+def folder_repositories(root: Path, old_name: str) -> tuple[Path, Path, Path]:
+    """Return the checkout, bare origin and unit worktree of a folder rename fixture."""
+    return root / "repository", root / "origin.git", root / "home/rust" / f"cargo-liner-{old_name}"
+
+
+def build_folder_repositories(root: Path, old_name: str) -> None:
+    """Build the fixture's checkout, bare origin and unit worktree once for a test class."""
+    checkout, origin, source = folder_repositories(root, old_name)
+    checkout.mkdir()
+    source.parent.mkdir(parents=True)
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update({"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+
+    def git(*arguments: str) -> None:
+        _ = subprocess.run(["git", "-C", str(checkout), *arguments], env=environment, capture_output=True,
+                           text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+
+    git("init", "-b", "main")
+    git("init", "--bare", str(origin))
+    git("remote", "add", "origin", str(origin))
+    git("config", "user.name", "Folder Rename Test")
+    git("config", "user.email", "rename@example.invalid")
+    git("config", "gc.auto", "0")
+    _ = (checkout / "kept.txt").write_text("Keep this work.\n")
+    git("add", ".")
+    git("commit", "-m", "fixture")
+    git("worktree", "add", "-b", f"cargo-liner-{old_name}", str(source))
+
+
+def copy_folder_repositories(seed: Path, root: Path, old_name: str) -> None:
+    """Copy the class repositories into root as if Git had made them there.
+
+    The origin URL keeps root as given; Git writes the worktree links with the resolved path.
+    """
+    for copied, destination in zip(folder_repositories(seed, old_name), folder_repositories(root, old_name)):
+        _ = shutil.copytree(copied, destination, symlinks=True)
+    checkout, _, source = folder_repositories(root, old_name)
+    for path, location in ((checkout / ".git/config", root),
+                           (checkout / ".git/worktrees" / source.name / "gitdir", root.resolve()),
+                           (source / ".git", root.resolve())):
+        text = path.read_text()
+        if str(seed) not in text:
+            raise AssertionError(f"{path} does not name the Git seed {seed}")
+        _ = path.write_text(text.replace(str(seed), str(location)))
+
+
 class FolderRenameFixture(StaffTestCase):
     """Keep folder rename inputs in one private staff record and Git repository."""
 
@@ -278,6 +334,16 @@ class FolderRenameFixture(StaffTestCase):
     records: Path = Path()
     configuration: Path = Path()
     env: dict[str, str] = {}
+    git_seed: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        directory = tempfile.TemporaryDirectory(prefix="folder-rename-seed-")
+        cls.addClassCleanup(directory.cleanup)
+        cls.git_seed = Path(directory.name).resolve()
+        build_folder_repositories(cls.git_seed, cls.old_name)
 
     @property
     def owner(self) -> staff.StaffRow:
@@ -286,11 +352,12 @@ class FolderRenameFixture(StaffTestCase):
         identity = staff.native_id(fixture_runtime_id(f"unit:{parent}:{self.old_name}"))
         return staff.StaffRow(identity, "unit", self.old_name, staff.ReportsTo(parent),
             current_session=staff.native_id(fixture_runtime_id("folder-current-after-clear")),
-            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source), unit_type=staff.UnitDetails("direct"))
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        bind_private_run_roots(self, self.root)
         self.home = self.root / "home"
         self.checkout = self.root / "repository"
         self.source = self.home / "rust" / f"cargo-liner-{self.old_name}"
@@ -307,21 +374,12 @@ class FolderRenameFixture(StaffTestCase):
             "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
         }
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
+        _ = self.enterContext(fake_unit_host.private_process_registry())
         self.home.mkdir(exist_ok=True)
         (self.root / "proc").mkdir()
-        self.checkout.mkdir()
         self.source.parent.mkdir(parents=True)
         self.records.mkdir()
-        _ = self.git("init", "-b", "main")
-        _ = self.git("init", "--bare", str(self.root / "origin.git"))
-        _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
-        _ = self.git("config", "user.name", "Folder Rename Test")
-        _ = self.git("config", "user.email", "rename@example.invalid")
-        _ = self.git("config", "gc.auto", "0")
-        _ = (self.checkout / "kept.txt").write_text("Keep this work.\n")
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "fixture")
-        _ = self.git("worktree", "add", "-b", f"cargo-liner-{self.old_name}", str(self.source))
+        copy_folder_repositories(self.git_seed, self.root, self.old_name)
         owner = fixture_member("showrunner", name="folder-production",
             doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
@@ -338,7 +396,7 @@ class FolderRenameFixture(StaffTestCase):
         return result.stdout.strip()
 
     def command(self, *, new: str = "") -> subprocess.CompletedProcess[str]:
-        from scripts.shutdown import shutdown as folder_rename
+        from scripts.agents import shutdown as folder_rename
 
         arguments = ["rename", f"folder-production/{self.old_name}", new or self.new_name]
         return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
@@ -350,12 +408,24 @@ class FolderRenameFixture(StaffTestCase):
         if row is None or not isinstance(row.worktree, staff.PresentWorktree):
             raise AssertionError("The fixture needs a present worktree")
         folder = row.worktree
-        fake_unit_host.process(os.environ, 998040, 1, ["zsh"], {}, cwd=folder.path)
+        process_root = Path(os.environ["HERDR_PROC"])
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json"
+        if not live and (process_root / str(pid)).exists():
+            shutil.rmtree(process_root / str(pid))
+        if not live:
+            registry.unlink(missing_ok=True)
+        fake_unit_host.process(os.environ, 998039, 1, ["herdr", "--session", "agents", "server"], {}, cwd=self.root)
+        fake_herdr.herdr_listener(process_root, 998039, "agents", os.environ)
+        marks = {"HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p1"}
+        fake_unit_host.process(os.environ, 998040, 998039, ["zsh"], marks, cwd=folder.path)
         arguments = [kind, "resume", self.owner.current_session] if kind == "codex" else [kind]
         environment = {"CODEX_HOME": str(self.home / ".codex")} if kind == "codex" else {
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "CLAUDE_CODE_SESSION_ID": self.owner.current_session}
-        fake_unit_host.process(os.environ, pid, 998040 if live else 1, arguments if live else [],
-                               environment, cwd=folder.path)
+        if live:
+            fake_unit_host.process(os.environ, pid, 998040, arguments, {**marks, **environment}, cwd=folder.path)
+            write_text_atomic(registry, json.dumps({"pid": pid, "procStart": "1",
+                "sessionId": self.owner.current_session, "name": self.owner.name, "updatedAt": 1,
+                "formerNames": [], "tmux": "", "messagingSocketPath": ""}))
 
     def transcript(self, kind: Literal["claude", "codex"]) -> None:
         for directory in (self.home / ".claude", self.home / ".codex"):
@@ -393,7 +463,7 @@ class FolderSessionFixture:
             raise AssertionError("The move must never start a second session")
         if row.current_session != self.owner.current_session:
             raise AssertionError("The move must resume current_session")
-        from scripts.shutdown import restart
+        from scripts.agents import restart
 
         kind, _environment, arguments = restart.session_launch(str(row.current_session), row.name)
         self.resumes.append((kind, arguments))
@@ -405,7 +475,7 @@ class FolderSessionFixture:
 
     @contextmanager
     def installed(self) -> Generator[None]:
-        from scripts.shutdown import restart, pane_record
+        from scripts.agents import restart, pane_record
 
         def live_members(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
             return [row for row in rows if self.live and row.id == self.owner.id]

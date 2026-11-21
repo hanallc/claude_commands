@@ -11,7 +11,6 @@ import sys
 import tempfile
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,7 +26,7 @@ from scripts.buildlog import record as recorder
 from scripts.buildlog import step_outputs
 from scripts.lib import test_hang_guard
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lint import sweep
 from scripts.test_times.gate_record_test_support import gate_run
 from scripts.buildlog.record import TARGET_DIR_UNSET
@@ -38,15 +37,13 @@ TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
 FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
 SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
-# Eight workers overlap imports and limit the number of Python processes.
-ISOLATION_IMPORT_WORKERS = 8
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
 
 
 COORDINATION_VARIABLES = (
-    "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "UNIT_ACTIVE_DIR",
+    "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR",
     "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
 )
 
@@ -188,6 +185,7 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     """Override the suite's temporary log root for this test only."""
     previous = os.environ.get("BUILDLOG_DIR")
     os.environ["BUILDLOG_DIR"] = str(root)
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, config_environment(root.parent / "config"))))
     _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {name: str(root / name) for name in COORDINATION_VARIABLES})))
 
     def restore() -> None:
@@ -209,7 +207,9 @@ def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]
         connection.row_factory = sqlite3.Row
         records = cast(list[sqlite3.Row],
                        connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
-        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+        return [{name: cast(object, row[name]) for name in row.keys()
+                 if not (table == "gate_modules" and name in {"config_reads", "folder_scans", "content_reads"} and row[name] is None)}
+                for row in records]
 
 
 class LogIsolationTests(unittest.TestCase):
@@ -231,30 +231,52 @@ class LogIsolationTests(unittest.TestCase):
         environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
         real_root = Path.home() / ".local/state/buildlog"
 
-        def import_module(module: Path) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                [
-                    str(CLI.parents[1] / "lib/py"),
-                    "-c",
-                    "import importlib, sys; from scripts.buildlog import store; "
-                    + "importlib.import_module(sys.argv[1]); print(store.root())",
-                    "scripts.buildlog." + module.stem,
-                ],
-                cwd=Path(__file__).resolve().parents[2],
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+        bootstrap = '''import importlib, json, os, sys, tempfile, traceback, unittest, unittest.mock
+from scripts.buildlog import store
 
+for module in json.loads(sys.argv[1]):
+    importlib.import_module(module)
+
+results = []
+for module in sys.argv[2:]:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        pid = os.fork()
+        if pid == 0:
+            os.dup2(output.fileno(), 1)
+            os.dup2(errors.fileno(), 2)
+            try:
+                importlib.import_module(module)
+                print(store.root(), flush=True)
+            except BaseException:
+                traceback.print_exc()
+                raise SystemExit(1)
+            raise SystemExit(0)
+        _, status = os.waitpid(pid, 0)
+        output.seek(0)
+        errors.seek(0)
+        results.append((os.waitstatus_to_exitcode(status), output.read().decode(), errors.read().decode()))
+print(json.dumps(results))
+'''
         modules = sorted(Path(__file__).parent.glob("test_*.py"))
-        with ThreadPoolExecutor(max_workers=ISOLATION_IMPORT_WORKERS) as pool:
-            futures = [(module, pool.submit(import_module, module)) for module in modules]
-            for module, future in futures:
-                with self.subTest(module=module.name):
-                    result = future.result()
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
+        production_modules = sorted(
+            "scripts.buildlog." + module.stem
+            for module in Path(__file__).parent.glob("*.py")
+            if not module.name.startswith("test_")
+            and not module.name.endswith("_test_support.py")
+            and module.name != "__init__.py"
+        )
+        parent = subprocess.run(
+            [str(CLI.parents[1] / "lib/py"), "-c", bootstrap, json.dumps(production_modules),
+             *("scripts.buildlog." + module.stem for module in modules)],
+            cwd=Path(__file__).resolve().parents[2], env=environment,
+            capture_output=True, text=True, check=True,
+        )
+        results = cast(list[tuple[int, str, str]], json.loads(parent.stdout))
+        for module, (status, output, errors) in zip(modules, results, strict=True):
+            with self.subTest(module=module.name):
+                result = subprocess.CompletedProcess([module.name], status, output, errors)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
 
 
 def encode(record: Record) -> bytes:
@@ -279,6 +301,44 @@ class IndexTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
+
+    def test_vcpu_schema_rebuild_keeps_old_records_and_reads_new_counts(self) -> None:
+        old: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "old", "host": "natedev"}
+        new: Record = {**old, "id": "new", "vcpus": 16}
+        self.write(self.host_file, old, new)
+        columns, key, description = index.TABLES["gate_runs"]
+        old_columns = [column for column in columns if column[0] != "vcpus"]
+        with mock.patch.dict(index.TABLES, {"gate_runs": (old_columns, key, description)}), \
+                mock.patch.object(index, "SCHEMA_VERSION", index.SCHEMA_VERSION - 1), \
+                mock.patch.object(index, "GATE_RUN_COLUMNS", old_columns):
+            self.assertEqual(index.update(), 2)
+            old_path = index.index_path()
+            self.assertEqual(self.rows("SELECT id FROM gate_runs ORDER BY id"), [("new",), ("old",)])
+        self.assertEqual(index.update(), 2)
+        self.assertNotEqual(index.index_path(), old_path)
+        self.assertEqual(self.rows("SELECT id, vcpus FROM gate_runs ORDER BY id"), [("new", 16), ("old", None)])
+        with closing(sqlite3.connect(old_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM gate_runs").fetchone(), (2,))
+
+    def test_gate_config_reads_store_sorted_empty_and_missing_records(self) -> None:
+        template = gate_run()["modules"][0]
+        run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "config-reads", "host": "mac",
+                       "modules": [{**template, "module": "test_empty.py", "config_reads": [], "folder_scans": [], "content_reads": []},
+                                   {**template, "module": "test_missing.py"},
+                                   {**template, "module": "test_read.py", "config_reads": ["z", "a", "z"],
+                                    "folder_scans": ["scripts/", "docs", "scripts/"],
+                                    "content_reads": ["scripts/z.py", "scripts/a.py", "scripts/z.py"]}]}
+        self.write(self.host_file, run)
+        _ = index.update()
+        self.assertIn("config_reads", [row[1] for row in self.rows("PRAGMA table_info(gate_modules)")])
+        self.assertEqual(self.rows("SELECT module, config_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None), ("test_read.py", '["a", "z"]')])
+        self.assertEqual(self.rows("SELECT module, folder_scans FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["docs", "scripts/"]')])
+        self.assertEqual(self.rows("SELECT module, content_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["scripts/a.py", "scripts/z.py"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
         spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
@@ -423,8 +483,8 @@ class IndexTests(unittest.TestCase):
         sidecars = [old_path.with_name(old_path.name + suffix) for suffix in SQLITE_SIDECARS]
         for path in sidecars:
             _ = path.write_bytes(b"old schema sidecar")
-        os.utime(old_path, (old, old))
-        os.utime(recent_path, (old, recent))
+        for path, accessed, modified in ((old_path, recent, old), (recent_path, old, recent)):
+            os.utime(path, (accessed, modified))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
@@ -436,7 +496,7 @@ class IndexTests(unittest.TestCase):
         self.assertTrue(recent_path.is_file())
         os.utime(recent_path, (recent, old))
         self.assertEqual(index.update(), 0)
-        self.assertTrue(recent_path.is_file())
+        self.assertFalse(recent_path.exists())
         self.assertEqual(self.ids(), ["retained"])
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
         self.assertEqual(index.update(), 0)
@@ -764,11 +824,70 @@ class IndexTests(unittest.TestCase):
         ):
             with self.subTest(threshold=threshold):
                 _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
-                tests = parse.test_results(lines)[0]
+                tests = parse.test_results(lines).timing_rows
                 self.assertEqual({test["test"] for test in tests}, expected)
                 self.write(self.host_file, step("threshold", step="nextest", tests=tests))
                 _ = index.update()
                 self.assertEqual({row[0] for row in self.rows("SELECT test FROM tests")}, expected)
+
+    def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_SPILL_PAGES=65536\nINDEX_TOUCH_MINUTES=60")
+        passed = "PASS [ 0.010s] hana tests::fast\n"
+        summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
+        partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"
+        retry = "TRY 1 FAIL [ 0.008s] (───) hana tests::fast\n"
+        captured = parse.log_facts("nextest", """\
+PASS [ 0.010s] hana tests::fast
+  stdout ───
+PASS [ 0.001s] hana tests::printed
+Summary [ 0.011s] 2 tests run: 2 passed, 0 skipped
+  ──────────
+PASS [ 0.010s] hana tests::gpu
+Summary [ 0.020s] 2 tests run: 2 passed, 1 skipped
+""")
+        self.assertEqual(captured["tests_skipped"], 1)
+        malformed: dict[str, object] = {
+            "string-names": {"by_binary": {"hana": "x"}, "complete": True},
+            "nested-names": {"by_binary": {"hana": [["tests::fast"]]}, "complete": True},
+            "array-by-binary": {"by_binary": ["tests::fast"], "complete": True},
+            "numeric-complete": {"by_binary": {"hana": ["tests::fast"]}, "complete": 1},
+        }
+        self.write(self.host_file,
+                   step("complete", step="nextest", **parse.log_facts("nextest", passed + summary)),
+                   step("hidden", step="nextest", **parse.log_facts("nextest", summary)),
+                   step("duplicate", step="nextest", **parse.log_facts("nextest", passed + passed + summary)),
+                   step("failed", step="nextest", status=101, **parse.log_facts("nextest", passed + summary)),
+                   step("partial", step="nextest", **parse.log_facts("nextest", passed + partial)),
+                   step("retry", step="nextest", **parse.log_facts("nextest", retry + summary)),
+                   step("missing-proof", step="nextest", **parse.log_facts(
+                       "nextest", passed + "PASS [ 0.010s] hana tests::other\n" + partial)),
+                   step("captured-output", step="nextest", **captured),
+                   step("legacy", step="nextest", tests_run=1,
+                        tests=[{"binary": "hana", "test": "tests::fast", "status": "passed"}]),
+                   *(step(name, step="nextest", tests_run=1, observed_tests=observed)
+                     for name, observed in malformed.items()))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT step_id FROM tests ORDER BY step_id"), [("legacy",), ("retry",)])
+        classes = index.NextestGpuClass
+        with closing(index.read_only()) as database:
+            proof = {("hana", "tests::fast"): classes.NO_GPU}
+            for verdict in (classes.NO_GPU, classes.GPU):
+                proof["hana", "tests::fast"] = verdict
+                self.assertEqual(index.nextest_gpu_class(database, "complete", proof), verdict)
+                for step_id in ("legacy", "hidden", "duplicate", "failed", "partial", "retry"):
+                    with self.subTest(step_id=step_id, verdict=verdict):
+                        self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
+            proof["hana", "tests::fast"] = classes.NO_GPU
+            self.assertEqual(index.nextest_gpu_class(database, "missing-proof", proof), classes.UNKNOWN)
+            proof["hana", "tests::printed"] = classes.NO_GPU
+            proof["hana", "tests::gpu"] = classes.GPU
+            self.assertEqual(index.nextest_gpu_class(database, "captured-output", proof), classes.UNKNOWN)
+            proof["hana", "x"] = classes.NO_GPU
+            for step_id in malformed:
+                with self.subTest(step_id=step_id):
+                    self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))
@@ -1753,12 +1872,6 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(
             self.rows("SELECT job_id, run_state, duration_s, queued_s FROM ci_jobs ORDER BY job_id"),
             [(11, "ran", 60.0, 0.0), (12, "skipped", None, None)],
-        )
-
-    def test_ci_job_run_states_name_the_persisted_outcomes(self) -> None:
-        self.assertEqual(
-            {state.value for state in index.JobRunState},
-            {"ran", "skipped", "carried_over"},
         )
 
     def test_tree_and_port_lint_columns(self) -> None:

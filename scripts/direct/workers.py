@@ -13,19 +13,18 @@ except FileNotFoundError:
 import argparse
 import sys
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Never, Protocol, cast
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib import unit_runs
 
 if TYPE_CHECKING:
-    from scripts.production import unit_lookup
-    from scripts.message.sessions import RegistryRead, SessionRecord
+    from scripts.message.sessions import RegistryRead
     from scripts.lib.names import JobKey
 
 STATE = "progress_history_state.json"
@@ -49,62 +48,66 @@ class LiveUnitDirector:
 
 @dataclass(frozen=True)
 class NoLiveUnitDirector:
-    """Neither the registry nor the unit mark identifies a live director."""
+    """The evidence proves there is no live director."""
 
 
-def running_director_sessions(registry: RegistryRead) -> list[SessionRecord]:
-    """Running director candidates, newest first, including sessions without sockets."""
-    from scripts.message import sessions
+@dataclass(frozen=True)
+class UnknownUnitDirector:
+    """The evidence cannot establish whether the director is live."""
 
-    return sessions.running_records(registry)
+    reason: str
+
+    def __bool__(self) -> Never:
+        raise WorkerUnavailable(self.reason)
+
+
+type UnitDirector = LiveUnitDirector | NoLiveUnitDirector | UnknownUnitDirector
 
 
 def resolve_live_unit_director(
-    run: Path, record: staff.StaffSnapshot, sources: unit_lookup.MemberSources,
-    running: Sequence[SessionRecord], dependencies: Callable[[Path], None], *,
-    use_live_marks: bool = True,
-) -> LiveUnitDirector | NoLiveUnitDirector:
-    """Resolve the current director from worker membership or the unit staff row."""
+    run: Path, record: staff.StaffSnapshot, registry: RegistryRead, dependencies: Callable[[Path], None],
+) -> UnitDirector:
+    """Check the recorded director's current conversation."""
     from scripts.production import unit_lookup
 
     dependencies(run / STATE)
     context = worker_lifecycle.read_json_object(run / STATE)
     owner = unit_runs.run_owner(context, record)
-    parents = ({owner.id: owner} if isinstance(owner, staff.StaffRow)
-               and owner.kind in ("unit", "showrunner") else {})
-    if len(parents) != 1:
+    if not isinstance(owner, staff.StaffRow) or owner.kind not in ("unit", "showrunner"):
         return NoLiveUnitDirector()
-    parent = next(iter(parents.values()))
-    for session in running:
-        if session["sessionId"] == parent.current_session:
-            return LiveUnitDirector(session["sessionId"], session["pid"])
-    production = record.parent_of(parent)
-    if use_live_marks and production is not None:
-        try:
-            marked = unit_lookup.labeled_session(production.name, parent.name, record=record, sources=sources, running=running)
-        except OSError:
+    match unit_lookup.checked_conversation(owner.current_session, record=record, registry=registry):
+        case unit_lookup.ProvedLiveUnit(
+            owner=unit_lookup.LabeledSession(claude=unit_lookup.LiveClaude() as claude)
+        ) | unit_lookup.ProvedLiveUnit(owner=unit_lookup.LiveClaude() as claude):
+            return LiveUnitDirector(claude.session_id, claude.pid)
+        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
+                identity=unit_lookup.LiveSession(id=identity),
+                process=session_staff.ProvedCodexPaneProcess(pid=pid))):
+            return LiveUnitDirector(identity, pid)
+        case unit_lookup.ProvedLiveUnit():
+            return UnknownUnitDirector("the checked director has no native process identity")
+        case unit_lookup.UnknownUnit(reason=reason):
+            return UnknownUnitDirector(reason)
+        case unit_lookup.ProvedAbsentUnit():
             return NoLiveUnitDirector()
-        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
-            if marked.claude.session_id == parent.current_session:
-                return LiveUnitDirector(marked.claude.session_id, marked.claude.pid)
-    return NoLiveUnitDirector()
 
 
-def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
+def live_unit_director(run: Path) -> UnitDirector:
     """Resolve the director across restarts with one owner snapshot."""
-    from scripts.production import staff, unit_lookup
     from scripts.message import sessions
 
-    dependencies = staff.RecordInputs()
-    record = staff.initial_snapshot()
-    registry = sessions.read_registry(dependencies=dependencies)
-    running = running_director_sessions(registry)
-    return resolve_live_unit_director(run, record, unit_lookup.member_sources(dependencies=dependencies),
-                                      running, dependencies)
+    try:
+        dependencies = staff.RecordInputs()
+        record = staff.initial_snapshot()
+        registry = sessions.read_registry(dependencies=dependencies)
+        return resolve_live_unit_director(run, record, registry, dependencies)
+    except (OSError, ValueError) as error:
+        return UnknownUnitDirector(str(error))
 
 
-def run_has_live_director(run: Path) -> bool:
-    return isinstance(live_unit_director(run), LiveUnitDirector)
+def run_has_live_director(run: Path) -> bool | UnknownUnitDirector:
+    director = live_unit_director(run)
+    return director if isinstance(director, UnknownUnitDirector) else isinstance(director, LiveUnitDirector)
 
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
@@ -160,13 +163,11 @@ def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str =
     owner = membership.parent_of(parent)
     assigned_role = role
     if not assigned_role:
-        from scripts.direct import progress_history
-        dispatch = progress_history.last_dispatch(member.id)
-        assigned_role = dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch) else ""
+        assigned_role = member.role.value if isinstance(member.role, staff.KnownWorkerRole) else ""
     jobs: dict[str, JobKey] = {"impl": "implementer", "test": "tester", "fix": "repair_worker",
                                "review": "code_reviewer"}
     peers = [row.name for row in membership.find(kind="worker", parent=parent.id)]
-    ordinal = peers.index(address) + 1
+    ordinal = peers.index(member.name) + 1
     return titles.unit_worker_title(owner.name if owner is not None else "", parent.name,
                                     jobs.get(assigned_role, "worker"),
                                     ordinal, address)

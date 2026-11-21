@@ -27,6 +27,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 # The account reader and the production scripts sit one directory over.
@@ -100,10 +101,10 @@ def record_time(text: str) -> datetime:
 
 def recent_replies(path: Path, since: datetime) -> bool:
     """A recent file write alone does not make an old reply part of tonight."""
-    with path.open(encoding="utf-8") as stream:
+    with open_transcript(path) as stream:
         for line in stream:
             try:
-                data = json_record(line)
+                data = json_record(line.decode("utf-8"))
                 record = DatedTranscriptRecord(type=record_text(data, "type"), timestamp=record_text(data, "timestamp"))
                 if record["type"] == "assistant" and record_time(record["timestamp"]) >= since:
                     return True
@@ -150,7 +151,9 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             config = record.get("config_dir", "")
             pid = record.get("pid", 0)
             if recorded:
-                candidates = [Path(recorded)]
+                recorded_path = Path(recorded)
+                candidates = ([recorded_path] if recorded_path.exists() else
+                              [recorded_path.with_suffix(recorded_path.suffix + ".zst")])
             else:
                 setting = (account.ConfiguredClaudeFolder(Path(config)) if config else
                            account.process_account_directory(account.process_config_dir(pid)) if pid > 0 else
@@ -159,10 +162,10 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
                     print(f"messages: account directory unavailable for {session}", file=sys.stderr)
                     continue
                 directory = setting.path
-                candidates = list((directory / "projects").glob(f"*/{session}.jsonl"))
+                candidates = transcript_paths(directory / "projects", f"*/{session}.jsonl")
             for candidate in candidates:
                 if candidate.is_file() and recent_replies(candidate, since):
-                    found.add(candidate)
+                    found.add(candidate.resolve())
         except (OSError, ValueError, TypeError) as error:
             print(f"messages: {path}: {error}", file=sys.stderr)
     return sorted(found)
@@ -306,21 +309,45 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
     return found[0]
 
 
-def live_unit(production: NightlyProduction, *, resolver: RowResolver) -> LiveClaude | None:
+@dataclass(frozen=True)
+class NightlyUnitLivenessUnknown:
+    reason: str
+
+
+@dataclass(frozen=True)
+class NightlyUnitWithoutSocket:
+    """The running unit has no usable messaging socket."""
+
+
+@dataclass(frozen=True)
+class NightlyUnitNotLive:
+    """The selected unit has no running session."""
+
+
+def live_unit(production: NightlyProduction, *, resolver: RowResolver
+              ) -> LiveClaude | NightlyUnitWithoutSocket | NightlyUnitLivenessUnknown | NightlyUnitNotLive:
     """Find the configured unit through its native session identity."""
     from scripts.production import session_staff
-    from scripts.message import sessions
+    from scripts.message import session_records
 
     if isinstance(production.selection, NightlyUnitNotSelected):
-        return None
+        return NightlyUnitNotLive()
     row = resolver.record.by_id(production.selection.unit.id)
     if row is None:
-        return None
-    for current in sessions.live_sessions():
-        if current["sessionId"] == row.current_session:
+        return NightlyUnitNotLive()
+    registry = session_records.enumerate_running_sessions()
+    if isinstance(registry, session_records.RunningSessionDiscoveryFailed):
+        return NightlyUnitLivenessUnknown(registry.reason)
+    matches = [current for current in registry.records if current["sessionId"] == row.current_session]
+    for current in matches:
+        if session_records.messaging_socket_exists(current):
             return session_staff.LiveClaude(current["name"], current["sessionId"],
-                                           current["messagingSocketPath"], current["pid"])
-    return None
+                                            current["messagingSocketPath"], current["pid"])
+    if matches:
+        return NightlyUnitWithoutSocket()
+    if registry.unreadable:
+        return NightlyUnitLivenessUnknown(session_records.registry_unreadable_reason(registry.unreadable))
+    return NightlyUnitNotLive()
 
 
 def tonight(day: date) -> list[str]:
@@ -338,7 +365,7 @@ def tonight(day: date) -> list[str]:
     lines: list[str] = []
     try:
         claude = live_unit(production, resolver=resolver)
-        if claude is None:
+        if isinstance(claude, NightlyUnitNotLive):
             plan = selection.config.plan
             launch = (["--permanent"] if isinstance(plan, unit_config.PermanentPlan) else
                       ["--standby"] if isinstance(plan, unit_config.StandbyPlan) else
@@ -352,7 +379,11 @@ def tonight(day: date) -> list[str]:
             claude = live_unit(production, resolver=resolver)
     except OSError as error:
         return [f"skipped: units unreadable: {error}"]
-    if claude is None:
+    if isinstance(claude, NightlyUnitLivenessUnknown):
+        return [*lines, f"{selection.unit.name}: {claude.reason}"]
+    if isinstance(claude, NightlyUnitWithoutSocket):
+        return [*lines, f"{selection.unit.name}: the running unit has no usable messaging socket"]
+    if isinstance(claude, NightlyUnitNotLive):
         return [*lines, f"{selection.unit.name}: no live Claude has the unit's recorded identity"]
     sent = subprocess.run(session_send.send_argv("--to", f"uds:{claude.socket}", "--from", "nightly-review timer",
                                             "--key", f"nightly-{day.isoformat()}", "--text", job(day)),

@@ -1,6 +1,8 @@
 """Validation and merged-branch recovery use only a local bare remote."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import shutil
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -56,7 +58,10 @@ touch hook-finished
         _ = self.git("commit", "-am", "next")
         self.install_gh()
         stopped = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
-        self.assertNotEqual(stopped.returncode, 0)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("post-push hook: failed (exit 9); rerun:", stopped.stderr)
+        self.assertIn("LANDED_SHA=", stopped.stderr)
+        self.assertIn("LANDED_BRANCH=main", stopped.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD").stdout, self.git("rev-parse", "origin/main").stdout)
         landed = self.git("rev-parse", "HEAD").stdout
         finished = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
@@ -73,10 +78,24 @@ touch hook-finished
         self.seed()
         self.install_gh()
         first = self.git("rev-parse", "HEAD").stdout.strip()
-        # Stop after publishing the completion, before the script exits.
-        self.stop_command("mv", target=".git/post-push-completed", after=True)
+        stop = self.write(self.root / "stop-completion", "stop\n")
+        startup = self.root / "startup"
+        _ = self.write(startup / "sitecustomize.py", f'''from pathlib import Path
+from scripts.lib import atomic_file
+write = atomic_file.write_text_atomic
+def stop_after_completion(path, text, **options):
+    write(path, text, **options)
+    flag = Path({str(stop)!r})
+    if path.name == "post-push-completed" and flag.exists():
+        flag.unlink()
+        raise SystemExit(86)
+atomic_file.write_text_atomic = stop_after_completion
+''')
+        self.environment["PYTHONPATH"] = os.pathsep.join((str(startup), str(Path(__file__).resolve().parents[2])))
         stopped = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
         self.assertNotEqual(stopped.returncode, 0)
+        self.assertFalse(stop.exists(), stopped.stdout + stopped.stderr)
+        self.assertEqual((self.repo / ".git/post-push-completed").read_text().strip(), first)
         repeated = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual((self.repo / ".git/hook-runs").read_text().splitlines(), [first])
@@ -189,6 +208,31 @@ printf '%s\\n' "${GIT_INDEX_FILE:-real}" >> "$TEST_INDEX_HOOK_LOG"
         self.assertTrue(calls, "The real commit still runs repository hooks")
         self.assertFalse(any("validate-index." in call for call in calls), calls)
         self.assertEqual((self.repo / "seed.txt").read_text(), "formatted\n")
+
+    def test_autofix_proof_refuses_a_same_size_edit_at_the_index_mtime(self) -> None:
+        self.seed()
+        self.install_autofix()
+        _ = self.git("config", "core.trustctime", "false")
+        source = self.write(self.repo / "racy.txt", "before\n")
+        timestamp = 1_600_000_000_000_000_000
+        os.utime(source, ns=(timestamp, timestamp))
+        _ = self.git("add", "racy.txt")
+        _ = self.git("commit", "-qm", "Add the racy file")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        _ = self.write(self.repo / ".git/validate-autofix", f"{head} {tree}\n")
+        index = self.repo / ".git/index"
+        os.utime(index, ns=(timestamp, timestamp))
+        _ = source.write_text("edited\n")
+        os.utime(source, ns=(timestamp, timestamp))
+
+        result = self.script("validate_and_push/validate_ci.sh")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uncommitted changes outside the saved autofix output", result.stderr)
+        self.assertIn("racy.txt", result.stderr)
+        self.assertEqual(source.read_text(), "edited\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head)
 
     def assert_user_edit_refused(self, before: str) -> None:
         index = (self.repo / ".git/index").read_bytes()

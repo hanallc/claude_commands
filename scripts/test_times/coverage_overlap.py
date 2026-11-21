@@ -21,10 +21,10 @@ from pathlib import Path
 import platform
 import sys
 from typing import TYPE_CHECKING, TypedDict, cast, override
-import tempfile
 import unittest
 
 
+from scripts.lib import build_folders
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
 )
@@ -77,7 +77,10 @@ class ChildEnvironment:
         self.saved: dict[str, str] = {name: os.environ[name] for name in self.names if name in os.environ}
         child_path = str(Path(__file__).resolve().parent / "coverage_child")
         previous = self.saved.get("PYTHONPATH", "")
-        self.python_path: str = child_path + (os.pathsep + previous if previous else "")
+        from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+        paths = inherited_paths(previous)
+        self.python_path: str = os.pathsep.join((child_path, *paths))
         self.leaves: str = " ".join(conf.read("test_times").words("COVERAGE_LEAF_PROGRAMS"))
 
     def start_test(self, test_id: str) -> None:
@@ -199,9 +202,9 @@ def child_causes(collector: LineCollector, evidence: ChildEvidence) -> dict[str,
         started = launch["started"]
         end = ends.get(launch_id, math.inf)
         for test_id, recorded in collector.completed.items():
-            at_start = started < recorded.started < end
-            at_stop = started < recorded.stopped < end
-            overlap = started < recorded.stopped and recorded.started < end
+            at_start = launch_id in recorded.live_children_at_start or started < recorded.started < end
+            at_stop = launch_id in recorded.live_children_at_stop or started < recorded.stopped < end
+            overlap = at_start or at_stop or (started < recorded.stopped and recorded.started < end)
             if owner == SHARED_THREAD:
                 if overlap:
                     causes[test_id].add("shared thread")
@@ -216,7 +219,7 @@ def child_causes(collector: LineCollector, evidence: ChildEvidence) -> dict[str,
 def collect(suite: Callable[[], unittest.TestSuite], repository: Path = REPOSITORY
             ) -> tuple[TimedResult, list[TestCoverage]]:
     """Run a suite through the shared timed runner and join its child reports."""
-    with tempfile.TemporaryDirectory(prefix="natest-coverage-") as directory:
+    with build_folders.tool_folder("natest-coverage") as directory:
         environment = ChildEnvironment(Path(directory))
 
         class CoverageResult(TimedResult):

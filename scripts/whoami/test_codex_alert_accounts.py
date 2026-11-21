@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import base64
 import io
 import json
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_models_registry import registry_text, write_registry
 
 
@@ -28,11 +31,13 @@ from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired
 from scripts.whoami.test_quota_alert import REGISTRY
+from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
+from scripts.whoami.quota_alert_test_support import complete_worker_moves, worker_mode_broadcasts
 
 CURRENT_READING_AGE = timedelta()
 
@@ -53,10 +58,17 @@ class CodexAccountAlertTests(unittest.TestCase):
     sent: list[str] = []
     pushes: list[RenderedPush] = []
     relayed: list[str] = []
+    credits: set[str] = set()
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(worker_mode_broadcasts())
+        _ = self.enterContext(patch.object(accounts, "_launch_worker_moves", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        _ = config_environment(settings.parent)
+        _ = write_config_fixture(settings, "usage_stale_minutes=10\n")
+        self.credits = hold_credit_accounts(self)
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.sent = []
         self.pushes = []
@@ -64,7 +76,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "CODEX_CONFIG_FILE": str(self.root / "absent"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "absent"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "synced"),
@@ -77,8 +89,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         config = self.root / "showrunners.conf"
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=director
@@ -153,10 +163,7 @@ always=director
                                        reset=self.now + timedelta(hours=12))
                         self.save_room(later, 90 if fallback == "codex2" else 0)
                         note = self.note(1, "active", left)
-                        _ = note.path.write_text(note.path.read_text().replace(
-                            "credit_balance:", f"use_credits: {credits}\ncredit_balance:"))
-                        note = note_file.read_note(note.path)
-                        assert isinstance(note, note_file.Note)
+                        set_credits(self.credits, "codex1", credits)
                         push = quota_alert.codex_next_move_push(note, now=self.now)
                         if not 0 < left <= 2:
                             self.assertIsInstance(push, quota_alert.QuotaStatusNote)
@@ -218,6 +225,7 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
         requests = [row for row in moves.read_moves() if row["kind"] == "requested"]
         self.assertEqual([(row.get("cause"), row["why"], row["to"]) for row in requests],
@@ -243,6 +251,7 @@ always=director
         self.assertEqual(journal[0]["move_id"], journal[1]["move_id"])
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
 
     def test_interrupted_workers_log_removal_does_not_replay_after_operator_return(self) -> None:
@@ -252,6 +261,7 @@ always=director
         with patch.object(next_moves, "write_next_moves", side_effect=OSError("fixture log replacement failed")):
             try:
                 _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
+                _ = complete_worker_moves(readings, self.now)
             except OSError:
                 pass
         self.assertEqual(agent_accounts.workers_home(), target.home)
@@ -311,6 +321,7 @@ always=director
         self.assertEqual(next_moves.read_next_moves(), (entry,))
         _ = quota_alert.run_workers_next_moves(readings, self.now)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
 
     def test_pending_failure_retry_after_a_failed_state_save_records_one_failure(self) -> None:
@@ -355,6 +366,7 @@ always=director
         self.assertEqual(failures, pending)
         self.assertEqual(len(failures), 1)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
         with quota_alert.state_file() as state:
             self.assertFalse(state.get("pending_move_failures"))
@@ -390,9 +402,7 @@ always=director
         self.save_room(target, 80)
         self.save_room(other, 80)
         note = self.note(1, "active", 0)
-        _ = note.path.write_text(note.path.read_text().replace("credit_balance:", "use_credits: off\ncredit_balance:"))
-        note = note_file.read_note(note.path)
-        assert isinstance(note, note_file.Note)
+        set_credits(self.credits, "codex1", "off")
         readings = self.readings(source, self.report(source, 0), self.report(target, 80), self.report(other, 80))
         _ = next_moves.add_next_move("workers", 1, "codex2")
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
@@ -457,15 +467,20 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         journal = moves.store_file()
         journal.parent.mkdir(parents=True, exist_ok=True)
-        _ = journal.write_bytes(b'{"kind":')
-        output = io.StringIO()
-        with redirect_stdout(output):
-            _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
-        self.assertEqual(agent_accounts.workers_home(), target.home)
+        for repeat in (False, True):
+            with self.subTest(repeat=repeat):
+                before = journal.read_bytes() if repeat else b""
+                _ = journal.write_bytes(before + b'{"kind":')
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
+                self.assertEqual(agent_accounts.workers_home(), target.home)
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+                lines = [line for line in output.getvalue().splitlines() if "torn final line" in line]
+                self.assertEqual(len(lines), 1)
+                self.assertIn("moves.jsonl", lines[0])
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
-        lines = [line for line in output.getvalue().splitlines() if "torn final line" in line]
-        self.assertEqual(len(lines), 1)
-        self.assertIn("moves.jsonl", lines[0])
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"],
                          [f"auto: {entry.id}"])
 
@@ -569,8 +584,10 @@ always=director
         readings = self.readings(source, self.report(source), self.report(target, 80))
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
             returned = quota_alert.run_workers_next_moves(readings, self.now)
-        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto")
+        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto", worker_moves="detach",
+            worker_move_journal=moves.read_moves())
         self.assertEqual(returned.workers, accounts.CodexWorkersAccount(target.label, target.home))
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), (later,))
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"], [f"auto: {head.id}"])
 
@@ -597,9 +614,7 @@ always=director
             with self.subTest(target=target_label):
                 head = next_moves.add_next_move("workers", 1, target_label)
                 note = self.note(1, "active", 1)
-                _ = note.path.write_text(note.path.read_text().replace("credit_balance:", "use_credits: off\ncredit_balance:"))
-                note = note_file.read_note(note.path)
-                assert isinstance(note, note_file.Note)
+                set_credits(self.credits, "codex1", "off")
                 reminder = quota_alert.codex_next_move_push(note, now=self.now)
                 self.assertEqual(reminder, quota_alert.QuotaStatusNote("codex1", expected))
                 with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
@@ -619,8 +634,10 @@ always=director
         head = next_moves.add_next_move("workers", 1, "codex2")
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
             returned = quota_alert.run_workers_next_moves(readings, self.now)
-        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto")
+        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto", worker_moves="detach",
+            worker_move_journal=moves.read_moves())
         self.assertEqual(returned.workers, accounts.CodexWorkersAccount(target.label, target.home))
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"], [f"auto: {head.id}"])
 
@@ -729,30 +746,40 @@ always=director
         self.assertEqual(agent_accounts.workers_home(), soon.home)
         self.assertIn("direct=codex", registry_view())
 
-    def test_each_exited_refusal_tells_only_its_director_even_with_an_open_fallback(self) -> None:
+    def test_each_stopped_worker_refusal_tells_only_its_director_even_with_an_open_fallback(self) -> None:
         source = self.account(1)
         readings = self.readings(source, self.report(source, 0))
         note = self.note(1, "active", 0)
-        commands = (("director-a", "impl", "worker.py assign impl 'first task'"),
-                    ("director-b", "test", "worker.py assign test 'second task'"))
-        with patch.object(quota_alert, "relay", return_value=None) as relay:
-            for director, worker, command in commands:
+        workers = (("director-a", "impl"), ("director-b", "test"))
+        with (patch.object(quota_alert, "relay", return_value=None) as relay,
+              patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST)):
+            for director, worker in workers:
                 log = quota_alert.blocked([note], source, self.now, codex_readings=readings,
-                    stopped=quota_alert.StoppedWorkerCommand(director, worker, command))
-                self.assertTrue(any(f"quota rerun {worker} -> {director}: sent" in line for line in log))
+                    stopped=quota_alert.StoppedWorker(director, worker))
+                self.assertIn(f"quota relay {worker} -> {director}: sent", log)
                 with quota_alert.state_file() as state:
                     self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(relay.call_count, 2)
-            for call, (director, worker, command) in zip(relay.call_args_list, commands):
+            for call, (director, worker) in zip(relay.call_args_list, workers):
                 recipient, text, key = cast(tuple[str, str, str | None], call.args)
                 self.assertEqual(recipient, f"session:{director}")
-                self.assertIn(worker, text)
-                self.assertIn(command, text)
-                self.assertIn("Rerun this command on Claude", text)
+                self.assertEqual(text, quota_alert.stopped_worker_relay(worker, quota_alert.NO_WORKER_MODE_STARTED))
                 self.assertIsNone(key)
             _ = quota_alert.blocked([note], source, self.now, codex_readings=readings,
-                                    stopped=quota_alert.StoppedCommandUnknown())
+                                    stopped=quota_alert.StoppedWorkerUnknown())
             self.assertEqual(relay.call_count, 2)
+
+    def test_stopped_worker_relay_names_each_outcome(self) -> None:
+        cases = ((quota_alert.WorkersMoved("codex2"), "Workers moved to codex2, and the move resumes the pass. "),
+                 (quota_alert.WorkersWaitForReset("14:05"), "Workers wait for the reset at 14:05. "),
+                 (quota_alert.REFUSAL_OUTCOME_UNKNOWN, ""))
+        for outcome, sentence in cases:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(quota_alert.stopped_worker_relay("impl", outcome),
+                    f"Codex refused worker impl for quota. Its pass stays open. {sentence}Do not rerun its assign command.")
+        self.assertEqual(quota_alert.stopped_worker_relay("impl", quota_alert.NO_WORKER_MODE_STARTED),
+            "Codex refused worker impl for quota. No-worker mode started. "
+            + "The stop of the Codex workers ends its pass as canceled. Do not rerun its assign command.")
 
     def account(self, number: int, *, default: bool = False) -> agent_accounts.KnownCodexAccount:
         home = self.root / (".codex" if default else f".codex{number}")
@@ -925,8 +952,10 @@ always=director
         with (patch.object(quota_alert, "switch_to_claude") as fallback,
               patch.object(accounts, "swap", wraps=accounts.swap) as swap):
             log = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
-                codex_readings=readings, window=refusals.KnownWindow("weekly"))
+                codex_readings=readings, window=refusals.KnownWindow("weekly"),
+                stopped=quota_alert.StoppedWorker("director-a", "impl"))
         fallback.assert_not_called()
+        self.assertEqual(self.relayed, [quota_alert.stopped_worker_relay("impl", quota_alert.WorkersMoved("codex2"))])
         swap.assert_called_once()
         self.assertEqual(swap.call_args.args[:2], ("workers", "codex2"))
         self.assertEqual(agent_accounts.workers_home(), target.home)
@@ -973,7 +1002,10 @@ always=director
         log: list[str] = []
         for _attempt in range(2):
             log += quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
-                codex_readings=readings, window=refusals.KnownWindow("five_hour"))
+                codex_readings=readings, window=refusals.KnownWindow("five_hour"),
+                stopped=quota_alert.StoppedWorker("director-a", "impl"))
+        waits = quota_alert.stopped_worker_relay("impl", quota_alert.WorkersWaitForReset(quota_alert.reset_display(refusals.KnownReset(reset))))
+        self.assertEqual(self.relayed, [waits, waits])
         self.assertEqual(agent_accounts.workers_home(), old.home)
         self.assertIn("direct=codex", registry_view())
         self.assertEqual(sum(text.startswith("workers wait for codex1's 5-hour reset at ")
@@ -1094,9 +1126,8 @@ always=director
             worktree=staff.PresentWorktree("natedev", self.root))
         _ = fixture_worker("alert-review", unit.id, backend=staff.CodexBackend(source.home))
         for number in (1, 2):
-            note = self.note(number, "active" if number == 1 else "inactive", 0, "6370")
-            _ = note.path.write_text(note.path.read_text().replace("credit_balance:",
-                "use_credits: on\ncredit_balance:"))
+            _ = self.note(number, "active" if number == 1 else "inactive", 0, "6370")
+            set_credits(self.credits, f"codex{number}", "on")
         readings = self.readings(source, self.report(source, 0, "6370"), self.report(target, 1, "6370"))
         with (patch.object(accounts, "_codex_live", return_value=self.report(target, 0, "6370")) as live,
               patch.object(stop_resume, "stop") as stop):
@@ -1119,7 +1150,7 @@ always=director
         self.save_room(old, 0)
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
-        with patch.object(accounts, "_write_role", side_effect=OSError("fixture workers role write failed")) as write:
+        with patch.object(accounts, "write_role_map", side_effect=OSError("fixture workers role write failed")) as write:
             _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
         write.assert_called_once()
@@ -1218,7 +1249,7 @@ always=director
                     self.assertEqual((rendered.sender, rendered.need), (example.values["sender"], "decision"))
                     self.assertIsInstance(rendered.action, ActionRequired)
                     assert isinstance(rendered.action, ActionRequired)
-                    self.assertIn(example.values["account"] + ".md", rendered.action.text)
+                    self.assertIn(f"remove {example.values['account']} from codex_credit_accounts", rendered.action.text)
                     keys = {"sender", "account", "machine", "credits", "refill"}
                     if entry.id == "quota.paid_credits":
                         keys.add("next_reset")

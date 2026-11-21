@@ -21,16 +21,16 @@ With the user's 2026-10-13 move to herdr, an L1 showrunner uses
 Run, with the sandbox off:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_showrunner.py" --production <showrunner name> [--doc <path>] --model <your model id> --effort <your effort level> [--resume <session id> --cwd <dir> [--account <label>|--config-dir <dir>]] [--check]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_showrunner.py" --production <showrunner name> [--doc <path>] [--model <your model id> --effort <your effort level>] [--resume <session id> --cwd <dir> [--account <label>|--config-dir <dir>]] [--check]
 ```
 
 Pass `--doc <path>` only when the showrunner has no staff row yet.
 A resume or a rerun reads the doc from the existing row.
 
-Pass your own model id and effort level, so the lower showrunner runs as you
-do. Your system prompt names your model's exact id. When you cannot tell your
-effort level, ask the user which to use. Show the script's output. If it exits
-nonzero, show its message and stop.
+Omit both flags to use `showrunner` in `[production.claude]` in `config/models.conf`.
+Pass both flags to override the default.
+Show the command output.
+Stop if the command exits with a nonzero status.
 On launch it prints `started <showrunner name>: herdr session attach agents, workspace <showrunner name>, tab <showrunner name>`: every
 Claude session is a tab of the one herdr session, `agents`.
 

@@ -1,6 +1,9 @@
 """Unit-status integration tests, grouped by subject."""
 from __future__ import annotations
 
+import os
+from unittest.mock import patch
+
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
 
 
@@ -8,6 +11,13 @@ class UnitStatusTests(UnitStatusFixture):
     def test_blocks_are_headed_by_the_unit_ids_of_the_registered_doc(self) -> None:
         output, _ = self.run_status(None, "ok", 0)
         self.assertIn("== hook", output)
+
+    def test_inherited_proc_root_uses_fixture_process_starts(self) -> None:
+        with patch.dict(os.environ, {"HERDR_PROC": "/proc"}):
+            output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
+        self.assertNotIn("CLAUDE NOT RUNNING", output)
+        self.assertNotIn("CLAUDE STATE UNKNOWN", output)
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_showrunner_form_omits_retired_unit(self) -> None:
         outputs, _, _ = self.run_statuses(
@@ -29,13 +39,8 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertNotIn("TICKS FAILING", output)
         self.assertEqual(calls, "health unit-test-run\n")
 
-    def test_missing_active_marker_skips_health(self) -> None:
+    def test_no_staff_run_skips_health(self) -> None:
         output, calls = self.run_status(None, "failing: no instance", 1)
-        self.assertNotIn("TICKS FAILING", output)
-        self.assertIsNone(calls)
-
-    def test_empty_active_marker_skips_health(self) -> None:
-        output, calls = self.run_status("", "failing: no instance", 1)
         self.assertNotIn("TICKS FAILING", output)
         self.assertIsNone(calls)
 

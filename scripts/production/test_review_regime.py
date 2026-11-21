@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the review ledger: what names a row, and rows written before the plan was part of the name."""
+"""Check how the review ledger identifies current and older rows."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,8 @@ SECOND_PLAN = "docs/plans/dashboard-link.md"
 @final
 class ReviewRegimeTests(unittest.TestCase):
     ledger: Path = Path()
+    checkpoint: str = ""
+    other_checkpoint: str = ""
 
     @override
     def setUp(self) -> None:
@@ -32,10 +35,22 @@ class ReviewRegimeTests(unittest.TestCase):
         _ = self.enterContext(cast(contextlib.AbstractContextManager[object],
                                    mock.patch.dict(os.environ, {"HOME": str(home)})))
         _ = self.enterContext(mock.patch.object(review_regime, "LEDGER", self.ledger))
+        _ = self.enterContext(contextlib.chdir(home))
+        _ = self.git("init", "--quiet", "--template=")
+        tree = self.git("mktree")
+        self.checkpoint = self.git("commit-tree", tree, "-m", "First checkpoint")
+        self.other_checkpoint = self.git("commit-tree", tree, "-m", "Second checkpoint")
 
-    def add(self, *identity: str, started: str = STARTED, merged: str = MERGED) -> str:
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
+                               "-c", "commit.gpgsign=false", *args],
+                              input="", capture_output=True, text=True, check=True).stdout.strip()
+
+    def add(self, *identity: str, checkpoint: str = "",
+            started: str = STARTED, merged: str = MERGED) -> str:
         arguments = ["review_regime.py", "add", *identity, "--regime", "after", "--started", started,
-                     "--merged", merged, "--holds", "0", "--merge-defects", "0"]
+                     "--merged", merged, "--holds", "0", "--merge-defects", "0",
+                     "--checkpoint", checkpoint or self.checkpoint]
         output = io.StringIO()
         with (mock.patch("sys.argv", arguments), contextlib.redirect_stdout(output),
               contextlib.redirect_stderr(io.StringIO())):
@@ -76,13 +91,28 @@ class ReviewRegimeTests(unittest.TestCase):
         self.assertIn("| code findings per phase (mean) | - | - | 3.0 |", report)
         self.assertNotIn("simplify", report)
 
-    def test_legacy_add_keeps_the_serialized_record_bytes(self) -> None:
+    def test_each_review_minute_field_reads_numbers_and_skips_other_values(self) -> None:
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1")
+        base = cast(dict[str, object], json.loads(self.ledger.read_text()))
+        for field in ("review_minutes", "ux_check_minutes", "ux_repair_minutes"):
+            for value, expected in ((7, 7.0), (2.5, 2.5), ("7", None), (None, None)):
+                with self.subTest(field=field, value=value):
+                    _ = self.ledger.write_text(json.dumps({**base, field: value}) + "\n")
+                    read = cast(object, getattr(review_regime.read_rows()[0], field))
+                    self.assertEqual(read, expected)
+                    self.assertIs(type(read), type(expected))
+            with self.subTest(field=field, value="missing"):
+                _ = self.ledger.write_text(json.dumps({key: value for key, value in base.items() if key != field}) + "\n")
+                self.assertIsNone(cast(object, getattr(review_regime.read_rows()[0], field)))
+
+    def test_add_serializes_the_review_fields_and_full_checkpoint(self) -> None:
         _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1")
         expected = {
             "unit": "dashboard", "plan": FIRST_PLAN, "phase": "1", "regime": "after",
             "started": STARTED, "merged": MERGED, "holds": 0, "merge_defects": 0,
             "ux_findings": None, "code_findings": None, "review_minutes": None,
             "ux_check_minutes": None, "ux_repair_minutes": None, "note": None, "excluded": None,
+            "checkpoint": self.checkpoint,
         }
         self.assertEqual(self.ledger.read_bytes(), (json.dumps(expected) + "\n").encode())
 
@@ -95,17 +125,54 @@ class ReviewRegimeTests(unittest.TestCase):
             ("dashboard", SECOND_PLAN, "1"),
         ])
 
-    def test_the_same_unit_plan_and_phase_keeps_the_first_merge(self) -> None:
+    def test_two_checkpoints_of_one_phase_add_two_rows(self) -> None:
         self.add_row(FIRST_PLAN, "1")
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1", checkpoint=self.other_checkpoint)
+
+        self.assertEqual([row.checkpoint for row in review_regime.read_rows()],
+                         [self.checkpoint, self.other_checkpoint])
+
+    def test_two_short_forms_of_the_same_checkpoint_keep_the_first_merge(self) -> None:
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1", checkpoint=self.checkpoint[:8])
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1", checkpoint=self.other_checkpoint)
         before = self.ledger.read_bytes()
 
         output = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1",
-                          "--note", "repair merge", merged="2026-10-13T11:00:00-04:00")
+                          "--note", "repair merge", checkpoint=self.checkpoint[:12],
+                          started="2026-10-12T10:00:00-04:00", merged="2026-10-13T11:00:00-04:00")
 
         self.assertEqual(output, f"kept dashboard phase 1 of {FIRST_PLAN}: "
                          + f"a row exists from the merge at {MERGED}; nothing added\n")
         self.assertEqual(self.ledger.read_bytes(), before)
-        self.assertEqual(len(review_regime.read_rows()), 1)
+        self.assertEqual([row.checkpoint for row in review_regime.read_rows()],
+                         [self.checkpoint, self.other_checkpoint])
+
+    def test_add_requires_a_checkpoint_before_writing(self) -> None:
+        arguments = ["review_regime.py", "add", "--unit", "dashboard", "--plan", FIRST_PLAN,
+                     "--phase", "1", "--regime", "after", "--started", STARTED, "--merged", MERGED,
+                     "--holds", "0", "--merge-defects", "0"]
+        errors = io.StringIO()
+        with mock.patch("sys.argv", arguments), contextlib.redirect_stderr(errors):
+            with self.assertRaises(SystemExit) as refused:
+                _ = review_regime.main()
+
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("the following arguments are required: --checkpoint", errors.getvalue())
+        self.assertFalse(self.ledger.exists())
+
+    def test_a_row_without_a_checkpoint_counts_but_does_not_match(self) -> None:
+        old = {"unit": "dashboard", "plan": FIRST_PLAN, "phase": "1", "regime": "after", "started": STARTED,
+               "merged": MERGED, "holds": 0, "merge_defects": 0}
+        before = json.dumps(old) + "\n"
+        _ = self.ledger.write_text(before)
+
+        output = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1",
+                          started="2026-10-12T13:00:00+00:00")
+        self.assertIn("added dashboard phase 1", output)
+        self.assertTrue(self.ledger.read_text().startswith(before))
+        self.assertEqual([row.checkpoint for row in review_regime.read_rows()], [None, self.checkpoint])
+        self.assertIn("| phases merged | 0 | 0 | 2 |", self.report())
+        self.assertEqual(review_regime.watched_phases(), 2)
 
     def test_a_repeated_phase_still_refuses_invalid_merge_times(self) -> None:
         self.add_row(FIRST_PLAN, "1")

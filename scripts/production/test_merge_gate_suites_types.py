@@ -1,21 +1,30 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 import unittest
+import fcntl
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import io
+import json
 import tempfile
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast, final, override
+from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
+from datetime import UTC, datetime, timedelta, tzinfo
+from scripts.agents import remote
 from scripts.copies import copies
-from scripts.production import merge_gate
+from scripts.direct import progress_history
+from scripts.lib import build_folders
+from scripts.production import change_review, merge_gate, staff, showrunners
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_gate_test_support import gate_suites, wait_for_file
@@ -30,13 +39,12 @@ class MergeGateTypesTests(GateSuitesFixture):
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
 
-    def run_nightly(self) -> subprocess.CompletedProcess[str]:
-        configuration = self.root / "copies.conf"
-        self.write(configuration, f"[copies]\nroot={self.root / 'copies'}\n"
-                   + "wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n")
-        self.environment["COPIES_CONFIG"] = str(configuration)
+    def run_nightly(self, *, production: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"]
-        with mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"):
+        if production:
+            arguments.extend(["--production", production])
+        owner = nullcontext() if production else mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner")
+        with owner:
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
                               self.environment, self.root)
 
@@ -48,7 +56,12 @@ class MergeGateTypesTests(GateSuitesFixture):
         python = self.state / "runner/typecheck-venv/bin/python"
         self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
         self.assertNotEqual(type_call["cwd"], str(self.checkout))
-        self.assertTrue(Path(type_call["cwd"]).is_relative_to(self.root / "copies"))
+        self.assertTrue(Path(type_call["cwd"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(type_call["cwd"])), "free")
+        records = list((self.root / "slots").glob("*-slot*.lease.json"))
+        self.assertEqual(len(records), 1)
+        self.assertTrue((Path(type_call["cwd"]) / "target").is_dir())
+        self.assertEqual(json.loads(records[0].read_text())["commit"], self.base)
         self.assert_all_modules_started()
         self.assertIn("basedpyright: OK", result.stdout)
         history, = self.gate_history()
@@ -78,6 +91,142 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertFalse((self.state / "runner/full-required").exists())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
+    def test_nightly_sends_each_type_diagnostic_to_its_author_unit(self) -> None:
+        history = self.root / "history"
+        source = "scripts/receipt.py"
+        hidden_source = "scripts/receipt detail.py"
+        wide_source = "scripts/" + ("long" * 45 + "/") * 3 + "wide.py"
+        plan = "docs/plans/receipt.md"
+        self.write(self.main / "scripts/unknown.py", "VALUE = 3\n")
+        main_change = self.commit(self.main, "Change without an author unit")
+        _ = self.git(self.checkout, "merge", "--no-ff", "-m", "Merge origin/main into integration", main_change)
+        main_merge = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.main / "scripts/fast.py", "VALUE = 2\n")
+        fast_change = self.commit(self.main, "fast-track(fast): change the value")
+        _ = self.git(self.main, "push", "origin", "main")
+        _ = self.git(self.unit, "merge", "--no-ff", "-m", "Merge origin/main into unit-phase", fast_change)
+        self.write(self.unit / plan, "# Receipt plan\n")
+        self.write(self.unit / source, "VALUE = 1\nOTHER = 2\n")
+        self.write(self.unit / hidden_source, "DETAIL = 1\n")
+        self.write(self.unit / wide_source, "DETAIL = 2\n")
+        checkpoint = self.commit(self.unit, "Checkpoint change")
+        _ = self.git(self.checkout, "merge", "--no-ff", "-m", "Merge receipt fixture", checkpoint)
+        receipt_merge = self.git(self.checkout, "rev-parse", "HEAD")
+        _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
+        self.write(self.unit / ".unit.toml", f'plan = "{plan}"\nresponsibilities = []\n')
+
+        self.environment["UNIT_HISTORY_DIR"] = str(history)
+        with (mock.patch.dict(os.environ, self.environment),
+              isolated_staff_file(self.root / "nightly-staff.json", self.environment)):
+            owner = fixture_member("showrunner", name="fixture-showrunner",
+                                   doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
+            receipt_author = fixture_member("unit", name="receipt", parent=owner.id,
+                                            worktree=staff.PresentWorktree(remote.local_machine(), self.unit))
+            fast_author = fixture_member("unit", name="fast", parent=owner.id)
+            recorded_author = fixture_member("unit", name="original", parent=owner.id)
+            _ = progress_history.write_merge_receipt(project="origin", phase_id="2", merge_commit=main_merge,
+                                                     source_checkpoint=main_change, target_branch="integration",
+                                                     merged_at=1, issue=plan)
+            _ = progress_history.write_merge_receipt(project="origin", phase_id="2", merge_commit=receipt_merge,
+                                                     source_checkpoint=checkpoint, target_branch="integration",
+                                                     merged_at=2, issue=plan)
+            self.assertIsInstance(change_review.merge_producer(receipt_merge), change_review.UnknownProducer)
+            with (history / "merge_receipts.jsonl").open("a", encoding="utf-8") as receipts:
+                _ = receipts.write("{incomplete\n")
+
+            receipt_lines = (f"{source}:1:1 - error: first", f"{source}:2:1 - error: second")
+            fast_line = "scripts/fast.py:1:1 - error: third"
+            unknown_line = "scripts/unknown.py:1:1 - error: fourth"
+            limit = merge_gate.NIGHTLY_TYPE_DIAGNOSTIC_LINES
+            byte_limit = merge_gate.NIGHTLY_TYPE_LINE_BYTES
+            long_line = f"{source}:1:1 - error: " + "漢" * byte_limit
+            for case in ("assigned", "unknown", "test red", "long report", "wide files", "notice failure", "recorded producer"):
+                with self.subTest(case=case):
+                    self.environment["MERGE_GATE_STATE_DIR"] = str(self.root / case)
+                    expected_author = receipt_author
+                    if case == "recorded producer":
+                        change_review.record_merge_producer(
+                            change_review.KnownMergeProducer(receipt_merge, recorded_author.id))
+                        expected_author = recorded_author
+                    routed_lines: list[str] = list(receipt_lines)
+                    if case == "long report":
+                        routed_lines.append(long_line)
+                        routed_lines.extend(f"{source}:1:1 - error: finding {i}." for i in range(limit - 2))
+                        routed_lines.append(f"{hidden_source}:1:1 - error: omitted file")
+                    if case == "wide files":
+                        routed_lines.append(f"{wide_source}:1:1 - error: wide path")
+                    lines = [*routed_lines, fast_line]
+                    if case == "unknown":
+                        lines.append(unknown_line)
+                    output = "\n".join([*lines, f"{len(lines)} errors, 0 warnings, 0 notes"])
+                    type_check = merge_gate.GateJobResult("types", "basedpyright", 1, 0, output,
+                                                         kind=merge_gate.GateJobKind.TYPE_CHECK)
+                    test = merge_gate.GateJobResult("hooks", "test_first.py", int(case == "test red"), 0, "")
+                    run = merge_gate.GateRun((type_check, test), 0, 0)
+                    notice_result = "could not tell fixture-showrunner" if case == "notice failure" else "told fixture-showrunner"
+                    with (mock.patch.object(merge_gate, "run_suites", return_value=run),
+                          mock.patch.object(showrunners, "send_to_address", return_value=showrunners.NoticeDelivery()) as deliver,
+                          mock.patch.object(showrunners, "tell", return_value=notice_result) as notice,
+                          mock.patch.object(merge_gate, "send_nightly_red", return_value=True) as push):
+                        result = self.run_nightly(production=owner.name)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    first, second = deliver.call_args_list
+                    self.assertEqual(first.args[0], f"session:{expected_author.current_session}")
+                    self.assertEqual(second.args[0], f"session:{fast_author.current_session}")
+                    first_text = cast(str, first.args[2])
+                    second_text = cast(str, second.args[2])
+                    shown = first_text.splitlines()[1:-1]
+                    recheck = first_text.splitlines()[-1]
+                    expected = routed_lines[:limit]
+                    if case in ("long report", "wide files"):
+                        self.assertLessEqual(len(shown[2].encode()), byte_limit)
+                        self.assertTrue(shown[2].endswith("..."))
+                        self.assertTrue(routed_lines[2].startswith(shown[2][:-3]))
+                        expected[2] = shown[2]
+                    if case == "long report":
+                        expected.append("2 other diagnostic lines omitted.")
+                        self.assertEqual(recheck, "Run `basedpyright 'scripts/receipt detail.py' scripts/receipt.py` "
+                                         + "to see every diagnostic in these files.")
+                    elif case == "wide files":
+                        self.assertLessEqual(len(recheck.encode()), byte_limit + 80)
+                        self.assertTrue(recheck.startswith("Files include scripts/long"))
+                        self.assertIn("Run `basedpyright scripts` to see every diagnostic.", recheck)
+                    else:
+                        self.assertEqual(recheck, f"Run `basedpyright {source}` to see every diagnostic in these files.")
+                    self.assertEqual(shown, expected)
+                    self.assertEqual(second_text.splitlines()[1:], [
+                        fast_line, "Run `basedpyright scripts/fast.py` to see every diagnostic in these files."])
+                    self.assertIn("Fix it in your next phase.", first_text)
+                    notice.assert_called_once()
+                    notice_text = cast(str, notice.call_args.args[2])
+                    heading = f"Sent to {expected_author.name}:"
+                    self.assertIn(heading + "\n" + "\n".join(receipt_lines), notice_text)
+                    if case == "long report":
+                        author_lines = notice_text[notice_text.index(heading):].splitlines()
+                        self.assertEqual(author_lines, [heading, *shown[:limit - 1], "5 other diagnostic lines omitted."])
+                        self.assertNotIn(long_line, notice_text)
+                    elif case == "wide files":
+                        self.assertNotIn(wide_source, notice_text)
+                        self.assertIn("Sent to fast:\n" + fast_line, notice_text)
+                    else:
+                        self.assertIn("Sent to fast:\n" + fast_line, notice_text)
+                    path, = (Path(self.environment["MERGE_GATE_STATE_DIR"]) / "nightly-red").glob("*.json")
+                    saved = merge_gate.read_nightly_red(path)
+                    if case not in ("unknown", "test red"):
+                        self.assertIsInstance(saved.assignment, merge_gate.NightlyFixAssigned)
+                        assert isinstance(saved.assignment, merge_gate.NightlyFixAssigned)
+                        self.assertEqual(saved.assignment.unit, expected_author.id)
+                        push.assert_called_once()
+                        self.assertNotIn("nightly-assigned", notice_text)
+                    else:
+                        self.assertIsInstance(saved.assignment, merge_gate.NightlyFixUnassigned)
+                        push.assert_not_called()
+                        self.assertIn(f"nightly-assigned --result {saved.id} --unit UNIT", notice_text)
+                    if case == "unknown":
+                        self.assertIn(unknown_line, notice_text)
+                    if case == "notice failure":
+                        self.assertIsInstance(saved.received, merge_gate.NightlyNoticeUnreceived)
+
     def test_nightly_notice_limits_a_large_type_report_and_keeps_its_summary(self) -> None:
         from scripts.production import showrunners
 
@@ -88,7 +237,7 @@ class MergeGateTypesTests(GateSuitesFixture):
             "\n".join([*diagnostics, summary]), kind=merge_gate.GateJobKind.TYPE_CHECK)
         with (mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"),
               mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
-            merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
+            _ = merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
                                         "fixture-tree", [], type_failures=(job,))
 
         notice.assert_called_once()
@@ -107,7 +256,7 @@ class MergeGateTypesTests(GateSuitesFixture):
 
         with (mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"),
               mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
-            merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"), "fixture-tree", [])
+            _ = merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"), "fixture-tree", [])
 
         arguments = notice.call_args
         assert arguments is not None
@@ -126,7 +275,7 @@ class MergeGateTypesTests(GateSuitesFixture):
             with self.subTest(status=status, summary=summary):
                 self.write(self.bin / "basedpyright",
                            f"#!{sys.executable}\nprint({summary!r})\nraise SystemExit({status})\n")
-                result = self.run_gate("--tests-only")
+                result = self.run_nightly()
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertIn("basedpyright: " + ("OK" if expected == 0 else "RED"), result.stdout)
 
@@ -148,7 +297,7 @@ class MergeGateTypesTests(GateSuitesFixture):
             return job
 
         with mock.patch.object(merge_gate, "start_gate_job", side_effect=observed):
-            result = self.run_gate("--tests-only")
+            result = self.run_nightly()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(types_pids), 1)
         self.assertEqual(self.jobserver_tokens(), b"T")
@@ -161,18 +310,16 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual([call["args"] for call in self.calls() if call["tool"] == "uv"],
                          [["venv", "--clear", str(venv)],
                           ["pip", "install", "--python", str(venv / "bin" / "python"),
-                           *merge_gate.TYPECHECK_REQUIREMENTS]])
+                           "fake-bpy-module==20260822"]])
 
-    def test_tests_only_runs_types_for_each_requested_directory(self) -> None:
-        result = self.run_gate("--tests-only", "--type-dirs", "scripts/production", "scripts/hooks")
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
-        python = self.state / "runner/typecheck-venv/bin/python"
-        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts/production", "scripts/hooks"])
-        self.assertEqual(type_call["cwd"], str(self.checkout))
-        self.assertIn("basedpyright: OK", result.stdout)
-        self.assert_all_modules_started()
+    def test_tests_only_refuses_type_check_options(self) -> None:
+        for option in ("--type-dirs", "--type-dir"):
+            with self.subTest(option=option):
+                result = self.run_gate("--tests-only", option, "scripts")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(f"unrecognized arguments: {option} scripts", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
@@ -191,7 +338,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual(history["shape"], "tests")
 
     def test_merge_pushes_modules_without_a_default_type_check(self) -> None:
-        result = self.run_gate(type_dirs=())
+        result = self.run_gate()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
@@ -203,7 +350,7 @@ class MergeGateTypesTests(GateSuitesFixture):
     @gate_suites("lib")
     def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
         self.write(self.state / "uv-fails", "fail")
-        result = self.run_gate()
+        result = self.run_nightly()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("basedpyright: RED\ntype-check venv missing: stderr: fixture: no network; build it with: ", result.stdout)
         self.assertIn(" pip install --python ", result.stdout)
@@ -211,38 +358,57 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertRegex(result.stdout, r"(?m)^lib: OK \d+\.\d+s$")
         self.assert_not_pushed()
 
-    def test_type_failure_resets_merge_and_does_not_push(self) -> None:
+    def test_a_red_type_stub_does_not_prevent_a_merge_push(self) -> None:
         self.write(self.state / "types-red", "red")
         result = self.run_gate()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("fixture type error", result.stdout + result.stderr)
-        self.assert_not_pushed()
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+
+class NightlyClock(datetime):
+    current: ClassVar[datetime] = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> datetime:
+        return cls.current.astimezone(tz) if tz is not None else cls.current.replace(tzinfo=None)
 
 
 @final
 class NightlyPushTests(unittest.TestCase):
     root: Path = Path()
 
+    @property
+    def fixer(self) -> staff.StaffRow:
+        row = staff.snapshot().by_path("sdlc/fixes")
+        assert row is not None
+        return row
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
-        _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", config)
+        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", config)
+        _ = write_config_fixture(config / "merge_gate.conf",
+            "nightly_result_push=on\nnightly_result_modules=8\nnightly_assign_minutes=30\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
             "MERGE_GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = fixture_member("showrunner", name="sdlc")
+        _ = fixture_member("unit", name="fixes", parent=owner.id)
 
     @contextmanager
     def execution(self, run: merge_gate.GateRun | Exception) -> Generator[mock.MagicMock, None, None]:
         with (mock.patch.object(merge_gate, "nightly_git", return_value=""),
               mock.patch.object(merge_gate, "checked_git", return_value="fixture-tree"),
-              mock.patch.object(merge_gate, "nightly_owner", return_value="fixture"),
+              mock.patch.object(merge_gate, "nightly_owner", return_value="sdlc"),
               mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
               mock.patch.object(merge_gate, "run_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
-              mock.patch.object(merge_gate, "tell_nightly_red"),
+              mock.patch.object(showrunners, "tell", return_value="told sdlc"),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
                   [], 0, "SENT: fixture\n", "")) as sent):
             yield sent
@@ -272,10 +438,17 @@ class NightlyPushTests(unittest.TestCase):
         for name, run, outcome, expected_types, tests in cases:
             with self.subTest(name=name), self.execution(run) as sent, redirect_stdout(io.StringIO()):
                 self.assertEqual(self.nightly(), 0 if outcome == "passed" else 1)
+                expected_key = "nightly-result"
+                if outcome == "failed":
+                    sent.assert_not_called()
+                    pending, = (merge_gate.read_nightly_red(path) for path in (self.root / "state/nightly-red").glob("*.json")
+                                if isinstance(merge_gate.read_nightly_red(path).delivery, merge_gate.NightlyPushPending))
+                    expected_key += ":" + pending.id
+                    self.assertEqual(merge_gate.main(["nightly-assigned", "--unit", str(self.fixer.id)]), 0)
                 sent.assert_called_once()
                 command = cast(list[str], sent.call_args.args[0])
-                for flag, value in (("--text-id", "nightly.result"), ("--need", "note"),
-                                    ("--key", "nightly-result")):
+                for flag, value in (("--text-id", "nightly.result" if outcome == "passed" else "nightly.assigned"), ("--need", "note"),
+                                    ("--key", expected_key)):
                     self.assertEqual(command[command.index(flag) + 1], value)
                 values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
                 self.assertEqual((values["types"], values["tests"], values["outcome"]),
@@ -283,6 +456,231 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertEqual(values["branch"], "main")
                 self.assertRegex(values["time"], r"^\d{2}:\d{2} E[SD]T$")
                 self.assertNotIn("--priority", command)
+
+    def test_assignment_sends_each_red_result_once(self) -> None:
+        from scripts.notify import push_texts
+        from scripts.maintenance import herdr_upkeep
+        from scripts.herdr import herdr, detection_rules
+        from scripts.accounts import accounts
+
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0,
+                                 "FAIL: saved branch differs"),), 0, 0)
+        for route in ("assignment", "maintenance", "notice failure", "send failure", "assignment race",
+                      "busy lock", "save failure", "long assignment"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                case_run = (merge_gate.GateRun(tuple(merge_gate.GateJobResult("production",
+                            f"test_staff.py_{index}_" + "x" * 100, 1, 0, "FAIL: saved branch differs")
+                            for index in range(8)), 0, 0) if route.startswith("long ") else run)
+                with (mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(state)}),
+                      self.execution(case_run) as sent, mock.patch.object(merge_gate, "datetime", NightlyClock),
+                      mock.patch.object(showrunners, "tell", return_value="told sdlc") as notice,
+                      redirect_stdout(io.StringIO())):
+                    finished = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+                    NightlyClock.current = finished
+                    if route == "notice failure":
+                        notice.return_value = "could not tell sdlc: offline"
+                    if route == "busy lock":
+                        result_directory = state / "nightly-red"
+                        result_directory.mkdir()
+                        attempted = Event()
+                        flock = fcntl.flock
+                        with (result_directory / "lock").open("a") as held:
+                            flock(held, fcntl.LOCK_EX)
+                            def observed_lock(fd: TextIO, operation: int) -> None:
+                                if operation & fcntl.LOCK_NB:
+                                    try:
+                                        flock(fd, operation)
+                                    finally:
+                                        attempted.set()
+                                else:
+                                    attempted.set()
+                                    flock(fd, operation)
+                            with ThreadPoolExecutor(max_workers=1) as executor:
+                                with mock.patch.object(fcntl, "flock", side_effect=observed_lock):
+                                    future = executor.submit(self.nightly)
+                                    try:
+                                        self.assertTrue(attempted.wait(TEST_HANG_GUARD_SECS))
+                                    finally:
+                                        flock(held, fcntl.LOCK_UN)
+                                    self.assertEqual(future.result(timeout=TEST_HANG_GUARD_SECS), 1)
+                    else:
+                        self.assertEqual(self.nightly(), 1)
+                    sent.assert_not_called()
+                    notice.assert_called_once()
+                    self.assertIn("production/test_staff.py", cast(str, notice.call_args.args[2]))
+                    record_path, = (state / "nightly-red").glob("*.json")
+                    saved = cast(dict[str, object], json.loads(record_path.read_text()))
+                    self.assertEqual(saved["tree"], "fixture-tree")
+                    self.assertIn("FAIL: saved branch differs", cast(list[str], saved["failures"]))
+                    self.assertEqual(saved["received"], {} if route == "notice failure" else {"at": finished.isoformat()})
+                    self.assertEqual(saved["finished"], finished.isoformat())
+                    assignment = ["nightly-assigned", "--result", record_path.stem, "--unit", str(self.fixer.id)]
+                    if route == "save failure":
+                        from scripts.message import send, send_result
+                        NightlyClock.current = finished + timedelta(minutes=5)
+                        sessions = state / "sessions"
+                        sessions.mkdir()
+                        def invoke_sender(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                            del options
+                            result = send.send(send.parse(command[2:] + ["--here"]))
+                            return subprocess.CompletedProcess(command, send_result.EXIT[result.outcome], result.detail, "")
+                        save = merge_gate.save_nightly_red
+                        def fail_acceptance_save(directory: Path, result: merge_gate.NightlyRedResult) -> None:
+                            if isinstance(result.delivery, merge_gate.NightlyPushAccepted):
+                                raise OSError("fixture: accepted result save failed")
+                            save(directory, result)
+                        with (mock.patch.object(send, "STATE", state / "message"),
+                              mock.patch.object(send, "SESSIONS", sessions),
+                              mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(sessions)}),
+                              mock.patch.object(send, "user", return_value=send.Result("sent", "fixture phone")) as phone,
+                              redirect_stderr(io.StringIO())):
+                            sent.side_effect = invoke_sender
+                            with mock.patch.object(merge_gate, "save_nightly_red", side_effect=fail_acceptance_save):
+                                self.assertEqual(merge_gate.main(assignment), 1)
+                            self.assertEqual(merge_gate.main(assignment), 0)
+                            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+                            phone.assert_called_once()
+                        continue
+                    assigned_minutes = 30 if route in ("assignment race", "maintenance") else 5
+                    NightlyClock.current = finished + timedelta(minutes=assigned_minutes)
+                    if route == "maintenance":
+                        with (mock.patch.object(herdr, "restore_server"),
+                              mock.patch.object(herdr, "live_sessions", return_value=[]),
+                              mock.patch.object(herdr, "save_shared_layout"),
+                              mock.patch.object(detection_rules, "refresh"),
+                              mock.patch.object(accounts, "producer_upkeep_members", return_value=[])):
+                            herdr_upkeep.upkeep()
+                        sent.assert_not_called()
+                        self.assertEqual(notice.call_count, 2)
+                        self.assertEqual(notice.call_args.args[1], f"merge-gate-nightly-unassigned:{record_path.stem}")
+                    if route == "assignment race":
+                        def racing_check(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                            del options
+                            self.assertEqual(merge_gate.main(["nightly-check"]), 1)
+                            return subprocess.CompletedProcess(command, 0, "SENT: fixture\n", "")
+                        sent.side_effect = racing_check
+                    if route == "send failure":
+                        sent.return_value = subprocess.CompletedProcess([], 3, "", "sender unavailable")
+                        with redirect_stderr(io.StringIO()):
+                            self.assertEqual(merge_gate.main(assignment), 1)
+                        pending = cast(dict[str, object], json.loads(record_path.read_text()))
+                        self.assertEqual(pending["delivery"], {})
+                        sent.return_value = subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")
+                        sent.reset_mock()
+                    self.assertEqual(merge_gate.main(assignment), 0)
+                    sent.assert_called_once()
+                    command = cast(list[str], sent.call_args.args[0])
+                    text_id = command[command.index("--text-id") + 1]
+                    values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
+                    message = push_texts.render(text_id, **values).message
+                    self.assertIn("production/test_staff.py", message)
+                    if route.startswith("long "):
+                        from scripts.notify import pushover
+                        message = pushover.fields({"token": "fixture", "user": "fixture"}, "Nightly", message, "0")["message"]
+                    self.assertIn("sdlc received it at " + ("03:05 EST" if route == "notice failure" else "03:00 EST"), message)
+                    self.assertIn(f"Assigned to fixes at 03:{assigned_minutes:02d} EST", message)
+                    with redirect_stdout(io.StringIO()) as repeated:
+                        self.assertEqual(merge_gate.main(assignment), 0)
+                        self.assertEqual(merge_gate.main(assignment), 0)
+                        self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+                    self.assertIn("unchanged", repeated.getvalue())
+                    sent.assert_called_once()
+                    saved = cast(dict[str, object], json.loads(record_path.read_text()))
+                    self.assertEqual(cast(dict[str, str], saved["assignment"])["unit"], str(self.fixer.id))
+
+    def test_nightly_check_retries_an_assigned_push_without_claiming_receipt(self) -> None:
+        directory = self.root / "state/nightly-red"
+        directory.mkdir(parents=True)
+        finished = "2026-11-11T08:00:00+00:00"
+        assignment = merge_gate.NightlyFixAssigned(self.fixer.id, "2026-11-11T08:05:00+00:00")
+        saved = merge_gate.NightlyRedResult("automatic", "main", "fixture-tree", finished, (),
+                                           "failed with 1 error, 0 warnings, 0 notes", "passed", assignment=assignment)
+        merge_gate.save_nightly_red(directory, saved)
+        path = directory / "automatic.json"
+        unavailable = subprocess.CompletedProcess([], 3, "", "sender unavailable")
+        accepted = subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")
+        with (mock.patch.object(subprocess, "run", side_effect=[unavailable, accepted]) as sent,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertEqual(merge_gate.main(["nightly-check"]), 1)
+            self.assertEqual(merge_gate.read_nightly_red(path), saved)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+
+        first, retry = sent.call_args_list
+        command = cast(list[str], retry.args[0])
+        self.assertEqual(first.args[0], command)
+        self.assertEqual(command[command.index("--key") + 1], "nightly-result:automatic")
+        self.assertEqual(command[command.index("--text-id") + 1], "nightly.result")
+        self.assertFalse(any(word.startswith(("received=", "unit=")) for word in command))
+        updated = merge_gate.read_nightly_red(path)
+        self.assertEqual(updated.received, saved.received)
+        self.assertEqual(updated.assignment, assignment)
+        self.assertIsInstance(updated.delivery, merge_gate.NightlyPushAccepted)
+
+    def red_nightly(self, finished: datetime) -> Path:
+        NightlyClock.current = finished
+        self.assertEqual(self.nightly(), 1)
+        record_path, = (self.root / "state/nightly-red").glob("*.json")
+        return record_path
+
+    def test_an_unassigned_red_sends_no_user_push_at_any_age(self) -> None:
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        finished = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+        with (self.execution(run) as sent, mock.patch.object(merge_gate, "datetime", NightlyClock),
+              redirect_stdout(io.StringIO())):
+            _ = self.red_nightly(finished)
+            for minutes in (0, 29, 30, 31, 90, 24 * 60):
+                NightlyClock.current = finished + timedelta(minutes=minutes)
+                self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            sent.assert_not_called()
+
+    def test_an_unassigned_red_alerts_the_production_owner_each_window_until_assigned(self) -> None:
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        finished = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+        with (self.execution(run) as sent, mock.patch.object(merge_gate, "datetime", NightlyClock),
+              redirect_stdout(io.StringIO())):
+            record_path = self.red_nightly(finished)
+            alerts = cast(mock.MagicMock, showrunners.tell)
+            alerts.reset_mock()
+            for minutes, expected in ((29, 0), (30, 1), (32, 1), (59, 1), (60, 2), (61, 2)):
+                NightlyClock.current = finished + timedelta(minutes=minutes)
+                self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+                self.assertEqual(alerts.call_count, expected, f"minute {minutes}")
+            owner, key, text = cast(tuple[str, str, str], alerts.call_args.args)
+            self.assertEqual(owner, "sdlc")
+            self.assertEqual(key, f"merge-gate-nightly-unassigned:{record_path.stem}")
+            self.assertIn(f"nightly-assigned --result {record_path.stem} --unit UNIT", text)
+            self.assertIn("production/test_staff.py", text)
+            alerts.return_value = "could not tell sdlc: offline"
+            NightlyClock.current = finished + timedelta(minutes=90)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            NightlyClock.current = finished + timedelta(minutes=92)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            self.assertEqual(alerts.call_count, 4)
+            alerts.return_value = "told sdlc"
+            self.assertEqual(merge_gate.main(["nightly-assigned", "--unit", str(self.fixer.id)]), 0)
+            sent.assert_called_once()
+            NightlyClock.current = finished + timedelta(minutes=180)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            self.assertEqual(alerts.call_count, 4)
+            sent.assert_called_once()
+
+    def test_a_unit_director_of_another_production_can_take_the_fix(self) -> None:
+        builds = fixture_member("showrunner", name="builds")
+        queue = fixture_member("unit", name="queue", parent=builds.id)
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        for reference in ("builds/queue", str(queue.id)):
+            with (self.subTest(reference=reference), tempfile.TemporaryDirectory() as directory,
+                  mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": directory}),
+                  self.execution(run) as sent, redirect_stdout(io.StringIO())):
+                self.assertEqual(self.nightly(), 1)
+                self.assertEqual(merge_gate.main(["nightly-assigned", "--unit", reference]), 0)
+                command = cast(list[str], sent.call_args.args[0])
+                self.assertIn("unit=queue", command)
+        with self.execution(run), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(self.nightly(), 1)
+            self.assertNotEqual(merge_gate.main(["nightly-assigned", "--unit", "builds"]), 0)
 
     def test_off_disables_both_push_texts_at_use(self) -> None:
         from scripts.notify import push_texts
@@ -307,6 +705,8 @@ class NightlyPushTests(unittest.TestCase):
                 f"nightly_result_push=on\n# whole: 1..\nnightly_result_modules={limit}\n")
             with self.execution(merge_gate.GateRun(jobs, 0, 0)) as sent, redirect_stdout(io.StringIO()):
                 self.assertEqual(self.nightly(), 1)
+                sent.assert_not_called()
+                self.assertEqual(merge_gate.main(["nightly-assigned", "--unit", str(self.fixer.id)]), 0)
                 command = cast(list[str], sent.call_args.args[0])
                 self.assertIn("tests=failed in " + ", ".join(f"test/test_{i}.py" for i in range(limit))
                               + f" and {4 - limit} more", command)
@@ -327,7 +727,10 @@ class NightlyPushTests(unittest.TestCase):
                     with redirect_stdout(io.StringIO()) as output:
                         self.assertEqual(self.nightly(), status)
                     self.assertEqual(marker.exists(), bool(status))
-                    self.assertIn("Nightly result push could not be sent:", output.getvalue())
+                    if not status:
+                        self.assertIn("Nightly result push could not be sent:", output.getvalue())
+                    else:
+                        sent.assert_not_called()
                     if status:
                         self.assertIn('"failed_modules": ["test/example"]', marker.read_text())
 

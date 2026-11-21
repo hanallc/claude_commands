@@ -4,20 +4,25 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
-from scripts.lib import names
+from scripts.lib import build_folders, names
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
+from scripts.lib.transcript_test_support import compressed_copy
 
 import io
 import json
 import os
 import shlex
+import socket
 import shutil
 import subprocess
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import cast, final
+from typing import Callable, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -51,6 +56,149 @@ from scripts.production import staff, unit_config
 from scripts.production.production_doc import Production, read_production
 
 class NativeClaudeUnitTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        registry = write_registry(Path.home() / ".claude/config/models.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+        })))
+
+    def pending_opening_fixture(self) -> tuple[add_unit.UnitLaunch, add_unit.LabeledSessionFound, Path, str, str]:
+        native = fixture_runtime_id("pending-opening-rerun")
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        production = read_production("demo")
+        request = add_unit.UnitLaunch(production=production, branch="demo-alpha", worktree=self.root,
+            plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(),
+            session=add_unit.NewSession(), timeout=5, identity=add_unit.UnitIdentity("alpha", "alpha"))
+        place = HerdrPlace("agents", "w1:p1")
+        marked = add_unit.LabeledSessionFound(unit_lookup.LabeledSession("alpha",
+            unit_lookup.LiveClaude("alpha", native, str(self.root), 101), place,
+            identity=unit_lookup.LiveSession(native)))
+        pending = add_unit.opening_record(production, "alpha")
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        text = "/unit:direct plan.md"
+        write_text_atomic(pending, json.dumps({"session_id": native, "prompt": text,
+            "config_dir": str(self.root), "launched_at": LAUNCHED_AT.isoformat()}))
+        return request, marked, pending, native, text
+
+    def test_pending_unit_with_empty_composer_reports_manual_recovery(self) -> None:
+        request, marked, pending, _native, _text = self.pending_opening_fixture()
+        saved = pending.read_bytes()
+        with (patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              patch.object(add_unit, "ensure_staff_unit"),
+              patch.object(herdr.Herdr, "panes", return_value=[]),
+              patch.object(herdr.Herdr, "run", return_value="────────\n❯ \n────────"),
+              patch.object(herdr.Herdr, "_wait_for_submit", return_value=None),
+              patch.object(herdr.Herdr, "_prompt") as typed,
+              patch.object(herdr.Herdr, "_send_keys") as keys):
+            outcome = add_unit.finish_opening(request, marked)
+        assert isinstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIn("sent once, not confirmed", outcome.reason)
+        self.assertIn("Check the retained pane and send the prompt by hand if absent.", outcome.reason)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertEqual(pending.read_bytes(), saved)
+        typed.assert_not_called()
+        keys.assert_not_called()
+        with patch.object(herdr, "close_agent") as close:
+            self.assertEqual(add_unit.close_unsent_session(request, outcome), "")
+        close.assert_not_called()
+
+    def test_pending_opening_rerun_sends_enter_without_typing_again(self) -> None:
+        request, marked, pending, native, text = self.pending_opening_fixture()
+        place = marked.unit.place
+        screen = f"────────\n❯ {text}\n────────"
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            client = herdr.Herdr("agents")
+
+        def enter(_pane: str, *_keys: str) -> None:
+            path = self.root / "projects/fixture" / f"{native}.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(LAUNCHED_AT.tzinfo).isoformat(),
+                "message": {"role": "user", "content": text}}) + "\n")
+
+        def check_transcript(receipt: Callable[[], object], _deadline: float) -> herdr.PromptSubmitted | None:
+            result = receipt()
+            return result if isinstance(result, herdr.PromptSubmitted) else None
+
+        def visible(*_args: str) -> str:
+            return screen
+
+        with (patch.object(add_unit, "ensure_staff_unit"),
+              patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(herdr, "prompt_recipient_process", return_value=herdr.PromptRecipientProcess(101, "fixture")),
+              patch.object(client, "pane_row", return_value={"pane_id": place.pane, "terminal_id": "fixture"}),
+              patch.object(client, "readiness", return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+              patch.object(client, "run", side_effect=visible),
+              patch.object(client, "_wait_for_submit", side_effect=check_transcript),
+              patch.object(client, "_prompt") as transport,
+              patch.object(client, "_send_keys", side_effect=enter) as keys):
+            self.assertIsInstance(add_unit.finish_opening(request, marked), herdr.PromptSubmitted)
+            transport.assert_not_called()
+            keys.assert_called_once_with(place.pane, "Enter")
+        self.assertFalse(pending.exists())
+
+    def test_add_unit_keeps_the_session_when_a_started_transport_records_its_turn_late(self) -> None:
+        request, marked, pending, native, text = self.pending_opening_fixture()
+        place = marked.unit.place
+        transcript = herdr.SessionTranscript(self.root, native)
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            client = herdr.Herdr(place.session)
+        screen = "────────\n❯ \n────────"
+        now = time.monotonic()
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with (patch.object(time, "monotonic", side_effect=lambda: now),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(client, "wait_for_prompt_input", return_value=herdr.PromptInputReady(screen, True)),
+              patch.object(client, "pane_row", return_value={"pane_id": place.pane, "terminal_id": "fixture"}),
+              patch.object(client, "run", return_value=screen),
+              patch.object(herdr, "prompt_recipient_process", return_value=herdr.PromptRecipientProcess(101, "fixture")),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(client, "_prompt") as transport,
+              patch.object(client, "_send_keys") as keys,
+              patch.object(herdr, "close_agent") as close):
+            outcome = client.submit_opening_prompt(place.pane, herdr.OpeningPrompt(text, transcript), LAUNCHED_AT, 1000)
+            self.assertEqual(outcome.state, "unknown")
+            self.assertEqual(add_unit.close_unsent_session(request, outcome), "")
+            self.assertTrue(pending.exists())
+
+            path = self.root / "projects/fixture" / f"{native}.jsonl"
+            at = LAUNCHED_AT + timedelta(seconds=1)
+            write_text_atomic(path, json.dumps({"type": "user", "timestamp": at.isoformat(),
+                "message": {"role": "user", "content": text}}) + "\n")
+            with patch.object(add_unit, "ensure_staff_unit"):
+                recovered = add_unit.finish_opening(request, marked)
+            assert not isinstance(recovered, add_unit.NoPendingOpening)
+            self.assertEqual(recovered.state, "confirmed")
+            self.assertEqual(add_unit.close_unsent_session(request, recovered), "")
+            self.assertFalse(pending.exists())
+        transport.assert_called_once_with(place.pane, text)
+        keys.assert_not_called()
+        close.assert_not_called()
+
+    def test_saved_transcript_model_uses_the_newest_file(self) -> None:
+        native = fixture_runtime_id("saved-model")
+        projects = Path.home() / ".claude/projects"
+        old = projects / "old" / f"{native}.jsonl"
+        newest = projects / "newest" / f"{native}.jsonl"
+        for path, model, modified in ((old, "older-model", 10), (newest, "saved-model", 20)):
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": model}}) + "\n")
+            os.utime(path, (modified, modified))
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    for path in (old, newest):
+                        _ = compressed_copy(path)
+                self.assertEqual(add_unit.transcript_model(native), "saved-model")
+
     def test_resume_uses_the_renamed_native_owner_for_arguments_and_tab(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
@@ -68,16 +216,34 @@ class NativeClaudeUnitTests(StaffTestCase):
             identity=add_unit.UnitIdentity("saved-name", "saved-name"))
         from scripts.accounts.accounts import NamedAccount
 
-        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
-              herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(LAUNCHED_AT))) as launch):
-            _ = add_unit.launch_session(request, add_unit.DirectorAgent("fixture", add_unit.DefaultEffort()),
-                "resume", NamedAccount("claude1", self.root))
-        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
-        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
-        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
-        self.assertEqual(launch.call_args.args[2], "row-name")
-        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
-        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in cast(dict[str, str], launch.call_args.args[4])))
+        caller = claude_catalog_environment(self.root / "caller-account", {"fable": "claude-fable-caller-fixture"})
+        selected = self.root / "selected-account"
+        _ = claude_catalog_environment(selected, {"fable": "claude-fable-selected-fixture"})
+        for director_model, saved_model, expected in (
+            ("fixture", "", "fixture"),
+            ("fable", "", "claude-fable-selected-fixture"),
+            ("fixture", "fable", "claude-fable-selected-fixture"),
+            ("fixture", "claude-fable-saved-fixture", "claude-fable-saved-fixture"),
+        ):
+            with (self.subTest(director=director_model, saved=saved_model),
+                  patch.dict(os.environ, {**caller, "HERDR_BIN": "/nonexistent/herdr"}),
+                  patch.object(herdr, "start_server"), patch.object(herdr, "open_tab", return_value="w1:p1"),
+                  patch.object(herdr.Herdr, "run_in_pane"),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmitted(LAUNCHED_AT)) as start,
+                  patch.object(herdr, "launch_agent", wraps=herdr.launch_agent) as launch):
+                _ = add_unit.launch_session(request, add_unit.DirectorAgent(director_model, add_unit.DefaultEffort()),
+                    "resume", NamedAccount("claude1", selected), model=saved_model)
+            arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+            started = cast(list[str], start.call_args.args[3])
+            self.assertEqual(started[started.index("--model") + 1], expected)
+            self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+            self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+            self.assertEqual(launch.call_args.args[2], "row-name")
+            environment = cast(dict[str, str], launch.call_args.args[4])
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(selected))
+            self.assertNotIn("STAFF_ID", environment)
+            self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in environment))
 
     def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
@@ -111,6 +277,33 @@ class NativeClaudeUnitTests(StaffTestCase):
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def test_plan_unit_type_controls_admission_and_repeated_launch(self) -> None:
+        _ = self.successful("alpha", "--unit-type", "style", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.opening_prompt(), "/unit:style docs/plans/given.md")
+        with patch.dict(os.environ, self.env):
+            row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+            self.assertEqual(row.unit_type, staff.UnitDetails("style"))
+        before_calls = self.herdr_calls()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertFalse(any(row[2:4] in (["agent", "start"], ["agent", "prompt"])
+                             for row in self.herdr_calls()[len(before_calls):]))
+        result = self.cli("alpha", "--unit-type", "merge", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("unit_type conflicts", result.stderr)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(staff.by_id(row.id), row)
+
+    def test_standby_merge_loads_its_command_before_waiting(self) -> None:
+        _ = self.successful("merges", "--unit-type", "merge", "--permanent")
+        prompt = self.opening_prompt()
+        self.assertIn("Load /unit:merge before waiting for orders.", prompt)
+        self.assertIn("on standby", prompt)
+        self.assertNotIn("/unit:direct", prompt)
+
+    def test_brief_approval_names_the_selected_command(self) -> None:
+        _ = self.successful("alpha", "--unit-type", "style", "--brief", "Judge the style tickets.")
+        self.assertIn("approval before you run /unit:style ", self.opening_prompt())
+
     def assert_observed_identity(self, row: staff.StaffRow) -> None:
         pid = int(self.env["FAKE_CLAUDE_PID"])
         registry = sessions.read_session(Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json")
@@ -165,6 +358,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         (self.state / f"herdr-live-{SHARED}").unlink()
         for pid in (101, 102):
             shutil.rmtree(self.root / "proc" / str(pid))
+        director = self.env["FAKE_CLAUDE_PID"]
+        shutil.rmtree(self.root / "proc" / director)
+        (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{director}.json").unlink()
         before_calls = len(self.herdr_calls())
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
@@ -173,6 +369,59 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(prompts, ["/unit:direct docs/plans/given.md"])
         self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(stub.read_bytes(), source)
+
+    def test_name_only_uses_the_recorded_plan_and_explicit_plan_wins(self) -> None:
+        write_text_atomic(self.doc, self.doc.read_text() +
+                          "\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| alpha | docs/plans/given.md |\n")
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "record unit plan")
+        for flags in ((), ("--plan", "docs/plans/given.md")):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--check", *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers_started(), [])
+
+    def test_hana_unit_without_a_port_gets_an_unused_port(self) -> None:
+        write_text_atomic(self.checkout / "crates/hana/Cargo.toml", '[package]\nname = "hana"\n')
+        _ = self.git("add", "crates/hana/Cargo.toml")
+        _ = self.git("commit", "-m", "record the Hana application")
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            occupied = cast(tuple[str, int], held.getsockname())[1]
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+            saved = unit_config.read(self.root / "project-alpha")
+            assert isinstance(saved, unit_config.UnitConfig)
+            self.assertIsInstance(saved.port, unit_config.AppPort)
+            assert isinstance(saved.port, unit_config.AppPort)
+            self.assertNotEqual(saved.port.number, occupied)
+
+    def test_hana_saved_config_without_a_port_gets_a_port_from_the_range(self) -> None:
+        from scripts.lib import conf
+
+        write_text_atomic(self.checkout / "crates/hana/Cargo.toml", '[package]\nname = "hana"\n')
+        _ = self.git("add", "crates/hana/Cargo.toml")
+        _ = self.git("commit", "-m", "record the Hana application")
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        saved = unit_config.read(worktree)
+        assert isinstance(saved, unit_config.UnitConfig)
+        self.assertIsInstance(saved.port, unit_config.AppPort)
+        assert isinstance(saved.port, unit_config.AppPort)
+        settings = conf.read("production")
+        self.assertGreaterEqual(saved.port.number, settings.whole("unit_port_first"))
+        self.assertLessEqual(saved.port.number, settings.whole("unit_port_last"))
+
+    def test_name_only_without_a_plan_reports_one_refusal_line(self) -> None:
+        result = self.cli("alpha", "--check")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("plan", result.stderr)
+        self.assertIn(str(self.doc), result.stderr)
+        self.assertEqual(self.servers_started(), [])
 
     def test_adopting_an_existing_config_without_a_port_flag_keeps_its_recorded_port(self) -> None:
         worktree = self.root / "project-alpha"
@@ -223,6 +472,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         worktree = self.root / "project-alpha"
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", worktree))
+        self.assertEqual(build_folders.build_folder_state(worktree), "free")
+        lease = cast(dict[str, object], json.loads(worktree.with_name(worktree.name + ".lease.json").read_text()))
+        self.assertEqual(lease["purpose"], worktree.name)
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
         ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)
@@ -357,11 +609,11 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
             def interrupted(production: Production, unit: str, *,
                             worktree: staff.PresentWorktree | staff.WorktreeUnfilled,
-                            runtime_id: str = "") -> staff.StaffRow:
+                            runtime_id: str = "", unit_type: staff.UnitType | None = None) -> staff.StaffRow:
                 self.assertEqual(runtime_id, self.env["FAKE_CLAUDE_SESSION_ID"])
                 self.assertEqual(self.staff.staff_file.read_bytes(), before)
                 if after:
-                    _ = original(production, unit, worktree=worktree, runtime_id=runtime_id)
+                    _ = original(production, unit, worktree=worktree, runtime_id=runtime_id, unit_type=unit_type)
                 raise RuntimeError("stopped at staff step")
 
             with patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
@@ -382,6 +634,21 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")),
                          (document, data, head))
+
+    def test_pending_admission_keeps_the_saved_type_without_a_retry_flag(self) -> None:
+        with patch.object(add_unit, "ensure_staff_unit", side_effect=RuntimeError("interrupted admission")):
+            stopped = self.cli("alpha", "--plan", "docs/plans/given.md", "--unit-type", "merge")
+        self.assertEqual(stopped.returncode, 1, stopped.stderr)
+        self.assertEqual(staff.find(kind="unit"), [])
+        production = read_production(self.production_name)
+        fields = cast(dict[str, str], json.loads(add_unit.opening_record(production, "alpha").read_text()))
+        self.assertEqual(fields["unit_type"], "merge")
+        conflicting = self.cli("alpha", "--plan", "docs/plans/given.md", "--unit-type", "style")
+        self.assertEqual(conflicting.returncode, 2, conflicting.stderr)
+        self.assertIn("conflicts with pending admission", conflicting.stderr)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        row = staff.find(kind="unit")[0]
+        self.assertEqual(row.to_json()["unit_type"], "merge")
 
     def test_new_row_with_a_running_labeled_session_refuses_before_any_write(self) -> None:
         prior = self.root / "prior-session"
@@ -477,8 +744,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 found = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(f"{unit}-unit",
                     unit_lookup.ClaudeNotRunning(), place,
                     identity=unit_lookup.LiveSession(fixture_runtime_id("unsubmitted:" + unit))))
+                state = "unknown" if typed else "not_sent"
                 outcome = herdr.PromptNotSubmitted("destination never became ready for input"
-                                                   + ("; prompt typed 1 times" if typed else ""), never_typed=not typed)
+                                                   + ("; prompt typed 1 times" if typed else ""), state=state)
                 with (patch.object(herdr, "start_agent", return_value=outcome),
                       patch.object(add_unit, "launched_unit", side_effect=[add_unit.NoLabeledSession(), found]),
                       patch.object(herdr, "close_agent") as closed):
@@ -820,10 +1088,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_refuses_checkout_off_merge_branch(self) -> None:
         _ = self.git("checkout", "-b", "wrong-branch")
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertFalse((self.root / "project-alpha").exists())
-        self.assert_staff_units()
+        for flags in (("--check",), ()):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertFalse((self.root / "project-alpha").exists())
+                self.assert_staff_units()
 
     def test_new_work_records_no_scheduled_prompt(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
@@ -1055,6 +1325,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
             herdr.SessionListResult(sessions=[herdr.SessionEntry(name="alpha2", running=True, default=False,
                 session_dir="/fixture", socket_path="/fixture/socket")])))
+        self.herdr_overrides["--session alpha2 pane list"] = CommandResponse(
+            code=0, stdout=json.dumps({"result": {"panes": []}}))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
 

@@ -1,24 +1,82 @@
 """Mac-only verify routing through the existing offload fixture."""
 from __future__ import annotations
 
-import signal
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
-from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VERIFY, VerifyMacOffloadFixture
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
+from scripts.direct import verify_mac_offload_test_support
+from scripts.direct.verify_mac_offload_test_support import (
+    CARGO_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
+)
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
+from scripts.lint.memory_test_support import write_config_fixture
+
+
+_CARGO_REFERENCE = compile(CARGO_STUB, "cargo-reference", "exec")
 
 
 @final
 class VerifyMacOnlyTests(VerifyMacOffloadFixture):
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        # The class owns the bytecode cache. Each test restores source at the same path.
+        self.environment["PYTHONPYCACHEPREFIX"] = str(self.root.parent / "bytecode")
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        _ = (self.root / "direct.conf").write_text(
+            "# whole: 1..\nVERIFY_TOKEN_HOLD_SECONDS=3600\n"
+            + "# whole: 1..\nVERIFY_TOKEN_RENEW_SECONDS=60\n"
+            + "# whole: 1..\nTOKEN_GUARD_ATTEMPTS=200\n"
+            + "# whole: 1..\nTOKEN_GUARD_DELAY_MS=50\n"
+            + "VERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG "
+            + "LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS "
+            + "LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER LC_TELEPHONE\n"
+            + "VERIFY_RESULT_ENV_PREFIXES=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n"
+            + "VERIFY_TEST_FIXED_ENV=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n",
+            encoding="utf-8",
+        )
+        mac_settings = (
+            "offload=on\nhost=mac\n"
+            + "# range: 5e-324..\nconnect_timeout_s=6\n"
+            + "# range: 5e-324..\nleftover_timeout_s=10\n"
+            + "# range: 5e-324..\nprobe_timeout_s=15\n"
+            + "# range: 5e-324..\nunreachable_backoff_s=300\n"
+            + "# range: 5e-324..\nfree_floor_gib=100\n"
+            + "# range: 5e-324..\nmirror_busy_backoff_s=120\n"
+            + "# whole: 1..\nabandoned_session_minutes=60\n"
+            + f"mac_budget_gib=24\nlinux_only.{self.root.name}=\n"
+        )
+        for path in (self.root / "mac_test.conf", Path(self.environment["MAC_TEST_CONFIG"])):
+            _ = write_config_fixture(path, mac_settings, template="mac_test")
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n"
+                                 + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+        _ = write_config_fixture(self.root / "build_admission.conf",
+                                 "running_pass_seconds=1\nrequest_max_bytes=1048576\n")
+
+        repository = self.root / "parser-repository"
+        git = shutil.which("git")
+        assert git is not None
+        _ = subprocess.run([git, "init", "-q", str(repository)], env=self.environment,
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = (repository / ".gitignore").write_text("target/\n")
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -30,11 +88,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
     def parser_results(self, cases: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
         repository = self.root / "parser-repository"
-        repository.mkdir(exist_ok=True)
         git = shutil.which("git")
         assert git is not None
-        _ = subprocess.run([git, "init", "-q", str(repository)], check=True)
-        _ = (repository / ".gitignore").write_text("target/\n")
         output = self.root / "parser-results"
         output.mkdir(exist_ok=True)
         commands = ["set -u", shell_functions(VERIFY, "parse_routing_arguments")]
@@ -47,7 +102,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 + f"printf '%s' \"$?\" >{shlex.quote(str(output / f'{index}.status'))}"
             )
         environment = {**self.environment, "PATH": str(Path(git).parent) + os.pathsep + self.environment["PATH"]}
-        _ = subprocess.run(["bash", "-c", "\n".join(commands)], cwd=repository, env=environment, check=True)
+        _ = subprocess.run(["bash", "-c", "\n".join(commands)], cwd=repository, env=environment,
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
         return [
             subprocess.CompletedProcess(
                 arguments, int((output / f"{index}.status").read_text()),
@@ -75,74 +131,116 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         }
 
     def mac_result(self, *, extra: dict[str, str], fetch: str = "") -> subprocess.CompletedProcess[str]:
-        """Pass a runner result through the real result reader and call recorder."""
-        functions = shell_functions(
-            VERIFY, "target_for_settings", "target_platform", "step_state", "release_wait_claim",
-            "phase_wait_finish", "collect_routing_wait", "collect_hold_wait", "note_event",
-            "try_mac_test", "check_mac_only_result", "mac_only_refuse", "try_reserved_target",
-        )
-        # These calls start after routing. Other tests keep the watcher and admission boundaries.
-        script = functions + r'''
-set -euo pipefail
-CMD=test PKG=sample ARGS=(sample) MAC_ONLY=1 LOCAL_ONLY=0
-MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() NEXTEST_ARGS=()
-MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_IDLE_MARKER=""
-MAC_FINISH_CALL=1 FILTER_RUN=0 CALL_NOTED=0 CACHE_DIR=""
-STEP_RECORD_ACTIVE=0 STEP_RUNS_ON=mac_allowed
-TREE_WATCH_PID=caller-owned ROUTING_WAIT_STARTED=""
-BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
-BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S=""
-BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
-BUILDLOG_LOCAL_REASON=""
-export BUILDLOG_CALL_ID="result-$$" BUILDLOG_LOCAL_REASON
-STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_SETTINGS")
-MAC_LEAVE_SETTINGS=$MAC_SETTINGS MAC_LEAVE_REASON=""
-try_reserved_target
-'''
-        return subprocess.run(
-            ["bash", "-c", script], cwd=self.root,
-            env={**self.environment, "PY": sys.executable, "MAC_RUNNER": str(self.runner),
-                 "MAC_SETTINGS": self.environment["MAC_TEST_CONFIG"],
-                 "DOC_REPO_TOP": str(self.root), "HOLD_WAIT_DIR": str(self.root / "tmp"),
-                 "BUILDLOG_RECORD": str(self.home / ".claude/scripts/buildlog/record.py"),
-                 "MAC_FETCH": fetch, "MAC_FETCH_GIVEN": "1" if fetch else "0", **extra},
-            text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
-        )
+        """Run the same result rows through queue placement."""
+        words = ["test", "sample", "--mac", "why", "--no-cache"]
+        if fetch:
+            words.extend(("--fetch", fetch))
+        return self.verify(*words, extra=extra)
+
+    def routing_result(self) -> subprocess.CompletedProcess[str]:
+        """Check caller routing through the real placement command."""
+        return self.verify("test", "sample", "--mac", "needs macOS", "--no-cache")
+
+    def _cargo_reference(self, arguments: tuple[str, ...], environment: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+        argv = ["cargo-reference", *arguments]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        admission = caller_admission(self, self.root, self.environment)
+        with (admission.loop_turn(), mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(sys, "argv", argv), redirect_stdout(stdout), redirect_stderr(stderr)):
+            try:
+                exec(_CARGO_REFERENCE, {"__name__": "__main__"})
+            except SystemExit as exit_status:
+                status = cast(int, exit_status.code)
+            except OSError as error:
+                print(error, file=sys.stderr)
+                status = 1
+            else:
+                status = 0
+        return subprocess.CompletedProcess(argv, status, stdout.getvalue().encode(), stderr.getvalue().encode())
+
+    def test_fixed_cargo_replies_match_python_events(self) -> None:
+        reference = self.bin_directory / "cargo-reference"
+        cargo = self.bin_directory / "cargo"
+        install_fixed_cargo(cargo)
+        token = Path(self.environment["TEST_TOKEN_RECORD"])
+        token.parent.mkdir(parents=True, exist_ok=True)
+        self.environment["BUILDLOG_HOLD_PID"] = "owned"
+        for token_held in (False, True):
+            if token_held:
+                _ = token.write_text("owned\n")
+            else:
+                token.unlink(missing_ok=True)
+            for arguments in (
+                ("check", "with space", 'double"quote', "back\\slash", ""),
+                ("check", "with space", 'double"quote', "back\\slash", "é", ""),
+                ("metadata", "--format-version", "1"),
+                ("mend", "--version"), ("+nightly", "fmt", "--version"),
+                ("clippy", "--version"), ("nextest", "--version"),
+            ):
+                with self.subTest(arguments=arguments, token_held=token_held):
+                    events: list[bytes] = []
+                    replies: list[subprocess.CompletedProcess[bytes]] = []
+                    for executable in (reference, cargo):
+                        self.cargo_events_path.unlink(missing_ok=True)
+                        reply = self._cargo_reference(arguments, self.environment) if executable == reference else subprocess.run(
+                            [str(executable), *arguments], env=self.environment,
+                            capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                        )
+                        replies.append(reply)
+                        events.append(self.cargo_events_path.read_bytes() if self.cargo_events_path.exists() else b"")
+                    self.assertEqual(events[1], events[0])
+                    self.assertEqual(replies[1].returncode, replies[0].returncode)
+                    self.assertEqual(replies[1].stdout, replies[0].stdout)
+                    self.assertEqual(replies[1].stderr, replies[0].stderr)
+                    if arguments[0] == "metadata":
+                        self.assertEqual(replies[1].stdout, (self.environment["TEST_METADATA"] + "\n").encode())
+                    elif arguments in (("mend", "--version"), ("+nightly", "fmt", "--version"), ("clippy", "--version")):
+                        self.assertEqual(events[1], b"")
+                    if events[1]:
+                        self.assertEqual(cast(dict[str, object], json.loads(events[1]))["token_held"], token_held)
+
+        for executable in (reference, cargo):
+            with self.subTest(executable=executable.name, event_output="/dev/full"):
+                arguments = ("metadata", "--format-version", "1")
+                environment = {**self.environment, "TEST_CARGO_EVENTS": "/dev/full"}
+                result = self._cargo_reference(arguments, environment) if executable == reference else subprocess.run(
+                    [str(executable), *arguments], env=environment,
+                    capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
-        for name, value in (
-            ("SHELLOPTS", "braceexpand:errexit:hashall:interactive-comments:nounset:pipefail"),
-            ("UID", str(os.getuid())),
-        ):
-            with self.subTest(name=name):
-                self.clear_observations()
-                passed = {name: value, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
-                result = self.verify("test", "sample", "--mac", "why", "--env", name, extra=passed)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {**automatic_environment, name: value})
-                self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(self.local_runs(), [])
-                self.clear_observations()
-                control = self.verify("test", "sample", "--mac", "why", "--no-cache", extra=passed)
-                self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
-                self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
+        # Both names are read-only in bash; one run forwards both, and one control run forwards neither.
+        values = {"SHELLOPTS": "braceexpand:errexit:hashall:interactive-comments:nounset:pipefail",
+                  "UID": str(os.getuid())}
+        passed = {**values, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
+        self.clear_observations()
+        result = self.verify("test", "sample", "--mac", "why", "--env", "SHELLOPTS", "--env", "UID", extra=passed)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
+        self.assertEqual(observed, {**automatic_environment, **values})
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(self.local_runs(), [])
+        self.clear_observations()
+        control = self.verify("test", "sample", "--mac", "why", "--no-cache", extra=passed)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
 
     def test_int_during_long_busy_poll_stops_every_child(self) -> None:
         real_sleep = shutil.which("sleep")
         assert real_sleep is not None
-        self.write_executable(self.bin_directory / "sleep", '#!/bin/sh\n'
+        self.route_waits_through_sleep('#!/bin/sh\n'
             + 'printf "sleeping\\n" > "$TEST_RUNNER_STATE/routing-sleep"\n'
-            + f'exec {shlex.quote(real_sleep)} "$@"\n')
+            + f'exec {shlex.quote(real_sleep)} "$1"\n')
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": "busy",
             "BUILD_TARGETS_POLL_S": "3600"})
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         process.send_signal(signal.SIGINT)
-        output, errors = process.communicate(timeout=10)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 130, output + errors)
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(self.last_call()["status"], 130)
@@ -150,15 +248,43 @@ try_reserved_target
         self.assert_nothing_outlives()
 
     def test_busy_then_blocked_refuses_instead_of_polling(self) -> None:
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        admission = caller_admission(self, self.root, self.environment)
+        controls = caller_provider_controls(self, admission)
+        previous = admission.server.handle_request
+        busy_published = False
+
+        def publish_busy(request: wire.Request,
+                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            nonlocal busy_published
+            if (isinstance(request, wire.ExecutionReport) and not busy_published
+                    and request.outcome == placement.PrelaunchRefused("busy")):
+                controls.set_host("mac", placement.TemporaryExclusion("busy"))
+                busy_published = True
+            return previous(request, connection)
+
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=publish_busy))
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "never-free"),
-            "TEST_STEP_ROUTING_SLEEP": "1"})
+            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1"})
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_path(self.runner_state / "routing-sleep", (process,))
+
+        def busy_wait_delivered() -> bool:
+            if not busy_published:
+                return False
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
+                try:
+                    queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
+                except (OSError, ValueError):
+                    continue
+                if queued.episode == self.runner_episode():
+                    return True
+            return False
+
+        self.wait_until(busy_wait_delivered, "the client queue wait after the busy refusal", (process,))
         _ = (self.runner_state / "busy-reason").write_text("blocked\n")
-        _ = (self.runner_state / "continue-sleep-1").write_text("continue\n")
-        output, errors = process.communicate(timeout=10)
+        controls.set_host("mac", placement.AllowedHost())
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 2, output + errors)
         self.assertIn("verify.sh: test --mac refused: the Mac is blocked (/build:status names the holder and when it lifts); nothing ran on natedev.\n", errors)
         self.assertEqual(len(self.runner_events()), 2)
@@ -168,15 +294,14 @@ try_reserved_target
     def test_forwarded_environment_uses_callers_values_despite_shell_bindings(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
         names = ("name", "PKG", "MAC_REASON", "ARGS")
-        for name in names:
-            with self.subTest(name=name):
-                self.clear_observations()
-                value = "original 'value'\nwith trailing newline\n"
-                result = self.verify("test", "sample", "--mac", "why", "--env", name, extra={
-                    name: value, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {**automatic_environment, name: value})
+        # Each name is a verify.sh shell binding; one run forwards all of them with a value of its own.
+        values = {name: f"original '{name}'\nwith trailing newline\n" for name in names}
+        self.clear_observations()
+        result = self.verify("test", "sample", "--mac", "why", *(word for name in names for word in ("--env", name)),
+                             extra={**values, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
+        self.assertEqual(observed, {**automatic_environment, **values})
         self.clear_observations()
         previous_calls = self.call_records()
         results = self.parser_results([("test", "sample", "--mac", "why", "--env", name) for name in names])
@@ -189,7 +314,7 @@ try_reserved_target
                 self.assertEqual(self.call_records(), previous_calls)
 
     def test_busy_then_pass_never_runs_on_natedev(self) -> None:
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        self.route_waits_through_sleep()
         free = self.runner_state / "mac-free"
         process = self.start_verify("test", "sample", "--mac", "needs macOS", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(free), "TEST_RUNNER_MAC": "passed",
@@ -203,14 +328,15 @@ try_reserved_target
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
-        self.assertGreaterEqual(len(self.runner_events()), 2)
+        self.assertGreaterEqual(sum(key.destination.provider == "mac" for key in self.provider_observations), 2)
+        self.assertEqual(len(self.runner_events()), 1)
         self.assertIn("Mac only (needs macOS)", errors)
         self.assertEqual(self.last_call()["mac"], "passed_full")
         self.assertEqual(self.routing_record()["target"], "mac")
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
 
     def test_policy_refusals_start_nothing(self) -> None:
-        result = self.verify("test", "sample", "--env", "SHOTS")
+        result, = self.parser_results([("test", "sample", "--env", "SHOTS")])
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(result.stderr, 'verify.sh: --env and --fetch need --mac "<why>".\n')
         self.assertEqual(self.runner_events(), [])
@@ -265,19 +391,36 @@ try_reserved_target
         self.assertEqual(self.cargo_events(), [])
         self.assertEqual(self.call_records(), [])
 
+    def refusal_texts(self, reasons: list[str]) -> dict[str, str]:
+        """Read the mac_only_refuse text of each reason in one shell process."""
+        output = self.root / "refusal-texts"
+        output.mkdir(exist_ok=True)
+        script = shell_functions(VERIFY, "mac_only_refuse") + "note_event() { :; }\nCMD=test PKG=sample\n" + "".join(
+            f"( mac_only_refuse {shlex.quote(reason)} ) 2>{shlex.quote(str(output / reason))}\n" for reason in reasons)
+        _ = subprocess.run(["bash", "-c", script], cwd=self.root, env=self.environment, check=False,
+                           timeout=TEST_HANG_GUARD_SECS)
+        return {reason: (output / reason).read_text() for reason in reasons}
+
     def test_runner_refusals_never_fall_back_or_retry(self) -> None:
         reasons = {
             "blocked": "the Mac is blocked (/build:status names the holder and when it lifts)",
             "unreachable": "the Mac cannot be reached (/build:status --probe)",
             "backoff": "the Mac was unreachable a short time ago (retry backoff)",
             "disk": "the Mac is below its free-space floor", "off": "Mac offload is off",
-            "repo": "this repository has no Mac setting", "linux_only": "sample is Linux only on the Mac",
+            "repo": "this repository has no Mac setting", "linux_only": "the step covers a package that is Linux only on the Mac",
             "state": "the Mac claim state cannot be read", "copy": "the tree copy to the Mac failed",
             "no_tests": "no test matched on the Mac", "lost": "the link to the Mac dropped during the run",
             "runner": "the Mac runner gave no usable result",
         }
+        texts = self.refusal_texts(list(reasons))
         for reason, text in reasons.items():
             with self.subTest(reason=reason):
+                self.assertEqual(texts[reason], f"verify.sh: test --mac refused: {text}; nothing ran on natedev.\n")
+        # After a refusal, only the printed text depends on the reason. One full run covers each runner
+        # mode and each placement.retry_decision class: no retry, an immediate retry and a delayed retry.
+        for reason in ("off", "blocked", "unreachable", "lost", "runner"):
+            text = reasons[reason]
+            with self.subTest(reason=reason, run="full"):
                 self.clear_observations()
                 mode = "lost" if reason == "lost" else "none" if reason == "runner" else "declined"
                 result = self.mac_result(extra={
@@ -293,7 +436,7 @@ try_reserved_target
 
     def test_eligibility_refuses_before_runner_and_records_decline(self) -> None:
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nexit 255\n')
-        result = self.verify("test", "sample", "--mac", "needs macOS")
+        result = self.routing_result()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac cannot be reached (/build:status --probe)", result.stderr)
         self.assertEqual(self.runner_events(), [])
@@ -303,8 +446,39 @@ try_reserved_target
         self.assertEqual(self.last_call()["mac_s"], 0)
         self.assertEqual(self.routing_record()["target"], "")
 
+    def write_backoff(self) -> Path:
+        """Mark the Mac as unreachable a short time ago, as a failed probe does."""
+        state = Path(self.environment["MAC_TEST_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        _ = (state / "failed_probe").write_text("failed\n")
+        backoff = state / "unreachable_until"
+        _ = backoff.write_text(f"{time.time() + 300:.6f}\n")
+        return backoff
+
+    def test_backoff_takes_one_fresh_probe_and_a_reached_mac_runs_the_step(self) -> None:
+        backoff = self.write_backoff()
+        result = self.verify("test", "sample", "--mac", "needs macOS", extra={
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mac_test: the Mac is reachable again", result.stderr)
+        self.assertFalse(backoff.exists())
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.routing_record()["target"], "mac")
+
+    def test_backoff_with_a_failed_fresh_probe_refuses_as_unreachable(self) -> None:
+        backoff = self.write_backoff()
+        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nexit 255\n')
+        result = self.routing_result()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("the Mac cannot be reached (/build:status --probe)", result.stderr)
+        self.assertTrue(backoff.exists())
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.last_call()["mac_reason"], "unreachable")
+
     def test_mac_failure_keeps_runner_status(self) -> None:
-        result = self.verify("test", "sample", "--mac", "why", extra={
+        result = self.mac_result(extra={
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
@@ -344,8 +518,8 @@ try_reserved_target
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-        result = self.verify("test", "sample", "--mac", "why", extra={
-            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.environment.update({"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        result = self.routing_result()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(self.local_runs(), [])
@@ -373,7 +547,8 @@ try_reserved_target
                 self.assertEqual(self.local_runs(), [])
 
     def test_missing_fetch_result_fails_pass_but_not_mac_failure(self) -> None:
-        for word in ("missing", "too_large", "failed", "not_run", "absent"):
+        # verify.sh prints a fetch word as the runner wrote it, so one written word and an absent word cover it.
+        for word in ("missing", "absent"):
             with self.subTest(word=word):
                 self.clear_observations()
                 result = self.mac_result(fetch="target/shots", extra={
@@ -392,7 +567,7 @@ try_reserved_target
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
 
     def test_term_during_busy_wait_stops_every_child(self) -> None:
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        self.route_waits_through_sleep()
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": "busy",
             "TEST_PAUSE_ROUTING_SLEEP": "1"})
@@ -408,12 +583,33 @@ try_reserved_target
 
     def test_missing_runner_refuses_instead_of_running_locally(self) -> None:
         self.runner.unlink()
-        result = self.verify("test", "sample", "--mac", "why")
+        result = self.mac_result(extra={})
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac runner gave no usable result", result.stderr)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac_reason"], "runner")
+
+    def test_fixture_reports_and_reaps_a_marked_process_that_outlives_the_test(self) -> None:
+        ready = self.runner_state / "leaked-child-ready"
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys; from pathlib import Path; Path(sys.argv[1]).touch(); signal.pause()",
+             str(ready)],
+            env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.wait_for_path(ready, (child,))
+            # Expire the leak wait while the real marked child remains alive.
+            with mock.patch.object(verify_mac_offload_test_support, "TEST_HANG_GUARD_SECS", 0):
+                with self.assertRaisesRegex(AssertionError, "processes outlived the test"):
+                    self.assert_nothing_outlives()
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(child.returncode, -signal.SIGKILL, output + errors)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

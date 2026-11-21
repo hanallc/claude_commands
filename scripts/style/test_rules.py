@@ -409,6 +409,10 @@ class RuleTests(unittest.TestCase):
         self.assertEqual([rule.reach for rule in loaded], [
             rules.MemberReach("root-package", Path(".")), rules.MemberReach("sample", Path(".")),
         ])
+        # Two member rule directories read the repository's manifests once.
+        with mock.patch.object(Path, "rglob", autospec=True, side_effect=Path.rglob) as searches:
+            self.assertEqual(rules.load_rules(repo), loaded)
+        self.assertEqual(searches.call_count, 1)
 
     def test_member_rule_without_a_matching_workspace_member_names_the_error(self) -> None:
         repo = self.member_repo()

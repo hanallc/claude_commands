@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import registered_fixture_image
+
+from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
+
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
-from scripts.shutdown import remote
+from scripts.agents import remote
+from scripts.copies.copies_test_support import copies_environment
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -13,10 +19,12 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
+import shlex
+import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
+import tempfile
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
@@ -25,12 +33,15 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lib import build_folders
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
+from scripts.buildlog import index
+from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -41,13 +52,21 @@ SCRIPT = Path(__file__).with_name("merge_gate.py")
 FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "fixture_b", "fixture_c")
 # Each folder holds test_first.py, and lib also holds test_second.py.
 
+MERGE_GATE_TEST_SETTINGS = """# range: 1..
+GATE_TIME_LIMIT_FACTOR=100
+# whole: 0..
+memory_stop_reruns=1
+"""
+# The fixture has no Mac placement. The client refuses it without contacting the queue.
+MAC_GATE_TEST_SETTINGS = (
+    "admission_client_command=" + shlex.join((sys.executable, "-c", "raise SystemExit(125)"))
+    + "\n# range: 5e-324..\nterminate_grace_seconds=3\n"
+)
+
 
 def install_test_runner(checkout: Path) -> Path:
-    """Install the real runner and its descendant helper in a fixture checkout."""
-    for relative in ("test_times/module_run.py", "lib/descendants.py"):
-        destination = checkout / "scripts" / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(SCRIPT.parents[1] / relative, destination)
+    """Install the runner, its bootstrap, and its descendant helper in the copy."""
+    copy_test_runner(checkout)
     return checkout / "scripts/test_times/module_run.py"
 
 
@@ -122,6 +141,7 @@ from pathlib import Path
 import signal
 import sys
 import time
+import tempfile
 import unittest
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
@@ -156,18 +176,20 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"), str(Path.cwd()))
+            self.assertNotIn(str(Path.cwd()), os.environ.get("PYTHONPATH", "").split(os.pathsep))
+            self.assertIn(str(Path.cwd()), sys.path)
             self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
             self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         if (state / "sample-module-memory").exists():
-            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
-                exec(package_root.read(), {"__file__": package_root.name})
-            from scripts.direct.wait_for_test_state import wait_until
+            import subprocess
+            checkout = Path(os.environ["MERGE_GATE_TEST_REPO"])
             (state / (str(os.getpgrp()) + ".memory-ready")).touch()
-            wait_until((state / (str(os.getpgrp()) + ".memory-done")).exists,
-                       state, timeout=TEST_HANG_GUARD_SECS)
+            subprocess.run([str(checkout / "scripts/lib/py"),
+                            str(checkout / "scripts/direct/wait_for_test_state.py"),
+                            str(state / (str(os.getpgrp()) + ".memory-done"))],
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
         death = state / ("signal-" + suite)
         if death.exists():
             if death.read_text() == "once":
@@ -205,7 +227,8 @@ class FixtureTest(unittest.TestCase):
         if (state / "leak-child").exists() and suite == "hooks":
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=(state / "detached-child").exists())
             (state / "child-pid.tmp").write_text(str(child.pid))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "child-pid.tmp", state / "child-pid")
@@ -266,6 +289,11 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
     return cast(tuple[str, ...], getattr(method, "gate_test_suites", ("hooks",)))
 
 
+def pin_gate_root(configuration: Path, root: Path) -> None:
+    """Keep the fixture gate on its private tmpfs path."""
+    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
+
+
 def wait_for_file(path: Path) -> None:
     wait_until(path.exists, path.parent, timeout=TEST_HANG_GUARD_SECS)
 
@@ -305,12 +333,25 @@ class MergeGateFixture(unittest.TestCase):
     fixture_seeds: ClassVar[dict[tuple[str, ...], GateFixtureSeed]]
 
     @classmethod
+    def fixture_configuration(cls, directory: Path) -> dict[str, str]:
+        environment = config_environment(directory)
+        pin_gate_root(directory / "build_folders.conf", Path("/dev/shm"))
+        return environment
+
+    @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(dir=build_folders.tmpfs_temporary_parent(), prefix="merge-gate-test-")
-        cls.addClassCleanup(directory.cleanup)
-        cls.fixture_root = Path(directory.name) / "case"
-        cls.fixture_snapshot = Path(directory.name) / "snapshot"
+        # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
+        configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, cls.fixture_configuration(configuration))))
+        parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
+        parent.mkdir(mode=0o700, exist_ok=True)
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        directory = cls.enterClassContext(build_folders.temporary_build_folder(
+            build_folders.BuildFolderSpec(kind="legacy-unique", parent=parent,
+                                          purpose="merge-gate-test-", suffix_length=8)))
+        cls.fixture_root = directory / "case"
+        cls.fixture_snapshot = directory / "snapshot"
         cls.fixture_snapshot.mkdir()
         cls.fixture_seeds = {}
 
@@ -319,9 +360,9 @@ class MergeGateFixture(unittest.TestCase):
         from scripts.message import session_send
 
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
+        self.addCleanup(shutil.rmtree, self.fixture_root)
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
-        self.addCleanup(shutil.rmtree, self.fixture_root)
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission_started = True
 
@@ -344,6 +385,9 @@ class MergeGateFixture(unittest.TestCase):
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        pin_gate_root(Path(self.environment["CONF_DIR"]) / "build_folders.conf", self.fixture_root.parent)
+        pin_gate_root(self.root / "build_folders.conf", self.fixture_root.parent)
+        self.configure_gate("program_first_peak_gib.merge-gate=4\n")
         seed = self.fixture_seeds[folders]
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
@@ -403,14 +447,16 @@ class MergeGateFixture(unittest.TestCase):
         self.checkout = self.root / "merge"
         self.unit = self.root / "unit"
         self.main = self.root / "main"
-        self.bin = self.root / "bin"
+        self.bin = self.root / "tools/bin"
         self.state = self.root / "state"
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
+        git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **copies_environment(root, repository="origin"), **interpreter_cache_environment(root / "cache"),
+            "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "MERGE_GATE_TEST_STATE": str(self.state),
             "MERGE_GATE_TEST_REPO": str(SCRIPT.parents[2]),
@@ -419,11 +465,13 @@ class MergeGateFixture(unittest.TestCase):
             "MERGE_GATE_UV": str(self.bin / "uv"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
+            "BUILD_TARGETS_STATE_DIR": str(self.state / "build-targets"),
+            "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.
@@ -432,7 +480,8 @@ class MergeGateFixture(unittest.TestCase):
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)
-        self.environment.update(fake_memory_readings(readings))
+        self.environment.update({key: value for key, value in fake_memory_readings(readings).items()
+                                 if key != "CONF_DIR"})
         self.environment.update({
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
@@ -524,10 +573,29 @@ class MergeGateFixture(unittest.TestCase):
         finally:
             server.reply_filter = previous
 
+    def install_fixture_runner(self) -> None:
+        _ = install_test_runner(self.checkout)
+
     def build_fixture(self, root: Path) -> None:
         self.bind_fixture(root)
+        copy_runtime(self.bin.parent)
         self.bin.mkdir()
         self.state.mkdir()
+        _ = write_config_fixture(self.root / "config/buildlog.conf")
+        for configuration in (self.root, Path(self.environment["CONF_DIR"])):
+            _ = write_config_fixture(configuration / "merge_gate.conf", MERGE_GATE_TEST_SETTINGS)
+            self.write(configuration / "mac_gate.conf", MAC_GATE_TEST_SETTINGS)
+        # These tests prove gate behavior without a near deadline from their short jobs.
+        history = Path(self.environment["BUILDLOG_DIR"])
+        history.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(index.index_path_in(history))) as connection, connection:
+            index.create_schema(connection)
+            # A full run's limit reads runs with its own job count, so seed every count a gate can use.
+            vcpus = os.cpu_count() or 1
+            connection.executemany("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
+                VALUES (?, '2000-01-01', 'merge-gate', ?, ?, 0, 0, 'full', 1000000)""",
+                [(f"fixture-normal-{jobs}", vcpus, jobs) for jobs in range(1, vcpus + 1)]).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
@@ -543,7 +611,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
-        _ = install_test_runner(self.checkout)
+        self.install_fixture_runner()
         shim = self.checkout / "scripts/lib/py"
         shim.parent.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(SCRIPT.parents[1] / "lib/py", shim)
@@ -574,7 +642,8 @@ class MergeGateFixture(unittest.TestCase):
         while True:
             try:
                 state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
+            # A process reaped between the open and the read is gone, so it is stopped.
+            except (FileNotFoundError, ProcessLookupError):
                 return
             if state == "Z":
                 return
@@ -609,22 +678,19 @@ class MergeGateFixture(unittest.TestCase):
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False, preamble: str = "",
-                 type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
+                 own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
              "--unit", "fixture", "--phase", "phase-2",
              "--body", "Fixture checkpoint gate.",
-             *(["--type-dirs", *type_dirs] if type_dirs else []),
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
         if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
-            arguments = ["--repo", str(self.checkout),
-                         *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
+            arguments = ["--repo", str(self.checkout), *extra]
         if own_process or ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
@@ -706,6 +772,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def checkpoint_commit(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        _ = registered_fixture_image(Path(self.environment["REVIEW_LINKS_ROOT"]), "012345abcdef")
         self.write(self.unit / "visible.txt", message)
         _ = self.git(self.unit, "add", ".")
         self.environment["GIT_COMMITTER_DATE"] = "2026-10-15T12:00:00-04:00"

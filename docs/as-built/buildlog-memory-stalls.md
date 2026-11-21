@@ -90,6 +90,39 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
    The resource objects use JSON `TEXT` columns.
    The index uses `(host, at)`. Older source rows retain NULL for fields that they lack.
 
+### Hourly Rust cache readings
+
+`buildlog hourly` records sccache statistics before sync. It writes a
+`sccache_sample` record to the monthly sample log. The index reads it into
+`sccache_samples`.
+
+The reading uses Rust hits and misses from the sccache JSON. Their sum counts
+Rust requests that reached the cache lookup. The hit rate is a fraction. It
+has no value when no requests reached the cache. The reading also records
+`cache_size` and `max_cache_size` in bytes. A size is null when sccache
+cannot measure it.
+
+`ExecMainStartTimestampMonotonic` identifies the start of the service's main
+process. It changes when systemd restarts that process. The host and boot ID
+identify the clock for that start time. The sampler checks the PID and start
+time before and after the statistics read. It reads the server's `SCCACHE_*`
+settings from `/proc/<MainPID>/environ`. The client starts in
+`/proc/<MainPID>/cwd` so relative socket paths resolve from the server's directory.
+The sampler skips the reading if it cannot read the environment or use the directory.
+It removes the server start flag because it conflicts with `--show-stats`.
+The sampler sets the logging level and disables log colors.
+It requires the sccache client to log `request_stats` at debug level and exit
+successfully. The client can return default counters after a connection failure
+without this message.
+
+`buildlog sccache START END` uses inclusive dates in the user's time zone.
+The earliest accepted date is 2000-01-01. With no dates, it uses today.
+It sums hit and miss deltas between readings inside the range from the same
+server life. A counter decrease starts a new
+baseline. The rate is unavailable until a measured delta contains requests.
+
+Baseline before the 128G cache (bob, 2026-11-19 about 11:37 EST, server up 4 d 16 h 45 min): Rust hits 76,653, misses 101,899, hit rate 42.93%.
+
 ### Raw resource readings and hourly use
 
 `cgroup_capture.read_cgroup(path)` supplies `memory.slice_state()` and the sample's
@@ -228,6 +261,26 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
   - A pair more than 5 minutes apart is ignored.
   - A pair across local midnight that is close enough counts, with `TZ=UTC` pinned.
   - An empty day keeps the heading, `memory waits: none` and `60 s samples: none; machine stall: unavailable.`
+
+## Build cost definitions
+
+Phase time is `phase_active_seconds`: the finish time minus `phase_started_at`, less the waits for the user or a supplier.
+A finish without `phase_active_seconds` has no phase time. Its day reads `phases ended before waits were recorded`.
+The phase finish time selects the window. Cost categories can overlap.
+
+Memory wait is the recorded wait time. A cold rebuild compiles at least 50 crates.
+A failed run has a counted nonzero step status, a nonzero gate run status or a failed CI result.
+A failed gate run costs its wall time on the machine that holds its file.
+A gate run also counts as a recorded event of that machine. AWS records only gate runs, under `aws`.
+
+A rerun after a pass repeats nextest within 60 minutes for the same worker.
+The recorded tree, worktree, and build input must match.
+
+CI cost sums job wall times. When job records are absent, CI cost uses the run wall time.
+Cancelled CI counts cancelled workflow attempts.
+
+Mac idle time starts with candidate wait intervals. It excludes Mac execution and recorded holds.
+Missing records remain unknown.
 
 ## Invariants
 

@@ -40,7 +40,7 @@ Match the pattern against every row that is not `offline`, case-insensitive:
 
 Resolution:
 
-- **One live match**: that is the recipient. Use its bare name; append ` [ref]` only if another live row shares the name.
+- **One live match.** Use its name. If another live row shares the name, use a unique roster address such as `session:<id>`.
 - **Several live matches**: ask in one plain-text line naming each match (name, status, started), recommend the closest name match, and send to the choice in the user’s next message.
 - **No live match**: stop. List the live names from the listing in one short block so the user can re-run with the right one. If the only match is `offline`, say that — an offline session cannot receive.
 - The listing's first line names this session. Never resolve the target to it; if the pattern only matches this session, say so and stop.
@@ -55,18 +55,20 @@ Whichever source, apply /message's first-line and context rules.
 In **respond mode**, append after a blank line:
 
 ```
-Respond: reply to this message with SendMessage — set `to` to the `from` attribute of the wrapper this message arrived in. Make the first line of your reply a self-contained sentence. Reply as soon as you have an answer; if you need your user's input first, reply once now saying so, and again after you have it.
+Respond: reply to this message with send.py (/message) — set `--to` to the `from` attribute of the wrapper this message arrived in. Make the first line of your reply a self-contained sentence. Reply as soon as you have an answer; if you need your user's input first, reply once now saying so, and again after you have it.
 ```
 </ComposeMessage>
 
 <Send>
-One `SendMessage` call:
+One `send.py` call (/message):
 
-- `to`: the resolved name (with ` [ref]` only when needed)
-- `summary`: `send to <name>` — or `send to <name>, reply requested` in respond mode
-- `message`: the composed text
+- `--to`: the resolved name
+- `--summary`: `send to <name>` — or `send to <name>, reply requested` in respond mode
+- `--text`: the composed text
 
-Do not set `notify_when_idle`. If the send errors asking for disambiguation, retry once with the ` [ref]` from the listing; if it still fails, report the error verbatim.
+A `Remote Control` row is on another machine: add `--machine <other machine>`.
+
+If the send fails, report its outcome line verbatim.
 </Send>
 
 <Report>

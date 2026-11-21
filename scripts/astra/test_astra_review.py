@@ -16,12 +16,13 @@ from scripts.agents import codex_test_support as codex_fixture
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
-from scripts.production import staff  # noqa: E402
+from scripts.production import staff, worker_admission  # noqa: E402
 from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.herdr import herdr, side_pane
-from scripts.direct import assign
+from scripts.herdr import herdr, side_pane, turn_end, worker_panes
+from scripts.direct import assign, progress_history
+from scripts.message import send
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
@@ -109,13 +110,14 @@ class AstraReviewTests(StaffTestCase):
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
         assignments: list[tuple[str, design_roles.ThreadAccessPolicy]] = []
 
-        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path) -> None:
+        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path) -> design_roles.SubmittedRoleTurn:
             instance = next(item for item in design.roles if item.role == role)
             self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
             self.assertTrue(prompt.is_file())
             if isinstance(instance.lifecycle, design_roles.RoleOpen):
                 assignments.append((instance.lifecycle.thread_id, design_roles.access_policy(design, role)))
             _ = reply.write_text("Held reviewer evidence.\n")
+            return design_roles.SubmittedRoleTurn(reply, design_roles.design_directory(design.placement.design_id))
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
@@ -137,7 +139,8 @@ class AstraReviewTests(StaffTestCase):
                     replies.append(header.reply_path)
         self.assertEqual(assignments, [(fixture_runtime_id("held-thread"), design_roles.ReadOnlyReviewer()), (fixture_runtime_id("held-thread"), design_roles.ReadOnlyReviewer())])
         self.assertEqual(len(set(replies)), 2)
-        self.assertIn("held reviewer", output.getvalue())
+        self.assertIn("Submitted:", output.getvalue())
+        self.assertNotIn("Held reviewer evidence.", output.getvalue())
         self.assertEqual(self.router.commands, [])
         self.assertEqual(self.world.requests, [])
 
@@ -232,7 +235,7 @@ class AstraReviewTests(StaffTestCase):
         report = self.root / "selected-review.md"
         arguments = ["--role", "review", "--operation", "astra-review", "--target", "consultation-pane",
                      "--policy", "astra-reviewer", "--new-worker", "selected-reviewer",
-                     "--prompt", str(self.document), "--summary", str(report),
+                     "--prompt", str(self.document), "--reply-file", str(report),
                      "--model", "gpt-review-fixture", "--effort", "high"]
         result = invoke_cli(assign, assign.main, arguments, self.environment, self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -388,14 +391,112 @@ class AstraReviewTests(StaffTestCase):
         self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)
         self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
         self.fixture.agent.without_done = False
-        result = self.run_script(str(self.document))
+        self.fixture.agent.finish_after = 1
+        with self.world.process_starts():
+            result = self.run_script(str(self.document))
         self.assertEqual(result.returncode, 0, result.stderr)
         command = self.router.commands[-1]
         self.assertEqual(command[command.index("--target") + 1], "staff-worker")
         self.assertEqual(command[command.index("--policy") + 1], "astra-reviewer")
-        self.assertEqual(self.saved_prompt().with_name("review.md").read_text().strip(), self.fixture.agent.replies[-1])
-        self.assertIn(self.fixture.agent.replies[-1], result.stdout)
+        review = self.saved_prompt().with_name("review.md")
+        self.assertFalse(review.exists())
+        self.assertIn(f"Submitted: {review}", result.stdout)
+        self.assertNotIn(self.fixture.agent.final, result.stdout)
+        pending = self.run_script("--read", str(review), "--run-directory", str(review.parent))
+        self.assertEqual(pending.returncode, 1)
+        self.assertIn("not completed", pending.stderr)
+        pane = self.fixture.agent.submitted[-1][0]
+        row = self.fixture.agent.row(pane)
+        self.fixture.agent.complete(pane)
+        with patch.dict(os.environ, self.environment):
+            self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
+        saved = self.run_script("--read", str(review), "--run-directory", str(review.parent))
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        self.assertEqual(review.read_text().strip(), self.fixture.agent.replies[-1])
+        self.assertIn(self.fixture.agent.replies[-1], saved.stdout)
         self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
+
+    def test_read_delivers_late_done_after_launcher_error_before_the_notice_stamp(self) -> None:
+        self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)
+        self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
+        self.fixture.agent.without_done = False
+        self.fixture.agent.finish_after = 1
+        with self.world.process_starts():
+            submitted = self.run_script(str(self.document))
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        reply = self.saved_prompt().with_name("review.md")
+        run = reply.parent
+        pane = self.fixture.agent.submitted[-1][0]
+        row = self.fixture.agent.row(pane)
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        prompts = tuple(self.fixture.agent.submitted)
+        self.assertEqual(sum(f"DONE {instance}" in line for _, line in prompts), 1)
+        progress_history.complete_dispatch(run, row.name, instance, status="error")
+        ended = worker_panes.worker_pass(row, run)
+        self.assertEqual(ended["status"], "error")
+        self.fixture.agent.complete(pane)
+        send_notice = send.send
+        reads: list[subprocess.CompletedProcess[str]] = []
+
+        def read_during_delivery(options: send.Options) -> send.Result:
+            delivered = send_notice(options)
+            pending = worker_panes.worker_pass(row, run)
+            self.assertNotIn("hook_notice", pending)
+            self.assertEqual(pending["status"], "error")
+            reads.append(self.run_script("--read", str(reply), "--run-directory", str(run)))
+            return delivered
+
+        with patch.dict(os.environ, self.environment), patch.object(send, "send", side_effect=read_during_delivery):
+            self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
+        during_delivery, = reads
+        after_delivery = self.run_script("--read", str(reply), "--run-directory", str(run))
+        for result in (during_delivery, after_delivery):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(self.fixture.agent.replies[-1], result.stdout)
+        state = cast(dict[str, dict[str, dict[str, object]]], json.loads((run / unit_runs.STATE_FILE).read_text()))
+        saved = state["pass"][row.name]
+        self.assertEqual((saved["instance_id"], saved["status"], saved["finished_at"]),
+                         (instance, "error", ended["finished_at"]))
+        self.assertTrue(saved["hook_notice"])
+        self.assertEqual(tuple(self.fixture.agent.submitted), prompts)
+
+    def test_read_prints_the_validated_reply_when_the_file_changes(self) -> None:
+        self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)
+        self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
+        self.fixture.agent.without_done = False
+        self.fixture.agent.finish_after = 1
+        with self.world.process_starts():
+            submitted = self.run_script(str(self.document))
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        pane = self.fixture.agent.submitted[-1][0]
+        self.fixture.agent.complete(pane)
+        with patch.dict(os.environ, self.environment):
+            self.assertEqual(self.fixture.finish(self.fixture.agent.row(pane).name), turn_end.TurnOutcome.DONE)
+        reply = self.saved_prompt().with_name("review.md")
+        original = reply.read_text(encoding="utf-8")
+        check_done = worker_admission.reply_ends_dispatch
+
+        for delete_reply in (False, True):
+            with self.subTest(delete_reply=delete_reply):
+                _ = reply.write_text(original, encoding="utf-8")
+
+                def change_after_check(text: str, dispatch_id: str) -> bool:
+                    matches = check_done(text, dispatch_id)
+                    if matches:
+                        if delete_reply:
+                            reply.unlink()
+                        else:
+                            _ = reply.write_text("Replacement reply.\nDONE stale-id\n", encoding="utf-8")
+                    return matches
+
+                with patch.object(worker_admission, "reply_ends_dispatch", new=change_after_check):
+                    result = self.run_script("--read", str(reply), "--run-directory", str(reply.parent))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{original.strip()}\n\nSaved: {reply}\n")
+                if delete_reply:
+                    self.assertFalse(reply.exists())
+                else:
+                    self.assertIn("DONE stale-id", reply.read_text(encoding="utf-8"))
 
     def test_showrunner_review_opens_a_worker_under_the_calling_showrunner(self) -> None:
         record = staff.snapshot()
@@ -412,9 +513,13 @@ class AstraReviewTests(StaffTestCase):
         def observe() -> None:
             published.extend(staff.snapshot().find(kind="worker", parent=owner.id))
         self.fixture.agent.during_prompt = observe
-        result = self.run_script(str(self.document))
+        with self.world.process_starts():
+            result = self.run_script(str(self.document))
         self.assertEqual(result.returncode, 0, result.stderr)
         reviewer, = published
+        with patch.dict(os.environ, self.environment):
+            event = turn_end.WorkerEvent(str(reviewer.current_session), reply=self.fixture.agent.replies[-1])
+            self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.DONE)
         self.assertEqual(reviewer.parent, staff.ReportsTo(owner.id))
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.router.commands[-1][self.router.commands[-1].index("--target") + 1], "staff-worker")

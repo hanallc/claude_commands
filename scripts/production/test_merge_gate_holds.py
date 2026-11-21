@@ -41,7 +41,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
         super().setUp()
         hold_environment = {name: os.environ[name] for name in (
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "MAC_TEST_STATE_DIR",
-            "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID", "UNIT_ACTIVE_DIR",
+            "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
         )}
         self.addCleanup(self.gate.doCleanups)
@@ -50,6 +50,10 @@ class MergeGateHoldTests(TemporaryHoldTest):
         # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
         _ = (Path(self.gate.environment["CONF_DIR"]) / "build_targets.conf").write_bytes(
             (self.root / "build_targets.conf").read_bytes())
+        # The fake process root also identifies the real process that owns this gate.
+        process = Path(os.environ["VERIFY_PROC_ROOT"]) / str(os.getpid())
+        process.mkdir(parents=True, exist_ok=True)
+        _ = (process / "stat").write_bytes(Path(f"/proc/{os.getpid()}/stat").read_bytes())
         self.environment = {**self.gate.environment, **hold_environment}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
 
@@ -60,11 +64,11 @@ class MergeGateHoldTests(TemporaryHoldTest):
                                          "event": event, "tmpdir": ""}) + "\n")
 
     @gate_suites("lib", "hooks")
-    def test_each_mode_waits_before_tests_types_or_promotion(self) -> None:
+    def test_each_mode_waits_before_tests_or_promotion(self) -> None:
         arguments = ["--repo", str(self.gate.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
                      "--previous-checkpoint", self.gate.base, "--unit", "fixture",
-                     "--phase", "hold", "--type-dirs", "scripts/production",
+                     "--phase", "hold",
                      "--production", "quiet",
                           "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
         for mode in ([], ["--tests-only"], ["--promote-only"]):
@@ -122,7 +126,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
         finish = merge_gate.finish_gate_job
         started: list[merge_gate.RunningGateJob] = []
         now = [0.0]
-        clock = SimpleNamespace(monotonic=lambda: now[0], sleep=time.sleep)
+        clock = SimpleNamespace(monotonic=lambda: now[0], sleep=time.sleep, time=time.time)
 
         def start_module(suite: str, path: Path, argv: list[str], repo: Path,
                          environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
@@ -177,7 +181,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
                 "--repo", str(self.gate.checkout), "--merge-branch", "integration",
                 "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
                 "--previous-checkpoint", self.gate.base, "--unit", "fixture", "--phase", "hold",
-                "--production", "quiet", "--type-dirs", "scripts/production",
+                "--production", "quiet",
             ])
         self.assertNotEqual(code, 0, output.getvalue())
         self.assertIn("natedev hold state cannot be read", output.getvalue())

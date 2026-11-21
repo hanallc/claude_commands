@@ -1,8 +1,16 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
+from scripts.build_queue import placement
+from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.copies import copies
+from scripts.lib import conf
+from scripts.lib.build_slots_test_support import private_slot_config
+from unittest import mock
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -97,6 +105,7 @@ class VerifyDocFixture(unittest.TestCase):
         builder = cls()
         builder.root = cls.fixture_root
         builder.build_fixture()
+        builder.environment["PYTHONPYCACHEPREFIX"] = str(cls.fixture_root.parent / "bytecode")
         cls.fixture_environment = builder.environment.copy()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -107,24 +116,29 @@ class VerifyDocFixture(unittest.TestCase):
         if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.exists():
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="verify-doc-test-")))
             self.build_fixture()
-            _ = caller_admission(self, self.root, self.environment)
+            self.start_admission()
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.repo = self.root / "workspace"
         self.records = self.root / "home/.local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.environment = self.fixture_environment.copy()
-        _ = caller_admission(self, self.root, self.environment)
+        self.start_admission()
+
+    def start_admission(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.05)
+        admission.server.host_probe = lambda key: private_caller_provider(admission, self.environment, key)
+        _ = caller_provider_controls(self, admission)
 
     def build_fixture(self) -> None:
         self.repo = self.root / "workspace"
         self.repo.mkdir()
         home = self.root / "home"
-        (home / ".claude").mkdir(parents=True)
-        (home / ".claude/scripts").symlink_to(SCRIPTS, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         self.records = home / ".local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
@@ -133,10 +147,11 @@ class VerifyDocFixture(unittest.TestCase):
         tools.mkdir()
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
-        targets = tools / "build-targets.py"
-        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.executable(tools / name, "#!/bin/sh\nexit 99\n")
+        write_unconfigured_berth(tools)
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
             (self.root / name).mkdir()
         memory_environment = fake_memory_readings(self.root)
@@ -157,14 +172,11 @@ class VerifyDocFixture(unittest.TestCase):
                              "manifest_path": str(member / "Cargo.toml"),
                              "targets": [{"name": name, "kind": ["lib"], "test": True,
                                           "src_path": str(source), "required-features": []}]})
-        self.environment = {
-            name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_", "CARGO_", "RUST",
-                                    "NEXTEST_", "CLAUDE_CODE_", "CODEX_", "GIT_"))
-        }
+        self.environment = verify_test_environment()
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.environment.update({
             "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
-            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(self.root / "bytecode"),
             "LINT_SKIP_SWEEP": "1",
             "TEST_CARGO_EVENTS": str(self.events),
             "TEST_ORIGINAL_REPO": str(self.repo),
@@ -177,16 +189,27 @@ class VerifyDocFixture(unittest.TestCase):
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
             **memory_environment,
-            "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
+            "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_SKIP_SWEEP": "1",
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
-        # These are doc-policy tests, not interpreter-discovery tests. Exercise
+        private = private_slot_config(self.root, repository=self.repo.name)
+        slot_settings = private.settings.read_text().splitlines(keepends=True)
+        for key, value in (("locks.probe_wait_seconds", "0.25"), ("locks.probe_retry_seconds", "1")):
+            line, _ = conf.editable_line(private.settings, key)
+            slot_settings[line] = f"{key}={value}\n"
+        _ = private.settings.write_text("".join(slot_settings))
+        _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
+        configuration = Path(self.environment["CONF_DIR"])
+        _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
+        self.environment.update({key: value for key, value in private.environment.items() if key != "CONF_DIR"})
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(copies.gates_root().is_relative_to(self.root))
+        # These tests use the interpreter cache. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
         seed_interpreter_cache(self.root / "cache")
-        _ = self.environment.pop("CLAUDE_PYTHON", None)
         _ = self.git("init", "-q", "-b", "test")
         _ = self.git("add", "-A")
         _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
@@ -217,33 +240,41 @@ class VerifyDocFixture(unittest.TestCase):
         holders.mkdir()
         _ = (holders / "other").write_text("private hold")
         settings = self.root / "mac.conf"
-        _ = settings.write_text("offload=on\n")
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", template="mac_test")
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n")
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
         self.environment["MAC_TEST_STATE_DIR"] = str(self.root / "mac-state")
-        targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])
-        self.executable(targets, '''
-import os
-from pathlib import Path
-import sys
-if sys.argv[1] == "eligible":
-    print("any_target")
-    print("natedev\\teligible\\t-\\t-\\t-")
-    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
-elif sys.argv[1] in ("register-local", "check-local"):
-    raise SystemExit(10)
-''')
+        admission = caller_admission(self, self.root, self.environment)
+        controls = caller_provider_controls(self, admission)
+        controls.set_host("mac", placement.AllowedHost())
+        self.environment["TEST_REAL_RECORD"] = str(SCRIPTS / "buildlog/record.py")
+        from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
+
         runner = self.root / "mac-doc.py"
         self.executable(runner, '''
 import os
 from pathlib import Path
 import sys
+import time
 words = sys.argv[1:]
+arguments = words
+root = Path(os.environ["TEST_ORIGINAL_REPO"]).parent
+result = Path(words[words.index("--result") + 1])
+''' + ASSIGNED_RUNNER_SETUP + '''
 assert words[words.index("--verb") + 1] == "doc"
 assert words[words.index("--repo-root") + 1] == os.environ["TEST_ORIGINAL_REPO"]
 os.chdir(words[words.index("--source-root") + 1])
 result = "failed" if int(os.environ.get("TEST_DOC_STATUS", "0")) else "passed"
 Path(words[words.index("--result") + 1]).write_text("mac=" + result + "\\nseconds=0\\n")
-''' + CARGO_STUB.replace('arguments = sys.argv[1:]', 'arguments = ["doc", *words[words.index("--") + 1:]]'))
+''' + CARGO_STUB.replace('arguments = sys.argv[1:]', 'arguments = ["doc", *words[words.index("--") + 1:]]').replace(
+    '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))',
+    '''    if "--assignment-file" in words:
+        fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_DOC_STATUS", "0")))
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private doc command ended", time.time())
+        fixture_cleanup_confirmed = True
+    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))'''))
         self.environment["VERIFY_MAC_RUNNER"] = str(runner)

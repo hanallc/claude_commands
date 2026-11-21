@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 
 import hashlib
 import io
@@ -10,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+from subprocess import run as run_fixture_zstd
 import tempfile
 import time
 import unittest
@@ -18,7 +20,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from scripts.lib.transcript_test_support import compressed_copy
+from typing import BinaryIO, Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -31,8 +34,10 @@ from scripts.notify.push_test_support import registered_send
 from scripts.notify.user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
 REAL_REVIEW = review.review
+REAL_PROCESS_RUN = subprocess.run
 
 from scripts.accounts import accounts
+from scripts.whoami.account_test_support import create_claude_account
 from scripts.production import staff
 from scripts.production.update_registration_test_support import RegistrationFixture
 from scripts.production.cli_fixture import production_paths
@@ -145,17 +150,23 @@ class LocalReviewTests(unittest.TestCase):
         notes.mkdir()
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
-        _ = (notes / "claude2.md").write_text("---\nlogin: reviewer@example.invalid\n---\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFY_STATE_DIR": str(self.root / "state")})))
-        self.assertEqual(accounts.setup("claude2"), [])
-        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
+        create_claude_account("claude2", "reviewer@example.invalid")
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
         _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
-        # Calls without an explicit fake must never start a reviewer or notifier.
-        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("real process")))
+        registry = write_registry(self.root / "models.conf")
+
+        def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
+                    check: bool, timeout: float = 60, input: str | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[0] != "bash" or env.get("MODELS_CONFIG_FILE") != str(registry):
+                raise AssertionError(f"unexpected process: {argv}")
+            return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout,
+                                    input=input)
+
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=process))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", self.root / "pushes.jsonl"))
@@ -164,8 +175,12 @@ class LocalReviewTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
         binary = self.root / "bin/claude"
         binary.parent.mkdir()
-        _ = binary.write_text("fake reviewer\n")
+        _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
         binary.chmod(0o700)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
+        })))
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
 
     def question_record(self, fields: dict[str, str], *, name: str) -> Path:
@@ -520,6 +535,15 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIsNone(entry["sent"])
         self.assertFalse((self.root / "state/held").exists())
         self.assertFalse(pushover.LOG_FILE.exists())
+        since = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        expected = review.transcript_replies(path, since)
+
+        def codec(command: list[str], *, stdout: BinaryIO, stderr: int, check: bool) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(command[0], "zstd")
+            return run_fixture_zstd(command, stdout=stdout, stderr=stderr, check=check)
+
+        with mock.patch.object(subprocess, "run", side_effect=codec):
+            self.assertEqual(review.transcript_replies(compressed_copy(path), since), expected)
 
     def test_sample_limit_selects_recent_non_question_replies_across_transcripts(self) -> None:
         paths = [self.transcript("one.jsonl", [
@@ -1452,11 +1476,34 @@ class LocalReviewTests(unittest.TestCase):
         self.assertTrue(all(0 < call.timeout <= 60 for call in runner.calls))
 
     def test_unresolved_registry_uses_opus_medium(self) -> None:
-        runner = FakeReviewer(verdict(self.draft), assignment_ok=False)
-        _ = review.review(self.draft, False, runner=runner)
-        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
-        self.assertEqual(command[command.index("--model") + 1], "opus")
-        self.assertEqual(command[command.index("--effort") + 1], "medium")
+        registry = write_registry(self.root / "models.conf")
+        caller = claude_catalog_environment(self.root / "caller-review", {"opus": "claude-opus-caller-fixture"})
+        binary = self.root / "bin/claude"
+        _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
+        catalog = accounts.account_dir("claude2") / "cache/model-catalog/fixture-cc.json"
+        catalog.parent.mkdir(parents=True)
+        for target in ("opus", "claude-opus-fixture"):
+            with self.subTest(target=target), mock.patch.dict(os.environ, {
+                **caller,
+                "MODELS_CONFIG_FILE": str(registry),
+                "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
+            }):
+                if target != "opus":
+                    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+                        "provider_alias_targets": {"opus": {"default": target}},
+                        "models": [{"id": target, "min_claude_code_version": "2.1.319"}],
+                    }}}))
+                runner = FakeReviewer(verdict(self.draft), assignment_ok=False)
+
+                def process(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    if argv[0] == "bash":
+                        return REAL_PROCESS_RUN(argv, timeout=timeout, env=env, capture_output=True, text=True, check=False)
+                    return runner(argv, timeout=timeout, env=env)
+
+                _ = review.review(self.draft, False, runner=process)
+                command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
+                self.assertEqual(command[command.index("--model") + 1], target)
+                self.assertEqual(command[command.index("--effort") + 1], "medium")
 
     def test_setup_and_reviewer_share_one_configured_budget_read_once(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
@@ -1497,10 +1544,8 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
-        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
-        self.assertEqual(accounts.setup("claude3"), [])
+        create_claude_account("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
         with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)

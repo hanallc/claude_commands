@@ -1,13 +1,14 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id
 
 import fcntl
 import io
 import json
 import multiprocessing
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -22,14 +23,15 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.production import staff
-from scripts.shutdown import shutdown, stop_resume, restart_support
+from scripts.production import demote_showrunner, promote_showrunner, staff
+from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import unit_runs
-from scripts.message import sessions
+from scripts.lib import transcripts, unit_runs
+from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.transcript_test_support import compressed_copy
 
 
 MISSING_ID = staff.StaffId("s00000000000")
@@ -91,6 +93,205 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffCommandTestCase):
+    def test_older_writer_unit_type_on_other_kinds_is_removed(self) -> None:
+        runner, _, worker = self.tree()
+        producer = fixture_member("producer", name="producer")
+        for row in (runner, worker, producer):
+            for value in ("merge", None, {"future": "type"}):
+                with self.subTest(kind=row.kind, value=value):
+                    decoded = staff.StaffRow.from_json({**row.to_json(), "unit_type": value})
+                    self.assertEqual(decoded, row)
+                    self.assertNotIn("unit_type", decoded.to_json())
+                    self.assertNotIn("unit_type", decoded.unknown_fields)
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        rows = cast(list[dict[str, object]], document["rows"])
+        next(item for item in rows if item["id"] == runner.id)["unit_type"] = "merge"
+        self.write_json(self.staff_file, document)
+        self.assertEqual(staff.by_id(runner.id), runner)
+        renamed = staff.rename(runner.id, "renamed")
+        self.assertNotIn("unit_type", renamed.to_json())
+        saved = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertNotIn("unit_type", next(item for item in cast(list[dict[str, object]], saved["rows"])
+                                         if item["id"] == runner.id))
+
+    def test_unit_details_have_distinct_variants(self) -> None:
+        runner, unit, _ = self.tree()
+        self.assertIsInstance(runner.unit_type, staff.NotUnit)
+        self.assertEqual(unit.unit_type, staff.UnitDetails("direct"))
+        self.assertNotIn("__post_init__", staff.StaffRow.__dict__)
+
+    def test_demotion_selects_unit_type_locally_and_remotely(self) -> None:
+        parent, unit, _ = self.tree()
+        location = staff.PresentWorktree("natedev", self.root / "typed-unit")
+        doc = staff.LiveDoc("natedev", self.root / "typed-production.md")
+        for machine in ("natedev", "mac"):
+            for unit_type in staff.UNIT_TYPES:
+                with self.subTest(machine=machine, unit_type=unit_type), self.machine(machine):
+                    promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=doc)
+                    self.assertNotIn("unit_type", promoted.to_json())
+                    demoted = staff.change_director(unit.id,
+                        staff.UnitRole(unit.name, parent.id, location, unit_type=unit_type))
+                    self.assertEqual(demoted.to_json()["unit_type"], unit_type)
+                    self.assertEqual(staff.unit_command(demoted), f"/unit:{unit_type}")
+
+    def test_unit_types_round_trip_and_select_commands(self) -> None:
+        _, unit, _ = self.tree()
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                typed = replace(unit, unit_type=staff.UnitDetails(unit_type))
+                decoded = staff.StaffRow.from_json(typed.to_json())
+                self.assertEqual(decoded, typed)
+                self.assertEqual(decoded.to_json()["unit_type"], unit_type)
+                self.assertNotIn("unit_type", decoded.unknown_fields)
+                self.assertEqual(staff.unit_command(decoded), f"/unit:{unit_type}")
+
+    def test_old_unit_defaults_to_direct_and_writes_the_type_on_change(self) -> None:
+        _, unit, _ = self.tree()
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        fields = next(row for row in cast(list[dict[str, object]], document["rows"]) if row["id"] == unit.id)
+        _ = fields.pop("unit_type", None)
+        self.write_json(self.staff_file, document)
+        decoded = staff.by_id(unit.id)
+        assert decoded is not None
+        self.assertEqual(decoded.unit_type, staff.UnitDetails("direct"))
+        changed = staff.rename(unit.id, "renamed")
+        self.assertEqual(changed.to_json()["unit_type"], "direct")
+        self.assertIn('"unit_type": "direct"', self.staff_file.read_text())
+
+    def test_invalid_unit_type_is_unreadable(self) -> None:
+        _, unit, _ = self.tree()
+        for value in ("unknown", "", None, 1, list[object](), dict[str, object]()):
+            with self.subTest(value=value), self.assertRaisesRegex(staff.StaffUnreadable, "unit_type"):
+                _ = staff.StaffRow.from_json({**unit.to_json(), "unit_type": value})
+
+    def test_other_kinds_drop_stored_unit_type_and_refuse_admission_type(self) -> None:
+        runner, _, worker = self.tree()
+        producer = fixture_member("producer", name="producer")
+        for row in (runner, worker, producer):
+            with self.subTest(kind=row.kind):
+                self.assertNotIn("unit_type", row.to_json())
+                decoded = staff.StaffRow.from_json({**row.to_json(), "unit_type": "direct"})
+                self.assertNotIn("unit_type", decoded.to_json())
+                with self.assertRaisesRegex(staff.StaffRefused, "unit_type"):
+                    _ = staff.ensure(row.kind, name=row.name, parent=row.parent, unit_type="merge")
+                with self.assertRaises(staff.StaffRefused):
+                    _ = staff.unit_command(row)
+
+    def test_mac_admission_preserves_unit_type_and_refuses_conflicts(self) -> None:
+        runner, _, _ = self.tree()
+        with self.machine("mac"):
+            typed = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+                runtime_id=fixture_runtime_id("merge-director"), unit_type="merge")
+            self.assertEqual(typed.unit_type, staff.UnitDetails("merge"))
+            self.assertEqual(staff.ensure("unit", name=typed.name, parent=typed.parent), typed)
+            with self.assertRaisesRegex(staff.StaffRefused, "unit_type"):
+                _ = staff.ensure("unit", name=typed.name, parent=typed.parent, unit_type="style")
+        self.assertEqual(staff.by_id(typed.id), typed)
+
+
+    def test_old_row_keeps_unknown_role_and_home_absent(self) -> None:
+        _, unit, member = self.tree()
+        value = member.to_json()
+        self.assertNotIn("role", value)
+        self.assertNotIn("home", value)
+        decoded = staff.StaffRow.from_json(value)
+        self.assertEqual(decoded.to_json(), value)
+        self.assertEqual(staff.snapshot().by_id(member.id), decoded)
+        before = self.staff_file.read_bytes()
+        with redirect_stderr(io.StringIO()):
+            staff._transaction(lambda rows: None)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        for machine in ("natedev", "mac"):
+            row = fixture_worker(f"home-{machine}", unit.id)
+            initial = self.root / f"{machine}-initial-home"
+            newer = self.root / f"{machine}-newer-home"
+            with self.subTest(machine=machine), self.machine(machine):
+                for requested, flags, expected in ((initial, ("--only-unknown",), initial),
+                                                   (newer, ("--only-unknown",), initial),
+                                                   (newer, (), newer)):
+                    with self.subTest(requested=requested, flags=flags):
+                        before_home = self.staff_state()
+                        result = self.cli("set-home", row.id, str(requested), *flags, "--json")
+                        changed = replace(row, home=staff.SessionHome(expected))
+                        self.assertEqual(json.loads(result.stdout), changed.to_json())
+                        self.assertEqual(staff.by_id(row.id), changed)
+                        if requested == newer and flags:
+                            self.assertEqual(self.staff_state(), before_home)
+        self.assertTrue(any("--only-unknown" in command for command in self.ssh_commands()))
+
+    def test_run_pointer_edits_preserve_other_fields_and_a_newer_run(self) -> None:
+        _, unit, _ = self.tree()
+        old = self.root / "old-run"
+        new = self.root / "new-run"
+        cases = (
+            ("set", old, staff.OpenRun(old)),
+            ("clear", self.root / "other-run", staff.OpenRun(old)),
+            ("set", new, staff.OpenRun(new)),
+            ("clear", old, staff.OpenRun(new)),
+            ("clear", new / ".." / "new-run", staff.NoRun()),
+            ("clear", new, staff.NoRun()),
+        )
+        self.assertIsInstance(unit.run, staff.NoRun)
+        self.assertNotIn("run", unit.to_json())
+        for action, path, expected in cases:
+            with self.subTest(action=action, path=path):
+                result = (staff.set_run(unit.id, staff.OpenRun(path)) if action == "set"
+                          else staff.clear_run(unit.id, path))
+                self.assertEqual(result, replace(unit, run=expected))
+                self.assertEqual(staff.local_by_current_session(unit.current_session), result)
+                self.assertEqual(staff.StaffRow.from_json(result.to_json()), result)
+                self.assertEqual(staff.by_id(unit.id), result)
+                if isinstance(expected, staff.OpenRun):
+                    self.assertEqual(result.to_json()["run"], str(expected.path))
+                else:
+                    self.assertNotIn("run", result.to_json())
+
+    def test_run_pointer_cli_uses_the_current_session_and_reports_missing_rows(self) -> None:
+        _, unit, _ = self.tree()
+        current = staff.native_id(fixture_runtime_id("run-current"))
+        unit = staff.update_current_session(unit.current_session, current)
+        run = self.root / "run"
+        for verb, expected in (("set-run", staff.OpenRun(run)), ("clear-run", staff.NoRun())):
+            with self.subTest(verb=verb):
+                _ = self.cli(verb, current, str(run))
+                self.assertEqual(staff.by_id(unit.id), replace(unit, run=expected))
+                result = self.cli(verb, unit.id, str(run), code=1)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_staff_admission_does_not_read_pane_publications(self) -> None:
+        from scripts.herdr import pane_launch
+
+        _, parent, member = self.tree()
+        with mock.patch.object(pane_launch, "staff_admitted", wraps=pane_launch.staff_admitted) as publication:
+            _ = staff.ensure("producer", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
+            _ = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-no-worker-pane-read")), "TEST-new", parent.id)
+            _ = staff.update_current_session(member.current_session, staff.native_id(fixture_runtime_id("TEST-next-native")))
+        publication.assert_not_called()
+
+    def test_invalid_role_and_home_preserve_the_staff_file_and_raw_values(self) -> None:
+        runner, _, member = self.tree()
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        rows = cast(list[dict[str, object]], document["rows"])
+        fields = next(row for row in rows if row["id"] == member.id)
+        fields.update(role="future-worker-role", home="relative-home")
+        self.write_json(self.staff_file, document)
+        with redirect_stderr(io.StringIO()) as errors:
+            record = staff.snapshot()
+        current = record.by_id(member.id)
+        assert current is not None
+        self.assertIsInstance(current.role, staff.WorkerRoleUnknown)
+        self.assertIsInstance(current.home, staff.HomeUnknown)
+        self.assertEqual(current.unknown_fields, {"role": "future-worker-role", "home": "relative-home"})
+        self.assertEqual(current.to_json(), fields)
+        self.assertEqual(record.by_id(runner.id), runner)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        with redirect_stderr(io.StringIO()):
+            _ = staff.rename(member.id, "TEST-renamed")
+        saved_document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        saved_rows = cast(list[dict[str, object]], saved_document["rows"])
+        saved = next(row for row in saved_rows if row["id"] == member.id)
+        self.assertEqual(saved, {**fields, "name": "TEST-renamed"})
+
     def test_running_claude_registry_identifies_a_worker_before_its_first_transcript(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
         unit = fixture_member("unit", name="models", parent=runner.id)
@@ -105,6 +306,50 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         self.assertEqual(staff.backend(worker), staff.ClaudeBackend())
         registry.unlink()
         self.assertIsInstance(staff.backend(worker), staff.BackendUnavailable)
+
+    def test_codex_backend_requires_the_recorded_home_to_hold_the_transcript(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        shared = Path.home() / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered = Path.home() / ".codex1"
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        absent = Path.home() / ".codex2"
+        absent.mkdir()
+        sibling = Path.home() / ".codex3"
+        sibling.mkdir()
+        (sibling / "sessions").symlink_to(shared, target_is_directory=True)
+        expected_backends: dict[staff.StaffId, staff.CodexBackend] = {}
+        for label, home, expected in (
+            ("recorded", staff.SessionHome(numbered), staff.CodexBackend(numbered)),
+            ("shared", staff.SessionHome(sibling), staff.CodexBackend(sibling)),
+            ("unknown", staff.HomeUnknown(), staff.BACKEND_UNAVAILABLE),
+            ("absent", staff.SessionHome(absent), staff.BACKEND_UNAVAILABLE),
+        ):
+            with self.subTest(home=label):
+                native = staff.native_id(fixture_runtime_id(label))
+                row = staff.ensure_worker(native, label, unit.id)
+                transcript = shared / f"{native}.jsonl"
+                transcript.touch()
+                if isinstance(home, staff.SessionHome):
+                    row = staff.set_home(row.id, home)
+                if isinstance(expected, staff.CodexBackend):
+                    expected_backends[row.id] = expected
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
+                    for compressed in (False, True):
+                        with self.subTest(compressed=compressed):
+                            if compressed:
+                                _ = compressed_copy(transcript)
+                            with mock.patch.object(transcripts, "transcript_stems", wraps=transcripts.transcript_stems) as listed:
+                                self.assertEqual(staff.backend(row), expected)
+                                backends = staff.local_snapshot().backends
+                                self.assertEqual(backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
+                            self.assertEqual(dict(backends), expected_backends)
+                            self.assertEqual(
+                                [cast(Path, call.args[0]).resolve() for call in listed.call_args_list].count(shared),
+                                2,
+                            )
 
     def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
         environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
@@ -173,22 +418,22 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         self.assertEqual(staff.by_id(holder.id), holder)
 
 
-    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+    def test_guarded_cli_adds_a_producer_without_a_parent_and_reads_its_locations(self) -> None:
         identity = fixture_runtime_id("morty-agent")
         for field, state in (("worktree", "present"), ("doc", "live")):
             with self.subTest(field=field):
                 self.staff_file.unlink(missing_ok=True)
-                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                result = self.cli("ensure", "producer", "--name", "morty", "--runtime-id", identity,
                                   "--" + field, "natedev", str(self.root / "morty"), state, "--json")
                 payload = cast(object, json.loads(result.stdout))
                 row = staff.StaffRow.from_json(payload)
                 self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
-                                 (identity, identity, "agent", "morty", staff.StaffRoot()))
+                                 (identity, identity, "producer", "morty", staff.StaffRoot()))
                 self.assertEqual(staff.snapshot().rows, (row,))
                 self.assertEqual(staff.by_path("morty"), row)
-                shown = self.cli("show", "--kind", "agent")
+                shown = self.cli("show", "--kind", "producer")
                 self.assertIn("morty", shown.stdout)
-                self.assertIn("agent", shown.stdout)
+                self.assertIn("producer", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
@@ -240,7 +485,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         before = self.write_document({"schema": 2, "rows": rows, "pending_retire": [unit]})
         record = staff.snapshot()
         self.assertEqual(record.schema, 2)
-        self.assertEqual([row.to_json() for row in record.rows], rows)
+        self.assertEqual([row.to_json() for row in record.rows], [rows[0], {**rows[1], "unit_type": "direct"}])
         self.assertEqual(record.pending_retire, (unit,))
         self.assertIsNone(record.by_current_session(unit))
         self.assertEqual(record.by_current_session(current), record.by_id(staff.StaffId(unit)))
@@ -275,11 +520,20 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         _, _, worker = self.tree()
         _ = self.session_record(worker.id, worker.name)
         before = self.staff_file.read_bytes()
-        with mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
             with self.assertRaisesRegex(staff.StaffRefused, worker.id):
                 _ = staff.retire(worker.id)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(staff.by_id(worker.id), worker)
+
+    def test_removing_a_worker_removes_its_id_from_the_restart_record(self) -> None:
+        from scripts.agents import shutdown_record
+
+        _, unit, worker = self.tree()
+        shutdown_record.save([str(unit.id), str(worker.id)])
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
+            self.assertEqual(staff.retire(worker.id), worker)
+        self.assertEqual(shutdown_record.read(), [str(unit.id)])
 
     def test_runtime_session_changes_only_current_session_in_one_write_and_rerun_changes_no_byte(self) -> None:
         runner, unit, worker = self.tree()
@@ -540,6 +794,20 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        mark = staff.RetiredProducer("claude:sonnet:high")
+        stopped = staff.set_producer_retirement(producer.id, mark)
+        _ = fixture_member("showrunner", name="another-production")
+        record = staff.StaffSnapshot.decode(staff.snapshot().encode())
+        self.assertEqual(record.by_id(producer.id), stopped)
+        self.assertIsNone(record.by_path(producer.name))
+        self.assertIsNone(record.by_current_session(producer.current_session))
+        self.assertNotIn(producer, staff.active(record, "producer"))
+        restored = staff.set_producer_retirement(producer.id, staff.Active())
+        self.assertEqual(restored, producer)
+        self.assertEqual(staff.snapshot().by_path(producer.name), restored)
+
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
         record = staff.local_snapshot()
@@ -719,7 +987,7 @@ class StaffTests(StaffCommandTestCase):
     def test_staff_fixture_keeps_registry_paths_under_its_private_folder(self) -> None:
         from scripts.lib.session_paths import sessions_directory
         from scripts.production import showrunners
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         keys = ("SHOWRUNNER_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "HERDR_PANE_RECORD_DIR", "XDG_CONFIG_HOME")
         root = self.root / "registry-fixture"
@@ -753,6 +1021,14 @@ class StaffTests(StaffCommandTestCase):
                   mock.patch.object(staff, "_remote", return_value=value)):
                 self.assertTrue(staff.snapshot().production)
 
+        supplied = staff.StaffSnapshot.decode(staff.snapshot().encode())
+        with (staff.supplied_snapshot(supplied),
+              mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote", side_effect=AssertionError("supplied staff reached ssh"))):
+            self.assertIs(staff.snapshot(), supplied)
+            self.assertIs(staff.initial_snapshot(), supplied)
+        self.assertFalse(staff.snapshot().production)
+
     def test_gate_module_writes_keep_the_inherited_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import merge_gate
@@ -784,15 +1060,16 @@ class StaffTests(StaffCommandTestCase):
             launch = pane_launch.launch("w1:p1", owner.id, str(module_root), {}, ["claude"])
             path = pane_launch.record_directory() / "agents.json"
             pane_launch.write(path, launch)
-            self.assertEqual(staff.snapshot().by_id(owner.id), owner)
-            self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
+            self.assertEqual(staff.snapshot().by_id(owner.id), replace(owner,
+                home=staff.SessionHome(Path.home() / ".claude")))
+            self.assertEqual(pane_launch.read_strict(path)["w1:p1"].get("staff_id"), owner.id)
         self.assertTrue((module_root / "staff.json").is_file())
         self.assertEqual((folder_bytes(inherited_staff), folder_bytes(inherited_launches)), before)
 
     def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
         row = fixture_member("showrunner", name="fixture",
             doc=staff.LiveDoc("natedev", self.root / "merge-gate-fixture/production.md"))
-        with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
             self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureRemoved(row))  # pyright: ignore[reportPrivateUsage]
             self.assertIsNone(staff.snapshot().by_id(row.id))
             before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
@@ -880,7 +1157,7 @@ class StaffTests(StaffCommandTestCase):
                 _ = staff.set_doc(fixture.id, staff.LiveDoc("natedev", Path("/srv/staff-guard/production.md")))
             self.assertEqual(primary_file.read_bytes(), before)
 
-            with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+            with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
                 self.assertEqual(staff._remove_test_fixture(fixture.id), staff.FixtureRemoved(fixture))  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(staff.snapshot().rows, (changed,))
 
@@ -963,6 +1240,24 @@ class StaffTests(StaffCommandTestCase):
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         self.assertEqual(staff.restore_unit(removed.id, location), unit)
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        document = staff.LiveDoc("natedev", self.root / "child-production.md")
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=document)
+                self.assertEqual(promoted, replace(unit, kind="showrunner", unit_type=staff.NotUnit(),
+                                                   worktree=staff.WORKTREE_UNFILLED, doc=document))
+                child = fixture_member("unit", name="child-" + machine, parent=promoted.id)
+                retained = fixture_member("worker", name="worker-" + machine, parent=promoted.id)
+                destination = staff.UnitRole(unit.name, parent.id, location)
+                demoted = staff.change_director(unit.id, destination)
+                self.assertEqual(demoted, unit)
+                self.assertEqual(staff.by_id(child.id), replace(child, parent=staff.ReportsTo(parent.id)))
+                self.assertEqual(staff.by_id(retained.id), retained)
+                unchanged = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                self.assertEqual(staff.change_director(unit.id, destination), unit)
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
+                self.assert_refused(lambda: staff.change_director(retained.id, destination))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
 
     def test_restore_unit_refuses_missing_identity_or_another_member_without_writing(self) -> None:
         parent, unit, worker = self.tree()
@@ -1077,7 +1372,7 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(record.by_path("unfilled/removed"), units[2])
         self.assertCountEqual(record.find(), [*runners, *units])
 
-    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_agents(self) -> None:
+    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_producers(self) -> None:
         runner, unit, worker = self.tree()
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
@@ -1085,7 +1380,7 @@ class StaffTests(StaffCommandTestCase):
                     self.assert_refused(lambda: staff.retire(row.id))
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
-                agent = fixture_member("agent", name="test-agent-" + machine)
+                agent = fixture_member("producer", name="test-agent-" + machine)
                 self.assertEqual(staff.retire(agent.id), agent)
                 self.assertIsNone(staff.by_id(agent.id))
         self.assertEqual(staff.retire(worker.id), worker)
@@ -1143,7 +1438,8 @@ class StaffTests(StaffCommandTestCase):
 
     def test_staff_writes_keep_unknown_row_location_and_pause_fields(self) -> None:
         runner, unit, worker = self.tree()
-        for row, other, key, state in ((unit, runner, "worktree", "present"),
+        for row, other, key, state in ((unit, runner, "worktree", "parked"),
+                                       (unit, runner, "worktree", "present"),
                                        (unit, runner, "worktree", "removed"),
                                        (runner, unit, "doc", "live"),
                                        (runner, unit, "doc", "wrapped")):
@@ -1153,6 +1449,8 @@ class StaffTests(StaffCommandTestCase):
                                "future_location": ["retained", {"revision": 2}]},
                          "paused": {"since": "2026-11-06T16:54:00-05:00", "by": "owner", "why": "review",
                                     "future_pause": {"enabled": True}}}
+                if state == "parked":
+                    value[key] = {**cast(dict[str, object], value[key]), "state": "removed", "branch": "feature/parked"}
                 _ = self.write_document({"schema": 2, "rows": [value, other.to_json(), worker.to_json()]})
                 current = staff.snapshot().by_id(row.id)
                 assert current is not None
@@ -1160,6 +1458,9 @@ class StaffTests(StaffCommandTestCase):
                 location = current.worktree if key == "worktree" else current.doc
                 assert isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc))
                 self.assertEqual(location.unknown_fields, {"future_location": ["retained", {"revision": 2}]})
+                if state == "parked":
+                    assert isinstance(location, staff.RemovedWorktree)
+                    self.assertEqual(location.branch, staff.ParkedBranch("feature/parked"))
                 assert isinstance(current.paused, staff.Paused)
                 self.assertEqual(current.paused.unknown_fields, {"future_pause": {"enabled": True}})
                 _ = staff.rename(other.id, "other-" + state)
@@ -1298,6 +1599,105 @@ class StaffTests(StaffCommandTestCase):
         self.assertIsNone(record.by_doc("natedev", path / "other.md"))
         _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path), expected=staff.PresentWorktree("natedev", path))
         self.assertIsNone(staff.snapshot().by_worktree("natedev", path))
+
+    def test_a_producer_transfer_sets_the_session_home_and_launch_folder_in_one_write(self) -> None:
+        _, unit, _ = self.tree()
+        morty = fixture_member("producer", name="morty", doc=staff.LiveDoc("natedev", self.root / "morty/current.md"))
+        brain = fixture_member("producer", name="brain")
+        session = staff.native_id(fixture_runtime_id("morty-claude"))
+        home, folder = staff.SessionHome(self.root / ".claude5"), staff.PresentWorktree("natedev", self.root / "launch")
+        moved = staff.transfer_producer(morty.id, session, home, folder)
+        self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
+        self.assertEqual(staff.by_id(morty.id), moved)
+        payload = self.assert_rerun("transfer-producer", morty.id, session, "--home", str(home.path),
+                                    "--machine", "natedev", "--path", str(folder.path))
+        self.assertEqual(staff.StaffRow.from_json(payload), moved)
+        for wrong in (brain.id, brain.current_session, unit.id):
+            self.assert_refused(lambda: staff.transfer_producer(morty.id, wrong, home, folder))
+        self.assert_refused(lambda: staff.transfer_producer(unit.id, session, home, folder))
+        with self.assertRaises(staff.StaffNotFound):
+            _ = staff.transfer_producer(staff.native_id(fixture_runtime_id("absent")), session, home, folder)
+        back = staff.transfer_producer(morty.id, morty.id, staff.SessionHome(self.root / ".codex2"), folder)
+        self.assertEqual(back, replace(morty, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
+
+    def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
+        morty = fixture_member("producer", name="morty")
+        session = staff.native_id(fixture_runtime_id("morty-claude"))
+        home, folder = staff.SessionHome(self.root / "mac/.claude5"), staff.PresentWorktree("mac", self.root / "mac/launch")
+        with self.machine("mac"):
+            moved = staff.transfer_producer(morty.id, session, home, folder)
+        self.assertEqual([command[0] for command in self.ssh_commands()], ["transfer-producer"])
+        self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
+        self.assertEqual(staff.by_id(morty.id), moved)
+
+        with self.subTest(operation="producer creation"):
+            registry = self.root / "models.conf"
+            _ = registry.write_text("[producers]\n")
+            marker = f"mac:{'1' * 32}"
+            with (self.machine("mac"),
+                  mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+                _ = staff.producer_creation_registry("claim", "dwight", marker, "claude:sonnet:high")
+                self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
+                                 staff.RecordedProducerCreation("dwight", marker))
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("claim", "Dwight", f"natedev:{'1' * 32}", "claude:sonnet:high")
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("finish", "dwight", f"natedev:{'1' * 32}")
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"),
+                                 staff.RecordedProducerCreation("dwight", marker))
+                _ = staff.producer_creation_registry("finish", "Dwight", marker)
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"),
+                                 staff.ProducerCreationRegistryStatus.ABSENT)
+            self.assertIn("dwight=claude:sonnet:high", registry.read_text())
+            self.assertEqual([command[:2] for command in self.ssh_commands()[1:]],
+                             [["producer-creation", action] for action in
+                              ("claim", "read-named", "claim", "finish", "read-named", "finish", "read-named")])
+
+    def test_old_caller_reads_a_marker_from_the_new_owner(self) -> None:
+        registry = self.root / "models.conf"
+        marker = f"mac:{'1' * 32}"
+        _ = registry.write_text(f"[producer_creations]\ndwight={marker}\n")
+        with (self.machine("mac"),
+              mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", "natedev",
+                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
+                + "producer-creation read --name=Dwight --marker= --profile= --json"],
+                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout, json.dumps(marker) + "\n")
+
+    def test_new_caller_reads_a_marker_from_the_old_owner(self) -> None:
+        marker = f"mac:{'1' * 32}"
+        actions: list[str] = []
+
+        def old_owner(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            remote = shlex.split(command[-1])
+            self.assertEqual(remote[2], "producer-creation")
+            self.assertIn("--name=Dwight", remote)
+            action = remote[3]
+            actions.append(action)
+            if action == "read-named":
+                return subprocess.CompletedProcess(command, 2, "", "usage: staff.py producer-creation ...\n"
+                    + "staff.py producer-creation: error: argument creation_action: invalid choice: 'read-named' "
+                    + "(choose from 'read', 'claim', 'finish')\n")
+            self.assertEqual(action, "read")
+            return subprocess.CompletedProcess(command, 0, json.dumps(marker), "")
+
+        with self.machine("mac"), mock.patch.object(subprocess, "run", side_effect=old_owner):
+            self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
+                             staff.RecordedProducerCreation("Dwight", marker))
+        self.assertEqual(actions, ["read-named", "read"])
+
+    def test_a_producer_launch_folder_owns_no_path_and_two_producers_share_it(self) -> None:
+        _, unit, _ = self.tree()
+        folder = staff.PresentWorktree("natedev", self.root)
+        morty = fixture_member("producer", name="morty", worktree=folder)
+        brain = fixture_member("producer", name="brain", worktree=folder)
+        checkout = self.root / "checkout"
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", checkout), expected=unit.worktree)
+        record = staff.snapshot()
+        self.assertEqual((morty.worktree, brain.worktree), (folder, folder))
+        self.assertIsNone(record.by_worktree("natedev", self.root / "unowned"))
+        self.assertEqual(record.by_worktree("natedev", checkout / "src"), unit)
 
     def test_remote_setters_use_one_owner_write_and_preserve_the_other_field(self) -> None:
         runner, unit, _ = self.tree()
@@ -1577,6 +1977,47 @@ class StaffTests(StaffCommandTestCase):
         for action in actions:
             with self.subTest(action=action):
                 self.assert_refused(action)
+
+    def test_unit_name_writers_refuse_the_reserved_suffix(self) -> None:
+        runner, unit, _ = self.tree()
+        child = fixture_member("showrunner", name="child", parent=runner.id)
+        location = ("--machine", "natedev", "--path", str(self.root / "child"))
+        cases = (
+            ("ensure-unit", ("ensure", "unit", "--parent", runner.id, "--runtime-id", fixture_runtime_id("new-x"))),
+            ("rename-unit", ("rename", unit.id)),
+            ("promote-unit", ("promote-unit", unit.id, "--parent", runner.id, *location)),
+            ("demote-unit", ("demote-showrunner", child.id, "--parent", runner.id, *location)),
+        )
+        before = self.staff_state()
+        for name, arguments in cases:
+            with self.subTest(command=arguments[0]):
+                result = self.cli(*arguments, "--name", name, code=2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, f"StaffRefused: unit name {name!r} must not end in -unit\n")
+                self.assertEqual(self.staff_state(), before)
+
+    def test_a_legacy_unit_name_loads_and_survives_an_unrelated_write(self) -> None:
+        runner, unit, _ = self.tree()
+        legacy = fixture_unit_saved_name(unit, "x-unit")
+        self.assertEqual(staff.snapshot().by_path(f"{runner.name}/x-unit"), legacy)
+        _ = staff.rename(runner.id, "tools")
+        self.assertEqual(staff.snapshot().by_path("tools/x-unit"), legacy)
+
+    def test_role_change_commands_refuse_the_reserved_suffix_before_changing_staff(self) -> None:
+        runner, unit, _ = self.tree()
+        _ = fixture_member("showrunner", name="x-unit", parent=runner.id)
+        cases = (
+            (promote_showrunner, promote_showrunner.main,
+             [unit.name, "--production", "x-unit", "--model", "opus", "--effort", "high"]),
+            (demote_showrunner, demote_showrunner.main, ["x-unit"]),
+        )
+        before = self.staff_state()
+        for command, main, arguments in cases:
+            with self.subTest(command=command.__name__):
+                result = invoke_cli(command, lambda: main(arguments), arguments, dict(os.environ), CHECKOUT)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (2, "", "StaffRefused: unit name 'x-unit' must not end in -unit\n"))
+                self.assertEqual(self.staff_state(), before)
 
     def test_promoted_showrunner_and_original_unit_have_distinct_paths(self) -> None:
         showrunner, unit, worker = self.tree()
@@ -1953,7 +2394,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_explicit_staff_file_is_local_even_on_a_mac(self) -> None:
         with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.mac_file)}), mock.patch(
-            "scripts.shutdown.remote.other_machine", return_value="natedev",
+            "scripts.agents.remote.other_machine", return_value="natedev",
         ):
             row = fixture_member("showrunner", name="private")
             self.assertEqual(staff.snapshot().rows, (row,))

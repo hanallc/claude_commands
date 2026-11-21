@@ -1,13 +1,46 @@
 """Encode and validate tagged domain records."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import MISSING, fields, is_dataclass
+from enum import Enum, auto
 from functools import lru_cache
 import math
 from pathlib import Path
 from types import UnionType
-from typing import Callable, Literal, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+
+# Literal unions use typing.Union on Python 3.13.
+LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
+
+
+class SnapshotReadPolicy(Enum):
+    ALL_FIELDS = auto()
+    ACQUISITION_FIELDS = auto()
+
+
+_READ_POLICY = ContextVar("snapshot_read_policy", default=SnapshotReadPolicy.ALL_FIELDS)
+
+
+@contextmanager
+def snapshot_read_policy(policy: SnapshotReadPolicy) -> Generator[None]:
+    """Limit omitted fields to the current reader and restore the previous policy."""
+    token = _READ_POLICY.set(policy)
+    try:
+        yield
+    finally:
+        _READ_POLICY.reset(token)
+
+
+@lru_cache(maxsize=None)
+def acquisition_unused_fields(schema: type) -> frozenset[str]:
+    """Each omitted field must have a default for the acquisition reader."""
+    return frozenset(member.name for member in fields(schema)
+                     if member.metadata.get("acquisition_unused") is True
+                     and (member.default is not MISSING or member.default_factory is not MISSING))
+
 
 @lru_cache(maxsize=None)
 def snapshot_fields(schema: type) -> dict[str, object]:
@@ -17,6 +50,131 @@ def snapshot_fields(schema: type) -> dict[str, object]:
 @lru_cache(maxsize=None)
 def record_field_names(schema: type) -> tuple[str, ...]:
     return tuple(member.name for member in fields(schema))
+
+
+def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
+    """Keep existing wire fields compatible with the pinned client."""
+    if writing and "job" in record and record["job"] == {"kind": "GateJobNotRecorded"}:
+        del record["job"]
+    if (schema.__module__ == "scripts.build_queue.placement"
+            and schema.__name__ in ("PlacementAssignment", "PlacementConstraints")):
+        source = record.get("source_identity", record.get("source_key"))
+        if writing:
+            assert isinstance(source, dict)
+            identity = cast(dict[str, object], source)
+            return {**record, "source_identity": identity, "source_key": identity.get("key", "")}
+        legacy = record.get("source_key")
+        if (isinstance(legacy, str) and isinstance(source, dict)
+                and cast(dict[str, object], source).get("key", "") != legacy):
+            source = legacy
+        if isinstance(source, str):
+            source = ({"kind": "SourceKeyKnown", "key": source} if source else
+                      {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"})
+        return {**record, "source_key": source}
+    if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
+        del record["verify"]
+    if schema.__module__ == "scripts.build_queue.admission_records":
+        if writing and schema.__name__ == "QueueInputs":
+            # Pinned clients require this inactive field in the wire record.
+            record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
+        elif not writing and schema.__name__ == "BetweenStepsSlot":
+            record = {**record, "identity": ended_step_facts(record.get("identity", {"kind": "HoldPredatesStepFacts"}))}
+    if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
+        if writing:
+            running = record["running"]
+            assert isinstance(running, list)
+            rows = cast(list[object], running)
+            local_rows = [row for row in rows if not remote_memory_row(row)]
+            if len(local_rows) != len(rows):
+                return {**record, "running": local_rows, "running_with_remote": rows}
+        elif "running_with_remote" in record:
+            return {**record, "running": record["running_with_remote"]}
+    return record
+
+
+def ended_step_facts(value: object) -> object:
+    """Recover the facts that an older name record retained."""
+    if not isinstance(value, dict):
+        return value
+    identity = cast(dict[str, object], value)
+    if identity.get("kind") != "EndedStepIdentity":
+        return identity
+    name, source = identity["name"], identity["source"]
+    absent = {"kind": "EndedStepFactNotRecorded"}
+    return {"kind": "EndedStepFacts", "step": name if source in ("step", "script") else absent,
+            "package": {"kind": "PackageNotRecorded"}, "project": name if source == "repository" else absent,
+            "folder": absent, "staff_id": identity["staff_id"]}
+
+
+def remote_memory_row(value: object) -> bool:
+    """Identify remote rows that the pinned memory schema cannot represent."""
+    if not isinstance(value, dict):
+        return False
+    row = cast(dict[str, object], value)
+    step = row.get("step") if row.get("kind") == "ExplainedRunningStep" else row
+    if not isinstance(step, dict):
+        return False
+    measured = cast(dict[str, object], step).get("measured")
+    return (isinstance(measured, dict)
+            and cast(dict[str, object], measured).get("kind") == "RemoteMemoryUnavailable")
+
+
+def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
+    # Older clients at 7fdfd9a6a require the old pressure shape.
+    if record["kind"] == "PressurePolicy":
+        return {**record, "swap_used_limit": 0.0}
+    if record["kind"] == "MemoryPressure" and record.get("condition") == "some":
+        return {**record, "condition": "swap"}
+    return record
+
+
+GPU_SLOT_SUFFIX = "_gpu_slot"
+NATEDEV_HOLD_SUFFIX = "_natedev_hold"
+CARGO_FOLDER_SUFFIX = "_cargo_folder"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX)
+
+
+@lru_cache(maxsize=None)
+def wait_reason_fields(schema: type) -> frozenset[str]:
+    """Name the fields that accept a wait behind the head, so an older client reads a newer wait there."""
+    return frozenset(name for name, hint in snapshot_fields(schema).items()
+                     if any(getattr(variant, "__name__", "") == "BehindHead" for variant in cast(tuple[object, ...], get_args(hint))))
+
+
+def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, object]:
+    """Write each newer wait as a wait behind the head, with the newer wait beside it.
+
+    Clients at 7fdfd9a6a have no GPU slot wait. The CI client pinned at bbc8803f4 has no natedev hold wait,
+    and it refuses its step on a wait that it cannot read.
+    """
+    shaped = dict(record)
+    for key in wait_reason_fields(schema):
+        item = record.get(key)
+        if not isinstance(item, dict):
+            continue
+        wait = cast(dict[str, object], item)
+        if wait.get("kind") == "GpuSlotWait":
+            head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
+        elif wait.get("kind") == "NatedevHeld":
+            head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
+        elif wait.get("kind") == "CargoFolderWait":
+            head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
+        else:
+            continue
+        shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}
+        shaped[key + suffix] = wait
+    return shaped
+
+
+def current_wait_shape(record: dict[str, object]) -> dict[str, object]:
+    """Restore each newer wait that the writer kept beside its older shape."""
+    shaped = dict(record)
+    for key, item in record.items():
+        for suffix in LEGACY_WAIT_SUFFIXES:
+            if key.endswith(suffix) and key.removesuffix(suffix) in record:
+                shaped[key.removesuffix(suffix)] = item
+                del shaped[key]
+    return shaped
 
 
 def snapshot_value(value: object) -> object:
@@ -32,8 +190,9 @@ def snapshot_value(value: object) -> object:
         if isinstance(item, Path):
             result: object = str(item)
         elif is_dataclass(item) and not isinstance(item, type):
-            result = {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
-                for name in record_field_names(type(item))}}
+            result = legacy_wait_shape(type(item), legacy_pressure_shape(wire_record(type(item),
+                {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
+                 for name in record_field_names(type(item))}}, writing=True)))
         elif isinstance(item, Mapping):
             result = {key: convert(value) for key, value in cast(Mapping[str, object], item).items()}
         elif isinstance(item, frozenset):
@@ -48,15 +207,44 @@ def snapshot_value(value: object) -> object:
     return convert(value)
 
 
+EXACT_SCALARS: tuple[object, ...] = (str, int, bool)
+
+
+@lru_cache(maxsize=None)
+def exact_scalars(schema: object) -> frozenset[object]:
+    """Name the scalar types that a schema takes unchanged by exact type; a float still needs its finite check."""
+    if schema in EXACT_SCALARS:
+        return frozenset({schema})
+    origin = get_origin(schema)
+    variants = cast(tuple[object, ...], get_args(schema))
+    if (origin is UnionType or origin is LITERAL_UNION_ORIGIN) and Path not in variants:
+        return frozenset(variant for variant in variants if variant in EXACT_SCALARS)
+    return frozenset()
+
+
+def parse_scalar(value: object, schema: type) -> object:
+    """Accept a value of the scalar type, or an int for a float; refuse a value that is not finite."""
+    valid = type(value) is schema or schema is float and type(value) is int
+    if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
+        raise ValueError("invalid snapshot scalar")
+    return value
+
+
 def parse_snapshot_value(value: object, schema: object) -> object:
     """Validate the wire shape against the same domain fields that the writer serializes."""
+    if schema is str or schema is int or schema is float or schema is bool:
+        # Profile records hold millions of scalars; this check comes before the typing lookups.
+        return parse_scalar(value, schema)
+    if isinstance(schema, NewType):
+        return parse_snapshot_value(value, schema.__supertype__)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
-    # A union of Literal aliases still has typing.Union as its origin on 3.13.
-    if origin is UnionType or origin is get_origin(Literal[0] | Literal[1]):
+    if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
+        if type(value) in exact_scalars(schema):
+            return value
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
@@ -71,11 +259,6 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         if value is not None:
             raise ValueError("invalid snapshot null")
         return None
-    if schema is str or schema is int or schema is float or schema is bool:
-        valid = (type(value) is schema or schema is float and type(value) is int)
-        if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
-            raise ValueError("invalid snapshot scalar")
-        return value
     if schema is Path:
         return Path(cast(str, parse_snapshot_value(value, str)))
     if origin in (list, tuple, frozenset, Sequence):
@@ -83,7 +266,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             raise ValueError("invalid snapshot sequence")
         items = cast(list[object], value)
         if origin in (list, frozenset, Sequence) or len(args) == 2 and args[1] is Ellipsis:
-            parsed = [parse_snapshot_value(item, args[0]) for item in items]
+            exact = exact_scalars(args[0])
+            parsed = [item if type(item) in exact else parse_snapshot_value(item, args[0]) for item in items]
         else:
             if len(items) != len(args):
                 raise ValueError("invalid snapshot tuple")
@@ -105,8 +289,13 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 if name in annotations}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
+    record = current_wait_shape(wire_record(schema, record, writing=False))
+    if schema.__name__ == "MemoryPressure" and record.get("condition") == "swap":
+        record = {**record, "condition": "some"}
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
            for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")
+    unused = (acquisition_unused_fields(schema)
+              if _READ_POLICY.get() is SnapshotReadPolicy.ACQUISITION_FIELDS else frozenset[str]())
     return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
-                                                for name, kind in annotations.items() if name in record})
+                                                for name, kind in annotations.items() if name in record and name not in unused})

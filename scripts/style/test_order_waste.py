@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -14,6 +15,12 @@ from typing import cast, final, override
 from scripts.style import order_waste
 from scripts.style import style_ledger
 from scripts.style.order_waste import AnalysisOrder, FamilyRead, RuleFix
+
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
 
 ALPHA = """pub fn alpha_configuration_value() -> u32 {
     let selected_mode_number = 1;
@@ -47,16 +54,25 @@ class OrderWasteTests(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
     connection: sqlite3.Connection = sqlite3.connect(":memory:")
+    repository_seed: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="order-waste-seed-")))
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "user.name", "Order waste tests")
+        _ = fixture.git("config", "user.email", "order-waste@example.invalid")
+        _ = fixture.git("config", "commit.gpgsign", "false")
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
-        self.repo.mkdir()
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Order waste tests")
-        _ = self.git("config", "user.email", "order-waste@example.invalid")
-        _ = self.git("config", "commit.gpgsign", "false")
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
         self.connection = self.enterContext(closing(sqlite3.connect(":memory:")))
         for _, migration in sorted(style_ledger.MIGRATIONS.items()):
             _ = self.connection.executescript(migration)
@@ -128,7 +144,7 @@ class OrderWasteTests(unittest.TestCase):
         self.ticket("types-1", "types", [IF_ELSE], start, types_1, at(1))
         self.ticket("types-2", "types", [INVALID_STATES], types_1, types_2, at(2))
         self.ticket("modules-1", "modules", MODULES, types_2, modules_1, at(3))
-        self.ticket("names-1", "names", [SPELL_OUT, "global:rust/forbidden-words.md"], modules_1, names_1, at(4))
+        self.ticket("names-1", "names", [SPELL_OUT, TYPE_NAMED], modules_1, names_1, at(4))
         self.ticket("values-0", "values", ["global:rust/no-magic-values.md"], names_1, names_1, at(5))
         # A dropped ticket's commits are not merged work, even where they hold another ticket's commit.
         self.ticket("dropped-1", "values", ["global:rust/no-magic-values.md", "global:rust/prefer-functional-patterns.md"],
@@ -150,6 +166,11 @@ class OrderWasteTests(unittest.TestCase):
         self.finding("gone", "dont-repeat-type-name-in-fields", "src/z.rs", "withdrawn", at(0, 30), at(2, 30), ticket="types-2",
                      gone_at="abc1234", followed_from="src/a.rs")
         self.finding("duplicate", "spell-out-names", "src/a.rs", "withdrawn", at(0, 30), at(6), duplicate_of="qualified")
+        self.finding("qualified", "spell-out-names", "src/a.rs", "unfiled", at(0, 30), at(6))
+        self.finding("whole-test-file", "split-by-type-ownership", "src/widget_tests.rs", "unfiled", at(0, 30), at(6))
+        _ = self.connection.execute("UPDATE held_findings SET kind='restructure' WHERE finding_id='whole-test-file'")
+        self.finding("folded-test-item", "split-by-type-ownership", "src/widget_tests.rs", "withdrawn", at(0, 30), at(6),
+                     duplicate_of="whole-test-file")
 
     def measured(self) -> order_waste.Report:
         return order_waste.report(order_waste.measure(self.connection, self.repo))
@@ -172,7 +193,7 @@ class OrderWasteTests(unittest.TestCase):
         self.assertEqual((data["changing_tickets"], data["counted_findings"]), (4, 4))
         self.assertEqual(data["not_counted"], {
             "bare rename duplicate": 1, "exception under a newer rule text": 1, "no other rule's merged fix changed its file": 1,
-            "person waive": 1,
+            "person waive": 1, "folded test file duplicate": 1,
         })
 
     def test_moved_lines_are_not_rework_and_keep_their_writer(self) -> None:
@@ -343,7 +364,8 @@ class OrderWasteTests(unittest.TestCase):
 
         self.assertEqual(order("enums-over-option-when-none-has-meaning", "prefer-functional-patterns"), AnalysisOrder.A_FIRST_BY_EDGE)
         self.assertEqual(order("prefer-functional-patterns", "enums-over-option-when-none-has-meaning"), AnalysisOrder.B_FIRST_BY_EDGE)
-        self.assertEqual(order("forbidden-words", "dont-create-traits-for-single-implementations"), AnalysisOrder.B_FIRST_BY_POSITION)
+        self.assertEqual(order("constants-file-organization", "spell-out-names"), AnalysisOrder.B_FIRST_BY_EDGE)
+        self.assertEqual(order("spell-out-names", "dont-create-traits-for-single-implementations"), AnalysisOrder.B_FIRST_BY_POSITION)
         self.assertEqual(order("always-use-nextest", "no-magic-values"), AnalysisOrder.UNORDERED)
         self.assertEqual(order_waste.analysis_order(FamilyRead("values"), RuleFix(SPELL_OUT)), AnalysisOrder.UNORDERED)
         self.assertEqual(order_waste.analysis_order(RuleFix(IF_ELSE), RuleFix("local:docs/style/no-magic-values.md")),

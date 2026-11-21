@@ -6,23 +6,145 @@ import os
 import subprocess
 import sys
 import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.direct import assign
+from scripts.direct import assign, phase_table
+from scripts.direct.assign_claude_test_support import direct_launcher_helpers
+from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message import process_table
 from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
+
+ASSIGNMENT_SETTINGS = {
+    "direct": """\
+# whole: 1..
+MIN_REPAIR_BUDGET=3
+# range: 5e-324..
+REPAIR_ROUNDS_PER_FINDING=0.5
+# whole: 1..
+RUNAWAY_ROUNDS=5
+# whole: 1..
+MAX_FIX_ATTEMPTS=2
+# whole: 1..
+MAX_REOPENS=2
+# whole: 1..
+STALLED_ROUNDS=4
+# whole: 1..
+MAX_CONSECUTIVE_SAME_KIND_PASSES=4
+# whole: 1..
+MAX_REVIEW_CANCELLATIONS=1
+# whole: 1..
+UNIT_COMPACT_ABOVE_TOKENS=200000
+# whole: 1..
+ROUTING_FROM_ROUND=4
+# whole: 1..
+ASTRA_AFTER_FAILED_FIXES=2
+# range: 0.1..0.9
+WORKER_SPLIT_RATIO=0.667
+WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+# range: 1..600
+WORKER_FIRST_TURN_SECONDS=120
+# range: 1..600
+WORKER_SETTLE_SECONDS=30
+# range: 1..1800
+WORKER_COMPACT_SECONDS=300
+# range: 1..600
+PANE_AGENT_START_SECONDS=90
+# range: 0.01..600
+WORKER_PUBLISH_LOCK_SECONDS=15
+""",
+    "build_folders": """\
+# whole: 1..
+names.suffix_length=11
+# whole: 1..64
+names.repository_key_length=8
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+roots.system=/tmp
+roots.temporary=${TMPDIR}/builds
+roots.gate=/dev/shm
+roots.scratch=~/scratch
+roots.copies=~/copies
+roots.workspace=~/worktrees
+roots.session=~/session
+patterns.named={showrunner}-{unit}/{work}-{purpose}
+patterns.legacy-stable={purpose}
+patterns.legacy-unique={purpose}{suffix}
+patterns.scratch={purpose}-{suffix}
+patterns.tool={purpose}{suffix}
+prefixes.style-review={owner}-
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""",
+    "scratch": """\
+visible_root=~/repro
+holds_file=~/.local/state/scratch/holds.json
+# whole: 1..
+default_life_seconds=86400
+# whole: 1..
+repo_depth=3
+# whole: 1..
+suffix_length=6
+repo_skip=target node_modules .git
+# whole: 1..
+record_lock_attempts=3
+# whole: 1..
+removal_remote_timeout_seconds=30
+""",
+    "send": """\
+# range: 0.001..
+waits_review_seconds=30
+# range: 0.001..
+delivery_timeout=40
+# range: 0.001..
+kill_grace=10
+# range: 0.001..
+caller_margin_seconds=15
+# range: 0.001..
+remote_transport_seconds=30
+""",
+    "staff": """\
+# range: 0.001..
+OPERATION_LOCK_SECONDS=30
+# range: 0.001..
+REMOTE_SECONDS=20
+PRODUCER_WORKSPACE=producers
+PRODUCER_FOLDER_ROOT=~/productions
+""",
+    "copies": """\
+remote_registry=~/.local/state/copies/remote-mirrors
+wait_seconds=1
+git_timeout_seconds=600
+guard_timeout_seconds=10
+guard_choice_limit=32
+""",
+    "lint": "style_review=off\n",
+    "showrunners": """\
+# range: 0..100
+threshold_percent=2
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=00000000-0000-4000-8000-000000000001
+always=00000000-0000-4000-8000-000000000001
+""",
+}
 
 
 def backend_fixture_command(directory: Path, command: list[str],
@@ -41,8 +163,8 @@ def backend_fixture_command(directory: Path, command: list[str],
         f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
     )) + "\n")
     child_environment = dict(environment)
-    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT))
-    child_environment["PYTHONPATH"] = os.pathsep.join((str(directory), str(ROOT)))
+    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT / "scripts/lib/python_startup"))
+    child_environment["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(directory)))
     return ["bash", str(ASSIGN)], child_environment
 
 
@@ -63,6 +185,55 @@ DEFAULT_ASSIGNMENT_EXECUTION = InProcessAssignment()
 def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
     with patch.object(assign, "require_live_director"):
         return invoke_cli(assign, assign.main, arguments, environment, ROOT)
+
+
+@contextmanager
+def assignment_environment(bytecode_setting: str) -> Generator[None]:
+    """Pin settings and use only the fixture's Git configuration."""
+    config = Path(os.environ["CONF_DIR"])
+    for stem, settings in ASSIGNMENT_SETTINGS.items():
+        _ = (config / f"{stem}.conf").write_text(settings)
+    cache = Path.home() / ".cache"
+    seed_interpreter_cache(cache)
+    environment = {
+        **fixture_git_environment(config),
+        "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache),
+        "PYTHONDONTWRITEBYTECODE": bytecode_setting,
+        "STAFF_CONFIG": str(config / "staff.conf"),
+        "COPIES_CONFIG": str(config / "copies.conf"),
+        "LINT_CONFIG_FILE": str(config / "lint.conf"),
+        "USER_ZONE": "America/New_York",
+        "PROCESS_TABLE_PS": "sh -c :",
+    }
+    with patch.dict(os.environ, environment, clear=True), patch.object(process_table, "PS", ["sh", "-c", ":"]):
+        yield
+
+
+@contextmanager
+def assignment_helpers(bytecode_setting: str) -> Generator[None]:
+    """Keep helper parsers and handlers in the fixture process."""
+    with assignment_environment(bytecode_setting), direct_launcher_helpers():
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(command[1]).resolve() if len(command) > 1 else Path()
+            if path not in (ROOT / "scripts/direct/phase_table.py", ROOT / "scripts/direct/findings.py"):
+                return run_process(command, **options)
+            environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+            directory = Path(cast(str | Path, options.get("cwd") or Path.cwd()))
+            result = (invoke_findings(command[2:], environment, directory) if path.name == "findings.py" else
+                      invoke_cli(phase_table, phase_table.main, command[2:], environment, directory))
+            if not options.get("capture_output"):
+                if options.get("stdout") is None:
+                    print(result.stdout, end="")
+                if options.get("stderr") is None:
+                    print(result.stderr, end="", file=sys.stderr)
+            if options.get("check"):
+                result.check_returncode()
+            return result
+
+        with patch.object(subprocess, "run", side_effect=run):
+            yield
 
 
 def read_object(path: Path) -> dict[str, object]:
@@ -86,11 +257,10 @@ class AssignLauncherFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
         self.native.setUp()
-        config = Path(os.environ["CONF_DIR"]) / "direct.conf"
-        _ = config.write_text((ROOT / "config/direct.conf").read_text())
-        _ = config.with_name("shutdown.conf").write_text((ROOT / "config/shutdown.conf").read_text())
         self.addCleanup(self.native.doCleanups)
+        _ = self.enterContext(assignment_helpers(bytecode_setting))
         self.home = Path.home()
         self.session_dir = self.native.run_dir
         self.project = self.session_dir.parent / "project"
@@ -115,12 +285,12 @@ class AssignLauncherFixture(unittest.TestCase):
         self.registry = self.native.fixture.root / "conf/models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "UNIT_HISTORY_DIR": str(self.history), "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
+            "UNIT_HISTORY_DIR": str(self.history), 
             "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
             "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
-            "PYTHONPATH": str(ROOT), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
+            "PYTHONPATH": str(ROOT / "scripts/lib/python_startup"), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
         })))
-        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE", "AGENTS_CALLER_FAMILY", "AGENTS_CALLER_ASSIGNMENT"):
+        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE"):
             _ = os.environ.pop(key, None)
         original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -187,10 +357,15 @@ class AssignLauncherFixture(unittest.TestCase):
         command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))", *arguments]
         if isolate_ancestors:
             command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", *command]
+        result = self.run_command(command)
+        return subprocess.CompletedProcess(arguments, result.returncode, result.stdout, result.stderr)
+
+    def run_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run the command in a process group that the test owns."""
         with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
+            return subprocess.CompletedProcess(command, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
@@ -208,10 +383,7 @@ class AssignLauncherFixture(unittest.TestCase):
 
     def prepare_style_project(self) -> None:
         self.commit_project()
-        config = self.session_dir.parent / "lint.conf"
-        _ = write_config_fixture(config, "style_review=on\n")
-        _ = config_environment(config.parent)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(config.parent)})))
+        _ = Path(os.environ["LINT_CONFIG_FILE"]).write_text("style_review=on\n")
 
     def events(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in
@@ -231,7 +403,7 @@ class AssignLauncherFixture(unittest.TestCase):
             f"        runpy.run_path({str(injection)!r})",
             f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
         )))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{directory}{os.pathsep}{ROOT}"})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{ROOT / 'scripts/lib/python_startup'}{os.pathsep}{directory}"})))
         self.injections.append(code)
         saved = vars(assign).copy()
         exec(code, {})
@@ -254,26 +426,19 @@ class AssignLauncherFixture(unittest.TestCase):
         return prepared
 
 
-class FirstDispatchFixture(AssignLauncherFixture):
+class HookAssignmentFixture(AssignLauncherFixture):
+    """Deliver native completion events after the launcher returns."""
+
+    @override
+    def launch(self, role: str = "implement", *options: str, paths: bool = True, session: bool = True,
+               execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
+        result = super().launch(role, *options, paths=paths, session=session, execution=execution)
+        if result.returncode == 0 and self.native.agent.submitted:
+            row = self.native.agent.row(self.native.agent.submitted[-1][0])
+            _ = self.native.finish(row.name)
+        return result
+
+
+class FirstDispatchFixture(HookAssignmentFixture):
     def first_assignment(self, role: str = "implement", *options: str) -> None:
         _ = self.successful(role, *options)
-
-
-@dataclass(frozen=True)
-class FirstDispatchArtifact:
-    """A completed first dispatch publishes this file."""
-
-    relative: Path
-    content: bytes
-    mode: int
-
-def snapshot_files(root: Path) -> dict[Path, bytes]:
-    """Read regular files before a dispatch."""
-    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()}
-
-def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
-    """Keep files that the dispatch changed."""
-    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
-                 for relative, content in snapshot_files(root).items()
-                 if before.get(relative) != content)

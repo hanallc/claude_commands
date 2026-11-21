@@ -6,12 +6,16 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from importlib import import_module
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
+from scripts.agents.stop_results import MoveHandedOff, StopFailed
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
@@ -138,6 +142,112 @@ def store_file() -> Path:
     return Path.home() / ".local" / "state" / "accounts" / "moves.jsonl"
 
 
+@dataclass(frozen=True)
+class MoveInProgress(MoveHandedOff):
+    account: str
+
+
+@dataclass(frozen=True)
+class MoveWaitingForRow(StopFailed):
+    """The batch could not take the row lock. A new command can retry the move."""
+
+
+class ExplicitMoveTarget(Enum):
+    REQUESTED_ACCOUNT = "use the requested account"
+
+
+@dataclass(frozen=True)
+class FollowGroupAccount:
+    group: role_map.ClaudeGroup
+
+
+@dataclass(frozen=True)
+class MoveMember:
+    reference: str
+    name: str
+
+
+@dataclass(frozen=True)
+class MoveBatchResult:
+    target: str | FollowGroupAccount
+    pending: tuple[MoveMember, ...]
+
+
+def native_row_key(reference: str) -> str:
+    return "native-" + sha256(reference.encode()).hexdigest()
+
+
+def _batch_path(batch_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
+        raise ValueError("invalid move batch id")
+    return store_file().parent / "move-results" / f"{batch_id}.json"
+
+
+def move_batch_id(decision: str, target: str | FollowGroupAccount, references: frozenset[str]) -> str:
+    """Retry a saved batch when only its pending members remain."""
+    prefix = sha256(json.dumps([decision, target.group if isinstance(target, FollowGroupAccount) else target]).encode()).hexdigest()[:16]
+    batch_id = prefix + sha256(json.dumps(sorted(references)).encode()).hexdigest()[:16]
+    path = _batch_path(batch_id)
+    if path.is_file():
+        return batch_id
+    for candidate in sorted(path.parent.glob(f"{prefix}*.json")):
+        try:
+            saved = read_batch_result(candidate.stem)
+        except (OSError, ValueError):
+            continue
+        if saved.target == target and references <= {member.reference for member in saved.pending}:
+            return candidate.stem
+    return batch_id
+
+
+def read_batch_result(batch_id: str) -> MoveBatchResult:
+    value = cast(object, json.loads(_batch_path(batch_id).read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError("invalid move batch result")
+    fields = cast(dict[str, object], value)
+    group, target, pending = fields.get("group"), fields.get("target"), fields.get("pending")
+    if group is not None:
+        if group not in role_map.CLAUDE_GROUPS:
+            raise ValueError("invalid move batch group")
+        target = FollowGroupAccount(group)
+    if not isinstance(target, (str, FollowGroupAccount)) or not isinstance(pending, list):
+        raise ValueError("invalid move batch result")
+    members: list[MoveMember] = []
+    for member in cast(list[object], pending):
+        if not isinstance(member, dict):
+            raise ValueError("invalid move batch member")
+        saved = cast(dict[str, object], member)
+        reference, name = saved.get("reference"), saved.get("name")
+        if not isinstance(reference, str) or not reference or not isinstance(name, str) or not name:
+            raise ValueError("invalid move batch member")
+        members.append(MoveMember(reference, name))
+    return MoveBatchResult(target, tuple(members))
+
+
+def save_batch_result(batch_id: str, target: str | FollowGroupAccount, pending: tuple[MoveMember, ...],
+                      finished: frozenset[str]) -> MoveBatchResult:
+    """Keep pending members from other attempts until a move resolves them."""
+    path = _batch_path(batch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            previous = read_batch_result(batch_id)
+        except FileNotFoundError:
+            previous = MoveBatchResult(target, ())
+        if previous.target != target:
+            raise ValueError("move batch intent changed")
+        members = {member.reference: member for member in previous.pending}
+        members.update((member.reference, member) for member in pending)
+        result = MoveBatchResult(target, tuple(sorted(
+            (member for member in members.values() if member.reference not in finished),
+            key=lambda member: (member.name, member.reference))))
+        destination = {"group": target.group} if isinstance(target, FollowGroupAccount) else {"target": target}
+        write_text_atomic(path, json.dumps({**destination, "pending": [
+            {"reference": member.reference, "name": member.name} for member in result.pending]}), new_file_mode=0o600)
+        return result
+
+
 def _valid(value: object) -> bool:
     if not isinstance(value, dict):
         return False
@@ -195,8 +305,7 @@ def _valid(value: object) -> bool:
                 "failed": ("reason",), "waited": ("window", "reset"),
                 "wait ended": (), "no room": ("earliest_reset",), "room again": ("label",)}
     if kind == "confirmed":
-        return (isinstance(fields.get("home"), str) or isinstance(fields.get("config_dir"), str)) and (
-            "worker" not in fields or isinstance(fields["worker"], str))
+        return "worker" not in fields or isinstance(fields["worker"], str)
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
@@ -243,7 +352,16 @@ class ReadCurrentMoveJournal:
 
 READ_CURRENT_MOVE_JOURNAL = ReadCurrentMoveJournal()
 
-def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
+
+@dataclass(frozen=True)
+class MoveReplayEvidence:
+    """Validated move rows and recorded queue entries from one journal read."""
+
+    entries: tuple[MoveEntry, ...]
+    history: RecordedAutoEntries
+
+
+def read_replay_evidence() -> MoveReplayEvidence | UnreadableMoveJournal:
     """Read replay evidence under the same flock as journal appenders."""
     path = store_file()
     try:
@@ -278,12 +396,19 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
                     or row.get("kind") == "requested" and row.get("tool") == "codex" and row.get("subject") == "workers"
                     and row.get("cause") == "auto" and row.get("move_id") not in failed):
                 ids.add(why.removeprefix("auto: "))
-        return RecordedAutoEntries(frozenset(ids))
+        journal = _resolve_journal_entries(cast(list[JournalEntry], cast(object, rows)))
+        return MoveReplayEvidence(tuple(account_moves(journal)), RecordedAutoEntries(frozenset(ids)))
     except FileNotFoundError:
-        return RecordedAutoEntries(frozenset())
+        return MoveReplayEvidence((), RecordedAutoEntries(frozenset()))
     except (OSError, ValueError, UnicodeError) as error:
         print(f"account moves: anomaly: cannot read recorded workers moves: {error}")
         return UnreadableMoveJournal()
+
+
+def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
+    """Return recorded queue entries from the shared replay reader."""
+    evidence = read_replay_evidence()
+    return evidence.history if isinstance(evidence, MoveReplayEvidence) else evidence
 
 
 def append_move(entry: MoveEntry) -> None:
@@ -319,9 +444,8 @@ def append_move(entry: MoveEntry) -> None:
         append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 
 
-def read_journal() -> list[JournalEntry]:
-    """Read valid transitions in order, skipping malformed or incomplete lines."""
-    # Keep this module a standard-library leaf until a journal is actually read.
+def _resolve_journal_entries(journal: list[JournalEntry]) -> list[JournalEntry]:
+    """Resolve legacy homes through historical evidence for both journal readers."""
     from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
 
     def numbered(value: object, tool: str) -> str | HomeAccountUnresolved:
@@ -348,6 +472,28 @@ def read_journal() -> list[JournalEntry]:
         matching = sorted((item for item in evidence if item.tool == tool and item.at <= at), key=lambda item: item.at)
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
 
+    entries: list[JournalEntry] = []
+    for value in journal:
+        raw: dict[str, object] = dict(value)
+        if raw["kind"] in ("routed to claude", "routed back", "routing not restored"):
+            raw["owner"] = _routing_owner(raw["owner"])
+            if raw["kind"] == "routed to claude":
+                _ = raw.setdefault("why", raw["cause"])
+            entries.append(cast(RoutingEntry, cast(object, raw)))
+            continue
+        entry = _canonical_entry(cast(MoveEntry, value))
+        fields: dict[str, object] = dict(entry)
+        for field in ("from", "to", "label"):
+            if fields.get(field) in ("default", f"~/.{entry['tool']}", str(homes[entry["tool"]])):
+                fields[field] = historical(entry, field)
+        if fields["kind"] == "requested":
+            _ = fields.setdefault("cause", "refusal")
+        entries.append(cast(MoveEntry, cast(object, fields)))
+    return entries
+
+
+def read_journal() -> list[JournalEntry]:
+    """Read valid transitions in order, skipping malformed or incomplete lines."""
     try:
         with store_file().open("r+", encoding="utf-8", errors="replace") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_EX)
@@ -367,22 +513,8 @@ def read_journal() -> list[JournalEntry]:
             if legacy.get("kind") == "routed to claude":
                 _ = legacy.setdefault("why", legacy.get("cause"))
         if _valid(cast(object, value)):
-            raw = cast(dict[str, object], value)
-            if raw["kind"] in ("routed to claude", "routed back", "routing not restored"):
-                raw["owner"] = _routing_owner(raw["owner"])
-                if raw["kind"] == "routed to claude":
-                    _ = raw.setdefault("why", raw["cause"])
-                entries.append(cast(RoutingEntry, cast(object, raw)))
-                continue
-            entry = _canonical_entry(cast(MoveEntry, value))
-            fields: dict[str, object] = dict(entry)
-            for field in ("from", "to", "label"):
-                if fields.get(field) in ("default", f"~/.{entry['tool']}", str(homes[entry["tool"]])):
-                    fields[field] = historical(entry, field)
-            if fields["kind"] == "requested":
-                _ = fields.setdefault("cause", "refusal")
-            entries.append(cast(MoveEntry, cast(object, fields)))
-    return entries
+            entries.append(cast(JournalEntry, value))
+    return _resolve_journal_entries(entries)
 
 
 def account_moves(journal: list[JournalEntry]) -> list[MoveEntry]:

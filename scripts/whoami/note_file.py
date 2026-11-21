@@ -113,6 +113,20 @@ def reset_time(value: str | None) -> KnownReset | NoResetKnown | InvalidReset:
     return KnownReset(parsed if parsed.tzinfo is not None else parsed.astimezone())
 
 
+
+def ahead(resets: str | None, *, now: datetime) -> bool:
+    """Whether a note's reset is still to come."""
+    reset = reset_time(resets)
+    return isinstance(reset, KnownReset) and reset.value > now
+
+
+def remaining(note: FieldReader) -> float | None:
+    """The note's weekly remaining usage in percent, or None when it is absent or not a number."""
+    try:
+        return float(note.get("weekly_remaining_usage") or "")
+    except ValueError:
+        return None
+
 @dataclass
 class Note:
     path: Path

@@ -92,6 +92,13 @@ class ArgvTests(unittest.TestCase):
         self.assertIsNone(parse.toolchain(["cargo", "clippy", "--workspace"]))
         self.assertIsNone(parse.toolchain(["rustup", "+nightly"]))
 
+    def test_global_options_before_the_subcommand_are_skipped(self) -> None:
+        self.assertEqual(parse.step_name(["cargo", "-q", "nextest", "run"]), "nextest")
+        self.assertEqual(parse.step_name(["cargo", "--color", "always", "clippy"]), "clippy")
+        self.assertEqual(parse.step_name(["cargo", "+nightly", "--locked", "-Z", "x", "fmt"]), "fmt")
+        self.assertEqual(parse.step_name(["cargo", "--config=term.color=never", "t"]), "t")
+        self.assertEqual(parse.step_name(["cargo", "--version"]), "cargo")
+
     def test_sweep_and_other_programs(self) -> None:
         sweep = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py", "--dry-run"]
         self.assertEqual(parse.step_name(sweep), "sweep")
@@ -195,6 +202,13 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["tests_skipped"], 0)
         self.assertEqual(result["tests_flaky"], 1)
         self.assertEqual(result["tests_retried"], 2)
+        self.assertEqual(result.get("observed_tests"), {
+            "by_binary": {
+                "alpha": ["tests::fails", "tests::adds", "tests::flaky", "tests::slow"],
+                "beta": ["tests::doubles"],
+            },
+            "complete": True,
+        })
         # The warning cargo repeats for the lib test target counts once.
         self.assertEqual(result["warnings"], 1)
         rows = {row["test"]: row for row in result["tests"] or []}
@@ -211,6 +225,7 @@ class FixtureTests(unittest.TestCase):
         tests = {row["test"] for row in result["tests"] or []}
         self.assertEqual(tests, {"tests::fails", "tests::flaky", "tests::slow"})
         self.assertEqual(result["tests_run"], 5)
+        self.assertEqual(result.get("observed_tests"), facts("nextest", "nextest").get("observed_tests"))
 
     def test_mend_times_and_fixes(self) -> None:
         result = facts("mend", "mend")
@@ -377,8 +392,9 @@ class NextestFormTests(unittest.TestCase):
             _ = write_config_fixture(config / "test_times.conf")
             _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
-                rows, summaries = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
-                self.assertEqual((rows, summaries), ([], []))
+                result = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
+                self.assertEqual((result.timing_rows, result.summaries), ([], []))
+                self.assertEqual(result.observed, {"by_binary": {}, "complete": False})
                 with self.assertRaises(ValueError):
                     _ = parse.test_results(["        PASS [ 2.000s] hana tests::slow"])
 
@@ -411,6 +427,34 @@ class NextestFormTests(unittest.TestCase):
         result = parse.log_facts("nextest", "  TRY 1 FAIL [   0.003s] (───) alpha tests::fails\n")
         self.assertIsNone(result["tests_run"])
         self.assertEqual([row["test"] for row in result["tests"] or []], ["tests::fails"])
+        self.assertEqual(result.get("observed_tests"), {"by_binary": {"alpha": ["tests::fails"]}, "complete": False})
+
+
+class CargoSubcommandTests(unittest.TestCase):
+    def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
+        wrapper = (Path(__file__).parents[1] / "build_hold" / "cargo").read_text()
+        branch = wrapper.split('case "$subcommand" in', 1)[1].split(') ;;', 1)[0].strip()
+        self.assertEqual(parse.CARGO_BUILD_VERBS, frozenset(branch.split("|")))
+        for verb in parse.CARGO_BUILD_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
+            with self.subTest(verb=verb):
+                self.assertEqual(parse.cargo_subcommand(("+nightly", "--config=term.color=never", verb)), verb)
+        self.assertEqual(parse.cargo_subcommand(("+stable", "-v")), "")
+
+    def test_option_values_cannot_turn_a_lookup_into_a_build(self) -> None:
+        for option in parse.CARGO_VALUE_OPTIONS:
+            with self.subTest(option=option):
+                self.assertEqual(parse.cargo_subcommand((option, "build", "metadata")), "metadata")
+                self.assertEqual(parse.cargo_subcommand((option, "metadata", "check")), "check")
+        self.assertEqual(parse.cargo_subcommand(("--config",)), "")
+
+    def test_cargo_front_call_splits_front_options_from_cargo_words(self) -> None:
+        for words, call in (
+                (("--front", "/f/cargo", "--shared-folder", "/run/x", "--cargo", "/c", "--", "build"),
+                 parse.CargoFrontCall("/f/cargo", "/run/x", "/c", ("build",))),
+                (("--front", "/f/cargo", "--", "--front", "test"), parse.CargoFrontCall("/f/cargo", "", "", ("--front", "test"))),
+                (("check",), parse.CargoFrontCall("", "", "", ("check",)))):
+            with self.subTest(words=words):
+                self.assertEqual(parse.cargo_front_call(words), call)
 
 
 if __name__ == "__main__":

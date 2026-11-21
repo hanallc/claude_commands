@@ -40,11 +40,12 @@ def schedule_directory(name: str) -> Path:
 
 
 @contextmanager
-def locked_history(directory: Path) -> Generator[IntervalHistory | ScheduleBusy]:
+def locked_history(directory: Path, *, wait: bool = False) -> Generator[IntervalHistory | ScheduleBusy]:
+    """Hold the schedule lock; without wait, a running pass yields ScheduleBusy."""
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "lock").open("a+") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             _ = lock.seek(0)
             yield ScheduleBusy(lock.read().strip() or directory.name)

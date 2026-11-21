@@ -41,13 +41,13 @@ Call `ListAgents` once.
 
 - Recipients are every row that is currently running: any status other than `offline`. Busy and idle sessions both receive the alert — a busy session drains its queue at its next tool round, which is exactly when it needs the alert.
 - Skip `offline` rows and say so in the report.
-- Address recipients per /message, and do not set `notify_when_idle`.
+- Address recipients per /message.
 </DiscoverRecipients>
 
 <SendAlerts>
-Send one `SendMessage` per recipient. Independent sends go in the same tool block.
+Send one `send.py --to <name> --from "<your session name>" --text "<message>"` per recipient (/message). Independent sends go in the same tool block. A `Remote Control` row is on another machine: add `--machine <other machine>`. Report each outcome line.
 
-Use `summary`: `forest-and-trees alert to <name>`.
+Use `--summary`: `forest-and-trees alert to <name>`.
 
 The `message` is the same for every recipient, in this shape:
 
@@ -69,7 +69,7 @@ If this problem cannot apply to your session at all — wrong repo, wrong projec
 In **respond mode**, append this block to the message, after the instructions:
 
 ```
-Respond: before doing anything else, reply to this alert with SendMessage — set `to` to the `from` attribute of the wrapper this message arrived in. Your reply's first line must stand alone as a preview. Cover, briefly:
+Respond: before doing anything else, reply to this alert with send.py (/message) — set `--to` to the `from` attribute of the wrapper this message arrived in. Your reply's first line must stand alone as a preview. Cover, briefly:
 - what you were doing when this arrived (repo, worktree, task)
 - whether this problem applies to your session, and why
 - anything your session already knows about it that the sender may not — a related finding, a file you changed, a test that exercises it
@@ -87,7 +87,7 @@ After every send returns, give the user one short table:
 | `<name>` | busy / idle / shell | sent / failed: `<error>` |
 | `<name>` | offline | skipped |
 
-Then one line restating the problem statement that went out. If any send failed, say what the error was and whether a retry with the ` [ref]` suffix resolved it.
+Restate the problem in one line. Report each send error. For a shared name, retry with a unique roster address such as `session:<id>`.
 
 In **respond mode**, add one line: how many replies are expected and that each will be relayed as it arrives. Then end the turn. Relay each reply per /message: sender, whether the problem applies there, and what they contributed.
 

@@ -71,10 +71,14 @@ class HeldRolePaneFixture:
         self.router.setup(case, self.root)
         self.commands: list[list[str]] = []
         self.recorder_commands: list[list[str]] = []
+        self.router.recorder_commands = self.recorder_commands
         write_text_atomic(self.root / "design.md", "# Private design\n")
+        config = Path(os.environ["CONF_DIR"]) / "design_roles.conf"
+        write_text_atomic(config, "[ownership]\nhost=natedev\n\n[roles]\nnew_open=true\n")
         _ = cast(object, case.enterContext(patch.dict(os.environ, {
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"),
+            "DESIGN_ROLES_CONFIG": str(config),
             "ASTRA_ROLES_STATE": str(self.root / "holds"),
             "DESIGN_ROLES_HOST": "natedev",
             "CODEX_HOME": str(self.root / "codex"),
@@ -82,7 +86,7 @@ class HeldRolePaneFixture:
         _ = case.enterContext(patch.object(design_roles, "_worker_command", side_effect=self.command))
         _ = case.enterContext(patch.object(design_roles, "_assign_command", side_effect=self.assign))
         _ = case.enterContext(patch.object(design_roles, "_recorder_command", side_effect=self.record))
-        design_roles.register_repository("private-repo", {"natedev": str(self.root)})
+        design_roles.register_repository("private-repo", {"natedev": design_roles.ConfiguredCheckout(str(self.root))})
         state_path = self.command_case.run_dir / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_path.read_text()))
         state["run_id"] = "held-role-private-run"
@@ -123,7 +127,22 @@ class HeldRolePaneFixture:
                                       binding=self.binding if bound else design_roles.UNBOUND)
 
     def resume(self, design: design_roles.HeldDesign, role: design_roles.Role) -> Path:
-        return design_roles.resume(design.placement.design_id + "/" + role, self.command_case.prompt)
+        submitted = design_roles.resume(design.placement.design_id + "/" + role, self.command_case.prompt)
+        self.finish(design, role)
+        return submitted.reply
+
+    def finish(self, design: design_roles.HeldDesign, role: design_roles.Role) -> None:
+        from scripts.herdr import turn_end
+
+        instance = next(item for item in design.roles if item.role == role)
+        if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove)):
+            raise AssertionError("role has no worker")
+        row = staff.by_id(instance.lifecycle.staff_id)
+        if row is None:
+            raise AssertionError("role worker is missing")
+        thread = str(row.current_session)
+        with self.world.process_starts():
+            _ = turn_end.handle(turn_end.WorkerEvent(thread, reply=self.command_case.agent.last_replies.get(thread, "")))
 
 
 class HeldRolePaneCase(unittest.TestCase):

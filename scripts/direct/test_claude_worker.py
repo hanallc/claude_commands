@@ -14,6 +14,8 @@ import signal
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.direct import worker_state
 from scripts.lib import models_registry
 from scripts.direct import claude_worker
@@ -25,6 +27,7 @@ from scripts.usage import agents_log
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.socket_test_support import ShortUnixSocket
+from scripts.lib.transcript_test_support import compressed_copy
 
 
 BACKEND = '''import json, os, sys, socket
@@ -142,9 +145,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         _, unit, _ = self.tree()
         identity = fixture_runtime_id("background-Claude-native")
         home = Path.home()
-        shim = home / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True)
-        shim.symlink_to(CHECKOUT / "scripts/lib/py")
+        _ = copy_helpers(home)
         self.write_json(home / ".claude.json", {"oauthAccount": {"emailAddress": "fixture@example.invalid"}})
         work = self.root / "project"
         work.mkdir()
@@ -224,10 +225,14 @@ class NativeClaudeWorkerTests(StaffTestCase):
             '{"type": "assistant", "message": {"stop_reason": "end_turn"}}',
             '{"type": "assistant", "message": {"stop_reason": "stop_sequence"}}',
         )) + '\n')
-        delivered = claude_worker.follow_up(turn, self.fixture.identity)
-        self.assertIsInstance(delivered, claude_worker.Delivered)
-        assert isinstance(delivered, claude_worker.Delivered)
-        self.assertEqual(delivered.turns_before, 2)
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    _ = compressed_copy(transcript)
+                delivered = claude_worker.follow_up(turn, self.fixture.identity)
+                self.assertIsInstance(delivered, claude_worker.Delivered)
+                assert isinstance(delivered, claude_worker.Delivered)
+                self.assertEqual(delivered.turns_before, 2)
 
     def test_claude_dispatch_records_the_task_role_before_delivery(self) -> None:
         for switched in (False, True):
@@ -240,11 +245,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     modules = stopped_worker_module(self.root / "source-stop-modules")
                     environment.update(CODEX_HOME=str(backend.codex_home),
                         FIXTURE_STOPPED=str(self.root / "source-stopped.json"),
-                        PYTHONPATH=os.pathsep.join((str(modules), str(CHECKOUT))))
+                        PYTHONPATH=os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules))))
                 result = self.launch(**environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
                 self.assertEqual(sent["role"], "impl")
+                self.assertEqual(cast(dict[str, object], sent["row"]).get("role"), "impl")
                 history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
                 self.assertEqual(history.assignments[self.fixture.identity][-1].role, "impl")
                 row = staff.by_current_session(self.fixture.identity)
@@ -292,7 +298,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 environment = {**self.fixture.environment, "FIXTURE_GATE": str(address),
                     "CODEX_HOME": str(backend.codex_home), "FIXTURE_STOPPED": str(stopped),
                     "UNIT_RUN_DIR": str(parent), "PLAN_DELEGATE_BOARD_DIR": str(parent),
-                    "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT)))}
+                    "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))}
                 with subprocess.Popen(command, cwd=self.fixture.work, text=True, env=environment,
                         start_new_session=True,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) as launcher:
@@ -386,7 +392,7 @@ if len(sys.argv) > 1 and sys.argv[0] == "-c":
 ''')
         environment = models_registry.launch_configuration(os.environ).environment(
             models_registry.edit_base(os.environ).environment(self.fixture.environment))
-        result = self.launch(**{**environment, "PYTHONPATH": os.pathsep.join((str(fake_modules), str(CHECKOUT))),
+        result = self.launch(**{**environment, "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(fake_modules))),
                                "FIXTURE_REGISTRY_READS": str(reads), "CLAUDE_CODE_CHILD_SESSION": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = cast(list[str], self.backend_calls()[0]["arguments"])

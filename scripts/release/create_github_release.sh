@@ -41,6 +41,11 @@ else
   PRERELEASE="false"
 fi
 
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  echo "already released: $TAG on $REPO"
+  exit 0
+fi
+
 if [[ ! -f "$NOTES_FILE" ]]; then
   echo "ERROR: Notes file not found: $NOTES_FILE" >&2
   exit 1
@@ -61,18 +66,24 @@ if [[ "$DRY_RUN" == "--dry-run" ]]; then
   exit 0
 fi
 
+if ! TAG_ERROR=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2>&1 >/dev/null); then
+  if [[ "$TAG_ERROR" == *"HTTP 404"* ]]; then
+    echo "ERROR: tag $TAG is not on $REPO; push it there first" >&2
+  else
+    printf '%s\n' "$TAG_ERROR" >&2
+    echo "ERROR: could not check tag $TAG on $REPO" >&2
+  fi
+  exit 1
+fi
+
 echo "  Creating release: $TAG on $REPO (prerelease: $PRERELEASE)"
+RELEASE_ARGS=(--repo "$REPO" --title "$TITLE" --notes-file "$NOTES_FILE" --verify-tag)
 if [[ "$PRERELEASE" == "true" ]]; then
-  gh release create "$TAG" \
-    --repo "$REPO" \
-    --title "$TITLE" \
-    --notes-file "$NOTES_FILE" \
-    --prerelease
-else
-  gh release create "$TAG" \
-    --repo "$REPO" \
-    --title "$TITLE" \
-    --notes-file "$NOTES_FILE"
+  RELEASE_ARGS+=(--prerelease)
+fi
+if ! gh release create "$TAG" "${RELEASE_ARGS[@]}"; then
+  echo "ERROR: gh release create failed for $TAG on $REPO" >&2
+  exit 1
 fi
 
 echo ""

@@ -10,12 +10,13 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -30,6 +31,15 @@ class ConfTests(unittest.TestCase):
         self.directory = self.root / "config"
         self.directory.mkdir()
         self.path = self.directory / "example.conf"
+        repository = self.root / "repository-config"
+        _ = write_config_fixture(repository / "accounts.conf",
+                                 "usage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
+        original = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
+
+        def repository_path(stem: str) -> Path:
+            return repository / "accounts.conf" if stem == "accounts" else original(stem)
+
+        _ = self.enterContext(mock.patch.object(conf, "_repository_path", side_effect=repository_path))
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.directory), "HOME": str(self.root / "home"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -37,6 +47,14 @@ class ConfTests(unittest.TestCase):
 
     def write(self, value: str) -> None:
         _ = self.path.write_text(value, encoding="utf-8")
+
+    def test_comments_start_only_at_a_line_start_or_after_whitespace(self) -> None:
+        self.write("# comment=value\n  # indented=value\n"
+                   + "color=#a0522d # comment\nname=brown\t# comment\n"
+                   + "fragment=path#part\nmultiple=one#two#three\n")
+        self.assertEqual(conf.read("example").values(), {
+            "color": "#a0522d", "name": "brown", "fragment": "path#part", "multiple": "one#two#three",
+        })
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
@@ -53,6 +71,70 @@ class ConfTests(unittest.TestCase):
         _ = self.git("init", "-q")
         _ = self.git("config", "user.name", "Configuration test")
         _ = self.git("config", "user.email", "conf@example.invalid")
+
+    def test_config_reads_record_all_resolvers_and_cache_the_log_path(self) -> None:
+        self.write("value=one\n")
+        log = self.root / "reads"
+        program = """from pathlib import Path
+import os
+from scripts.lib import conf, conf_reads
+conf.path('example')
+conf_reads.read_text(Path(os.environ['CONF_DIR']) / 'example.conf')
+conf.path(Path(os.environ['CONF_DIR']) / 'example.conf')
+conf._repository_path('example')
+conf.read('example').text('value')
+os.environ['CONF_READ_LOG'] = os.environ['CONF_READ_LOG'] + '.other'
+conf.read_or_repository('example').text('value')
+conf.effective_line('example', 'value')
+conf.editable_line('example', 'value')
+conf.check('example', 'value', 'two')
+"""
+        result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+                                env={**os.environ, "CONF_READ_LOG": str(log)}, check=True)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(log.is_file(), "The reader must record its config reads")
+        self.assertEqual(set(log.read_text().splitlines()), {"example"})
+        self.assertGreaterEqual(len(log.read_text().splitlines()), 8)
+        self.assertFalse(log.with_suffix(".other").exists())
+
+    def test_config_read_log_context_restores_the_cached_destination(self) -> None:
+        self.write("value=one\n")
+        first = self.root / "first-reads"
+        second = self.root / "second-reads"
+        program = """import os
+import sys
+from scripts.lib import conf_reads
+first, second, source = sys.argv[1:]
+with conf_reads.record_reads(first):
+    conf_reads.record('first')
+    try:
+        with conf_reads.record_reads(second):
+            conf_reads.read_text(source)
+            assert os.environ['CONF_READ_LOG'] == second
+            raise ValueError('fixture interruption')
+    except ValueError:
+        pass
+    assert os.environ['CONF_READ_LOG'] == first
+    conf_reads.record('restored')
+assert 'CONF_READ_LOG' not in os.environ
+conf_reads.record('disabled')
+"""
+        environment = dict(os.environ)
+        _ = environment.pop("CONF_READ_LOG", None)
+        result = subprocess.run([sys.executable, "-c", program, str(first), str(second), str(self.path)],
+                                capture_output=True, text=True, env=environment, check=True)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(first.read_text().splitlines(), ["first", "restored"])
+        self.assertEqual(second.read_text().splitlines(), ["example"])
+
+    def test_config_read_record_ignores_patched_os_functions(self) -> None:
+        log = self.root / "reads"
+        with conf_reads.record_reads(log), \
+                mock.patch.object(os, "open", side_effect=OSError("fixture open refusal")), \
+                mock.patch.object(os, "write", side_effect=OSError("fixture write refusal")), \
+                mock.patch.object(os, "close", side_effect=OSError("fixture close refusal")):
+            conf_reads.record("example")
+        self.assertEqual(log.read_text().splitlines(), ["example"])
 
     def test_one_read_serves_many_settings_and_a_new_read_observes_changes(self) -> None:
         self.write("# range: 0..\nfraction=2.5\n# whole: 1..\ncount=3\n"
@@ -134,6 +216,16 @@ class ConfTests(unittest.TestCase):
                 self.fail("The valid live setting must retain its origin")
             self.assertEqual(origin.value, Decimal("2.5"))
             self.assertEqual(conf.read("example").values(), {"label": "changed", "amount": "9"})
+
+    def test_values_combines_requested_keys_with_host_only_prefix(self) -> None:
+        self.write("label=base\nlabel.testhost=local\nmodel.active.testhost=blue\n"
+                   + "model.other.anotherhost=green\naccount.active.testhost=red\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"):
+            settings = conf.read("example")
+            self.assertEqual(settings.values("label", "missing"), {"label": "local"})
+            self.assertEqual(settings.values(host_only_prefix="model."), settings.values() | {"model.active": "blue"})
+            self.assertEqual(settings.values("label", "missing", host_only_prefix="model."),
+                             {"label": "local", "model.active": "blue"})
 
     def test_each_reader_returns_its_type_and_preserves_text_after_the_first_equals(self) -> None:
         self.write("# range: ..\nfraction=2.5\n# whole: ..\ncount=-2\nlabel= a=b c # note\nnames= alpha  beta\tempty\n")
@@ -401,7 +493,7 @@ class ConfTests(unittest.TestCase):
         self.commit("# whole: 1..10\namount=3\n")
         self.commit("# whole: 1..10\namount=8\n")
         self.commit("# whole: 1..4\namount=9\n")
-        self.write("# whole: 1..2\namount=broken\n")
+        self.write("# whole: 1..10\namount=broken\n")
         warning = io.StringIO()
         with redirect_stderr(warning):
             self.assertEqual(conf.read("example").whole("amount"), 8)
@@ -409,6 +501,50 @@ class ConfTests(unittest.TestCase):
         self.assertIn("broken", warning.getvalue())
         self.assertIn("amount", warning.getvalue())
         self.assertIn(str(self.path), warning.getvalue())
+
+    def test_recovery_skips_values_outside_the_current_limits(self) -> None:
+        self.history()
+        self.commit("# whole: 1..\ncount=2\n# range: 0..\namount=2.5\n# one of: off, on\nmode=on\n")
+        self.commit("# whole: 1..\ncount=1\n# range: 0..\namount=9\n# one of: off, on\nmode=off\n")
+        self.write("# whole: 1..\ncount=3\n# whole: 2..\ncount.testhost=broken\n"
+                   + "# range: 0..4\namount=broken\n# one of: on\nmode=broken\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"), redirect_stderr(io.StringIO()):
+            settings = conf.read("example")
+            self.assertEqual(settings.whole("count"), 2)
+            self.assertEqual(settings.number("amount"), 2.5)
+            self.assertEqual(settings.text("mode"), "on")
+
+    def test_recovery_uses_committed_limits_when_no_value_passes_the_current_limit(self) -> None:
+        self.history()
+        self.commit("# whole: -1000..1000\namount=500\n# one of: on, off\nmode=on\n")
+        self.commit("# whole: -1000..1000\namount=1001\n# one of: on, off\nmode=broken\n")
+        for limit, reason in (("# whole: -1000.1000", "invalid limit"),
+                              ("# whole: -1000..400.5", "expected a whole number"),
+                              ("# whole: 1000..-1000", "outside range 1000..-1000"),
+                              ("# whole: 0..100", "outside range 0..100")):
+            with self.subTest(limit=limit), redirect_stderr(io.StringIO()) as warning:
+                self.write(f"{limit}\namount=400\n")
+                self.assertEqual(conf.read("example").whole("amount"), 500)
+                self.assertEqual(len(warning.getvalue().splitlines()), 1)
+                self.assertIn(reason, warning.getvalue())
+
+        self.write("# one of:\nmode=off\n")
+        with redirect_stderr(io.StringIO()) as warning:
+            self.assertEqual(conf.read("example").text("mode"), "on")
+        self.assertEqual(len(warning.getvalue().splitlines()), 1)
+        self.assertIn("mode='off': expected one of", warning.getvalue())
+
+    def test_recovery_reads_each_revision_once_when_the_current_limit_rejects_all_values(self) -> None:
+        self.history()
+        self.commit("# whole: 1..1000\namount=400\n")
+        self.commit("# whole: 1..1000\namount=500\n")
+        self.commit("# whole: 1..1000\namount=1001\n")
+        self.write("# whole: 1..100\namount=600\n")
+        git = cast(Callable[..., subprocess.CompletedProcess[str]], getattr(conf, "_git"))
+        with mock.patch.object(conf, "_git", wraps=git) as history_reads, redirect_stderr(io.StringIO()):
+            self.assertEqual(conf.read("example").whole("amount"), 500)
+        # Git reads the checkout, the history, and each of the three revisions.
+        self.assertEqual(history_reads.call_count, 5)
 
     def test_missing_current_key_recovers_from_history_and_host_override_is_validated(self) -> None:
         self.history()
@@ -558,6 +694,27 @@ class ConfTests(unittest.TestCase):
                 _ = conf.editable_line("example", "count")
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_editable_line_refuses_overrides_for_keys_outside_model_colors(self) -> None:
+        for stem, key in (("example", "model.provider"), ("example", "model.gpt-6.2-sol"),
+                          ("statusline", "model.provider")):
+            with self.subTest(stem=stem, key=key):
+                source = self.directory / f"{stem}.conf"
+                _ = source.write_text(f"{key}=3\n{key}.remote=4\n", encoding="utf-8")
+                with mock.patch("socket.gethostname", return_value="remote"):
+                    self.assertEqual(conf.effective_line(stem, key), (1, "4"))
+                with mock.patch("socket.gethostname", return_value="local"):
+                    with self.assertRaisesRegex(conf.Unusable, "has host override"):
+                        _ = conf.editable_line(stem, key)
+
+    def test_editable_line_keeps_each_dotted_model_key_independent(self) -> None:
+        source = self.directory / "statusline.conf"
+        keys = ("model.gpt-6", "model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
+        for order in (keys, keys[::-1]):
+            with self.subTest(order=order):
+                _ = source.write_text("".join(f"{key}=#123456\n" for key in order), encoding="utf-8")
+                for line, key in enumerate(order):
+                    self.assertEqual(conf.editable_line("statusline", key), (line, "#123456"))
+
     def test_installed_script_refuses_conf_dir_override(self) -> None:
         from scripts.build_hold import override_guard
 
@@ -610,6 +767,24 @@ class ConfTests(unittest.TestCase):
         if not isinstance(live, conf.UsableLiveValue):
             self.fail("A repaired live limit must replace the recovered state")
         self.assertEqual(live.value, Decimal("7.25"))
+
+
+class HanaConfigurationTests(unittest.TestCase):
+    source: Path = Path(__file__).resolve().parents[2] / "config/hana_aws.conf"
+
+    def test_render_configuration_has_no_host_suffixes(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        self.assertTrue(settings)
+        for key in settings:
+            with self.subTest(key=key):
+                self.assertNotIn('.', key)
+
+    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
+            self.assertNotIn(key, settings)
+        self.assertEqual(sum(line.startswith('free_floor_gib=')
+            for line in self.source.read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":

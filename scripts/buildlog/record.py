@@ -59,12 +59,13 @@ import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
+from scripts.build_queue import execution_identity
 from scripts.lib.test_phase import (
     CallRecord,
     NoCallRecord,
@@ -80,9 +81,10 @@ from scripts.lib.test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-from scripts.buildlog import cgroup_capture, store, step_context
+from scripts.buildlog import cgroup_capture, parse, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+    MANIFEST_IDENTITY_PREFIX,
     output as output,
     remote_identity as remote_identity,
     repository_key as repository_key,
@@ -91,6 +93,7 @@ from scripts.buildlog.repository import (
 
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 if TYPE_CHECKING:
+    from scripts.aws_target import hana_result
     from scripts.aws_target.config import MeasurementUnavailable
 
 
@@ -169,6 +172,7 @@ def local_targets() -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class LocalStepIdentity:
+    """The identity holds target and host names for local step classification."""
     targets: tuple[str, ...]
     hosts: tuple[str, ...]
 
@@ -249,23 +253,24 @@ class LaunchStep(GitFacts):
 
 @dataclass(frozen=True)
 class InvalidLaunchState:
-    pass
+    """The saved launch state is invalid."""
 
 
 @dataclass(frozen=True)
 class PublishedLaunch:
+    """The publication result reports a new launch row and an unknown worktree."""
     added: bool
     unknown_worktree: bool
 
 
 @dataclass(frozen=True)
 class NoHeldLog:
-    pass
+    """The step has no retained log."""
 
 
 @dataclass(frozen=True)
 class NoPeakFile:
-    pass
+    """The step has no peak memory file."""
 
 
 @dataclass(frozen=True)
@@ -283,6 +288,7 @@ class PendingStep:
 
 @dataclass(frozen=True)
 class PublishedStep:
+    """The publication result reports whether a step row was added."""
     added: bool
 
 
@@ -521,8 +527,6 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
-    from scripts.buildlog import parse
-
     words = ["rustc"]
     chosen = parse.toolchain(argv)
     if chosen:
@@ -565,12 +569,13 @@ def tree_facts(start: str | None, end: str | None) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class SentTreeKey:
+    """The value identifies the source tree sent to the remote host."""
     value: str
 
 
 @dataclass(frozen=True)
 class NoSentTreeKey:
-    pass
+    """The remote step has no recorded source tree key."""
 
 
 def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
@@ -581,12 +586,13 @@ def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
 
 @dataclass(frozen=True)
 class SentRepositoryIdentity:
+    """The value identifies the repository sent to the remote host."""
     value: str
 
 
 @dataclass(frozen=True)
 class NoSentRepositoryIdentity:
-    pass
+    """The remote step has no recorded source repository identity."""
 
 
 def sent_repository_identity() -> SentRepositoryIdentity | NoSentRepositoryIdentity:
@@ -600,9 +606,17 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
 
 
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    return _keep_compressed(data, _log_relative_path(host, epoch, record_id))
+
+
+def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    """Keep a cloud gate result beside its gate run record."""
+    return _keep_compressed(data, f"{host}/{store.RESULTS_DIR}/{store.month(epoch)}/{record_id}.json.gz")
+
+
+def _keep_compressed(data: bytes, relative: str) -> str:
     import gzip
 
-    relative = _log_relative_path(host, epoch, record_id)
     target = store.root() / relative
     if target.is_file():
         _sync_directory(target.parent)
@@ -628,11 +642,13 @@ def pending_steps_root() -> Path:
 
 @dataclass(frozen=True)
 class ReservedTestPhaseRecord(TestPhaseRecord):
+    """The test phase evidence includes its admission reservation identifier."""
     reservation_id: str
 
 
 @dataclass(frozen=True)
 class ChargedTestPhaseRecord(ReservedTestPhaseRecord):
+    """The reserved test phase evidence includes its completed memory charge."""
     charge: TestPhaseChargeUse
 
 
@@ -682,8 +698,6 @@ def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoT
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    from scripts.buildlog import parse
-
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
         raise ValueError("test-phase sampling context is not an object")
@@ -914,6 +928,137 @@ def finish_pending_step(path: Path) -> PublishedStep:
     return _finish_step(path, pending, _resume_step_line)
 
 
+@dataclass(frozen=True)
+class HanaStepContext:
+    """The caller supplies record metadata without replacing the execution host."""
+    target: str
+    step: str
+    repo_identity: str
+    cwd: str
+    target_dir: str
+    environment: Mapping[str, str] = field(default_factory=dict[str, str])
+
+
+def placement_step_fields() -> dict[str, object]:
+    """Read the link passed by the assigned offload or fallback adapter."""
+    encoded = os.environ.get('BUILDLOG_HANA_ATTEMPT')
+    if not encoded:
+        assignment_path = os.environ.get('BUILDLOG_PLACEMENT_FILE')
+        return fallback_step_fields(Path(assignment_path)) if assignment_path else {}
+    from scripts.aws_target import hana_result
+
+    key = hana_result.decode_attempt_key(cast(object, json.loads(encoded)))
+    link = hana_result.LogicalStepLink(os.environ['BUILDLOG_CALL_ID'], key.episode)
+    return {**hana_result.linked_step_fields(key, link, os.environ['BUILDLOG_ATTEMPT_ROLE'],
+                                           os.environ['BUILDLOG_IS_FINAL_RESULT'] == '1'),
+            'source_key': os.environ['BUILDLOG_SOURCE_KEY']}
+
+
+def save_hana_fallback_link(assignment_path: Path, key: hana_result.HanaAttemptKey,
+                            link: hana_result.LogicalStepLink) -> None:
+    """Pass result metadata from the remote child to the later local recorder."""
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.aws_target import hana_result
+
+    write_text_atomic(Path(str(assignment_path) + '.hana-link'), json.dumps({'version': 1,
+        'key': hana_result.encode_attempt_key(key), 'link': {'call_id': link.call_id, 'episode': link.episode}}))
+
+
+def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
+    """Link a local grant without claiming that it ran on the Hana boot."""
+    try:
+        content = Path(str(assignment_path) + '.hana-link').read_text()
+    except FileNotFoundError:
+        return {}
+    from scripts.aws_target import hana_result
+    from scripts.build_queue import admission_protocol as wire, admission_wire
+
+    row = hana_result.object_fields(cast(object, json.loads(content)))
+    if type(row.get('version')) is not int or row['version'] != 1:
+        raise ValueError('Unsupported Hana fallback link version')
+    remote_key = hana_result.decode_attempt_key(row['key'])
+    fields = hana_result.object_fields(row['link'])
+    link = hana_result.LogicalStepLink(hana_result.string_field(fields, 'call_id'), hana_result.string_field(fields, 'episode'))
+    reply = admission_wire.read_assignment(assignment_path)
+    if (not isinstance(reply, wire.LocalPlacementGranted) or reply.assignment.episode != link.episode
+            or remote_key.episode != link.episode
+            or link.call_id != os.environ.get('BUILDLOG_CALL_ID')):
+        return {}
+    assignment = reply.assignment
+    return {'step_link': json.dumps([link.call_id, link.episode], separators=(',', ':')),
+            'placement_episode': assignment.episode, 'placement_attempt': assignment.attempt,
+            'attempt_role': 'fallback', 'is_final_result': True,
+            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, execution_identity.SourceKeyKnown) else {})}
+
+
+def _publish_hana_step(row: dict[str, object], output: bytes) -> PublishedStep:
+    """Retain one deterministic row through recorder failure and replay."""
+    root = store.root()
+    root.mkdir(parents=True, exist_ok=True)
+    path = pending_steps_root() / f"{row['id']}.json"
+    with (root / LAUNCH_LOCK_NAME).open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            return finish_pending_step(path)
+        if path.with_suffix('.done').exists():
+            return PublishedStep(False)
+        if output:
+            started = datetime.fromisoformat(str(row['started_at'])).timestamp()
+            row['log'] = keep_log(output, str(row['host']), started, str(row['id']))
+        pending = PendingStep(str(row['id']), row, NoHeldLog(), NoPeakFile(),
+                              store.read_last_whole_row_end(_step_month_file(row)))
+        return _finish_step(_save_pending_step(pending), pending, _resume_step_line)
+
+
+def _hana_step_row(key: hana_result.HanaAttemptKey, link: hana_result.LogicalStepLink,
+                   context: HanaStepContext, host: str, started: float, finished: float,
+                   status: int, final: bool) -> dict[str, object]:
+    from scripts.aws_target import hana_result
+
+    return {'kind': 'step', 'v': RECORD_VERSION, 'id': hana_result.attempt_record_id(key),
+            'host': host, 'target': context.target, 'step': context.step,
+            'repo_identity': context.repo_identity, 'cwd': context.cwd, 'target_dir': context.target_dir,
+            'started_at': store.utc_iso(started), 'ended_at': store.utc_iso(finished),
+            'duration_s': finished - started, 'status': status, 'caller': 'verify-linux',
+            'call_id': link.call_id, **hana_result.linked_step_fields(key, link, 'remote', final)}
+
+
+def captured_log_facts(step: str, source: str, argv: Sequence[str], environment: Mapping[str, str],
+                       *streams: bytes) -> parse.LogFacts:
+    try:
+        trust = step != "nextest" or parse.nextest_status_is_trusted(argv, environment)
+        return parse.log_facts(step, *(stream.decode("utf-8", "replace") for stream in streams),
+                               trust_nextest_status=trust)
+    except Exception:  # noqa: BLE001 -- a parser failure must preserve the step result
+        store.note_error(f"parse {step} {source}")
+        return parse.no_facts()
+
+
+def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_result.LogicalStepLink,
+                        context: HanaStepContext) -> PublishedStep:
+    """Publish only a result accepted under the execution journal lock."""
+    from scripts.aws_target import hana_result
+
+    result = accepted.result
+    row = _hana_step_row(result.key, link, context, result.host, result.started_at, result.finished_at,
+                         result.status, True)
+    row.update({'argv': list(result.argv), 'source_key': result.source_key, 'source_commit': result.commit,
+                'sha': result.commit[:12], 'toolchain_identity': result.toolchain,
+                'duration_s': result.execution_seconds,
+                'peak_mem_bytes': result.memory.bytes if isinstance(result.memory, hana_result.MeasuredPeak) else None,
+                **captured_log_facts(context.step, str(row['id']), result.argv, context.environment,
+                                     result.stdout, result.stderr)})
+    return _publish_hana_step(row, result.stdout + result.stderr)
+
+
+def publish_hana_loss(key: hana_result.HanaAttemptKey, link: hana_result.LogicalStepLink,
+                      context: HanaStepContext, host: str, started: float, finished: float,
+                      reason: str) -> PublishedStep:
+    """Record settled remote loss separately from the queue's later fallback."""
+    row = _hana_step_row(key, link, context, host, started, finished, 75, False)
+    return _publish_hana_step(row, reason.encode())
+
+
 def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
     """Parse raw scope sidecars; only absence may lose a reading on retry.
 
@@ -934,7 +1079,6 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
 
 def step(args: list[str]) -> None:
     import hashlib
-    from scripts.buildlog import parse
     from scripts.buildlog import treekey
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
@@ -975,7 +1119,8 @@ def step(args: list[str]) -> None:
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_identity = sent_repository_identity()
-        if (repo_identity == store.UNKNOWN_IDENTITY and step_caller in ("verify-mac", "verify-linux")
+        if ((repo_identity == store.UNKNOWN_IDENTITY or repo_identity.startswith(MANIFEST_IDENTITY_PREFIX))
+                and step_caller in ("verify-mac", "verify-linux")
                 and isinstance(sent_identity, SentRepositoryIdentity)):
             repo_identity = sent_identity.value
         sent_key = sent_tree_key()
@@ -987,10 +1132,7 @@ def step(args: list[str]) -> None:
         log: str | None = None
         if not tty and held and os.path.isfile(held):
             data = Path(held).read_bytes()
-            try:
-                facts = parse.log_facts(name, data.decode("utf-8", "replace"))
-            except Exception:  # noqa: BLE001 -- a parser bug loses the facts, never the record
-                store.note_error(f"parse {name} {held}")
+            facts = captured_log_facts(name, held, argv, os.environ, data)
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
         output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")
@@ -1047,6 +1189,7 @@ def step(args: list[str]) -> None:
             **facts,
             "log": log,
             **(test_phase_fields(phase) if not isinstance(phase, UnreadableTestPhaseRecord) else {}),
+            **placement_step_fields(),
         }
         with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1173,6 +1316,13 @@ class SshAttempt(TypedDict):
     cleanup: str
     unresolved_count: int | None
     evidence_at: float
+    step_link: NotRequired[str]
+    placement_episode: NotRequired[str]
+    placement_attempt: NotRequired[str]
+    execution_generation: NotRequired[str]
+    source_key: NotRequired[str]
+    attempt_role: NotRequired[Literal['remote', 'fallback']]
+    is_final_result: NotRequired[bool]
 
 
 def ssh_attempt(attempt: SshAttempt) -> None:
@@ -1189,6 +1339,7 @@ def ssh_attempt(attempt: SshAttempt) -> None:
 
 @dataclass(frozen=True)
 class AttemptResult:
+    """The attempt result holds repository, slot, outcome, completion, and cleanup evidence."""
     repo_identity: str
     slot: int
     outcome: str
@@ -1246,15 +1397,6 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
-def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
-                   need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
-    host = store.host_name()
-    store.append_line(store.host_file(host, at), {
-        "kind": "head_admission", "v": RECORD_VERSION,
-        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
-        "action": action, "unit": unit, "step": step, "need": need, "free": free,
-        "reserve": reserve, "why": why, "set_by": set_by,
-    })
 
 
 def queue_priority(action: Literal["set", "clear"], unit: str,

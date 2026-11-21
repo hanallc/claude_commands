@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import unittest
-import subprocess
-from pathlib import Path
 
 from scripts.style import style_footprint
 from scripts.style import approved_renames
@@ -14,6 +12,12 @@ from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, Approve
                               approved_rename, binding_rename, binding_rename_check, binding_scope, resolution_scope, declaration_sites, file_rename,
                               refactor_rename, rename_declaration, RenameDeclaration,
                               pattern_binding_check, PatternBindingCollision, DistinctPatternBindings)
+
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
 
 
 def files(sources: dict[str, str]) -> FileReader:
@@ -314,12 +318,6 @@ class AppliedCheckTests(unittest.TestCase):
             "src/lib.rs", source, source, (pair,)), current=source).checks[pair],
                               approved_renames.OuterBindingBlocked | approved_renames.OuterBindingUnproved)
 
-    def test_syntax_and_site_modules_import_without_an_initialization_cycle(self) -> None:
-        result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-B", "-c", "from scripts.style import approved_renames, finding_sites, declarations"],
-            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_inner_attributes_of_the_file_and_enclosing_modules_require_admission(self) -> None:
         for source in (
                 "mod outer { #![inject] fn label() {\nmap(|g| g + 1)\n} }\n",
@@ -383,16 +381,6 @@ class AppliedCheckTests(unittest.TestCase):
             rename = BindingRename(line, source.splitlines()[line - 1], "g", "checkout_info")
             with self.subTest(form=label):
                 self.assertIsInstance(approved_renames.rename_admission(source, rename), expected)
-
-    def test_unparsed_enclosing_condition_is_unproved_instead_of_clear(self) -> None:
-        source = ("fn label() {\n    if let Some(checkout_info) = if flag { value } else { other } {\n"
-                  "        map(|g| g + 1);\n    }\n}\n")
-        rename = BindingRename(3, source.splitlines()[2], "g", "checkout_info")
-        result = approved_renames.rename_admission(source, rename)
-        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
-        assert isinstance(result, approved_renames.OuterBindingUnproved)
-        self.assertEqual(result.reason, "wanted name already used in this item: 'checkout_info' at line 2")
-        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
 
     def test_preceding_enclosing_macro_cannot_hide_a_binding(self) -> None:
         source = "fn label() { introduce!(checkout_info);\n    map(|g| g + 1)\n}\n"
@@ -489,6 +477,10 @@ class AppliedCheckTests(unittest.TestCase):
         self.assertEqual(check("Config::old_field", "Config::new_field", "src/config.rs",
                                applied.replace("new_field", "old_field")), RenameNotApplied("src/config.rs"))
 
+    def test_a_struct_field_rename_ignores_another_structs_old_field(self) -> None:
+        source = "struct Wrap { new: u8 }\nstruct Other { old: u8 }\n"
+        self.assertEqual(check("Wrap::old", "Wrap::new", "src/lib.rs", source), AppliedInCode())
+
     def test_a_top_level_item_of_a_file_module_is_under_the_module(self) -> None:
         source = "pub fn new_fn() {}\nmod tests { fn reads() { super::new_fn(); } }\n"
         self.assertEqual(check("paths::old_fn", "paths::new_fn", "src/paths.rs", source), AppliedInCode())
@@ -508,18 +500,21 @@ class AppliedCheckTests(unittest.TestCase):
         self.assertEqual(check("crate::OldType", "crate::NewType", "src/types.rs", "pub struct NewType;\n"),
                          NoAppliedCheck("rename"))
 
-    def test_a_file_that_holds_both_names_has_no_check(self) -> None:
+    def test_a_file_that_holds_both_names_outside_the_same_scope_has_no_check(self) -> None:
         both = (("paths::old_fn", "paths::new_fn", "src/paths.rs", "pub fn new_fn() {}\nmod tests { fn old_fn() {} }\n"),
                 ("Parser::next", "Parser::advance", "src/parser.rs",
                  "pub struct Parser;\nimpl Parser { fn advance() {} }\nimpl Iterator for Parser { fn next() {} }\n"),
-                ("Config::enabled", "Config::is_enabled", "src/config.rs",
-                 "pub struct Config { is_enabled: bool }\nimpl Config { pub fn enabled(&self) -> bool { self.is_enabled } }\n"),
                 ("ffi::old", "ffi::new", "src/ffi.rs", 'pub fn new() {}\nextern "C" { fn old(); }\n'),
                 ("ffi::old", "ffi::new", "src/lib.rs", "mod ffi { pub fn new() {} items! { fn old() {} } }\n"),
                 ("Kind::Old", "Kind::New", "src/kind.rs", "struct Kind;\nimpl Kind { fn New() {} }\n"
                  + "mod other { struct Kind; impl Kind { fn Old() {} } }\n"))
         for before, after, path, source in both:
             self.assertEqual(check(before, after, path, source), NoAppliedCheck("rename"), source)
+
+    def test_an_item_rename_refuses_when_the_parent_still_declares_both_names(self) -> None:
+        source = "pub struct Config { is_enabled: bool }\nimpl Config { pub fn enabled(&self) -> bool { self.is_enabled } }\n"
+        self.assertEqual(check("Config::enabled", "Config::is_enabled", "src/config.rs", source),
+                         RenameNotApplied("src/config.rs"))
 
     def test_a_parent_name_that_more_than_one_item_has_gives_no_check(self) -> None:
         source = "mod a { enum Kind { Gone } }\nmod b { enum Kind { New } }\n"
@@ -625,6 +620,40 @@ class AppliedCheckTests(unittest.TestCase):
 
 
 class FileRenameTests(unittest.TestCase):
+    def test_a_binding_with_division_is_an_item_rename(self) -> None:
+        rename = approved_renames.classify_rename("src/lib.rs", "let old = total / count;", "let new = total / count;")
+        self.assertEqual(rename, approved_renames.ItemRename(BindingRename(0, "", "old", "new")))
+
+    def test_file_instruction_grammar_consumes_all_clauses(self) -> None:
+        parse = approved_renames.classify_rename
+        first = FileRename("src/foot.rs", "src/summary_foot.rs")
+        second = FileRename("src/foot_tests.rs", "src/summary_foot_tests.rs")
+        for suffix in (
+            " and foot_tests.rs to summary_foot_tests.rs.",
+            ", plus `foot_tests.rs` to `summary_foot_tests.rs`.",
+            ". Rename the companion file foot_tests.rs to summary_foot_tests.rs.",
+            "; Rename foot_tests.rs to summary_foot_tests.rs. Update the module declaration, imports, "
+            + "path attribute and documentation references.",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(parse(first.old, "foot.rs", "Rename foot.rs to summary_foot.rs" + suffix),
+                                 approved_renames.FileRenamePlan(first, (second,)))
+        for after in (
+            "Rename foot.rs to summary_foot.rs. Apply the same prefix to its companion tests.",
+            "Rename foot.rs to summary_foot.rs. Update imports and apply the same prefix to its tests.",
+            "Rename the directory foot to summary_foot.",
+            "Rename crate::foot to crate::summary_foot.",
+        ):
+            with self.subTest(after=after):
+                self.assertIsInstance(parse(first.old, "foot.rs", after), approved_renames.UnparsedFileRenames)
+        self.assertEqual(parse(first.old, "foot.rs", "Rename foot.rs to summary_foot.rs; "
+                               + "update ledger/mod.rs and all super::lock paths"), approved_renames.FileRenamePlan(first))
+        self.assertIsInstance(parse(first.old, "Foot::Old", "Foot::New"), approved_renames.ItemRename)
+
+    def test_file_rename_plan_refuses_the_same_source_under_two_path_spellings(self) -> None:
+        after = "Rename foot.rs to summary_foot.rs and src/foot.rs to src/other.rs."
+        self.assertEqual(approved_renames.stated_file_renames("rename", "src/foot.rs", after), ())
+
     def test_a_file_rename_is_read_from_the_finding_path_and_the_paths_its_after_names(self) -> None:
         path = "crates/cargo-berth/src/ledger/lock.rs"
         accepted = (

@@ -31,7 +31,7 @@ SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 def private_name(name: str) -> bool:
     """Identify publisher metadata and unfinished writes in any letter case."""
     folded = name.casefold()
-    return (folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+    return (folded in (".index.json", ".index.lock", "page-states") or folded.startswith(".review-link-")
             or atomic_file.temporary_target(folded) is not None)
 
 
@@ -48,6 +48,18 @@ def link_host() -> str:
     result = subprocess.run(["tailscale", "ip", "-4"],
                             capture_output=True, text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
     return str(ipaddress.IPv4Address(result.stdout.strip()))
+
+
+def snapshot_url(root: Path, path: Path, *,
+                 host: str | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                 port: int | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> str:
+    """Return the review URL for a path under the selected root."""
+    relative = path.relative_to(root).as_posix()
+    if isinstance(port, conf.UseConfiguredValue):
+        port = conf.read("review_links").whole("server_port")
+    if isinstance(host, conf.UseConfiguredValue):
+        host = link_host()
+    return f"http://{host}:{port}/{quote(relative)}"
 
 
 def render_markdown(source: str, title: str) -> str:
@@ -181,7 +193,7 @@ def snapshot_at(root: Path, files: list[Path], name: str = "review", *, new: boo
             if not reuse:
                 shutil.rmtree(folder)
             raise
-    return [f"http://{host}:{port}/{quote((folder / output).relative_to(root).as_posix())}"
+    return [snapshot_url(root, folder / output, host=host, port=port)
             for output in destinations]
 
 

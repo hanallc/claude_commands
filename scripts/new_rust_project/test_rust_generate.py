@@ -15,7 +15,7 @@ class RustGenerationRerunTests(ScriptRepositoryTestCase):
         _ = self.write(self.home / ".claude/templates/settings_local.json", "{}\n")
         self.environment["TEST_REMOTE"] = str(self.remote)
         self.environment["TEST_CARGO_CALLS"] = str(self.root / "cargo-calls")
-        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
         for command in ("cargo-generate", "cargo-mend", "taplo"):
             _ = self.stub(command, "pass\n")
         _ = self.stub("cargo", '''import os, sys
@@ -77,6 +77,17 @@ elif args[0] not in ("clippy", "+nightly"):
         self.assertEqual(finished.returncode, 0, finished.stderr)
         self.assertEqual((dest / ".claude/settings.local.json").read_text(), settings)
         self.assertNotIn("rust-generate", self.git("-C", str(dest), "ls-files").stdout)
+
+    def test_an_interrupted_project_publish_removes_the_stage_and_reruns(self) -> None:
+        dest = self.home / "rust/sample"
+        self.stop_command("mv", target=str(dest))
+        stopped = self.script("new_rust_project/rust_generate.sh", "sample", "--no-bevy")
+        self.assertNotEqual(stopped.returncode, 0)
+        self.assertEqual(list(dest.parent.glob(".sample.rust-generate-work*")), [])
+        finished = self.script("new_rust_project/rust_generate.sh", "sample", "--no-bevy")
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        self.assertEqual((dest / "src/main.rs").read_text(), "fn main() {}\n")
+        self.assertEqual(list(dest.parent.glob(".sample.rust-generate-work*")), [])
 
     def test_an_options_record_cannot_claim_a_foreign_standalone_destination(self) -> None:
         self.assert_foreign_destination_refused(("sample",), self.home / "rust/sample")

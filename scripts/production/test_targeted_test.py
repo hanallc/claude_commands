@@ -3,16 +3,48 @@ from __future__ import annotations
 
 import json
 import os
-from typing import ClassVar
+from pathlib import Path
+from typing import ClassVar, override
 from unittest import mock
 
-from scripts.production import merge_gate
+from scripts.production import merge_gate, targeted_test
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.lib import build_folders
 from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class TargetedTestTests(MergeGateFixture):
     suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.TARGETED_TEST
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        # The fixture's main branch has no merge gate pass.
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf",
+                                 "landing_branches=fixture-landing\nscan_roots=\n")
+
+    def test_targeted_runner_holds_and_removes_its_test_folder(self) -> None:
+        allocated: list[Path] = []
+
+        def run(args: merge_gate.GateArguments, mode: merge_gate.SuiteMode) -> int:
+            self.assertIs(mode, merge_gate.SuiteMode.TARGETED_TEST)
+            self.assertEqual(args.gate_job, StepJob("test-affected"))
+            path = Path(os.environ["TMPDIR"])
+            allocated.append(path)
+            self.assertEqual(build_folders.build_folder_state(path), "held")
+            _ = (path / "unfinished-output").write_text("temporary output")
+            return 7
+
+        with mock.patch.dict(os.environ, {**self.environment, "TMPDIR": str(self.root)}):
+            with mock.patch.object(merge_gate, "run_tests_only", side_effect=run):
+                self.assertEqual(targeted_test.main(["--repo", str(self.checkout)]), 7)
+            self.assertEqual(os.environ["TMPDIR"], str(self.root))
+        path, = allocated
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+        self.assertFalse(path.with_name(path.name + ".lock").exists())
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
@@ -64,6 +96,7 @@ class TargetedTestTests(MergeGateFixture):
     def test_a_nightly_red_marker_keeps_selection_by_the_four_rules(self) -> None:
         subject = self.checkout / "scripts/hooks/affected_subject.py"
         self.write(subject, "VALUE = 1\n")
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + "\n# affected_subject\n")
         self.write(self.checkout / "scripts/lib/test_first.py", "import scripts.hooks.affected_subject\n" + SUITE_MODULE)
         self.write(self.checkout / "scripts/message/test_first.py", 'SUBJECT = "assets/changed.txt"\n' + SUITE_MODULE)
         self.write(self.checkout / "scripts/message/test_unrelated.py", SUITE_MODULE)

@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import legacy_overlapping_tickets
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import os
 import sqlite3
 import subprocess
+import types
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from contextlib import closing
 from typing import cast, final
 from unittest import mock
+from weakref import ref
 from scripts.style import style_ledger
 from scripts.style import rules
 from scripts.style.approved_renames import AppliedInCode, BindingRename, RenameNotApplied, binding_rename_check
 from scripts.style import declarations
+from scripts.style import refill_facts
 from scripts.style import style_footprint
 from scripts.style import style_proposals
 from scripts.style import bulk_run
@@ -30,7 +34,55 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class StyleLedgerSitesTests(LedgerTestCase):
     def test_judging_checkpoint_keeps_the_base_coordinate_and_bulk_rename(self) -> None:
         ledger, finding, base, checkpoint = self.site_with_comment_checkpoint()
-        evidence = ledger.finding_site(finding, checkpoint)
+        parsed_files: list[ref[declarations.DeclaredFile]] = []
+        parse = declarations.read_declarations
+
+        def remember(source: str) -> declarations.DeclaredFile:
+            file = parse(source)
+            parsed_files.append(ref(file))
+            return file
+
+        cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips")).clear()
+        flush = refill_facts.RefillWriteBatch.flush
+        batch_versions: list[set[int]] = []
+
+        def flush_batch(batch: refill_facts.RefillWriteBatch, facts: refill_facts.RefillFacts) -> None:
+            versions: list[int] = []
+            for operation in batch.operations:
+                names = cast(types.CodeType, getattr(operation, "__code__")).co_freevars
+                if "versions" in names:
+                    cells = cast(tuple[types.CellType, ...], getattr(operation, "__closure__"))
+                    versions.append(id(cast(object, cells[names.index("versions")].cell_contents)))
+            if len(versions) > 1:
+                batch_versions.append(set(versions))
+            flush(batch, facts)
+
+        with (self.tip_builds() as inventories,
+              mock.patch.object(style_ledger, "read_declarations", wraps=remember) as reads,
+              mock.patch.object(declarations, "read_declarations", wraps=declarations.read_declarations) as separate,
+              mock.patch.object(refill_facts.RefillWriteBatch, "flush", autospec=True, side_effect=flush_batch)):
+            for _ in range(3):
+                _ = tuple(ledger.cells(rule=finding.rule))
+            evidence = ledger.finding_site(finding, checkpoint)
+        # The queued cell writes of one batch share one copy of unchanged source versions.
+        self.assertTrue(batch_versions)
+        self.assertTrue(all(len(versions) == 1 for versions in batch_versions))
+        commits = [cast(tuple[Path, str], call.args)[1] for call in inventories.call_args_list]
+        self.assertEqual(set(commits), {base, checkpoint})
+        self.assertEqual(len(commits), len(set(commits)))
+        self.assertEqual(style_footprint.tokenized_text.cache_info().currsize, 0)
+        parsed = [cast(tuple[str], call.args)[0] for call in reads.call_args_list]
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(len(set(parsed)), len(parsed))
+        separate.assert_not_called()
+        self.assertTrue(all(file() is None for file in parsed_files))
+        for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
+                      "_tips", "_commit_files", "_item_bodies", "_name_sites", "_outside_diffs"):
+            with self.subTest(completed_cache=cache):
+                self.assertFalse(getattr(ledger, cache))
+        items = cast(dict[tuple[str, str], tuple[declarations.DeclaredItem, ...]], getattr(ledger, "_declared_files"))
+        self.assertTrue(items)
+        self.assertTrue(all(commit == checkpoint for commit, _ in items))
         self.assertIsInstance(evidence, style_ledger.UnchangedSite)
         assert isinstance(evidence, style_ledger.UnchangedSite)
         self.assertEqual((evidence.path, evidence.line), (PARENT_FILE, 2))
@@ -278,20 +330,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
         finally:
             connection.set_trace_callback(None)
 
-    def test_legacy_candidate_source_blobs_are_read_in_the_site_batch(self) -> None:
-        source = "fn work() {\n    let old = 791;\n}\n"
-        ledger, finding, base, checkpoint = self.legacy_anchor(source, "// shifted\n" + source, "let old = 791;")
-        read_tip = cast(Callable[[str], style_ledger.RepositoryTip], getattr(ledger, "_tip"))
-        before, current = read_tip(base), read_tip(checkpoint)
-        wanted = {before.blobs[PARENT_FILE], current.blobs[PARENT_FILE]}
-        prepare = cast(Callable[[tuple[style_ledger.HeldFinding, ...], style_ledger.RepositoryTip], None],
-                       getattr(ledger, "_prepare_sites"))
-        with mock.patch.object(style_ledger, "blob_contents", wraps=style_ledger.blob_contents) as batches:
-            prepare((finding,), current)
-            self.assertEqual(ledger.finding_anchor(finding), style_ledger.FindingAnchor(base, PARENT_FILE, finding.line))
-        candidate_reads = [set(cast(dict[str, str], call.args[1]).values()) & wanted
-                           for call in batches.call_args_list]
-        self.assertEqual([blobs for blobs in candidate_reads if blobs], [wanted])
 
     def assert_hidden_enclosing_move_refused(self, prefix: str) -> None:
         header = "macro_rules! declarations {\n    () => {\n"
@@ -686,7 +724,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
         # The types read predates the rename ticket but reads exactly the base blob.
         ledger.ticket_add("2001", ticket_owner_id("types"), "read", "types", "crates/alpha", [path], [types])
-        ledger.ticket_assign("2001", "main")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("2001", "main")
         _ = ledger.ticket_base("2001")
         findings = tuple(ledger.hold(types, path, line, source.splitlines()[line - 1], "type", "u32", "Count",
                                      self.blob(types), "2001") for line in (2, 3))
@@ -738,7 +777,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         deleting = self.commit("Delete the types cell")
         self.record_removed(ledger, types, path, deleting, ticket="2001")
         # The rename ticket starts at a byte-identical restoration of the deleted file.
-        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        with legacy_overlapping_tickets():
+            ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
         self.assertEqual(self.git("rev-parse", f"{original}:{path}"), self.git("rev-parse", f"{base}:{path}"))
         ledger.record(types, path, original, self.blob(types), "clean", ticket="2001", worker="late-judge",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
@@ -922,6 +962,12 @@ class StyleLedgerSitesTests(LedgerTestCase):
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
         _, (field, header) = self.judge_parent(ledger, ((2, "old: u32,"), (1, "pub struct Parent {")))
         tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: PARENT})
+        with mock.patch.object(style_ledger, "read_declarations", wraps=declarations.read_declarations) as first_reads:
+            reading = ledger.declaration_reading((field, header), lambda _: True)
+        sources = [cast(tuple[str], call.args)[0] for call in first_reads.call_args_list]
+        self.assertEqual(len(sources), len(set(sources)))
+        self.assertEqual([type(outcome) for outcome in reading.outcomes], [style_ledger.DeclarationMoved] * 2)
+        self.assertEqual(style_footprint.tokenized_text.cache_info().currsize, 0)
         judged = style_ledger.Ledger.finding_anchor
         written = False
 
@@ -940,12 +986,16 @@ class StyleLedgerSitesTests(LedgerTestCase):
             outcomes = self.follow_approved(ledger, [field, header])
         resolves = [call for call in runs.call_args_list if "--quiet" in cast(tuple[list[str]], call.args)[0]]
         self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
-        # One judged commit, and each of a.rs and b.rs at the judged commit and at the tip, across two findings and
-        # four readings: a plan, its refused recheck, a plan and its recheck.
-        self.assertEqual((len(resolves), reads.call_count), (1, 4))
+        # Each reading shares compact parsing until its final outcome.
+        # The first reading also supplies the immutable ancestry result.
+        self.assertEqual((len(resolves), reads.call_count), (0, 4))
         rows = {finding.finding_id: (finding.path, finding.line, finding.follow) for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
         self.assertEqual(rows[field], (MOVED_FILE, 3, style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
         self.assertEqual(rows[header][:2], (MOVED_FILE, 1))
+        for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
+                      "_tips", "_commit_files", "_item_bodies", "_name_sites", "_outside_diffs"):
+            with self.subTest(completed_cache=cache):
+                self.assertFalse(getattr(ledger, cache))
 
 
     def test_a_filed_rename_whose_after_name_its_file_now_declares_is_built_not_withdrawn(self) -> None:
@@ -1075,7 +1125,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         left, = self.follow_approved(ledger, [finding_id])
         self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
         self.assertEqual(self.held_rows(ledger.database), before)
-        self.assertIn("keyword differs", repr(left))
+        assert isinstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(left.evidence.candidates, style_ledger.NoOutsideCandidates())
 
 
     def test_a_filed_rename_whose_after_name_one_file_in_another_crate_gained_is_left(self) -> None:
@@ -1164,19 +1215,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
               self.assertRaisesRegex(style_ledger.LedgerError, f"synced tip moved from {planned}")):
             _ = ledger.follow_declarations([finding_id], planned, lambda _: True)
         self.assertEqual(self.held_rows(ledger.database), before)
-
-
-    def test_a_built_rename_reads_its_file_at_each_commit_once_across_the_plan_and_its_recheck(self) -> None:
-        ledger = self.ledger()
-        finding_id = self.renamed_parent(ledger)
-        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
-        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as runs:
-            renamed, = self.follow_approved(ledger, [finding_id])
-        self.assertIsInstance(renamed, style_ledger.DeclarationRenamed)
-        reads = [call for call in runs.call_args_list
-                 if PARENT_FILE in cast(tuple[list[str]], call.args)[0] and "ls-tree" in cast(tuple[list[str]], call.args)[0]]
-        # a.rs at the read commit and at the tip; the applied check and the recheck under the lock read no git.
-        self.assertEqual(len(reads), 2)
 
 
     def test_a_trait_qualified_built_rename_follows_a_filed_impl_method_and_keeps_its_type_owner(self) -> None:
@@ -1303,7 +1341,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         ledger.ticket_assign("4001", "main")
         _ = ledger.ticket_base("4001")
         finding = ledger.hold(rule, PARENT_FILE, 7, "7", "restructure", "body", "new body", self.blob(rule), "4001")
-        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        with legacy_overlapping_tickets():
+            _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
         _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
         before = self.held_rows(ledger.database)
         outcome, = self.follow_approved(ledger, [finding.finding_id])
@@ -1673,26 +1712,80 @@ class StyleLedgerSitesTests(LedgerTestCase):
 
 
     def test_outside_method_renames_require_the_same_resolved_generic_argument(self) -> None:
-        for changed in (False, True):
-            with self.subTest(argument_changed=changed):
-                with style_ledger.Ledger(self.repo, self.root / f"generic-owner-{changed}.db") as ledger:
+        for changed, unrelated in ((False, False), (True, False), (False, True)):
+            with self.subTest(argument_changed=changed, unrelated_items=unrelated):
+                with style_ledger.Ledger(self.repo, self.root / f"generic-owner-{changed}-{unrelated}.db") as ledger:
                     source = ("use crate::a::one::Arg as A;\nmod one { pub struct Arg; }\n"
                               + "mod two { pub struct Arg; }\nstruct Holder<T>(T);\n"
                               + "impl crate::a::Holder<A> {\n    fn original(&self) -> u32 {\n        1\n    }\n}\n")
-                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: ""})
                     _, (finding_id,) = self.judge_parent(ledger, ((6, "fn original(&self) -> u32 {"),), kind="restructure")
                     target = source.replace("fn original", "fn renamed")
                     if changed:
                         target = target.replace("use crate::a::one::Arg", "use crate::a::two::Arg")
-                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    if not unrelated:
+                        target += ("impl crate::a::Holder<A> {\n"
+                                   "    fn rejected(&self) -> u32 {\n        2\n    }\n"
+                                   "    fn ignored(&self) -> u32 {\n        3\n    }\n}\n")
+                    other_items = ("pub struct Other;\nimpl Other {\n    fn unrelated(&self) -> u32 {\n        1\n    }\n}\n"
+                                   if unrelated else "")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target, MOVED_FILE: other_items})
                     before = self.held_rows(ledger.database)
-                    outcome, = self.follow_approved(ledger, [finding_id])
+                    tokenizer = style_footprint.tokenized_text
+                    lexical_reads: list[str] = []
+
+                    def read_tokens(text: str) -> style_footprint.TokenizedText:
+                        misses = tokenizer.cache_info().misses
+                        result = tokenizer(text)
+                        if tokenizer.cache_info().misses != misses:
+                            lexical_reads.append(text)
+                        return result
+
+                    release = cast(Callable[[str], None], getattr(ledger, "_release_declaration_commit"))
+                    released: list[str] = []
+
+                    def release_commit(commit: str) -> None:
+                        tips = cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips"))
+                        self.assertIn(commit, tips)
+                        release(commit)
+                        released.append(commit)
+                        # A finished group keeps no historical tree inventory or search domain.
+                        self.assertNotIn(commit, tips)
+                        domains = cast(dict[tuple[str, tuple[str, ...]], object], getattr(ledger, "_search_domains"))
+                        self.assertFalse([key for key in domains if key[0] == commit])
+
+                    with (mock.patch.object(style_footprint, "tokenized_text", wraps=read_tokens) as tokens,
+                          mock.patch.object(ledger, "_file_at", wraps=getattr(ledger, "_file_at")) as file_reads,
+                          mock.patch.object(ledger, "_outside_search", wraps=getattr(ledger, "_outside_search")) as searches,
+                          mock.patch.object(ledger, "_release_declaration_commit", side_effect=release_commit)):
+                        setattr(tokens, "__wrapped__", tokenizer.__wrapped__)
+                        tokens.attach_mock(mock.Mock(side_effect=tokenizer.cache_clear), "cache_clear")
+                        _ = ledger.declaration_reading((finding_id,), lambda _: True)
+                    self.assertTrue(released)
+                    self.assertEqual(lexical_reads.count(source), 1)
+                    self.assertEqual(lexical_reads.count(target), 1)
+                    coordinates = [cast(tuple[str, str], call.args) for call in file_reads.call_args_list]
+                    self.assertEqual(len(coordinates), len(set(coordinates)))
+                    searches.assert_called()
+                    for cache in ("_trait_imports", "_trait_positions", "_module_links", "_extern_file_names",
+                                  "_type_header_conditions", "_commit_files", "_parsed_files", "_declared_blobs"):
+                        self.assertFalse(getattr(ledger, cache))
+                    with mock.patch.object(ledger, "_outside_body_check", wraps=getattr(ledger, "_outside_body_check")) as body_checks:
+                        outcome, = self.follow_approved(ledger, [finding_id])
+                    if unrelated:
+                        body_checks.assert_called()
+                        for call in body_checks.call_args_list:
+                            item = cast(declarations.DeclaredItem, call.args[5])
+                            self.assertEqual((call.args[4], item.declaration), (
+                                PARENT_FILE, declarations.Declaration("fn", "renamed", declarations.ImplOrTraitItem("Holder"))))
                     if changed:
                         self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
                         self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
                         self.assertEqual(self.held_rows(ledger.database), before)
                     else:
                         self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        moved = cast(style_ledger.DeclarationMoved, outcome)
+                        self.assertEqual((moved.path, moved.line), (PARENT_FILE, 6))
                         row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
                         self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Filed(self.root / "decision.md")))
 
@@ -2149,7 +2242,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
             left, = self.follow_approved(ledger, [finding_id])
         self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
 
 if __name__ == "__main__":

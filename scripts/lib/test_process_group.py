@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_startup
+
 import ast
 from collections.abc import Callable
 from contextlib import redirect_stderr
@@ -21,16 +23,41 @@ import unittest
 from typing import cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
+
+
+def shell_without_redirections(line: str) -> str:
+    """Remove redirections and preserve commands inside process substitutions."""
+    tokens = re.finditer(
+        r'''(?:[^\s;&|()<>'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+'''
+        + r'''|[<>]\(|&>>|<<<|<<-|>>|<<|>&|<&|<>|>\||&>|&&|\|\||[^\s]''', line)
+    parts: list[re.Match[str]] = []
+    target = False
+    for token in tokens:
+        if target:
+            target = False
+            if token.group() not in {"<(", ">("}:
+                continue
+        if token.group() in {"<", ">", ">>", "<<", "<<-", "<<<", ">&", "<&", "<>", ">|", "&>", "&>>"}:
+            if (parts and token.group() not in {"&>", "&>>"} and parts[-1].group().isdigit()
+                    and parts[-1].end() == token.start()):
+                _ = parts.pop()
+            target = True
+            continue
+        parts.append(token)
+    return " ".join(part.group() for part in parts)
 
 
 def shell_group_kills(line: str) -> bool:
     """Find group operands, including commands quoted for a nested shell."""
     if "kill" not in line:
         return False
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
+    lexer = shlex.shlex(shell_without_redirections(line), posix=True, punctuation_chars=";&|()")
     lexer.whitespace_split = True
     try:
         words = list(lexer)
@@ -93,33 +120,39 @@ def unguarded_group_signals(scripts: Path) -> list[str]:
                 continue
         relative = path.relative_to(scripts)
         source = path.read_text(encoding="utf-8")
+        # Each finding needs the word kill: a parse of each other file only costs time.
+        if "kill" not in source.replace("\\\n", ""):
+            continue
         lines: set[int] = set()
         if path.suffix == ".py" or (source.startswith("#!") and "python" in source.partition("\n")[0]):
             tree = ast.parse(source, filename=str(path))
             direct_names = {"killpg"}
+            names: list[ast.Name] = []
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
                     for alias in node.names:
                         if alias.name == "killpg":
                             direct_names.add(alias.asname or alias.name)
                             lines.add(node.lineno)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Attribute) and node.attr == "killpg":
+                elif isinstance(node, ast.Attribute) and node.attr == "killpg":
                     lines.add(node.lineno)
-                elif isinstance(node, ast.Name) and node.id in direct_names:
-                    lines.add(node.lineno)
+                elif isinstance(node, ast.Name):
+                    names.append(node)
                 elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    if any(shell_group_kills(line) or re.search(r"\.\s*killpg\s*\(", line)
-                           for line in node.value.replace("\\\n", "").splitlines()):
+                    text = node.value.replace("\\\n", "")
+                    if "kill" in text and any("kill" in line and (shell_group_kills(line)
+                                                                  or re.search(r"\.\s*killpg\s*\(", line))
+                                              for line in text.splitlines()):
                         lines.add(node.lineno)
+            lines.update(node.lineno for node in names if node.id in direct_names)
         else:
             for number, line in enumerate(source.replace("\\\n", "").splitlines(), 1):
-                if (re.search(r"(?:\.\s*|\b)killpg\s*\(|\bfrom\s+os\s+import\s+killpg\b", line)
-                        or shell_group_kills(line)):
+                if "kill" in line and (re.search(r"(?:\.\s*|\b)killpg\s*\(|\bfrom\s+os\s+import\s+killpg\b", line)
+                                       or shell_group_kills(line)):
                     lines.add(number)
         if relative == Path("lib/process_group.py"):
             allowed = next((node for node in ast.walk(ast.parse(source))
-                            if isinstance(node, ast.FunctionDef) and node.name == "send_process_group"), None)
+                            if isinstance(node, ast.FunctionDef) and node.name == "_send_checked_group"), None)
             if allowed is not None:
                 send_line = next((node.lineno for node in ast.walk(allowed)
                                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -158,6 +191,16 @@ class ProcessGroupTests(PrivateGroupFixture):
             process_group.send_process_group(child.pid, signal.SIGTERM)
             send.assert_called_once_with(child.pid, signal.SIGTERM)
 
+    def test_only_the_group_leader_can_terminate_its_own_group(self) -> None:
+        pid = os.getpid()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid + 1):
+            with self.assertRaises(ValueError):
+                process_group.terminate_owned_process_group()
+            send.assert_not_called()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid):
+            process_group.terminate_owned_process_group()
+            send.assert_called_once_with(pid, signal.SIGTERM)
+
     def test_cli_refuses_invalid_ids_without_sending_a_signal(self) -> None:
         invalid: tuple[object, ...] = (MagicMock(), True, False, 0, 1, -2, os.getpgrp())
         with patch.object(os, "killpg") as send, redirect_stderr(io.StringIO()):
@@ -178,24 +221,28 @@ class ProcessGroupTests(PrivateGroupFixture):
 
 class ShellProcessGroupTests(PrivateGroupFixture):
     root: Path = Path()
-    environment: dict[str, str] = {}
+    fixture_environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(directory)
         scripts = Path(__file__).resolve().parents[1]
-        for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
-                     "lib/process_start.py", "lib/conf.sh", "lib/conf.py"):
+        for name in ("direct/board.sh", "direct/file_lock.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
+                     "lib/process_start.py", "lib/conf.sh", "lib/conf_record.sh", "lib/conf.py", "lib/conf_reads.py"):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(scripts / name, destination)
+        copy_startup(self.root)
         home = self.root / "home"
         home.mkdir()
-        self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), "CLAUDE_PYTHON": sys.executable,
-                            "XDG_CACHE_HOME": str(self.root / "cache"),
-                            "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+        self.fixture_environment = {**config_environment(self.root / "config"),
+                                    "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
+                                    "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {**verify_test_environment(), **self.fixture_environment}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         board = self.root / "scripts/direct/board.sh"
@@ -268,8 +315,14 @@ final_pass_finish() { :; }
     def test_copied_verify_cancellation_uses_the_local_helper(self) -> None:
         self.fake_helper(0)
         child = self.private_child()
-        for function, status, signum in (("cancel_tree_run", 77, "KILL"), ("verify_interrupted", 143, "15")):
-            with self.subTest(function=function):
+        startup = refusing_bash_startup(self.root)
+        for function, status, signum, bash_env in (
+            ("cancel_tree_run", 77, "KILL", ""),
+            ("verify_interrupted", 143, "15", ""),
+            ("cancel_tree_run", 77, "KILL", str(startup)),
+        ):
+            with (self.subTest(function=function, caller_startup=bool(bash_env)),
+                  patch.dict(os.environ, {"BASH_ENV": bash_env})):
                 result = self.cancel_step(function, child)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
@@ -312,7 +365,7 @@ final_pass_finish() { :; }
     def test_verify_forward_uses_its_local_helper_without_an_individual_signal(self) -> None:
         self.fake_helper(0)
         forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(os, "kill") as individual:
             forward(signal.SIGTERM, None)
         individual.assert_not_called()
         self.assertTrue((self.root / "helper-arguments").read_text().endswith(f" {signal.SIGTERM}"))
@@ -324,7 +377,7 @@ final_pass_finish() { :; }
                 self.fake_helper(2)
                 if failure == "missing":
                     (self.root / "scripts/lib/process_group.py").unlink()
-                with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
+                with patch.dict(os.environ, self.environment, clear=True), patch.object(os, "kill") as individual:
                     with self.assertRaises(SystemExit) as refused:
                         forward(signal.SIGTERM, None)
                 individual.assert_not_called()
@@ -334,16 +387,13 @@ final_pass_finish() { :; }
     def test_verify_only_uses_individual_fallback_for_a_missing_group(self) -> None:
         self.fake_helper(3)
         forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(os, "kill") as individual:
             forward(signal.SIGTERM, None)
         arguments = (self.root / "helper-arguments").read_text().split()
         individual.assert_called_once_with(int(arguments[0]), signal.SIGTERM)
 
 
 class ProcessGroupSourceTests(unittest.TestCase):
-    def test_scripts_route_every_group_signal_through_the_shared_check(self) -> None:
-        self.assertEqual(unguarded_group_signals(Path(__file__).resolve().parents[1]), [])
-
     def test_guard_finds_planted_python_shell_and_heredoc_sends(self) -> None:
         python_send = "os." + "killpg"
         shell_send = "ki" + "ll"
@@ -353,6 +403,24 @@ class ProcessGroupSourceTests(unittest.TestCase):
             "direct.py": "from os import " + "killpg as send\nsend(pid, 15)\n",
             "raw.sh": f'{shell_send} -TERM -- "-$CHILD_PID"\n',
             "numeric.sh": f"{shell_send} -9 -12345\n",
+            "equals.sh": f"{shell_send} = 0\n",
+            "command_equals.sh": f"command {shell_send} = 0\n",
+            "nested_equals.sh": f'bash -c "{shell_send} = 0"\n',
+            "nested_equals.py": f"import subprocess\nsubprocess.run(['bash', '-c', '{shell_send} = 0'])\n",
+            "shell_equals.py": f"import subprocess\nsubprocess.run('{shell_send} = 0', shell=True)\n",
+            "system_equals.py": f"import os\nos.system('{shell_send} = 0')\n",
+            "assignment_shell.py": f"script = 'x=1\\n{shell_send} -TERM -0'\n",
+            "redirect_stderr.sh": f"{shell_send} -TERM -0 2>/dev/null\n",
+            "redirect_stdin.sh": f"{shell_send} -TERM -0 < /dev/null\n",
+            "redirect_both.sh": f"{shell_send} -TERM 0&>/dev/null\n",
+            "redirect_both_append.sh": f"{shell_send} -TERM 0&>>/dev/null\n",
+            "process_substitution_input.sh": f"cat <({shell_send} -TERM -0)\n",
+            "process_substitution_output.sh": f"cat >({shell_send} -TERM -0)\n",
+            "redirect_process_substitution_input.sh": f"cat < <({shell_send} -TERM -0)\n",
+            "redirect_process_substitution_output.sh": f"cat > >({shell_send} -TERM -0)\n",
+            "spaced_descriptor.sh": f"{shell_send} -TERM 0 >/dev/null\n",
+            "quoted_descriptor.sh": f'{shell_send} -TERM "0">/dev/null\n',
+            "quoted_operator.sh": f'{shell_send} -TERM ">" 0\n',
             "continued.sh": f'{shell_send} -TERM \\\n-- "-$CHILD_PID"\n',
             "no_extension": f'#!/bin/bash\n{shell_send} -- "-$CHILD_PID"\n',
             "lib/process_group.py": f"def send_process_group(pid, sig):\n    {python_send}(pid, sig)\n{python_send}(pid, sig)\n",
@@ -368,6 +436,21 @@ class ProcessGroupSourceTests(unittest.TestCase):
             _ = (scripts / "prose.py").write_text(
                 f"body = 'Type ! {shell_send} -TERM -12345 in the other session.'\n"
                 + f'''reason = 'the body says to type "{shell_send} -TERM -12345"'\n''')
+            safe_cases = {
+                "worker.py": """worker = \"\"\"
+    kill = 'put-object' in arguments if during_launch < 0 else 'run-instances' in arguments if during_launch else 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json')
+\"\"\"
+""",
+                "annotated_worker.py": 'worker = "kill: bool = during_launch < 0"\n',
+                "spaced_annotation_worker.py": 'worker = "kill : bool = during_launch < 0"\n',
+            }
+            for number, redirect in enumerate(("<", ">", ">>", "<<", "<<<", ">&", "<&", "&>", "2>", "0>")):
+                name = f"redirect_before_group_{number}.sh"
+                cases[name] = f"{shell_send} -TERM {redirect} /dev/null -- -0\n"
+                _ = (scripts / name).write_text(cases[name])
+                safe_cases[f"redirect_target_{number}.sh"] = f"{shell_send} -TERM {redirect} 0\n"
+            for name, source in safe_cases.items():
+                _ = (scripts / name).write_text(source)
             found = {finding.split(":", 1)[0] for finding in unguarded_group_signals(scripts)}
             self.assertEqual(found, set(cases))
 

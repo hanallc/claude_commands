@@ -22,7 +22,6 @@ CLEAR = Path(__file__).with_name("clear_phase_review.sh")
 
 
 class PhaseArtifactTests(StaffTestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @cached_property
@@ -32,15 +31,10 @@ class PhaseArtifactTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.temporary = tempfile.TemporaryDirectory()
-        self.session = Path(self.temporary.name) / "run"
+        self.session = Path(self.enterContext(tempfile.TemporaryDirectory())) / "run"
         for phase in ("3", "4"):
             (self.session / "phases" / phase).mkdir(parents=True)
         self.write_json(self.session / "progress_history_state.json", {"owner_staff_id": self.parent.id})
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def write(self, relative: str, text: str = "") -> Path:
         path = self.session / relative
@@ -53,18 +47,27 @@ class PhaseArtifactTests(StaffTestCase):
             "owner_staff_id": self.parent.id,
             "pass": {"review": {"instance_id": "review-pass", "worker_id": reviewer.id,
                                   "kind": "review", "status": "completed"}}})
-        cleared = [self.write(f"phases/3/{name}") for name in ("review_prompt_1_adversary.md",
-                                                                "review_findings_1_adversary.txt",
-                                                                "review_status_adversary", "project-review_status_adversary", "ux_shots_1.txt")]
-        kept = [self.write(f"phases/4/{name}") for name in ("review_prompt_1_adversary.md",
-                                                             "review_findings_1_adversary.txt")]
-        kept.append(self.write("phases/3/implementation_prompt.md"))
-        kept.append(self.write("phases/3/impl_status_impl", "implementing\n"))
-        result = subprocess.run(["bash", str(CLEAR), str(self.session), "3"], capture_output=True,
-                                text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([path for path in cleared if path.exists()], [])
-        self.assertEqual([path for path in kept if not path.exists()], [])
+        # An older checkout as the working directory must not replace the script's own modules.
+        decoy = self.session.parent / "older-checkout"
+        for package in ("scripts", "scripts/direct", "scripts/production"):
+            (decoy / package).mkdir(parents=True, exist_ok=True)
+            _ = (decoy / package / "__init__.py").write_text("", encoding="utf-8")
+        (decoy / "scripts/lib").mkdir()
+        _ = (decoy / "scripts/lib/py").write_text("", encoding="utf-8")
+        for directory in (None, decoy):
+            with self.subTest(directory=directory):
+                cleared = [self.write(f"phases/3/{name}") for name in ("review_prompt_1_adversary.md",
+                                                                        "review_findings_1_adversary.txt",
+                                                                        "review_status_adversary", "project-review_status_adversary", "ux_shots_1.txt")]
+                kept = [self.write(f"phases/4/{name}") for name in ("review_prompt_1_adversary.md",
+                                                                     "review_findings_1_adversary.txt")]
+                kept.append(self.write("phases/3/implementation_prompt.md"))
+                kept.append(self.write("phases/3/impl_status_impl", "implementing\n"))
+                result = subprocess.run(["bash", str(CLEAR), str(self.session), "3"], capture_output=True,
+                                        text=True, check=False, cwd=directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([path for path in cleared if path.exists()], [])
+                self.assertEqual([path for path in kept if not path.exists()], [])
 
     def test_a_phase_reviewing_counts_as_running_work(self) -> None:
         _ = self.write("phases/4/project-review_status_adversary", "reviewing\n")

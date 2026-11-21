@@ -88,8 +88,8 @@ Phase records are the unit director's, and both belong at the real boundary:
 before that phase's first dispatch. Recording them late attributes the new
 phase's work to the finished one — its title, its elapsed clock, and its pass
 counts all describe the wrong phase. A phase opened beside one still running
-leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
-closes each at its own end. Name the phase on every launch,
+leaves that phase open. Use `finish-phase --phase-id <id>` at the end of each phase.
+Name the phase on every launch.
 `assign.sh --role implement --phase <id>` and `assign.sh --role review --phase <id>`: the pass is stamped
 with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
 A launch without a phase is refused (the user, 2026-10-28).
@@ -300,7 +300,7 @@ question, never on a path. Use the unit's own reviewer under <TeamReview/> and d
 On completion, read the dispatch's status and summary paths.
 A successful dispatch continues as above. An error applies <WorkerLaunchFailure/>.
 If the error remains, apply <RetainPhaseReservation/> and report the fix log.
-Record the error, clear the session marker, and stop.
+Record the error. Clear the run pointer in the director's staff row. Stop the run.
 The launcher records either outcome in the ledger.
 Apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
 Run `abandon` only when that recovery cannot finish it.

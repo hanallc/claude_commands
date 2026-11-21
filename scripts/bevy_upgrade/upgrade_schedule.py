@@ -12,7 +12,7 @@ from pathlib import Path
 
 from scripts.lib.process_failure import failure_detail
 from scripts.production import staff
-from scripts.message import session_send
+from scripts.message import send_result, session_send
 from scripts.bevy_upgrade.upgrade_record import Record
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -64,14 +64,15 @@ def tell_showrunner(staff_id: str, summary: str, text: str) -> bool:
     if address:
         sender = os.environ.get("BEVY_UPGRADE_SEND", str(session_send.SEND_SCRIPT))
         try:
-            result = subprocess.run([str(SCRIPTS / "lib/py"), sender, "--to", address,
+            result = subprocess.run(session_send.send_argv("--to", address,
                                      "--from", "bevy-upgrade", "--key", instance(staff_id),
-                                     "--summary", summary, "--text", text],
+                                     "--summary", summary, "--text", text, send_script=Path(sender),
+                                     python_interpreter=session_send.PYTHON_LAUNCHER),
                                     capture_output=True, text=True, check=False)
         except OSError as error:
             outcome = f"FAILED: {error}"
         else:
-            if result.returncode == 0 and result.stdout.strip().startswith("SENT:"):
+            if send_result.delivered_or_kept(result.returncode, result.stdout):
                 return True
             outcome = failure_detail(result)
     print(f"bevy_upgrade: the showrunner was not told: {outcome}", file=sys.stderr)
@@ -85,8 +86,9 @@ def retire_message(staff_id: str) -> None:
         if not address:
             return
         sender = os.environ.get("BEVY_UPGRADE_SEND", str(session_send.SEND_SCRIPT))
-        result = subprocess.run([str(SCRIPTS / "lib/py"), sender, "retire", "--to", address,
-                                 "--from", "bevy-upgrade", "--key", instance(staff_id)],
+        result = subprocess.run(session_send.send_argv("retire", "--to", address,
+                                 "--from", "bevy-upgrade", "--key", instance(staff_id), send_script=Path(sender),
+                                 python_interpreter=session_send.PYTHON_LAUNCHER),
                                 capture_output=True, text=True, check=False)
     except OSError as error:
         outcome = str(error)

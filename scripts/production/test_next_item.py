@@ -2,10 +2,13 @@
 """Tests for next_item.py: the one item /next shows from the four lists, and moving an item to the end."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.production.change_review_test_support import pictured_changes
+
+from scripts.agents import remote
 
 import contextlib
 import io
+import json
 import os
 import re
 import tempfile
@@ -21,7 +24,7 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.production import footer_counts
-from scripts.production import next_item
+from scripts.production import next_item, investigation
 from scripts.production.production_doc import Production
 from scripts.production import proposals_folder
 from scripts.production import showrunners
@@ -45,6 +48,7 @@ ITEM = re.compile(r"\b(\w+)-item\b")
 LEDGER = """\
 - 2026-10-05 rust/nateroids: Build CI tests without debug info [gain/week: 2.5 h red CI] — deferred
 - 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed
+- 2026-10-13 rust/hana: Keep the smaller check [gain/week: 12 min waiting] — proposed
 """
 
 
@@ -78,7 +82,7 @@ class NextItemTests(unittest.TestCase):
         self.root = Path(folder.name)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
-                "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
+                "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
         _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
         with contextlib.ExitStack() as stack:
@@ -92,6 +96,7 @@ class NextItemTests(unittest.TestCase):
                                                Entry("C2", "C2 Later change", Urgency(urgency.LATER), since=at(2))]),
             "proposal": Queue("proposal-demo", [Entry("P1", "P1 A proposal", since=at(3), value=(9.0,))]),
             "efficiency": Queue("efficiency", []),
+            "investigation": Queue("investigation", []),
             "question": Queue("question-demo", [Entry("Q1", "demo: Which port?", Urgency(urgency.BLOCKS), since=at(4)),
                                                 Entry("Q2", "demo: Newest question", since=at(5))]),
         }
@@ -201,11 +206,11 @@ class NextItemTests(unittest.TestCase):
         assert owner is not None
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         _ = doc.write_text(f"# Demo\n\n## Production Context\n\n- **Efficiency ledger:** {self.root / 'ledger.md'}\n")
-        line = LEDGER.splitlines()[0]
+        line = LEDGER.splitlines()[1]
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name), (0, f"efficiency\n{line}\n", ""))
         self.assertEqual(run("move-to-end", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[0], 0)
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[1],
-                         f"efficiency\n{LEDGER.splitlines()[1]}\n")
+                         f"efficiency\n{LEDGER.splitlines()[2]}\n")
         # A production whose doc names no Efficiency ledger has no efficiency items.
         bare = doc.with_name("bare-production.md")
         _ = fixture_member("showrunner", name="bare", doc=staff.LiveDoc(remote.local_machine(), bare))
@@ -213,12 +218,13 @@ class NextItemTests(unittest.TestCase):
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(bare, staff.snapshot()).name)[1],
                          "no efficiency is waiting for you\n")
         path = self.root / "change-review" / "change-review - natedev.md"
-        _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
+        _ = change_review.append_rows(path, pictured_changes([Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")]),
                                       date(2026, 10, 15), "", doc, record=staff.snapshot())
         _ = doc.write_text(doc.read_text() + f"- **Change review:** `{path.with_name('change-review - demo.md')}`\n")
         self.assertEqual(run("show", "--kind", "change", "--production", "demo"), (0, "\n".join([
-            "change", "natedev/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
-            "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
+            "change", "demo/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
+            "  Merged: 2026-10-15", "  Production: demo",
+            f"  Image: {change_review.pending(path)[0][change_review.IMAGE]}", ""]), ""))
 
     def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:
         plans = self.root / "docs" / "plans"
@@ -240,7 +246,7 @@ class NextItemTests(unittest.TestCase):
         # The side production is a root of its own, with its own list.
         side_list = path.with_name("change-review - side.md")
         for name in (*names, "gone"):
-            _ = change_review.append_rows(side_list if name == "side" else path, [Visible(f"{name}-item change", "Run it", "It works")], date(2026, 10, 15),
+            _ = change_review.append_rows(side_list if name == "side" else path, pictured_changes([Visible(f"{name}-item change", "Run it", "It works")]), date(2026, 10, 15),
                                           "", docs.get(name, docs["top"]), record=staff.snapshot())
         # A row without a production belongs to the list's root.
         root_id = unit_lookup.doc_owner(docs["top"], staff.snapshot()).id
@@ -254,8 +260,15 @@ class NextItemTests(unittest.TestCase):
             if existing is not None:
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc(remote.local_machine(), doc))
-            _ = (outstanding / f"{owner.id}.json").write_text(
-                f'[{{"since": "2026-10-06T09:00", "text": "{name}-item"}}]')
+            with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
+                item = investigation.file(owner.id, f"{name}-item", "Find the cause.", waiting_why='The owner must complete the investigation.')
+                _ = investigation.answer(owner.id, item.id, "The cause is known.")
+            fields = {"since": "2026-10-06T09:00", "text": f"{name}-item", "question": f"{name}-item next step?",
+                      "asked_by": owner.id}
+            _ = (issues_folder / f"question-{owner.id}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{name}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
@@ -291,7 +304,7 @@ class NextItemTests(unittest.TestCase):
                 mock.patch.object(showrunner_tree, "descendants_of", descendants_of), \
                 mock.patch.object(showrunners, "timer_docs", return_value=docs), \
                 mock.patch.object(change_review, "production_list", the_list), \
-                mock.patch.object(next_item, "read_production", production), \
+                mock.patch("scripts.production.production_doc.read_production", production), \
                 mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
             for kind in next_item.KINDS:
                 # Each showrunner shows its own production: never the one above, and not the ones below.
@@ -309,12 +322,36 @@ class NextItemTests(unittest.TestCase):
             # Each showrunner pins its own change row, so one /next never moves the other's.
             self.assertNotEqual(next_item.change_queue(docs["top"]).name, next_item.change_queue(docs["kid"]).name)
 
+            producer = fixture_member("producer", name="planner")
+            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.", waiting_why='The owner must complete the investigation.')
+            ready = investigation.answer(producer.id, ready.id, "The producer answer is ready.")
+            with mock.patch.object(staff, "caller_identity", return_value=producer.current_session):
+                for arguments in (("show", "--kind", "investigation"), ("show",)):
+                    with self.subTest(finding="F025", arguments=arguments):
+                        code, output, error = run(*arguments)
+                        self.assertEqual((code, error), (0, ""))
+                        self.assertEqual(output.splitlines()[:2],
+                                         ["investigation", "planner/"+ready.id+" Producer investigation"])
+                for kind in ("change", "proposal", "efficiency"):
+                    with self.subTest(finding="F025", kind=kind):
+                        self.assertEqual(run("show", "--kind", kind),
+                                         (0, f"no {kind} is waiting for you\n", ""))
+                        queue = next_item.read_queue(kind, None)
+                        self.assertTrue(queue.name)
+                        self.assertEqual(queue.entries, [])
+                with self.subTest(finding="F025", selection="explicit production"):
+                    code, output, error = run("show", "--kind", "investigation", "--production", "top")
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertIn("top-item", output)
+                    self.assertNotIn("Producer investigation", output)
+                self.assertEqual(urgency.pinned("next-"+producer.id), f"investigation/{producer.id}/{ready.id}")
+
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"
         root = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
         _ = fixture_member("showrunner", name="kid", parent=root.id, doc=staff.LiveDoc(remote.local_machine(), kid))
-        _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
+        _ = change_review.append_rows(path, pictured_changes([Visible("kid change", "Run it", "It works")]), date(2026, 10, 15), "",
                                       kid, record=staff.snapshot())
 
         def the_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
@@ -330,7 +367,7 @@ class NextItemTests(unittest.TestCase):
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
                 mock.patch.object(proposals_folder, "owner_docs", return_value=[kid]):
             self.assertEqual([entry.item.splitlines()[0] for entry in next_item.change_queue(kid).entries],
-                             ["C1 kid change"])
+                         ["kid/C1 kid change"])
 
     def attached_changes(self) -> dict[str, Path]:
         docs = {name: self.root / f"{name}-production.md" for name in ("top", "kid", "grand")}
@@ -373,7 +410,7 @@ class NextItemTests(unittest.TestCase):
         lists = {path: path.read_bytes() for path in (self.root / "change-review").glob("*.md")}
         for order, expected in (("urgent", "kid/C10 Urgent child change"),
                                 ("oldest", "kid/C9 Earlier child change"),
-                                ("newest", "C434 Newest child change")):
+                                ("newest", "kid/C434 Newest child change")):
             code, output, error = run("show", "--kind", "change", "--order", order, "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(output.splitlines()[:2], ["change", expected])
@@ -385,7 +422,7 @@ class NextItemTests(unittest.TestCase):
         queue = next_item.change_queue(doc)
         self.assertEqual({entry.key for entry in queue.entries}, {"kid/C9", "kid/C10", "C9", "C434"})
         self.assertEqual(footer_counts.changes(doc), len(queue.entries))
-        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 4 changes")
+        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "Review: 4 changes")
         self.assertEqual(set(lists) & set(footer_counts.sources(doc)),
                          {change_review.list_file("top"), change_review.list_file("kid")})
         self.assertEqual({path: path.read_bytes() for path in lists}, lists)
@@ -408,6 +445,22 @@ class NextItemTests(unittest.TestCase):
         self.assertEqual(run("move-to-end", "--kind", "change", "--all-below", "--production", unit_lookup.doc_owner(docs["kid"], staff.snapshot()).name),
                          (0, "change: moved C434 to the end\n", ""))
         self.assertEqual(urgency.pinned(child_queue.name), "kid/C9")
+
+    def test_an_id_shows_that_change_row_or_one_line_for_a_verdict_or_no_list(self) -> None:
+        doc = self.attached_changes()["kid"]
+        earlier = change_review.list_file("kid")
+        _ = earlier.write_text(earlier.read_text() + "\n## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n"
+                               + "| C11 | Checked change | works | 2026-10-05 |\n")
+        queue = next_item.change_queue(doc)
+        code, output, error = run("show", "--id", "kid/C10", "--production", "kid")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[:3], ["change", "kid/C10 Urgent child change", "  How to check: Try urgent"])
+        self.assertEqual(run("show", "--id", "C1", "--production", "kid")[1].splitlines()[:2], ["change", "top/C1 Root-only change"])
+        self.assertEqual(run("show", "--id", "kid/C11", "--production", "kid"), (0, "kid/C11 has its verdict: works\n", ""))
+        self.assertEqual(run("show", "--id", "kid/C99", "--production", "kid"), (0, "kid/C99 is on no review list\n", ""))
+        self.assertEqual(run("show", "--id", "C99", "--production", "kid"), (0, "C99 is on no review list\n", ""))
+        # The row shown by its ID does not take the pin of the queue /next works through.
+        self.assertEqual(urgency.pinned(queue.name), "")
 
     def test_change_review_shows_the_earlier_row_pinned_by_next_and_the_same_queue_count(self) -> None:
         doc = self.attached_changes()["kid"]
@@ -442,7 +495,7 @@ class NextItemTests(unittest.TestCase):
         _ = broken.write_bytes(b"\xff")
         code, output, error = review_show(doc)
         self.assertEqual(code, 0)
-        self.assertEqual(output.splitlines()[0], "C9 Current child change")
+        self.assertEqual(output.splitlines()[0], "kid/C9 Current child change")
         self.assertEqual(output.splitlines()[-1], "1 more to review")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(str(broken), error)
@@ -457,7 +510,7 @@ class NextItemTests(unittest.TestCase):
         _ = broken.write_bytes(b"\xff")
         code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
         self.assertEqual(code, 0)
-        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(output.splitlines()[1], "kid/C9 Current child change")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(str(broken), error)
         errors = io.StringIO()
@@ -472,7 +525,7 @@ class NextItemTests(unittest.TestCase):
         saved = earlier.read_bytes()
         earlier.unlink()
         self.assertEqual(run("show", "--kind", "change", "--order", "newest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[1].splitlines()[1],
-                         "C434 Newest child change")
+                         "kid/C434 Newest child change")
         queue = next_item.change_queue(doc)
         self.assertEqual(urgency.pinned(queue.name), "C434")
         _ = earlier.write_bytes(saved)
@@ -493,7 +546,7 @@ class NextItemTests(unittest.TestCase):
         _ = earlier.write_bytes(saved)
         code, output, error = run("show", "--kind", "change", "--order", "newest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(output.splitlines()[1], "kid/C9 Current child change")
         self.assertIn("C434", urgency.ended(queue.name))
         entries = urgency.queue_order(next_item.change_queue(doc).entries, queue.name)
         self.assertEqual(entries[-1].key, "C434")
@@ -509,9 +562,9 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(change_review.scope_list(doc), own)
             code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
             self.assertEqual((code, error), (0, ""))
-            self.assertEqual(output.splitlines()[1], "C9 Earlier child change")
+            self.assertEqual(output.splitlines()[1], "kid/C9 Earlier child change")
             self.assertEqual(footer_counts.changes(doc), 2)
-            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 2 changes")
+            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "Review: 2 changes")
 
     def test_bad_urgency_in_earlier_list_leaves_current_rows_in_show_and_count(self) -> None:
         doc = self.attached_changes()["kid"]
@@ -519,7 +572,7 @@ class NextItemTests(unittest.TestCase):
         _ = broken.write_text(broken.read_text().replace("| blocks |", "| invalid |"))
         code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
         self.assertEqual(code, 0)
-        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(output.splitlines()[1], "kid/C9 Current child change")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(str(broken), error)
         errors = io.StringIO()

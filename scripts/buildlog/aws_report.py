@@ -3,11 +3,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import sqlite3
+from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING, cast
+
+from scripts.aws_target import ledger, run_cost
+from scripts.lib import conf
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
@@ -18,6 +22,105 @@ else:
     from scripts.buildlog import record
     from scripts.buildlog import store
     from scripts.mac_test import offload
+
+
+def daily_spend_source(spend: ledger.DailySpend) -> str:
+    if spend.provisional_bill:
+        return 'provisional bill'
+    return 'bill' if spend.source == 'AWS bill' else 'estimate'
+
+
+def daily_spend_lines(spends: list[ledger.DailySpend], limit: Decimal, today: str) -> list[str]:
+    if not spends:
+        return ['No spend days.', '']
+    latest = next((row for row in spends if row.day == today), spends[0])
+    label = 'Today' if latest.day == today else 'Latest day'
+    source = daily_spend_source(latest)
+    lines = [f'**{label} (UTC {latest.day}, {source}): ${latest.usd:.2f} of the ${limit:.2f} daily limit. '
+             + f'{latest.runs} gate runs.**', '']
+    lines.extend(('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Kept-machine compute | Storage | Other | Gate runs | Source |',
+                  '|---|---:|---:|---:|---:|---:|---:|---:|---|'))
+    groups = (*ledger.SPEND_GROUPS[:2], 'kept-machine compute', 'storage')
+    for spend in spends:
+        amounts = {row.group: row.usd for row in spend.groups}
+        cells = [f'${amounts.get(group, Decimal(0)):.2f}' for group in groups]
+        other = sum((usd for group, usd in amounts.items() if group not in groups), Decimal(0))
+        source = daily_spend_source(spend)
+        lines.append(f'| {spend.day} | ${spend.usd:.2f} | ' + ' | '.join(cells)
+                     + f' | ${other:.2f} | {spend.runs} | {source} |')
+    return [*lines, '']
+
+
+@dataclass(frozen=True)
+class GateCostReport:
+    tables: list[str]
+    source: str
+
+
+def run_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[run_cost.BilledKey, Decimal]) -> str:
+    if not runs:
+        return '—'
+    billed = run_cost.billed_runs(runs, allocations)
+    if not billed:
+        return f'not billed yet ({len(runs)})'
+    return f'${run_cost.billed_cost_per_run(billed, allocations):.4f} per run ({len(runs)})'
+
+
+def trend_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[run_cost.BilledKey, Decimal]) -> str:
+    if not runs:
+        return '—'
+    billed = run_cost.billed_runs(runs, allocations)
+    if not billed:
+        return 'not billed yet'
+    return f'${run_cost.billed_cost_per_run(billed, allocations):.4f}'
+
+
+def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
+    """Compare costs and times by machine type, run kind, and UTC completion day."""
+    end = datetime.fromisoformat(day).replace(tzinfo=UTC) + timedelta(days=1)
+    start = end - timedelta(days=days)
+    book = ledger.CostLedger(directory)
+    measured = run_cost.gate_runs(book, start, end, conf.read_or_repository('aws_target').text('region'))
+    runs, omitted, fallbacks = measured.runs, measured.omitted, measured.fallbacks
+    kinds = run_cost.KINDS
+    allocations = run_cost.billed_allocations(run_cost.spot_bills(book, start, end), runs)
+    lines = ['| Machine type | Merge gates | Targeted tests | All runs |', '|---|---:|---:|---:|']
+    sizes = sorted({run.instance_type for run in runs})
+    for size in sizes:
+        selected = [run for run in runs if run.instance_type == size]
+        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode, _label in kinds]
+        lines.append(f'| {size} | ' + ' | '.join([*cells, run_cost_cell(selected, allocations)]) + ' |')
+    if len(sizes) >= 2:
+        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode, _label in kinds]
+        lines.append('| All types | ' + ' | '.join([*cells, run_cost_cell(runs, allocations)]) + ' |')
+    source = (f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
+              + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch.')
+    lines.extend(('', '| Day (UTC) | Merge gates | Merge gate test time | Merge gate box time | Targeted tests | Targeted test time | Targeted box time | Cost per run |',
+        '|---|---:|---:|---:|---:|---:|---:|---:|'))
+    for at in sorted({run.day for run in runs}, reverse=True):
+        selected = [run for run in runs if run.day == at]
+        cells: list[str] = []
+        for mode, _label in kinds:
+            matching = [run for run in selected if run.mode == mode]
+            cells.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
+                          run_cost.median_run_time([run.box_s for run in matching])))
+        cost = trend_cost_cell(selected, allocations)
+        lines.append(f'| {at} | ' + ' | '.join([*cells, cost]) + ' |')
+    totals: list[str] = []
+    for mode, _label in kinds:
+        matching = [run for run in runs if run.mode == mode]
+        totals.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
+                       run_cost.median_run_time([run.box_s for run in matching])))
+    lines.append('| All shown days | ' + ' | '.join([*totals, trend_cost_cell(runs, allocations)]) + ' |')
+    for at, row in sorted(fallbacks, key=lambda entry: entry[0], reverse=True):
+        reason = next((line.strip() for line in str(row.get('reason', '')).splitlines() if line.strip()),
+                      'Reason unavailable')
+        reason = ' '.join(reason.split())
+        if len(reason) > 200:
+            reason = reason[:197] + '...'
+        mode = str(row.get('mode', 'unknown mode'))
+        lines.extend(('', f'- Cloud gate uses natedev: {reason} ({at:%Y-%m-%d %H:%M:%S UTC}, {mode}).'))
+    return GateCostReport([*lines, ''], source)
 
 
 @dataclass(frozen=True)

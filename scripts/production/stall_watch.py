@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as clock
+from enum import Enum
 from pathlib import Path
 from socket import gethostname
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
@@ -33,6 +34,8 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 
+from scripts.agents import detached_runs
+from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
@@ -42,13 +45,14 @@ from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff, session_staff
 from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
+from scripts.whoami import account, usage_store
 
 from scripts.hooks import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
 from scripts.message import rca  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr, worker_panes  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
@@ -58,6 +62,7 @@ PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / 
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
+WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
@@ -74,6 +79,8 @@ PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 SENDER = "stall-watch"
 # The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
 PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
+# The first answer under the question, with the cursor mark when it is selected: "❯ 1. Yes".
+PROMPT_OPTION = re.compile(r"^❯?\s*1\.\s*Yes\b")
 # "make this edit to panes.py" reads as "edit panes.py".
 EDIT_ASK = re.compile(r"make (?:this|these) edits? to (?P<file>.+)")
 BASH_PROMPT_TITLE = "Bash command"
@@ -119,6 +126,8 @@ class Stretch(TypedDict):
     bump_sent: bool
     tell_sent: bool
     reported_status: str
+    login_since: NotRequired[float]
+    login_pid: NotRequired[int]
 
 
 class PaneInspection(NamedTuple):
@@ -128,7 +137,18 @@ class PaneInspection(NamedTuple):
     peers: tuple[str, ...]
     name: str
     unit: unit_lookup.LabeledSession
+    claude: unit_lookup.LiveClaude | unit_lookup.ClaudeNotRunning
     row: staff.StaffRow
+
+
+class PaneWorkersUnread(NamedTuple):
+    """The cycle has not needed worker activity yet."""
+
+
+class BusyPaneWorkerParents(NamedTuple):
+    """The directors with busy pane workers in this cycle."""
+
+    ids: frozenset[staff.StaffId]
 
 
 class PromptWait(TypedDict):
@@ -212,6 +232,12 @@ class TranscriptEntry(TypedDict, total=False):
     type: str
     timestamp: str
     message: TranscriptMessage
+    isApiErrorMessage: bool
+
+
+class SessionLoginLifetime(TypedDict):
+    sessionId: str
+    startedAt: int
 
 
 class PendingTool(NamedTuple):
@@ -306,7 +332,8 @@ def process_session(pid: int) -> str:
             environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
             return ""
-        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment
+                      if item.startswith((b"CODEX_THREAD_ID=", b"CLAUDE_CODE_SESSION_ID=")))
     return values.get("CODEX_THREAD_ID", "") or values.get("CLAUDE_CODE_SESSION_ID", "")
 
 
@@ -336,6 +363,40 @@ def work_running(pid: int, rows: list[Process], session_id: str = "") -> bool:
     return False
 
 
+def read_busy_pane_worker_parents(parents: tuple[staff.StaffRow, ...], record: staff.StaffSnapshot) -> BusyPaneWorkerParents:
+    """Read worker activity for all directors once per cycle."""
+    if not any(record.find(kind="worker", parent=parent.id) for parent in parents):
+        return BusyPaneWorkerParents(frozenset())
+    try:
+        observations = worker_panes.observe_parents(parents, record)
+    except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError) as error:
+        print(f"stall-watch: pane workers: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        return BusyPaneWorkerParents(frozenset())
+    return BusyPaneWorkerParents(frozenset(
+        parent for parent, workers in observations.items()
+        if any(worker_panes.worker_state(observed) == "busy" for observed in workers)))
+
+
+def has_live_detached_worker_run(parent: staff.StaffRow, run: unit_lookup.HeldRun,
+                                record: staff.StaffSnapshot) -> bool:
+    """Check detached work for the director's staff workers in its unfinished run."""
+    workers = record.find(kind="worker", parent=parent.id)
+    if not workers:
+        return False
+    directory = run.folder / "detached_runs"
+    try:
+        try:
+            # Path.glob suppresses folder errors in live_runs.
+            with os.scandir(directory):
+                pass
+        except FileNotFoundError:
+            return False
+        return any(detached_runs.live_runs(directory, worker.name) for worker in workers)
+    except (OSError, ValueError) as error:
+        print(f"stall-watch: detached runs: {parent.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+    return False
+
+
 def latest_transcript_activity(session_id: str) -> float:
     latest = 0.0
     for transcript in PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
@@ -345,6 +406,63 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
+
+
+class LoginVerdict(Enum):
+    """The current login evidence can establish a limit, clear it, or remain unknown."""
+
+    LIMITED = "limited"
+    CLEAR = "clear"
+    UNKNOWN = "unknown"
+
+
+def login_limited(pid: int, session_id: str, pattern: re.Pattern[str]) -> LoginVerdict:
+    """Use the current process's latest assistant error, independent of pane scrollback."""
+    try:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+        if transcript is None:
+            return LoginVerdict.CLEAR
+        for line in lines_from_end(transcript):
+            if b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            text = "\n".join(block.get("text", "") for block in blocks_of(entry) if block.get("type") == "text")
+            if not entry.get("isApiErrorMessage") or not pattern.search(text):
+                return LoginVerdict.CLEAR
+            try:
+                failed_at = datetime.fromisoformat(entry.get("timestamp", "")).timestamp()
+            except (ValueError, KeyError, OverflowError):
+                return LoginVerdict.LIMITED
+            break
+        else:
+            return LoginVerdict.CLEAR
+    except OSError:
+        return LoginVerdict.UNKNOWN
+    try:
+        record = cast(SessionLoginLifetime, json.loads((sessions.sessions_dir() / f"{pid}.json").read_text()))
+        if record["sessionId"] == session_id and record["startedAt"] / 1000 > failed_at:
+            return LoginVerdict.CLEAR
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        folder = account.process_config_dir(pid)
+        if not isinstance(folder, account.ConfiguredClaudeFolder):
+            return LoginVerdict.LIMITED
+        stored = usage_store.load()
+        login = stored.directory_logins[usage_store.directory_key("Claude", str(folder.path))]
+        usage = stored[login]
+        if "weekly" not in usage:
+            return LoginVerdict.LIMITED
+        read_at = datetime.fromisoformat(usage["weekly"]["at"])
+        return (LoginVerdict.CLEAR if read_at.tzinfo is not None and read_at.timestamp() > failed_at
+                else LoginVerdict.LIMITED)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return LoginVerdict.LIMITED
 
 
 def context_near_compaction(session_id: str) -> bool:
@@ -378,28 +496,40 @@ def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
 
 
 def transcript_turn_end(session_id: str) -> re.Match[str] | None:
-    """The turn-end line closing the session's last assistant text, read from its transcript.
+    """Read the turn-end line from the session's latest assistant text.
 
-    Read before the pane, whose text can be stale after resume or compaction. The pane supplies
-    the fallback when the transcript has no usable turn end. A tool call after the text means
-    the turn went on, so there is no turn-end line.
+    Read the transcript before the pane, which can show stale text after resume or compaction.
+    Use the pane when the transcript has no usable turn-end line.
+    If the stripped text is only "—", skip that turn and its tool calls to read the previous assistant text.
+    A user prompt ends this skip; a tool result does not.
+    Otherwise, a tool call after the text means the turn continued, so return no turn-end line.
     """
     try:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
         if transcript is None:
             return None
+        skipping_peer_turn = False
         for line in lines_from_end(transcript):
-            if b'"assistant"' not in line:
+            if b'"assistant"' not in line and (not skipping_peer_turn or b'"user"' not in line):
                 continue
             try:
                 entry = cast(TranscriptEntry, json.loads(line))
             except ValueError:
                 continue
-            content = entry.get("message", {}).get("content") if entry.get("type") == "assistant" else None
+            content = entry.get("message", {}).get("content")
             blocks = content if isinstance(content, list) else []
-            if any(block.get("type") == "tool_use" for block in blocks):
+            if entry.get("type") == "user":
+                if not any(block.get("type") == "tool_result" for block in blocks):
+                    skipping_peer_turn = False
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            if not skipping_peer_turn and any(block.get("type") == "tool_use" for block in blocks):
                 return None
             text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            if text.strip() == "—":
+                skipping_peer_turn = True
+                continue
             if text:
                 turns = list(TURN_END.finditer(text))
                 return turns[-1] if turns else None
@@ -518,13 +648,13 @@ def prompt_alert_seconds() -> float:
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
-    defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+    defaults = WATCH_DEFAULTS
     path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
     fields: dict[str, str] = {}
     for source in paths:
         try:
-            content = source.read_text(encoding="utf-8")
+            content = conf_reads.read_text(source)
         except FileNotFoundError:
             if status_defaults and source != defaults:
                 continue
@@ -881,6 +1011,13 @@ def save_prompt(path: Path, prompt: PromptWait) -> None:
     write_text_atomic(path, json.dumps(record) + "\n")
 
 
+def prompt_on_screen(pane: str) -> bool:
+    """Whether a permission prompt's question and its first answer show at the pane's bottom."""
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-PROMPT_LINES:]]
+    asked = next((index for index, line in enumerate(lines) if PROMPT_QUESTION.search(line)), None)
+    return asked is not None and any(PROMPT_OPTION.match(line) for line in lines[asked + 1:])
+
+
 def auto_denied(pane: str) -> bool:
     """Whether the permission prompt at the pane's bottom shows the auto-deny banner."""
     return any(AUTO_DENY_BANNER.match(line.strip(FRAME)) for line in pane.splitlines()[-PROMPT_LINES:])
@@ -1058,7 +1195,7 @@ def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
     try:
         old = saved_stretch(path)
         if (old["pane_hash"] == pane_hash or old["bump_sent"] or old["tell_sent"]
-                or old.get("reported_status")):
+                or old.get("reported_status") or "login_since" in old):
             return old
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -1227,8 +1364,20 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             try:
                 production_name = configured["name"]
-                marked = sessions.status_units(production_name)
-                for name, unit in marked.items():
+                for name in sessions.status_units(production_name):
+                    match sessions.checked_unit(production_name, name):
+                        case unit_lookup.UnknownUnit(reason=reason):
+                            print(f"stall-watch: {name}: {reason}", file=sys.stderr)
+                            continue
+                        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
+                                claude=unit_lookup.LiveClaude() as claude) as unit):
+                            pass
+                        case unit_lookup.ProvedAbsentUnit(pane=unit_lookup.LabeledSession(
+                                claude=unit_lookup.ClaudeNotRunning() as claude,
+                                empty=herdr.ObservedEmpty()) as unit):
+                            pass
+                        case _:
+                            continue
                     if isinstance(unit.identity, session_staff.NoSession):
                         raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
                     row = unit_lookup.unit_row(name, record, reference=unit.identity)
@@ -1240,14 +1389,16 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                     peers = (*showrunner_names,
                              *(sibling_name for sibling_id, sibling_name in sibling_names_by_parent[row.parent].items()
                                if sibling_id != row.id), configured["session"], production_name)
-                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, row))
+                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, claude, row))
             except (OSError, UnicodeError, ValueError) as error:
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
     runs = unit_lookup.HeldRunLookup(record=record)
+    pane_worker_parents = tuple(item.row for item in work)
+    busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
-    for production_name, configured, zone, peers, name, unit, row in inspection_order(work):
+    for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
@@ -1267,12 +1418,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if (retire := forget(watch)) is not None:
                 pending.append(retire)
             continue
-        claude = unit.claude
         if not isinstance(claude, unit_lookup.LiveClaude):
-            if isinstance(claude, unit_lookup.ClaudeUnknown):
-                print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
-            # A prompt is not on screen without its Claude.
-            elif (retire := end_prompt(watch)) is not None:
+            if (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
             continue
         observed_at = time.time()
@@ -1312,6 +1459,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 if time.monotonic() >= inspection_deadline:
                     continue
                 blocked = None
+            # herdr's state can miss a prompt for hours while the pane shows it: the screen decides too.
+            if prompt_on_screen(pane):
+                blocked = True
             if not pane_budget_left(name, inspection_deadline):
                 continue
             if blocked:
@@ -1338,8 +1488,34 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             if blocked is not None and (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
-            stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
+            pane_hash = hashlib.sha256(pane.encode()).hexdigest()
+            stretch = read_stretch(path, pane_hash, now)
             turns = list(TURN_END.finditer(pane))
+            try:
+                login_limit = login_limited(pid, session_id, re.compile(
+                    watch_config(status_defaults=True)["login_limit_pattern"].strip(), re.IGNORECASE))
+            except (OSError, UnicodeError, KeyError, ValueError, re.error) as error:
+                print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
+                continue
+            if login_limit is LoginVerdict.UNKNOWN:
+                continue
+            if login_limit is LoginVerdict.LIMITED:
+                report.decision = "login limit"
+                if "login_since" not in stretch or stretch.get("login_pid", pid) != pid:
+                    stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
+                                      reported_status="", login_since=now)
+                stretch["login_pid"] = pid
+                stretch["since"] = now
+                save_stretch(path, stretch)
+                if not stretch["tell_sent"]:
+                    text = f"{name}: the Claude login reached its time limit and needs /login."
+                    login_since = stretch.get("login_since", now)
+                    key = f"stall-watch:{row.id}:login:{int(login_since)}:tell"
+                    pending.append(delivery(path, "tell", showrunner_socket, key, text))
+                continue
+            if "login_since" in stretch:
+                stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
+                                  reported_status="")
             # A resumed or compacted pane can retain an older turn. The session's last
             # assistant text is authoritative when it supplies a turn-end status.
             turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)
@@ -1362,6 +1538,12 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 report.decision = "waiting"
                 continue
             running_work = work_running(pid, rows, session_id)
+            if not running_work:
+                if isinstance(busy_pane_workers, PaneWorkersUnread):
+                    busy_pane_workers = read_busy_pane_worker_parents(pane_worker_parents, record)
+                running_work = row.id in busy_pane_workers.ids
+            if not running_work:
+                running_work = has_live_detached_worker_run(row, run, record)
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
@@ -1378,12 +1560,12 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
             report.decision = "holding" if holding else "idle already bumped"
-            if not holding and not stretch["bump_sent"]:
+            if not holding and socket and not stretch["bump_sent"]:
                 report.decision = "idle bump requested"
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
-            if not holding and not stretch["tell_sent"] and showrunner_socket:
+            if not holding and socket and not stretch["tell_sent"] and showrunner_socket:
                 text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline, limits=sender.limits)

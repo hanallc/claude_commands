@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.checkout_test_support import copy_runtime
+
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lib.process_group import send_process_group
@@ -9,13 +12,15 @@ from scripts.lib import test_hang_guard
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+import json
 import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 from unittest.mock import patch
 
 # Initialize dependencies before invoke_cli swaps HOME. The recorder currently
@@ -24,25 +29,22 @@ from scripts.direct import progress_history
 from scripts.lib import models_registry, user_zone
 from scripts.lib.test_models_registry import write_registry
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production import staff
+from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
 
 def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
                         workers: Mapping[str, str]) -> None:
     """Publish private staff references before the recorder attributes a wait."""
-    import json
     with isolated_staff_file(root / "staff.json", environment):
         owner = fixture_member("showrunner", name="wait-owner")
         parent = fixture_member("unit", name="wait", parent=owner.id,
                                 runtime_id=fixture_runtime_id("fixture-director"),
                                 worktree=staff.PresentWorktree("natedev", root))
-        roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
+        entries = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
                   for name, identity in workers.items()}
     session.mkdir(parents=True, exist_ok=True)
-    # The recorder still reads historical aliases from this roster.
-    _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
-    for name, entry in roster.items():
+    for name, entry in entries.items():
         _ = (session / f"impl_worker_{name}.json").write_text(json.dumps({"slot": name, **entry}))
 
 
@@ -60,7 +62,9 @@ if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
             _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
         _fixture_state = _fixture_json.loads(
             (_fixture_session / "progress_history_state.json").read_text())
-        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
+        _fixture_phases = _fixture_state.get("open_phases", [])
+        if len(_fixture_phases) == 1:
+            _fixture_sys.argv.extend(["--phase-id", _fixture_phases[0]["id"]])
 
 """
 
@@ -68,7 +72,6 @@ if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
 class LauncherFixture(unittest.TestCase):
     """Prepare one seed per launcher class and give every test a private copy."""
     fixture_seed: ClassVar[Path]
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path = Path()
     history_dir: Path = Path()
     working_dir: Path = Path()
@@ -79,26 +82,19 @@ class LauncherFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        seed_directory = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(seed_directory.cleanup)
-        cls.fixture_seed = Path(seed_directory.name)
+        cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
         seed = cls("runTest")
         seed.root = cls.fixture_seed
         seed.prepare_fixture()
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         # Private files and Git objects/index/refs: mutations never reach another test.
         _ = shutil.copytree(self.fixture_seed, self.root, dirs_exist_ok=True)
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "project"
         self.config_file = self.root / "direct.conf"
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def prepare_fixture(self) -> None:
         raise NotImplementedError("the launcher fixture must prepare its seed")
@@ -151,18 +147,30 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     direct, agents, lib = (root / "scripts" / name for name in ("direct", "agents", "lib"))
     for directory in (direct, agents, lib, root / "scripts/production"):
         directory.mkdir(parents=True)
-    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "models_registry.py", "process_failure.py",
+    for name in ("process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "models_registry.py", "process_failure.py",
                  "codex_models_cache.py", "build_folders.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
     home_lib = root / ".claude/scripts/lib"
     home_lib.mkdir(parents=True, exist_ok=True)
-    for name in ("py", "process_group.py"):
-        _ = shutil.copy2(source / "lib" / name, home_lib / name)
+    _ = shutil.copy2(source / "lib/process_group.py", home_lib / "process_group.py")
+    for checkout in (root, root / ".claude"):
+        for relative in STARTUP_FILES:
+            destination = checkout / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copy2(source.parent / relative, destination)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
+    copy_runtime(root)
+    copy_runtime(root / ".claude")
+    # The launcher fixtures do not contact a Codex catalog.
+    for checkout in (root, root / ".claude"):
+        catalog = checkout / "scripts/agents/sync_codex_catalog.sh"
+        _ = catalog.write_text("#!/bin/sh\nexit 0\n")
+        catalog.chmod(0o755)
+    _ = (root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"worker@example.invalid"}}')
+    for name in ("models_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
-                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
+                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh", "file_lock.sh"):
         _ = shutil.copy2(source / "direct" / name, direct / name)
     return direct, agents, lib
 
@@ -187,7 +195,8 @@ def launcher_environment(root: Path) -> dict[str, str]:
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
     seed_interpreter_cache(root / "cache")
-    for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+    for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
+                 "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_REMOTE_MEMORY_DIR"):
         _ = environment.pop(name, None)
     return environment
 
@@ -210,6 +219,13 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
     home = Path(environment["HOME"])
 
     def main() -> int:
+        if arguments and arguments[0] == "start-pass" and "--worker-name" in arguments and "--worker-id" not in arguments:
+            session = Path(arguments[arguments.index("--session-dir") + 1])
+            name = arguments[arguments.index("--worker-name") + 1]
+            state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+            matches = [row for row in session_staff.run_workers(state, staff.local_snapshot()) if row.name == name]
+            if len(matches) == 1:
+                sys.argv.extend(("--worker-id", matches[0].id))
         progress_history.main()
         return 0
 

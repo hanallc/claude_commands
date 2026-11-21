@@ -15,7 +15,6 @@ from typing import cast
 
 from scripts.production import showrunners, staff, staff_move, staff_sources
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.production.rename_state import RenameRefused
 
 
 @dataclass(frozen=True)
@@ -50,10 +49,15 @@ def apply(from_name: str, unit: str, to_name: str) -> UnitTransfer:
                 f"Your unit now belongs to production {request.receiving.name}.", recipient=request.unit)
             for line in notice.lines:
                 print(line)
-        _ = staff_move.move_unit(from_name, request.unit, request.receiving.name,
-                                 identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
+        place_unit(from_name, request)
         print("done" if changed else "unchanged")
         return request
+
+
+def place_unit(from_name: str, request: UnitTransfer) -> None:
+    """Place the retained unit tab in its parent's workspace."""
+    _ = staff_move.move_unit(from_name, request.unit, request.receiving.name,
+                             identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
 
 
 def main(argv: list[str]) -> int:
@@ -75,7 +79,7 @@ def main(argv: list[str]) -> int:
         except subprocess.TimeoutExpired as error:
             print(f"transfer_unit: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, RenameRefused, Refusal) as error:
+        except (ValueError, OSError, Refusal) as error:
             print(f"transfer_unit: {error}", file=sys.stderr)
             return 1
     return staff.cli_result(run)

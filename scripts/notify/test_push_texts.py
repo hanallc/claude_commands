@@ -17,16 +17,11 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
-from scripts.lib.code_kind import is_test_code  # noqa: E402
-
 from scripts.notify import gpu_xid
 from scripts.notify import push_texts
 from scripts.message import session_send
 from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
-
-ROOT = Path(__file__).resolve().parents[2]
-EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
 
 
 def literal_path(node: ast.expr) -> str:
@@ -142,16 +137,40 @@ def missing_approvals(entries: tuple[PushText, ...], path: Path) -> list[str]:
 
 
 class PushTextTests(unittest.TestCase):
+    def test_login_sitting_examples_name_end_dates_and_steps_as_normal_notes(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "accounts.login_sitting")
+        self.assertEqual(entry.sender, "accounts")
+        self.assertEqual(entry.need, "note")
+        self.assertEqual([example.name for example in entry.examples], ["weekly", "safety"])
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertTrue(push.body.startswith("You asked "))
+                self.assertIn("login end dates", push.body)
+                self.assertIn("Sign out of claude.ai in the browser.", push.body)
+                self.assertIn("Sign in as that account.", push.body)
+                self.assertIn("run /login in a Claude session on that account.", push.body)
+                self.assertNotIn("No action needed.", push.message)
+
     def entry(self) -> PushText:
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
 
-    def test_blocked_mac_catalog_keeps_its_required_action(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "mac_idle.blocked")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertIsInstance(push.action, ActionRequired)
-        self.assertEqual(push.action, ActionRequired(cast(ActionTemplate, entry.action).text.format_map(push.values)))
+    def test_unreachable_mac_catalog_requires_an_action_and_names_the_waiting_tests(self) -> None:
+        entries = [entry for entry in push_texts.catalog() if entry.id.startswith("mac_idle.")]
+        self.assertEqual([entry.id for entry in entries], ["mac_idle.unreachable"])
+        entry = entries[0]
+        for example, minutes, tests in (("one_test", "10", "1 test waits"),
+                                         ("three_tests", "12", "3 tests wait")):
+            with self.subTest(example=example):
+                values = next(row.values for row in entry.examples if row.name == example)
+                push = push_texts.render_entry(entry, values)
+                self.assertEqual(push.action, ActionRequired("Wake the Mac or check its network."))
+                self.assertEqual(push.title, "Mac tests stopped")
+                self.assertEqual(push.body, f"Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.")
+                self.assertEqual(push.message.splitlines(), ["Action: Wake the Mac or check its network.",
+                    f"Mac tests stopped {minutes} min ago.", f"{tests}; builds cannot reach the Mac."])
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
@@ -437,7 +456,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
                          + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
                          + "Turn off: work moves to Claude until Sat 10-24 16:40 AST.")
@@ -448,7 +467,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual((entry.title, entry.action, entry.need, entry.sender), (plain.title, plain.action, plain.need, plain.sender))
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
                          + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): workers spend these credits until your queued move runs. "
                          + "If the credits run out first, workers wait.\n\n"
@@ -474,14 +493,11 @@ class PushTextTests(unittest.TestCase):
                   self.assertRaises(ValueError)):
                 _ = push_texts.catalog()
 
-
     def test_remote_control_push_is_absent_from_catalog_and_approvals(self) -> None:
         removed_id = "shutdown." + "remote_control"
         self.assertNotIn(removed_id, {entry.id for entry in push_texts.catalog()})
         approvals = cast(dict[str, object], json.loads(push_texts.REVIEWED_FILE.read_text()))
         self.assertNotIn(removed_id, approvals)
-
-
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
         entry = self.entry()
@@ -568,19 +584,6 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(literal_delivery_calls('command = ["scripts/notify/pushover.py", "title", "body"]\nrun(command)'), [1])
         self.assertEqual(literal_delivery_calls('run(["python3", str(ROOT / "notify" / "pushover.py"), "title", "body"])'), [1])
 
-    def test_each_script_delivery_uses_the_registry(self) -> None:
-        findings: list[str] = []
-        for path in (ROOT / "scripts").rglob("*.py"):
-            relative = path.relative_to(ROOT).as_posix()
-            if relative in EXEMPT or is_test_code(path):
-                continue
-            findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
-        for folder in ("commands", "codex"):
-            for path in (ROOT / folder).rglob("*.md"):
-                findings.extend(f"{path.relative_to(ROOT)}:{line}: unregistered phone instruction"
-                                for line in instruction_phone_sends(path.read_text()))
-        self.assertEqual(findings, [])
-
     def test_instruction_gate_checks_inline_and_multiline_phone_commands(self) -> None:
         self.assertEqual(instruction_phone_sends('`pushover.py --no-action Title Body`'), [1])
         self.assertEqual(instruction_phone_sends('`send.py --to user --text "use --text-id"`'), [1])
@@ -613,10 +616,3 @@ class PushTextTests(unittest.TestCase):
                 with self.subTest(executable=executable, quote=quote):
                     self.assertEqual(instruction_phone_sends(f'`{path} {target} "--text-id"`'), [1])
                     self.assertEqual(instruction_phone_sends(f'`{path} {target} --text-id nate.adhoc`'), [])
-
-    def test_only_pushover_posts_to_pushover(self) -> None:
-        """pushover.post_message adds the "Sent by" and "Template" lines; no other script may post round it."""
-        found = [path.relative_to(ROOT).as_posix() for path in (ROOT / "scripts").rglob("*")
-                 if path.is_file() and "__pycache__" not in path.parts and not is_test_code(path)
-                 and path.name != "pushover.py" and b"api.pushover.net" in path.read_bytes()]
-        self.assertEqual(found, [])

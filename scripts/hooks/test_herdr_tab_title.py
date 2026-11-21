@@ -7,17 +7,19 @@ import json
 import math
 import tempfile
 import unittest
+from collections.abc import Iterator
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
 from scripts.lib import names
+from scripts.herdr import herdr_types
 from scripts.lib.test_names import fixture_names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.hooks import herdr_tab_title  # noqa: E402
@@ -62,7 +64,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertTrue(tab)
         self.retitled.append((pane, title))
         if self.fault:
-            raise herdr.HerdrFailure("server gone")
+            raise herdr_types.HerdrFailure("server gone")
         return True
 
     def record(self, pid: int, session_id: str, name: str, entrypoint: str = "cli", *, proc_start: str = "") -> None:
@@ -74,7 +76,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         entry = pane_record.launch("w3:p7", session_id, str(self.records.parent), {}, ["claude"])
         entry.update(pid=41, proc_start="fixture-start")
         path = pane_record.record_path("agents")
-        write_text_atomic(path, json.dumps({"w3:p7": entry}))
+        pane_record.save("agents", {"w3:p7": entry})
         return path
 
     def renamed_unit(self) -> staff.StaffRow:
@@ -192,6 +194,22 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(self.retitled, [("w3:p7", "showrunner-fixer")])
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_denied_registry_reports_an_unknown_title_and_leaves_the_pane_unchanged(self) -> None:
+        iterdir = Path.iterdir
+
+        def list_folder(path: Path) -> Iterator[Path]:
+            if path == self.records:
+                raise PermissionError(path)
+            return iterdir(path)
+
+        with (patch.object(Path, "iterdir", new=list_folder), redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(herdr_tab_title.sync({"session_id": "session-a"},
+                {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents"}))
+            with self.assertRaisesRegex(OSError, "session registry unreadable"):
+                _ = herdr_tab_title.current_name("session-a")
+        self.assertEqual(self.retitled, [])
+        self.assertEqual(errors.getvalue(), "herdr title: session registry unreadable for session-a.\n")
 
     def test_delayed_clear_reports_a_missing_row_until_the_native_handoff_finishes(self) -> None:
         unit = self.renamed_unit()

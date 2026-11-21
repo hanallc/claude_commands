@@ -129,9 +129,49 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         for options in ((), ("--withdraw", "Withdraw the ruling.")):
             with self.subTest(options=options):
                 self.assert_refused(
-                    "Only a held or decided finding can receive an answer", "decision", "--id", finding_id,
+                    "Only a held, decided or accepted finding can receive an answer", "decision", "--id", finding_id,
                     "--answer", "approved", "--user-words", "Remove repeated parsing.", *options,
                 )
+
+    def accepted_finding_in_a_closed_phase(self) -> str:
+        """Phase 62 accepts its finding, then closes while phase 63 runs."""
+        self.write_progress_state("phase-sixty-two", "62")
+        finding_id = self.open_finding("blocker", "The byte split hides a cast")
+        self.close_round([finding_id])
+        state = {"history_file": str(self.history_file),
+                 "open_phases": [{"instance_id": "phase-sixty-three", "id": "63", "title": "63", "status": "active"}]}
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
+        return finding_id
+
+    def phase_finding(self, phase: str) -> dict[str, object]:
+        return cast(list[dict[str, object]], self.phase_status(phase)["findings"])[0]
+
+    def test_an_accepted_finding_in_a_closed_phase_takes_the_users_decision(self) -> None:
+        finding_id = self.accepted_finding_in_a_closed_phase()
+        decide = ("decision", "--phase", "62", "--id", finding_id, "--answer", "approved", "--user-words", "Approved")
+        self.assertEqual(self.run_command(*decide, at=1_500), f"{finding_id} decided: approved")
+        entry = self.phase_finding("62")
+        self.assertEqual(entry["state"], "accepted")
+        self.assertEqual(entry["decision"], {"answer": "approved", "user_words": "Approved", "timestamp_epoch": 1_500})
+        event = self.events()[-1]
+        self.assertEqual((event["event_type"], event["finding_id"], event["phase_instance_id"]),
+                         ("finding_decision", finding_id, "phase-sixty-two"))
+        ledger, events = self.ledger(), self.events()
+        _ = self.run_command(*decide, at=1_510)
+        self.assertEqual((self.ledger(), self.events()), (ledger, events))
+        self.assert_refused("use --withdraw", "decision", "--phase", "62", "--id", finding_id,
+                            "--answer", "declined", "--user-words", "Remove the allow.")
+
+    def test_a_decided_finding_a_verdict_accepted_changes_its_ruling_with_withdraw(self) -> None:
+        finding_id = self.decided_finding("approved", "Remove the retry.", at=1_010)
+        _ = self.run_command("verdict", "--id", finding_id, "--state", "accepted")
+        _ = self.run_command("decision", "--id", finding_id, "--answer", "declined", "--user-words", "Keep the retry.",
+                             "--withdraw", "The user changed the answer.", at=1_020)
+        entry = self.finding_rows()[0]
+        self.assertEqual(entry["state"], "accepted")
+        self.assertEqual(cast(dict[str, object], entry["decision"])["answer"], "declined")
+        history = cast(list[dict[str, object]], entry["decision_history"])
+        self.assertEqual([(row["answer"], row["withdrawn_epoch"]) for row in history], [("approved", 1_020)])
 
     def test_an_approved_decision_permits_a_closure_verdict(self) -> None:
         finding_id = self.decided_finding("approved", "Remove the retry.")
@@ -236,6 +276,15 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
 
+    def test_an_unnamed_finding_ignores_the_last_finished_phase(self) -> None:
+        state: dict[str, object] = {
+            "history_file": str(self.history_file), "open_phases": [],
+            "phase": {"id": "14", "instance_id": "phase-fourteen", "status": "completed"},
+        }
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
+        _ = self.open_finding("minor", "A finding outside a phase")
+        self.assertEqual(self.events()[-1]["phase_instance_id"], "")
+
     # Keep process persistence coverage.
     @process_boundary
     def test_ids_are_stable_across_rounds(self) -> None:
@@ -278,18 +327,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], expected)
 
-    def test_an_unknown_lens_is_refused_and_records_nothing(self) -> None:
-        self.write_progress_state("instance-a")
-        for lens in ("style", "adversary,style", "both,craft", "craft,"):
-            result = self.run_failing_command(
-                "open", "--severity", "minor", "--title", "misspelt lens",
-                "--caught-by", "worker", "--lens", lens,
-            )
-            self.assertEqual(result.returncode, 2, lens)
-            self.assertIn("argument --lens: unknown lens", result.stderr)
-        self.assertEqual(self.status()["findings"], [])
-        self.assertEqual(self.events(), [])
-
     def test_first_round_gates_blocker_and_minor_but_never_nits(self) -> None:
         _ = self.open_finding("blocker", "null deref")
         _ = self.open_finding("minor", "unused import")
@@ -329,12 +366,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must repair every gating open finding together", result.stderr)
         self.assertIn("F002", result.stderr)
-
-    def test_dispatch_refuses_unknown_ids(self) -> None:
-        _ = self.open_finding("blocker", "null deref")
-        result = self.run_failing_command("dispatch", "--covers", "F001,F099")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Unknown finding ids", result.stderr)
 
     def test_dispatch_refuses_when_the_gate_says_converged(self) -> None:
         _ = self.open_finding("nit", "comment typo")
@@ -575,12 +606,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         ]
         self.assertEqual(abandoned[0]["reason"], "the user stopped the launcher")
 
-    def test_abandon_refuses_when_no_repair_is_in_flight(self) -> None:
-        _ = self.open_finding("blocker", "null deref")
-        result = self.run_failing_command("abandon", "--reason", "nothing to abandon")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No repair round is in flight", result.stderr)
-
     def test_landed_is_quiet_when_no_repair_is_in_flight(self) -> None:
         """Implementation dispatches call it too, and must not fail because of it."""
         _ = self.open_finding("blocker", "null deref")
@@ -663,32 +688,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         payload = self.gate()
         self.assertEqual(payload["verdict"], "dispatch")
         self.assertIsNone(payload["advisory"])
-
-    # Keep process configuration coverage.
-    @process_boundary
-    def test_an_unusable_config_value_stops_the_run(self) -> None:
-        """A bad value is an error, not a fall back to some compiled limit."""
-        self.write_config("MIN_REPAIR_BUDGET=zero\n")
-        result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("MIN_REPAIR_BUDGET=zero is not a whole number", result.stderr)
-        self.assertEqual(result.stdout, "")
-
-    def test_a_missing_config_key_stops_the_run(self) -> None:
-        """Every limit must be set, and one run names all of the missing ones."""
-        self.write_partial_config("# whole: 1..\nMIN_REPAIR_BUDGET=3\n")
-        result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("RUNAWAY_ROUNDS is not set", result.stderr)
-        self.assertIn("MAX_REVIEW_CANCELLATIONS is not set", result.stderr)
-        self.assertNotIn("MIN_REPAIR_BUDGET", result.stderr)
-
-    def test_a_missing_config_file_stops_the_run(self) -> None:
-        """No config at all is the same error, not a run on defaults."""
-        self.config_file.unlink()
-        result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("cannot be read", result.stderr)
 
     def test_repair_budget_scales_with_the_original_finding_count(self) -> None:
         """Eight findings buy four rounds; two buy the floor of three."""

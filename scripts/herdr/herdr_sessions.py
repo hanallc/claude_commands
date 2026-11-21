@@ -19,15 +19,18 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
+from scripts.message import sessions as native_sessions
+from scripts.herdr import herdr_types
 
-from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
+from scripts.message.sessions import UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
 
 from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.lib import names as display_names  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
@@ -90,15 +93,24 @@ class LaunchOptions(argparse.Namespace):
 
 
 def _tab_pane(name: str) -> str:
-    """The pane of the shared session's tab named `name`; empty when no such tab is open."""
-    return next((pane["pane_id"] for pane in herdr.Herdr(herdr.shared_session()).panes() if pane.get("label") == name), "")
+    """Find a member or native launch by its name, then prove its pane."""
+    shared = herdr.shared_session()
+    client = herdr.Herdr(shared)
+    panes = client.panes()
+    record = staff.initial_snapshot()
+    entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
+    references = pane_launch.named_references(name, record, entries)
+    scan = client.scan_row_panes(record, [dict(pane) for pane in panes]) if record.rows else herdr.RowPaneScan({}, [])
+    evidence = pane_launch.NativePaneEvidence(panes, scan)
+    return next((str(pane["pane_id"]) for reference in references
+                 for pane in pane_launch.reference_panes(reference, record, client, entries, evidence=evidence)), "")
 
 
 def _attach(pane: str) -> None:
     shared = herdr.shared_session()
     try:
         herdr.Herdr(shared).focus_tab_of(pane)
-    except (herdr.HerdrFailure, OSError) as error:
+    except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "session", "attach", shared])
@@ -146,7 +158,13 @@ def _launch(verb: str, arguments: list[str]) -> int:
     shared = herdr.shared_session()
     _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
     panes = herdr.Herdr(shared).panes()
-    taken = {pane.get("label") for pane in panes}
+    record = staff.initial_snapshot()
+    entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
+    opened = {pane["pane_id"] for pane in panes}
+    taken = {row.name for row in record.rows}
+    taken.update(entry["name"] for pane, entry in entries.items() if pane in opened and "staff_id" not in entry)
+    taken.update(session["name"] for session in native_sessions.running_sessions()
+                 if record.by_member_reference(session["sessionId"]) is None)
     name = options.name or next(candidate for candidate in (
         herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
         if candidate not in taken)
@@ -157,7 +175,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
         unset_environment=frozenset(unset_variables))
     if isinstance(launched, herdr.nix_env.Refused):
-        raise herdr.HerdrFailure(launched.reason)
+        raise herdr_types.HerdrFailure(launched.reason)
     pane, outcome = launched.pane, launched.outcome
     if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
         reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
@@ -167,47 +185,42 @@ def _launch(verb: str, arguments: list[str]) -> int:
     return 0
 
 
-def claude_names() -> dict[str, str]:
-    """The newest live Claude name in each pane of the shared herdr session."""
-    shared = herdr.shared_session()
-    newest: dict[str, SessionRecord] = {}
-    directory = sessions_dir()
-    if not directory.exists():
-        return {}
-    places = herdr.herdr_places()
-    for path in sorted(directory.iterdir()):
-        if path.suffix != ".json":
-            continue
-        record = read_session(path)
-        if isinstance(record, UnreadableSessionRecord) or not live_session(record):
-            continue
-        place = places.get(record["pid"])
-        if not isinstance(place, herdr.HerdrPlace) or place.session != shared:
-            continue
-        if place.pane not in newest or record["updatedAt"] > newest[place.pane]["updatedAt"]:
-            newest[place.pane] = record
-    return {pane: record["name"] for pane, record in newest.items()}
+def _claude_name(owner: pane_launch.ProvedPaneConversation) -> str:
+    if owner.kind != "claude":
+        return ""
+    record = read_session(sessions_dir() / f"{owner.pid}.json")
+    if (isinstance(record, UnreadableSessionRecord) or record["pid"] != owner.pid
+            or record["sessionId"] != owner.identity or not live_session(record)):
+        return ""
+    return record["name"]
 
 
-def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
-               record: staff.StaffSnapshot) -> dict[str, str]:
-    """Classify live unit panes using the same staff join as tab ordering."""
-    from scripts.production.session_labels import StaffLabels
-
-    classifier = herdr.UnitTabClassifier(
-        client.session, herdr.herdr_processes(membership=StaffLabels.for_record(record)), record)
-    spaces: dict[str, str] = {}
-    if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
-        for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
-            space = herdr.json_object(item, "herdr workspace")
-            spaces[herdr.json_text(space.get("workspace_id"), "herdr workspace id")] = (
-                herdr.json_text(space.get("label"), "herdr workspace label"))
-    roles: dict[str, str] = {}
-    for pane in panes:
-        unit = classifier.classify(spaces.get(pane["workspace_id"], ""), pane.get("label") or "", [pane["pane_id"]])
-        if isinstance(unit, herdr.UnitTab):
-            roles[pane["pane_id"]] = f"unit {unit.parent.name}/{unit.row.name}"
-    return roles
+def _list_panes(client: herdr.Herdr, membership: staff.StaffSnapshot) -> None:
+    classifier = herdr.UnitTabClassifier(membership)
+    loaded = display_names.runtime_names()
+    showrunner_name = loaded.job("showrunner") if isinstance(loaded, display_names.Names) else "unknown"
+    documents = {runner["doc"] for runner in require_complete(registered_showrunners(membership=membership))}
+    showrunner_ids = {row.id for row in membership.find(kind="showrunner")
+                      if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and str(row.doc.path) in documents}
+    for row in client.panes():
+        pane = row["pane_id"]
+        title = row.get("label") or pane
+        try:
+            info = client.result("pane", "process-info", "--pane", pane).get("process_info")
+            owner = herdr.foreground_pane_conversation(info, row)
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            print(f"{title}\tunknown\t")
+            continue
+        role, name = "standalone", ""
+        if isinstance(owner, pane_launch.ProvedPaneConversation):
+            unit = classifier.classify(owner)
+            member = membership.by_current_session(owner.identity)
+            if isinstance(unit, herdr.UnitTab):
+                role = f"unit {unit.parent.name}/{unit.row.name}"
+            elif member is not None and member.id in showrunner_ids:
+                role = showrunner_name
+            name = _claude_name(owner)
+        print(f"{title}\t{role}\t{name}")
 
 
 def _main(argv: list[str]) -> int:
@@ -228,13 +241,13 @@ def _main(argv: list[str]) -> int:
             return _remote_list(host)
         try:
             return _attach_remote(host, argv[3])
-        except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired) as error:
+        except (herdr_types.HerdrFailure, OSError, subprocess.TimeoutExpired) as error:
             print(f"herdr_sessions: {host.target}: attach failed: {' '.join(str(error).split())}", file=sys.stderr)
             return 1
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
-        except (herdr.HerdrFailure, OSError, ValueError) as error:
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             print(f"herdr_sessions: {error}", file=sys.stderr)
             return 1
     if argv[1:] not in (["list"], ["sort-tabs"]) and not (len(argv) == 3 and argv[1] in ("attach", "focus") and argv[2]):
@@ -264,20 +277,10 @@ def _main(argv: list[str]) -> int:
                 print(shared)
                 return 0
             _attach(pane)
-        with herdr.pane_snapshot() as read_panes:
-            panes = read_panes(shared)
-            names = claude_names()
-            membership = staff.initial_snapshot()
-            roles = unit_roles(herdr.Herdr(shared), panes, record=membership)
-            showrunner_names = {runner["session"] for runner in require_complete(
-                registered_showrunners(membership=membership)) if runner["session"]}
-            for row in panes:
-                pane = row["pane_id"]
-                claude = names.get(pane, "")
-                role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
-                print(f"{row.get("label") or pane}\t{role}\t{claude}")
-            return 0
-    except (herdr.HerdrFailure, OSError) as error:
+        with herdr.observation_snapshot():
+            _list_panes(herdr.Herdr(shared), staff.initial_snapshot())
+        return 0
+    except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3
 

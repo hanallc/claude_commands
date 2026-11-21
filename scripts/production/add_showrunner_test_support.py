@@ -2,7 +2,9 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.lib.checkout_test_support import write_python_tool
+
+from scripts.agents import remote
 
 import json
 import os
@@ -20,10 +22,10 @@ from unittest.mock import patch
 
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
-from scripts.whoami.account_test_support import write_claude_account
+from scripts.whoami.account_test_support import create_claude_account, write_claude_account
 from scripts.production import add_showrunner
 from scripts.production import showrunners, showrunner_tree, staff
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import private_process_registry, confirm_tab_close, native_claude, process as write_process
@@ -98,14 +100,14 @@ class AddShowrunnerFixture(unittest.TestCase):
     def setUp(self) -> None:
         socket_for = showrunners.socket_for
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(patch.object(showrunners, "socket_for", socket_for))
         # Account links, trust entries and timer records embed absolute paths.
         # Restore private files and symlinks at the seed's original path.
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.state = self.root / "stub"
         self.env = self.fixture_env.copy()
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
@@ -196,8 +198,7 @@ class AddShowrunnerFixture(unittest.TestCase):
 
 '''
         source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
-        _ = fake.write_text(source)
-        fake.chmod(0o755)
+        write_python_tool(fake, source)
         self.on_start = {}
         self.herdr_overrides = {}
         self.processes = []
@@ -368,10 +369,6 @@ class AddShowrunnerFixture(unittest.TestCase):
 
         def advance(seconds: float) -> None:
             nonlocal elapsed
-            # Registry fixtures change on the next read; no asynchronous writer
-            # needs wall time. Keep the requested interval observable.
-            with (self.root / "polls.jsonl").open("a") as output:
-                _ = output.write(json.dumps(seconds) + "\n")
             elapsed += seconds
 
         with (patch.object(subprocess, "run", run),
@@ -389,6 +386,17 @@ class AddShowrunnerFixture(unittest.TestCase):
         _ = self.env.setdefault("FAKE_CLAUDE_PID", "998041")
         native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
         _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", fixture_runtime_id("showrunner::" + production_name))
+        if (self.state / "live-agents").exists():
+            path = Path(self.env["HERDR_PANE_RECORD_DIR"]) / "agents.json"
+            entries = pane_launch.read(path)
+            if "w1:p1" not in entries:
+                owner = staff.by_path(production_name)
+                options: pane_launch.LaunchOptions = {"pane_id": "w1:p1", "model": "", "remote_control": False,
+                    "environment": {}, "flags_read": True, "written_at": "fixture"}
+                entry = (pane_launch.StaffPaneLaunch(staff_id=owner.id, **options) if owner is not None else
+                         pane_launch.NativePaneLaunch(session_id=fixture_runtime_id("open-shell:" + production_name),
+                            name=production_name, cwd=str(self.root), kind="claude", **options))
+                pane_launch.save(path, {**entries, "w1:p1": entry}, record=staff.snapshot())
         self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
                     session_dir="/fixture", socket_path="/fixture/socket") for path in self.state.glob("live-*")]
@@ -404,6 +412,7 @@ class AddShowrunnerFixture(unittest.TestCase):
             f"--session {SHARED} pane list": CommandResponse(code=0, stdout=json.dumps({
                 "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": production_name}]}})),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "workspace": {"workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})
@@ -448,11 +457,8 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     def named_account(self) -> Path:
         with patch.dict(os.environ, self.env, clear=True):
-            notes = Path(self.env["AGENT_NOTES_DIR"])
-            _ = (notes / "claude3.md").write_text("---\nlogin: target@example.invalid\n---\n")
-            self.assertEqual(accounts.setup("claude3"), [])
+            create_claude_account("claude3", "target@example.invalid")
             directory = accounts.account_dir("claude3")
-            _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"}}))
             # The trust checks use a separate fixture, so selection does not expose any live home.
             _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"},
                 "projects": {str(self.root): {"hasTrustDialogAccepted": True},

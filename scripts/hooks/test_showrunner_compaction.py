@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import json
@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, final, override
 from unittest.mock import patch
+from scripts.hooks import context_usage
 from scripts.lib.file_module import load_file_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -100,6 +101,11 @@ class ShowrunnerCompactionTests(unittest.TestCase):
 
 
 class ContextNoticeTests(unittest.TestCase):
+    def test_parse_window_refuses_non_finite_values(self) -> None:
+        for value in ("inf", "1e308m"):
+            with self.subTest(value=value):
+                self.assertIsNone(context_usage.parse_window(value))
+
     def test_a_showrunner_is_told_to_fill_next_and_not_to_write_a_handoff(self) -> None:
         module = load_file_module(
             "post_tool_use_context_usage", Path(__file__).resolve().parent / "post-tool-use-context-usage.py")

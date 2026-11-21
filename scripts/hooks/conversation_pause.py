@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pause scheduled updates while a session has an active conversation."""
+"""Pause configured reports while a session has an active conversation."""
 
 from __future__ import annotations
 try:
@@ -22,8 +22,9 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.message import send_budget, session_send
+from scripts.message import review_hold, send_budget, send_result, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
+from scripts.production import staff
 
 if TYPE_CHECKING:
     from scripts.lib import script_prompts, unit_runs
@@ -59,10 +60,12 @@ KEEP_COMMAND = (
 )
 NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder|agent-message)(?:\s|>)")
 CROSS_SESSION_TAG = re.compile(r"^<cross-session-message\b[^>]*>")
+CROSS_SESSION_END = "</cross-session-message>"
 # Claude Code types these itself: a session it was asked to watch is idle, or a message was dropped.
 HARNESS_NOTICE = re.compile(r"^\[Cross-session [a-z]+ notice\]")
 USAGE_RESET = "Your claude.ai usage limit has reset."
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
+FROM_ADDRESS = re.compile(r'\sfrom="([^"]*)"')
 CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
 WHOLE_PASTE = re.compile(
     r'<pasted_content id="(?P<id>[^"]+)">'
@@ -82,6 +85,13 @@ class PromptSource(Enum):
     # A job's prompt, or one a script typed into the pane (script_prompts).
     SCHEDULED = "scheduled"
     NOTICE = "notice"
+
+
+@dataclass(frozen=True)
+class ScheduledTaskPrompt:
+    id: str
+    prompt: str
+    recurring: bool
 
 
 @dataclass(frozen=True)
@@ -303,7 +313,15 @@ def scheduled_senders() -> frozenset[str]:
     return frozenset(senders)
 
 
-def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
+def record_scheduled_prompts(session_id: str, prompts: tuple[ScheduledTaskPrompt, ...]) -> None:
+    """Retain missing one-shot tasks until their prompts arrive."""
+    current_ids = {task.id for task in prompts}
+    pending = tuple(task for task in read_scheduled_task_prompts(session_id)
+                    if not task.recurring and task.id not in current_ids)
+    write_scheduled_task_prompts(session_id, prompts + pending)
+
+
+def write_scheduled_task_prompts(session_id: str, prompts: tuple[ScheduledTaskPrompt, ...]) -> None:
     destination = scheduled_prompts_path(session_id)
     if not prompts:
         destination.unlink(missing_ok=True)
@@ -319,7 +337,8 @@ def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
             delete=False,
             encoding="utf-8",
         ) as temporary:
-            json.dump(list(prompts), temporary)
+            json.dump([{"id": task.id, "prompt": task.prompt, "recurring": task.recurring}
+                       for task in prompts], temporary)
             _ = temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
@@ -331,7 +350,7 @@ def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
+def read_scheduled_task_prompts(session_id: str) -> tuple[ScheduledTaskPrompt, ...]:
     try:
         raw = cast(object, json.loads(
             scheduled_prompts_path(session_id).read_text(encoding="utf-8")
@@ -341,22 +360,53 @@ def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return ()
     items = cast(list[object], raw)
-    if not all(isinstance(item, str) for item in items):
-        return ()
-    return tuple(cast(list[str], items))
+    prompts: list[ScheduledTaskPrompt] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return ()
+        fields = cast(dict[str, object], item)
+        task_id, prompt, recurring = fields.get("id"), fields.get("prompt"), fields.get("recurring")
+        if not isinstance(task_id, str) or not isinstance(prompt, str) or not isinstance(recurring, bool):
+            return ()
+        prompts.append(ScheduledTaskPrompt(task_id, prompt, recurring))
+    return tuple(prompts)
 
 
-def _is_recorded_scheduled_prompt(prompt: str, recorded: tuple[str, ...]) -> bool:
+def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
+    return tuple(task.prompt for task in read_scheduled_task_prompts(session_id))
+
+
+def consume_scheduled_prompt(session_id: str, prompt: str) -> None:
+    """Prefer exact matches. Retain recurring tasks and consume one-shot tasks."""
+    prompts = read_scheduled_task_prompts(session_id)
+    for allow_prefix in (False, True):
+        matched_recurring = False
+        for index, task in enumerate(prompts):
+            if not _is_recorded_scheduled_prompt(
+                prompt, (task.prompt,), allow_prefix=allow_prefix,
+            ):
+                continue
+            if task.recurring:
+                matched_recurring = True
+                continue
+            write_scheduled_task_prompts(session_id, prompts[:index] + prompts[index + 1:])
+            return
+        if matched_recurring:
+            return
+
+
+def _is_recorded_scheduled_prompt(prompt: str, recorded: tuple[str, ...], *, allow_prefix: bool = True) -> bool:
     prompt = prompt.strip()
     for scheduled in recorded:
         scheduled = scheduled.strip()
         if prompt == scheduled:
             return True
-        marker = CLIPPED_PROMPT_MARKER.search(scheduled)
-        if marker is not None:
-            prefix = scheduled[:marker.start()]
-            if prefix and prompt.startswith(prefix):
-                return True
+        if allow_prefix:
+            marker = CLIPPED_PROMPT_MARKER.search(scheduled)
+            if marker is not None:
+                prefix = scheduled[:marker.start()]
+                if prefix and prompt.startswith(prefix):
+                    return True
     return False
 
 
@@ -367,6 +417,20 @@ def is_return_question(prompt: str) -> bool:
     opening_tag = text.partition(">")[0]
     match = FROM_NAME.search(opening_tag)
     return match is not None and message_sender_name(match.group(1)) == WATCHER
+
+
+def keep_native_review_prompt(session_id: str, prompt: str, now: int) -> bool:
+    text = prompt.strip()
+    opening = CROSS_SESSION_TAG.match(text)
+    if opening is None or not text.endswith(CROSS_SESSION_END):
+        return False
+    sender = FROM_NAME.search(opening.group())
+    address = FROM_ADDRESS.search(opening.group())
+    body = text[opening.end():-len(CROSS_SESSION_END)]
+    body = re.sub(r"^\r?\n|\r?\n\Z", "", body)
+    message = review_hold.ReviewMessage(sender.group(1) if sender else "unavailable", now, body,
+                                        address.group(1) if address else "unavailable")
+    return review_hold.keep_native_message(session_id, message)
 
 
 def prompt_source(
@@ -418,34 +482,46 @@ def is_showrunner_session(session_id: str) -> bool:
     return bool(showrunner_footer.targeted_instances(session_id))
 
 
-def is_showrunner_or_unit_director(session_id: str) -> bool:
-    """A showrunner's dailies timer or a unit run's status timer targets it, or a unit run marks it."""
-    prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
-    if any(report.name.startswith(prefixes) for report in session_reports(session_id)):
+def session_staff(session_id: str) -> staff.StaffSnapshot:
+    """Read one staff row for the timer and open run lookups."""
+    try:
+        row = staff.local_by_current_session(session_id)
+    except (OSError, UnicodeError) as error:
+        print(f"conversation-pause: timer lookup: {first_error_line(str(error))}", file=sys.stderr)
+        row = None
+    return staff.StaffSnapshot((row,) if row is not None else ())
+
+
+def is_showrunner_or_unit_director(
+    session_id: str, *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+) -> bool:
+    """A timer targets the session, or its staff row names an open run."""
+    record = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
+    if unit_runs.open_run(session_id, record=record) is not None:
         return True
-    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None).is_file()
+    prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
+    return any(report.name.startswith(prefixes) for report in session_reports(session_id, record=record))
 
 
-def session_reports(session_id: str) -> list[Report]:
-    from scripts.hooks import showrunner_footer
-
+def session_reports(session_id: str, *,
+                    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> list[Report]:
     reports: list[Report] = []
     try:
         entries = list(notifier_root().iterdir())
     except OSError:
         return reports
-    try:
-        showrunner_instances = showrunner_footer.targeted_instances(session_id)
-    except (OSError, UnicodeError) as error:
-        print(f"conversation-pause: timer lookup: {first_error_line(str(error))}", file=sys.stderr)
-        showrunner_instances = []
+    snapshot = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
+    row = snapshot.by_current_session(session_id)
+    reference = row.id if row is not None else session_id
     for entry in entries:
         try:
             if not entry.is_dir():
                 continue
             conf_lines = (entry / "conf").read_text(encoding="utf-8").splitlines()
             if (f"TARGET=session:{session_id}" not in conf_lines
-                    and entry not in showrunner_instances):
+                    and not (entry.name.startswith("showrunner-")
+                             and f"TARGET=session:{reference}" in conf_lines)):
                 continue
             if any(line.startswith("RUN=") for line in conf_lines):
                 continue
@@ -602,9 +678,7 @@ def _record(session_id: str) -> RecordLookup:
 def user_words(instances: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     instance_set = set(instances)
     words: list[str] = []
-    if any(name.startswith("showrunner-") for name in instance_set):
-        words.append("dailies")
-    if any(name.startswith(unit_runs.INSTANCE_PREFIXES) for name in instance_set):
+    if any(name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES)) for name in instance_set):
         words.append("status reports")
     known = {name for name in instance_set
              if name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES))}
@@ -635,9 +709,9 @@ def ensure_watcher() -> None:
     _ = run_notifier("new", WATCHER, "--every", "1", "--run", command)
 
 
-def _pause_locked(session_id: str, now: int) -> PauseResult:
+def _pause_locked(session_id: str, now: int, staff_record: staff.StaffSnapshot) -> PauseResult:
     current = _record(session_id)
-    reports = session_reports(session_id)
+    reports = session_reports(session_id, record=staff_record)
     if isinstance(current, NoPauseRecord) and not any(report.enabled for report in reports):
         return NothingToPause()
     ensure_watcher()
@@ -679,7 +753,7 @@ def _pause_locked(session_id: str, now: int) -> PauseResult:
 
 def pause(session_id: str, now: int) -> PauseResult:
     with record_lock():
-        return _pause_locked(session_id, now)
+        return _pause_locked(session_id, now, session_staff(session_id))
 
 
 def _resume_items(record: PauseRecord) -> tuple[str, ...]:
@@ -807,21 +881,23 @@ class DirectorTurn(Enum):
     HOLD = "hold"
 
 
-def director_turn(session_id: str) -> DirectorTurn:
+def director_turn(
+    session_id: str, *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+) -> DirectorTurn:
     """Read the staff hold before a director starts another turn."""
-    from scripts.production import staff
-
-    try:
-        row = staff.snapshot().by_current_session(session_id)
-    except (OSError, ValueError, staff.StaffRefused) as error:
-        print(f"anomaly: staff hold: {error}", file=sys.stderr)
-        return DirectorTurn.ACTIVE
+    row = (staff.local_by_current_session(session_id) if isinstance(record, unit_runs.RunStaffAtUse)
+           else record.by_current_session(session_id))
     return (DirectorTurn.HOLD if row is not None and
             isinstance(row.paused, staff.Paused) else DirectorTurn.ACTIVE)
 
 
-def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
-    if director_turn(session_id) is DirectorTurn.HOLD:
+def message_arrived(
+    session_id: str, source: PromptSource, prompt: str, now: int, *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+) -> HookReply:
+    record = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
+    if director_turn(session_id, record=record) is DirectorTurn.HOLD:
         return ContextOnly("This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume.")
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     return_question = is_return_question(prompt)
@@ -864,7 +940,7 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     f"Automatic updates stay off. {_ask_again()}",
                     _keep_context(),
                 )
-            _ = _pause_locked(session_id, now)
+            _ = _pause_locked(session_id, now, record)
             if source is not PromptSource.TYPED:
                 return NoReply.NOTHING
             return ContextOnly(
@@ -882,7 +958,7 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     "Automatic updates already returned on their own. Tell the user that in one line."
                 )
             if late_answer and isinstance(response, No):
-                result = _pause_locked(session_id, now)
+                result = _pause_locked(session_id, now, record)
                 refreshed = _record(session_id)
                 if isinstance(refreshed, PauseRecord):
                     write_record(replace(refreshed, phase=KeptOff()))
@@ -893,8 +969,8 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     _keep_context(),
                 )
             record_path(session_id).unlink(missing_ok=True)
-            return _pause_reply(_pause_locked(session_id, now))
-        return _pause_reply(_pause_locked(session_id, now))
+            return _pause_reply(_pause_locked(session_id, now, record))
+        return _pause_reply(_pause_locked(session_id, now, record))
 
 
 def _keep(session_id: str) -> bool:
@@ -929,7 +1005,7 @@ def _send_question(delivery: QuestionDelivery) -> bool:
         print(f"conversation-pause: send for {delivery.session_id}: {error}", file=sys.stderr)
         return False
     first_output = first_error_line(result.stdout)
-    if result.returncode == 0 and first_output.startswith("SENT:"):
+    if send_result.delivered_or_kept(result.returncode, result.stdout):
         return True
     message = first_error_line(result.stderr) or first_output or str(result.returncode)
     print(f"conversation-pause: send for {delivery.session_id}: {message}", file=sys.stderr)
@@ -940,18 +1016,6 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     words = _resume_items(record)
     write_record(PauseRecord(record.session_id, (), Returned(now)))
     return words
-
-
-def _review_names(record: PauseRecord) -> frozenset[str]:
-    from scripts.production import showrunners, staff
-
-    names: set[str] = set()
-    for name in record.instances:
-        if name.startswith("showrunner-"):
-            owner = showrunners.owner_for_timer(notifier_root() / name)
-            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-                names.add(owner.name)
-    return frozenset(names)
 
 
 def _timer_paused(instance: Path) -> bool:
@@ -979,14 +1043,12 @@ def _prune_unscheduled(record: PauseRecord) -> PauseRecord | None:
     return kept
 
 
-def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, review_open: bool,
+def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup,
              questions: list[QuestionDelivery], actions: list[str]) -> None:
     if session is NotRunning.GONE:
         words = _resume_items(record)
         path.unlink(missing_ok=True)
         actions.append(f"session ended: {record.session_id}: {', '.join(words)}")
-        return
-    if review_open:
         return
     if not isinstance(record.phase, Returned):
         kept = _prune_unscheduled(record)
@@ -1027,8 +1089,6 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    from scripts.hooks import showrunner_footer
-
     scheduled_root = state_root() / "scheduled-prompts"
     try:
         scheduled_paths = list(scheduled_root.glob("*.json"))
@@ -1049,11 +1109,7 @@ def tick(now: int) -> tuple[str, ...]:
         for path, session in lookups:
             try:
                 record = read_record(path)
-                review_open = any(
-                    showrunner_footer.review_pause_path(name).exists()
-                    for name in _review_names(record)
-                )
-                _advance(path, record, now, session, review_open, questions, actions)
+                _advance(path, record, now, session, questions, actions)
             except FileNotFoundError:
                 continue
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:

@@ -12,9 +12,10 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import ledger
-from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, git_only, instant
+from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, charge_readings, git_only, instant
 
 from scripts.buildlog import index, store
+from scripts.lib import conf
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
 
 
@@ -71,13 +72,19 @@ class MeasurementFixture(CostFixture):
             "BUILDLOG_PEER": "", "USER_ZONE": "UTC", "TZ": "UTC",
         })))
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac,aws\nkind.natedev=local\nplatform.natedev=linux\n"
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n"
             + "sync.hosts.natedev=natedev\nsync.hosts.mac=Mac,mac\nsync.hosts.aws=aws-build\n")
 
     def book(self) -> ledger.CostLedger:
         return ledger.CostLedger(self.state)
+
+    def charge_fetch(self, usd: Decimal) -> mock.Mock:
+        def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
+            fee = conf.decimal(conf.read(self.settings).text('cost_explorer_read_usd'))
+            return charge_readings(start, end, usd, fee)
+        return mock.Mock(side_effect=fetch)
 
     def seed_cost(self, *, hours: int = 2, price: str = "1") -> None:
         book = self.book()

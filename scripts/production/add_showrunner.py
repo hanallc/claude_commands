@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Start a lower production's showrunner in a named herdr session, attached to this showrunner's production.
 
-Usage: add_showrunner.py --production <child staff name> --model <id> --effort <level>
+Usage: add_showrunner.py --production <child staff name> [--model <id> --effort <level>]
                          [--doc <path>] [--resume <session id> --cwd <dir> [--account <label> | --config-dir <dir>]] [--check]
 
 The parent showrunner runs it. The session is named for the child's staff name and starts in the child's
@@ -34,13 +34,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from scripts.production import completion_receipt, staff
-from scripts.shutdown.remote import local_machine
+from scripts.herdr import herdr_types
+from scripts.lib import models_registry
+from scripts.agents.remote import local_machine
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
 from scripts.production import showrunner_tree
 from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
@@ -74,11 +76,18 @@ class ShowrunnerLaunch:
     started_at: datetime
 
     @classmethod
-    def from_receipt(cls, fields: dict[str, object]) -> ShowrunnerLaunch:
-        session_id, config_dir, started_at = (fields.get(key) for key in ("session_id", "config_dir", "started_at"))
-        if not all(isinstance(value, str) and value for value in (session_id, config_dir, started_at)):
+    def from_receipt(cls, receipt: completion_receipt.OwnedReceipt | completion_receipt.UnpublishedReceipt) -> ShowrunnerLaunch:
+        started_at = receipt.fields.get("started_at")
+        if isinstance(receipt, completion_receipt.OwnedReceipt):
+            session_id = receipt.owner.current_session
+            home = receipt.owner.home
+            config_dir = str(home.path) if isinstance(home, staff.SessionHome) else ""
+        else:
+            session_id = receipt.identity
+            config_dir = receipt.fields.get("config_dir")
+        if (not session_id or not isinstance(config_dir, str) or not config_dir
+                or not isinstance(started_at, str) or not started_at):
             raise Refusal("showrunner receipt has no launch identity")
-        assert isinstance(session_id, str) and isinstance(config_dir, str) and isinstance(started_at, str)
         return cls(session_id, Path(config_dir), datetime.fromisoformat(started_at))
 
 
@@ -90,6 +99,22 @@ class NewShowrunnerLaunch:
 NEW_SHOWRUNNER_LAUNCH = NewShowrunnerLaunch()
 
 
+def finish_publication(receipt: completion_receipt.OwnedReceipt) -> completion_receipt.OwnedReceipt:
+    """Complete an unknown staff home, then remove the admitted launch copies."""
+    owner = receipt.owner
+    config_dir = receipt.fields.get("config_dir")
+    if isinstance(owner.home, staff.HomeUnknown) and config_dir is not None:
+        if not isinstance(config_dir, str) or not config_dir or not Path(config_dir).is_absolute():
+            raise Refusal("showrunner receipt has no launch home")
+        owner = staff.set_home(owner.id, staff.SessionHome(Path(config_dir)), only_unknown=True)
+    fields = {key: value for key, value in receipt.fields.items() if key not in ("session_id", "doc", "config_dir")}
+    if fields == receipt.fields:
+        return receipt
+    path = showrunners.SHOWRUNNER_STATE_DIR / owner.id / "add_showrunner.json"
+    completion_receipt.write_receipt(path, owner.id, fields)
+    return completion_receipt.OwnedReceipt(owner, fields)
+
+
 def launch_place(identity: ShowrunnerLaunch) -> herdr.HerdrPlace | herdr.NotInHerdr:
     from scripts.message import sessions
 
@@ -98,7 +123,9 @@ def launch_place(identity: ShowrunnerLaunch) -> herdr.HerdrPlace | herdr.NotInHe
         raise Refusal(f"cannot locate session {identity.session_id}: {observed.reason}")
     if isinstance(observed, sessions.SessionNotLive):
         return herdr.NotInHerdr()
-    place = herdr.herdr_place_of(observed.pid)
+    place = herdr.process_placement(observed.pid)
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        raise Refusal(place.reason)
     if isinstance(place, herdr.NotInHerdr):
         raise Refusal(f"session {identity.session_id} runs outside herdr")
     return place
@@ -135,18 +162,24 @@ def checked(child: ProductionDocument, caller: str, ending: EndingTab = NO_ENDIN
     try:
         if herdr_tab_open(child.name, ending):
             raise Refusal(f"a tab named {child.name} is already open in herdr session {herdr.shared_session()}")
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         raise Refusal(str(error)) from error
 
 
 def herdr_tab_open(name: str, ending: EndingTab) -> bool:
-    """Whether a tab named `name` remains in the shared herdr session after `ending`."""
+    """Find the showrunner's native pane or retained shell after the ending pane closes."""
     shared = herdr.shared_session()
     if not any(session["name"] == shared for session in herdr.live_sessions()):
         return False
-    return any(pane.get("label") == name
-               and (not isinstance(ending, EndingUnitTab) or pane["pane_id"] != ending.pane_id)
-               for pane in herdr.Herdr(shared).panes())
+    client = herdr.Herdr(shared)
+    record = staff.initial_snapshot()
+    entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
+    references = pane_launch.named_references(name, record, entries)
+    return any(not isinstance(ending, EndingUnitTab) or pane["pane_id"] != ending.pane_id
+               for reference in references
+               if isinstance(reference, pane_launch.NativeLaunchReference)
+               or (owner := record.by_id(reference.id)) is not None and owner.kind == "showrunner"
+               for pane in pane_launch.reference_panes(reference, record, client, entries))
 
 
 def account_directory(selected: ClaudeLaunchAccount) -> Path:
@@ -181,7 +214,7 @@ def launch(child: ProductionDocument, model: str, effort: str, resume: str | Non
     arguments = ["--model", model, "--effort", effort]
     if resuming:
         arguments.extend(["--resume", session_id])
-    from scripts.shutdown.launch_names import LaunchNames
+    from scripts.agents.launch_names import LaunchNames
 
     name = LaunchNames.read().name(session_id, child.name)
     arguments.extend(["--remote-control", name, "-n", name, "--settings", '{"disableAgentView": true}'])
@@ -195,7 +228,7 @@ def launch(child: ProductionDocument, model: str, effort: str, resume: str | Non
             before_prompt if before_prompt is not None else
             lambda observed: ensure_staff_showrunner(child, runtime_id=observed.session_id)), timeout_ms=90_000)
     if isinstance(launched, herdr.nix_env.Refused):
-        raise herdr.HerdrFailure(launched.reason)
+        raise herdr_types.HerdrFailure(launched.reason)
     outcome = launched.outcome
     return (outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
             else herdr.PromptNotSubmitted("launcher supplied no submit proof"))
@@ -228,8 +261,8 @@ def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Start a lower production's showrunner in herdr and attach it.")
     _ = parser.add_argument("--production", required=True)
     _ = parser.add_argument("--doc", type=Path, help="the production doc; needed only when the showrunner has no staff row yet")
-    _ = parser.add_argument("--model", required=True, help="pass your own model id")
-    _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
+    _ = parser.add_argument("--model", default="", help="override the showrunner model")
+    _ = parser.add_argument("--effort", default="", help="override the showrunner effort")
     _ = parser.add_argument("--resume", help="the session id to resume; needs --cwd")
     _ = parser.add_argument("--account", default="", help="with --resume: retained or selected account")
     _ = parser.add_argument("--config-dir", default="", help="with --resume: retained config directory")
@@ -240,8 +273,14 @@ def _main(argv: list[str]) -> int:
     cwd = cast(Path | None, args.cwd)
     if (resume is None) != (cwd is None):
         parser.error("--resume and --cwd go together")
+    model, effort = cast(str, args.model), cast(str, args.effort)
+    if bool(model) != bool(effort):
+        parser.error("--model and --effort go together")
     caller = showrunners.own_name()
     try:
+        if not model:
+            default = models_registry.launch_settings("production", "showrunner", "claude")
+            model, effort = default.model, default.effort
         record = staff.initial_snapshot()
         name = cast(str, args.production)
         doc = cast(Path | None, args.doc)
@@ -265,10 +304,13 @@ def _main(argv: list[str]) -> int:
                     saved = candidate
         if isinstance(saved, (completion_receipt.OwnedReceipt, completion_receipt.UnpublishedReceipt)) and not cast(bool, args.check):
             fields = saved.fields
-            if ((isinstance(saved, completion_receipt.UnpublishedReceipt) or saved.owner.kind == "showrunner")
-                    and fields.get("doc") == str(child.doc)
-                    and fields.get("caller") == caller and fields.get("resume") == resume):
-                identity = ShowrunnerLaunch.from_receipt(fields)
+            matches = (fields.get("doc") == str(child.doc) if isinstance(saved, completion_receipt.UnpublishedReceipt)
+                       else saved.owner.kind == "showrunner" and isinstance(saved.owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                       and saved.owner.doc.path == child.doc)
+            if matches and fields.get("caller") == caller and fields.get("resume") == resume:
+                if isinstance(saved, completion_receipt.OwnedReceipt):
+                    saved = finish_publication(saved)
+                identity = ShowrunnerLaunch.from_receipt(saved)
                 if identity.config_dir != selected.dir:
                     raise Refusal(f"{child.name}: unfinished launch belongs to {identity.config_dir}")
                 place = launch_place(identity)
@@ -280,18 +322,21 @@ def _main(argv: list[str]) -> int:
                     _ = ensure_staff_showrunner(child, caller, runtime_id=identity.session_id)
                     print(f"{child.name} already started")
                     return showrunners.main(["attach", child.name, caller])
-                if isinstance(place, herdr.HerdrPlace) and not any(
-                    pane["pane_id"] == place.pane and pane.get("label") == child.name
-                    for pane in herdr.Herdr(place.session).panes()
-                ):
+                if (isinstance(place, herdr.HerdrPlace)
+                        and herdr.Herdr(place.session).native_session(place.pane, "claude", 90) != identity.session_id):
                     raise Refusal(f"session {identity.session_id} does not own {child.name}'s tab")
         ending = EndingUnitTab(place.pane) if isinstance(place, herdr.HerdrPlace) else NO_ENDING_TAB
         checked(child, caller, ending=ending, start_in=cwd, config_dir=account_directory(selected))
         if resume and isinstance(place, herdr.NotInHerdr):
             from scripts.message import sessions
-            if any(item["sessionId"] == resume for item in sessions.live_sessions()):
-                raise Refusal(f"session {resume} is still live")
-    except (Refusal, OSError, herdr.HerdrFailure) as refusal:
+            match sessions.session_liveness(resume):
+                case sessions.LiveSessionProcess():
+                    raise Refusal(f"session {resume} is still live")
+                case sessions.SessionLivenessUnknown(reason=reason):
+                    raise Refusal(reason)
+                case sessions.SessionNotLive():
+                    pass
+    except (Refusal, OSError, ValueError, herdr_types.HerdrFailure) as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2
     if cast(bool, args.check):
@@ -307,33 +352,42 @@ def _main(argv: list[str]) -> int:
                     raise Refusal(f"{child.name}: unfinished launch owner changed")
                 existing = staff.update_current_session(retained.current_session, native)
         owner = existing.id if existing is not None else native
-        completion_receipt.write_receipt(showrunners.SHOWRUNNER_STATE_DIR / owner / "add_showrunner.json", owner, {"doc": str(child.doc), "caller": caller, "resume": resume,
-                                  "session_id": transcript.session_id, "config_dir": str(identity.config_dir),
-                                  "started_at": identity.started_at.isoformat()})
-        _ = ensure_staff_showrunner(child, caller, runtime_id=native)
+        path = showrunners.SHOWRUNNER_STATE_DIR / owner / "add_showrunner.json"
+        fields: dict[str, object] = {"caller": caller, "resume": resume, "started_at": identity.started_at.isoformat()}
+        fields.update({"doc": str(child.doc), "config_dir": str(transcript.config_dir)})
+        completion_receipt.write_receipt(path, owner, fields)
+        try:
+            _ = ensure_staff_showrunner(child, caller, runtime_id=native)
+        finally:
+            admitted = staff.initial_snapshot().by_current_session(native)
+            if admitted is not None:
+                _ = finish_publication(completion_receipt.OwnedReceipt(admitted, fields))
     try:
         if isinstance(place, herdr.HerdrPlace):
             prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
             transcript = herdr.SessionTranscript(identity.config_dir, identity.session_id)
             outcome = herdr.submitted_prompt(transcript, prompt, identity.started_at)
             published(transcript)
-            if not isinstance(outcome, herdr.PromptSubmitted):
+            if outcome.state != "confirmed":
                 outcome = herdr.Herdr(place.session).submit_opening_prompt(
-                    place.pane, herdr.OpeningPrompt(prompt, transcript), identity.started_at, 90_000)
+                    place.pane, herdr.OpeningPrompt(prompt, transcript, may_type=False), identity.started_at, 90_000)
         else:
-            outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected,
+            outcome = launch(child, model, effort, resume, where, selected,
                              identity=identity, before_prompt=published)
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY
-    except (OSError, subprocess.SubprocessError, herdr.HerdrFailure) as error:
+    except (OSError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         said = cast(object, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
         print(f"add_showrunner: the session did not start: {detail}", file=sys.stderr)
         return 2
     if isinstance(outcome, herdr.ClaudeTrustNotWritten):
         return SESSION_NOT_READY
-    if isinstance(outcome, herdr.PromptNotSubmitted):
+    if outcome.publication_error is not None:
+        print(f"add_showrunner: {child.name}: staff publication failed: {outcome.publication_error}", file=sys.stderr)
+        return 1 if outcome.state == "confirmed" else SESSION_NOT_READY
+    if outcome.state != "confirmed":
         print(f"add_showrunner: {child.name}: opening prompt not submitted: {outcome.reason}", file=sys.stderr)
         return SESSION_NOT_READY
     attach = herdr.attach_hint(child.name, child.name)

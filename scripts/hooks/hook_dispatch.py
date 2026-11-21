@@ -100,20 +100,19 @@ PRE_TOOL_USE = (
     HookSpec("pre-tool-use-showrunner-move-guard.py", "Bash"),
     HookSpec("pre-tool-use-change-review-gate.py", "Bash"),
     HookSpec("pre-tool-use-checkpoint-doc-gate.py", "Bash"),
+    HookSpec("pre-tool-use-push-alone.py", "Bash", 10),
     CopyPolicyHook(),
 )
 POST_TOOL_USE = (
     HookSpec("post-tool-use-basedpyright.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-fn-length.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-context-usage.py", None),
-    HookSpec("post-tool-use-banned-words.py", None),
     HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
     HookSpec("post-tool-use-sendmessage-miss.py", "SendMessage"),
 )
 STOP = (
     HookSpec("compaction-marker-clear.py", None, 10),
     HookSpec("stop-conversation-pause.py", None),
-    HookSpec("stop-assistant-prose-banned-words.py", None),
     HookSpec("stop-context-deferral.py", None, 10),
     HookSpec("herdr_tab_title.py", None),
 )

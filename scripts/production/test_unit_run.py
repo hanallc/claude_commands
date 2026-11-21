@@ -1,7 +1,9 @@
 """Find a unit's review history through the command with disposable local and Mac roots."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.lib.helper_tree_test_support import copy_helpers
+
+from scripts.agents import remote
 
 import json
 import os
@@ -69,7 +71,8 @@ class UnitRunTests(unittest.TestCase):
         self.ssh_log = self.root / "ssh.jsonl"
         mac_home = self.root / "mac-home"
         mac_home.mkdir()
-        (mac_home / ".claude").symlink_to(REPOSITORY, target_is_directory=True)
+        _ = copy_helpers(mac_home, "scripts/production", "scripts/usage", "scripts/agents",
+                         "scripts/herdr", "scripts/message")
         bin_directory = self.root / "bin"
         bin_directory.mkdir()
         ssh = bin_directory / "ssh"
@@ -111,6 +114,7 @@ class UnitRunTests(unittest.TestCase):
                     row = fixture_member("unit", name="history-" + run_id, parent=owner.id,
                                          runtime_id=fixture_runtime_id("history:" + run_id),
                                          worktree=staff.PresentWorktree(remote.local_machine(), normalized))
+                event["owner_staff_id"] = row.id
                 event["main_agent"] = {"family": "claude", "session_id": row.current_session}
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         return path

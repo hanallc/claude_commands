@@ -73,7 +73,7 @@ class ServiceGateFixture(GateSuitesFixture):
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
     @gate_suites("lib", "hooks")
-    def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:
+    def test_suite_progress_counts_test_modules_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
         counters: list[progress.ProgressCounter] = []
         sidecars: list[Path] = []
@@ -101,7 +101,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(merge_gate, "start_gate_job", side_effect=start_job):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        initial_total = self.module_count + 1
+        initial_total = self.module_count
         self.assertEqual([counter for counter in counters if counter.phase == "suites:1"],
             [progress.ProgressCounter("suites:1", done, initial_total) for done in range(initial_total + 1)])
         self.assertEqual([counter for counter in counters if counter.phase != "suites:1"], [])
@@ -134,9 +134,35 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(merge_gate, "gate_reservation") as admission:
             with self.assertRaisesRegex(GateRefused,
-                                        f"requires writable tmpfs at {build_folders.tmpfs_temporary_parent()}"):
+                                        f"requires a writable gate folder at {build_folders.tmpfs_temporary_parent()}"):
                 _ = merge_gate.run_suites(self.checkout)
             admission.assert_not_called()
+        self.assert_gate_released()
+
+    def test_suites_remove_free_gate_folders_before_admission_and_keep_held_ones(self) -> None:
+        tmpfs = self.root / "gate-tmpfs"
+        parent = merge_gate.gate_test_parent(tmpfs)
+        parent.mkdir(parents=True)
+        held = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "merge-gate-test-", build_folders.ExplicitBuildParent(parent)))
+        release = cast(Callable[[Path], None], getattr(build_folders, "_release_build_folder"))
+        self.addCleanup(release, held)
+        free = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "merge-gate-", build_folders.ExplicitBuildParent(parent)))
+        release(free)
+        # Another program's folder in the shared tmpfs, with a free lock file beside it, is kept.
+        foreign = tmpfs / "foreign"
+        foreign.mkdir()
+        (tmpfs / "foreign.lock").touch()
+        with mock.patch.dict(os.environ, self.environment), \
+             mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=tmpfs), \
+             mock.patch.object(merge_gate, "gate_reservation", side_effect=GateRefused("stopped at admission")):
+            with self.assertRaisesRegex(GateRefused, "stopped at admission"):
+                _ = merge_gate.run_suites(self.checkout)
+        self.assertFalse(free.exists())
+        self.assertFalse(free.with_name(free.name + ".lease.json").exists())
+        self.assertTrue(held.is_dir())
+        self.assertTrue(foreign.is_dir())
         self.assert_gate_released()
 
     def test_gate_reservation_refuses_unusable_config_before_default_sizing_admission(self) -> None:
@@ -232,36 +258,39 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         handle_request = fixture.server.handle_request
         first_gate_request = threading.Event()
 
-        def fit_older(request: wire.Request,
-                      connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+        def keep_older_waiting(request: wire.Request,
+                               connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             with fixture.loop_turn():
                 if isinstance(request, wire.AdmitRequest) and request.owner != older.owner and not first_gate_request.is_set():
                     first_gate_request.set()
                     self.assertIn(older.episode, fixture.server.waiters)
-                    fixture.free(23 * admission_records.GIB // 2)
+                    fixture.free(11 * admission_records.GIB)
                 return handle_request(request, connection)
 
         admit = client.admit
         output = io.StringIO()
+        waits: list[wire.Wait] = []
 
         def acquire(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None], refresh: Callable[[], wire.AdmitRequest], *,
                     _attempt: Callable[[], None]) -> wire.Admitted | wire.Refused | client.LeftQueue:
             def held(reply: wire.Wait) -> None:
+                waits.append(reply)
                 on_wait(reply)
                 fixture.proc.kill(older.owner)
                 fixture.free(60 * admission_records.GIB)
             return admit(request, held, refresh, _attempt=_attempt)
 
         with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(fixture.server, "handle_request", side_effect=fit_older), \
+             mock.patch.object(fixture.server, "handle_request", side_effect=keep_older_waiting), \
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with merge_gate.gate_reservation(self.checkout, self.state, merge_gate.BuildHoldWait()):
                 pass
-        self.assertIn("head older-step needs 0.4 GiB", output.getvalue())
+        self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
+        self.assertIsInstance(waits[0].reason, admission_records.BehindHead)
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
 
-    def test_memory_wait_reports_changes_and_only_one_reminder_per_minute(self) -> None:
+    def test_memory_wait_reports_only_reason_and_place_changes(self) -> None:
         clock = FakeClock()
         formatter = client.WaitOutput()
         reported_at: list[float] = []
@@ -280,9 +309,9 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 before = len(output.getvalue().splitlines())
                 formatter(replace(reply, snapshot=snapshot))
                 reported_at.extend([float(at)] * (len(output.getvalue().splitlines()) - before))
-        self.assertEqual(reported_at, [0.0, 60.0, 61.0, 63.0], output.getvalue())
+        self.assertEqual(reported_at, [0.0, 61.0], output.getvalue())
         self.assertIn("memory pressure", output.getvalue())
-        self.assertIn("0.750 GiB needed", output.getvalue())
+        self.assertIn("needs 0.5 GiB", output.getvalue())
         self.assert_gate_released()
 
     @gate_suites("hooks")
@@ -449,8 +478,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_all_modules_started()
-        self.assertEqual(kinds.count(merge_gate.GateJobKind.TEST_MODULE), len(self.module_events()) // 2)
-        self.assertEqual(kinds.count(merge_gate.GateJobKind.TYPE_CHECK), 1)
+        self.assertEqual(kinds, [merge_gate.GateJobKind.TEST_MODULE] * (len(self.module_events()) // 2))
         self.assertEqual(len(paths), len(kinds) + 1)
         self.assertEqual(len(set(paths)), 1)
         self.assert_gate_released()
@@ -485,14 +513,14 @@ class MergeGateAdmissionTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(root)))
 
-    def test_swap_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
+    def test_some_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
         peak = admission_records.ExpectedPeak(admission_records.GIB, "fallback", 0)
         default = admission_policy_fixture()
         root = Path(os.environ["CONF_DIR"])
         _ = fake_memory_readings(root, full_avg10=8, some_avg10=40,
                                  swap_total_kib=100, swap_free_kib=20)
-        lower = replace(default, pressure=replace(default.pressure, swap_used_limit=70))
-        higher = replace(default, pressure=replace(default.pressure, swap_used_limit=90))
+        lower = replace(default, pressure=replace(default.pressure, full_avg10_limit=9, some_avg10_limit=30))
+        higher = replace(default, pressure=replace(default.pressure, some_avg10_limit=50))
         host = memory_admit.read_meminfo(Path(os.environ["BUILDLOG_MEMINFO"]))
         pressure = memory_admit.read_pressure(host, policy=lower)
         assert isinstance(pressure, admission_records.MemoryPressure)
@@ -504,7 +532,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
         with mock.patch.object(admission_records, "read_memory_config", side_effect=AssertionError("frozen check")), \
              mock.patch.object(step_estimator, "memory_config", side_effect=AssertionError("frozen check")):
             self.assertEqual(queue.wait_reasons(snapshot_with_head_cause(replace(result, policy=lower), pressure)),
-                             ("swap memory pressure",))
+                             ("some memory pressure",))
             self.assertEqual(queue.wait_reasons(snapshot_with_head_cause(replace(result, policy=higher),
                                  higher_pressure)),
                              ("memory pressure",))

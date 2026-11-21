@@ -36,7 +36,7 @@ def prepare(diff: Path, source: Path, prompt: Path, report: Path, settings: conf
     """Clear the report and write the prompt with the standing instructions."""
     _ = report.write_text("")
     standing = Template((conf.directory() / "review/simplify.md").read_text()).substitute(
-        agents=",".join(settings.words("SIMPLIFY_AGENTS")))
+        agents=", ".join(settings.words("SIMPLIFY_AGENTS")))
     user_words = source.read_text()
     write_text_atomic(prompt, f"/simplify {shlex.quote(str(diff))}\n\n" + standing + "\n\n" + user_words + "\n")
 
@@ -45,12 +45,10 @@ def validate(report: str, log: str, agent_count: int) -> str:
     """Return the reason when the report or agent completion is invalid."""
     if report.startswith("ERROR:"):
         return report.removeprefix("ERROR:").strip()
-    result = claude_result(log)
-    if result.reason:
-        return result.reason
+    stats = claude_result(log).stats
     if not report.strip():
         return log_errors(log) or "Claude returned an empty simplify report"
-    if result.stats and (result.stats.get("completed") != agent_count or result.stats.get("failed") != 0):
+    if stats and (stats.get("completed") != agent_count or stats.get("failed") != 0):
         return f"the {agent_count} simplify agents did not all complete successfully"
     return "" if well_formed(report) else "the simplify report must start with Pass or item 1"
 

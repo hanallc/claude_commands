@@ -2,11 +2,8 @@
 
 ## Items to consider
 
-- [ ] **A production two levels up also shows its grandchild style production's line in an expanded dailies view**
-  - Target: scripts/production/dailies_input.py, scripts/production/dailies_render.py (expand of a middle production)
-  - Why needed: a middle production's saved report does not carry its style child's summary, so the grandparent's `expand` shows no style line under the middle production's style child.
-  - Completion condition: the grandparent's expand shows the same style line under the middle production's style child that the middle production's own dailies shows.
-  - Revealed by: Phase 13
+2026-11-11: Dailies retirement removed the proposed expanded style summary.
+Use `/showrunner:units` for unit status and `/showrunner:style_report` for style coverage.
 
 - [ ] **Changing which files a rule checks no longer makes all of that rule's earlier results out of date**
   - Target: scripts/style/style_ledger.py (rule version), scripts/style/rules.py (rule blob)
@@ -25,3 +22,9 @@
   - Why needed: three cargo-liner rows (`impl Subscriber for GitStatusTrace` inside checkout.rs `mod tests`, which has `use super::*`) stay "trait identity uncertain" after phase 34, because a block glob can bind the trait name. Resolving the glob from the parent module's proved items and imports would let them follow.
   - Completion condition: a dry-run follow on a copy of cargo-liner's ledger shows those three rows in place; a glob whose parent cannot be fully read still keeps the row.
   - Revealed by: Phase 34 (showrunner disposition next, 2026-10-20)
+
+- [ ] **A crate run's integrate step reuses the held validated checkout instead of making a new one**
+  - Target: scripts/style/crate_run.py (`CrateRun.integrate`)
+  - Why needed: integrate makes a new checkout although the run already holds a validated one. Measured upper bound of the saving: 5.0 CPU s per gate (natest, via builds and natedev, 2026-11-07).
+  - Completion condition: integrate reuses the held checkout only when the integration candidate's tree is the tree that checkout validated: the destination tip did not move and no published path overlaps. When the destination moved, it makes a new checkout as now. A test proves both cases.
+  - Revealed by: sdlc backlog ask, 2026-11-07

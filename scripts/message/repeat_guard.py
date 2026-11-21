@@ -4,34 +4,38 @@ The pure transition is also the log replay. One sender record serializes concurr
 receivers; literal-repeat episodes cover receivers together; rate episodes belong to one receiver.
 """
 from __future__ import annotations
-try:
-    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
-except FileNotFoundError:
-    pass
+
+import sys
+from pathlib import Path
+
+_WORKER_PATH = Path(__file__).resolve()
+if __name__ == "__main__" and sys.flags.isolated and sys.flags.no_site:
+    # The guard worker loads local modules from the checkout that owns this file.
+    sys.path.insert(0, str(_WORKER_PATH.parents[2]))
+else:
+    try:
+        with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+    except FileNotFoundError:
+        pass
 
 import fcntl
 import hashlib
 import json
 import math
 import os
-import signal
 import contextvars
-import socket
-import threading
 import subprocess
 import time
-import sys
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from subprocess import Popen
 from typing import Literal, cast
 
-from scripts.lib import process_group
+from scripts.lib import conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 
-CONFIG = Path(__file__).resolve().parents[2] / "config/send_repeat_guard.conf"
+CONFIG = _WORKER_PATH.parents[2] / "config/send_repeat_guard.conf"
 NOTICE_SENDER = "send-repeat-guard"
 
 
@@ -67,7 +71,7 @@ def configuration() -> Limits | GuardUnavailable:
     path = Path(os.environ.get("SEND_REPEAT_CONFIG", str(CONFIG)))
     try:
         values: dict[str, int] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in conf_reads.read_text(path).splitlines():
             line = line.split("#", 1)[0].strip()
             if not line:
                 continue
@@ -385,9 +389,8 @@ def _stored_check(root: Path, attempt: Attempt, *, event: bool = False) -> Decis
         return Decision()
 
 
-# An I/O-free caller safety ceiling, not a holding policy or configuration default.
-# Only the worker reads policy. On timeout the caller always admits delivery.
-GUARD_IO_CEILING_SECONDS = 0.25
+# The isolated worker took up to 407 ms in 64 paired trials per operation on natedev.
+GUARD_IO_CEILING_SECONDS = 0.75
 _ACCOUNTING_OWNER = contextvars.ContextVar("repeat_accounting_owner", default=True)
 _REPORT_RECIPIENT = contextvars.ContextVar("repeat_report_recipient", default=False)
 
@@ -409,6 +412,11 @@ def isolated(command: list[str], request: str, budget: float) -> Decision:
     The caller's deadline includes interpreter startup and every storage operation.
     Reaping a killed, uninterruptible worker never delays delivery.
     """
+    import signal
+    from threading import Thread
+
+    from scripts.lib import process_group
+
     started = time.monotonic()
     child = Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -442,14 +450,13 @@ def isolated(command: list[str], request: str, budget: float) -> Decision:
             except ProcessLookupError:
                 pass
             # Reaping must not extend the caller's I/O safety ceiling.
-            threading.Thread(target=child.communicate, daemon=True).start()
+            Thread(target=child.communicate, daemon=True).start()
 
 
 def bounded(operation: Literal["check", "event"], root: Path, attempt: Attempt, *,
             event: bool = False, outcome: str = "") -> Decision:
     request = json.dumps({"root": str(root), "attempt": asdict(attempt), "event": event, "outcome": outcome})
-    return isolated([sys.executable, str(Path(__file__).resolve()), operation], request,
-                    GUARD_IO_CEILING_SECONDS)
+    return isolated([sys.executable, "-I", "-S", str(_WORKER_PATH), operation], request, GUARD_IO_CEILING_SECONDS)
 
 
 def check(root: Path, attempt: Attempt, *, event: bool = False) -> Decision:
@@ -472,6 +479,8 @@ def message_state() -> Path:
 
 
 def transport_attempt(sender: str, receiver: str, text: str, human: bool) -> Attempt:
+    import socket
+
     return Attempt(sender, receiver, text, socket.gethostname().split(".")[0], time.time(),
                    human or sender.casefold() == "user")
 
@@ -589,6 +598,10 @@ def drain(root: Path, deliver: Callable[[SenderState, Notice, Limits], NoticeOut
 
 def notice_job(command: list[str], budget: float) -> None:
     """One supervisor owns the job group, including delivery children on both OSes."""
+    import signal
+
+    from scripts.lib import process_group
+
     child = Popen(command, start_new_session=True,
                   env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1",
                        "SEND_REPEAT_NOTICE_DEADLINE": str(time.monotonic() + budget)})

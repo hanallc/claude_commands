@@ -15,6 +15,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import json
+from fnmatch import fnmatchcase
 import math
 import os
 import shlex
@@ -22,14 +23,17 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.lib import conf, nix_env
-from scripts.message import send_result, sessions
+from scripts.lib import atomic_file, conf, nix_env
+from scripts.herdr import pane_launch
+from scripts.production import staff
+from scripts.message import send_result, session_records, sessions
 from scripts.message import send_budget
 if TYPE_CHECKING:
     from scripts.notify import push_texts, review
@@ -97,7 +101,7 @@ class PendingRestart(TypedDict):
     login: str
     name: str
     cwd: str
-    config_dir: str
+    config_dir: NotRequired[str]
     pid: int
     proc_start: str
     stop_request_sent: bool
@@ -139,48 +143,98 @@ class HealLog(TypedDict):
     reason: str
 
 
-def registry_sessions() -> list[HealSession]:
-    """Decode all registries without probing unrelated processes."""
-    directories = set(Path.home().glob(conf.read("nix_env").text("session_directory_glob")))
-    configured = os.environ.get("NOTIFIER_SESSIONS_DIR")
-    if configured:
-        directories.add(Path(configured))
+@dataclass(frozen=True)
+class HealSessionRead:
+    sessions: tuple[HealSession, ...]
+    unreadable: tuple[Path, ...] = ()
+
+
+def registry_sessions() -> HealSessionRead:
+    """Decode the configured registry and any other discovered registries."""
+    configured = sessions.sessions_dir()
+    directories = {Path.home()}
+    unreadable: list[Path] = []
+
+    def recursive_directories(root: Path) -> Iterator[Path]:
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        path = directory / entry.name
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(path)
+                        except OSError:
+                            unreadable.append(path)
+            except NotADirectoryError:
+                continue
+            except OSError:
+                unreadable.append(directory)
+                continue
+            yield directory
+
+    pattern = conf.read("nix_env").text("session_directory_glob")
+    for part in Path(pattern).parts:
+        if part == "**":
+            directories = {child for root in directories for child in recursive_directories(root)}
+            continue
+        matches: set[Path] = set()
+        wildcard = any(character in part for character in "*?[")
+        for directory in directories:
+            if wildcard:
+                try:
+                    matches.update(child for child in directory.iterdir() if fnmatchcase(child.name, part))
+                except OSError:
+                    unreadable.append(directory)
+                continue
+            path = directory / part
+            try:
+                _ = path.stat()
+                matches.add(path)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                unreadable.append(path)
+        directories = matches
+
     found: dict[tuple[str, int, str], HealSession] = {}
-    previous = os.environ.get("NOTIFIER_SESSIONS_DIR")
-    try:
-        for directory in sorted(directories):
-            os.environ["NOTIFIER_SESSIONS_DIR"] = str(directory)
-            for observation in sessions.read_registry().entries:
-                record, details = observation.record, observation.details
-                if sessions.headless(record):
-                    continue
-                cwd, status = details.get("cwd"), details.get("status")
-                if (not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute()
-                        or not isinstance(status, str) or not record["sessionId"]):
-                    continue
-                started = record.get("procStart", "")
-                if not started:
-                    continue
-                found[(record["sessionId"], record["pid"], started)] = HealSession(record["sessionId"], record["pid"], started,
-                    record["name"], Path(cwd), status, directory.parent)
-    finally:
-        if previous is None:
-            if "NOTIFIER_SESSIONS_DIR" in os.environ:
-                del os.environ["NOTIFIER_SESSIONS_DIR"]
-        else:
-            os.environ["NOTIFIER_SESSIONS_DIR"] = previous
-    return list(found.values())
+    for directory in sorted({configured, *directories}):
+        registry = session_records.read_registry(directory=directory)
+        unreadable.extend(registry.unreadable)
+        for observation in registry.entries:
+            record, details = observation.record, observation.details
+            if sessions.headless(record):
+                continue
+            cwd, status = details.get("cwd"), details.get("status")
+            if (not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute()
+                    or not isinstance(status, str) or not record["sessionId"]):
+                continue
+            started = record.get("procStart", "")
+            if not started:
+                continue
+            found[(record["sessionId"], record["pid"], started)] = HealSession(record["sessionId"], record["pid"], started,
+                record["name"], Path(cwd), status, directory.parent)
+    return HealSessionRead(tuple(found.values()), tuple(dict.fromkeys(unreadable)))
 
 
-def list_sessions() -> list[HealSession]:
-    """List confirmed live processes, including those without messaging sockets."""
-    return [item for item in registry_sessions() if sessions.process_start(item.pid) == item.proc_start]
+def list_sessions() -> HealSessionRead:
+    """List confirmed live processes and keep unreadable registry paths."""
+    reading = registry_sessions()
+    return HealSessionRead(
+        tuple(item for item in reading.sessions if sessions.process_start(item.pid) == item.proc_start),
+        reading.unreadable,
+    )
 
 
-def find_session(session_id: str) -> HealSession | Gone:
-    for item in registry_sessions():
-        if item.session_id == session_id and sessions.process_start(item.pid) == item.proc_start:
+def find_session(session_id: str) -> HealSession | Gone | Unavailable:
+    reading = list_sessions()
+    for item in reading.sessions:
+        if item.session_id == session_id:
             return item
+    if reading.unreadable:
+        return Unavailable(session_records.registry_unreadable_reason(reading.unreadable))
     return Gone()
 
 
@@ -251,13 +305,16 @@ def read_pending(value: object) -> NoPendingRestart | PendingRestart:
     stop_request_sent = fields.get("stop_request_sent", True)
     if (kind not in ("stopping", "launching") or not isinstance(login, str) or not login
             or not isinstance(name, str) or not isinstance(cwd, str) or not Path(cwd).is_absolute()
-            or not isinstance(config_dir, str) or not Path(config_dir).is_absolute()
+            or ("config_dir" in fields and (not isinstance(config_dir, str) or not Path(config_dir).is_absolute()))
             or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
             or not isinstance(proc_start, str) or not proc_start
             or not isinstance(stop_request_sent, bool)):
         raise ValueError("invalid nix-heal pending restart; refusing an unproven relaunch")
-    return PendingRestart(kind="launching" if kind == "launching" else "stopping", login=login, name=name, cwd=cwd,
-                          config_dir=config_dir, pid=pid, proc_start=proc_start, stop_request_sent=stop_request_sent)
+    pending = PendingRestart(kind="launching" if kind == "launching" else "stopping", login=login, name=name, cwd=cwd,
+                             pid=pid, proc_start=proc_start, stop_request_sent=stop_request_sent)
+    if isinstance(config_dir, str):
+        pending["config_dir"] = config_dir
+    return pending
 
 
 def read_history(directory: Path) -> dict[str, HealHistory]:
@@ -288,12 +345,7 @@ def read_history(directory: Path) -> dict[str, HealHistory]:
 
 
 def save_history(directory: Path, histories: dict[str, HealHistory]) -> None:
-    temporary = directory / f"state.{os.getpid()}.tmp"
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(histories, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-    _ = temporary.replace(directory / "state.json")
+    atomic_file.write_text_atomic(directory / "state.json", json.dumps(histories))
 
 
 def log(directory: Path, session: HealSession, history: HealHistory, action: str, reason: str) -> None:
@@ -339,10 +391,10 @@ def stop_completion(session: HealSession, login: str) -> StopComplete | StopPend
     return StopPending() if isinstance(observed, sessions.LiveSessionProcess) else StopComplete()
 
 
-def confirm_relaunch(directory: Path, session: HealSession, history: HealHistory) -> bool:
-    """A successful command is not yet proof of a live, healthy replacement."""
-    replacement = next((item for item in list_sessions() if item.session_id == session.session_id), None)
-    if (replacement is not None and (replacement.pid, replacement.proc_start) != (session.pid, session.proc_start)
+def confirm_relaunch(directory: Path, session: HealSession, history: HealHistory,
+                     replacement: HealSession | Gone) -> bool:
+    """Confirm a live, healthy replacement before clearing the pending restart."""
+    if (isinstance(replacement, HealSession) and (replacement.pid, replacement.proc_start) != (session.pid, session.proc_start)
             and replacement.cwd.resolve() == session.cwd.resolve()
             and replacement.config_dir.resolve() == session.config_dir.resolve()
             and isinstance(inspect(replacement), Healthy)):
@@ -356,7 +408,7 @@ def confirm_relaunch(directory: Path, session: HealSession, history: HealHistory
 
 def request_stop(directory: Path, limits: HealLimits, session: HealSession, pending: PendingRestart, history: HealHistory,
                  histories: dict[str, HealHistory]) -> bool:
-    from scripts.shutdown import stop_resume
+    from scripts.agents import stop_resume
 
     result = stop_resume.stop(session.session_id)
     if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
@@ -372,9 +424,12 @@ def request_stop(directory: Path, limits: HealLimits, session: HealSession, pend
 def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pending: PendingRestart, history: HealHistory,
                    histories: dict[str, HealHistory]) -> None:
     if pending["kind"] == "launching":
-        if not confirm_relaunch(directory, session, history):
-            replacement = next((item for item in list_sessions() if item.session_id == session.session_id), None)
-            still_broken = replacement is not None and isinstance(inspect(replacement), Broken)
+        replacement = find_session(session.session_id)
+        if isinstance(replacement, Unavailable):
+            log(directory, session, history, "pending", replacement.reason)
+            return
+        if not confirm_relaunch(directory, session, history, replacement):
+            still_broken = isinstance(replacement, HealSession) and isinstance(inspect(replacement), Broken)
             reason = ("session still has no nix shell after its heal restart" if still_broken else
                       "waiting for a live replacement with a nix shell; relaunch will not be repeated")
             log(directory, session, history, "pending", reason)
@@ -416,7 +471,7 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
     pending["kind"] = "launching"
     history["restart_at"] = time.time()
     save_history(directory, histories)
-    from scripts.shutdown import stop_resume
+    from scripts.agents import stop_resume
     try:
         result = stop_resume.resume(session.session_id, why="nix shell heal")
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -430,7 +485,10 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
         log(directory, session, history, "refused", reason)
         alert(directory, limits, session, history, reason)
         return
-    if not confirm_relaunch(directory, session, history):
+    replacement = find_session(session.session_id)
+    if isinstance(replacement, Unavailable):
+        log(directory, session, history, "pending", replacement.reason)
+    elif not confirm_relaunch(directory, session, history, replacement):
         log(directory, session, history, "pending", "restart command completed; waiting for a live replacement with a nix shell")
 
 
@@ -448,7 +506,7 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     if held:
         log(directory, session, history, "skip", held)
         return
-    if session.status not in {"idle", "shell"}:
+    if session.status not in sessions.INPUT_STATUSES:
         log(directory, session, history, "skip", "session is not idle")
         return
     now = time.time()
@@ -476,9 +534,12 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     if held:
         log(directory, session, history, "skip", held)
         return
-    fresh = next((item for item in list_sessions() if item.session_id == session.session_id), None)
-    if (fresh is None or fresh.pid != session.pid or fresh.proc_start != session.proc_start
-            or fresh.status not in {"idle", "shell"} or not broken(fresh)):
+    fresh = find_session(session.session_id)
+    if isinstance(fresh, Unavailable):
+        log(directory, session, history, "skip", fresh.reason)
+        return
+    if (isinstance(fresh, Gone) or fresh.pid != session.pid or fresh.proc_start != session.proc_start
+            or fresh.status not in sessions.INPUT_STATUSES or not broken(fresh)):
         log(directory, session, history, "skip", "session changed during environment load")
         return
     from scripts.whoami import account
@@ -497,8 +558,10 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     history["restart_proc_start"] = session.proc_start
     history["healthy_since_restart"] = False
     pending = PendingRestart(kind="stopping", login=selected.login, name=session.name, cwd=str(session.cwd),
-                             config_dir=str(session.config_dir), pid=session.pid, proc_start=session.proc_start,
+                             pid=session.pid, proc_start=session.proc_start,
                              stop_request_sent=False)
+    if staff.initial_snapshot().by_member_reference(session.session_id) is None:
+        pending["config_dir"] = str(session.config_dir)
     history["pending"] = pending
     save_history(directory, histories)
     if not request_stop(directory, limits, session, pending, history, histories):
@@ -509,7 +572,12 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
 def sweep(only: str = "", check: bool = False) -> int:
     """Keep one bad record or launch from preventing other sessions' recovery."""
     try:
-        selected = [item for item in list_sessions() if not only or item.session_id == only]
+        reading = list_sessions()
+        selected = [item for item in reading.sessions if not only or item.session_id == only]
+        if reading.unreadable:
+            print(f"nix-heal: {session_records.registry_unreadable_reason(reading.unreadable)}", file=sys.stderr)
+            if check:
+                return 1
         if check:
             # Absence is not healthy proof: a registry write may be in progress
             # during restart. Keep the push until a live replacement proves it.
@@ -536,8 +604,15 @@ def sweep(only: str = "", check: bool = False) -> int:
                 if pending["kind"] == "none" or (only and only != session_id):
                     continue
                 pending_ids.add(session_id)
+                home = pane_launch.config_home({**pending, "session_id": session_id})
+                if isinstance(home, staff.HomeUnknown):
+                    from scripts.accounts import accounts
+
+                    print(f"anomaly: {session_id}: session home is unknown; select the normal account", file=sys.stderr)
+                    selected_account = accounts.role_account("unit")
+                    home = staff.SessionHome(selected_account.dir)
                 session = HealSession(session_id, pending["pid"], pending["proc_start"], pending["name"],
-                                      Path(pending["cwd"]), "idle", Path(pending["config_dir"]))
+                                      Path(pending["cwd"]), "idle", home.path)
                 try:
                     resume_pending(directory, limits, session, pending, history, histories)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

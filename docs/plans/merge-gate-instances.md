@@ -302,7 +302,8 @@ Partial logs cannot complete a gate.
 A dead instance without a final result permits local fallback.
 A remote test failure remains red and never starts a local retry.
 
-The route imports the explicit buildlog record once by its identity under the real remote host.
+The route imports the explicit buildlog record once by its identity into the one AWS place, `aws`.
+The record keeps the box host name in `host`.
 It uses `scripts/test_times/gate_record.py` for module measurements.
 It adds no gate host to the build-target registry or peer sync service.
 The synchronous caller receives the existing `GateRun` shape and exit behavior.
@@ -788,6 +789,9 @@ The route requests no local memory for a cloud gate.
 
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call appends its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Launch, refusal, fallback, and finish rows record the queue's tagged job record in `gate_job`.
+The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
+Older rows can omit the field.
 Capacity refusals first try the remaining zones and sizes.
 Every cloud setup or infrastructure failure permits local fallback.
 Only a real remote test failure remains red.

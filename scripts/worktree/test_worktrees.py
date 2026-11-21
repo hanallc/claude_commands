@@ -7,17 +7,29 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 from typing import NamedTuple, TypedDict, cast, override
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
+
+
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.buildlog.store import host_name
+from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
+from scripts.lint.memory_test_support import config_environment
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 MAKE_WORKTREE = CHECKOUT / "scripts/worktree/make_worktree.sh"
+WORKTREES = CHECKOUT / "scripts/worktree/worktrees.py"
 
 END_LANDED = """
 import json
@@ -75,9 +87,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="worktree-lifecycle-")))
         self.home = self.root / "home"
         self.home.mkdir()
-        scripts = self.home / ".claude/scripts"
-        scripts.parent.mkdir()
-        scripts.symlink_to(CHECKOUT / "scripts", target_is_directory=True)
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"
@@ -89,13 +99,14 @@ class WorktreeLifecycleTests(unittest.TestCase):
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
+            **config_environment(self.root / "settings"),
             "HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "WORKTREES_STATE_DIR": str(self.state),
             "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
-            "CLAUDE_PYTHON": sys.executable, "PYTHONPATH": str(CHECKOUT),
+            **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": "/nonexistent/herdr",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
@@ -147,6 +158,10 @@ class WorktreeLifecycleTests(unittest.TestCase):
                        if line.startswith("RESULT="))
         return cast(list[EndResult], json.loads(payload))
 
+    def cleanup_result(self, tree: Path) -> subprocess.CompletedProcess[str]:
+        python = self.home / ".claude/scripts/lib/py"
+        return self.command(self.repository, [str(python), str(WORKTREES), "cleanup", str(tree)])
+
     def make(self, tree: Path, branch: str) -> None:
         result = self.command(self.repository, ["bash", str(MAKE_WORKTREE), str(tree), branch])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -161,6 +176,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def publish(self, tree: Path, branch: str) -> None:
         _ = self.git(tree, "push", "-u", "origin", branch)
+        _ = self.git(tree, "config", "--local", f"branch.{branch}.merge", f"refs/heads/{branch}")
 
     def land(self, branch: str) -> None:
         _ = self.git(self.merge_tree, "merge", "--no-ff", branch, "-m", "Merge the checkpoint")
@@ -189,6 +205,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertNotIn(f"refs/heads/{branch}", [line.split()[0] for line in state.origin_branches.splitlines()])
         self.assertNotIn(self.record_path(tree).name, state.records)
         self.assertNotIn(tree.name, state.folders)
+        self.assertFalse(tree.with_name(tree.name + ".lease.json").exists())
+        self.assertFalse(tree.with_name(tree.name + ".lock").exists())
+        config = self.command(self.repository, ["git", "config", "--local", "--get", f"branch.{branch}.merge"])
+        self.assertEqual(config.returncode, 1, config.stdout + config.stderr)
+        self.assertEqual(config.stdout, "")
 
     def test_make_records_the_staff_owner_and_merge_branch(self) -> None:
         for branch in ("recorded", "record-unwritable"):
@@ -219,21 +240,48 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertLessEqual(made_at, after)
                     self.assertEqual((tree / "code.txt").read_text(), "base\n")
                     self.assertEqual(self.git(tree, "branch", "--show-current"), branch)
+                    self.assertEqual(build_folders.build_folder_state(tree), "free")
+                    lease = cast(dict[str, object], json.loads(tree.with_name(tree.name + ".lease.json").read_text()))
+                    self.assertEqual(lease["purpose"], tree.name)
 
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
-        tree, branch = self.trees / "checkpoint", "checkpoint"
-        self.make(tree, branch)
-        _ = self.commit(tree, "code.txt", "checkpoint\n")
-        self.publish(tree, branch)
-        self.land(branch)
-        _ = self.commit(tree, "docs/plans/phase.md", "# Completed phase\n")
-        self.publish(tree, branch)
+        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config"):
+            with self.subTest(branch=branch):
+                if branch != "checkpoint":
+                    self.setUp()
+                tree = self.trees / branch
+                self.make(tree, branch)
+                commit_dates: dict[str, str] = {} if branch == "checkpoint" else {
+                    "GIT_COMMITTER_DATE": "2030-01-02T00:00:00+00:00",
+                    "GIT_AUTHOR_DATE": "2030-01-02T00:00:00+00:00"}
+                with patch.dict(self.environment, commit_dates):
+                    _ = self.commit(tree, "code.txt", "checkpoint\n")
+                self.publish(tree, branch)
+                if branch == "checkpoint":
+                    self.land(branch)
+                    _ = self.commit(tree, "docs/plans/phase.md", "# Completed phase\n")
+                    self.publish(tree, branch)
+                else:
+                    _ = self.git(self.merge_tree, "merge", "--ff-only", branch)
+                    with patch.dict(self.environment, {
+                            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+                            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00"}):
+                        _ = self.commit(self.merge_tree, "code.txt", "later target work\n")
+                    self.publish(self.merge_tree, "integration")
 
-        results = self.finish_landed()
+                if branch == "without-branch-config":
+                    _ = self.git(self.repository, "config", "--local", "--remove-section", f"branch.{branch}")
+                cleanup = self.cleanup_result(tree)
+                self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+                self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
+                results = self.finish_landed()
 
-        self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
-        self.assertEqual((self.merge_tree / "code.txt").read_text(), "checkpoint\n")
-        self.assert_ended(tree, branch)
+                self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                if branch == "checkpoint":
+                    self.assertEqual((self.merge_tree / "code.txt").read_text(), "checkpoint\n")
+                else:
+                    self.assertEqual((self.merge_tree / "code.txt").read_text(), "later target work\n")
+                self.assert_ended(tree, branch)
 
     def test_cherry_picked_content_ends_under_a_different_commit_hash(self) -> None:
         tree, branch = self.trees / "cherry", "cherry"
@@ -249,28 +297,201 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual((self.merge_tree / "code.txt").read_text(), "cherry-picked\n")
         self.assert_ended(tree, branch)
 
-    def test_unlanded_commit_is_reported_and_preserves_all_items(self) -> None:
-        tree, branch = self.trees / "unlanded", "unlanded"
+    def landed_cargo_worktree(self) -> tuple[Path, Path, cargo_seed.SeedLimits]:
+        tree, branch = self.trees / "seeded", "seeded"
         self.make(tree, branch)
-        checkpoint = self.commit(tree, "code.txt", "unlanded work\n")
+        _ = self.commit(tree, "Cargo.toml", "[workspace]\n")
         self.publish(tree, branch)
-        before = self.repository_state()
+        self.land(branch)
+        cargo_root = self.root / "external"
+        cargo_root.mkdir()
+        build = cargo_root / tree.name
+        mirror = self.root / "mirror"
+        parent = mirror.joinpath(*tree.parent.parts[1:])
+        parent.parent.mkdir(parents=True)
+        parent.symlink_to(cargo_root, target_is_directory=True)
+        mapping = {"workspace_root": str(tree), "target_directory": str(tree / "target"),
+                   "build_directory": str(build)}
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cargo = bin_dir / "cargo"
+        overridden = {**mapping, "build_directory": str(cargo_root / "override")}
+        _ = cargo.write_text("#!/bin/sh\ncase \"$*\" in\n"
+                             + "  *build.build-dir=*) printf '%s\\n' " + shlex.quote(json.dumps(overridden)) + " ;;\n"
+                             + "  *) printf '%s\\n' " + shlex.quote(json.dumps(mapping)) + " ;;\nesac\n")
+        cargo.chmod(0o755)
+        state = self.root / "sweep-state"
+        state.mkdir()
+        _ = (state / "cargo-output-roots.json").write_text(json.dumps([mapping]))
+        self.environment.update({"PATH": str(bin_dir) + os.pathsep + self.environment["PATH"],
+                                 "LINT_SWEEP_STATE_DIR": str(state)})
+        config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        host = host_name()
+        overrides = {f"roots.slot_cargo.{host}": str(cargo_root), f"roots.cargo_paths.{host}": str(mirror),
+                     f"seed.enabled.{host}": "1",
+                     "seed.max_gib": "1", "seed.min_free_gib": "0"}
+        lines: list[str] = []
+        for line in config.read_text().splitlines():
+            key = line.partition("=")[0]
+            lines.append(f"{key}={overrides.pop(key)}" if key in overrides else line)
+        lines.extend(f"{key}={value}" for key, value in overrides.items())
+        _ = config.write_text("\n".join(lines) + "\n")
+        limits = cargo_seed.SeedLimits(cargo_root, 1 << 30, 0)
+        self.assertEqual(cargo_seed.seed_limits(conf.read(config), host), limits)
+        return tree, build, limits
 
-        results = self.finish_landed()
+    def test_landed_worktree_removes_its_external_cargo_seed(self) -> None:
+        tree, build, _limits = self.landed_cargo_worktree()
+        file = build / "debug/deps/libportable-1234567890abcdef.rlib"
+        file.parent.mkdir(parents=True)
+        _ = file.write_text("seed")
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(build.exists())
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
+        self.assert_ended(tree, "seeded")
 
-        self.assertEqual([(row["kind"], row["path"]) for row in results], [("Kept", str(tree))])
-        self.assertIn(checkpoint, results[0]["detail"])
-        self.assertEqual(self.repository_state(), before)
-        self.assertEqual((tree / "code.txt").read_text(), "unlanded work\n")
+    def test_failed_worktree_removal_keeps_the_mapping_until_retry(self) -> None:
+        tree, build, _limits = self.landed_cargo_worktree()
+        build.mkdir()
+        git = self.root / "bin/git"
+        real_git = shutil.which("git")
+        assert real_git is not None
+        _ = git.write_text("#!/bin/sh\n"
+                           + 'if [ "$3" = worktree ] && [ "$4" = remove ]; then\n'
+                           + '    echo "fixture refuses worktree remove" >&2\n    exit 1\nfi\n'
+                           + f'exec {shlex.quote(real_git)} "$@"\n')
+        git.chmod(0o755)
+        self.assertEqual(self.finish_landed(), [{"kind": "Kept", "path": str(tree),
+                                                "detail": "stderr: fixture refuses worktree remove"}])
+        marker = scratch.cargo_removal_mark(tree)
+        self.assertIn(str(build), marker.read_text())
+        self.assertFalse(build.exists())
+        self.assertTrue(tree.is_dir())
+        git.unlink()
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(marker.exists())
+        self.assert_ended(tree, "seeded")
+
+    @unittest.skipUnless(sys.platform == "linux", "seeding is supported on Linux")
+    def test_worktree_removal_keeps_a_checkout_that_a_seed_holds(self) -> None:
+        tree, build, _limits = self.landed_cargo_worktree()
+        self.assertFalse(build.exists())
+        with cargo_seed.checkout_guard(tree, cargo_seed.CheckoutAccess.BUILD):
+            self.assertEqual(self.finish_landed(), [{"kind": "Kept", "path": str(tree),
+                                                    "detail": f"Cargo output kept: Cargo seed is in progress: {tree}"}])
+        self.assertTrue(tree.is_dir())
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "seeding is supported on Linux")
+    def test_cargo_override_skips_seed_and_worktree_removal_keeps_the_override(self) -> None:
+        tree, default, limits = self.landed_cargo_worktree()
+        override = limits.cargo_root / "override"
+        git_dir = git_files.at(tree).git_dir
+        before = set(git_dir.iterdir())
+        helper = self.home / ".claude/scripts/lib"
+        result = self.command(tree, [str(helper / "py"), str(helper / "cargo_seed.py"), "cargo", "+stable",
+                                     "check", "--config", "build.build-dir=" + json.dumps(str(override))])
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertFalse(override.exists())
+        self.assertEqual(set(git_dir.iterdir()), before)
+        mark = scratch.cargo_removal_mark(tree)
+        self.assertFalse(mark.exists())
+
+        outside = self.root / "downloads"
+        for directory in (default, override, outside):
+            directory.mkdir()
+            _ = (directory / "contents").write_text(directory.name)
+        no_peers: list[str] = []
+        scratch.atomic_record(mark, [
+            {"workspace_root": str(tree), "target_directory": str(tree / "target"),
+             "build_directory": str(directory), "other_checkouts": no_peers}
+            for directory in (override, outside)
+        ])
+
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(default.exists())
+        self.assertEqual((override / "contents").read_text(), "override")
+        self.assertEqual((outside / "contents").read_text(), "downloads")
+        self.assertFalse(mark.exists())
+        self.assert_ended(tree, "seeded")
+
+    def test_unlanded_commit_is_reported_and_preserves_all_items(self) -> None:
+        for branch in ("unlanded", "origin-ahead", "origin-ahead-missing-locally"):
+            with self.subTest(branch=branch):
+                if branch != "unlanded":
+                    self.setUp()
+                tree = self.trees / branch
+                self.make(tree, branch)
+                checkpoint = self.commit(tree, "code.txt", "unlanded work\n")
+                self.publish(tree, branch)
+                if branch != "unlanded":
+                    self.land(branch)
+                    clone = self.root / branch
+                    _ = self.git(self.root, "clone", "--branch", branch, str(self.origin), str(clone))
+                    checkpoint = self.commit(clone, "origin.txt", "unlanded origin work\n")
+                    self.publish(clone, branch)
+                    if branch == "origin-ahead":
+                        _ = self.git(self.repository, "fetch", "origin", branch)
+                    else:
+                        absent = self.command(self.repository, ["git", "cat-file", "-e", f"{checkpoint}^{{commit}}"])
+                        self.assertNotEqual(absent.returncode, 0)
+                before = self.repository_state()
+
+                results = self.finish_landed()
+
+                self.assertEqual([(row["kind"], row["path"]) for row in results], [("Kept", str(tree))])
+                self.assertIn(checkpoint, results[0]["detail"])
+                self.assertEqual(self.repository_state(), before)
+                self.assertEqual((tree / "code.txt").read_text(), "unlanded work\n")
+                cleanup = self.cleanup_result(tree)
+                self.assertEqual(cleanup.returncode, 1, cleanup.stdout + cleanup.stderr)
+                self.assertEqual(self.repository_state(), before)
+                if branch != "unlanded":
+                    self.assertEqual(results[0]["detail"], f"origin has commits that the local branch lacks: {checkpoint}")
+                    self.assertEqual(cleanup.stdout.strip(), results[0]["detail"])
+                else:
+                    self.assertIn(checkpoint, cleanup.stdout)
+
+    def test_cleanup_without_a_record_uses_the_origin_default_branch(self) -> None:
+        for state in ("landed", "unlanded", "missing-default"):
+            with self.subTest(state=state):
+                if state != "landed":
+                    self.setUp()
+                tree, branch = self.trees / "unrecorded", "unrecorded"
+                self.make(tree, branch)
+                checkpoint = self.commit(tree, "code.txt", "unrecorded work\n")
+                self.publish(tree, branch)
+                self.record_path(tree).unlink()
+                if state == "landed":
+                    _ = self.git(self.repository, "push", "origin", f"{branch}:main")
+                elif state == "missing-default":
+                    _ = self.git(self.repository, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+                    _ = self.git(self.origin, "symbolic-ref", "HEAD", "refs/heads/missing-default")
+                before = self.repository_state()
+
+                result = self.cleanup_result(tree)
+
+                expected = {"landed": 0, "unlanded": 1, "missing-default": 2}[state]
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(self.repository_state(), before)
+                if state == "landed":
+                    self.assertEqual(result.stdout.splitlines(), ["cleanup: all work is on the target branch"])
+                elif state == "unlanded":
+                    self.assertIn(checkpoint, result.stdout)
+                else:
+                    self.assertIn("origin default branch is missing", result.stderr)
 
     def test_dirty_and_staff_held_trees_preserve_all_items(self) -> None:
-        for reason in ("dirty", "staff-held", "switched", "detached"):
+        for reason in ("dirty", "staff-held", "switched", "detached", "no-commit", "target-merge-only"):
             with self.subTest(reason=reason):
                 tree = self.trees / reason
                 self.make(tree, reason)
-                _ = self.commit(tree, f"{reason}.txt", "landed work\n")
-                self.publish(tree, reason)
-                self.land(reason)
+                if reason not in ("no-commit", "target-merge-only"):
+                    _ = self.commit(tree, f"{reason}.txt", "landed work\n")
+                    self.publish(tree, reason)
+                    self.land(reason)
                 if reason == "dirty":
                     _ = (tree / "code.txt").write_text("uncommitted work\n")
                 elif reason == "staff-held":
@@ -286,9 +507,14 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 elif reason == "switched":
                     _ = self.git(tree, "checkout", "-b", "replacement-branch")
                     _ = self.commit(tree, f"{reason}-work.txt", "unlanded replacement work\n")
-                else:
+                elif reason == "detached":
                     _ = self.git(tree, "checkout", "--detach")
                     _ = self.commit(tree, f"{reason}-work.txt", "unlanded replacement work\n")
+                elif reason == "target-merge-only":
+                    _ = self.commit(self.merge_tree, "target.txt", "new target work\n")
+                    self.publish(self.merge_tree, "integration")
+                    _ = self.git(tree, "fetch", "origin", "integration")
+                    _ = self.git(tree, "merge", "--no-ff", "origin/integration", "-m", "Merge the target")
                 before = self.repository_state()
                 tip = self.git(tree, "rev-parse", "HEAD")
 
@@ -299,38 +525,238 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 self.assertTrue(selected["detail"], results)
                 self.assertEqual(self.repository_state(), before)
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
-                self.assertEqual((tree / f"{reason}.txt").read_text(), "landed work\n")
+                if reason == "no-commit":
+                    self.assertEqual(selected["detail"], "no commit of its own")
+                elif reason == "target-merge-only":
+                    self.assertEqual(selected["detail"], "only merges of the target outside it")
+                else:
+                    self.assertEqual((tree / f"{reason}.txt").read_text(), "landed work\n")
                 if reason == "dirty":
                     self.assertEqual((tree / "code.txt").read_text(), "uncommitted work\n")
+                    cleanup = self.cleanup_result(tree)
+                    self.assertEqual(cleanup.returncode, 1, cleanup.stdout + cleanup.stderr)
+                    self.assertIn("dirty worktree", cleanup.stdout)
+                    self.assertEqual(self.repository_state(), before)
                 elif reason in ("switched", "detached"):
                     self.assertEqual((tree / f"{reason}-work.txt").read_text(), "unlanded replacement work\n")
 
     def test_partial_removal_resumes_from_the_retained_record(self) -> None:
-        tree, branch = self.trees / "partial", "partial"
-        self.make(tree, branch)
-        checkpoint = self.commit(tree, "code.txt", "landed work\n")
-        self.publish(tree, branch)
-        self.land(branch)
-        retained = self.record_path(tree).read_bytes()
-        hook = self.origin / "hooks/pre-receive"
-        _ = hook.write_text("#!/bin/sh\necho 'fixture refuses deletion' >&2\nexit 1\n")
-        hook.chmod(0o755)
+        for landing in ("merged", "cherry-picked", "plan-shrink", "origin-race",
+                        "legacy-landed", "legacy-unlanded", "local-race", "config-error",
+                        "held-lock", "registered-only", "missing-tree", "missing-parent-registered",
+                        "missing-parent-pruned"):
+            with self.subTest(landing=landing):
+                if landing != "merged":
+                    self.setUp()
+                tree, branch = self.trees / "partial", "partial"
+                if landing.startswith("missing-parent-"):
+                    tree = self.trees / "absent-parent" / "partial"
+                self.make(tree, branch)
+                checkpoint = self.commit(tree, "code.txt", "landed work\n")
+                self.publish(tree, branch)
+                if landing == "cherry-picked":
+                    _ = self.git(self.merge_tree, "cherry-pick", "-x", checkpoint)
+                    self.publish(self.merge_tree, "integration")
+                elif landing != "legacy-unlanded":
+                    self.land(branch)
+                if landing == "plan-shrink":
+                    checkpoint = self.commit(tree, "docs/plans/phase.md", "# Completed phase\n")
+                    self.publish(tree, branch)
+                retained = self.record_path(tree).read_bytes()
+                if landing.startswith("missing-parent-"):
+                    shutil.rmtree(tree.parent)
+                    if landing == "missing-parent-pruned":
+                        _ = self.git(self.repository, "worktree", "prune", "--expire=now")
+                    registered = f"worktree {tree}\n" in self.git(self.repository, "worktree", "list", "--porcelain") + "\n"
+                    self.assertEqual(registered, landing == "missing-parent-registered")
 
-        interrupted = self.finish_landed()
+                    results = self.finish_landed()
 
-        self.assertEqual([(row["kind"], row["path"]) for row in interrupted], [("Kept", str(tree))])
-        self.assertIn("fixture refuses deletion", interrupted[0]["detail"])
-        self.assertEqual(self.record_path(tree).read_bytes(), retained)
-        self.assertEqual(self.git(self.origin, "rev-parse", f"refs/heads/{branch}"), checkpoint)
-        partial = self.repository_state()
-        self.assertNotIn(tree.name, partial.folders)
-        self.assertNotIn(f"refs/heads/{branch}", [line.split()[0] for line in partial.branches.splitlines()])
-        hook.unlink()
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    self.assertFalse(tree.parent.exists())
+                    continue
+                if landing in ("registered-only", "missing-tree"):
+                    if landing == "registered-only":
+                        shutil.rmtree(tree)
+                    else:
+                        _ = self.git(self.repository, "worktree", "remove", str(tree))
+                    self.assertTrue(tree.with_name(tree.name + ".lease.json").is_file())
+                    self.assertTrue(tree.with_name(tree.name + ".lock").is_file())
 
-        results = self.finish_landed()
+                    results = self.finish_landed()
 
-        self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
-        self.assert_ended(tree, branch)
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    continue
+                if landing == "held-lock":
+                    lease = tree.with_name(tree.name + ".lease.json")
+                    lock = tree.with_name(tree.name + ".lock")
+                    retained_lease = lease.read_bytes()
+                    holder = subprocess.Popen([str(self.home / ".claude/scripts/lib/py"), "-c",
+                        "import fcntl, sys\n"
+                        + "with open(sys.argv[1], 'r+') as lock:\n"
+                        + "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                        + "    print('held', flush=True)\n"
+                        + "    sys.stdin.readline()\n", str(lock)],
+                        env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True)
+                    try:
+                        assert holder.stdout is not None
+                        self.assertEqual(holder.stdout.readline(), "held\n")
+
+                        results = self.finish_landed()
+
+                        self.assertEqual(results, [{"kind": "Kept", "path": str(tree),
+                            "detail": "the build folder lock is held; the worktree stays"}])
+                        self.assertTrue(tree.is_dir())
+                        self.assertEqual(self.git(self.repository, "rev-parse", f"refs/heads/{branch}"), checkpoint)
+                        self.assertEqual(self.git(self.repository, "config", "--local", "--get",
+                                                  f"branch.{branch}.merge"), f"refs/heads/{branch}")
+                        self.assertEqual(self.record_path(tree).read_bytes(), retained)
+                        self.assertEqual(lease.read_bytes(), retained_lease)
+                        self.assertTrue(lock.is_file())
+                    finally:
+                        if holder.poll() is None:
+                            _ = holder.communicate(input="release\n", timeout=20)
+                        else:
+                            _ = holder.communicate(timeout=20)
+                    self.assertEqual(holder.returncode, 0)
+
+                    results = self.finish_landed()
+
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    continue
+                if landing in ("legacy-landed", "legacy-unlanded"):
+                    _ = self.git(self.repository, "worktree", "remove", str(tree))
+                    _ = self.git(self.repository, "branch", "-D", branch)
+                    before = self.repository_state()
+
+                    results = self.finish_landed()
+
+                    if landing == "legacy-landed":
+                        self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                        self.assert_ended(tree, branch)
+                    else:
+                        self.assertEqual(results, [{"kind": "Kept", "path": str(tree),
+                                                  "detail": f"origin has commits that the merge branch lacks: {checkpoint}"}])
+                        self.assertEqual(self.repository_state(), before)
+                        self.assertEqual(self.record_path(tree).read_bytes(), retained)
+                    continue
+                hook = self.origin / "hooks/pre-receive"
+                if landing == "config-error":
+                    real_git = shutil.which("git", path=self.environment["PATH"])
+                    assert real_git is not None
+                    shim_dir = self.root / "bin"
+                    shim_dir.mkdir()
+                    shim = shim_dir / "git"
+                    _ = shim.write_text("\n".join([
+                        "#!/bin/sh",
+                        "for argument do",
+                        '    if [ "$argument" = --remove-section ]; then',
+                        "        echo 'injected config failure' >&2",
+                        "        exit 3",
+                        "    fi",
+                        "done",
+                        f'exec {shlex.quote(real_git)} "$@"',
+                        "",
+                    ]))
+                    shim.chmod(0o755)
+                    self.environment["PATH"] = str(shim_dir) + os.pathsep + self.environment["PATH"]
+                elif landing in ("origin-race", "local-race"):
+                    clone = self.root / "concurrent-writer"
+                    _ = self.git(self.root, "clone", "--branch", branch, str(self.origin), str(clone))
+                    if landing == "origin-race":
+                        checkpoint = self.commit(clone, "origin.txt", "concurrent origin work\n")
+                    else:
+                        checkpoint = self.commit(clone, "code.txt", "concurrent local work\n")
+                        _ = self.git(self.repository, "fetch", str(clone), branch)
+                    real_git = shutil.which("git", path=self.environment["PATH"])
+                    assert real_git is not None
+                    shim_dir = self.root / "bin"
+                    shim_dir.mkdir()
+                    shim = shim_dir / "git"
+                    marker = self.root / "race-injected"
+                    if landing == "origin-race":
+                        trigger = "--delete"
+                        injection = f"{shlex.quote(real_git)} -C {shlex.quote(str(clone))} push origin HEAD:refs/heads/{branch}"
+                    else:
+                        trigger = "remove"
+                        injection = (f"{shlex.quote(real_git)} -C {shlex.quote(str(tree))} "
+                                     + f"reset --hard {checkpoint}")
+                    _ = shim.write_text("\n".join([
+                        "#!/bin/sh",
+                        'for argument do',
+                        f'    if [ "$argument" = {trigger} ]; then',
+                        f"        if [ ! -f {shlex.quote(str(marker))} ]; then",
+                        f"            : > {shlex.quote(str(marker))}",
+                        f"            {injection} >&2 || exit 1",
+                        "        fi",
+                        "    fi",
+                        "done",
+                        f'exec {shlex.quote(real_git)} "$@"',
+                        "",
+                    ]))
+                    shim.chmod(0o755)
+                    self.environment["PATH"] = str(shim_dir) + os.pathsep + self.environment["PATH"]
+                else:
+                    _ = hook.write_text("#!/bin/sh\necho 'fixture refuses deletion' >&2\nexit 1\n")
+                    hook.chmod(0o755)
+                before = self.repository_state()
+
+                interrupted = self.finish_landed()
+
+                self.assertEqual([(row["kind"], row["path"]) for row in interrupted], [("Kept", str(tree))])
+                if landing == "config-error":
+                    self.assertIn("injected config failure", interrupted[0]["detail"])
+                elif landing == "origin-race":
+                    self.assertIn("stale info", interrupted[0]["detail"])
+                elif landing == "local-race":
+                    self.assertIn("the local branch changed after the cleanup check", interrupted[0]["detail"])
+                else:
+                    self.assertIn("fixture refuses deletion", interrupted[0]["detail"])
+                self.assertEqual(self.record_path(tree).read_bytes(), retained)
+                if landing == "config-error":
+                    self.assertFalse(tree.exists())
+                    self.assertEqual(self.git(self.repository, "branch", "--list", branch), "")
+                    self.assertEqual(self.git(self.repository, "config", "--local", "--get", f"branch.{branch}.merge"),
+                                     f"refs/heads/{branch}")
+                    (self.root / "bin/git").unlink()
+
+                    results = self.finish_landed()
+
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    continue
+                if landing == "local-race":
+                    self.assertFalse(tree.exists())
+                    self.assertEqual(self.git(self.repository, "rev-parse", f"refs/heads/{branch}"), checkpoint)
+                    self.assertEqual(self.git(self.repository, "show", f"{branch}:code.txt"), "concurrent local work")
+                    self.assertEqual(self.git(self.repository, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"), "")
+                    retried = self.finish_landed()
+                    self.assertEqual([(row["kind"], row["path"]) for row in retried], [("Kept", str(tree))])
+                    self.assertIn(checkpoint, retried[0]["detail"])
+                    self.assertEqual(self.record_path(tree).read_bytes(), retained)
+                    self.assertEqual(self.git(self.repository, "rev-parse", f"refs/heads/{branch}"), checkpoint)
+                    continue
+                self.assertEqual(self.git(self.origin, "rev-parse", f"refs/heads/{branch}"), checkpoint)
+                partial = self.repository_state()
+                self.assertIn(tree.name, partial.folders)
+                self.assertEqual(partial.branches, before.branches)
+                self.assertEqual(partial.worktrees, before.worktrees)
+                if landing == "origin-race":
+                    self.assertEqual((tree / "code.txt").read_text(), "landed work\n")
+                    continue
+                hook.unlink()
+
+                results = self.finish_landed()
+
+                self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                partial = self.repository_state()
+                self.assertNotIn(tree.name, partial.folders)
+                self.assertNotIn(f"refs/heads/{branch}", [line.split()[0] for line in partial.branches.splitlines()])
+                self.assert_ended(tree, branch)
 
 
 if __name__ == "__main__":

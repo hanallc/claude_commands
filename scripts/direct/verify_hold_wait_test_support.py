@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
+from scripts.lib.checkout_test_support import fixture_shim_source
+
 from scripts.lint.memory_test_support import write_pressure_reading
 
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
+from scripts.build_queue import placement
 
 import json
 import os
@@ -15,7 +20,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import textwrap
 import time
+import traceback
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
@@ -27,9 +34,13 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.direct.verify_mac_offload_test_support import (
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
+)
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, episode_is_assigned, local_release_waiter
+from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -68,13 +79,66 @@ def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
 
 
+def wait_rows(session: Path) -> list[dict[str, object]]:
+    """Read the recorder's wait events from its private history."""
+    state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+    return [row for line in Path(cast(str, state["history_file"])).read_text().splitlines(keepends=True)
+            if line.endswith("\n")
+            and str((row := cast(dict[str, object], json.loads(line)))["event_type"]).startswith("wait_")]
+
+
+def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
+    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
+
+
+def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: subprocess.Popen[str],
+                          what: str) -> None:
+    """Wait for the fixture state or the caller's exit."""
+    wait_until(lambda: ready() or process.poll() is not None, directory, processes=(process,))
+    if not ready():
+        raise AssertionError(f"verify exited {process.returncode} before {what}")
+
+
+def wait_for_target_holder(episode: str) -> None:
+    """Pause when the recorder writes a new holder entry."""
+    root = Path(os.environ["PACKAGE_ROOT"])
+    session = Path(os.environ["UNIT_RUN_DIR"])
+    pauses = int(os.environ["TEST_TARGET_PAUSES"])
+    admission = Path(os.environ["TEST_TARGET_ADMISSION"])
+    snapshot = admission / "queue.json"
+    state = admission / "state.json"
+
+    def snapshot_version() -> tuple[int, int] | None:
+        try:
+            status = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        return status.st_ino, status.st_mtime_ns
+
+    previous = snapshot_version()
+    for number in range(1, pauses + 1):
+        resume = root / f"target-resume-{number}"
+        if resume.exists():
+            continue
+        if len(recorded_holders(wait_rows(session))) >= number:
+            (root / f"target-holder-{number}").touch()
+            wait_for_file(resume)
+            return
+        break
+    # The next pass can publish new provider evidence.
+    wait_until(lambda: snapshot_version() != previous or episode_is_assigned(state, episode), admission)
+
+
 @contextmanager
 def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, None, None]:
     """Restore changed keys without clearing the admission reader's environment."""
+    from scripts.build_targets import build_targets
+
     previous_values = {name: os.environ[name] for name in environment if name in os.environ}
     try:
         os.environ.update(environment)
-        yield
+        with hold_recorder_exits(), mock.patch.object(build_targets, "tell_wait_holder"):
+            yield
     finally:
         for name in environment:
             if name in previous_values:
@@ -88,7 +152,7 @@ def grant_call(path: Path) -> None:
     with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
+        "STAFF_FILE": str(release.parent / "staff.json"),
     }), mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
          mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
         holders = build_hold.read_holders(build_hold.holder_directory())
@@ -101,10 +165,10 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
     with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
+        "STAFF_FILE": str(release.parent / "staff.json"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         change(cycle)
         build_hold.save_cycle(cycle)
 
@@ -132,12 +196,15 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                                     continue
                     if stop.is_set():
                         return
-                    if path.exists() and any(root.glob("**/verify-hold.*/waiter")):
+                    holds = tool_folders(root, "verify", nested=True)
+                    queued = any(any(hold.glob("placement-*.json.queued")) or (hold / "waiter").exists()
+                                 for hold in holds)
+                    if path.exists() and queued:
                         grant_call(path)
                         return
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("registered hold call never published its waiter")
+                        raise TimeoutError("the registered hold call never queued its placement")
                     if isinstance(events, LocalReleaseEvents):
                         # Read every subscribed directory event, including the
                         # nested waiter and the stop marker; production's
@@ -172,29 +239,26 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
+    cleanup_failures: tuple[str, ...] = ()
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-", dir=fixture_parent)))
         builder.build_fixture()
+        _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
         cls.fixture_root = builder.root
-        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
+        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-", dir=fixture_parent))
         cls.fixture_seed = Path(seed_directory) / "seed"
         # These tests select a known interpreter, including recorder observers.
         # Version discovery is the lib/py suite's boundary. Preserve every
         # requested script and its real process, without a probe before each.
         library = builder.home / ".claude/scripts/lib"
-        source = library.resolve()
-        library.unlink()
-        library.mkdir()
-        for entry in source.iterdir():
-            if entry.name != "py":
-                (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
-        builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        _ = copy_helpers(builder.home, *VERIFY_HELPERS)
+        builder.write_executable(library / "py", fixture_shim_source())
         (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
@@ -209,27 +273,45 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def setUp(self) -> None:
+        self.cleanup_failures = ()
         self.root: Path = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(self.assert_nothing_outlives)
         self.home: Path = self.root / "home"
+        self.verify_script: Path = self.home / ".claude/scripts/direct/verify.sh"
         self.bin_directory: Path = self.root / "bin"
         self.board: Path = self.root / "board"
         self.runner: Path = self.root / "runner.py"
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
-        _ = caller_admission(self, self.root, self.environment)
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.05)
+        self.placement_policy: dict[str, str] = {}
+        admission.server.host_probe = lambda key: private_caller_provider(
+            admission, {**self.environment, **self.placement_policy}, key)
+        controls = caller_provider_controls(self, admission)
+        self.provider_observations: list[placement.HostEvidenceKey] = controls.observations
+
+    @override
+    def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
+        def recorded_cleanup() -> None:
+            try:
+                _ = function(*args, **kwargs)
+            except BaseException:
+                self.cleanup_failures += (traceback.format_exc(),)
+                raise
+
+        super().addCleanup(recorded_cleanup)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        # Completed calls are drained here; the unchanged final marker scan
-        # still observes and reaps detached children before restoring the seed.
-        if process.poll() is None:
+        # Stop owned processes before draining pipes that a descendant can hold open.
+        if process.poll() is None or any(
+            stream is not None and not stream.closed for stream in (process.stdout, process.stderr)
+        ):
             super().stop_verify(process)
-        else:
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 class VerifyHoldWaitFixture(unittest.TestCase):
@@ -246,24 +328,24 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
-        VerifyHoldTools.setUpClass()
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
+        VerifyHoldTools.setUpClass(fixture_parent=fixture_parent)
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
         self.addCleanup(self.fixture_cleanups)
+        self.fixture.setUp()
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
-            "CLAUDE_PYTHON": sys.executable,
+            "CLAUDE_PYTHON": "",
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-            "UNIT_ACTIVE_DIR": str(root / "active"),
+            "STAFF_FILE": str(root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "UNIT_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
@@ -276,13 +358,14 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def run_unblocked_step(self, command: str) -> subprocess.CompletedProcess[str]:
         """Call the real hold checks, command launcher, and call recorder."""
+        install_fixed_cargo(self.fixture.bin_directory / "cargo")
         script = self.fixture.root / "unblocked-step.sh"
         _ = script.write_text('set -eo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
-PY=$CLAUDE_PYTHON
+PY=$HOME/.claude/scripts/lib/py
 CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
 STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
@@ -305,11 +388,11 @@ exit "$status"
             env={**self.fixture.environment, "TEST_HOLD_DIRECTORY": str(self.fixture.root / "direct-hold")},
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
-    def hold(self, key: str = "hana") -> None:
+    def hold(self, key: str = "hana", *, purpose: str = "render checks") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         holders.mkdir(exist_ok=True)
         now = datetime.now().astimezone().isoformat()
-        _ = (holders / key).write_text(json.dumps({"holder": "hana", "since": now, "for": "render checks", "release_eta": "unknown"}))
+        _ = (holders / key).write_text(json.dumps({"holder": "hana", "since": now, "for": purpose, "release_eta": "unknown"}))
         self.cycle_file.parent.mkdir(parents=True, exist_ok=True)
         _ = (self.cycle_file.parent.parent / "current").write_text(CYCLE_ID)
         cycle: build_hold.HoldCycle = {
@@ -320,9 +403,7 @@ exit "$status"
         _ = self.cycle_file.write_text(json.dumps(cycle))
 
     def fixture_cleanups(self) -> None:
-        # Outside a run, doCleanups keeps a failed cleanup to itself:
-        # a process the fixture found outliving the test fails this one.
-        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed; a process may have outlived the test")
+        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed:\n" + "\n".join(self.fixture.cleanup_failures))
 
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)
@@ -339,10 +420,7 @@ exit "$status"
             _ = admission.occupy_host()
             admission.free(0)
         _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
-            'lint_config_enabled() {\n'
-            + '    [[ "$1" == clippy ]] || return 1\n'
-            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
-            + '}\n'
+            'lint_config_enabled() { [[ "$1" == clippy ]]; }\n'
             + 'lint_config_skip_notice() { :; }\n')
         self.fixture.environment.update({
             "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
@@ -399,21 +477,12 @@ exit "$status"
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
     def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
-        targets = self.fixture.root / "hold-targets.py"
-        _ = targets.write_text(f'''import os
-import runpy
-import sys
-import tempfile
-
-if sys.argv[1] == "eligible":
-    print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
-    print("natedev\\teligible\\t-\\t-\\t-")
-    if {runs_on!r} == "any_target":
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
-else:
-    runpy.run_path({str(TARGETS)!r}, run_name="__main__")
-''')
-        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
+        targets = "natedev" if runs_on == "natedev_only" else "natedev,mac"
+        settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
+        _ = (self.fixture.root / "build_targets.conf").write_text(
+            f"targets={targets}\nkind.natedev=local\nplatform.natedev=linux\n"
+            + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n")
+        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
@@ -468,20 +537,28 @@ else:
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"
         self.fixture.environment.update({"TEST_PYTHON_STARTS": str(starts), "TEST_REAL_PYTHON": sys.executable})
+        self.fixture.environment["VERIFY_PY_TRACE"] = str(self.fixture.root / "helper-starts")
         self.fixture.write_executable(self.fixture.bin_directory / "python3", '''import json, os, sys
 from pathlib import Path
 with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + chr(10))
+from scripts.lib.checkout_test_support import restore_startup_environment
+restore_startup_environment()
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
         return starts
 
     def hold_commands(self, starts: Path) -> list[list[str]]:
         commands: list[list[str]] = []
-        for line in starts.read_text().splitlines() if starts.exists() else []:
-            arguments = cast(list[str], json.loads(line))
+        calls = [cast(list[str], json.loads(line))
+                 for line in starts.read_text().splitlines()] if starts.exists() else []
+        trace = Path(self.fixture.environment["VERIFY_PY_TRACE"] + ".calls")
+        if trace.exists():
+            calls.extend(line.split("\t") for line in trace.read_text().splitlines())
+        for arguments in calls:
             if (len(arguments) < 2 or Path(arguments[0]).name not in {"build_targets.py", "build_hold.py"}
-                    or arguments[1] == "eligible"):
+                    or arguments[1] in {"eligible", "constraints", "submitting-session", "source-key",
+                                        "assigned-info", "reserve", "recover-reservation", "release-wait"}):
                 continue
             arguments[0] = Path(arguments[0]).name
             for option, replacement in (("--call-id", "c1"), ("--pid", "<pid>"), ("--cycle-id", CYCLE_ID)):
@@ -514,14 +591,23 @@ from pathlib import Path
 if os.environ.get("TEST_PYTHON_STARTS"):
     with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + chr(10))
-if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
-    with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
-        output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))
-if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "call":
-    path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
-    Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
+from scripts.lib.checkout_test_support import restore_startup_environment
+restore_startup_environment()
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
+        recorder = self.fixture.home / ".claude/scripts/buildlog/record.py"
+        source = recorder.read_text()
+        observation_code = '''
+if sys.argv[1:2] == ["step"]:
+    with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
+        output.write(json.dumps({"start": sys.argv[3], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[8:]}) + chr(10))
+if sys.argv[1:2] == ["call"]:
+    path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
+    Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
+'''
+        anchor = "    return real_record()\n"
+        assert source.count(anchor) == 1
+        _ = recorder.write_text(source.replace(anchor, textwrap.indent(observation_code, "    ") + anchor))
         observation = self.fixture.root / "wait-observation"
         self.fixture.environment.update({"CLAUDE_PYTHON": str(observer), "TEST_REAL_PYTHON": sys.executable, "TEST_WAIT_OBSERVATION": str(observation), "TEST_STEP_OBSERVATIONS": str(self.fixture.root / "step-observations")})
         return observation

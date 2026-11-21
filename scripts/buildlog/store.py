@@ -2,8 +2,8 @@
 
 The permanent record is JSON lines, one file per host per month, appended and
 never edited: ~/.local/state/buildlog/<host>/<YYYY-MM>.jsonl, with the logs of
-failed steps beside it under <host>/logs/<YYYY-MM>/. CI timings sit in ci/ the
-same way. index.py derives the SQLite index from these lines and can rebuild it
+failed steps beside it under <host>/logs/<YYYY-MM>/ and cloud gate results under
+<host>/results/<YYYY-MM>/. CI timings sit in ci/ the same way. index.py derives the SQLite index from these lines and can rebuild it
 from nothing. BUILDLOG_DIR moves the root, for tests.
 
 Many processes append at once (every lint step on the machine). Each append
@@ -19,22 +19,29 @@ import json
 import mmap
 import os
 import socket
+import sys
 import traceback
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, TypedDict, cast
 
 
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
+# Every AWS gate box records into one place, so the history counts AWS as one machine.
+CLOUD_GATE_PLACE = "aws"
+CLOUD_GATE_SOURCE = "cloud-gate"
 LOGS_DIR = "logs"
+RESULTS_DIR = "results"
 ERRORS_NAME = "errors.log"
 SYNC_STATUS_NAME = "sync.json"
 SYNC_PAUSED_NAME = "sync_paused.json"
 CI_POLLED_NAME = "polled.json"
 DISK_NAME = "disk.json"
+DISK_WALK_REQUEST_NAME = "disk-walk-request.json"
 DEFAULT_ROOT_DISPLAY = "~/.local/state/buildlog"
 ERRORS_DISPLAY_PATH = f"{DEFAULT_ROOT_DISPLAY}/{ERRORS_NAME}"
 
@@ -44,6 +51,46 @@ def root() -> Path:
     return Path(override) if override else Path(DEFAULT_ROOT_DISPLAY).expanduser()
 
 
+class DiskWalkRequest(TypedDict):
+    requested_at: str
+    alert_at: str
+    unnamed_bytes: int
+
+
+class DiskWalkRequestState(Enum):
+    ABSENT = "no walk requested"
+    UNREADABLE = "walk request cannot be read"
+
+
+def read_disk_walk_request() -> DiskWalkRequest | DiskWalkRequestState:
+    path = root() / DISK_WALK_REQUEST_NAME
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+        if not isinstance(raw, dict):
+            raise ValueError("expected an object")
+        data = cast(dict[str, object], raw)
+        requested_at, alert_at, unnamed_bytes = data["requested_at"], data["alert_at"], data["unnamed_bytes"]
+        if not isinstance(requested_at, str) or not isinstance(alert_at, str):
+            raise ValueError("invalid request times")
+        for stamp in (requested_at, alert_at):
+            if datetime.fromisoformat(stamp).tzinfo is None:
+                raise ValueError("request time lacks a zone")
+        if type(unnamed_bytes) is not int:
+            raise ValueError("invalid unnamed_bytes")
+        return {"requested_at": requested_at, "alert_at": alert_at, "unnamed_bytes": unnamed_bytes}
+    except FileNotFoundError:
+        return DiskWalkRequestState.ABSENT
+    except (OSError, UnicodeError, ValueError, KeyError) as error:
+        print(f"buildlog: cannot read {path}: {error}", file=sys.stderr)
+        return DiskWalkRequestState.UNREADABLE
+
+
+def write_disk_walk_request(request: DiskWalkRequest) -> None:
+    from scripts.lib.atomic_file import write_text_atomic
+
+    write_text_atomic(root() / DISK_WALK_REQUEST_NAME, json.dumps(request) + "\n")
+
+
 def host_name() -> str:
     """The short host name, as verify.sh's ledger and send.py name machines."""
     return socket.gethostname().split(".")[0]
@@ -51,7 +98,7 @@ def host_name() -> str:
 
 def utc_iso(epoch: float) -> str:
     """Milliseconds, UTC, with the Z suffix SQLite's date functions accept."""
-    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="milliseconds").removesuffix("+00:00") + "Z"
 
 
 def month(epoch: float) -> str:
@@ -110,12 +157,18 @@ def _whole_row_bytes(handle: BinaryIO, start: int) -> bytearray:
     return contents
 
 
-def _object_rows(contents: bytearray) -> Iterator[dict[str, object]]:
-    """Decode complete object rows and skip invalid rows."""
+def _every_row(_line: bytearray) -> bool:
+    return True
+
+
+def _object_rows(contents: bytearray, may_match: Callable[[bytearray], bool] = _every_row) -> Iterator[dict[str, object]]:
+    """Decode complete object rows and skip invalid rows and rows that cannot match."""
     position = 0
     while (end := contents.find(b"\n", position)) != -1:
         line = contents[position:end]
         position = end + 1
+        if not may_match(line):
+            continue
         try:
             decoded = cast(object, json.loads(line.decode("utf-8")))
         except (UnicodeDecodeError, ValueError):
@@ -142,6 +195,44 @@ def locked_rows(path: Path, start: int = 0) -> Iterator[dict[str, object]]:
     except FileNotFoundError:
         return
     yield from _object_rows(contents)
+
+
+def _first_reached_row(contents: mmap.mmap, end: int, reached: Callable[[dict[str, object]], bool]) -> int:
+    """Search rows appended in order; an unreadable row counts as reached, so the search reads more, never less."""
+    low, high = 0, end
+    while low < high:
+        middle = (low + high) // 2
+        start = contents.rfind(b"\n", 0, middle) + 1
+        stop = contents.find(b"\n", middle, end)
+        try:
+            row = cast(object, json.loads(contents[start:stop]))
+        except ValueError:
+            row = None
+        if not isinstance(row, dict) or reached(cast(dict[str, object], row)):
+            high = start
+        else:
+            low = stop + 1
+    return low
+
+
+def locked_rows_in_order(path: Path, reached: Callable[[dict[str, object]], bool],
+                         may_match: Callable[[bytearray], bool]) -> Iterator[dict[str, object]]:
+    """Decode rows from the first reached row of a file appended in that order.
+
+    A row whose bytes fail `may_match` is skipped before it is decoded.
+    """
+    try:
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            end = last_whole_row_end(handle)
+            if not end:
+                return
+            with mmap.mmap(handle.fileno(), end, access=mmap.ACCESS_READ) as mapped:
+                start = _first_reached_row(mapped, end, reached)
+            contents = _whole_row_bytes(handle, start)
+    except FileNotFoundError:
+        return
+    yield from _object_rows(contents, may_match)
 
 
 def read_last_whole_row_end(path: Path) -> int:
@@ -185,7 +276,7 @@ def note_error(context: str) -> None:
     try:
         path = root() / ERRORS_NAME
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
+        with path.open("a", errors="backslashreplace") as handle:
             _ = handle.write(f"{utc_iso(datetime.now(UTC).timestamp())} {context}\n{traceback.format_exc()}\n")
     except OSError:
         pass

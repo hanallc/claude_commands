@@ -12,14 +12,16 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import Mock, patch
 
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.production import add_unit
 from scripts.production import staff, unit_config
 from scripts.production import unit_lookup
-from scripts.message import sessions
-from scripts.shutdown import stop_resume
+from scripts.message import session_records, sessions
+from scripts.agents import pane_record, stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.herdr import HerdrPlace
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
@@ -44,7 +46,9 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = unit_config.write(worktree, saved)
         path = worktree / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
-        _ = self.successful("alpha", "--resume", "3001165e-ca76-59c2-9490-878224585fad", "--cwd", str(worktree))
+        source = Path(self.env["HOME"]) / ".claude5/projects/prior" / f"{row.current_session}.jsonl"
+        write_text_atomic(source, json.dumps({"type": "assistant", "message": {"model": "opus"}}) + "\n")
+        _ = self.successful("alpha", "--resume", row.current_session, "--cwd", str(worktree), "--model", "sonnet")
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertEqual(unit_config.read(worktree), saved)
         self.assertEqual(staff.by_id(fixed_id), row)
@@ -53,6 +57,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], row.current_session)
+        self.assertEqual(arguments[arguments.index("--model") + 1], "sonnet")
         self.assertEqual(self.git("ls-files", ".unit.toml", cwd=worktree), "")
 
     def test_unreadable_staff_refuses_resume_before_closing_its_stopped_pane(self) -> None:
@@ -155,7 +160,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.write_resume_registry_record("recorded-start")
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        with patch.object(sessions, "process_start", return_value=None):
+        with (patch.object(sessions, "process_start", return_value=None),
+              patch.object(session_records, "process_start", return_value=None)):
             result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
@@ -177,16 +183,32 @@ class AddUnitResumeTests(AddUnitTestCase):
 
     def test_attach_stops_then_launches_once_with_staff_marks_and_finishes(self) -> None:
         prior, trace = self.prepare_attach()
-        result = self.successful("alpha", "--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
+        identity = "62ccbd64-f22e-5647-b20e-7899aa39d766"
+        transcript = Path(self.env["HOME"]) / ".claude/projects/prior" / f"{identity}.jsonl"
+        write_text_atomic(transcript, json.dumps({"type": "assistant", "message": {"model": "sonnet"}}) + "\n")
+        stop_for_attach = add_unit.stop_for_attach
+
+        def stop(source: add_unit.RunningSessionHandoff) -> None:
+            stop_for_attach(source)
+            with transcript.open("a") as stream:
+                _ = stream.write(json.dumps({"type": "assistant", "message": {"model": "opus"},
+                                             "effort": "xhigh"}) + "\n")
+
+        with patch.object(add_unit, "stop_for_attach", side_effect=stop):
+            result = self.successful("alpha", "--unit-type", "merge", "--permanent", "--attach",
+                                     identity, "--cwd", str(prior))
         self.assertEqual(trace, ["stop", "launch"])
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(len(starts), 1)
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], "62ccbd64-f22e-5647-b20e-7899aa39d766")
+        self.assertEqual(arguments[:4], ["--model", "opus", "--effort", "xhigh"])
         self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in self.pane_environment()))
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha: one process, pid 202", result.stdout)
         row = unit_membership("build-followups", "alpha")
+        self.assertEqual(row.unit_type, staff.UnitDetails("merge"))
+        self.assertIn("Load /unit:merge before waiting for orders.", self.opening_prompt())
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
@@ -404,10 +426,29 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assert_no_launch_change(document, head)
 
     def test_resume_uses_session_id_cwd_and_promote_prompt(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        identity = "62ccbd64-f22e-5647-b20e-7899aa39d766"
+        home = Path(self.env["HOME"])
+        source, target = home / ".claude4", home / ".claude2"
+        transcript = source / "projects/prior" / f"{identity}.jsonl"
+        write_text_atomic(transcript, json.dumps({"type": "assistant", "message": {"model": "opus"},
+                                                  "effort": "xhigh"}) + "\n")
         prior = self.root / "prior-session"
         prior.mkdir()
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
-                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        with (patch.dict(os.environ, self.env),
+              patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"]))):
+            pane_record.write("recorded-herdr", pane_record.launch("w1:p1", identity, str(prior),
+                {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "-n", "alpha", "--model", "sonnet"]))
+        corrupt = Path(self.env["HERDR_PANE_RECORD_DIR"]) / "unrelated-herdr.json"
+        for unreadable in (False, True):
+            with self.subTest(unreadable_launch=unreadable):
+                if unreadable:
+                    write_text_atomic(corrupt, "{broken\n")
+                _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", identity,
+                                    "--cwd", str(prior), "--unit-type", "style", "--account", "claude2", "--check")
+        corrupt.unlink()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", identity,
+                            "--cwd", str(prior), "--unit-type", "style", "--config-dir", str(target))
         self.assertEqual(self.opened()[7], str(prior))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.agent_arguments(), [
@@ -419,7 +460,12 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn("You are now alpha in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
-        self.assertIn(f"Run /unit:direct {promoted_plan}", command)
+        self.assertIn(f"Run /unit:style {promoted_plan}", command)
+        selected = staff.unit_command(unit_membership("build-followups", "alpha"))
+        self.assertEqual(selected, "/unit:style")
+        contract = SCRIPT.parents[2] / "commands/unit/style.md"
+        self.assertTrue(contract.is_file())
+        self.assertIn("<RestartTakeover/>", contract.read_text())
 
     def test_excluded_standing_plan_launches_and_keeps_the_units_copy(self) -> None:
         plan = Path("docs/style-production/units/alpha-unit.md")
@@ -463,18 +509,46 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", plan.as_posix())
         self.assertEqual(copied.read_text(encoding="utf-8"), progress)
 
-    def test_transcript_model_reads_newest_file_and_crosses_chunk_boundaries(self) -> None:
+        with self.subTest(plan="committed only on the unit branch"):
+            _ = self.git("add", "-f", "--", plan.as_posix(), cwd=worktree)
+            _ = self.git("commit", "-q", "-m", "commit the unit plan", cwd=worktree)
+            write_text_atomic(source, header)
+            row = unit_membership("build-followups", "alpha")
+            state = self.repository_state()
+            for flag, observed in (("--resume", sessions.SessionNotLive()),
+                                   ("--attach", sessions.LiveSessionProcess(os.getpid()))):
+                with (self.subTest(flag=flag),
+                      patch.object(sessions, "session_liveness", return_value=observed),
+                      patch.object(add_unit, "attach_source", return_value=add_unit.RunningSessionHandoff(
+                          row.current_session, os.getpid(), "fixture-start", "fixture-login")),
+                      patch.object(add_unit, "stop_for_attach") as stopped):
+                    _ = self.successful("alpha", "--plan", plan.as_posix(), flag, row.current_session,
+                                        "--cwd", str(worktree), "--check")
+                    stopped.assert_not_called()
+                    self.assertEqual(self.repository_state(), state)
+                    self.assertEqual(copied.read_text(encoding="utf-8"), progress)
+
+    def test_transcript_model_reads_latest_turn_and_crosses_chunk_boundaries(self) -> None:
         root = Path(self.env["HOME"]) / ".claude/projects"
         old = root / "old/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         newest = root / "new/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         for path in (old, newest):
             path.parent.mkdir(parents=True)
-        _ = old.write_text(json.dumps({"type": "assistant", "message": {"model": "old-model"}}))
-        _ = newest.write_text(json.dumps({"type": "assistant", "message": {"model": "opus", "content": "é" * 70000}})
-                              + '\n' + json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + '\n{partial')
-        os.utime(old, (1, 1))
         with patch.dict(os.environ, self.env):
-            self.assertEqual(add_unit.transcript_model("62ccbd64-f22e-5647-b20e-7899aa39d766"), "opus")
+            for older, latest, old_mtime, new_mtime, compressed in (
+                ({}, {}, 1, 2, False),
+                ({"timestamp": "2026-11-19T10:00:00Z"}, {"timestamp": "2026-11-19T09:00:00-05:00"}, 2, 1, False),
+                ({"timestamp": "2026-11-19T10:00:00Z"}, {"timestamp": "2026-11-19T14:00:00Z"}, 2, 1, True),
+            ):
+                with self.subTest(latest=latest, compressed=compressed):
+                    _ = old.write_text(json.dumps({"type": "assistant", "message": {"model": "old-model"}, **older}))
+                    _ = newest.write_text(
+                        json.dumps({"type": "assistant", "message": {"model": "opus", "content": "é" * 70000}, **latest})
+                        + '\n' + json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + '\n{partial')
+                    source = compressed_copy(newest) if compressed else newest
+                    os.utime(old, (old_mtime, old_mtime))
+                    os.utime(source, (new_mtime, new_mtime))
+                    self.assertEqual(add_unit.transcript_model("62ccbd64-f22e-5647-b20e-7899aa39d766"), "opus")
             self.assertEqual(add_unit.transcript_model("absent"), "")
 
 
@@ -513,7 +587,7 @@ class UnitLaunchProtocolTests(ShutdownTestCase):
 
     def test_manual_unit_resume_uses_configured_units_account_and_names_missing_configuration_command(self) -> None:
         instructions = self.resume_instructions()
-        self.assertIn("starts it on the configured units account", instructions)
+        self.assertIn("starts it on the pane launch's account, else the configured units account", instructions)
         self.assertIn("units account is not configured", instructions)
         self.assertIn("accounts.py move units", instructions)
 

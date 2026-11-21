@@ -11,10 +11,10 @@ from typing import final
 from unittest import mock
 
 
-from scripts.style import style_proposals
+from scripts.style import style_plan, style_proposals
 
 from scripts.lib import berth_board
-from scripts.style import style_ledger
+from scripts.style import style_footprint, style_ledger
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 
@@ -57,9 +57,12 @@ class StylePlanTests(StylePlanFixture):
         probe, gauge = (next(finding for finding in self.ledger().proposal_findings(issue) if finding.path == path)
                         for path in ("crates/alpha/src/probe.rs", "crates/alpha/src/gauge.rs"))
         with (mock.patch.object(berth_board, "read_board", return_value=self.board("crates/alpha/src/render.rs")),
-              mock.patch.object(style_proposals, "proposal_command")):
+              mock.patch.object(style_proposals, "proposal_command"),
+              mock.patch.object(style_footprint, "token_spans", wraps=style_footprint.token_spans) as reads):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
+        # One token read of lib.rs serves both file moves.
+        self.assertEqual([call.args[0] for call in reads.call_args_list].count("mod gauge;\nmod probe;\nmod render;\n"), 1)
         self.assertEqual(output.count(f"waiting {issue}: {probe.path} edits crates/alpha/src/render.rs, busy (1 finding)\n"), 1)
         self.assertNotIn(f"waiting {issue}: crates/alpha/src/probe.rs busy", output)
         ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
@@ -70,9 +73,12 @@ class StylePlanTests(StylePlanFixture):
         issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
         # The busy file holds the word probe, as a function name, not as the renamed module.
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])),
-              mock.patch.object(style_proposals, "proposal_command")):
+              mock.patch.object(style_proposals, "proposal_command"),
+              mock.patch.object(style_plan, "renamed_text", wraps=style_plan.renamed_text) as renamed):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
+        # The footprint reads only whether each file names the module; it does not build renamed code.
+        renamed.assert_not_called()
         self.assertNotIn("waiting", output)
         ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]),
@@ -130,11 +136,24 @@ class StylePlanTests(StylePlanFixture):
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
     def test_decision_refill_holds_a_file_rename_whose_busy_file_declares_it_by_a_raw_name(self) -> None:
-        issue = self.file_rename_decision(self.rule("read"), (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),),
+        # Refill considers the declaring file before it validates the full rename instruction.
+        rule = self.rule("read")
+        gauge_after = "After the moves, rename crates/alpha/src/gauge.rs to crates/alpha/src/meter.rs. Sweep the mod line."
+        issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),
+                                                 ("crates/alpha/src/gauge.rs", gauge_after)),
                                           (("crates/alpha/src/lib.rs", "mod gauge;\nmod r#probe;\nmod render;\n"),))
-        finding = self.ledger().proposal_findings(issue)[0]
+        findings = self.ledger().proposal_findings(issue)
         output = self.refill_with_busy("crates/alpha/src/lib.rs")
-        self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/lib.rs, busy (1 finding)\n", output)
+        for finding in findings:
+            with self.subTest(path=finding.path):
+                self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/lib.rs, busy (1 finding)\n", output)
+        ledger = self.ledger()
+        gauge = next(finding for finding in findings if finding.path == "crates/alpha/src/gauge.rs")
+        ticket = ledger.next_ticket_id()
+        ledger.ticket_add(ticket, ticket_owner_id("names"), "proposal", "names", "crates/alpha", [gauge.path], [rule],
+                          proposal=str(issue), finding_ids=(gauge.finding_id,))
+        with self.assertRaisesRegex(style_ledger.LedgerError, "cannot parse all file renames"):
+            _ = ledger.pipeline_footprint(ledger.ticket_get(ticket), frozenset({ledger.synced_commit()}))
 
     def test_decision_refill_holds_a_file_rename_declared_by_a_path_attribute_in_an_inline_module(self) -> None:
         self.assert_rename_waits_for_an_uncertain_path(
@@ -185,7 +204,9 @@ class StylePlanTests(StylePlanFixture):
 
     def test_decision_gate_names_the_cause_for_a_ticket_made_before_decisions(self) -> None:
         ticket = self.approved_reference_ticket()
-        with closing(sqlite3.connect(self.ledger().database)) as connection, connection:
+        ledger = self.ledger()
+        ledger.ticket_assign(ticket, "main")
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET finding_ids='[]' WHERE id=?", (ticket,))
             _ = connection.execute("UPDATE held_findings SET build_ticket=''")
         self.write(self.sources[0], "pub fn approved_change() {}\n")

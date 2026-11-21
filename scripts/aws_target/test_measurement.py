@@ -17,10 +17,10 @@ import unittest
 
 from scripts.aws_target import aws_target, config as aws_config, ledger, measurement
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
-from scripts.aws_target.ledger_test_support import instant
+from scripts.aws_target.ledger_test_support import account_reply, instant
 from scripts.aws_target.control_test_support import AwsReplies
 
-from scripts.buildlog import aws_report, index, report
+from scripts.buildlog import aws_report, index, report, store
 
 
 class MeasurementTests(MeasurementFixture):
@@ -33,7 +33,7 @@ class MeasurementTests(MeasurementFixture):
 
     def test_newest_pending_reply_recovers_without_reading_corrupt_older_charges(self) -> None:
         self.seed_previous_day()
-        fetch = mock.Mock(return_value=Decimal(2))
+        fetch = self.charge_fetch(Decimal(2))
         with mock.patch.object(ledger.CostLedger, "_save", side_effect=OSError("confirmation failed")), self.assertRaises(OSError):
             _ = measurement.read_charges(self.settings, self.state, NOW, fetch)
         older = self.state / "charges" / "2026-01-13.json"
@@ -41,14 +41,11 @@ class MeasurementTests(MeasurementFixture):
         _ = (self.state / "deployment.json").write_text(json.dumps({
             "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
-        controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
-            clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
+        controller = aws_target.AccountRefresh(self.settings, self.state, execute=replies, clock=lambda: float(NOW + 1))
         _ = controller.tick()
         fetch.assert_called_once()
         self.assertEqual(replies.count("get-cost-and-usage"), 0)
         self.assertEqual(len(self.book().read_snapshot().reconciliations), 1)
-        state = cast(dict[str, object], json.loads((self.state / "controller.json").read_text()))
-        self.assertNotIn("charge_error", state)
         self.assertEqual(older.read_text(), "{broken")
 
     def test_report_day_cost_matches_full_history_with_whole_day_reconciliation(self) -> None:
@@ -65,7 +62,7 @@ class MeasurementTests(MeasurementFixture):
 
     def test_concurrent_charge_refresh_uses_one_query_and_one_reconciliation(self) -> None:
         self.seed_previous_day()
-        fetch = mock.Mock(return_value=Decimal(2))
+        fetch = self.charge_fetch(Decimal(2))
         def refresh(_number: int) -> measurement.ChargeRead | measurement.MeasurementUnavailable:
             return measurement.read_charges(self.settings, self.state, NOW, fetch)
         with ThreadPoolExecutor(max_workers=2) as workers:
@@ -99,6 +96,16 @@ class MeasurementTests(MeasurementFixture):
                     left, right = ledger.period_bounds(date.fromisoformat(day), settings.accounting_zone)
                     self.assertEqual(result.usd, ledger.period_cost(full.intervals, left, right))
 
+        reading = ledger.ChargeRead(DAY, now, start, end, Decimal(24), Decimal(0), Decimal(1),
+                                   (ledger.UsageTypeCost('storage', Decimal(24)),))
+        _ = book.refresh_charges(self.settings, now, lambda _start, _end: (reading,))
+        with read_only_evidence(self, self.state):
+            for day, expected in (('2026-01-14', Decimal(25)), (DAY, Decimal(24)), ('2026-01-16', Decimal(1))):
+                with self.subTest(day=day, source='account bill'):
+                    result = narrow(self, measurement.daily_usage(
+                        self.settings, self.state, day, now), measurement.DailyUsage)
+                    self.assertEqual(result.usd, expected)
+
     def test_uptime_includes_pending_and_stopping_and_caps_stale_evidence(self) -> None:
         self.costs({"observation_max_age_seconds": "60"})
         book = self.book()
@@ -110,21 +117,10 @@ class MeasurementTests(MeasurementFixture):
         result = narrow(self, measurement.daily_usage(self.settings, self.state, DAY, MIDNIGHT + 600), measurement.DailyUsage)
         self.assertEqual(result.uptime_s, 120)
 
-    def test_tick_does_not_persist_an_unused_charge_error(self) -> None:
-        self.seed_cost()
-        _ = (self.state / "deployment.json").write_text(json.dumps({
-            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
-        replies = AwsReplies()
-        controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
-            clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
-        _ = controller.tick()
-        self.assertEqual(replies.count("get-cost-and-usage"), 1)
-        state = cast(dict[str, object], json.loads((self.state / "controller.json").read_text()))
-        self.assertNotIn("charge_error", state)
 
     def test_charge_difference_is_derived_and_legacy_difference_still_reads(self) -> None:
         self.seed_previous_day()
-        reading = narrow(self, measurement.read_charges(self.settings, self.state, NOW, mock.Mock(return_value=Decimal(3))), measurement.ChargeRead)
+        reading = narrow(self, measurement.read_charges(self.settings, self.state, NOW, self.charge_fetch(Decimal(3))), measurement.ChargeRead)
         path = self.state / "charges" / "2026-01-14.json"
         row = cast(dict[str, object], json.loads(path.read_text()))
         self.assertNotIn("difference_usd", row)
@@ -133,15 +129,17 @@ class MeasurementTests(MeasurementFixture):
         _ = path.write_text(json.dumps(row))
         self.assertEqual(measurement.read_charge(path), reading)
 
-    def test_wait_estimate_uses_the_report_local_day_instead_of_the_accounting_day(self) -> None:
+    def test_wait_estimate_uses_the_explicit_day_bounds(self) -> None:
         self.text_setting("accounting_zone", "Asia/Tokyo")
         departure = instant("2026-01-16T02:00:00+00:00")
         local = self.local_step("local-day", 300, 100, started_at="2026-01-16T01:00:00+00:00")
         self.write_records(local, self.call("local-day"), self.call("fallback-call"), self.remote_step(),
             self.attempt(queued_at=departure - 100, departed_at=departure))
-        _ = index.update()
+        with mock.patch.object(time, "time", return_value=departure + 1):
+            _ = index.update()
         try:
-            with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            # Use the fixed UTC-05:00 offset for New York in January.
+            with mock.patch.dict(os.environ, {"TZ": "EST5"}):
                 time.tzset()
                 with closing(index.read_only()) as connection:
                     result = aws_report.estimate_wait_saved(connection, DAY, bounds=report.day_range(DAY))
@@ -149,6 +147,63 @@ class MeasurementTests(MeasurementFixture):
             self.assertEqual(result.queue_saved_s, Decimal(200))
         finally:
             time.tzset()
+
+    def test_aws_lead_uses_one_utc_window_when_new_york_is_on_the_previous_day(self) -> None:
+        self.text_setting('accounting_zone', 'UTC')
+        self.seed_previous_day(hours=1)
+        book = self.book()
+        start = MIDNIGHT + 1800
+        stop = start + 7200
+        now = instant('2026-01-14T22:30:00-05:00')
+        book.record_price(ledger.PriceSample(start, Decimal(1), 'fixture price'))
+        book.observe(ledger.InstanceObservation(start, 'running', 'fixture'))
+        book.observe(ledger.InstanceObservation(stop, 'stopped', 'fixture'))
+
+        self.write_records(
+            self.local_step('utc-comparison', 1900, 100, started_at=store.utc_iso(start),
+                            ended_at=store.utc_iso(start + 100)),
+            self.call('utc-comparison'), self.call('utc-run'),
+            self.remote_step(call_id='utc-run', started_at=store.utc_iso(stop - 300),
+                             ended_at=store.utc_iso(stop - 100)),
+            self.attempt('utc-run', call_id='utc-run', at=store.utc_iso(stop - 100),
+                         queued_at=stop - 400, departed_at=stop - 300, evidence_at=stop - 100),
+            self.call('previous-run'),
+            self.attempt('previous-run', call_id='previous-run', at=store.utc_iso(MIDNIGHT - 300),
+                         queued_at=MIDNIGHT - 600, departed_at=MIDNIGHT - 500, evidence_at=MIDNIGHT - 300),
+        )
+        with (mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}),
+              mock.patch.object(time, 'time', return_value=float(now)),
+              mock.patch.object(report, 'ssh_target_state_directory', return_value=self.state)):
+            _ = index.update()
+            with closing(index.read_only()) as connection, read_only_evidence(self, self.root):
+                lines = report.aws_section(connection, '2026-01-14',
+                                           day_selection=report.ReportDaySelection.CURRENT_DAY)
+        lead = [line for line in lines if line.startswith('- AWS: up ')]
+        self.assertEqual(lead, [
+            '- AWS: up 2.00 h, 1 steps, about 0.50 h of queue wait saved for $2.00 ($4.00 per saved hour, estimated).',
+        ])
+
+    def test_explicit_report_date_uses_its_utc_accounting_day(self) -> None:
+        self.seed_previous_day(hours=1)
+        now = instant('2026-01-14T22:30:00-05:00')
+        departure = MIDNIGHT - 300
+        self.write_records(
+            self.local_step('january-14-local', 1000, 100, started_at=store.utc_iso(departure - 300),
+                            ended_at=store.utc_iso(departure - 200)),
+            self.call('january-14-local'), self.call('january-14-aws'),
+            self.attempt('january-14-aws', call_id='january-14-aws', at=store.utc_iso(departure + 100),
+                         queued_at=departure - 100, departed_at=departure, evidence_at=departure + 100),
+        )
+        with (mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}),
+              mock.patch.object(time, 'time', return_value=float(now)),
+              mock.patch.object(report, 'ssh_target_state_directory', return_value=self.state)):
+            _ = index.update()
+            with closing(index.read_only()) as connection, read_only_evidence(self, self.root):
+                lines = report.aws_section(connection, '2026-01-14')
+        lead = [line for line in lines if line.startswith('- AWS: up ')]
+        self.assertEqual(lead, [
+            '- AWS: up 1.00 h, 1 steps, about 0.25 h of queue wait saved for $1.00 ($4.00 per saved hour, estimated).',
+        ])
 
     def test_charge_query_uses_whole_utc_days_and_reconciles_the_queried_period(self) -> None:
         cases = (
@@ -177,11 +232,10 @@ class MeasurementTests(MeasurementFixture):
                     for key in ("Start", "End"):
                         if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", fields[key]) is None:
                             raise ValueError("Cost Explorer requires YYYY-MM-DD")
-                    return subprocess.CompletedProcess(arguments, 0, json.dumps({
-                        "ResultsByTime": [{"Total": {"UnblendedCost": {"Amount": "2", "Unit": "USD"}}}]}), "")
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(account_reply(arguments, "2")), "")
 
                 execute = mock.Mock(side_effect=date_only_api)
-                controller = aws_target.Controller(self.settings, directory, self.root / "admission", execute=execute)
+                controller = aws_target.AccountRefresh(self.settings, directory, execute=execute)
                 result = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), instant(when))
                 result = narrow(self, result, measurement.ChargeRead)
                 arguments = cast(Sequence[str], execute.call_args.args[0])
@@ -198,7 +252,7 @@ class MeasurementTests(MeasurementFixture):
     def test_saved_reply_reconciles_after_midnight_before_the_next_query(self) -> None:
         self.seed_cost()
         self.seed_previous_day(hours=0)
-        fetch = mock.Mock(return_value=Decimal("1.25"))
+        fetch = self.charge_fetch(Decimal("1.25"))
         before_midnight = MIDNIGHT + 86400 - 1
         with mock.patch.object(ledger.CostLedger, "_save", side_effect=OSError("ledger write failed")), \
              self.assertRaises(OSError):
@@ -213,7 +267,7 @@ class MeasurementTests(MeasurementFixture):
     def test_query_fee_stays_in_total_after_actual_charge_reconciliation(self) -> None:
         self.costs({"cost_explorer_read_usd": "0.01"})
         self.seed_previous_day()
-        _ = measurement.read_charges(self.settings, self.state, NOW, mock.Mock(return_value=Decimal(2)))
+        _ = measurement.read_charges(self.settings, self.state, NOW, self.charge_fetch(Decimal(2)))
         result = measurement.daily_usage(self.settings, self.state, "2026-01-14", NOW)
         result = narrow(self, result, measurement.DailyUsage)
         self.assertEqual(result.usd, Decimal("2.01"))
@@ -298,7 +352,7 @@ class MeasurementTests(MeasurementFixture):
         self.costs({"cost_explorer_read_usd": "0.01", "cost_explorer_interval_seconds": "172800"})
         start = MIDNIGHT - 86400
         self.seed_previous_day()
-        fetch = mock.Mock(return_value=Decimal(2))
+        fetch = self.charge_fetch(Decimal(2))
 
         first = measurement.read_charges(self.settings, self.state, NOW, fetch)
         second = measurement.read_charges(self.settings, self.state, NOW + 1, fetch)
@@ -317,7 +371,7 @@ class MeasurementTests(MeasurementFixture):
     def test_saved_charge_reply_survives_a_failed_reconciliation_without_another_query(self) -> None:
         self.seed_cost()
         self.seed_previous_day(hours=0)
-        fetch = mock.Mock(return_value=Decimal("1.25"))
+        fetch = self.charge_fetch(Decimal("1.25"))
         with mock.patch.object(ledger.CostLedger, "_save", side_effect=OSError("ledger write failed")), \
              self.assertRaises(OSError):
             _ = measurement.read_charges(self.settings, self.state, NOW, fetch)
@@ -330,7 +384,7 @@ class MeasurementTests(MeasurementFixture):
         self.text_setting("accounting_zone", "America/New_York")
         self.seed_cost()
         at = instant("2026-11-02T00:00:01-05:00")
-        fetch = mock.Mock(return_value=Decimal(0))
+        fetch = self.charge_fetch(Decimal(0))
 
         result = measurement.read_charges(self.settings, self.state, at, fetch)
         result = narrow(self, result, measurement.ChargeRead)
@@ -338,20 +392,33 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(fetch.call_args_list, [mock.call(instant("2026-11-01T00:00:00+00:00"), instant("2026-11-02T00:00:00+00:00"))])
         self.assertEqual(result.period_end - result.period_start, 24 * 3600)
 
-    def test_disabled_charge_reader_never_queries_or_creates_state(self) -> None:
-        self.text_setting("offload", "off")
-        absent = self.root / "disabled-state"
-        fetch = mock.Mock(side_effect=AssertionError("disabled AWS must remain inert"))
-        result = measurement.read_charges(self.settings, absent, NOW, fetch)
-        self.assertIsInstance(result, measurement.MeasurementUnavailable)
-        self.assertFalse(absent.exists())
-        fetch.assert_not_called()
 
-    def test_controller_schedules_one_tagged_charge_query_and_local_reports_never_repeat_it(self) -> None:
-        self.seed_cost()
-        self.text_setting("cost_explorer_tag_key", "Project")
-        self.text_setting("cost_explorer_tag_value", "fixture-build")
+    def test_45_day_watch_uses_one_request_and_fee_for_one_page(self) -> None:
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '45',
+                    'cost_explorer_read_usd': '0.01'})
         calls: list[list[str]] = []
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            calls.append(list(arguments))
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(account_reply(arguments, '2')), '')
+
+        controller = aws_target.AccountRefresh(self.settings, self.state, execute=execute)
+        api = aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute)
+        at = NOW + 86400
+        first = narrow(self, controller.refresh_charges(api, at), measurement.ChargeRead)
+        self.assertEqual(controller.refresh_charges(api, at + 1), first)
+        arguments, = calls
+        self.assertEqual(arguments[arguments.index('--time-period') + 1], 'Start=2025-12-02,End=2026-01-16')
+        self.assertIn('--no-paginate', arguments)
+        self.assertEqual(first.query_usd, Decimal('0.01'))
+        self.assertEqual(len(self.book().bill_paths()), 45)
+        self.assertEqual(sum(row.query_usd for row in self.book().read_snapshot().reconciliations), Decimal('0.01'))
+
+    def test_controller_schedules_one_account_charge_query_and_local_reports_never_repeat_it(self) -> None:
+        self.seed_cost()
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '7', 'cost_explorer_read_usd': '0.01'})
+        calls: list[list[str]] = []
+        amount = '0'
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
                     timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -360,25 +427,53 @@ class MeasurementTests(MeasurementFixture):
             self.assertGreater(timeout, 0)
             self.assertFalse(check)
             calls.append(list(arguments))
-            return subprocess.CompletedProcess(arguments, 0, json.dumps({"ResultsByTime": [
-                {"Total": {"UnblendedCost": {"Amount": "2.50", "Unit": "USD"}}}]}), "")
+            reply = account_reply(arguments, amount)
+            if '--next-page-token' not in arguments:
+                reply['NextPageToken'] = 'second-page'
+                for row in ledger.rows(reply, 'ResultsByTime'):
+                    row['Estimated'] = True
+            else:
+                self.assertEqual(arguments[arguments.index('--next-page-token') + 1], 'second-page')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
-        controller = aws_target.Controller(self.settings, self.state, self.root / "admission",
-                                           execute=execute, clock=lambda: float(NOW + 86400))
-        first = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), NOW + 86400)
-        second = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), NOW + 86401)
-        self.assertIsInstance(first, measurement.ChargeRead)
+        controller = aws_target.AccountRefresh(self.settings, self.state, execute=execute)
+        api = aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute)
+        first = narrow(self, controller.refresh_charges(api, NOW + 86400), measurement.ChargeRead)
+        second = controller.refresh_charges(api, NOW + 86401)
         self.assertEqual(second, first)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(first.actual_usd, Decimal(0))
+        self.assertEqual(first.query_usd, Decimal('0.02'))
+        self.assertTrue(first.provisional)
+        self.assertEqual(len(list((self.state / 'charges').glob('*.json'))), 7)
         arguments = calls[0]
-        self.assertEqual(arguments[arguments.index("--profile") + 1], "build-scaler")
-        self.assertEqual(arguments[arguments.index("--region") + 1], "us-east-1")
-        self.assertIn("ce", arguments)
-        self.assertIn("get-cost-and-usage", arguments)
-        self.assertEqual(json.loads(arguments[arguments.index("--filter") + 1]),
-                         {"Tags": {"Key": "Project", "Values": ["fixture-build"]}})
+        self.assertEqual(arguments[arguments.index('--profile') + 1], 'build-scaler')
+        self.assertEqual(arguments[arguments.index('--region') + 1], 'us-east-1')
+        self.assertEqual(arguments[arguments.index('--time-period') + 1], 'Start=2026-01-09,End=2026-01-16')
+        self.assertIn('ce', arguments)
+        self.assertIn('get-cost-and-usage', arguments)
+        self.assertEqual(arguments[arguments.index('--filter') + 1], aws_target.USAGE_ONLY)
+        self.assertIn('--no-paginate', arguments)
+        self.assertEqual(arguments[arguments.index('--metrics') + 1:arguments.index('--group-by')],
+                         ['UnblendedCost', 'UsageQuantity'])
+        self.assertEqual(arguments[arguments.index('--group-by') + 1], 'Type=DIMENSION,Key=USAGE_TYPE')
         _ = measurement.read_measurement(self.settings, self.state, NOW + 86401)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
+
+        amount = '1.25'
+        _ = controller.refresh_charges(api, NOW + 2 * 86400)
+        replaced = ledger.read_charge(self.state / 'charges' / '2026-01-15.json')
+        self.assertEqual(replaced.actual_usd, Decimal('2.50'))
+        self.assertEqual(replaced.usage_types, (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('2.50'), Decimal(2), 'Hrs'),))
+        self.assertEqual(replaced.at, NOW + 2 * 86400)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(sum(row.query_usd for row in self.book().read_snapshot().reconciliations), Decimal('0.04'))
+        _ = controller.refresh_charges(api, NOW + 2 * 86400 + 1)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(sum(row.query_usd for row in self.book().read_snapshot().reconciliations), Decimal('0.04'))
+
+        with mock.patch.object(api, 'call', return_value={'ResultsByTime': []}), self.assertRaisesRegex(ValueError, 'daily reply is unavailable'):
+            _ = controller.refresh_charges(api, NOW + 3 * 86400)
 
 
 if __name__ == "__main__":

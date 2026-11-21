@@ -61,14 +61,17 @@ class VerifyNixShellTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         scripts = self.root / "fixture scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
         self.verify_script = direct / "verify.sh"
         _ = shutil.copy2(VERIFY, self.verify_script)
+        _ = shutil.copy2(VERIFY.with_name("file_lock.sh"), direct / "file_lock.sh")
         self.verify_script.chmod(0o755)
         self.script(scripts / "lib/py", PYTHON_SHIM)
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")
+        (scripts / "lib/conf_record.sh").symlink_to(SCRIPTS / "lib/conf_record.sh")
         (scripts / "lint").mkdir()
         _ = shutil.copy2(SCRIPTS / "lint/invoke.sh", scripts / "lint/invoke.sh")
         _ = shutil.copy2(SCRIPTS / "lib/build_folders.py", scripts / "lib/build_folders.py")
@@ -78,6 +81,10 @@ class VerifyNixShellTests(NixFixture):
         lint = self.home / ".claude/scripts/lint"
         lint.mkdir(parents=True)
         _ = (lint / "invoke.sh").write_text(TOOL_SETUP, encoding="utf-8")
+        prepare = ('if [[ ${1:-} == --prepare-temp ]]; then\n'
+                   + f'    source "{SCRIPTS / "lint/invoke.sh"}" --prepare-temp\n'
+                   + '    return $?\nfi\n')
+        _ = (scripts / "lint/invoke.sh").write_text(prepare + TOOL_SETUP, encoding="utf-8")
         self.setup_log = self.root / "verification.json"
         self.python_log = self.root / "python.jsonl"
         self.env.update({"CLAUDE_PYTHON": sys.executable,

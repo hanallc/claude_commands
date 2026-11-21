@@ -6,16 +6,39 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeVar, cast
 from collections.abc import Callable
-import subprocess
-import sys
-import time
-from urllib.parse import urlsplit
-import re
+import os
 import json
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.build_targets import target_config
+
+
+def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:
+    """Read the ordered regions permitted by the account policy."""
+    values = configuration if configuration is not None else conf.read_or_repository('cloud_gate')
+    regions = tuple(values.words('regions'))
+    if not regions or regions[0] != home or len(set(regions)) != len(regions):
+        raise ValueError('regions must start with the home region and contain no duplicates')
+    return regions
+
+
+def gate_deployment(path: Path, home: str) -> dict[str, object]:
+    """Migrate the single-region record once and read the regional form."""
+    from scripts.lib.atomic_file import write_text_atomic
+    value = cast(dict[str, object], json.loads(path.read_text()))
+    if 'regions' not in value:
+        regional = {key: value.pop(key) for key in ('image', 'subnets', 'template', 'version', 'security_group') if key in value}
+        regional['region'] = value.pop('region', home)
+        value['regions'] = [regional]
+        write_text_atomic(path, json.dumps(value, sort_keys=True) + '\n')
+    return value
+
+
+def account_settings_path() -> Path:
+    """Use the installed account settings regardless of the checkout's CONF_DIR."""
+    override = os.environ.get('AWS_TARGET_CONFIG')
+    return Path(override).expanduser() if override else Path.home() / '.claude/config/aws_target.conf'
 
 
 @dataclass(frozen=True)
@@ -50,12 +73,19 @@ class SpendingSettings:
     observation_max_age_seconds: int
     cost_explorer_interval_seconds: int
     cost_explorer_read_usd: Decimal
+    cost_explorer_lookback_days: int
+    cost_explorer_watch_days: int
+    cost_explorer_unchanged_reads: int
+    cost_explorer_change_recipient: str
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
     cost_explorer_tag_key: str
     cost_explorer_tag_value: str
     limits: tuple[LimitSettingEvidence, ...]
+    box_minimum_seconds: int
+    instance_type: str
+    spot_max_usd_per_hour: Decimal
 
 
 def money(value: str) -> Decimal:
@@ -80,25 +110,6 @@ def _live(settings: conf.ConfigRead, key: str, convert: Callable[[str], T]) -> T
     if not isinstance(result, conf.UsableLiveValue):
         raise ValueError(f'{key}: {result.reason}; live input is unavailable')
     return result.value
-
-
-def service_loop(settings_path: Path, interval: str, action: Callable[[], object], *,
-                 pause: Callable[[float], object] = time.sleep) -> None:
-    """Repeat enabled work and retain the last usable interval after a read failure."""
-    if not offload_enabled(conf.read(settings_path)):
-        return
-    delay = conf.read(settings_path).number(interval)
-    while offload_enabled(conf.read(settings_path)):
-        try:
-            try:
-                _ = action()
-            finally:
-                delay = conf.read(settings_path).number(interval)
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            print(f'aws_service: {error}', file=sys.stderr)
-        if not offload_enabled(conf.read(settings_path)):
-            return
-        _ = pause(delay)
 
 
 def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
@@ -127,6 +138,7 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
         "retained_storage_usd_per_month", "root_storage_usd_per_month", "ipv4_usd_per_month",
         "gp3_iops_usd_per_month", "gp3_throughput_usd_per_month"))
     explorer = amount("cost_explorer_read_usd")
+    spot_bid = amount('spot_max_usd_per_hour')
     if errors:
         raise SpendingConfigurationUnavailable("; ".join(errors), tuple(limits))
 
@@ -148,38 +160,26 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
         zone = ZoneInfo(live_text("accounting_zone"))
     except (ValueError, KeyError) as error:
         raise SpendingConfigurationUnavailable(f"accounting_zone: {error}", tuple(limits)) from error
+    try:
+        unchanged_reads = _live(settings, 'cost_explorer_unchanged_reads', conf.positive_whole)
+    except ValueError as error:
+        raise SpendingConfigurationUnavailable(str(error), tuple(limits)) from error
+    lookback_days = seconds('cost_explorer_lookback_days')
+    watch_days = seconds('cost_explorer_watch_days')
+    if watch_days < lookback_days:
+        raise SpendingConfigurationUnavailable(
+            'cost_explorer_watch_days must be at least cost_explorer_lookback_days', tuple(limits))
+    cost_explorer_change_recipient = live_text('cost_explorer_change_recipient').strip()
+    if not cost_explorer_change_recipient or cost_explorer_change_recipient.casefold() == 'user':
+        raise SpendingConfigurationUnavailable('cost_explorer_change_recipient must name a session', tuple(limits))
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, live_text("notification_recipient"), seconds("notification_timeout_s"),
+                            explorer, lookback_days, watch_days, unchanged_reads, cost_explorer_change_recipient,
+                            live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
-                            live_text("cost_explorer_tag_value"), tuple(limits))
-
-
-@dataclass(frozen=True)
-class ControlSettings:
-    enabled: bool
-    instance_type: str
-    region: str
-    instance_id: str
-    credentials_profile: str
-    start_after_wait_s: float
-    start_min_waiting: int
-    version_decline_hold_s: float
-    capacity_backoff_s: float
-    drain_max_minutes: float
-    idle_stop_minutes: float
-    tick_interval_s: float
-    aws_timeout_s: float
-    snapshot_max_age_s: float
-    permission_ttl_s: float
-    interruption_poll_s: float
-    imds_timeout_s: float
-    remote_state_directory: str
-
-
-def offload_enabled(settings: conf.ConfigRead) -> bool:
-    return target_config.aws_routing_enabled(settings)
+                            live_text("cost_explorer_tag_value"), tuple(limits), seconds('box_minimum_seconds'),
+                            live_text('instance_type'), spot_bid)
 
 
 def deployment_record(directory: Path | None = None) -> dict[str, object]:
@@ -203,32 +203,6 @@ def deployment_outputs(directory: Path | None = None) -> dict[str, str]:
     if any(not isinstance(key, str) or not isinstance(item, str) for key, item in entries.items()):
         raise ValueError('deployment.json: expected text resource identities')
     return cast(dict[str, str], value)
-
-
-def read_control_settings(path: Path | conf.ConfigRead, directory: Path | None = None, *,
-                          remote_identity: bool = False) -> ControlSettings:
-    settings = conf.read(path) if isinstance(path, Path) else path
-    values = settings.values()
-    enabled = offload_enabled(settings)
-    if enabled and not remote_identity:
-        saved = deployment_record(directory)
-        if saved and saved.get('region') != values.get('region'):
-            raise ValueError('deployment.json: the saved region differs from configuration')
-    def required(key: str) -> str:
-        value = settings.text(key)
-        if not value.strip():
-            raise ValueError(f'{key}: expected nonempty text')
-        return value
-    return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
-                           values.get('instance_id', '') if remote_identity else deployment_outputs(directory).get('InstanceId', ''),
-                           required('credentials_profile'), settings.number('start_after_wait_s'),
-                           settings.whole('start_min_waiting'), settings.number('version_decline_hold_s'),
-                           settings.number('capacity_backoff_s'),
-                           settings.number('drain_max_minutes'), settings.number('idle_stop_minutes'),
-                           settings.number('tick_interval_s'), settings.number('aws_timeout_s'),
-                           settings.number('snapshot_max_age_s'), settings.number('permission_ttl_s'),
-                           settings.number('interruption_poll_s'), settings.number('imds_timeout_s'),
-                           required('remote_state_directory'))
 
 
 @dataclass(frozen=True)
@@ -257,33 +231,22 @@ class DeploymentSettings:
     region: str
     profile: str
     stack_name: str
-    instance_type: str
     ami_id: str
     ami_owner_id: str
     nixos_release: str
     availability_zone: str
     vpc_id: str
     subnet_id: str
-    existing_data_volume_id: str
     root_device_name: str
-    root_volume_gib: int
-    data_volume_gib: int
-    data_volume_iops: int
-    data_volume_throughput: int
-    spot_max_usd_per_hour: Decimal
     notice_low: int
     notice_high: int
     stop_percent: int
     timeout_s: int
     preflight_max_age_s: int
     scaler_user_name: str
-    scripts_source_url: str
-    scripts_source_commit: str
-    scripts_source_sha256: str
-    bootstrap_template_path: Path
 
 
-def read_deployment_settings(path: Path, directory: Path | None = None) -> DeploymentSettings:
+def read_deployment_settings(path: Path) -> DeploymentSettings:
     """Require current deployment inputs before preparing any resource request."""
     settings = conf.read(path)
     def text(key: str) -> str:
@@ -292,15 +255,8 @@ def read_deployment_settings(path: Path, directory: Path | None = None) -> Deplo
     def whole(key: str) -> int:
         return _live(settings, key, positive_seconds)
 
-    def positive_money(key: str) -> Decimal:
-        value = _live(settings, key, money)
-        if value <= 0:
-            raise ValueError(f'{key}: live positive price is required')
-        return value
-
     region = text('region')
     zone = text('availability_zone')
-    instance_type = text('instance_type')
     if region not in ('us-east-1', 'us-east-2') or not zone.startswith(region):
         raise ValueError('select a supported region and its availability zone')
     owner = text('ami_owner_id')
@@ -310,52 +266,7 @@ def read_deployment_settings(path: Path, directory: Path | None = None) -> Deplo
         'budget_notice_low_percent', 'budget_notice_high_percent', 'budget_stop_percent'))
     if not 0 < low < high < stop:
         raise ValueError('Budget thresholds must increase')
-    source_url = text('scripts_source_url')
-    url = urlsplit(source_url)
-    if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
-        raise ValueError('scripts_source_url must contain a public HTTPS URL without credentials')
-    commit, source_hash = text('scripts_source_commit'), text('scripts_source_sha256')
-    if not re.fullmatch(r'[0-9a-f]{40}', commit) or not re.fullmatch(r'sha256-[A-Za-z0-9+/]{43}=', source_hash):
-        raise ValueError('the public scripts need an exact commit and a Nix SHA-256 hash')
-    template = Path(text('bootstrap_template_path')).expanduser()
-    if not template.is_absolute():
-        template = path.parent / template
-    return DeploymentSettings(region, text('deployment_profile'), text('stack_name'), instance_type,
-                              text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'),
-                              text('subnet_id'), retained_volume(path, directory),
-                              text('root_device_name'), whole('root_volume_gib'), whole('data_volume_gib'),
-                              whole('data_volume_iops'), whole('data_volume_throughput'),
-                              positive_money('spot_max_usd_per_hour'), low, high, stop,
-                              whole('deployment_timeout_s'), whole('preflight_max_age_s'), text('scaler_user_name'),
-                              source_url, commit, source_hash, template)
-
-
-
-def retained_volume(path: Path, directory: Path | None = None) -> str:
-    """Keep the saved volume selection until the stack owner changes."""
-    saved = deployment_record(directory)
-    outputs = deployment_outputs(directory)
-    if saved.get('stack') == conf.read(path).text('stack_name'):
-        return outputs.get('ExistingDataInput', '')
-    return outputs.get('DataVolumeId', '')
-
-def deployment_price_path(path: Path) -> Path:
-    """Locate the deployment price state outside the public repository."""
-    key = 'deployment_price_file'
-    state_path = Path(_live(conf.read(path), key, str)).expanduser().resolve()
-    if state_path.is_relative_to(Path(__file__).resolve().parents[2]):
-        raise ValueError(f'{key}: {state_path}: the price file must stay outside the public repository')
-    return state_path
-
-
-def deployment_price(path: Path, now: int) -> tuple[int, Decimal]:
-    state_path = deployment_price_path(path)
-    try:
-        state = conf.read(state_path)
-        at = _live(state, 'deployment_price_at', positive_seconds)
-        price = _live(state, 'deployment_price_usd_per_hour', money)
-        if price <= 0 or not 0 <= now - at <= read_settings(path).price_max_age_seconds:
-            raise ValueError('deployment requires a fresh positive public price')
-    except ValueError as error:
-        raise ValueError(f'deployment_price_file: {state_path}: {error}; run deploy.py price') from None
-    return at, price
+    return DeploymentSettings(region, text('deployment_profile'), text('stack_name'),
+                              text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'), text('subnet_id'),
+                              text('root_device_name'), low, high, stop,
+                              whole('deployment_timeout_s'), whole('preflight_max_age_s'), text('scaler_user_name'))

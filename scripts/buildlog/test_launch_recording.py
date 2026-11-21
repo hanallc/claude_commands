@@ -19,6 +19,7 @@ from types import FrameType
 from typing import cast, override
 from unittest import mock
 
+from scripts.aws_target.ledger_test_support import install_cost_settings, write_gate_config
 from scripts.buildlog import index
 from scripts.buildlog import launches
 from scripts.buildlog import record
@@ -26,6 +27,7 @@ from scripts.buildlog import report
 from scripts.buildlog import store
 from scripts.buildlog.test_index import Record, encode, point_root_at, step
 from scripts.buildlog.test_launches import CLI, result_line
+from scripts.lib import scratch as scratch_folders
 from scripts.lib import test_hang_guard
 from scripts.lint.memory_test_support import config_environment
 
@@ -64,9 +66,14 @@ class LaunchRecordingTests(unittest.TestCase):
             ["git", "init", "--quiet", "--initial-branch=main", str(self.worktree)],
             check=True, capture_output=True,
         )
+        aws_settings = base / 'config/aws_target.conf'
+        install_cost_settings(aws_settings)
+        write_gate_config(base / 'config/cloud_gate.conf')
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(base / "config"),
+            "AWS_TARGET_CONFIG": str(aws_settings),
+            "BUILD_TARGETS_STATE_DIR": str(base / "targets"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),
@@ -131,7 +138,7 @@ class LaunchRecordingTests(unittest.TestCase):
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
             mock.patch.object(hana_shot, "wait_ready"),
-            mock.patch.object(tempfile, "mkdtemp", return_value=str(scratch)),
+            mock.patch.object(scratch_folders, "new", return_value=scratch),
             mock.patch.object(subprocess, "Popen", side_effect=start, wraps=subprocess.Popen),
             mock.patch.object(hana_shot, "Brp", return_value=mock.Mock(call=mock.Mock(side_effect=stop))),
             redirect_stderr(io.StringIO()),

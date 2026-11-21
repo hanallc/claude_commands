@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from typing import cast
 from unittest.mock import patch
 
 
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.snapshot_codec import parse_snapshot_value, snapshot_value
 from scripts.lib import conf
 
 GIB = 1 << 30
@@ -23,6 +26,11 @@ BAD_GATE_RECORDS: tuple[tuple[str, str], ...] = (
 )
 
 
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    write_memory_config(root / "build_admission.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(root)})))
+
 
 class ProfileRankTests(unittest.TestCase):
     @staticmethod
@@ -32,10 +40,18 @@ class ProfileRankTests(unittest.TestCase):
                            (3 * GIB, 8 * GIB, GIB, 4 * GIB),
                            (6 * GIB, 4 * GIB, 7 * GIB, 3 * GIB)))
 
-    def test_rank_two_uses_the_second_highest_run_in_each_bin(self) -> None:
-        merged = progress.merge_profiles(self.runs(), rank=2)
-        assert isinstance(merged, progress.ProgressProfile)
-        self.assertEqual(merged.phases[0].bins, (6 * GIB, 4 * GIB, 5 * GIB, 3 * GIB) * 5)
+    def test_rank_floor_and_share_select_each_bin(self) -> None:
+        ordinary = progress.ProgressProfile((progress.PhaseProfile("build:1", (GIB,) * 20),))
+        runaway = tuple(progress.ProgressProfile((progress.PhaseProfile("build:1", (peak,) * 20),))
+                        for peak in (16 * GIB, 26 * GIB))
+        for runs, expected in (
+            (self.runs(), (6 * GIB, 4 * GIB, 5 * GIB, 3 * GIB) * 5),
+            ((ordinary,) * 20 + runaway, (GIB,) * 20),
+        ):
+            with self.subTest(count=len(runs)):
+                merged = progress.merge_profiles(runs, rank=2)
+                assert isinstance(merged, progress.ProgressProfile)
+                self.assertEqual(merged.phases[0].bins, expected)
 
     def test_rank_one_keeps_the_highest_run_in_each_bin(self) -> None:
         merged = progress.merge_profiles(self.runs(), rank=1)
@@ -75,10 +91,13 @@ class ProfileRankTests(unittest.TestCase):
                 progress.save_profile(directory / f"run-{index}.json", profile, 100)
             history = progress.ProfileHistory(root)
             config = fixture.root / "build_admission.conf"
-            for rank in (2, 1, 2):
-                with self.subTest(rank=rank):
-                    write_memory_config(config, progress_profile_rank=str(rank))
+            for rank, share in ((2, 10), (1, 10), (1, 50), (1, 0), (2, 10), (1, 0)):
+                with self.subTest(rank=rank, share=share):
+                    write_memory_config(config, progress_profile_rank=str(rank), peak_history_share_percent=str(share))
+                    history.prune(90, 60)
                     self.assertEqual(history.matching("build", 90), progress.merge_profiles(self.runs(), rank=rank))
+            write_memory_config(config, progress_profile_rank="1", peak_history_share_percent="50")
+            self.assertEqual(history.matching("build", 90), progress.merge_profiles(self.runs(), rank=2, share_percent=0))
 
     def test_saved_records_preserve_the_source_and_the_highest_bin_processes(self) -> None:
         with AdmissionFixture() as fixture:
@@ -121,6 +140,11 @@ class ProfileRankTests(unittest.TestCase):
             for value in ("0", "-1", "text"):
                 with self.subTest(value=value), self.assertRaises(conf.Unusable):
                     conf.check(path, "progress_profile_rank", value)
+            for value in ("0", "10", "50"):
+                conf.check(path, "peak_history_share_percent", value)
+            for value in ("-1", "51", "0.1", "text"):
+                with self.subTest(share=value), self.assertRaises(conf.Unusable):
+                    conf.check(path, "peak_history_share_percent", value)
 
     def test_two_saved_gate_outliers_do_not_set_the_rank_two_need(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -193,7 +217,38 @@ class ProgressCounterTests(unittest.TestCase):
             progress.NoCounter)
 
 
+    def test_the_token_wait_line_is_a_token_wait_until_the_tokens_are_taken(self) -> None:
+        built = "\r    Building [==========] 10/10: tests\nFinished `test` profile in 29s\n"
+        waiting = progress.parse_progress(built + progress.token_wait_line(4) + "\n")
+        self.assertEqual(waiting, progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4)))
+        taken = progress.parse_progress(built + progress.token_wait_line(4) +
+            "\nnextest: 8 of 8 test threads; one jobserver token for each thread\n")
+        self.assertEqual(progress.token_wait(taken), progress.NoTokenWait())
+        tests = progress.parse_progress(built + progress.token_wait_line(4) +
+            "\nnextest: 8 of 8 test threads\nStarting 12 tests across 3 binaries\n")
+        self.assertEqual(tests, progress.ProgressCounter("test:1", 0, 12))
+
+    def test_a_token_wait_keeps_the_counter_wire_union_for_pinned_clients(self) -> None:
+        waiting = progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4))
+        wire = snapshot_value(waiting)
+        self.assertEqual(parse_snapshot_value(wire, progress.ProgressCounter | progress.NoCounter), waiting)
+        older = {"kind": "NoCounter", "reason": "phase ended or waiting"}
+        self.assertEqual(parse_snapshot_value(older, progress.ProgressCounter | progress.NoCounter),
+                         progress.NoCounter("phase ended or waiting"))
+
+
 class ProgressCaptureTests(unittest.TestCase):
+    def test_process_status_with_invalid_name_keeps_rss_anon(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            directory = proc / "123"
+            directory.mkdir()
+            _ = (directory / "cmdline").write_bytes(b"verify\0")
+            _ = (directory / "status").write_bytes(b"Name:\tverify\xff\nRssAnon:\t42 kB\n")
+
+            self.assertEqual(progress.read_processes((123,), proc),
+                             (progress.ProfileProcess(123, ("verify",), 42 * 1024),))
+
     def test_a_counter_split_between_log_reads_is_complete_after_the_next_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "cargo.log"
@@ -358,9 +413,35 @@ class ProfileHistoryTests(unittest.TestCase):
             root = Path(temporary)
             progress.ProfileHistory(root).observe("gone", "build", progress.ProgressCounter("build:1", 5, 100), GIB, 100)
             restarted = progress.ProfileHistory(root)
-            restarted.prune(101)
+            restarted.prune(101, 60)
             self.assertIsInstance(restarted.matching("build", 101), progress.NoMatchingProfile)
             self.assertEqual(list(root.rglob("*.active")), [])
+
+    def test_a_history_entry_keeps_the_profile_and_time_of_a_record_with_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "run.json"
+            profile = progress.ProgressProfile((progress.PhaseProfile("build:1", (GIB,) * 20),))
+            processes = (progress.ProfileProcess(101, ("rustc", "--private"), GIB),)
+            progress.save_profile(path, profile, 100.5,
+                peak_processes=progress.PeakProcesses("build:1", 4, GIB, processes))
+            self.assertEqual(progress.read_history_entry(path), progress.HistoryEntry(profile, 100.5))
+            _ = path.write_text('{"measurement":"attributed_anonymous","record":{"kind":"Other"}}')
+            self.assertIsInstance(progress.read_history_entry(path), progress.NoMatchingProfile)
+
+    def test_a_sweep_that_runs_out_of_time_continues_on_the_next_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = progress.ProgressProfile((progress.PhaseProfile("build:1", (GIB,) * 20),))
+            for key in ("first", "second", "third"):
+                (root / key).mkdir()
+                progress.save_profile(root / key / "old.json", profile, 50)
+                progress.save_profile(root / key / "new.json", profile, 100)
+            history = progress.ProfileHistory(root)
+            for passes in (1, 2, 3):
+                history.prune(90, 0)
+                self.assertEqual(len(history.merged), passes)
+                self.assertEqual(len(list(root.glob("*/old.json"))), 3 - passes)
+            self.assertEqual(history.matching("second", 90), progress.merge_profiles((profile,)))
 
     def test_failed_publication_can_retry_the_same_finish(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

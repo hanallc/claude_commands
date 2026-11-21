@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -52,6 +52,32 @@ class NextMovesTests(unittest.TestCase):
         self.assertNotIn('"else"', document)
         self.assertEqual(next_moves.decode_next_moves(document), (legacy,))
         self.assertEqual(legacy.fallback_targets, ())
+
+    def test_producers_have_an_independent_next_move_list(self) -> None:
+        runner = next_moves.add_next_move("showrunners", 1, "claude2")
+        producer = next_moves.add_next_move("producers", 2, "claude3")
+        self.assertEqual(next_moves.read_next_moves(), (runner, producer))
+        self.assertIn("producers 1: at 2% → claude3", next_moves.list_next_moves())
+        next_moves.remove_next_move("producers", next_moves.FIRST_GROUP_POSITION)
+        self.assertEqual(next_moves.read_next_moves(), (runner,))
+
+    def test_unknown_groups_keep_known_moves_readable_and_survive_an_edit(self) -> None:
+        unit = next_moves.ClaudeGroupMove("unit", "units", 1, 0, "claude2", NOW)
+        runner = next_moves.ClaudeGroupMove("runner", "showrunners", 1, 0, "claude2", NOW)
+        future = {"id": "future", "group": "future-role", "hold_mode": "future-mode", "to": "future-account"}
+        path = next_moves.next_moves_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        known = cast(list[dict[str, object]], json.loads(next_moves.encode_next_moves((unit, runner))))
+        _ = path.write_text(json.dumps([known[0], future, known[1]]))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(next_moves.read_next_moves(), (unit, runner))
+        self.assertEqual(errors.getvalue().splitlines(), ["next: anomaly: skipped entries for unknown groups 'future-role'"])
+
+        with redirect_stderr(io.StringIO()):
+            next_moves.remove_next_move("units", next_moves.FIRST_GROUP_POSITION)
+            self.assertEqual(next_moves.read_next_moves(), (runner,))
+        self.assertIn(future, cast(list[dict[str, object]], json.loads(path.read_text())))
 
     def test_workers_keep_their_existing_target_form(self) -> None:
         with self.assertRaisesRegex(next_moves.NextMoveError, "workers entries cannot use --else"):
@@ -132,10 +158,33 @@ class NextMovesTests(unittest.TestCase):
                 entry = next_moves.add_next_move("units", 1, target, fallback_targets=fallbacks)
                 self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW, dry_run=True), ["units: unchanged"])
                 self.assertEqual(next_moves.read_next_moves(), (entry,))
-                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), ["units: unchanged"])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), [])
+                self.assertEqual(output.getvalue().splitlines(), [f"Removed next move units 1 at 1% to {target}."])
                 self.assertEqual(next_moves.read_next_moves(), ())
                 self.assertEqual(fixture.moves.calls, [])
                 self.assertEqual(fixture.notifications, [])
+
+    def test_current_account_fallback_stays_queued_after_the_selection_changes(self) -> None:
+        with self.watch_fixture() as fixture:
+            _ = fixture.groups()
+            fixture.reading("main@example.invalid", 0)
+            entry = next_moves.add_next_move("units", 1, "claude2", fallback_targets=("claude1",))
+            choose = refusal_watch._choose_auto_move_target  # pyright: ignore[reportPrivateUsage]
+
+            def change_after_choice(rule: refusal_watch.AutoMoveRule, account: str, now: datetime,
+                                    account_config: conf.ConfigRead) -> refusal_watch.AutoMoveRule | refusal_watch.BlockedAutoMoveTargets:
+                chosen = choose(rule, account, now, account_config)
+                assert isinstance(chosen, refusal_watch.AutoMoveRule)
+                self.assertEqual(chosen.to, "claude1")
+                _ = accounts.set_group_account("units", "claude3", why="operator selection", now=now)
+                return chosen
+
+            with patch.object(refusal_watch, "_choose_auto_move_target", side_effect=change_after_choice):
+                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), [])
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+            self.assertEqual(fixture.moves.calls, [])
 
     def test_due_entry_stays_queued_when_both_targets_are_blocked(self) -> None:
         with self.watch_fixture() as fixture:
@@ -187,7 +236,10 @@ class NextMovesTests(unittest.TestCase):
             _ = accounts.set_group_account("units", "claude3", why="auto: " + entry.id,
                                            now=watch_tests.NOW, origin=accounts.AutoOrigin())
             accounts.roles_history_file().unlink()
-            _ = refusal_watch.run_auto_moves(watch_tests.NOW)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), [])
+            self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude2."])
             self.assertEqual(next_moves.read_next_moves(), ())
             self.assertIn("auto: " + entry.id, accounts.roles_history_file().read_text())
             self.assertEqual(fixture.moves.calls, [])
@@ -209,6 +261,38 @@ class NextMovesTests(unittest.TestCase):
         next_moves.remove_next_move("units", next_moves.GroupPosition(1))
         next_moves.remove_next_move("showrunners", next_moves.GroupPosition(1))
         self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_set_first_replaces_only_the_groups_first_entry_or_appends_one(self) -> None:
+        runner = next_moves.add_next_move("showrunners", 2, "claude2")
+        added = next_moves.set_first_next_move("units", 1, "claude3")
+        self.assertEqual(next_moves.read_next_moves(), (runner, added))
+        self.assertEqual((added.group, added.at_percent, next_moves.target_label(added)), ("units", 1, "claude3"))
+        later = next_moves.add_next_move("units", 5, "claude4", next_moves.HalfPointHold())
+        replaced = next_moves.set_first_next_move("units", 1, "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (runner, replaced, later))
+        self.assertIsInstance(replaced, next_moves.ClaudeGroupMove)
+        self.assertEqual(cast(next_moves.ClaudeGroupMove, replaced).hold_mode, next_moves.FixedHold(0))
+        with self.assertRaises(next_moves.NextMoveError):
+            _ = next_moves.set_first_next_move("units", 1, "codex2")
+        self.assertEqual(next_moves.read_next_moves(), (runner, replaced, later))
+
+    def test_remote_set_first_removes_the_hosts_first_entry_then_inserts_at_one(self) -> None:
+        for queued, expected in (("[]", [("next-read",), ("next-write", "--at", "1")]),
+                                 (json.dumps([{"id": "old", "group": "units", "at_percent": 1, "hold_minutes": 0,
+                                               "to": "claude2", "added_at": NOW.isoformat()}]),
+                                  [("next-read",), ("next", "remove", "units", "1"), ("next-write", "--at", "1")])):
+            calls: list[tuple[str, ...]] = []
+
+            def remote(arguments: tuple[str, ...], queued: str = queued) -> str:
+                calls.append(arguments[:1] + arguments[2:] if arguments[0] == "next-write" else arguments)
+                return queued if arguments == ("next-read",) else arguments[1] if arguments[0] == "next-write" else ""
+
+            with (self.subTest(queued=queued), patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                entry = next_moves.set_first_next_move("units", 1, "claude3")
+            self.assertEqual(calls, expected)
+            self.assertEqual(next_moves.target_label(entry), "claude3")
+        self.assertFalse(next_moves.next_moves_file().exists())
 
     def test_group_positions_are_one_based_and_out_of_range_edits_preserve_the_log(self) -> None:
         for value in (0, -1, True):

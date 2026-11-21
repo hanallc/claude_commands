@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
+from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
@@ -20,10 +24,34 @@ from scripts.direct.verify_hold_wait_test_support import (
     release_registered_call,
 )
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    def test_hold_release_records_before_the_fixture_restores_its_environment(self) -> None:
+        startup = self.fixture.root / "caller-startup.sh"
+        _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\nexit 97\n')
+        caller_environment = {"BASH_ENV": str(startup)}
+        environments: tuple[tuple[str, dict[str, str], dict[str, str]], ...] = (
+            ("ambient", {}, {}),
+            ("marked", self.fixture.environment, {}),
+            ("caller-startup", {}, caller_environment),
+        )
+        for count, (name, environment, caller) in enumerate(environments, 1):
+            with self.subTest(environment=name):
+                self.hold()
+                with mock.patch.dict(os.environ, caller), local_hold_environment(environment):
+                    grant_call(self.cycle_file)
+                recorded: list[tuple[object, object]] = []
+                for path in (self.fixture.root / "buildlog").rglob("*.jsonl"):
+                    for line in path.read_text().splitlines():
+                        row = cast(dict[str, object], json.loads(line))
+                        if row.get("kind") == "hold_event":
+                            recorded.append((row.get("event"), row.get("holder")))
+                self.assertEqual(recorded, [("ended", "hana")] * count)
+                self.assertFalse(startup.with_suffix(".sh.ran").exists())
+
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
         from scripts.direct.local_release_wait import LocalReleaseEvents
@@ -42,11 +70,19 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         from scripts.build_targets import build_targets
 
         self.hold()
+        library = ctypes.CDLL
+        caller = threading.get_ident()
+
+        def unavailable_for_caller(name: str | None, *, use_errno: bool = False) -> object:
+            if threading.get_ident() == caller:
+                return object()
+            return library(name, use_errno=use_errno)
+
         def release_on_poll(_seconds: float) -> None:
             grant_call(self.cycle_file)
 
         with local_hold_environment(self.fixture.environment):
-            with mock.patch.object(ctypes, "CDLL", return_value=object()), \
+            with mock.patch.object(ctypes, "CDLL", side_effect=unavailable_for_caller), \
                  mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
                 self.assertEqual(build_targets.command_wait_local("polling-call"), 0)
             polling.assert_called_once_with(0.01)
@@ -96,7 +132,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         removed = threading.Event()
         add_watch = inotify.add_watch
 
-        def remove_before_watch(descriptor: int, path: Path, mask: int) -> int:
+        def remove_before_watch(descriptor: int, path: Path, mask: int = inotify.DIRECTORY_CHANGES) -> int:
             if path == vanished:
                 vanished.rmdir()
                 removed.set()
@@ -110,12 +146,37 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
+class PlacementWaitModeTests(unittest.TestCase):
+    def test_only_the_first_empty_reply_of_an_episode_wakes_at_the_next_pass(self) -> None:
+        source = (Path(__file__).resolve().parent / "verify.sh").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            calls = Path(directory) / "calls"
+            script = "\n".join((
+                "set -euo pipefail",
+                'record() { printf \'%s\\n\' "$4 $5" >> "$CALLS"; }',
+                "PY=record LOCAL_RELEASE_WAIT_SCRIPT=wait BUILDLOG_CALL_ID=call PHASE_RESOURCE_WAIT=''",
+                "PLACEMENT_WAIT_MEMORY=0 PLACEMENT_EVIDENCE_EPISODE='' HOLD_WAITER_PID=''",
+                "start_routing_wait() { :; }",
+                "build_hold_nothing_held() { return 0; }",
+                shell_function(source, "wait_for_placement"),
+                "PLACEMENT_EPISODE=one; wait_for_placement; wait_for_placement; wait_for_placement",
+                "PLACEMENT_EPISODE=two; wait_for_placement",
+                "PLACEMENT_WAIT_MEMORY=1; PLACEMENT_EPISODE=three; wait_for_placement",
+            ))
+            result = subprocess.run(["bash", "-c", script], env={**verify_test_environment(), "CALLS": str(calls)},
+                                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), [
+                "one evidence", "one resource", "one resource", "two evidence", "three resource"])
+
+
 class ReleaseDeadlineTests(unittest.TestCase):
     def test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop(self) -> None:
         from scripts.direct.local_release_wait import LocalReleaseEvents
 
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary) / "watched"
+            directory.mkdir()
             with LocalReleaseEvents(directory, directory) as waiter:
                 waiter.arm()
                 noise = directory / ".noise"

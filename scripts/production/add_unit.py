@@ -9,7 +9,8 @@ except FileNotFoundError:
 
 import argparse
 import json
-from collections.abc import Iterator
+from collections.abc import Mapping
+from contextlib import chdir
 import os
 import shlex
 import subprocess
@@ -18,12 +19,14 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
+from typing import TYPE_CHECKING, NamedTuple, cast, override
 
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
+from scripts.herdr import herdr_types
+from scripts.herdr import pane_launch
 from scripts.herdr import herdr
-from scripts.shutdown import remote
-from scripts.lib import git_exclude
+from scripts.agents import pane_record, remote
+from scripts.lib import build_folders, git_exclude, git_files, models_registry
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
@@ -177,6 +180,7 @@ class UnitLaunchConfiguration:
     session: NewSession | ResumedSession
     timeout: float
     responsibilities: tuple[str, ...] = ()
+    unit_type: staff.UnitType = "direct"
 
     @property
     def plan_path(self) -> Path:
@@ -270,6 +274,13 @@ def git(production: Production, *args: str, check: bool = True) -> subprocess.Co
                           capture_output=True, check=check)
 
 
+def require_merge_branch(production: Production) -> None:
+    """Require the parent checkout on its merge branch before any change."""
+    branch = git(production, "branch", "--show-current").stdout.strip()
+    if branch != production.merge_branch:
+        raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
+
+
 def relative_plan(production: Production, raw: str) -> Path:
     path = Path(raw).expanduser()
     resolved = (path if path.is_absolute() else production.checkout / path).resolve()
@@ -317,6 +328,20 @@ def launch_request(args: argparse.Namespace, *,
         else:
             standby = isinstance(saved.plan, unit_config.StandbyPlan)
             permanent = isinstance(saved.plan, unit_config.PermanentPlan)
+    if not any((given_plan is not None, given_brief is not None, standby, permanent)):
+        member = checked_unit_member(production, name, record)
+        folder = (member.row.worktree.path if isinstance(member, staff_sources.MemberFound)
+                  and isinstance(member.row.worktree, staff.PresentWorktree)
+                  else unit_names.worktree(production.checkout, unit_names.stem(name)))
+        try:
+            saved_plan = unit_config.default_plan(folder, production.doc, name)
+        except unit_config.ConfigRefused as error:
+            raise Refusal(str(error)) from error
+        if isinstance(saved_plan, unit_config.PlanFile):
+            given_plan = str(saved_plan.path)
+        else:
+            standby = isinstance(saved_plan, unit_config.StandbyPlan)
+            permanent = isinstance(saved_plan, unit_config.PermanentPlan)
     if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
         raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
     kebab = unit_names.stem(name)
@@ -348,6 +373,23 @@ def launch_request(args: argparse.Namespace, *,
         raise Refusal("--port must be between 1 and 65535")
     if timeout < 0:
         raise Refusal("--timeout must be nonnegative")
+    requested_type = cast(staff.UnitType | None, getattr(args, "unit_type", None))
+    pending = opening_record(production, name)
+    if pending.exists():
+        fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+        saved_type = saved_unit_type(fields)
+        if requested_type is not None and requested_type != saved_type:
+            raise Refusal(f"unit {name}: explicit unit_type conflicts with pending admission")
+        requested_type = saved_type
+    member = checked_unit_member(production, name, record,
+        identity=session_staff.LiveSession(identity) if identity is not None else session_staff.NO_SESSION)
+    unit_type = requested_type or "direct"
+    if isinstance(member, staff_sources.MemberFound):
+        if not isinstance(member.row.unit_type, staff.UnitDetails):
+            raise Refusal(f"unit {name}: staff has no unit details")
+        if requested_type is not None and requested_type != member.row.unit_type.value:
+            raise Refusal(f"unit {name}: explicit unit_type conflicts with staff")
+        unit_type = member.row.unit_type.value
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
@@ -359,6 +401,7 @@ def launch_request(args: argparse.Namespace, *,
         session=session,
         timeout=timeout,
         responsibilities=tuple(cast(list[str], getattr(args, "responsibility", None) or [])),
+        unit_type=unit_type,
     )
 
 
@@ -435,10 +478,17 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
 def director_agent(request: UnitLaunch) -> DirectorAgent:
     """Resolve the unit director in this script's checkout before any writes."""
     resolver = Path(__file__).resolve().parents[1] / "agents" / "models_config.sh"
+    try:
+        with chdir(request.production.checkout):
+            configuration = models_registry.launch_configuration(
+                os.environ, registry=models_registry.registry_path(os.environ))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise Refusal(f"ERROR: {error}") from error
     result = subprocess.run(
-        ["bash", "-c", 'source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
+        ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+         + 'agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
          "_", str(resolver)], cwd=request.production.checkout,
-        text=True, capture_output=True, check=False)
+        input=models_registry.configuration_shell(configuration), text=True, capture_output=True, check=False)
     if result.returncode != 0:
         error = next((line for line in result.stderr.splitlines() if line.startswith("ERROR:")),
                      result.stderr.splitlines()[0] if result.stderr else "ERROR: cannot resolve production.director.")
@@ -487,9 +537,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     member = checked_unit_member(production, request.unit, record,
                                  identity=(session_staff.LiveSession(request.session.session_id)
                                            if isinstance(request.session, ResumedSession) else session_staff.NO_SESSION))
-    branch = git(production, "branch", "--show-current").stdout.strip()
-    if branch != production.merge_branch:
-        raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
+    require_merge_branch(production)
     try:
         _ = production.doc.relative_to(production.checkout)
     except ValueError as error:
@@ -498,7 +546,6 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (isinstance(existing, ExistingUnitRow)
             and isinstance(request.session, ResumedSession)
-            and isinstance(request.session.handoff, ResumeStoppedSession)
             and request.plan_cell == existing.plan):
         plan_context = ExistingConversationPlan()
     if isinstance(request.session, ResumedSession) and isinstance(existing, ExistingUnitRow):
@@ -515,6 +562,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
         session=request.session,
         timeout=request.timeout,
         responsibilities=request.responsibilities,
+        unit_type=request.unit_type,
     )
     if launch.worktree.exists():
         git_exclude.require_untracked_ignored(launch.worktree, ".unit.toml", planned_pattern="/.unit.toml")
@@ -533,7 +581,9 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
             raise Refusal(f"unit {request.unit} Plan is {existing.plan!r}; expected {launch.plan_cell!r}")
         if mode == "brief" and isinstance(launch.plan, PlanGiven):
             plan_transition = BriefToPlanTransition()
-    launch = replace(launch, responsibilities=configuration_for(launch).responsibilities)
+    config = configuration_for(launch)
+    launch = replace(launch, responsibilities=config.responsibilities,
+                     port=SuppliedCell(str(config.port.number)) if isinstance(config.port, unit_config.AppPort) else launch.port)
     has_worktree = worktree_on_branch(launch)
     local_branch = git(production, "show-ref", "--verify", "--quiet",
                        f"refs/heads/{request.branch}", check=False).returncode == 0
@@ -556,7 +606,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
 
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
-    from scripts.shutdown import inventory
+    from scripts.agents import inventory
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -574,7 +624,7 @@ def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
 
 
 def stop_for_attach(handoff: RunningSessionHandoff) -> None:
-    from scripts.shutdown import stop_resume
+    from scripts.agents import stop_resume
 
     result = stop_resume.stop(handoff.session_id)
     if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
@@ -607,7 +657,7 @@ def attached_pid(handoff: RunningSessionHandoff) -> int:
 def finish_attach(handoff: StoppedSessionHandoff,
                   selected: ClaudeLaunchAccount, outcome: herdr.PromptSubmitOutcome, timeout: float) -> int:
     del selected
-    from scripts.shutdown import restart
+    from scripts.agents import restart
 
     if isinstance(outcome, herdr.PromptNotSubmitted):
         raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: {outcome.reason}")
@@ -675,8 +725,8 @@ def ensure_worktree(request: UnitLaunch) -> None:
     if worktree.exists():
         _ = worktree_on_branch(request)
     else:
-        _ = git(production, "worktree", "add", str(worktree), "-b", request.branch,
-                production.merge_branch)
+        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+            worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch)))
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
         if not destination.exists():
@@ -696,6 +746,7 @@ def ensure_worktree(request: UnitLaunch) -> None:
 def prompt_for(request: UnitLaunch) -> str:
     production = request.production
     doc = str(production.doc)
+    command = staff.unit_command(request.unit_type)
     # The showrunner's address is written nowhere: a unit looks it up, since a restart changes it.
     # It is the session on this machine, so no other session of the same name can be meant.
     showrunner = ("the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
@@ -709,6 +760,8 @@ def prompt_for(request: UnitLaunch) -> str:
                  + "Do nothing until the showrunner sends you work.")
         prompt = (f"You are {request.identity.unit} in production {production.name} (doc {doc}), under "
                   f"{showrunner}, on standby.{kept}{place}")
+        if request.unit_type != "direct":
+            prompt += f" Load {command} before waiting for orders."
         return prompt
     plan = request.plan_path.as_posix()
     if isinstance(request.session, ResumedSession):
@@ -717,15 +770,15 @@ def prompt_for(request: UnitLaunch) -> str:
                     f"{showrunner}. Work only in your worktree {request.worktree}, "
                     f"branch {request.branch}, and name in every Work Order the worktree and branch "
                     "git reports at dispatch.")
-        return f"{identity} Run /unit:direct {plan}."
+        return f"{identity} Run {command} {plan}."
     if isinstance(request.plan, PlanGiven):
-        return f"/unit:direct {plan}"
+        return f"{command} {plan}"
     return (f"You are {request.identity.unit} in production {production.name} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "
             f"branch {request.branch}, and name in every Work Order the worktree and branch git reports "
             f"at dispatch. Your plan {plan} holds only the "
             f"user's words. Write the full phased plan there, send it to the showrunner, and wait for its "
-            f"approval before you run /unit:direct {plan}.")
+            f"approval before you run {command} {plan}.")
 
 
 def attach_hint(request: UnitLaunch) -> str:
@@ -756,7 +809,7 @@ def launch_session(
 ) -> herdr.PromptSubmitOutcome:
     """Start Claude in a tab of the shared herdr session, carrying its session labels."""
     from scripts.accounts import accounts
-    from scripts.shutdown.launch_names import LaunchNames
+    from scripts.agents.launch_names import LaunchNames
     from scripts.whoami.account import named_account_environment
 
     environment = {"ENABLE_TOOL_SEARCH": "true"}
@@ -791,38 +844,37 @@ def launch_session(
     pending.parent.mkdir(parents=True, exist_ok=True)
     def published(transcript: herdr.SessionTranscript) -> None:
         write_text_atomic(pending, json.dumps({
-            "session_id": transcript.session_id, "config_dir": str(transcript.config_dir),
+            "session_id": transcript.session_id,
+            "unit_type": request.unit_type,
             "prompt": prompt, "launched_at": datetime.now(UTC).isoformat(),
         }) + "\n")
         _ = ensure_staff_unit(request.production, request.unit_id,
             worktree=staff.PresentWorktree(remote.local_machine(), request.worktree.resolve()),
-            runtime_id=transcript.session_id)
+            runtime_id=transcript.session_id, unit_type=request.unit_type)
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
     launched = herdr.launch_agent(host, production.name,
         session_name, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request),
-        agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id),
-            published),
+        agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id), published),
         timeout_ms=timeout_ms)
     if isinstance(launched, herdr.nix_env.Refused):
         raise Refusal(launched.reason)
     outcome = launched.outcome
-    if isinstance(outcome, herdr.PromptSubmitted):
+    if isinstance(outcome, herdr.PromptSubmitted) and outcome.publication_error is None:
         pending.unlink(missing_ok=True)
     return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
 
 
 def opening_record(production: Production, unit: str) -> Path:
     """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
-    checkout = production.checkout
-    directory = checkout / ".git"
-    if directory.is_file():
-        pointer = directory.read_text(encoding="utf-8").strip()
-        if not pointer.startswith("gitdir: "):
-            raise Refusal(f"invalid Git directory pointer: {directory}")
-        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
-    return directory / "add-unit-openings" / f"{unit}.json"
+    try:
+        git_dir = git_files.at(production.checkout).git_dir
+    except git_files.NotACheckout:
+        git_dir = production.checkout / ".git"
+    except git_files.UnreadableGitFiles as error:
+        raise Refusal(f"invalid Git directory: {error}") from error
+    return git_dir / "add-unit-openings" / f"{unit}.json"
 
 
 def pending_opening(production: Production, unit: str, session_id: str) -> bool:
@@ -836,6 +888,14 @@ def pending_opening(production: Production, unit: str, session_id: str) -> bool:
 
 class NoPendingOpening(NamedTuple):
     """No live conversation still needs this saved opening."""
+
+
+def saved_unit_type(fields: Mapping[str, object]) -> staff.UnitType:
+    """Read the saved operation type; older records used the direct command."""
+    value = fields.get("unit_type", "direct")
+    if value not in staff.UNIT_TYPES:
+        raise Refusal("pending admission has invalid unit_type")
+    return value
 
 
 def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.PromptSubmitOutcome | NoPendingOpening:
@@ -854,35 +914,43 @@ def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.Pr
         if isinstance(observed, sessions.SessionLivenessUnknown):
             raise Refusal(f"cannot tell whether pending session {fields['session_id']} runs: {observed.reason}")
         raise Refusal("pending opening does not name the session that carries the unit's session label")
-    transcript = herdr.SessionTranscript(Path(fields["config_dir"]), fields["session_id"])
+    home = pane_launch.config_home(fields)
+    if isinstance(home, staff.HomeUnknown):
+        from scripts.accounts import accounts
+
+        print(f"anomaly: {fields['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
+        selected = accounts.role_account("unit")
+        home = staff.SessionHome(selected.dir)
+    transcript = herdr.SessionTranscript(home.path, fields["session_id"])
     _ = ensure_staff_unit(request.production, request.unit_id,
         worktree=staff.PresentWorktree(remote.local_machine(), request.worktree.resolve()),
-        runtime_id=transcript.session_id)
+        runtime_id=transcript.session_id, unit_type=saved_unit_type(fields))
     at = datetime.fromisoformat(fields["launched_at"])
     outcome = herdr.submitted_prompt(transcript, fields["prompt"], at)
-    if not isinstance(outcome, herdr.PromptSubmitted):
-        outcome = herdr.Herdr(marked.unit.place.session).submit_opening_prompt(
-            marked.unit.place.pane, herdr.OpeningPrompt(fields["prompt"], transcript), at, int(request.timeout * 1000))
-    if isinstance(outcome, herdr.PromptSubmitted):
+    if outcome.state != "confirmed":
+        place = marked.unit.place
+        opening = herdr.OpeningPrompt(fields["prompt"], transcript, may_type=False)
+        outcome = herdr.Herdr(place.session).submit_opening_prompt(place.pane, opening, at, int(request.timeout * 1000))
+    if outcome.state == "confirmed" and outcome.publication_error is None:
         pending.unlink(missing_ok=True)
     return outcome
 
 
-def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
+def close_unsent_session(request: UnitLaunch, outcome: herdr.PromptSubmitOutcome) -> str:
     """Close a new session that never got its prompt, so no half-started unit stays behind.
 
     The staff row, .unit.toml and worktree stay: the same command finds them and starts the session
     again. A prompt typed even once may have started work, so that session stays open.
     """
 
-    if not outcome.never_typed:
+    if outcome.state != "not_sent":
         return ""
     found = launched_unit(request)
     if isinstance(found, NoLabeledSession):
         return "; run the same command again"
     try:
         herdr.close_agent(found.unit.place.session, found.unit.place.pane)
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         return f"; its session {found.unit.place.session} could not be closed: {error}"
     return "; its session is closed: run the same command again"
 
@@ -927,7 +995,9 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> LabeledSessionFo
     pending = _pending_launch(request)
     if isinstance(pending, LivePendingOpening):
         native = pending.session_id
-        place = herdr.herdr_place_of(pending.process.pid)
+        place = herdr.process_placement(pending.process.pid)
+        if isinstance(place, herdr.UnprovedHerdrPlacement):
+            raise Refusal(place.reason)
         if isinstance(place, herdr.NotInHerdr):
             raise Refusal(f"pending session {native} runs outside herdr")
         observed = herdr.Herdr(place.session).native_session(place.pane, "claude", request.timeout)
@@ -935,8 +1005,11 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> LabeledSessionFo
             raise Refusal(f"pending session {native} differs from pane identity {observed}")
         return LabeledSessionFound(unit_lookup.LabeledSession(name,
             unit_lookup.LiveClaude(name, native, "", pending.process.pid), place, identity=unit_lookup.LiveSession(native)))
-    unit = unit_lookup.labeled_session(request.production.name, name)
-    return NoLabeledSession() if unit is None else LabeledSessionFound(unit)
+    try:
+        pane = unit_lookup.labeled_session(request.production.name, name)
+    except OSError as error:
+        raise Refusal(f"cannot tell whether Claude runs for {name}: {error}") from error
+    return NoLabeledSession() if pane is None else LabeledSessionFound(pane)
 
 
 def registry_remote_control(claude: unit_lookup.Claude) -> bool:
@@ -997,14 +1070,17 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         if isinstance(request.session, ResumedSession) and not config_dir:
             from scripts.production import unit_move
 
-            conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            try:
+                conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            except staff.StaffUnreadable:
+                raise
+            except (OSError, unit_move.RenameRefused):
+                conversation = unit_move.NoUnitConversation()
             if source_fallback and (not isinstance(conversation, unit_move.UnitConversation)
                                     or conversation.account != target):
                 raise Refusal("--source-fallback must name the pane launch's source account")
             if isinstance(conversation, unit_move.UnitConversation) and (not target or target == conversation.account):
-                prepared = accounts.prepared_account(conversation.account, resume=True)
-                if isinstance(prepared, accounts.AccountRefused):
-                    raise Refusal(prepared.reason)
+                _ = accounts.prepare_claude_launch(conversation.account, resume=True)
                 return accounts.NamedAccount(conversation.account, accounts.claude_account_dir(conversation.account))
         elif source_fallback:
             raise Refusal("--source-fallback requires a resumed session and its pane launch account")
@@ -1014,74 +1090,41 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         raise Refusal(str(error)) from error
 
 
-class TranscriptMessage(TypedDict, total=False):
-    model: str
-
-
-class TranscriptEntry(TypedDict, total=False):
-    type: str
-    message: TranscriptMessage
-
-
-def transcript_lines_from_end(path: Path) -> Iterator[str]:
-    """Read newest entries first without loading the whole conversation."""
-    with path.open("rb") as stream:
-        offset = stream.seek(0, os.SEEK_END)
-        pending = b""
-        while offset:
-            size = min(offset, 65536)
-            offset -= size
-            _ = stream.seek(offset)
-            lines = (stream.read(size) + pending).split(b"\n")
-            pending = lines[0]
-            for line in reversed(lines[1:]):
-                yield line.decode("utf-8", errors="replace")
-        if pending:
-            yield pending.decode("utf-8", errors="replace")
-
-
 def transcript_model(session_id: str) -> str:
-    """The newest real assistant model in the newest transcript for this session."""
-    try:
-        matches = list((Path.home() / ".claude/projects").rglob(f"{session_id}.jsonl"))
-        if not matches:
-            return ""
-        path = max(matches, key=lambda path: path.stat().st_mtime)
-        for line in transcript_lines_from_end(path):
-            try:
-                value = cast(object, json.loads(line))
-            except ValueError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            entry = cast(TranscriptEntry, cast(object, value))
-            message = cast(object, entry.get("message"))
-            if entry.get("type") != "assistant" or not isinstance(message, dict):
-                continue
-            model = cast(object, cast(TranscriptMessage, cast(object, message)).get("model", ""))
-            if isinstance(model, str) and model and model != "<synthetic>":
-                return model
-    except OSError:
-        pass
-    return ""
+    """Read the model of the latest real assistant turn."""
+    turn = pane_record.claude_turn_settings(session_id)
+    return turn.model if isinstance(turn, pane_record.ClaudeTurnSettings) else ""
 
 
 def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
-    """Use the pane launch model when available, with --model as the restore boundary."""
+    """Read the model for a unit resume."""
+    return settings_for_resume(request, explicit).model
+
+
+def settings_for_resume(request: RequestedUnitLaunch, explicit: str = "", *config_dirs: Path) -> pane_record.ClaudeResumeSettings:
+    """Use the latest Claude turn, with an explicit model override."""
     if isinstance(request.session, NewSession):
         if explicit:
             raise Refusal("--model requires --resume")
-        return ""
-    if explicit:
-        return explicit
-    from scripts.shutdown import pane_record
+        return pane_record.ClaudeResumeSettings()
+    identity = request.session.session_id
+    record = staff.initial_snapshot()
+    owner = record.by_current_session(identity)
+    if owner is not None and isinstance(owner.home, staff.SessionHome):
+        config_dirs = (*config_dirs, owner.home.path)
+    turn = pane_record.claude_turn_settings(identity, *config_dirs)
     try:
-        entry = pane_record.launch_for_session(request.session.session_id)
+        entry = pane_record.launch_for_session(identity)
     except (OSError, ValueError) as error:
-        raise Refusal(f"pane launch unreadable: {error}") from error
-    if entry is not None and entry["model"]:
-        return entry["model"]
-    return transcript_model(request.session.session_id) if isinstance(launched_unit(request), LabeledSessionFound) else ""
+        if not explicit and isinstance(turn, pane_record.NoClaudeTurn):
+            raise Refusal(f"pane launch unreadable: {error}") from error
+        entry = None
+    if entry is not None:
+        home = pane_launch.config_home(entry, record=record)
+        if isinstance(home, staff.SessionHome) and home.path not in (*config_dirs, *sessions.config_dirs()):
+            turn = pane_record.claude_turn_settings(identity, *config_dirs, home.path)
+    fallback = pane_record.ClaudeResumeSettings(model=entry["model"] if entry is not None else "")
+    return pane_record.claude_resume_settings(turn, fallback=fallback, explicit_model=explicit)
 
 
 def autocompact_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
@@ -1128,23 +1171,27 @@ def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
     """Keep saved responsibilities or use explicit launch responsibilities."""
     existing = unit_config.read(request.worktree, cleanup=False)
     if isinstance(request.session, ResumedSession) and isinstance(existing, unit_config.UnitConfig):
-        return existing
+        selected = (unit_config.parse_port_cell(request.port.value)
+                    if isinstance(existing.port, unit_config.NoAppPort) and isinstance(request.port, SuppliedCell)
+                    else existing.port)
+        return replace(existing, port=unit_config.default_port(request.production.checkout, selected))
     plan = (unit_config.PlanFile(request.plan_path) if not isinstance(request.plan, Standby) else
             unit_config.PermanentPlan() if request.plan.permanent else unit_config.StandbyPlan())
     try:
-        port = (unit_config.parse_port_cell(request.port.value) if isinstance(request.port, SuppliedCell)
-                else existing.port if isinstance(existing, unit_config.UnitConfig) else unit_config.NoAppPort())
+        selected = (unit_config.parse_port_cell(request.port.value) if isinstance(request.port, SuppliedCell)
+                    else existing.port if isinstance(existing, unit_config.UnitConfig) else unit_config.NoAppPort())
+        port = unit_config.default_port(request.production.checkout, selected)
     except unit_config.ConfigRefused as error:
         raise Refusal(f"unit {request.unit_id}: {error}") from error
     responsibilities = (existing.responsibilities if isinstance(existing, unit_config.UnitConfig) else
                         tuple(dict.fromkeys(request.responsibilities)))
     config = unit_config.UnitConfig(plan, port, responsibilities)
     if isinstance(existing, unit_config.UnitConfig):
-        comparable = existing
+        comparable = replace(existing, port=port) if isinstance(existing.port, unit_config.NoAppPort) else existing
         stub = stub_plan(request.production, request.branch)
         if (isinstance(request.plan, PlanGiven) and existing.plan == unit_config.PlanFile(stub)
                 and recorded_mode(request, stub.as_posix()) == "brief"):
-            comparable = replace(existing, plan=plan)
+            comparable = replace(comparable, plan=plan)
         key = unit_config.first_difference(comparable, config)
         if key:
             raise Refusal(f"{request.worktree / '.unit.toml'}: {key} differs; no file was changed")
@@ -1168,6 +1215,7 @@ class UnitMembershipPublished:
 def admit_unit(request: UnitLaunch, *,
                record: staff.StaffSnapshot | None = None) -> UnitAdmissionPending | UnitMembershipPublished:
     """Create the actual worktree before the row, then publish the checked config."""
+    staff.validate_unit_name_for_write(request.unit_id)
     record = staff.initial_snapshot() if record is None else record
     config = configuration_for(request)
     ensure_worktree(request)
@@ -1179,7 +1227,8 @@ def admit_unit(request: UnitLaunch, *,
     row = selected.row if isinstance(selected, staff_sources.MemberFound) else None
     if row is not None:
         row = ensure_staff_unit(request.production, request.unit_id, worktree=location, record=record,
-                                runtime_id=request.session.session_id if isinstance(request.session, ResumedSession) else "")
+                                runtime_id=request.session.session_id if isinstance(request.session, ResumedSession) else "",
+                                unit_type=request.unit_type)
     _ = unit_config.write(request.worktree, config)
     return UnitMembershipPublished(row) if row is not None else UnitAdmissionPending()
 
@@ -1243,25 +1292,31 @@ def checked_unit_member(production: Production, unit: str,
 def ensure_staff_unit(production: Production, unit: str, *,
                       worktree: staff.PresentWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
                       runtime_id: str = "",
-                      record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
+                      record: staff.StaffSnapshot | None = None,
+                      unit_type: staff.UnitType | None = None) -> staff.StaffRow:
     """Admit a unit with its location; only agents resume --retired reactivates a removed row."""
     record = staff.initial_snapshot() if record is None else record
     found = checked_unit_member(production, unit, record,
                                 identity=session_staff.LiveSession(runtime_id) if runtime_id else session_staff.NO_SESSION)
     if isinstance(found, staff_sources.MemberFound):
+        if unit_type is not None and staff.UnitDetails(unit_type) != found.row.unit_type:
+            raise Refusal(f"unit {unit}: explicit unit_type conflicts with staff")
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
             raise Refusal(f"{unit}: native session conflicts with retained staff identity")
         if isinstance(worktree, staff.WorktreeUnfilled) or worktree == found.row.worktree:
-            return found.row
-        return staff.set_worktree(found.row.id, worktree, expected=found.row.worktree)
+            return pane_launch.staff_admitted(found.row)
+        return pane_launch.staff_admitted(staff.set_worktree(found.row.id, worktree, expected=found.row.worktree))
     if isinstance(worktree, staff.WorktreeUnfilled):
         raise Refusal(f"unit {unit}: no filled worktree for admission")
+    staff.validate_unit_name_for_write(unit)
     runner = ensure_staff_showrunner(production)
-    return staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id), worktree=worktree, runtime_id=runtime_id)
+    return pane_launch.staff_admitted(staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id),
+                                                  worktree=worktree, runtime_id=runtime_id, unit_type=unit_type))
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
+    _ = parser.add_argument("--unit-type", choices=staff.UNIT_TYPES)
     _ = parser.add_argument("name")
     _ = parser.add_argument("--plan")
     _ = parser.add_argument("--brief")
@@ -1281,6 +1336,7 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
+    staff.validate_unit_name_for_write(cast(str, args.name))
     try:
         request = launch_request(args)
         with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)
@@ -1303,9 +1359,10 @@ def _main(argv: list[str]) -> int:
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
+                    f"unit account {unit_account.label}: {problems[0]}; see Hana console, Accounts"
                 )
-            resume_model = model_for_resume(request, cast(str, args.model))
+            explicit_model = cast(str, args.model)
+            resume = settings_for_resume(request, explicit_model, unit_account.dir)
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
 
             handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
@@ -1317,6 +1374,7 @@ def _main(argv: list[str]) -> int:
                 assert isinstance(source, RunningSessionHandoff)
                 stop_for_attach(source)
                 require_stopped_session(source)
+                resume = settings_for_resume(request, explicit_model, unit_account.dir)
                 handoff = StoppedSessionHandoff(source)
                 request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
@@ -1358,14 +1416,19 @@ def _main(argv: list[str]) -> int:
                 place = stopped_tab.unit.place
                 try:
                     herdr.close_agent(place.session, place.pane)
-                except herdr.HerdrFailure as error:
+                except herdr_types.HerdrFailure as error:
                     raise Refusal(f"cannot end session {place.session}: {error}") from error
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if isinstance(labeled_session, NoLabeledSession):
                 prompt = prompt_for(request)
-                outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
-                               if isinstance(request.session, ResumedSession) else "", model=resume_model,
+                role_effort = ready.director.effort
+                launch_settings = pane_record.claude_resume_settings(resume, fallback=pane_record.ClaudeResumeSettings(
+                    effort=role_effort.value if isinstance(role_effort, Effort) else ""))
+                director = ready.director._replace(
+                    effort=Effort(launch_settings.effort) if launch_settings.effort else DefaultEffort())
+                outcome = launch_session(request, director, prompt, unit_account, target=unit_account.label
+                               if isinstance(request.session, ResumedSession) else "", model=launch_settings.model,
                                autocompact_window=resume_autocompact)
             elif opening_record(request.production, request.unit_id).exists():
                 recovered = finish_opening(request, labeled_session)
@@ -1375,11 +1438,13 @@ def _main(argv: list[str]) -> int:
                     raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
             if isinstance(outcome, herdr.ClaudeTrustNotWritten):
                 return 1
-            if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(labeled_session, NoLabeledSession):
+            if outcome.state == "confirmed" and outcome.publication_error is not None:
+                raise RuntimeError(f"{request.identity.unit}: staff publication failed: {outcome.publication_error}")
+            if outcome.state != "confirmed" and isinstance(labeled_session, NoLabeledSession):
                 if isinstance(handoff, StoppedSessionHandoff):
                     raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: opening prompt not submitted: {outcome.reason}")
                 raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}"
-                                   + close_untyped_session(request, outcome))
+                                   + close_unsent_session(request, outcome))
             if isinstance(handoff, StoppedSessionHandoff):
                 pid = finish_attach(handoff, unit_account, outcome, request.timeout)
                 record(request)
@@ -1397,7 +1462,7 @@ def _main(argv: list[str]) -> int:
     except (Refusal, unit_config.ConfigRefused, git_exclude.ExcludeRefused) as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
-    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr_types.HerdrFailure) as error:
         detail = str(error)
         print(f"add_unit: {detail}", file=sys.stderr)
         return 1

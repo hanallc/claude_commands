@@ -1,14 +1,15 @@
 """Quota alerts: delivery."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
+import os
+from pathlib import Path
 import json
-import shutil
 import subprocess
 import sys
 import unittest
-from pathlib import Path
 from contextlib import redirect_stdout
 from datetime import timedelta
 from typing import cast, override
@@ -17,7 +18,7 @@ from unittest import mock
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.notify import review
@@ -70,7 +71,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                f"To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on {remote.local_machine()}")),
+                f"To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on {remote.local_machine()}")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 
@@ -85,6 +86,8 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertEqual(REAL_TELL_USER(push), quota_alert.PushFailed("sender unavailable"))
 
     def test_user_send_uses_configured_review_limit_without_shortening_agent_relays(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+        _ = write_config_fixture(settings, "quota_relay_timeout_seconds=40\n")
         config = self.root / "notify.conf"
         _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
@@ -103,11 +106,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_relay_reads_the_current_account_timeout(self) -> None:
         config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
         for name in ("send", "postmaster", "codex_daemon"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf", config.with_name(f"{name}.conf"))
-        original = config.read_text()
+            _ = write_config_fixture(config.with_name(f'{name}.conf'))
         done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
         for limit in (40, 55):
-            _ = config.write_text(original.replace("quota_relay_timeout_seconds=40", f"quota_relay_timeout_seconds={limit}"))
+            _ = write_config_fixture(config, f"quota_relay_timeout_seconds={limit}\n")
             with self.subTest(limit=limit), mock.patch.object(subprocess, "run", return_value=done) as run:
                 self.assertIsNone(REAL_RELAY("fixture", "message", None))
                 command = cast(list[str], run.call_args.args[0])
@@ -128,6 +130,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_legacy_blocked_cli_finds_the_canonical_episode_and_saves_no_spaced_label(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "1")]
         _ = self.alert(notes, self.now)
+        notes = [self.note("codex1.md", "active", "0", credit_balance="0")]
         _ = self.block(notes, self.now)
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
+from scripts.lib.berth_test_support import write_unconfigured_berth
+from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
+
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -12,7 +17,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
@@ -57,15 +61,37 @@ class CargoWorkspaceMetadata(TypedDict):
     packages: list[CargoPackageMetadata]
 
 
+def write_fixture_cargo_mend(path: Path, build_id: str = "fixture") -> None:
+    """Install a fixture with a stable version and a selectable build ID."""
+    write_stdlib_tool(path, f'''import os
+import sys
+
+print(os.environ.get("TEST_VERSION_MEND", "cargo-mend 0.23.0-dev"))
+if sys.argv[-1] == "--build-info":
+    print("git_hash: fixture")
+    print({("build_id: " + build_id)!r})
+    print("build_sysroot: fixture")
+''')
+
+
+CARGO_MEND_DISPATCH_SOURCE = '''
+def exec_fixture_cargo_mend(flag: str) -> None:
+    mend = str(Path(__file__).with_name("cargo-mend"))
+    os.execv(mend, [mend, flag])
+'''
+
+
 CARGO_STUB = r'''
 import json
 import os
 from pathlib import Path
 import sys
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 arguments = sys.argv[1:]
 version_tools = {
     ("mend", "--version"): "MEND",
+    ("mend", "--build-info"): "MEND",
     ("+nightly", "fmt", "--version"): "RUSTFMT",
     ("clippy", "--version"): "CLIPPY",
 }
@@ -78,6 +104,8 @@ if version_tool:
     if "TEST_VERSION_EVENTS" in os.environ:
         with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
             output.write(version_tool + "\n")
+    if version_tool == "MEND":
+        exec_fixture_cargo_mend(arguments[-1])
     print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
     raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
@@ -209,8 +237,8 @@ class VerifyLintScopeFixture(unittest.TestCase):
             _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.config = self.root / "lint.conf"
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
@@ -219,23 +247,36 @@ class VerifyLintScopeFixture(unittest.TestCase):
 
     def build_fixture(self) -> None:
         home = self.root / "home"
-        claude = home / ".claude"
-        claude.mkdir(parents=True)
-        (claude / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         bin_directory = self.root / "bin"
         bin_directory.mkdir()
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.write_config(clippy="on")
-        self.write_executable(bin_directory / "cargo", CARGO_STUB)
-        self.write_executable(bin_directory / "taplo", TAPLO_STUB)
+        write_stdlib_tool(bin_directory / "cargo", CARGO_STUB)
+        write_fixture_cargo_mend(bin_directory / "cargo-mend")
+        write_stdlib_tool(bin_directory / "taplo", TAPLO_STUB)
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
+        self.write_executable(targets, '''import runpy
+import sys
+from pathlib import Path
+def main():
+    if sys.argv[1] == "eligible":
+        print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")
+    else:
+        if sys.argv[1] == "constraints":
+            sys.argv.extend(("--local", "test target"))
+        runpy.run_path(str(Path.home() / ".claude/scripts/build_targets/build_targets.py"), run_name="__main__")
+
+if __name__ == "__main__":
+    main()
+''')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
+        write_unconfigured_berth(bin_directory)
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
         seed_interpreter_cache(self.root / "cache")
@@ -273,11 +314,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
                 ],
             }],
         }
-        self.environment = {
-            name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
-                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
-        }
+        self.environment = verify_test_environment()
         self.environment.update({
             # The fixture supplies its complete toolchain; Nix discovery is unrelated
             # to lint scope, formatting, fix convergence or cache assertions.
@@ -313,8 +350,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         })
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def write_shell(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")

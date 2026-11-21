@@ -25,7 +25,9 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ROLE_MAP_HOST = "natedev"
-Role = Literal["showrunners", "units", "workers"]
+ClaudeGroup = Literal["units", "showrunners", "producers"]
+CLAUDE_GROUPS: tuple[ClaudeGroup, ...] = ("units", "showrunners", "producers")
+Role = ClaudeGroup | Literal["workers"]
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ def selection_reason(selection: StoredGroupSelection) -> TransitionReason:
 class StoredGroupSelections(TypedDict, total=False):
     units: str | StoredGroupSelection
     showrunners: str | StoredGroupSelection
+    producers: str | StoredGroupSelection
 
 
 @dataclass(frozen=True)
@@ -258,6 +261,16 @@ def role_map_command(function: Callable[P, R]) -> Callable[P, R]:
 
 
 @contextmanager
+def supplied_role_map(value: RoleMap) -> Generator[None]:
+    """Use the caller's role map for this command only."""
+    token = _command_map.set(CommandRoleMap(value))
+    try:
+        yield
+    finally:
+        _command_map.reset(token)
+
+
+@contextmanager
 def stored_role_map() -> Generator[None]:
     """Read local authority or saved cache only, within an independent scope."""
     source_token = _role_map_source.set(StoredRoleMap())
@@ -316,7 +329,7 @@ def ssh_role_map(arguments: tuple[str, ...], *, machine: str = ROLE_MAP_HOST) ->
     """Only transport boundary; callers never invoke remote account launches."""
     account_config = conf.read('accounts')
     command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
-    result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={account_config.whole("role_map_connect_timeout_seconds")}",
+    result = subprocess.run(("ssh", "-o", "BatchMode=yes",
                              machine, command), capture_output=True, text=True, timeout=account_config.whole("role_map_timeout_seconds"))
     if result.returncode:
         message = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
@@ -336,7 +349,7 @@ def _object(path: Path) -> dict[str, object]:
 
 def _groups(raw: dict[str, object]) -> StoredGroupSelections:
     groups = StoredGroupSelections()
-    for group in ("units", "showrunners"):
+    for group in CLAUDE_GROUPS:
         if group not in raw:
             continue
         value = raw[group]
@@ -445,8 +458,8 @@ def _cached_role_map() -> tuple[RoleMap, datetime]:
     return decode_role_map(json.dumps(saved["map"])), stamp
 
 
-def read_role_map() -> RoleMap:
-    scope = _command_map.get()
+def read_role_map(*, fresh: bool = False) -> RoleMap:
+    scope = MapNotRead() if fresh else _command_map.get()
     if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap):
         return scope.value
     if isinstance(scope, CommandRoleMap) and isinstance(scope.value, MapReadRefused):
@@ -454,7 +467,7 @@ def read_role_map() -> RoleMap:
     try:
         if is_role_map_host():
             result = _local_role_map()
-        elif isinstance(_role_map_source.get(), StoredRoleMap):
+        elif not fresh and isinstance(_role_map_source.get(), StoredRoleMap):
             result, stamp = _cached_role_map()
             result = replace(result, provenance=ExplicitStoredRoleMap(stamp))
             _map_observer.get()(result.provenance)
@@ -525,7 +538,7 @@ def decode_role_map_change(text: str) -> RoleMapChange | WorkersClaudeRouteChang
             raise ValueError("Claude workers route needs an end time")
         return WorkersClaudeRouteChange(NamedWorkersClaudeAccount(cast(str, label), datetime.fromisoformat(cast(str, until))) if label
             else DEFAULT_WORKERS_CLAUDE_ACCOUNT, cast(str, why), cast(str, at))
-    if role not in ("units", "showrunners", "workers") or not all(isinstance(item, str) for item in (label, why, at)):
+    if role not in ("units", "showrunners", "producers", "workers") or not all(isinstance(item, str) for item in (label, why, at)):
         raise ValueError("invalid role change")
     move_id, reset = fields.get("move_id", ""), fields.get("reset", "")
     cause, window = fields.get("cause", "by hand"), fields.get("window", "unknown")
@@ -736,7 +749,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
                 continue
             fields = cast(dict[str, object], raw)
             why = fields.get("why")
-            if (fields.get("cause") == "auto" and fields.get("group") in ("units", "showrunners")
+            if (fields.get("cause") == "auto" and fields.get("group") in CLAUDE_GROUPS
                     and isinstance(why, str) and why.startswith("auto: ")):
                 consumed.add(why.removeprefix("auto: "))
     except ValueError as error:
@@ -748,7 +761,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
 @dataclass(frozen=True)
 class AutoMoveTarget:
     entry_id: str
-    group: Literal["units", "showrunners"]
+    group: ClaudeGroup
     label: str
 
 
@@ -770,7 +783,10 @@ def repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now: datetim
             consumed = set(recorded.entry_ids)
             missing: list[RoleHistoryEntry] = []
             for entry in entries:
-                selected = selections.get("units") if entry.group == "units" else selections.get("showrunners")
+                if entry.group == "producers":
+                    selected = selections.get("producers")
+                else:
+                    selected = selections.get("units") if entry.group == "units" else selections.get("showrunners")
                 if (selected is None or isinstance(selected, str) or selected["cause"] != "auto"
                         or selected.get("why") != "auto: " + entry.entry_id
                         or selected["label"] != entry.label):

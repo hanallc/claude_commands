@@ -23,7 +23,6 @@ PROBE = ("from scripts.lib import user_zone; from datetime import datetime, time
 HARDCODED = re.compile(r"""ZoneInfo\(\s*["'](?!UTC)|TZ=["']?[A-Z][a-z]+/|%[HMS] ?[PE][DS]T\b""")
 # The scripts that may name a zone, each because the zone there is a fact and never the user's setting.
 NAMES_A_ZONE = {
-    "build_queue/queue_fixture.py": "one fixed zone, so a golden render is the same in every user zone",
     "model_study/turns.py": "the zone the roster's stored times were recorded in",
     "prioritize/renumber.py": "one fixed zone, so a date is the same on both machines",
     "whoami/agent_accounts.py": "the offset a stored reset time is written with",
@@ -32,10 +31,8 @@ NAMES_A_ZONE = {
 MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
 # The scripts that may use the machine's zone, each because the time there is stored or compared, never shown.
 USES_THE_MACHINE_ZONE = {
-    "hooks/banned_words_lib.py": "a log stamp written with its offset",
     "notify/pushover.py": "a log stamp written with its offset",
     "notify/review.py": "a log stamp written with its offset",
-    "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
     "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",

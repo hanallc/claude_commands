@@ -2,7 +2,8 @@
 """Track whether the extra review workers pay for themselves.
 
 Usage:
-  review_regime.py add --unit <unit> --plan <plan path> --phase <N> --regime before|trial|after
+  review_regime.py add --unit <unit> --plan <plan path> --phase <N> --checkpoint <commit>
+                       --regime before|trial|after
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
                        [--ux-check-minutes <U>] [--ux-repair-minutes <R>]
@@ -40,6 +41,7 @@ WATCH_PHASES `after` phases it exits 3, the report waiting for the user, until
 import argparse
 import json
 import statistics
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -76,6 +78,8 @@ class Row:
     ux_repair_minutes: float | None
     note: str | None
     excluded: str | None
+    # Older rows can have no checkpoint.
+    checkpoint: str | None
 
     def hours(self) -> float:
         return (datetime.fromisoformat(self.merged) - datetime.fromisoformat(self.started)).total_seconds() / 3600
@@ -86,6 +90,11 @@ def optional_int(record: dict[str, object], key: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def optional_float(record: dict[str, object], key: str) -> float | None:
+    value = record.get(key)
+    return float(value) if isinstance(value, int | float) else None
+
+
 def read_rows() -> list[Row]:
     if not LEDGER.exists():
         return []
@@ -94,12 +103,10 @@ def read_rows() -> list[Row]:
         if not line.strip():
             continue
         record = cast(dict[str, object], json.loads(line))
-        minutes = record.get("review_minutes")
-        check_minutes = record.get("ux_check_minutes")
-        repair_minutes = record.get("ux_repair_minutes")
         note = record.get("note")
         excluded = record.get("excluded")
         plan = record.get("plan")
+        checkpoint = record.get("checkpoint")
         rows.append(
             Row(
                 unit=str(record["unit"]),
@@ -112,11 +119,12 @@ def read_rows() -> list[Row]:
                 merge_defects=int(cast(int, record["merge_defects"])),
                 ux_findings=optional_int(record, "ux_findings"),
                 code_findings=optional_int(record, "code_findings"),
-                review_minutes=float(minutes) if isinstance(minutes, int | float) else None,
-                ux_check_minutes=float(check_minutes) if isinstance(check_minutes, int | float) else None,
-                ux_repair_minutes=float(repair_minutes) if isinstance(repair_minutes, int | float) else None,
+                review_minutes=optional_float(record, "review_minutes"),
+                ux_check_minutes=optional_float(record, "ux_check_minutes"),
+                ux_repair_minutes=optional_float(record, "ux_repair_minutes"),
                 note=note if isinstance(note, str) else None,
                 excluded=excluded if isinstance(excluded, str) else None,
+                checkpoint=checkpoint if isinstance(checkpoint, str) else None,
             )
         )
     return rows
@@ -129,6 +137,12 @@ def add(arguments: argparse.Namespace) -> None:
         parsed = datetime.fromisoformat(moment)
         if parsed.tzinfo is None:
             raise SystemExit(f"review_regime: --{label} {moment!r} needs a UTC offset")
+    checkpoint_ref = cast(str, arguments.checkpoint)
+    resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{checkpoint_ref}^{{commit}}"],
+                              capture_output=True, text=True, check=False)
+    if resolved.returncode:
+        raise SystemExit(f"review_regime: cannot resolve --checkpoint {checkpoint_ref!r}: {resolved.stderr.strip()}")
+    checkpoint = resolved.stdout.strip()
     check_minutes = cast(float | None, arguments.ux_check_minutes)
     excluded = cast(str | None, arguments.excluded)
     if excluded is None and check_minutes == 0:
@@ -149,12 +163,13 @@ def add(arguments: argparse.Namespace) -> None:
         ux_repair_minutes=cast(float | None, arguments.ux_repair_minutes),
         note=cast(str | None, arguments.note),
         excluded=excluded,
+        checkpoint=checkpoint,
     )
     if row.hours() < 0:
         raise SystemExit("review_regime: --merged is before --started")
-    # A unit that runs a second plan starts again at phase 1, so the plan is part of what names a row.
+    identity = (row.unit, row.plan, row.phase, checkpoint)
     for existing in read_rows():
-        if (existing.unit, existing.plan, existing.phase) == (row.unit, row.plan, row.phase):
+        if (existing.unit, existing.plan, existing.phase, existing.checkpoint) == identity:
             print(f"kept {row.unit} phase {row.phase} of {row.plan}: "
                   + f"a row exists from the merge at {existing.merged}; nothing added")
             return
@@ -243,6 +258,7 @@ def main() -> int:
     _ = adding.add_argument("--unit", required=True)
     _ = adding.add_argument("--plan", required=True, help="the unit's plan, as its production doc names it")
     _ = adding.add_argument("--phase", required=True)
+    _ = adding.add_argument("--checkpoint", required=True, help="the checkpoint commit in the current repository")
     _ = adding.add_argument("--regime", choices=REGIMES, required=True)
     _ = adding.add_argument("--started", required=True)
     _ = adding.add_argument("--merged", required=True)

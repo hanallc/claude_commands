@@ -11,14 +11,16 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib import build_folders, scratch
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,34 @@ class Ended:
 class Kept:
     path: Path
     reason: str
+
+
+@dataclass(frozen=True)
+class OriginBranchAbsent:
+    """Origin has no branch to delete."""
+
+
+@dataclass(frozen=True)
+class CheckedOriginTip:
+    """The origin tip is contained in the local branch or the target."""
+
+    sha: str
+
+
+@dataclass(frozen=True)
+class LocalBranchAbsent:
+    """The local branch is already absent."""
+
+
+@dataclass(frozen=True)
+class CheckedLocalTip:
+    sha: str
+
+
+@dataclass(frozen=True)
+class CleanupReady:
+    local: CheckedLocalTip
+    origin: OriginBranchAbsent | CheckedOriginTip
 
 
 class Refused(Exception):
@@ -125,12 +155,39 @@ def plan_path(path: str) -> bool:
     return path.startswith("docs/plans/")
 
 
+def only_target_merges(record: WorktreeRecord) -> bool:
+    repo = Path(record.repo)
+    target = f"refs/remotes/origin/{record.merge_branch}"
+    branch = f"refs/heads/{record.branch}"
+    commits = git(repo, "rev-list", f"{target}..{branch}").stdout.splitlines()
+    if not commits:
+        return False
+    for commit in commits:
+        parents = git(repo, "rev-list", "--parents", "-n", "1", commit).stdout.split()[1:]
+        if len(parents) < 2:
+            return False
+        for parent in parents[1:]:
+            ancestor = git(repo, "merge-base", "--is-ancestor", parent, target, check=False)
+            if ancestor.returncode == 0:
+                break
+            if ancestor.returncode != 1:
+                raise Refused(1, ancestor.stderr.strip())
+        else:
+            return False
+    return True
+
+
 def landed(record: WorktreeRecord) -> Landed | NotLanded:
     repo = Path(record.repo)
     if not has_branch(repo, record.branch):
         return Landed()
     target = f"refs/remotes/origin/{record.merge_branch}"
     branch = f"refs/heads/{record.branch}"
+    ancestor = git(repo, "merge-base", "--is-ancestor", branch, target, check=False)
+    if ancestor.returncode == 0:
+        return Landed()
+    if ancestor.returncode != 1:
+        raise Refused(1, ancestor.stderr.strip())
     equivalent = {line[2:] for line in git(repo, "cherry", target, branch).stdout.splitlines()
                   if line.startswith("- ")}
     remaining: list[str] = []
@@ -183,6 +240,87 @@ def new_record(path: Path, branch: str, repo: Path, base: str,
                           datetime.now(timezone.utc).isoformat())
 
 
+def local_branch_tip(repo: Path, branch: str) -> LocalBranchAbsent | CheckedLocalTip:
+    if not has_branch(repo, branch):
+        return LocalBranchAbsent()
+    return CheckedLocalTip(git(repo, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip())
+
+
+def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedOriginTip | Kept:
+    repo = Path(record.repo)
+    remote_branch = git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{record.branch}").stdout
+    if not remote_branch:
+        return OriginBranchAbsent()
+    tip = remote_branch.split()[0]
+    reason = f"origin has commits that the local branch lacks: {tip}"
+    commit = git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False)
+    if commit.returncode in (1, 128):
+        return Kept(Path(record.path), reason)
+    if commit.returncode:
+        raise Refused(1, commit.stderr.strip())
+    branch = f"refs/heads/{record.branch}"
+    if not has_branch(repo, record.branch):
+        branch = f"refs/remotes/origin/{record.merge_branch}"
+        reason = f"origin has commits that the merge branch lacks: {tip}"
+    ancestor = git(repo, "merge-base", "--is-ancestor", tip, branch, check=False)
+    if ancestor.returncode == 1:
+        return Kept(Path(record.path), reason)
+    if ancestor.returncode:
+        raise Refused(1, ancestor.stderr.strip())
+    return CheckedOriginTip(tip)
+
+
+def cleanup(path: Path) -> CleanupReady | Kept:
+    _ = git(path, "fetch", "--no-prune", "origin")
+    dirty = git(path, "status", "--porcelain").stdout
+    if dirty:
+        return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
+    head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if head.returncode == 1:
+        return Kept(path, "HEAD is detached")
+    if head.returncode:
+        raise Refused(1, head.stderr.strip())
+    branch = head.stdout.strip()
+    repo = main_checkout(path)
+    local = local_branch_tip(repo, branch)
+    if isinstance(local, LocalBranchAbsent):
+        return Kept(path, "the local branch is absent")
+    try:
+        record = read_record(record_file(path))
+    except FileNotFoundError:
+        default = git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+        if default.returncode == 1:
+            raise Refused(1, "origin default branch is missing")
+        if default.returncode:
+            raise Refused(1, default.stderr.strip())
+        target = default.stdout.strip()
+        base = git(repo, "merge-base", f"refs/heads/{branch}", target).stdout.strip()
+        record = new_record(path, branch, repo, base, "", target.removeprefix("refs/remotes/origin/"))
+    if Path(record.repo).resolve() != repo or Path(record.path).resolve() != path or record.branch != branch:
+        return Kept(path, "the worktree does not match its record")
+    result = landed(record)
+    if isinstance(result, NotLanded):
+        return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
+    origin = origin_branch_state(record)
+    if isinstance(origin, Kept):
+        return origin
+    if local_branch_tip(repo, branch) != local:
+        return Kept(path, "the local branch changed during the cleanup check")
+    return CleanupReady(local, origin)
+
+
+def release_worktree_pair(path: Path) -> None:
+    try:
+        result = build_folders.release_removed_folder(path)
+    except (OSError, ValueError) as error:
+        print(f"Worktree pair kept for {str(path)!r}: {str(error)!r}", file=sys.stderr)
+        return
+    if result is build_folders.FolderPairRelease.PARTIAL:
+        print(f"Worktree pair partially released for {str(path)!r}", file=sys.stderr)
+    elif result not in (build_folders.FolderPairRelease.RELEASED, build_folders.FolderPairRelease.PAIR_ABSENT):
+        print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
+
+
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
     resolver = session_staff.RowResolver(snapshot)
@@ -198,20 +336,87 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         if head.returncode or head.stdout.strip() != expected:
             reason = head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
             return Kept(path, reason)
+    if has_branch(repo, record.branch) and not git(
+            repo, "rev-list", "-n", "1", f"{record.base}..refs/heads/{record.branch}").stdout.strip():
+        # A tree with no commit of its own can be in use before its first commit.
+        return Kept(path, "no commit of its own")
+    if has_branch(repo, record.branch) and only_target_merges(record):
+        return Kept(path, "only merges of the target outside it")
+    local = local_branch_tip(repo, record.branch)
     result = landed(record)
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))
         return Kept(path, f"work has not landed: {detail}")
-    registered = path in worktree_branches(repo)
-    if path.exists() or registered:
-        _ = git(repo, "worktree", "remove", str(path))
-    if has_branch(repo, record.branch):
-        _ = git(repo, "branch", "-D", record.branch)
-    remote_branch = git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{record.branch}").stdout
-    if remote_branch:
-        _ = git(repo, "push", "origin", "--delete", record.branch)
+    origin = origin_branch_state(record)
+    if isinstance(origin, Kept):
+        return origin
+    cargo_mark = scratch.cargo_removal_mark(path.resolve())
+    with ExitStack() as guards:
+        try:
+            _guard_cargo_cleanup(path, guards)
+        except (OSError, ValueError) as error:
+            return Kept(path, f"Cargo output kept: {error}")
+        if isinstance(origin, CheckedOriginTip):
+            deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
+                           "origin", "--delete", record.branch, check=False)
+            if deletion.returncode:
+                return Kept(path, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
+        registered = path in worktree_branches(repo)
+        if local_branch_tip(repo, record.branch) != local:
+            return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
+        if not build_folders.remove_build_folder(
+                path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
+            return Kept(path, "the build folder lock is held; the worktree stays")
+        cargo_mark.unlink(missing_ok=True)
+    if isinstance(local, CheckedLocalTip):
+        deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)
+        if deletion.returncode:
+            return Kept(path, "the local branch changed after the cleanup check; the local branch stays: "
+                        + failure_detail(deletion))
+    section = f"branch.{record.branch}"
+    config = subprocess.run(["git", "-C", str(repo), "config", "--local", "--remove-section", section],
+                            capture_output=True, text=True, check=False, env={**os.environ, "LC_ALL": "C"})
+    if config.returncode and not (config.returncode == 128
+                                  and config.stderr == f"fatal: no such section: {section}\n"):
+        raise Refused(1, failure_detail(config))
     record_file(path).unlink(missing_ok=True)
     return Ended(path, record.branch)
+
+
+def _guard_cargo_cleanup(path: Path, guards: ExitStack) -> None:
+    from scripts.buildlog.store import host_name
+    from scripts.lib import cargo_seed, conf
+
+    checkout = path.resolve()
+    if path.exists() and sys.platform == "linux":
+        try:
+            guards.enter_context(cargo_seed.checkout_guard(checkout, cargo_seed.CheckoutAccess.REMOVE))
+        except BlockingIOError as error:
+            raise OSError(f"Cargo seed is in progress: {checkout}") from error
+
+    settings = conf.read_or_repository("build_folders")
+    host = host_name()
+    cargo_root = cargo_seed.managed_cargo_root(settings, host).resolve()
+    directory = cargo_seed.managed_build_directory(checkout, settings, host, cargo_root)
+    if isinstance(directory, cargo_seed.UnmanagedBuildDirectory) or not directory.is_dir():
+        return
+    if sys.platform == "linux":
+        limits = cargo_seed.seed_limits(settings, host)
+        if isinstance(limits, cargo_seed.SeedLimits):
+            try:
+                guards.enter_context(cargo_seed.destination_guards((directory,), limits))
+            except BlockingIOError as error:
+                raise OSError(f"Cargo seed holds an output lock: {checkout}") from error
+    target = checkout / "target"
+    mark = scratch.cargo_removal_mark(checkout)
+    scratch.atomic_record(mark, [{
+        "workspace_root": str(checkout),
+        "target_directory": str(target),
+        "build_directory": str(directory),
+        "other_checkouts": [str(peer) for peer in scratch.cargo_checkout_peers(checkout)],
+        "shared_output_roots": [str(target.resolve())] if target.is_symlink() else [],
+    }])
+    scratch.clean_cargo_outputs(checkout, scratch.save_cargo_outputs(checkout))
 
 
 def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
@@ -247,12 +452,13 @@ def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
 def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.StaffSnapshot) -> None:
     owner, merge_branch = caller_branch(repo, caller, snapshot)
     base = git(caller, "rev-parse", "HEAD").stdout.strip()
-    _ = git(caller, "worktree", "add", str(path), "-b", branch)
+    _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+        path, caller, build_folders.NewWorktreeBranch(branch, base)))
     record = new_record(path, branch, repo, base, owner, merge_branch)
     try:
         write_record(record)
     except OSError:
-        _ = git(caller, "worktree", "remove", str(path))
+        _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
         _ = git(caller, "branch", "-D", branch)
         raise
     print(f"made worktree {path} on {branch}")
@@ -264,7 +470,30 @@ def main() -> int:
     create = commands.add_parser("make")
     _ = create.add_argument("path")
     _ = create.add_argument("branch")
+    check_cleanup = commands.add_parser("cleanup")
+    _ = check_cleanup.add_argument("path")
+    _ = check_cleanup.add_argument("--checked-tips", action="store_true")
+    release = commands.add_parser("release-pair")
+    _ = release.add_argument("path")
     arguments = parser.parse_args()
+    if cast(str, arguments.command) == "release-pair":
+        release_worktree_pair(Path(cast(str, arguments.path)).absolute())
+        return 0
+    if cast(str, arguments.command) == "cleanup":
+        try:
+            result = cleanup(Path(cast(str, arguments.path)).expanduser().resolve())
+        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        if isinstance(result, Kept):
+            print(result.reason)
+            return 1
+        if cast(bool, arguments.checked_tips):
+            origin_tip = result.origin.sha if isinstance(result.origin, CheckedOriginTip) else ""
+            print(f"{result.local.sha} {origin_tip}")
+        else:
+            print("cleanup: all work is on the target branch")
+        return 0
     try:
         caller = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").stdout.strip()).resolve()
         repo = main_checkout(caller)

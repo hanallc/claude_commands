@@ -412,12 +412,12 @@ enum Choice {
         ):
             with self.subTest(before=before):
                 self.assertEqual(declarations.preserved_body(
-                    declarations.ReadableBody(tuple(before.splitlines())),
-                    declarations.ReadableBody(tuple(after.splitlines())), old, new),
+                    declarations.name_sites(declarations.ReadableBody(tuple(before.splitlines())), old),
+                    declarations.ReadableBody(tuple(after.splitlines())), new),
                     2 if before.startswith("    /*") else 0)
         self.assertEqual(declarations.preserved_body(
-            declarations.ReadableBody(('    original(); // original', '    "original";')),
-            declarations.ReadableBody(('    renamed(); // original', '    "original";')), "original", "renamed"), 2)
+            declarations.name_sites(declarations.ReadableBody(('    original(); // original', '    "original";')), "original"),
+            declarations.ReadableBody(('    renamed(); // original', '    "original";')), "renamed"), 2)
 
     def test_const_generic_header_braces_do_not_supply_an_items_body(self) -> None:
         for header, field in (
@@ -444,7 +444,7 @@ enum Choice {
         self.assertIsInstance(old_body, declarations.ReadableBody)
         self.assertIsInstance(new_body, declarations.ReadableBody)
         if isinstance(old_body, declarations.ReadableBody) and isinstance(new_body, declarations.ReadableBody):
-            self.assertEqual(declarations.preserved_body(old_body, new_body, "Original", "Renamed"), 0)
+            self.assertEqual(declarations.preserved_body(declarations.name_sites(old_body, "Original"), new_body, "Renamed"), 0)
 
     def test_outside_rename_source_evidence_excludes_headers_and_reads_local_children(self) -> None:
         before = "#[test]\nfn original() {\n    let rows = collect();\n    serve(move |answers| { publish(answers); });\n    rows();\n}\n"
@@ -473,7 +473,7 @@ enum Choice {
         self.assertEqual(old_body, declarations.ReadableBody((" Device::new() ",)))
         self.assertEqual(new_body, declarations.ReadableBody((" Total::new() ",)))
         if isinstance(old_body, declarations.ReadableBody) and isinstance(new_body, declarations.ReadableBody):
-            self.assertEqual(declarations.preserved_body(old_body, new_body, "original", "renamed"), 0)
+            self.assertEqual(declarations.preserved_body(declarations.name_sites(old_body, "original"), new_body, "renamed"), 0)
         declarations_source = read_declarations("struct Type {\n    value: u32,\n}\ntrait Trait {\n    fn child() { first(); }\n}\n")
         child = declarations_source.declaration_at(5)
         self.assertIsInstance(child, DeclaredItem)

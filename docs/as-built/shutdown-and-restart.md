@@ -1,12 +1,26 @@
 # Shutdown and restart
 
+## Process-group signals
+
+`scripts/lib/process_group.py` owns process-group signal validation.
+`check_process_group(pid)` requires an integer greater than one and refuses the caller's own group.
+It also refuses booleans and mock values.
+`send_process_group(pid, signum)` validates before the sole raw `os.killpg` call.
+Callers handle `ProcessLookupError` when the group has ended.
+Shell callers use their checkout's helper through `scripts/lib/py`.
+The helper returns exit 3 for a missing group and exit 2 for refusal or failure.
+`test_process_group.unguarded_group_signals` checks Python references, embedded scripts, and shell commands for unguarded signals.
+
+## Session commands
+
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
 The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 Add `--dry-run` to print their names without stopping them.
-`agents` runs `scripts/shutdown/shutdown.py`; script callers keep that path.
+`agents` runs `scripts/agents/shutdown.py`.
+All lifecycle scripts use `scripts/agents/`.
 
 `agents pause NAME --why TEXT` stops the workers now.
 The director finishes its current turn and holds at the prompt.
@@ -17,8 +31,12 @@ The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
 `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
-Resume removes a pause record and sends the director one continuation message.
+Resume removes a pause record and sends a running director one continuation message.
+A paused director on the other machine gets the continuation message without a local liveness read.
+The machine comes from its worktree or its showrunner document.
+A stopped paused director starts through the shared resume path, including its requested `--to` account.
 Queued or failed delivery restores the same pause record and returns failure.
+A failed start or a start exception also restores the pause record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
 The prompt hook retains a paused director's hold for every prompt source.
 It adds context without blocking or removing the message.
@@ -27,7 +45,7 @@ It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.
 Stop does not save or restore composer drafts.
 
-Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
+Stop, resume and account move use `scripts/agents/stop_resume.py`.
 
 `stop(session)` ends only the selected local session's process.
 It reads the session identity, pid, and start time before TERM.
@@ -45,6 +63,8 @@ Stall-watch retires the saved prompt keys on its next pass, even after launch de
 A cancellation error prints a separate warning and does not change the stop result.
 Workers keep their threads.
 Staff membership selects worker children for stop and restart.
+A retained worker pane at its shell or a closed pane still needs proof that the conversation stopped.
+An incomplete conversation read returns `StopUnproved`.
 These operations do not read a transport pin.
 
 `release_source(row, backend)` uses the current native conversation evidence.
@@ -54,12 +74,11 @@ Unknown process evidence or an unproved stop gives `SourceReleaseUnknown`.
 A family switch preserves its source when release remains unproved.
 
 `agents resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
-The short form is `resume NAME`, through `scripts/shutdown/resume`.
+The short form is `resume NAME`, through `scripts/agents/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
-The lookup accepts a short name, a staff id, or a current session id.
-An exact Codex thread name resolves through the shared `session_index.jsonl`.
-A raw session id takes priority over a thread name.
+The lookup accepts a staff name, a staff id, a launch reference, or a native session id.
+A Codex thread name is display text and selects no conversation.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
@@ -69,26 +88,50 @@ Resume does not stop or move a running session.
 Unknown Codex process evidence prints an anomaly and does not block resume.
 A pane with the session id and a foreground program counts as already running.
 Without process evidence, its account remains unknown.
-A pane at its shell does not prevent resume.
+Unknown process evidence without a pane that reports the id can allow a second process on the same conversation.
+A unit pane at its shell permits resume when no remaining process blocks it.
+Direct resume and watchdog recovery use the same wait while non-agent processes block the pane.
+`HOLDER_EXIT_SECONDS` in `config/shutdown.conf` allows 5 seconds by default.
+A live agent in the holder list causes an immediate refusal.
+The `no foreground agent` refusal lists each blocking command and its position relative to the shell tree.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved environment, arguments, and folder.
+`member_account.resume_account` selects the account for both families at invocation.
+The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Other Claude sessions, and sessions with no staff row, use the configured units account.
+Claude producers use the configured producers account, or the showrunners account while the producers group has no selection.
+Other Claude sessions use the configured units account.
+A configured producer without a staff row uses the producer first-start account rule.
 When the account does not change, the resume message names no move.
 `--to ACCOUNT` overrides the account for either family.
 Restart without ACCOUNT and folder moves use the role account.
-A herdr server restore keeps the saved account for both families.
-It restores a closed tab when a saved launch exists.
+Explicit pane restore keeps the saved account for both families.
+It passes the saved home to `restart.start_row` as an `AccountSelection`.
+Explicit pane restore restores a closed tab when a saved launch exists.
+Producer upkeep uses shared resume and selects the current family account.
 An explicit CLI resume can restore an intentionally stopped session.
-Automatic recovery preserves an intentional stop.
+Unit watchdog recovery preserves an intentional stop.
+Producer upkeep excludes paused and exited rows, but it can resume an otherwise active producer after a process stop.
 A separate terminal starts the account command in the target pane.
 The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
-Resume from its own empty pane executes the saved launch in that pane.
+Resume, restart and account moves start a session in its own pane.
+The own pane is a pane that runs the member, else the newest pane whose launch record names the member and no other member runs in.
+`herdr.saved_row_tab` waits within `OWN_PANE_SHELL_SECONDS` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
+When the wait ends first, the start is refused with one line.
+The line names the session, its own pane and `agents resume <name>`, and the session stays stopped.
+A new tab opens only for a session with no own pane.
+A producer whose own pane is outside `PRODUCER_WORKSPACE`, or shares its tab, gets a new tab in that workspace with no wait.
+A restart never splits a pane beside a worker.
+`stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
+Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
+Other rows use their parent showrunner's workspace, the entry name, or the shared session.
+A role account change does not update an existing pane shell's `resume` alias.
+Each agent launch prepares the pane aliases through `herdr.agent_alias_script(kind)` for its selected family.
 
 `resume_message.py` builds every opening message.
 The restore paths use these causes:
@@ -116,29 +159,328 @@ Pane input waits up to ten seconds for the target shell to finish its startup wo
 Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
+Worker stop uses the backend in the staff snapshot for both native checks when that backend is available.
+Full restart and full stop require complete Claude registry discovery before they act.
 
 `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` delegates to the accounts move command.
 It normalizes the account label and preserves the result and output.
 
 `move_sessions` writes each session request before the stops, then records its confirmed or failed outcome in the accounts moves log.
 Each attempt has its own move ID and cause.
-Handed-off callers and sessions already on the target write nothing.
+Delegated callers and sessions proved live on the target write nothing.
 
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
+A resume in the same pane skips the source close check.
+A resume in a different pane checks that the source contains no other work before it closes the source.
+A layout scan retains a pane without a notice when a new Claude process in its foreground group lacks arguments during `START_SECONDS`.
+If the arguments stay unreadable after that period, the next scan reports unknown evidence once per scan run.
+
 The notes timer delegates account moves to this detached batch before any stop.
+An automatic move (cause `auto`, `refusal` or `credits off`) reads the admission queue and verify records before any stop.
+A session with a running, waiting or cloud build step keeps its process and queue place.
+A live verify call also prevents a move while it waits for the cargo token or enters the queue.
+The reader checks each verify PID and saved start time.
+Unreadable queue, verify record or process evidence defers the move without a stop.
+Free sessions move first.
+The detached batch waits for build owners.
+The batch checks ownership every `MOVE_BUILD_POLL_SECONDS` and moves an owner after its steps end.
+At `MOVE_BUILD_WAIT_MINUTES`, remaining owners receive a deferred result and keep their processes.
+A later group account selection applies to the next stop attempt.
+A later `refusal_watch` check retries the move after the build ends.
+A move by hand does not read build ownership.
+The batch writes its wait lines to its move log.
 The supervisor needs a restart request; an exited child alone does not cause a restart.
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
+
+The staff row lock covers each member through its build wait, stop, and resume.
+The batch verifies each reference and reads the current conversation while it holds the row lock.
+If a native session gains a staff row, the batch acquires the staff row lock before it acts.
+References to the same member share one move and receive the same result.
+Each build check uses the current conversation.
+The batch reports a move to the same account as in progress.
+Other busy rows remain pending while the batch moves available members.
+The pending result is final for the batch and gives the user a retry command.
+The batch omits busy members from both the self-move and build handoffs.
+Each attempt reads the member's live account while it holds the row lock.
+The batch reads the current role map for a group move.
+A single-session move uses the explicit account.
+The batch keeps a member running when its live account matches the target.
+The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
+The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.
+The batch refuses a member if its live source read fails.
+The stop verifies the live source PID and process start time before it records the source and sends a signal.
+A refused destination leaves the members running and goes in the batch result.
+The handoff carries the group name or explicit account and the results already collected.
+The child saves and reports the carried failures even if a startup read fails.
+The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.
+
+The batch keeps the showrunner notices and sends one phone push for the members that still need help.
+The push shows qualified names and gives a short command to retry the batch.
+If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
+The saved batch result holds every pending name and its fixed reference.
+The sender uses the same key for retries of the batch.
+`MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
+A standalone resume failure still sends its own keyed push.
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 
-Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
+Retirement, checkout moves, running-session attach and nix-shell healing use this API.
+Retirement reads process facts with the reader for the host that owns the worktree.
+Retirement keeps the recorded pane address and its terminal identity before cleanup.
+The remote retirement journal keeps both identities for completion retries.
+Cleanup excludes only that pane's proved idle shell from the remaining processes.
+After successful retirement, it closes that pane as its last step on the pane's machine.
+It sends no signal to that shell.
+A pane already gone needs no second close.
+Foreground work inside the worktree keeps the process refusal.
+Foreground work outside the worktree keeps the pane open and produces one anomaly line.
+A failed retirement closes no pane.
+Herdr refuses a changed terminal and keeps the new pane and its launch record.
+Retirement reports that mismatch without changing its result.
+The confirmed close retires the pane launch record.
+Unit rename closes the unit's own pane after its ownership checks.
+A pane already gone counts as closed.
+Checkout moves stop before moving files and resume afterward.
+The checkout coordinator excludes only its own pid from cwd holders.
+Other holders still refuse.
+Attach keeps its process and prompt-submission proofs.
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
 A unit with no pane launch record stays down.
 The watchdog does not read shutdown session records.
+Unit recovery writes its completion receipt and discards the parked facts before it restores workers.
+It returns the worker restore exit code.
+A completed recovery rerun restores the workers again.
+
+## Producer launch and admission
+
+`resume morty`, `resume brain`, and `resume dwight` use `stop_resume.resume`.
+Account moves and restart share the same resume arguments, account selection, and pane launch code.
+Each producer uses its own tab in the `producers` workspace of the shared herdr session.
+`config/staff.conf` supplies the workspace through `PRODUCER_WORKSPACE`.
+`restart.producer_launch(row)` resumes `row.current_session` with the producer's configured settings.
+`restart.producer_resume(row, entry)` preserves saved launch options through `pane_record.configured_resume_arguments`.
+It takes the family, model, and effort from the current producer settings.
+`pane_launch` reads `--effort` as an option with a value.
+
+When the configured family matches the current session, a named resume uses that session.
+When the family changes, `stop_resume._resume_once` uses the first-start path.
+It stops the old conversation and closes its pane before it starts a fresh conversation in a new tab.
+If the old process exits before the `ended` write, a retry can use the saved binding to identify its family.
+The retry checks that the old process has stopped before it writes `ended`.
+First admission binds the new conversation to the existing producer row.
+A retry uses the saved admission record to complete the launch or bind the live conversation.
+If an interruption occurs after tab creation and before the admission write, a retry can leave an extra shell tab open.
+
+`models_registry.launch_settings("producers", name)` validates each `family:model:effort` value in `config/models.conf`.
+The configured lines are:
+
+```ini
+[producers]
+morty=claude:fable:high
+brain=claude:fable:high
+dwight=claude:fable:high
+```
+
+These model names are aliases that the shared model registry resolves.
+`member_account.producer_account(kind, *, to="")` selects the account before admission.
+An admitted producer's same-family resume uses `member_account.resume_account`.
+Both functions select the workers account for Codex.
+Claude uses the producers account, or the showrunners account while the producers group has no selection.
+An explicit `--to` overrides that selection.
+
+`accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
+`accounts.producer_settings(member)` returns `LaunchSettings` or `InvalidProducerSettings`.
+Invalid settings exclude that producer.
+`settings_report_scope` limits its warning to one per operation.
+A workers swap includes eligible Codex producers.
+A producers group move includes eligible Claude producers.
+Units and showrunners retain their existing group selection.
+
+A repeated move selects a stopped producer even when its recorded home already names the target.
+Only proof that the producer runs on the target permits the move to skip it.
+`LiveAccountUnproved`, a `ResumeFailed`, identifies a live process with unreadable account evidence.
+A move returns `StopFailed` with the unreadable account reason.
+It sends no stop or start and makes no home change.
+Producers, units, and showrunners share this move check and `member_account.repair_home`.
+The move writes `home` only when it changes.
+The home records an account; it does not prove that a start finished.
+
+`pane_launch.write` owns retained producer bindings.
+`pane_launch.producer_start(directory, expected)` writes the start contract before each retained launch, including an own-pane exec.
+`ProducerStartExpectation(member, session, kind, folder, home)` defines the expected launch.
+Publication checks the native identity, process generation, family, folder, and account.
+The shared `.publication.lock` protects every pane record writer.
+Publication replaces earlier bindings through the recoverable `.producer-publication` record without closing their panes.
+`pane_launch.read_entries` returns no entries or lock file when the record folder is absent.
+Resume compares source and destination pane locations before it lists panes.
+An own-pane resume therefore needs no pane list call.
+
+### Catch-up reader
+
+`scripts/agents/catch_up.py NATIVE_ID [--blocks N] [--chars N]` prints the last blocks of a saved conversation.
+A session that takes a producer role reads the earlier conversation of that role with it.
+`NATIVE_ID` is `session:<id>`, `codex:<id>` or an ID alone. An ID alone selects the newest transcript of either family.
+A block is one user message, assistant message, tool call or tool result. A tool block is one shortened line.
+A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
+The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
+`config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
+### Create a producer
+
+`agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
+The create command validates the name and records its profile and README text before it writes them.
+The staff owner publishes the creation machine and creation ID under `[producer_creations]` with the profile.
+The staff owner compares names without case distinctions and refuses a claim when a marker or staff row exists.
+The staff owner checks the current marker before removal.
+A pending creation requires the local creation record on that machine.
+Resume on another machine names the machine that holds the record and gives the `add-producer` command.
+It creates the README from `templates/producer/README.md` when the README is absent.
+The first conversation receives a prompt to read the README and run `/producer:produce`.
+The creation record keeps the time for prompt recovery after a failed start.
+Resume accepts a matching Codex user turn even when the turn has no timestamp.
+A malformed Codex rollout line blocks automatic retries of the opening prompt.
+Check the reserved pane for the opening prompt.
+If the prompt is absent, run `agents resume NAME --resend-opening-prompt` on the creation machine.
+The command sends the prompt once when the pane is idle and its input is empty.
+The create or resume command removes the shared creation entry after prompt confirmation, staff admission, and pane publication.
+The command reports the staff id, account and tab.
+
+### Rename or retire a producer
+
+`agents rename OLD NEW` moves the registry key and retains the staff id.
+If the old name no longer belongs to the saved staff id, the retry keeps the old key.
+It updates the session label and tab title.
+The staff document path still names the original folder.
+Rename and retire refuse while the producer has a pending admission.
+
+`agents retire NAME [--to PRODUCER]` requires a handoff file and no open questions.
+Without `handoff.md`, it asks the producer for the file and returns.
+The command stops the conversation and closes its tab before it reads the open List items.
+It moves those items with log source `agents retire` and tells each item's showrunner.
+The retirement receipt keeps the profile, session id, and notices.
+The command records notice delivery after the send succeeds.
+A retry refuses if the producer has a different session id.
+The command removes the producer key after a final read confirms that no open List items remain assigned to the producer.
+The staff row keeps the profile in `retired_producer`.
+Active staff lookups omit retired producers.
+The fixed-id lookup supplies their names for closed List items.
+`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+
+### First start
+
+`ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
+It is separate from an admitted `StaffRow`.
+`PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
+The first start requires `<root>/<name>/README.md`.
+Dwight uses `~/rust/hanadocs/dwight/README.md`.
+
+The first-start path uses this order:
+
+1. Lock the producer's first admission through `staff.slot_operation`.
+2. Adopt one proved live session with the producer name before a new reservation.
+3. Reserve the producer's tab in the configured workspace.
+4. Save `PendingProducerAdmission(pane, terminal, kind, home)` at `_producer_admission_path(name)`.
+5. Start without a resume argument through `restart.producer_first_arguments(name)`.
+6. Prove the native identity through `Herdr.producer_admission_launch`.
+7. Admit the row through `staff.ensure("producer", ..., runtime_id=identity)`.
+8. Publish the retained binding through `pane_launch.staff_admitted` under `producer_start`.
+9. Remove the pending admission record after publication succeeds.
+
+`producer_conflicts` uses `sessions.running_sessions`, the Codex index, and loaded daemon threads.
+It checks live agents in producer workspace tabs and panes with the producer label.
+An empty labeled shell does not count as a live session.
+`adopt_named_producer` adopts exactly one proved native conversation without a launch.
+It records that session as `current_session` and preserves its account and working folder.
+It records the configured producer folder as the document location.
+It publishes a retained binding when the live session has a proved pane.
+Two live sessions cause refusal before any staff write or launch.
+An unproved live session also causes refusal.
+The refusal names each conflicting session ID and pane on one line.
+An unreadable Claude registry or daemon registry refuses producer admission.
+Recovery checks live sessions before it resumes a retained conversation.
+Recovery adopts a different proved live session and removes the pending admission record.
+Recovery resumes the retained conversation only when no other live session carries the producer name.
+
+`agents stop NAME` resolves a producer name to its row's `current_session` before tab label selection.
+Several tabs with the producer label therefore do not select a different conversation.
+The shared native process reader uses Claude's session registry to prove a plain `claude` start.
+The process arguments need no session ID.
+
+`agents transfer NAME [--model MODEL --effort EFFORT]` gives a producer role to the conversation that runs it.
+`producer_transfer.transfer` checks for a pending admission while it holds the `producer-first-NAME` slot.
+If an admission is pending, transfer asks the user to run `agents resume NAME` first.
+`producer_transfer.transfer` holds the `producer-first-NAME` slot and the row lock for these steps:
+
+1. Refuse a caller that another staff row records. Refuse a producer on another machine.
+2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
+3. Refuse a Claude caller outside the selected producer account. Print the `agents move` command.
+4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
+5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
+6. Publish `[producers].NAME` through `models_registry.store_producer`.
+7. Write the row through `staff.transfer_producer`, then publish the pane record as the producer binding.
+8. Give the tab the producer name through `retitle_row`; the saved layout supplies the position of the old tab.
+
+`restart.restart(stop_all=True, only=(row id,))` then restarts the caller outside the row lock.
+The restart runs in a detached process and sends no opening prompt.
+The row id, the document, and the `staff:<row id>` message queue do not change.
+Each step is safe to run again; a caller that already holds the row skips step 5.
+A failure between steps 6 and 7 leaves the new settings on the old session until the next run.
+
+`agents remove-stray NAME SESSION` removes a local stray producer conversation.
+The command uses this order:
+
+1. Refuse a session that any staff row records as its `current_session`.
+2. Prove the producer name and native process identity before the stop.
+3. Save `PendingProducerCleanup` before the first change.
+4. Stop the selected conversation through `stop_resume.stop`.
+5. Delete the admission record if its saved content still matches the proved admission record.
+6. Close its proved terminal through `Herdr.close_retained_pane`.
+7. Delete its transcripts across Claude account projects folders through `Path.unlink`.
+8. Delete the cleanup record after every step completes.
+
+The pane and terminal match also applies when no retained launch entry exists.
+The cleanup record path is `<pane record directory>/.producer-cleanup-<name>-<session>`.
+The record holds the name, session ID, process IDs, process start times, agent kinds, and herdr session.
+It also holds the pane IDs, tab IDs, terminal IDs, admission match, admission content, and transcript paths.
+`ProducerCleanupStep` stores a progress hint.
+Each command checks every saved target, regardless of that hint.
+A process stop is complete when the saved PID is absent or has a different process start time.
+An absent saved pane needs no closure.
+The saved tab and terminal IDs protect other targets when the pane still exists.
+An absent admission record or transcript needs no deletion.
+Each completed step atomically saves its progress before the next step starts.
+A repeated command reads the saved targets without native identity discovery.
+Each step permits repetition after a failure between its action and its progress write.
+A lost stop progress write cannot require a removed registry entry or absent pane metadata.
+Cleanup also completes when only the saved transcripts remain.
+A failed pane closure retains the terminal target even without herdr session metadata or a retained launch entry.
+A failed transcript deletion retains the transcript targets.
+
+Pane closure preserves other panes in the same tab.
+The command adds no permission rule and uses no shell deletion command.
+A repeated command prints `unchanged` when no cleanup record or selected resource remains.
+
+The record path is `<pane record directory>/.producer-admission-<name>`.
+The saved record also holds the folder.
+A repeated resume uses the saved record to complete the admission.
+Later resumes use the admitted row's `current_session`.
+The pending record retains the original account.
+A conflicting `--to`, family, or folder returns failure and preserves that record.
+
+A lost or replaced reserved pane requires proof that its retained conversation stopped.
+Recovery reserves another pane and transfers the retained entry without `pid` or `proc_start`.
+It then retires the lost pane's launch.
+A shell is eligible only without a retained entry or with this pending producer's identity.
+A shell with another session's retained launch stays unchanged; recovery opens another tab.
+
+`_resume` checks pending admission before it reads the model registry.
+A registry error during pending admission returns `ResumeFailed` and preserves the record.
+Without pending admission, a registry error permits the generic resume lookup.
+The [upkeep service](herdr-restore.md#restore-services) recovers admitted producers after server loss or reboot.
 
 ## Worker resume results
 
@@ -154,10 +496,11 @@ Each child has one result:
 |---|---|---|
 | `Resumable` | The child's turn was live | The unchanged command from `resume_worker_command` |
 | `Idle` | The child's readable turn was not live | `idle` and `nothing to run now` |
-| `Unavailable` | The run, worker record, or last assignment is unavailable | One `anomaly:` line with the child and reason |
+| `Unavailable` | The run, worker record, or known staff role is unavailable | One `anomaly:` line with the child and reason |
 
 The reader selects staff members under the moved parent.
 It reads each member's backend and current native session.
+The member's `KnownWorkerRole` supplies the child's role without a history fallback.
 A Claude child uses its `impl_worker_<slot>.json` record and the matching status file.
 The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
 A readable status other than `implementing`, including `capacity_exhausted`, gives `Idle`.
@@ -176,6 +519,23 @@ The message names idle children separately.
 It keeps the account move source and destination.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
+
+`quota_state.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+`scripts/whoami/quota_state.py` is a leaf module, so restart, resume and worker code never import `quota_alert`.
+A missing or unreadable state reads as off.
+In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
+In no-worker mode, no command starts new worker work. Each refuses with exit 2 and the `quota_state.NO_WORKER_START` text:
+- `assign.sh`, before it writes run state;
+- `worker.py add` and `worker.py assign`;
+- `worker_panes.py start-or-resume`.
+In the mode, `style_plan.py next-phase --session-dir` restores the run and phase records of each ticket and sends no assignment. It prints `style-ticket-<id>: <the refusal text>`, and the director does the ticket directly.
+`worker.restore` and account moves keep work that started before the mode, so a Claude worker with an open pass resumes.
+`agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.
+A skipped worker leaves the restart record. The next assignment resumes it.
+`stop_resume` refuses a Codex worker row with `no-worker mode keeps Codex workers stopped`, before it opens a pane.
+`resume_message.worker_mode()` gives `WorkersHeld` in no-worker mode.
+The resume, restart and relaunch messages of a director then carry the `no_worker_mode_on` text from `config/accounts.conf` and no worker lines.
+A paused director gets `Continue where you stopped.` and the same text.
 Pane worker resume uses the dispatch record and transcript to select one step.
 An idle worker receives a continuation prompt when its transcript contains the open dispatch.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
@@ -213,14 +573,27 @@ Worker restore uses the shared run index.
 The stop helpers use the shared Codex snapshot.
 Action checks still prove the target process before a signal.
 Independent rows stop and start in parallel.
+Each row stop reads the pane list and pane processes once, inside its own `herdr.observation_snapshot()`.
+Each identity check forgets its pane's evidence before it reads that pane again.
+A pane process that exits between the pane read and the process read counts as starting or exiting; the scan prints no notice.
 Each restore line starts with the staff name, including worker restore results.
 
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
-The selection includes freestanding agents, such as brain and morty.
-It saves each row ID before its stop. It starts nothing.
+The selection includes producers, such as brain, morty, and dwight.
+A complete unscoped read prunes recorded rows whose sessions still run.
+Each prune checks current liveness again while it holds the row lock.
+A refused row lock preserves the entry.
+A partial liveness read prints an anomaly and prunes nothing.
+Recorded stopped rows remain pending.
+Each stop holder saves its selected rows while it holds their row locks.
+A refused stop removes its provisional entry before the row lock releases.
+No command clears the whole record.
+It starts nothing.
+`stop --all --only ID[,ID...]` and `stop --all --account ACCOUNT` merge selected rows into the record.
+These scoped stops preserve other saved rows.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
 It keeps only the row IDs whose starts failed.
@@ -238,15 +611,125 @@ An unknown ACCOUNT prints one error and returns status 2 before any stop.
 Without ACCOUNT, the existing selection and role accounts apply.
 
 `--only ID[,ID...]` also limits `--all`; ACCOUNT and `--only` must both match.
+An `--only` run observes only the requested rows as restart candidates.
+It judges workers only for selected worker rows and their parents.
+It retains incomplete evidence and anomaly lines for a selected worker.
+It skips the scan for live sessions without staff rows.
+The shared pane read still supplies complete identity evidence.
+A run without `--only` keeps the existing observations.
 If a stop includes the caller, restart continues in a detached process before the first stop.
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
 A stop checks the current conversation before it sends a signal.
-A failed row prints one anomaly line. Other rows continue.
+A failed row does not stop other rows.
+After the start pool finishes, restart reads each failed unit director or showrunner conversation again.
+If the read proves that the conversation stopped, restart retries that start once with the same arguments.
+A successful retry prints only `<name>: down; started`.
+If the row becomes live before the retry launches it, the retry prints only `<name>: unchanged`.
+A second failure prints `<name>: down: <reason>` on stdout and keeps the row pending.
+An error without text uses its type name as the reason.
+A live or unknown conversation keeps the existing anomaly line and gets no retry.
+Trust-write failures and row-lock refusals keep their existing behavior without a retry.
+An unreadable native identity in a retained pane excludes that pane from placement candidates.
+It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
+A restarted unit director or showrunner gets one continuation message in its current conversation.
+The shared resume message builder supplies the text.
+The default cause is "agents restart ran".
+The restart option `--why TEXT` replaces that cause.
+The message asks the session to continue its work.
+If Codex message delivery fails after launch, restart reports one anomaly line with the director's name and the first error line.
+The director counts as started and leaves the restart record.
+Restart checks each unit director and showrunner that it starts with a continuation message.
+The check uses the launched account home and native session identity.
+It reads only turns after that director's start.
+Herdr keeps one cursor for each native transcript and preserves the requested cursor's launch offsets.
+The Claude resume check uses the requested cursor when the pane reports the same ID.
+The check creates its own cursor when the pane reports a different ID.
+Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
+A starting agent can lack its registry record, its process start time or its argv.
+Herdr retries the identity read and the target check until the launch deadline.
+The pause between tries starts at `PANE_POLL_SECONDS` and doubles up to `START_RETRY_MAX_SECONDS`.
+Herdr reports each reason for retaining a target once per target during an opening prompt attempt.
+Only a failure at the deadline prints the native session error.
+Herdr checks the requested and discovered transcripts before typing, sending Enter or reporting a failure.
+If the send gate finds a different native ID, the failure check includes that ID's transcript.
+The receipt check reports a matching turn, a readable search with no match, or unknown evidence.
+An inaccessible transcript directory gives unknown evidence.
+Unknown evidence blocks a send.
+A matching turn gives the submission state `confirmed`.
+A new launch with no transport process gives `not_sent` when Herdr finds no matching turn.
+All other results without a matching turn have the state `unknown`.
+Add-unit closes a session for an opening prompt failure only when the state is `not_sent`.
+Herdr uses the last native ID reported by the pane to publish the staff relationship.
+When a transcript confirms the prompt during startup, Herdr publishes the staff relationship before it returns success.
+Staff publication uses the remaining launch time.
+The result reports a staff publication error in a separate field.
+A change in the recipient does not cancel a matching turn.
+Herdr requires one registered foreground agent and a recorded recipient for the same process.
+The registered agent must lead the foreground group or be a Claude child of the group leader.
+Herdr accepts the child only when its direct parent runs the package's resolved `scripts/lib/relaunch.py` with the `run` argument.
+Herdr reads the live child and parent identities before and after it reads the parent command.
+Herdr reads the parent command again and refuses input if either identity or the command changes.
+Herdr limits the slash-command record lock to the remaining launch time.
+Herdr prepares the slash-command record before it reads the transcript.
+After the gate accepts the send, Herdr writes the record.
+Herdr can evict an old record after the transport starts.
+If startup fails, Herdr removes the new record and keeps the older records.
+Each attempt reads the transcript for a matching turn before it checks the pane.
+The gate reads the composer first, then checks the terminal and registered foreground recipient.
+The gate checks that the agent is idle before record publication and transport.
+Typing requires an empty composer. Herdr types at most once per launch.
+An empty composer ends Enter retries for that launch.
+Add-unit, add-showrunner, and promote-showrunner reruns check the transcript before they send Enter for a matching draft.
+A rerun in the retained pane never types the prompt.
+If the composer is empty at the deadline and the transcript has no matching turn, Herdr reports "sent once, not confirmed".
+The terminal, process, or composer can still change between the last check and the terminal's receipt of input.
+The launch deadline limits the pane queries and both transport calls.
+The prompt transport uses the remaining time after its process starts.
+If Herdr declines to send a resume prompt, the anomaly tells the operator to check the retained pane and send the prompt by hand.
+For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
+`config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
+The operation deadline can reduce either limit.
+Other launches use `START_SECONDS`.
+The launch limit covers the start, input readiness, and proof of the opening prompt's user turn.
+The separate resume check then requires an assistant turn or tool call.
+The cursor skips complete historical records without parsing their JSON.
+Herdr preserves a caller's cursor and prepares one before the start command when the caller supplies none.
+If the native session identity changes, the cursor reads that transcript from byte zero and filters turns by the launch time.
+The cursor retains observed turns, so prompt submission does not remove evidence from the resume check.
+The reader leaves a final record without a newline unread until the writer completes it.
+The launch boundary follows the last complete newline.
+A malformed Codex record with a newline makes the transcript unreadable.
+A Claude transcript missing from the current read also makes the transcript unreadable.
+A matching user turn followed by an assistant turn or tool call confirms resumed work.
+All checked directors share one deadline.
+The check ends as soon as every director resumes.
+At the deadline, each failed check prints one of these lines:
+
+- `<name>: restart check: no continuation message`
+- `<name>: restart check: no work after the continuation message`
+- `<name>: restart check: transcript unreadable`
+
+The check then prints `restart check: <passed> of <checked> directors resumed`.
+The check prints nothing when it checks no director.
+It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
+It does not change the exit code, restart record, or staff.
+config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
+
+A paused or exited director stays stopped and keeps its hold record and restart entry.
+A running row gets no continuation message.
+Producers keep their existing start behavior.
+Herdr server restore keeps its existing start behavior.
 A row leaves the saved list when it starts or already runs.
+`stop_resume.resume` removes a row after a confirmed start while it holds the row lock.
+Upkeep, account moves, watchdog recovery, and named resume share this removal.
+Named resume also removes a row after a successful continuation message.
+Retired recovery removes a row after it proves the resumed native session.
+These removals and restart cleanup occur before the row locks release.
+Native resume, continuation messages, restart, retired recovery, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
@@ -258,10 +741,25 @@ Both commands change nothing.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
+The record holds only rows that a restart starts:
+- `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
+- `worker.not_restored` names that worker: a Codex worker in no-worker mode, or a worker with no active dispatch and no detached run.
+- `restart` removes a saved id with no staff row, or a saved worker that `worker.not_restored` names, with one anomaly line: `<name>: restart anomaly: <reason>; removed from the restart record`.
+- `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
+- `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
+- An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.
+`shutdown_record.update` holds the record lock for each change.
+Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.
+It checks current liveness again under each row lock.
+It saves the live tab positions and preserves recorded stopped rows.
+`held-sessions ACCOUNT` and `held-sessions --only ID[,ID...]` merge selected rows and preserve other saved rows.
+A failed staff read preserves the record.
+A partial live-row read prunes nothing.
+The stop loop can still save rows that it stops.
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
-A freestanding agent without a recorded folder uses the home folder.
+A producer without a recorded folder uses the user's home folder.
 The native pane reader identifies Codex sessions from their resume arguments or pane reports.
 Callers without a report read the process's own pane through the same reader.
 No thread identity comes from an open rollout file.
@@ -287,3 +785,74 @@ Stop selects workers from their current staff parent.
 An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
 Live or unknown evidence leaves the worker pending.
 The worker check uses the same function as the Codex row check.
+
+### Legacy Claude launchers
+
+`assign_claude.run` installs no signal handler.
+Its child commands inherit the launcher's process group.
+Stop that group to stop the launcher and its child commands.
+`assign.sh` uses `exec` for `assign.py` and creates no separate process group.
+The current native worker path does not call the legacy Claude launcher.
+
+The launcher checks the claim owner under the claim lock before each publication.
+The launcher records its PID and process start in `impl_claim_<slot>.json` before work starts.
+The claim also records the host, boot, and PID namespace.
+`read_worker_claim` rejects dead processes, zombie processes, and reused PIDs.
+It compares local processes only when the saved scope matches the current scope.
+It retains claims with missing start evidence, missing scope, different scope, or unreadable identity.
+Status readers recover an `implementing` status whose launcher has ended.
+They write `error` and add a blocked board entry under the claim lock.
+The next assignment can replace the ended claim.
+Normal completion still releases the claim.
+An interrupted exit retains the claim, including a Python `KeyboardInterrupt` from SIGINT.
+A killed launcher cannot record pass completion.
+Its ledger entry keeps the last saved state.
+
+### Gates during a session restart
+
+A session stop sends TERM, then KILL after the grace period, to the one proved agent PID (`stop_resume.py`).
+It sends no signal to the process group, the child processes, or the build cgroup.
+A normal stop keeps the pane and its shell.
+
+A detached run continues across a session stop or restart.
+`detached_runs.py start` starts its supervisor in a new process session.
+The command runs in a `builds-detached.slice` scope when systemd is available.
+The command runs in its own session, including through the scope prefix.
+The record saves the command's process group.
+The supervisor uses default TERM, INT, and HUP dispositions.
+It installs no signal handler.
+`detached_runs.py stop` checks the supervisor and the command identity before it signals the command group.
+The supervisor stays alive to record the exit status and deliver the result.
+A worker that stops its own run keeps its pass active.
+A stop from another caller can end the pass and notify the director.
+The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
+The supervisor writes "done" to the pipe after the command ends.
+If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.
+The watcher then runs `detached_runs.py supervisor-gone`. It leaves the command group and saves a stop reason.
+It sends TERM to the command group, waits for the command leader and reaps the record.
+So a supervisor end never leaves the command running, and the worker gets a STOPPED result.
+If the supervisor dies, the next start, worker restore, or explicit `detached_runs.py reap` finishes its record and delivers its result.
+The result reports no exit status unless the command or the supervisor saved one. `verify.sh` saves its own status at exit.
+The record, the log and the exit code stay in the run folder's `detached_runs` directory.
+After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
+The supervisor waits for delivery before it marks the run finished.
+The result goes to the worker's fixed staff row and its current conversation.
+A stopped worker's result goes to its parent. A stopped parent's result waits in its queue.
+
+`verify.sh final` detaches by itself only for a registered Codex worker.
+A bare call from a Claude director stays attached.
+`assign.sh` does not detach the commands that its worker starts later.
+
+A merge gate in a Claude background shell has no proved survival.
+`copies.py run` starts the gate attached, and `merge_gate.py` stops its module groups on TERM or HUP.
+Before another run, check for a complete saved gate result.
+Put a gate that must survive a restart in a detached run.
+
+The cloud gate runs as its own user service and on a remote guest.
+A local stop does not end it. Its outcome stays under the Git `cloud-gates` folder.
+The local import and type checks after the cloud result still need the local caller.
+
+A surviving run keeps its memory queue place and its age.
+A new process does not take over the place of a dead waiter.
+
+A session restart is not a machine restart. A reboot or power-off can end local supervisors and waiting processes.

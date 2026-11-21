@@ -183,6 +183,7 @@
     "additionalDirectories": [
       "~/Library",
       "~/rust",
+      "~/worktrees",
       "/tmp",
       "/tmp/claude/",
       "~/.claude/projects",
@@ -223,7 +224,6 @@
     "exclude_from_merge": "user-invocable-only",
     "focused_eval": "user-invocable-only",
     "idle_timeout": "user-invocable-only",
-    "implement_issue": "user-invocable-only",
     "improve_decisions": "user-invocable-only",
     "local_style": "user-invocable-only",
     "monitor": "user-invocable-only",
@@ -233,10 +233,6 @@
     "style_rename": "user-invocable-only",
     "watcher": "user-invocable-only",
     "zed": "user-invocable-only",
-    "banned_word_analysis": "user-invocable-only",
-    "banned_word_hook": "user-invocable-only",
-    "revert_banned_count": "user-invocable-only",
-    "add_banned_word": "user-invocable-only",
     "nightly_review": "user-invocable-only"
   },
   "hooks": {
@@ -287,7 +283,7 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" pre_tool_use",
-            "timeout": 3040
+            "timeout": 3050
           }
         ]
       },
@@ -356,6 +352,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-ste.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-review-hold.py\""
           }
         ]
       },
@@ -481,6 +481,7 @@
         "~/Library/Application Support",
         "~/Library/Caches/Mozilla.sccache",
         "~/rust",
+        "~/worktrees",
         "/private/tmp",
         "/tmp"
       ]
@@ -496,7 +497,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 258000,
+  "autoCompactWindow": 308800,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"

@@ -9,9 +9,13 @@ argument-hint: "[tables]"
 
 Type this to see the phase, stage, ETA, workers and summary table; add `tables`
 for the round table, `Earlier:` and verification gate lines. It runs inside
-the current session and already knows the session directory, the phase, and
-which dispatches are live. If no `/unit:direct` run is active, say so in one line and
+the current session and uses its run directory. If no `/unit:direct` run is active, say so in one line and
 stop.
+
+Run `progress_history.py progress --session-dir "${SESSION_DIR}" --all` to list the open phases.
+When several phases are open, show each phase's elapsed time, recorded percent, and ETA.
+Repeat the phase assessment below for each phase in scope.
+Pass `--phase-id <id>` to each recorder call that assesses progress.
 
 Reports come only when someone asks: no timer sends them. `/unit:direct` reads
 this file for each one. It defines `<ProgressReport/>` — the content of an update. Never compose a report from memory of an earlier read: the byte-for-byte
@@ -62,13 +66,13 @@ Everything below is the contract.
    already listed among this report's workers.
 5. Run:
 
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py calibrate --session-dir "${SESSION_DIR}" --phase-id "<id>" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
 
    Pass the same stage to both calls; `progress` refuses a calibration drawn
    for another. Use its phase suggestion when applicable; otherwise keep the raw value. Then
    run:
 
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py progress --session-dir "${SESSION_DIR}" --phase-id "<id>" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
 
    Pass `--tables` only for `/unit:report tables`. The call also rewrites this
    unit's phase note, which keeps the full phase list; write nothing there by
@@ -92,7 +96,7 @@ Everything below is the contract.
    verification gate lines byte for byte. Worker narration supplies step 7;
    never paste the `- **Agent N**` lines themselves.
 6. Present sections in this order: phase and stage, ETA line, summary table,
-   worker table, summary sentences, then `See /showrunner:unit_board for the board.`
+   worker table, and summary sentences.
    For `tables`, put the round table after the summary table. If early review
    is armed, say the writer and reviewer are working at once.
 

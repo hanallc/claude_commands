@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from scripts.copies.copies_test_support import copies_environment
+from scripts.lib import build_folders
+
 import fcntl
 import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,12 +18,14 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
+from unittest.mock import patch
 
 from scripts.production import ci_points
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -114,6 +120,9 @@ class ValidationObservation(TypedDict):
     push_origin: str
     remote_tip: str
     cargo_target: str
+    local_config: str
+    slot_git: bool
+    cache: str
 
 
 @final
@@ -129,9 +138,41 @@ class CiPointsTests(unittest.TestCase):
     doc: Path = Path()
     log: Path = Path()
     env: dict[str, str] = {}
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = cls(methodName="runTest")
+        cls.addClassCleanup(builder.doCleanups)
+        builder.build_fixture()
+        cls.fixture_root = builder.root
+        cls.fixture_environment = dict(builder.env)
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="ci-points-seed-")))
+        cls.fixture_seed = seed_root / "case"
+        _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(builder.root)
 
     @override
     def setUp(self) -> None:
+        self.root = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.home = self.root / "home"
+        self.origin = self.root / "origin.git"
+        self.checkout = self.root / "checkout"
+        self.state = self.root / "state"
+        self.stub_state = self.root / "stub-state"
+        self.bin = self.root / "bin"
+        self.doc = self.root / "tool-based-ui-production.md"
+        self.log = self.checkout / "production.log"
+        self.env = dict(self.fixture_environment)
+        _ = self.git("update-index", "--refresh")
+
+    def build_fixture(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()
@@ -158,9 +199,9 @@ class CiPointsTests(unittest.TestCase):
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
+        self.env = {**os.environ, **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
-                    "DAILIES_REVIEW_REGIME": str(self.bin / "review_regime.py"),
+                    "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -243,8 +284,14 @@ class CiPointsTests(unittest.TestCase):
         validate = self.bin / "validate_and_push.sh"
         self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
         scripts = SCRIPT.parents[1] / "validate_and_push"
-        for name in ("validate_and_push.sh", "push_direct.sh", "post_push_hook.sh"):
+        for name in ("validate_and_push.sh", "push_direct.sh"):
             _ = shutil.copy2(scripts / name, self.bin / name)
+        library = self.bin.parent / "lib"
+        shim = library / "py"
+        self.write(shim, f'#!/bin/sh\nexec {shlex.quote(str(scripts.parent / "lib/py"))} "$@"\n')
+        shim.chmod(0o755)
+        for name in ("land_main.py", "main_push_lock.py"):
+            _ = shutil.copy2(scripts.parent / "lib" / name, library / name)
         self.write(self.bin / "run_validation.sh", '''#!/bin/sh
 set -eu
 "$TEST_PYTHON" - <<'PY'
@@ -277,6 +324,9 @@ observation = {
     "directory": str(directory), "initial": initial, "validated": validated,
     "origin": origin, "push_origin": git("remote", "get-url", "--push", "origin"), "remote_tip": remote_tip,
     "cargo_target": os.environ.get("CARGO_TARGET_DIR", ""),
+    "local_config": Path(git("rev-parse", "--path-format=absolute", "--git-path", "config")).read_text(),
+    "slot_git": (directory / ".git").is_file(),
+    "cache": str((directory / "target").resolve()),
 }
 (state / "validation-observation.json").write_text(json.dumps(observation))
 with (state / "validation-attempts.jsonl").open("a") as attempts:
@@ -313,7 +363,8 @@ PY
         self.assertEqual(ci_points.read_run(self.state).tip, observed["validated"])
         self.assertEqual(self.git("rev-parse", "HEAD"), observed["validated"])
         self.assertIn("fast-forward push", result.stdout)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_failed_validation_without_a_build_cache_keeps_its_log_and_removes_its_copy(self) -> None:
         _ = self.git("rm", "Cargo.toml")
@@ -326,7 +377,8 @@ PY
         self.assert_step(result, "validation", False)
         checkout = Path(self.validation_observation()["directory"])
         self.assertNotEqual(checkout, self.checkout)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
         log = self.state / "ci_validation.log"
         self.assertIn(str(log), result.stdout)
         self.assertIn("FAILED: fixed-commit validation", log.read_text())
@@ -351,7 +403,10 @@ PY
         self.assertEqual(ci_points.read_run(self.state).tip, observed["remote_tip"])
         self.assertTrue(any("--commit" in call and observed["remote_tip"] in call
                             for call in self.calls("gh")), self.calls("gh"))
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_validation_fix_fast_forwards_an_unchanged_remote_branch(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -372,28 +427,39 @@ PY
         self.assertEqual(self.git("rev-parse", "HEAD"), fixed)
         self.assertEqual(self.git("show", "production:README.md", cwd=self.origin), "validation fix")
         self.assertEqual((self.checkout / "README.md").read_text(), "validation fix\n")
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_validation_keeps_the_standing_git_configuration_clean(self) -> None:
         push_origin = self.origin.as_uri()
         _ = self.git("remote", "set-url", "--push", "origin", push_origin)
         self.fixed_commit_validation()
+        original = self.git("config", "--local", "--list").splitlines()
         result = self.run_ci("ci", "start", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = [line for line in original if not line.startswith(("core.bare=", "core.worktree="))]
+        expected.append("extensions.worktreeconfig=true")
+        self.assertCountEqual(self.git("config", "--local", "--list").splitlines(), expected)
         observed = self.validation_observation()
         checkout = Path(observed["directory"])
         self.assertEqual(observed["origin"], str(self.origin))
         self.assertEqual(observed["push_origin"], push_origin)
-        self.assertEqual(self.git("config", "--local", "--get", "remote.origin.url", cwd=checkout),
-                         str(self.origin))
-        for key in ("remote.origin.pushurl", "user.name", "user.email"):
-            config = subprocess.run(["git", "config", "--local", "--get", key], cwd=checkout,
-                                    env=self.env, capture_output=True, text=True, check=False)
-            self.assertEqual(config.returncode, 1, (key, config.stdout, config.stderr))
-        before = (checkout / ".git/config").read_bytes()
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        before = observed["local_config"]
+        self.assertIn(str(self.origin), before)
+        config = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "config"))
+        self.assertEqual(before, config.read_text())
         result = self.run_ci("ci", "start", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((checkout / ".git/config").read_bytes(), before)
+        current = self.validation_observation()
+        self.assertEqual(current["directory"], observed["directory"])
+        self.assertTrue(Path(current["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(current["directory"])), "free")
+        self.assertEqual(current["local_config"], before)
+        self.assertEqual(current["cache"], observed["cache"])
 
     def test_collect_accepts_green_ci_on_the_published_validation_fix(self) -> None:
         self.fixed_commit_validation(fix_commit=True)
@@ -423,7 +489,10 @@ PY
         self.assertEqual(self.git("rev-parse", "production"), fixed)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue((Path(self.validation_observation()["directory"]) / ".git").is_dir())
+        self.assertTrue(self.validation_observation()["slot_git"])
+        self.assertTrue(Path(self.validation_observation()["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(self.validation_observation()["directory"])), "free")
+        self.assertTrue(Path(self.validation_observation()["cache"]).is_dir())
 
         result = self.start_point()
 
@@ -438,8 +507,12 @@ PY
         self.assertIn(f"validation: ok — validated {fixed}; no push; following {fixed}", result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all((Path(attempt["directory"]) / ".git").is_dir() for attempt in attempts))
+        self.assertTrue(all(attempt["slot_git"] for attempt in attempts))
+        self.assertTrue(all(Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertEqual({build_folders.build_folder_state(Path(attempt["directory"])) for attempt in attempts}, {"free"})
         self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
+        self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
+        self.assertTrue(Path(attempts[0]["cache"]).is_dir())
 
     def test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -459,7 +532,10 @@ PY
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
         self.assertFalse(self.calls("gh"))
-        self.assertTrue((Path(self.validation_observation()["directory"]) / ".git").is_dir())
+        self.assertTrue(self.validation_observation()["slot_git"])
+        self.assertTrue(Path(self.validation_observation()["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(self.validation_observation()["directory"])), "free")
+        self.assertTrue(Path(self.validation_observation()["cache"]).is_dir())
         reject.unlink()
 
         result = self.start_point()
@@ -477,8 +553,12 @@ PY
                       result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all((Path(attempt["directory"]) / ".git").is_dir() for attempt in attempts))
+        self.assertTrue(all(attempt["slot_git"] for attempt in attempts))
+        self.assertTrue(all(Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertEqual({build_folders.build_folder_state(Path(attempt["directory"])) for attempt in attempts}, {"free"})
         self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
+        self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
+        self.assertTrue(Path(attempts[0]["cache"]).is_dir())
 
     def test_a_later_merge_push_fast_forwards_from_the_published_ci_fix(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -543,7 +623,10 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {merged}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -559,7 +642,10 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {observed['remote_tip']}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -578,9 +664,12 @@ PY
         self.assertEqual(self.git("status", "--porcelain"), before_status)
         self.assertEqual((self.checkout / "README.md").read_bytes(), before_readme)
         self.assertFalse((self.stub_state / "pushes").exists())
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
-    def test_a_failed_validation_keeps_its_private_checkout_without_pushing(self) -> None:
+    def test_a_failed_validation_keeps_its_cache_without_pushing(self) -> None:
         initial = self.git("rev-parse", "HEAD")
         self.fixed_commit_validation(fail=True)
 
@@ -594,7 +683,10 @@ PY
         self.assertEqual((self.state / "ci_validation.log").read_text(),
                          "=== STEP: validation ===\nFAILED: fixed-commit validation\n")
         observed = self.validation_observation()
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
+        self.assertTrue(Path(observed["cache"]).is_dir())
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
         self.assertEqual(self.git("rev-parse", "HEAD"), initial)
         self.assertFalse((self.stub_state / "pushes").exists())
@@ -678,12 +770,11 @@ PY
         self.assertFalse((self.stub_state / "validate-calls").exists())
         self.assertEqual(self.calls("gh"), [])
 
-    def test_showrunner_and_dailies_share_review_watch_state_directory(self) -> None:
+    def test_showrunner_uses_one_review_watch_state_directory(self) -> None:
         root = Path(__file__).resolve().parents[2]
         produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
-        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
+        self.assertRegex(state_list, r"`WAITING_STATE_DIR`\s+—\s+`<STATE_DIR>/waiting_state`")
         calls = cast(list[tuple[str, str]], re.findall(
             r"ci_points\.py\s+(due|watch|ci start|ci collect)\b([^`]*)`",
             produce, flags=re.DOTALL))
@@ -693,9 +784,8 @@ PY
         self.assertEqual(len(stateful), 4, calls)
         for command, body in stateful:
             with self.subTest(command=command):
-                self.assertRegex(body, r"--state-dir\s+DAILIES_STATE_DIR\b")
+                self.assertRegex(body, r"--state-dir\s+WAITING_STATE_DIR\b")
                 self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
-        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<STATE_DIR>/dailies_input_state\b")
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
         tip = self.git("rev-parse", "HEAD")
@@ -968,59 +1058,52 @@ PY
 
     def test_simultaneous_watch_calls_claim_only_one_first_alert(self) -> None:
         _ = (self.stub_state / "watch-three").touch()
-        program = """import fcntl, os, runpy, sys
-ready = int(sys.argv.pop(1))
-sys.argv.pop(0)
-original = fcntl.flock
-def observed_lock(fd, operation):
-    if operation == fcntl.LOCK_EX:
-        try:
-            original(fd, operation | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.write(ready, b'blocked')
-        else:
-            raise RuntimeError('expected the parent to hold the review lock')
-        # Observe only the initial contention; later locks use their real path.
-        fcntl.flock = original
-    return original(fd, operation)
-fcntl.flock = observed_lock
-runpy.run_path(sys.argv[0], run_name='__main__')
-"""
         self.state.mkdir(exist_ok=True)
-        processes: list[subprocess.Popen[str]] = []
-        readiness: list[int] = []
-        try:
-            with (self.state / "review_watch.lock").open("a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                for _ in range(2):
-                    read_ready, write_ready = os.pipe()
-                    readiness.append(read_ready)
+
+        def watch(announcement: int) -> int:
+            original = fcntl.flock
+
+            def observed_lock(fd: int, operation: int) -> None:
+                if operation == fcntl.LOCK_EX:
                     try:
-                        processes.append(subprocess.Popen(
-                            [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
-                             "watch", "--production", "example", "--state-dir", str(self.state)],
-                            cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                        ))
-                    finally:
-                        os.close(write_ready)
-                for fd, process in zip(readiness, processes, strict=True):
-                    readable, _, _ = select.select([fd], [], [], 300)
-                    self.assertEqual(readable, [fd], "watch never reached the held lock")
-                    if os.read(fd, 7) != b"blocked":
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.fail("watch exited before observing the review lock: " + stdout + stderr)
-                self.assertTrue(all(process.poll() is None for process in processes))
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                results = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            for fd in readiness:
-                os.close(fd)
-        self.assertTrue(all(process.returncode == 0 for process in processes), results)
+                        original(fd, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        _ = os.write(announcement, b"blocked")
+                        os.close(announcement)
+                    else:
+                        raise RuntimeError("The parent must hold the review lock.")
+                    # Observe the first wait. Later locks use the real function.
+                    fcntl.flock = original
+                original(fd, operation)
+
+            with (patch.dict(os.environ, self.env, clear=True),
+                  patch.object(sys, "argv", [str(SCRIPT), "watch", "--production", "example",
+                                            "--state-dir", str(self.state)]),
+                  patch.object(fcntl, "flock", observed_lock)):
+                os.chdir(self.checkout)
+                return ci_points.main()
+
+        with ForkChildren() as children, (self.state / "review_watch.lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            processes: list[ForkChild] = []
+            readiness: list[int] = []
+            for _ in range(2):
+                read_ready, write_ready = children.pipe()
+                processes.append(children.start(
+                    lambda write_ready=write_ready: watch(write_ready),
+                    close_fds=(lock.fileno(),), pass_fds=(write_ready,)))
+                readiness.append(read_ready)
+            for fd, process in zip(readiness, processes, strict=True):
+                readable, _, _ = select.select([fd], [], [], 300)
+                self.assertEqual(readable, [fd], "watch never reached the held lock")
+                if os.read(fd, 7) != b"blocked":
+                    result = process.result()
+                    self.fail("watch exited before observing the review lock: " + result.stdout + result.stderr)
+            self.assertTrue(all(process.is_alive() for process in processes))
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            completed = [process.result() for process in processes]
+        results = [(process.stdout, process.stderr) for process in completed]
+        self.assertTrue(all(process.returncode == 0 for process in completed), results)
         self.assertEqual(sum("| phases merged | 12 |" in stdout for stdout, _ in results), 1)
         self.assertEqual(len(self.calls("send.py")), 0)
         self.assertEqual(self.log.read_text().count("review watch"), 1)

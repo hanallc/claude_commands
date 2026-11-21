@@ -3,28 +3,39 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 import unittest
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 
 
 class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment["PYTHONPYCACHEPREFIX"] = str(self.fixture.root.parent / "bytecode")
+        _ = self.fixture.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
     def hold_before_repair(self, tool: str) -> Path:
-        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
-        shell = self.fixture.root / "hold-before-repair.sh"
-        _ = shell.write_text('''
-hold_before_repair() {
-    case "$BASH_COMMAND" in
-        'invoke_mend --workspace --fix '*|'invoke_clippy_fix --workspace '*)
-            printf held > "$BUILD_HOLD_DIR/other"
-            ;;
-    esac
-}
-set -o functrace
-trap hold_before_repair DEBUG
-''')
-        self.fixture.environment["BASH_ENV"] = str(shell)
+        self.fixture.environment["TEST_REQUIRE_CLIPPY_FIX"] = "1" if tool == "clippy" else "0"
+        self.fixture.environment["TEST_REQUIRE_MEND_FIX"] = "1" if tool == "mend" else "0"
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink(missing_ok=True)
+        script = self.fixture.verify_script
+        invoke = script.parent.parent / "lint/invoke.sh"
+        function = "invoke_mend() {" if tool == "mend" else "invoke_clippy_fix() {"
+        self.assertIn(function, invoke.read_text())
+        commands = (("if lint_rewrite invoke_mend --workspace --fix ", "invoke_mend --workspace --fix ")
+                    if tool == "mend" else ("lint_rewrite invoke_clippy_fix --workspace ",))
+        hold = 'printf held > "$BUILD_HOLD_DIR/other"'
+        original = script.read_text()
+        updated = original
+        for command in commands:
+            line, = (line for line in original.splitlines() if line.lstrip().startswith(command))
+            indentation = line[:len(line) - len(line.lstrip())]
+            replacement = f"{indentation}{hold}\n{line}"
+            if replacement not in updated:
+                updated = updated.replace(line, replacement, 1)
+        _ = script.write_text(updated)
         cargo = self.fixture.bin_directory / "cargo"
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 repair = Path(os.environ["PACKAGE_ROOT"]) / "local-repair"
@@ -40,18 +51,18 @@ if arguments[:1] == ["''' + tool + '''"]:
         _ = cargo.write_text(source)
         return self.fixture.root / "local-repair"
 
-    def assert_local_repair(self, tool: str) -> None:
+    def assert_local_repair(self, tool: str, selection: tuple[str, ...] = ()) -> None:
         repair = self.hold_before_repair(tool)
-        result = self.run_verify("lint", "sample")
+        repair.unlink(missing_ok=True)
+        self.fixture.local_waits.clear()
+        result = self.run_verify("lint", "sample", "--no-cache", *selection)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(repair.exists(), result.stdout + result.stderr)
         self.assertEqual(repair.read_text(), "fixed locally")
         self.assertEqual(cast(dict[str, str], json.loads(repair.with_suffix(".hooks").read_text())), {
             "LINT_QUEUE_LEAVE_HOOK": "false", "BUILDLOG_MAC_IDLE_HOOK": "false",
         })
-        commands = [cast(dict[str, object], json.loads(line))["command"]
-                    for line in self.events.read_text().splitlines()]
-        self.assertIn("wait-local", commands)
+        self.assertTrue(self.fixture.local_waits)
         calls = [event["args"] for event in self.fixture.cargo_events()]
         self.assertTrue(any(words[:1] == [tool] and "--fix" in words for words in calls), calls)
         self.assertTrue(any("fmt" in words for words in calls), calls)
@@ -64,6 +75,16 @@ if arguments[:1] == ["''' + tool + '''"]:
 
     def test_clippy_fix_waits_for_natedev_and_changes_the_local_tree(self) -> None:
         self.assert_local_repair("clippy")
+
+    def test_a_mac_pin_keeps_mend_tree_writes_on_natedev(self) -> None:
+        for selection in (("--target", "mac"), ("--mac", "test local writes")):
+            with self.subTest(selection=selection):
+                self.assert_local_repair("mend", selection)
+
+    def test_a_mac_pin_keeps_clippy_tree_writes_on_natedev(self) -> None:
+        for selection in (("--target", "mac"), ("--mac", "test local writes")):
+            with self.subTest(selection=selection):
+                self.assert_local_repair("clippy", selection)
 
 
 if __name__ == "__main__":

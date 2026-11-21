@@ -27,6 +27,7 @@ Codex review prompts also include section 3's command block.
    Assign its required suites to the director or a writer.
    Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
    Include this command block verbatim after section 2 in every Codex prompt:
+   Merge prompts replace only the exit 3 line under <MergeWorkerCommands/>.
 
    ```
    ## Builds and tests
@@ -36,6 +37,7 @@ Codex review prompts also include section 3's command block.
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --label "<what>" -- <command>`.
+   For Python test runs, pass `--kind python-tests` before `--`.
    A successful start returns at once with the run, its pid and its log.
    A live twin takes priority over config/detached_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.
@@ -45,13 +47,18 @@ Codex review prompts also include section 3's command block.
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
    `wait`, loop on a status file, or post a waiting status.
+   The run's record and log stay until your pass ends; then they are deleted.
    Status 77 means cancelled because the tree changed: resubmit after your
    edits are done; it is not a test failure.
-   When a later edit or result makes a run of yours useless, cancel it in
-   the same turn: take `pid` from the run's record (the `.json` beside its
-   log), check that `ps -p <pid> -o args=` still shows
-   `detached_runs.py supervise` with that record's path, then run
-   `kill -TERM -- -<pid>`.
+   Cancel your run in the same turn if a later edit or result makes it obsolete.
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>`.
+   Use the run's `.json` file beside its log as `<record>`.
+   The command checks the supervisor and command identity before it stops the command group.
+   Your pass stays active if your native session record verifies the run's owner staff ID.
+   The supervisor sends you the STOPPED result with your reason.
+   If the supervisor dies, the next start or worker restore reaps the record and delivers its result.
+   To recover it directly, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py reap --session-dir <run>`.
    ```
 
    Claude workers use `run_in_background: true` and end the turn until the result arrives.
@@ -86,6 +93,9 @@ Codex review prompts also include section 3's command block.
       Keep every main-path test.
 
    For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
+   Every implementation, fix, test, research and review prompt carries this instruction verbatim:
+   "Make every folder you need for your own work (a clone, a copy, a download, a trial project) with `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]`. It prints the path, and the folder is removed when your assignment ends. Never make a folder under `/tmp` or `~/rust` by hand."
+   "A folder or file you make on another machine (the Mac) follows the same rule. Make it in a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`."
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
    - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
@@ -120,6 +130,22 @@ Codex review prompts also include section 3's command block.
 
     Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
+
+<MergeWorkerCommands>
+Apply section 3's command block from <WritePromptContract/> with this replacement for its exit 3 line:
+
+```
+Exit 3 means the caller has no registered worker route. Report the route failure and stop.
+Never run the command attached.
+```
+</MergeWorkerCommands>
+
+<MergeWorkerPaths>
+Store merge worker prompts, replies, logs, and command scripts under the existing run directory.
+Replace old session scratch paths in scripts and their dependencies before dispatch.
+Run long gates and builds in task-owned copies at the ordered commit.
+Keep those copies independent of the director's movable checkout until their commands end.
+</MergeWorkerPaths>
 
 <PhaseTeam>
 Every phase's implementation dispatch assigns **two workers at once**; a
@@ -195,7 +221,7 @@ Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
   A `status` post does not change the role field.
 
 Record decisions on the board. Keep the slot argument in every post.
-Read worker names and states with `worker.py list`.
+Read worker names and states with `worker.py list all`.
 Use `send.py --to worker:<unit>/<short name> --from "<sender>" --text "<text>"` under the sender's showrunner.
 Use `worker:<showrunner>/<unit>/<short name>` from outside that showrunner.
 The address resolves through staff and the shared pane observation.

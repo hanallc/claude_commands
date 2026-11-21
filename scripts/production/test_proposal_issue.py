@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import hashlib
 import io
+import json
 import threading
 import time
 import os
@@ -18,10 +19,12 @@ from typing import final, override
 from unittest import mock
 
 from scripts.production import proposal_issue
-from scripts.production.issues import Issue
-from scripts.production import staff, unit_names
+from scripts.production.issues import Issue, frontmatter
+from scripts.production import proposals_folder, record_store, staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
+from scripts.review_links import new_item_dialog
+from scripts.review_links.review_events import ReviewMark
 from scripts.style import rules
 
 ISSUE = """---
@@ -66,17 +69,166 @@ class ProposalIssueTests(unittest.TestCase):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
-        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
+        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime),
+                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners")}))
         members: tuple[tuple[str, staff.Kind], ...] = (
             ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
             ("names", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
         rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind,
                                     unit_names.name(name) if kind == "unit" else name,
                                     staff.ReportsTo(staff.StaffId(fixture_runtime_id("hana"))) if kind == "unit" else staff.StaffRoot(),
-                                    current_session=staff.StaffId(fixture_runtime_id(name)))
+                                    current_session=staff.StaffId(fixture_runtime_id(name)),
+                                    unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit())
                      for name, kind in members)
         _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
         _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value=fixture_runtime_id("hana")))
+
+    def test_review_filing_uses_the_existing_number_allocator_and_reads_the_archive(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        original = folder / self.issue.name
+        _ = original.write_text(VAULT_ISSUE)
+        self.assertEqual(proposal_issue.number([original], date(2026, 11, 17)), ["number a proposal.md: P1"])
+        recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
+                                                    "hana answers this", details)
+        self.assertEqual(issue.value("proposal_id"), "P2")
+        self.assertEqual(proposal_issue.number([issue.path], date(2026, 11, 17)), ["number next proposal.md: P2"])
+        archive = self.root / proposal_issue.ARCHIVE
+        archive.mkdir(parents=True)
+        archived = issue.path.rename(archive / issue.path.name)
+        saved = proposal_issue.find_review_proposal(folder, recipient, new_item_dialog.ByRequestId(details.request_id))
+        assert saved is not None
+        self.assertEqual(saved.path, archived)
+        self.assertEqual(proposal_issue.review_submission(saved), details)
+
+    def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
+        folder = self.root / "issues"
+        recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        today = date(2026, 11, 17)
+        issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
+                                                    "hana answers this", details)
+        changed = proposal_issue.approve(issue.path, {"unit": "names"}, proposal_issue.SHOWRUNNER, "hana", today)
+        self.assertIn(proposal_issue.REVIEW_MARK_FIELD, changed)
+        approved = Issue(issue.path, frontmatter(issue.path))
+        self.assertTrue(proposal_issue.review_is_done(approved))
+        self.assertEqual(approved.value(proposal_issue.REVIEW_MARK_FIELD), "")
+        key = new_item_dialog.ScopedSubmissionKey(new_item_dialog.SubmissionKind.PROPOSAL, recipient,
+                                                   issue.value("proposal_id"), details.request_id)
+        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
+            _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", details.reply_token, owner=key.recipient_id)
+
+    def test_f060_number_scans_the_folder_of_a_selected_numbered_proposal(self) -> None:
+        today = date(2026, 11, 17)
+        _ = self.issue.write_text(VAULT_ISSUE)
+        _ = proposal_issue.number([self.issue], today)
+        synced = self.root / "synced" / "already numbered.md"
+        synced.parent.mkdir()
+        _ = synced.write_text(VAULT_ISSUE.replace("stage: backlog", 'proposal_id: "P2"\nstage: backlog'))
+        unnumbered = self.root / "new.md"
+        _ = unnumbered.write_text(VAULT_ISSUE)
+        self.assertEqual(proposal_issue.number([synced, unnumbered], today),
+                         ["number already numbered.md: P2", "number new.md: P3"])
+
+    def test_f061_unreadable_selection_refuses_the_entire_number_batch(self) -> None:
+        today = date(2026, 11, 17)
+        _ = self.issue.write_text(VAULT_ISSUE)
+        _ = proposal_issue.number([self.issue], today)
+        new = self.root / "new.md"
+        _ = new.write_text(VAULT_ISSUE)
+        unreadable = self.root / "other" / "unreadable.md"
+        unreadable.parent.mkdir()
+        _ = unreadable.write_bytes(b"---\n\xff\n")
+        with self.assertRaisesRegex(OSError, "Cannot read record.*unreadable.md"):
+            _ = proposal_issue.number([new, unreadable], today)
+        self.assertEqual(new.read_text(), VAULT_ISSUE)
+        self.assertEqual((record_store.state_root() / "record-ids/proposal.water").read_text(), "1\n")
+
+    def test_f081_create_keeps_a_legacy_decision_with_its_proposer(self) -> None:
+        members = staff.snapshot()
+        owner = next(row for row in members.rows if row.name == "style")
+        other = staff.StaffRow(staff.StaffId("other-style"), "showrunner", "other", staff.StaffRoot(),
+                               current_session=staff.StaffId("other-session"))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*members.rows, other))))
+        template = self.root / "template.yaml"
+        _ = template.write_text(VAULT_ISSUE)
+        legacy = self.root / "decision.md"
+        original = (f"---\nproposed_by: {other.id}\nproposal_id: P7\nstyle_rule: rule\n"
+                    "style_crate: crate\nstyle_rule_blob: blob\n---\nThe other production decided.\n")
+        _ = legacy.write_text(original)
+        filed: list[Path] = []
+        created = proposal_issue.create(legacy, "alpha", "a", owner.id, ["style"],
+                                        "rule", "crate", "blob", 1, "Words.", template, date(2026, 11, 17),
+                                        initial_fields={}, filed_at=filed.append)
+        self.assertTrue(created)
+        decision, = filed
+        self.assertNotEqual(decision, legacy)
+        self.assertEqual(frontmatter(decision)["production_id"], [owner.id])
+        self.assertEqual(legacy.read_text(), original)
+
+    def test_f062_create_checks_both_folders_under_the_proposal_lock(self) -> None:
+        owner = next(row for row in staff.snapshot().rows if row.name == "style")
+        former, current = self.root / "former", self.root / "current"
+        former.mkdir()
+        current.mkdir()
+        registry = record_store.state_root() / "review-folders" / owner.id / "proposal.json"
+        registry.parent.mkdir(parents=True)
+        _ = registry.write_text(json.dumps([str(former), str(current)]))
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        chosen: list[Path] = []
+
+        def create(folder: Path) -> bool:
+            return proposal_issue.create(folder / "decision.md", "alpha", "a", owner.id, ["style"],
+                                         "rule", "crate", "blob", 1, "Words.", template, date(2026, 11, 17),
+                                         initial_fields={}, filed_at=chosen.append)
+
+        lock = proposal_issue.proposal_numbers
+        competitor: list[bool] = []
+
+        @contextlib.contextmanager
+        def enter_lock() -> Generator[record_store.LockedRecordNumbers]:
+            if not competitor:
+                competitor.append(False)
+                competitor[0] = create(former)
+            with lock() as numbers:
+                yield numbers
+
+        with mock.patch.object(proposal_issue, "proposal_numbers", side_effect=enter_lock):
+            self.assertFalse(create(current))
+        self.assertEqual(competitor, [True])
+        self.assertEqual(chosen, [former / "decision.md"] * 2)
+        self.assertEqual(list(current.glob("*.md")), [])
+
+    def test_f063_create_refuses_an_invalid_result_file_before_publication(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        body = self.root / "body.txt"
+        _ = body.write_text("Words.")
+        issue = self.root / "decision.md"
+        code, _, _ = self.run_cli("create", str(issue), "--project", "alpha", "--short", "a",
+                                  "--proposed-by", "style", "--rule", "rule", "--crate", "crate",
+                                  "--rule-blob", "blob", "--count", "1", "--body-file", str(body),
+                                  "--template", str(template), "--filed-path-file", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertFalse(issue.exists())
+
+    def test_f068_proposal_count_ignores_an_archive_index(self) -> None:
+        doc = self.root / "production.md"
+        folder = self.root / "issues"
+        folder.mkdir()
+        _ = doc.write_text(f"- **Proposals:** {folder}\n")
+        issue = folder / "proposal.md"
+        _ = issue.write_text(VAULT_ISSUE)
+        archive = folder / "archive"
+        archive.mkdir()
+        index = archive / "README.md"
+        _ = index.write_text("# Archive\n")
+        sources: list[Path] = []
+        self.assertEqual([item.path for item in proposals_folder.proposal_issues(doc, sources=sources)], [issue])
+        self.assertIn(index, sources)
 
     def test_unit_staff_reference_accepts_the_short_name_and_unit_id(self) -> None:
         row = next(member for member in staff.snapshot().rows if member.name == "names")
@@ -140,14 +292,22 @@ class ProposalIssueTests(unittest.TestCase):
         arguments = ["create", str(issue), "--project", "alpha", "--short", "alpha", "--proposed-by", "sample-style",
                      "--extra-tags", "style", "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", "abc123", "--count", "3", "--body-file", str(body), "--template", str(template)]
         ranking = "goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐⭐ · urgency ⭐ · effort ⭐"
-        for label, flags, expected in (("new style issue", [], ""),
-                                       ("ranked style issue", ["--proposed-ranking", ranking], ranking)):
-            with self.subTest(ranking=expected):
+        for label, flags, expected, proposer in (
+                ("new style issue", [], "", "sample-style"),
+                ("ranked style issue", ["--proposed-ranking", ranking], ranking, "sample-style"),
+                ("unit name issue", [], "", "names"),
+                ("unit id issue", [], "", fixture_runtime_id("names"))):
+            with self.subTest(ranking=expected, proposer=proposer):
                 destination = self.root / (label + ".md")
                 command = [*arguments]
                 command[1] = str(destination)
+                if destination != issue:
+                    command[command.index("--rule-blob") + 1] = destination.stem
+                command[command.index("--proposed-by") + 1] = proposer
                 code, _, err = self.run_cli(*command, *flags)
                 self.assertEqual(code, 0, err)
+                expected_id = fixture_runtime_id("sample-style" if proposer == "sample-style" else "names")
+                self.assertIn(f'proposed_by: "{expected_id}"', destination.read_text())
                 self.assertIn(f"\n\nProposed ranking: {expected}\n\n<!-- style-decision:start -->\n# Findings\nBefore and after.\n",
                               destination.read_text())
         from scripts.production.issues import frontmatter
@@ -165,7 +325,11 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(self.run_cli(*arguments)[0], 0)
         self.assertEqual(issue.stat().st_mtime_ns, stamp)
         arguments[arguments.index("--rule-blob") + 1] = "c"
-        self.assertEqual(self.run_cli(*arguments)[0], 2)
+        code, output, error = self.run_cli(*arguments)
+        self.assertEqual(code, 0, error)
+        alternate, = self.root.glob("new style issue p*.md")
+        self.assertEqual(output, f"create {alternate.name}: created\n")
+        self.assertEqual(frontmatter(alternate)["style_rule_blob"], ["c"])
         self.assertEqual(issue.read_bytes(), original)
 
     def test_area_style_sets_the_area_and_vault_date_on_current_and_closed_legacy_issues(self) -> None:
@@ -338,7 +502,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(stamps, [issue.stat().st_mtime_ns])
         self.assertEqual(list(self.root.glob(".decision-*")), [])
 
-    def test_create_refuses_a_different_key_decision_that_appears_at_the_link(self) -> None:
+    def test_create_uses_a_free_name_when_another_decision_appears_at_the_link(self) -> None:
         template = self.root / "template.yaml"
         _ = template.write_text("---\nstatus: open\n---\n")
         issue = self.root / "decision.md"
@@ -348,18 +512,18 @@ class ProposalIssueTests(unittest.TestCase):
         stamps: list[int] = []
 
         def competing_create(temporary: Path, path: Path) -> None:
-            self.assertEqual(path, issue)
             self.assertTrue(temporary.is_file())
-            _ = path.write_bytes(original)
-            stamps.append(path.stat().st_mtime_ns)
+            if path == issue:
+                _ = path.write_bytes(original)
+                stamps.append(path.stat().st_mtime_ns)
             link(temporary, path)
 
         with mock.patch.object(os, "link", side_effect=competing_create):
-            with self.assertRaises(proposal_issue.Refusal) as refusal:
-                _ = proposal_issue.create(
-                    issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
-                    "# New examples\n", template, date(2026, 10, 20), initial_fields={})
-        self.assertEqual(str(refusal.exception), f"{issue}: different decision key")
+            self.assertTrue(proposal_issue.create(
+                issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                "# New examples\n", template, date(2026, 10, 20), initial_fields={}))
+        alternate = issue.with_stem("decision p48")
+        self.assertIn('proposal_id: "P48"', alternate.read_text())
         self.assertEqual(issue.read_bytes(), original)
         self.assertEqual(stamps, [issue.stat().st_mtime_ns])
         self.assertEqual(list(self.root.glob(".decision-*")), [])
@@ -389,7 +553,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual({path.name for path in self.root.iterdir()},
                          {"a proposal.md", "template.yaml", "decision.md"})
 
-    def test_create_refuses_a_different_key_decision_that_appears_before_the_folder_lock(self) -> None:
+    def test_create_uses_a_free_name_when_another_decision_appears_before_the_folder_lock(self) -> None:
         template = self.root / "template.yaml"
         _ = template.write_text("---\nstatus: open\n---\n")
         issue = self.root / "decision.md"
@@ -407,13 +571,27 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(issue.stat().st_mtime_ns, stamp)
 
         with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
-            with self.assertRaises(proposal_issue.Refusal) as refusal:
-                _ = proposal_issue.create(
-                    issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
-                    "# New examples\n", template, date(2026, 10, 20), initial_fields={})
-        self.assertEqual(str(refusal.exception), f"{issue}: different decision key")
+            self.assertTrue(proposal_issue.create(
+                issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                "# New examples\n", template, date(2026, 10, 20), initial_fields={}))
+        self.assertIn('proposal_id: "P48"', issue.with_stem("decision p48").read_text())
         self.assertEqual(issue.read_bytes(), original)
         self.assertEqual(list(self.root.glob(".decision-*")), [])
+
+    def test_f069_create_refuses_an_existing_result_file(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        body = self.root / "body.txt"
+        _ = body.write_text("Examples\n")
+        before = self.issue.read_bytes()
+        code, _, error = self.run_cli(
+            "create", str(self.issue), "--filed-path-file", str(self.issue), "--project", "sample",
+            "--short", "s", "--proposed-by", "style", "--rule", "global:rust/names.md", "--crate",
+            "alpha", "--rule-blob", "abc", "--count", "1", "--template", str(template), "--body-file", str(body))
+        self.assertEqual(code, 2, error)
+        self.assertIn("The result file already exists", error)
+        self.assertEqual(self.issue.read_bytes(), before)
+        self.assertEqual(list(self.root.glob("*.md")), [self.issue])
 
     def test_create_gives_two_different_decisions_distinct_proposal_numbers(self) -> None:
         template = self.root / "template.yaml"
@@ -538,6 +716,26 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(blocked, [True])
                 self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["a proposal.md"])
 
+    def test_review_writes_check_the_record_under_the_issue_lock(self) -> None:
+        before = self.issue.read_bytes()
+        today = date(2026, 11, 15)
+
+        def refuse() -> None:
+            lock, = self.runtime.glob("proposal-issue-*.lock")
+            with lock.open("a") as other, self.assertRaises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.issue.read_bytes(), before)
+            raise proposal_issue.Refusal("The record changed.")
+
+        actions = {
+            "decline": lambda: proposal_issue.edit(self.issue, {"style_answer": "declined"}, today, check=refuse),
+            "approve": lambda: proposal_issue.record_review(self.issue, "Approve", ReviewMark.DONE, today, check=refuse),
+        }
+        for outcome, action in actions.items():
+            with self.subTest(outcome=outcome), self.assertRaisesRegex(proposal_issue.Refusal, "The record changed"):
+                _ = action()
+            self.assertEqual(self.issue.read_bytes(), before)
+
     def test_fill_ranking_writes_an_empty_ranking_once_under_the_issue_lock(self) -> None:
         self.decision_issue()
         _ = self.issue.write_text(self.text().replace("Proposed ranking: effort one", "Proposed ranking: "))
@@ -595,7 +793,7 @@ class ProposalIssueTests(unittest.TestCase):
                 issue = self.root / f"{name}.md"
                 code, _, error = self.run_cli(
                     "create", str(issue), "--project", "sample", "--short", "s", "--proposed-by", "style",
-                    "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", "abc123", "--count", "1",
+                    "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", name, "--count", "1",
                     "--template", str(template), "--body-file", str(body), "--initial-fields", fields)
                 self.assertEqual(code, 0, error)
                 self.assertEqual(frontmatter(issue)["stage"], [stage])

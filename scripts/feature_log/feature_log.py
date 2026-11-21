@@ -18,7 +18,7 @@ import socket as socket
 import subprocess as subprocess
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
@@ -352,6 +352,16 @@ SshRunner = Callable[[list[str]], int]
 class FeatureLogError(ValueError):
     """A rejected command or invalid feature note."""
 
+    @property
+    def diagnostic(self) -> str:
+        """Return the refusal text with one feature log prefix."""
+        message = str(self)
+        return message if message.startswith("feature_log: ") else f"feature_log: {message}"
+
+
+class ProposalCloseoutBlocked(FeatureLogError):
+    """The proposal conflicts with another closeout that has already finished."""
+
 
 def vault_dir() -> Path:
     """Return the feature-log vault selected by the current environment."""
@@ -379,6 +389,31 @@ def _run_ssh(command: list[str]) -> int:
 def _ssh_command(argv: list[str]) -> list[str]:
     remote = "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py "
     return ["ssh", "natedev", remote + shlex.join(argv)]
+
+
+def _off_host(argv: list[str]) -> bool:
+    """Keep project lookup local and forward vault commands when no vault is configured."""
+    return (
+        (not argv or argv[0] != "project-of")
+        and socket.gethostname().split(".", 1)[0] != "natedev"
+        and "FEATURE_LOG_VAULT" not in os.environ
+    )
+
+
+def _forward_review(argv: list[str]) -> list[str]:
+    """Return remote output lines or raise the remote refusal."""
+    try:
+        result = subprocess.run(_ssh_command(argv), capture_output=True, text=True, check=False)
+    except (OSError, UnicodeError) as error:
+        raise FeatureLogError(str(error)) from error
+    if result.returncode:
+        diagnostic = (result.stderr or result.stdout).strip() or "feature-log operation failed"
+        reason = diagnostic.removeprefix("feature_log: ")
+        if result.returncode == 2 and re.fullmatch(
+                r"(?:proposal .+ is already (?:dropped|landed)|old note .+ is not live)", reason):
+            raise ProposalCloseoutBlocked(diagnostic)
+        raise FeatureLogError(diagnostic)
+    return result.stdout.splitlines()
 
 
 def _read_forwarded_selection(command: list[str]) -> ChangelogSelection | ForwardFailed:
@@ -1318,7 +1353,7 @@ def _prepare_new(
     return True, note
 
 
-def _apply_add(note: Note, arguments: argparse.Namespace) -> list[str]:
+def _apply_add(note: Note, arguments: argparse.Namespace, *, check_only: bool = False) -> list[str]:
     path = _note_path(note)
     backfill = cast(bool, arguments.backfill)
     should_write, stored = _prepare_new(
@@ -1327,6 +1362,8 @@ def _apply_add(note: Note, arguments: argparse.Namespace) -> list[str]:
         completed_date_was_defaulted=cast(str | None, arguments.completed) is None,
         replacing_titles=frozenset(),
     )
+    if check_only:
+        return []
     if not should_write:
         if not _event_recorded("add", stored["project"], stored["title"]):
             _append_event(_add_event(stored, backfill))
@@ -1354,7 +1391,7 @@ def _updated_replacement(note: Note, replacement: str) -> Note:
 
 
 def _apply_supersede(
-    note: Note, arguments: argparse.Namespace, policy: ReplacementPolicy
+    note: Note, arguments: argparse.Namespace, policy: ReplacementPolicy, *, check_only: bool = False
 ) -> list[str]:
     old_titles = [normalize_title(item) for item in cast(list[str], arguments.old)]
     old_titles = list(dict.fromkeys(old_titles))
@@ -1382,11 +1419,13 @@ def _apply_supersede(
             )
         elif note["title"] not in old_note["replaced_by"]:
             if isinstance(policy, ReplaceLiveNotes):
-                raise FeatureLogError(f"old note {old_title} is not live")
+                raise ProposalCloseoutBlocked(f"old note {old_title} is not live")
             replacements.append(
                 (old_path, _updated_replacement(old_note, note["title"]), old_title)
             )
 
+    if check_only:
+        return []
     if write_new:
         _write_note(new_path, stored)
         outputs.append(f"added: {_relative(new_path)}")
@@ -1615,7 +1654,7 @@ def _validate_proposal_old_notes(note: Note, old_titles: list[str]) -> None:
         old_note = parse_note(path)
         validate_note(old_note, note["project"])
         if old_note["state"] != "live":
-            raise FeatureLogError(f"old note {old_title} is not live")
+            raise ProposalCloseoutBlocked(f"old note {old_title} is not live")
 
 
 def _run_propose(arguments: argparse.Namespace) -> int:
@@ -1655,63 +1694,81 @@ def _run_propose(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _run_review_land(verb: Literal["add", "supersede"], row_value: str, if_proposed: bool) -> int:
+def land_review(
+    row_value: str, if_proposed: bool = False, *,
+    verb: Literal["add", "supersede", "recorded"] = "recorded", check_only: bool = False,
+) -> list[str]:
+    """Land a proposal with its recorded verb, or require the verb supplied by the CLI."""
+    arguments = ["land" if verb == "recorded" else verb, "--review", row_value]
+    if if_proposed:
+        arguments.append("--if-proposed")
+    if check_only:
+        arguments.append("--check-only")
+    if _off_host(arguments):
+        return _forward_review(arguments)
     row = _review_row(row_value)
-    with locked():
+    with nullcontext() if check_only else locked():
         proposal = _read_proposal(row)
         if proposal is None:
             if if_proposed:
-                print(f"skipped: no proposal for {row}")
-                return 0
+                return [f"skipped: no proposal for {row}"]
             raise FeatureLogError(f"no proposal for {row}; run propose first")
-        if proposal["verb"] != verb:
+        if verb != "recorded" and proposal["verb"] != verb:
             raise FeatureLogError(
                 f"proposal {row} uses {proposal['verb']}; run {proposal['verb']} --review {row}"
             )
         if proposal["status"] == "landed":
-            print(f"unchanged: [[{proposal['note']}]]")
-            return 0
+            return [f"unchanged: [[{proposal['note']}]]"]
         if proposal["status"] == "dropped":
-            raise FeatureLogError(f"proposal {row} is already dropped")
+            raise ProposalCloseoutBlocked(f"proposal {row} is already dropped")
         saved_arguments = _proposal_namespace(proposal["args"])
+        # Each review row identifies a separate result, including older proposals.
+        saved_arguments.separate_result = True
         note = _new_note(saved_arguments)
         outputs = (
-            _apply_add(note, saved_arguments)
-            if verb == "add"
-            else _apply_supersede(note, saved_arguments, ReplaceLiveNotes())
+            _apply_add(note, saved_arguments, check_only=check_only)
+            if proposal["verb"] == "add"
+            else _apply_supersede(note, saved_arguments, ReplaceLiveNotes(), check_only=check_only)
         )
+        if check_only:
+            return []
         landed: LandedProposal = {
             "row": row,
-            "verb": verb,
+            "verb": proposal["verb"],
             "args": proposal["args"],
             "status": "landed",
             "at": _event_time(),
             "note": note["title"],
         }
         _write_json(_proposal_path(row), landed)
-    for output in outputs:
-        print(output)
-    print(f"[[{note['title']}]]")
-    return 0
+    return [*outputs, f"[[{note['title']}]]"]
 
 
-def _run_drop(arguments: argparse.Namespace) -> int:
-    row = _review_row(cast(str, arguments.review))
-    verdict = cast(str, arguments.verdict).strip()
+def drop_review(row_value: str, verdict: str, if_proposed: bool = False, *, check_only: bool = False) -> list[str]:
+    """Drop a proposal with a verdict that contains one nonempty line."""
+    arguments = ["drop", "--review", row_value, f"--verdict={verdict}"]
+    if if_proposed:
+        arguments.append("--if-proposed")
+    if check_only:
+        arguments.append("--check-only")
+    if _off_host(arguments):
+        return _forward_review(arguments)
+    row = _review_row(row_value)
+    verdict = verdict.strip()
     if not verdict or "\n" in verdict:
         raise FeatureLogError("verdict must be one non-empty line")
-    with locked():
+    with nullcontext() if check_only else locked():
         proposal = _read_proposal(row)
         if proposal is None:
-            if cast(bool, arguments.if_proposed):
-                print(f"skipped: no proposal for {row}")
-                return 0
+            if if_proposed:
+                return [f"skipped: no proposal for {row}"]
             raise FeatureLogError(f"no proposal for {row}; run propose first")
         if proposal["status"] == "dropped":
-            print(f"unchanged: {row}")
-            return 0
+            return [f"unchanged: {row}"]
         if proposal["status"] == "landed":
-            raise FeatureLogError(f"proposal {row} is already landed")
+            raise ProposalCloseoutBlocked(f"proposal {row} is already landed")
+        if check_only:
+            return []
         dropped: DroppedProposal = {
             "row": row,
             "verb": proposal["verb"],
@@ -1721,7 +1778,20 @@ def _run_drop(arguments: argparse.Namespace) -> int:
             "verdict": verdict,
         }
         _write_json(_proposal_path(row), dropped)
-    print(f"dropped: {row}")
+    return [f"dropped: {row}"]
+
+
+def _run_review_land(verb: Literal["add", "supersede", "recorded"], row_value: str, if_proposed: bool, *,
+                     check_only: bool = False) -> int:
+    for line in land_review(row_value, if_proposed, verb=verb, check_only=check_only):
+        print(line)
+    return 0
+
+
+def _run_drop(arguments: argparse.Namespace) -> int:
+    for line in drop_review(cast(str, arguments.review), cast(str, arguments.verdict),
+                            cast(bool, arguments.if_proposed), check_only=cast(bool, arguments.check_only)):
+        print(line)
     return 0
 
 
@@ -2272,7 +2342,7 @@ def _github_slug(remote: str) -> str | None:
     return None
 
 
-def _project_of(path: str) -> str | None:
+def project_of(path: str) -> str | None:
     """Return the configured project for a checkout's origin, when known."""
     result = subprocess.run(
         ["git", "-C", path, "remote", "get-url", "origin"],
@@ -2289,7 +2359,7 @@ def _project_of(path: str) -> str | None:
 
 
 def _run_project_of(arguments: argparse.Namespace) -> int:
-    project = _project_of(cast(str, arguments.path))
+    project = project_of(cast(str, arguments.path))
     print(project or "none")
     return 0
 
@@ -2369,9 +2439,15 @@ def _parser() -> FeatureLogArgumentParser:
     _ = propose.add_argument("--old", action="append")
     _add_new_note_arguments(propose, required=True)
 
+    land = subparsers.add_parser("land")
+    _ = land.add_argument("--if-proposed", action="store_true")
+    _ = land.add_argument("--review", required=True)
+    _ = land.add_argument("--check-only", action="store_true")
+
     drop = subparsers.add_parser("drop")
     _ = drop.add_argument("--if-proposed", action="store_true")
     _ = drop.add_argument("--review", required=True)
+    _ = drop.add_argument("--check-only", action="store_true")
     _ = drop.add_argument("--verdict", required=True)
 
     amend = subparsers.add_parser("amend")
@@ -2427,11 +2503,7 @@ def main(
     forwarded_reader: ForwardedReader = _read_forwarded_selection,
     release_forwarder: ReleaseForwarder = _forward_release,
 ) -> int:
-    off_host = (
-        (not argv or argv[0] != "project-of")
-        and socket.gethostname().split(".", 1)[0] != "natedev"
-        and "FEATURE_LOG_VAULT" not in os.environ
-    )
+    off_host = _off_host(argv)
     if off_host and (not argv or argv[0] not in {"changelog", "release"}):
         return ssh_runner(_ssh_command(argv))
     try:
@@ -2471,6 +2543,9 @@ def main(
             return _run_supersede(arguments, policy)
         if command == "propose":
             return _run_propose(arguments)
+        if command == "land":
+            return _run_review_land("recorded", cast(str, arguments.review), cast(bool, arguments.if_proposed),
+                                    check_only=cast(bool, arguments.check_only))
         if command == "drop":
             return _run_drop(arguments)
         if command == "amend":
@@ -2485,7 +2560,7 @@ def main(
             return _run_check()
         raise FeatureLogError(f"unknown command {command}")
     except FeatureLogError as error:
-        print(f"feature_log: {error}", file=sys.stderr)
+        print(error.diagnostic, file=sys.stderr)
         return 2
 
 

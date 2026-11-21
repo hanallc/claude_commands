@@ -18,7 +18,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
 from pathlib import Path
 from typing import Literal, cast, final, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import sys
@@ -30,15 +30,16 @@ from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch,
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import fake_unit_host, showrunners, staff
 from scripts.message import sessions as reader_sessions
-from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
-from scripts.shutdown import stop_resume
-from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
-from scripts.shutdown import pane_record as hook_pane_record
+from scripts.agents.remote import local_machine
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, recorded_unit
+from scripts.agents import stop_resume
+from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
+from scripts.agents import pane_record as hook_pane_record
 
-from scripts.shutdown import inventory, pane_record
-from scripts.herdr import herdr
-from scripts.message import sessions
+from scripts.agents import inventory, pane_record
+from scripts.herdr import herdr, pane_launch
+from scripts.herdr.test_herdr import ClaudeForegroundSocket
+from scripts.message import session_records, sessions
 from scripts.production import unit_lookup
 from scripts.whoami import quota_alert
 from scripts.lib.atomic_file import write_text_atomic
@@ -103,6 +104,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.pending = []
         self.finish_jobs = True
         _ = self.enterContext(patch.object(staff, "local_snapshot", side_effect=self.current_staff))
+        _ = self.enterContext(patch.object(staff, "initial_snapshot", side_effect=self.current_staff))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(hook_pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=self.resume))
@@ -113,8 +115,10 @@ class UnitWatchdogTests(unittest.TestCase):
             showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", name="fixture", zone="UTC", doc=str(self.doc))])))
         _ = self.enterContext(patch.object(showrunners, "tell", side_effect=self.tell))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
+        _ = self.enterContext(patch.object(stop_resume, "_send_move_push"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
         _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "panes", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
         _ = self.fixture.groups(units="claude2")
@@ -125,19 +129,23 @@ class UnitWatchdogTests(unittest.TestCase):
         self.fixture.reading("four@example.invalid", 80)
         self.write_doc()
 
-    def session_liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-        return (sessions.LiveSessionProcess(self.units[identity]["pid"]) if identity in
-                {entry["sessionId"] for entry in self.fixture.live} else sessions.SessionNotLive())
+    def session_liveness(self, identity: str,
+                         ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+        registry = sessions.read_registry()
+        with patch.object(session_records, "running_session", return_value=True):
+            return session_records.session_liveness(identity, registry)
 
     def write_doc(self) -> None:
         for name in self.units:
             tree = self.home / name
-            member = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
+            member = next((row for row in self.fixture.membership().find(kind="unit") if row.name == name), None)
+            if member is None:
+                member = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
             if name in self.retired:
                 _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
             _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
-            events: list[dict[str, object]] = [{"event_type": "run_started", "main_agent": {"session_id": member.current_session},
+            events: list[dict[str, object]] = [{"event_type": "run_started", "owner_staff_id": member.id,
                                               "working_dir": str(tree), "run_started_at": 1}]
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
@@ -152,6 +160,7 @@ class UnitWatchdogTests(unittest.TestCase):
         entry = pane_record.launch(name, name, cast(str, owner["cwd"]),
             {"CLAUDE_CONFIG_DIR": str(accounts.account_dir(label)), ('' + 'SHOWRUNNER_' + 'UNIT'): "fixture",
              ('' + 'SHOWRUNNER_' + 'UNIT_ID'): name}, ["claude", "-n", owner["name"]])
+        write_text_atomic(accounts.account_dir(label) / "projects/fixture" / f"{owner['session_id']}.jsonl", "")
         pane_record.write("shared", entry)
         identity = accounts.account_identity(accounts.account_dir(label))
         assert isinstance(identity, agent_accounts.NumberedAccount)
@@ -296,15 +305,20 @@ class UnitWatchdogTests(unittest.TestCase):
         for owner in self.units.values():
             fake_unit_host.process({"HERDR_PROC": str(proc)}, owner["pid"], 1, ["claude"], {}, cwd=self.home)
 
-        def reader_liveness(identity: str) -> reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive:
+        def reader_liveness(identity: str) -> (
+                reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive | reader_sessions.SessionLivenessUnknown):
             observed = self.session_liveness(identity)
+            if isinstance(observed, sessions.SessionLivenessUnknown):
+                return reader_sessions.SessionLivenessUnknown(observed.reason)
             return (reader_sessions.LiveSessionProcess(observed.pid) if isinstance(observed, sessions.LiveSessionProcess)
                     else reader_sessions.SessionNotLive())
 
         unread_names = LaunchNamesNotRead()
 
-        def tab(identity: str, *, names: LaunchNames | LaunchNamesNotRead = unread_names) -> herdr.TabSession:
+        def tab(reference: str, *, names: LaunchNames | LaunchNamesNotRead = unread_names) -> herdr.TabSession:
             _ = names
+            row = self.current_staff().by_member_reference(reference)
+            identity = str(row.current_session) if row is not None else reference
             return herdr.TabSession(identity, self.units[identity]["name"], "fixture", identity)
 
         def signal_claude(pid: int, requested: int) -> None:
@@ -321,12 +335,28 @@ class UnitWatchdogTests(unittest.TestCase):
             owner = next(entry for entry in self.fixture.live if entry["pid"] == pid)
             return herdr.NativeAgentProcess(herdr.EnvironmentThread(owner["sessionId"]), "fixture-start", {})
 
+        def panes() -> list[herdr.PaneIdentity]:
+            return [{"pane_id": identity, "terminal_id": "terminal-" + identity, "workspace_id": "fixture",
+                     "tab_id": "tab-" + identity, "label": owner["name"], "session_id": identity}
+                    for identity, owner in self.units.items()]
+
+        def process_info(*arguments: str) -> dict[str, object]:
+            identity = arguments[-1]
+            owner = self.units[identity]
+            live = isinstance(self.session_liveness(identity), sessions.LiveSessionProcess)
+            pid = owner["pid"] if live else 998042
+            return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "claude" if live else "zsh",
+                                          "argv": ["claude"] if live else ["zsh"]}]}}
+
         with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
               patch.object(reader_sessions, "session_liveness", side_effect=reader_liveness),
               patch.object(herdr, "shared_session", return_value="shared"),
               patch.object(herdr, "native_process", side_effect=native_process),
+              patch.object(herdr.Herdr, "panes", side_effect=panes),
+              patch.object(herdr.Herdr, "result", side_effect=process_info),
               patch.object(pane_record, "seed", return_value=0),
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),
@@ -362,26 +392,71 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
         self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"alpha"})
 
+    def test_live_move_holds_watchdog_recovery_until_row_release(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        _ = self.pass_at(0)
+        row = self.current_staff().by_current_session("alpha")
+        assert row is not None
+        with staff.slot_operation(row.id, row.name), staff.mark_row_move(row.id, "claude2"):
+            _ = self.pass_at(2)
+            self.assertEqual(self.pending, [])
+            with patch.object(staff, "snapshot", side_effect=self.current_staff):
+                failure = unit_watchdog._restart("claude4", "alpha", row.id)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(failure, "account move in progress")
+            self.assertEqual(self.commands, [])
+        _ = self.pass_at(4)
+        self.assertEqual(len(self.pending), 1)
+        self.complete_jobs()
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+
+    def test_recovery_holds_the_row_from_the_liveness_read_through_the_resume(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        row = self.current_staff().by_current_session("alpha")
+        assert row is not None
+
+        def liveness(_session: str) -> sessions.SessionNotLive:
+            self.assertIsInstance(staff.row_activity(row.id), staff.RowBusy)
+            return sessions.SessionNotLive()
+
+        def resume(session: str, **_options: object) -> stop_resume.ClaudeUp:
+            self.assertIsInstance(staff.row_activity(row.id), staff.RowBusy)
+            return stop_resume.ClaudeUp(session, "fixture-pane", "claude4")
+
+        with (patch.object(staff, "snapshot", side_effect=self.current_staff),
+              patch.object(sessions, "session_liveness", side_effect=liveness) as observed,
+              patch.object(stop_resume, "resume", side_effect=resume) as resumed):
+            failure = unit_watchdog._restart("claude4", row.current_session, row.id)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(failure, "")
+        observed.assert_called_once_with(row.current_session)
+        resumed.assert_called_once_with(row.current_session, why="unit watchdog recovery", to="claude4")
+        self.assertIsInstance(staff.row_activity(row.id), staff.RowAvailable)
+
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
+        from scripts.production import session_staff
+
         owner = self.add_unit("alpha")
         self.assertEqual(accounts.group_accounts().get("units"), "claude2")
-        member = unit_membership("fixture", "alpha")
+        member = next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha")
         record = staff.StaffSnapshot(tuple(
-            replace(row, id=staff.StaffId(owner["session_id"]),
-                    current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
+            replace(row, current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
             for row in staff.snapshot().rows))
 
-        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
+        def start(tab: herdr.TabSession, entry: pane_launch.CurrentLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
             self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude2"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
-                           "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
+                           "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["environment"]["CLAUDE_CONFIG_DIR"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
+            proof = ClaudeForegroundSocket("shared", tab.pane_id, owner["pid"])
             with (patch.dict(os.environ, environment),
+                  patch.object(herdr, "session_socket_request", side_effect=proof.request),
                   patch.object(os, "getppid", return_value=owner["pid"]),
                   patch.object(staff, "runtime_id", return_value=owner["session_id"]),
                   patch.object(sys, "stdin", io.StringIO(payload)),
-                  patch.object(hook_pane_record, "claude_arguments", return_value=stop_resume.resume_arguments(entry))):
+                  patch.object(hook_pane_record, "process_arguments",
+                               return_value=["claude", *stop_resume.resume_arguments(entry)])):
                 with self.assertRaises(SystemExit) as exited:
                     _ = runpy.run_path(str(stop_resume.SCRIPTS / "hooks/session-start-pane-record.py"), run_name="__main__")
                 self.assertEqual(exited.exception.code, 0)
@@ -392,7 +467,10 @@ class UnitWatchdogTests(unittest.TestCase):
         with self.stop_process_leaves():
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
+            panes = self.marked().units.get("fixture", {})
+            evidence = session_staff.SessionLabelObservations(tuple(panes.values()))
             with (patch.object(stop_resume, "_start_session", side_effect=start),
+                  patch.object(unit_lookup, "observed_session_labels", return_value=evidence),
                   patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"),
@@ -405,7 +483,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
-        self.assertEqual((entry["session_id"], entry["config_dir"]), ("alpha", str(config)))
+        self.assertEqual((entry.get("staff_id"), str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)), (member.id, str(config)))
         self.assertFalse(any(name.startswith("SHOWRUNNER_") for name in entry["environment"]))
         self.die("alpha")
         for minute in (0, 2, 4):
@@ -476,8 +554,9 @@ class UnitWatchdogTests(unittest.TestCase):
         entry = pane_record.read("shared")["alpha"]
         entry["written_at"] = "2026-10-30T01:00:00+00:00"
         pane_record.write("shared", entry)
-        pane_record.write("shared", {**entry, "pane_id": "new-alpha", "ended": True,
-                                     "written_at": "2026-10-31T01:00:00+00:00"})
+        ended = entry.copy()
+        ended.update(pane_id="new-alpha", ended=True, written_at="2026-10-31T01:00:00+00:00")
+        pane_record.write("shared", ended)
         for minute in (2, 4):
             self.assertEqual(self.pass_at(minute), [])
         self.assertEqual(self.commands, [])
@@ -522,7 +601,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_newest_moved_launch_decides_recovery_account_after_one_tick(self) -> None:
         _ = self.add_unit("alpha")
-        old = pane_record.read("shared")["alpha"]
+        old = pane_record.resume_launch(pane_record.read("shared")["alpha"])
         old["written_at"] = "2026-10-30T01:00:00+00:00"
         pane_record.write("shared", old)
         moved = pane_record.launch("new-alpha", "alpha", old["cwd"],
@@ -530,7 +609,7 @@ class UnitWatchdogTests(unittest.TestCase):
              ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude", "-n", "alpha"])
         pane_record.write("shared", moved)
         self.die("alpha")
-        self.assertEqual(pane_record.launch_for_session("alpha"), moved)
+        self.assertEqual(pane_record.launch_for_session("alpha"), pane_record.read("shared")["new-alpha"])
         self.assertEqual(self.pass_at(0), [])
         self.assertEqual(self.pending, [])
         self.assertEqual(unit_watchdog._read_state()["alpha"]["first_seen"], NOW.isoformat())  # pyright: ignore[reportPrivateUsage]
@@ -560,7 +639,7 @@ class UnitWatchdogTests(unittest.TestCase):
                     self.assertEqual(self.pending, [])
                     _ = self.pass_at(2)
                     self.assertEqual(len(self.pending), 1)
-                    self.assertEqual(self.pending[0][self.pending[0].index("--recover") + 2], str(unit_membership("fixture", "alpha").id))
+                    self.assertEqual(self.pending[0][self.pending[0].index("--recover") + 2], str(next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha").id))
                     _ = self.pass_at(4)
                 self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
                 self.commands.clear()
@@ -573,6 +652,70 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0][launches[0].index("--to") + 1], "claude4")
 
+    def test_watchdog_recovers_a_unit_after_its_only_holder_exits(self) -> None:
+        from scripts.production import session_staff
+
+        owner = self.add_unit("alpha")
+        self.die("alpha")
+        blocked = self.marked()
+        blocked.units["fixture"]["alpha"] = replace(blocked.units["fixture"]["alpha"],
+            claude=session_staff.PaneHeldByNonAgents(
+                "no foreground agent. Blocking processes are sleep (inside the shell tree)"))
+        holder_present = True
+
+        def marked() -> unit_lookup.LabeledProductions:
+            return blocked if holder_present else self.marked()
+
+        def observe(**_options: object) -> session_staff.SessionLabelObservations:
+            return session_staff.SessionLabelObservations(tuple(marked().units["fixture"].values()))
+
+        def release(_seconds: float) -> None:
+            nonlocal holder_present
+            holder_present = False
+
+        def start(tab: herdr.TabSession, entry: pane_launch.CurrentLaunch, label: str,
+                  _message: str) -> sessions.LiveSessionProcess:
+            self.assertFalse(holder_present)
+            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude4"))
+            self.revive("alpha", label)
+            return sessions.LiveSessionProcess(owner["pid"])
+
+        wait = Mock(side_effect=release)
+        with (self.stop_process_leaves(),
+              patch.dict(os.environ, {"HERDR_PANE_ID": ""}),
+              patch.object(unit_lookup, "every_labeled_session", side_effect=marked),
+              patch.object(unit_lookup, "observed_session_labels", side_effect=observe),
+              patch.object(stop_resume, "resume", new=self.shared_resume),
+              patch.object(stop_resume, "Event", return_value=Mock(wait=wait)),
+              patch.object(stop_resume, "_start_session", side_effect=start) as launch,
+              patch.object(stop_resume, "_watch_resume"),
+              patch.object(herdr.Herdr, "retitle", return_value=False)):
+            self.assertEqual(self.pass_at(0), [])
+            self.assertEqual(self.pass_at(2), [])
+            self.assertEqual(len(self.pending), 1)
+            self.assertTrue(holder_present)
+            _ = self.pass_at(4)
+        wait.assert_called_once_with(herdr.PANE_POLL_SECONDS)
+        launch.assert_called_once()
+        self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"alpha"})
+
+    def test_unreadable_registry_prevents_queued_recovery(self) -> None:
+        source = self.queued_unit()
+        directory = sessions.sessions_dir()
+        iterdir = Path.iterdir
+
+        def denied(path: Path) -> Generator[Path]:
+            if path == directory:
+                raise PermissionError(path)
+            yield from iterdir(path)
+
+        with (patch.object(Path, "iterdir", new=denied),
+              patch.object(stop_resume, "resume", wraps=self.resume) as resume):
+            failure, launches = self.recover_queued(source)
+        self.assertEqual(failure, f"session registry unreadable: {directory}")
+        self.assertEqual(launches, [])
+        resume.assert_not_called()
+
     def test_queued_recovery_uses_its_launch_even_when_the_units_group_is_unavailable(self) -> None:
         source = self.queued_unit()
         with patch.object(accounts, "account_for_group_launch", side_effect=accounts.AccountsError("units unavailable")):
@@ -583,8 +726,9 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_queued_recovery_keeps_the_account_of_the_latest_move_launch(self) -> None:
         _ = self.queued_unit()
-        entry = pane_record.read("shared")["alpha"]
-        entry["config_dir"] = str(accounts.account_dir("claude2"))
+        entry = pane_record.resume_launch(pane_record.read("shared")["alpha"])
+        entry = pane_record.launch(entry["pane_id"], entry["session_id"], entry["cwd"],
+            {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}, ["claude", "-n", entry["name"]])
         pane_record.write("shared", entry)
         with patch.object(staff, "snapshot", side_effect=self.current_staff):
             source = unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
@@ -749,6 +893,22 @@ class UnitWatchdogTests(unittest.TestCase):
         self.revive("unit", "claude4")
         return state, result
 
+    def test_unreadable_pane_list_preserves_the_outage_and_result(self) -> None:
+        from scripts.production import session_staff
+
+        state, result = self.finished_recovery()
+        self.die("unit")
+        every = unit_lookup.LabeledProductions({}, self.marked().members, unreadable_pane_lists=(
+            session_staff.UnreadablePaneList("agents", "pane list denied"),))
+        with patch.object(unit_lookup, "every_labeled_session", return_value=every):
+            dry_lines = self.pass_at(3, dry_run=True)
+            lines = self.pass_at(3)
+        self.assertTrue(any("pane list denied" in line for line in lines), lines)
+        self.assertFalse(any("would restart" in line for line in dry_lines), dry_lines)
+        self.assertEqual(result.read_text(), '"fixture evidence"')
+        self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(self.pending), 1)
+
     def test_finished_recovery_keeps_evidence_when_the_second_fresh_read_is_unreadable(self) -> None:
         state, result = self.finished_recovery()
         with (patch.object(unit_watchdog, "_live_account", side_effect=["", OSError("fixture unreadable")]) as live,
@@ -877,8 +1037,9 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = refusal_watch.run(NOW)
         self.assertEqual(len(self.fixture.moves.calls), 1)
         self.assertEqual(accounts.group_accounts().get("units"), "claude2")
-        entry = pane_record.read("shared")["alpha"]
-        entry["config_dir"] = str(accounts.account_dir("claude2"))
+        entry = pane_record.resume_launch(pane_record.read("shared")["alpha"])
+        entry = pane_record.launch(entry["pane_id"], entry["session_id"], entry["cwd"],
+            {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}, ["claude", "-n", entry["name"]])
         pane_record.write("shared", entry)
         self.die("alpha")
         _ = self.pass_at(2)
@@ -1128,7 +1289,7 @@ class UnitWatchdogTests(unittest.TestCase):
         offset = command.index("--recover")
         if newer_launch:
             self.assertEqual(pane_record.read("shared")["alpha"]["model"], "sonnet")
-            self.assertEqual(command[offset + 4], str(unit_membership("fixture", "alpha").id))
+            self.assertEqual(command[offset + 4], str(next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha").id))
         self.finish_jobs = True
         _ = self.pass_at(6)
         self.assertEqual({item["sessionId"] for item in self.fixture.live}, {"alpha"})

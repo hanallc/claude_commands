@@ -13,6 +13,7 @@ import tempfile
 from typing import TypedDict, cast
 import unittest
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_function, shell_functions
 
@@ -46,7 +47,7 @@ class VerifyMetadataTests(unittest.TestCase):
     def run_helper(self, fixture: str, requests: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(DIRECT / "verify_metadata.py"), *requests],
-            input=(FIXTURES / fixture).read_text(),
+            env=verify_test_environment(), input=(FIXTURES / fixture).read_text(),
             cwd=REPOSITORY,
             capture_output=True,
             text=True,
@@ -142,7 +143,7 @@ class VerifyShellHelperTests(unittest.TestCase):
                     "CMD=test; ARGS=(alpha --filter 'case_one'); token_waiters_key",
                 ))
                 result = subprocess.run(["bash", "-c", script, "hash-test", str(folder)],
-                                        cwd=folder, text=True, capture_output=True,
+                                        env=verify_test_environment(), cwd=folder, text=True, capture_output=True,
                                         timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 scopes = (("lint", "--check"), ("lint", "--check"),
@@ -157,12 +158,14 @@ class VerifyShellHelperTests(unittest.TestCase):
             output = Path(directory) / "seconds"
             script = "\n".join((
                 "set -euo pipefail", "phase_wait_finish() { :; }", "PY=false",
-                'BUILDLOG_HOLD_WAIT_FILE="$1"', shell_function(source, "collect_routing_wait"),
+                'BUILDLOG_HOLD_WAIT_FILE="$1"', shell_functions(DIRECT.parent / "lint/invoke.sh", "buildlog_now"),
+                shell_function(source, "collect_routing_wait"),
                 "unset EPOCHREALTIME; EPOCHREALTIME=103.500000; ROUTING_WAIT_STARTED=100.250000",
                 "collect_routing_wait", 'test -z "$ROUTING_WAIT_STARTED"',
                 "EPOCHREALTIME=99.000000; ROUTING_WAIT_STARTED=100.250000; collect_routing_wait",
             ))
             result = subprocess.run(["bash", "-c", script, "clock-test", str(output)],
+                                    env=verify_test_environment(),
                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(output.read_text().splitlines(), ["3.250000", "0.000000"])

@@ -20,11 +20,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from math import inf
 from pathlib import Path
-from typing import Literal, TypeGuard, TypedDict, cast
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 
 from scripts.lib import conf
 
 from scripts.message import sessions  # noqa: E402
+from scripts.production import staff
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 RELAY_ONLY_SENDERS = frozenset({"shutdown"})
@@ -59,6 +60,8 @@ def poll_seconds() -> float:
 class OutboxEntry(TypedDict):
     id: str
     session_id: str
+    recipient_pid: int
+    recipient_start: str
     socket: str
     text: str
     sha256: str
@@ -69,6 +72,9 @@ class OutboxEntry(TypedDict):
 
 class OutboxResult(TypedDict):
     id: str
+    session_id: NotRequired[str]
+    recipient_pid: NotRequired[int]
+    recipient_start: NotRequired[str]
     outcome: ModOutcome
     detail: str
     sha256: str
@@ -185,6 +191,8 @@ def _hash(value: object) -> bool:
 
 def is_outbox_entry(value: object) -> TypeGuard[OutboxEntry]:
     return (_record(value) and _entry_id(value.get("id"))
+            and _timestamp(pid := value.get("recipient_pid")) and pid > 0
+            and isinstance(value.get("recipient_start"), str) and value["recipient_start"] != ""
             and isinstance(value.get("session_id"), str) and value["session_id"] != ""
             and isinstance(value.get("sender"), str) and value["sender"] != ""
             and all(isinstance(value.get(field), str) for field in ("socket", "text", "reply_to_session_id"))
@@ -195,7 +203,10 @@ def is_outbox_result(value: object) -> TypeGuard[OutboxResult]:
     return (_record(value) and _entry_id(value.get("id"))
             and value.get("outcome") in ("delivered", "failed", "expired", "withdrawn", "abandoned")
             and isinstance(value.get("detail"), str) and _hash(value.get("sha256"))
-            and _timestamp(value.get("claimed_ms")) and _timestamp(value.get("finished_ms")))
+            and _timestamp(value.get("claimed_ms")) and _timestamp(value.get("finished_ms"))
+            and ("session_id" not in value or isinstance(value["session_id"], str))
+            and ("recipient_pid" not in value or _timestamp(value["recipient_pid"]))
+            and ("recipient_start" not in value or isinstance(value["recipient_start"], str)))
 
 
 def is_heartbeat(value: object) -> TypeGuard[Heartbeat]:
@@ -208,14 +219,24 @@ def new_entry_id() -> str:
     return uuid.uuid4().hex
 
 
-def reply_destination(sender: str, live: list[sessions.SessionRecord]) -> ReplyDestination:
-    matches = [session for session in live if session["name"] == sender]
-    return ReplyToSession(matches[0]["sessionId"]) if len(matches) == 1 else ReplyUnroutable()
+def reply_destination(sender: str, live: list[sessions.SessionRecord], *,
+                      membership: staff.StaffSnapshot | None = None) -> ReplyDestination:
+    """Select a reply through a fixed staff ID or an explicit session address."""
+    if sender.startswith("session:"):
+        identity = sender.removeprefix("session:")
+    elif sender.startswith("staff:"):
+        record = staff.snapshot() if membership is None else membership
+        member = record.by_id(staff.StaffId(sender.removeprefix("staff:")))
+        identity = member.current_session if member is not None else ""
+    else:
+        return ReplyUnroutable()
+    return ReplyToSession(identity) if identity and any(item["sessionId"] == identity for item in live) else ReplyUnroutable()
 
 
 def wire_entry(entry_id: str, session: sessions.SessionRecord, sender: str,
                destination: ReplyDestination, text: str, deadline_ms: int) -> OutboxEntry:
-    return {"id": entry_id, "session_id": session["sessionId"], "socket": f"uds:{session['messagingSocketPath']}",
+    return {"id": entry_id, "session_id": session["sessionId"], "recipient_pid": session["pid"],
+            "recipient_start": session.get("procStart", ""), "socket": f"uds:{session['messagingSocketPath']}",
             "text": text, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "deadline_ms": deadline_ms,
             "sender": sender, "reply_to_session_id": destination.session_id if isinstance(destination, ReplyToSession) else ""}
 
@@ -300,11 +321,24 @@ def receipt(state: Path, entry_id: str) -> OutboxResult | ResultPending:
     return read.value
 
 
+def receipt_matches_recipient(result: OutboxResult, conversation: str, pid: int, started: str) -> bool:
+    return (result.get("session_id") == conversation and result.get("recipient_pid") == pid
+            and result.get("recipient_start") == started)
+
+
+def receipt_has_recipient_fields(result: OutboxResult) -> bool:
+    return "session_id" in result or "recipient_pid" in result or "recipient_start" in result
+
+
 def _result(root: Path, entry: OutboxEntry, started: float) -> Attempt | ResultPending:
     read = receipt(root.parent, entry["id"])
     if isinstance(read, ResultPending):
         return read
     seconds = time.monotonic() - started
+    if receipt_has_recipient_fields(read) and not receipt_matches_recipient(
+        read, entry["session_id"], entry["recipient_pid"], entry["recipient_start"]
+    ):
+        return DeliveryUnconfirmed(seconds)
     match read["outcome"]:
         case "delivered":
             return Delivered(seconds, read["sha256"] == entry["sha256"])
@@ -363,11 +397,14 @@ def no_key_resolution(result: Delivered | RelayRequired) -> None:
 
 def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id: str,
             text: str, live: list[sessions.SessionRecord], *, deadline: float = inf,
+            reply_identity: str = "", membership: staff.StaffSnapshot | None = None,
             publish: Callable[[Path, Path], bool] = publish_entry,
             resolve: Callable[[Delivered | RelayRequired], None] = no_key_resolution) -> Attempt:
     started = time.monotonic()
     if sender in RELAY_ONLY_SENDERS:
         return RelayRequired("relay-only-sender", time.monotonic() - started)
+    if not session.get("procStart"):
+        return RelayRequired("outbox-error", time.monotonic() - started)
     root = state / "postmaster"
     heartbeat = _heartbeat(root, live)
     if isinstance(heartbeat, NoFreshHeartbeat):
@@ -378,7 +415,7 @@ def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id:
     grace = claim_grace_seconds()
     interval = poll_seconds()
     wait_deadline = min(time.monotonic() + wait, deadline)
-    entry = wire_entry(entry_id, session, sender, reply_destination(sender, live), text,
+    entry = wire_entry(entry_id, session, sender, reply_destination(reply_identity, live, membership=membership), text,
                        int(time.time() * 1000) + int(wait * 1000))
     temporary = root / "outbox" / f".{entry_id}.json.tmp"
     result: Attempt | ResultPending = ResultPending()
