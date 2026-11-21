@@ -138,6 +138,31 @@ class ScratchTests(unittest.TestCase):
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["ended_task"], task)
 
+    def test_task_end_drops_saved_holds_for_missing_paths(self) -> None:
+        task = scratch.worker_task(MAKER_ID)
+        kept = self.base / "kept"
+        kept.mkdir()
+        canary = kept / "canary"
+        _ = canary.write_text("fixture data")
+        missing = self.base / "missing"
+        link = self.base / "dangling-link"
+        link.symlink_to(missing, target_is_directory=True)
+        scratch.write_holds({
+            str(path): scratch.Hold(task=task, reason="fixture", maker=MAKER_ID, made=1.0, ended=2.0)
+            for path in (kept, missing, link)
+        })
+
+        notice = [scratch.retained_task_folder_notice(path, f"task {task} ended") for path in (kept, link)]
+        with mock.patch.object(scratch, "remove_folder", side_effect=AssertionError("task end requested removal")):
+            for report in ("first", "next"):
+                with self.subTest(report=report), redirect_stderr(io.StringIO()) as errors:
+                    self.assertCountEqual([entry.path for entry in scratch.end(task)], [kept, link])
+                    self.assertCountEqual(errors.getvalue().splitlines(), notice)
+                    self.assertEqual(set(scratch.holds()), {str(kept), str(link)})
+        self.assertEqual(canary.read_text(), "fixture data")
+        self.assertTrue(link.is_symlink())
+        self.assertFalse(missing.exists())
+
     def test_a_callers_folder_goes_in_its_session_folder_and_its_task_ends_it(self) -> None:
         sessions = self.base / "session"
         sessions.mkdir()

@@ -2594,8 +2594,23 @@ def unsaved_work(path: Path, *,
     return work.reason if isinstance(work, KeptFolder) else None
 
 
+def retained_folder_exists(path: Path) -> bool:
+    """Check if a retained path still exists, including a dangling symlink."""
+    return os.path.lexists(path)
+
+
+_RETAINED_TASK_FOLDER_PREFIX = "kept for a manual removal list: "
+_RETAINED_TASK_FOLDER_REASON = " (scratch, "
+
+
 def retained_task_folder_notice(path: Path, reason: str) -> str:
-    return f"kept for a manual removal list: {path} (scratch, {reason})"
+    return f"{_RETAINED_TASK_FOLDER_PREFIX}{path}{_RETAINED_TASK_FOLDER_REASON}{reason})"
+
+
+def is_retained_task_folder_notice(detail: str) -> bool:
+    """Recognize the format of a saved scratch notice."""
+    return (detail.startswith(_RETAINED_TASK_FOLDER_PREFIX)
+            and _RETAINED_TASK_FOLDER_REASON in detail and detail.endswith(")"))
 
 
 def report_retained_task_folder(path: Path, reason: str) -> None:
@@ -2627,16 +2642,24 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
     _ = checked_task(task, False)
     kept: list[KeptFolder] = []
     moment = time.time() if now is None else now
-    paths = {folder.path.resolve(): folder.path for folder in folders(scratch_settings=scratch_settings)
+    paths = {str(folder.path.resolve()): folder.path for folder in folders(scratch_settings=scratch_settings)
              if folder.task == task}
     with locked_holds(scratch_settings=scratch_settings) as found:
-        task_holds = {Path(name): record for name, record in found.items() if record["task"] == task}
-        for path in task_holds:
-            _ = paths.setdefault(path, path)
-        protected = {path for path in paths.values() if keep(path)}
+        task_holds = {name: record for name, record in found.items() if record["task"] == task}
+        for name in task_holds:
+            _ = paths.setdefault(name, Path(name))
+        protected: set[Path] = set()
         changed = False
-        for path, record in task_holds.items():
-            if paths[path] not in protected and not record["ended"]:
+        for name, path in list(paths.items()):
+            record = task_holds.get(name)
+            if not retained_folder_exists(path):
+                del paths[name]
+                if record is not None:
+                    del found[name]
+                    changed = True
+            elif keep(path):
+                protected.add(path)
+            elif record is not None and not record["ended"]:
                 record["ended"] = moment
                 changed = True
         if changed:
