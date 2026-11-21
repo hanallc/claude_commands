@@ -153,6 +153,24 @@ else:
     (root / 'close_finished').touch()
 """
 
+QUEUE_SIGNAL_TO_SENDER = """\
+import os, runpy, signal, sys, threading
+
+original_kill = os.kill
+
+def kill_on_sender(pid, signum):
+    if (pid == os.getpid() and signum == signal.SIGINT
+            and threading.current_thread() is not threading.main_thread()):
+        signal.pthread_kill(threading.get_ident(), signum)
+    else:
+        original_kill(pid, signum)
+
+os.kill = kill_on_sender
+entry = os.environ.pop('MAC_GATE_QUEUE_ENTRY')
+sys.argv[0] = entry
+runpy.run_path(entry, run_name='__main__')
+"""
+
 CALL_ROUTE = """\
 import os, signal, sys
 from pathlib import Path
@@ -165,6 +183,9 @@ from scripts.production import gate_routes
 
 repo, callback, fd = sys.argv[1:]
 mac_gate.__file__ = callback
+if wrapper := os.environ.pop('MAC_GATE_QUEUE_WRAPPER', ''):
+    os.environ['MAC_GATE_QUEUE_ENTRY'] = mac_gate.QUEUE_COMMAND[1]
+    mac_gate.QUEUE_COMMAND = (sys.executable, wrapper)
 cancellation = gate_routes.MacGateCancellation(int(fd)) if fd else mac_gate.USE_CALLER_PROCESS_LIFETIME
 print(mac_gate.route(Path(repo), mode=SuiteMode.MERGE_GATE, full=True,
                      module_time_limit_s=30, cancellation=cancellation), flush=True)
@@ -470,7 +491,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.install_held_module()
         for explicit in (False, True):
             with self.subTest(explicit=explicit), tempfile.TemporaryDirectory(dir=self.root) as temporary:
-                self.cancel_route(Path(temporary), explicit=explicit)
+                self.cancel_route(Path(temporary), explicit=explicit, force_signal_to_sender=explicit)
 
     def test_route_cancellation_reports_a_close_failure(self) -> None:
         self.install_held_module()
@@ -480,7 +501,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.cancel_route(self.root, explicit=True, prepare_bundle=True)
 
     def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
-                     prepare_bundle: bool = False) -> None:
+                     prepare_bundle: bool = False, force_signal_to_sender: bool = False) -> None:
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
                        **copies_environment(root),
                        'PATH': os.pathsep.join((str(root), os.defpath)),
@@ -491,6 +512,10 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         callback = root / 'callback'
         _ = callback.write_text(f'#!{sys.executable}\n' + LOCAL_MAC)
         callback.chmod(0o755)
+        if force_signal_to_sender:
+            wrapper = root / 'queue-wrapper.py'
+            _ = wrapper.write_text(QUEUE_SIGNAL_TO_SENDER)
+            environment['MAC_GATE_QUEUE_WRAPPER'] = str(wrapper)
         if cleanup_refused:
             (root / 'close_refusal').touch()
         git = shutil.which('git')
