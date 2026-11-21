@@ -305,6 +305,10 @@ Each member has an independent result.
 The group command prints moved, pending, and failed members by staff name.
 A retry of the selected destination reuses the group transition ID.
 The refusal watcher skips members whose staff rows are busy.
+The watcher uses one read of the move journal for all members.
+It skips a member when the latest request was by hand, names a different account, and is newer than the group selection.
+A selection without a time is older than any move by hand.
+A later group selection lets the watcher complete the move for that member.
 A pending refusal stays eligible until its move completes or a detached batch accepts it.
 An in-progress result from another move keeps the refusal pending.
 The watcher saves the decision ID before it requests the move.
