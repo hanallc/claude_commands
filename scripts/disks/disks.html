@@ -699,7 +699,7 @@ function slotsAbout(report) {
     field("", "A test takes the lowest free copy number in its unit and checks out the commit.", "long"),
     field("", "If all copies are in use, the test takes the smallest missing number.", "long"),
     field("", "The copy keeps its build output for the next test.", "long"),
-    field("", `The nightly sweep deletes a free copy after ${report ? report.unused_days : "some"} days without use.`, "long")];
+    field("", `The nightly sweep lists a free copy for review after ${report ? report.unused_days : "some"} days without use.`, "long")];
 }
 
 const SESSIONS_ABOUT = [stepTip.field("Session folders", "", "title"),
