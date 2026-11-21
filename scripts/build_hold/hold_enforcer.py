@@ -264,6 +264,8 @@ def classify_drain_runs(
     runs: list[WaitingRun | WorkingRun] = []
     ancestors = {pid: build_hold.audit_ancestors(process, processes) for pid, process in processes.items()}
     for process in processes.values():
+        if process.pid_namespace is build_hold.PidNamespaceRelation.DIFFERENT:
+            continue
         if not is_outermost_gate(process, ancestors[process.identity.pid]):
             continue
         owner = build_hold.audit_owner(process, ancestors[process.identity.pid])
@@ -289,7 +291,7 @@ def drain_identities(
 
     A gate that only waits is not kept: it waits for the release like new work.
     """
-    processes = build_hold.read_audit_processes(proc_root)
+    processes = build_hold.read_audit_processes(proc_root, build_hold.DRAIN_BUILD_AUDIT)
     holder = build_hold.Holder(identity.name, datetime.now(timezone.utc), "drain",
                                build_hold.UnknownReleaseEta(), identity.key)
     claims = claimed_processes(proc_root)

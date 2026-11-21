@@ -329,7 +329,7 @@ def in_force_holder() -> build_hold.Holder:
 def stop_waiting_gates(settings: DeploymentSettings) -> None:
     """Stop each gate that only waits, by its run record or its exact pid and start time."""
     holder = in_force_holder()
-    processes = build_hold.read_audit_processes(PROC_ROOT)
+    processes = build_hold.read_audit_processes(PROC_ROOT, build_hold.DRAIN_BUILD_AUDIT)
     runs = hold_enforcer.classify_drain_runs(processes, hold_enforcer.admitted_processes(),
                                              hold_enforcer.claimed_processes(PROC_ROOT))
     if isinstance(runs, build_hold.ClaimsUnreadable):
