@@ -392,6 +392,7 @@ gate.start_gate_job = stop_after_start
 
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:
+        self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
         self.supply_jobserver(b"S")
         self.write(self.state / "hold-module", "hold")
         process = subprocess.Popen(

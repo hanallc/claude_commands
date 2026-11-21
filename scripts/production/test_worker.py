@@ -2314,6 +2314,7 @@ class WorkerCommandTests(unittest.TestCase):
         instance = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
             worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.prompt, kind="impl", lens="")
         for delivery in (None,
+                         pass_recorder.DispatchDelivery("", "", ""),
                          pass_recorder.DispatchDelivery("fixture prompt", "", str(self.reply)),
                          pass_recorder.DispatchDelivery("fixture prompt", instance, str(self.reply))):
             if delivery is not None:
@@ -3546,7 +3547,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(path, self.run_dir / unit_runs.STATE_FILE)
             raise OSError("confirmation save failed")
 
-        with (patch.object(progress_history, "write_text_atomic", side_effect=fail_state_write) as writes,
+        with (patch.object(pass_recorder, "write_text_atomic", side_effect=fail_state_write) as writes,
               self.assertRaisesRegex(OSError, "confirmation save failed")):
             _ = self.finish(row.name, turn_end.EventKind.STAGE_READY)
 

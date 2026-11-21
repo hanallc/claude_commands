@@ -397,10 +397,8 @@ function priceHeader(row, name, unit, className) {
 }
 
 function costViewLabel() {
-  const unit = " (minutes)";
   const gateCosts = data.runs.find(entry => entry.scope === "gate");
-  const duration = gateCosts?.tables[0]?.headers.find(header => header.endsWith(unit));
-  return "Cost per " + (duration ? duration.slice(0, -unit.length) : "run");
+  return "Cost per " + (gateCosts?.noun ?? "gate");
 }
 
 function priceCell(row, source, rowIndex, column, className, marks) {

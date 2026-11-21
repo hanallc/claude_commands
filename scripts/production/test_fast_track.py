@@ -26,6 +26,7 @@ from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, build_slots, conf, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
@@ -343,6 +344,7 @@ names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system={self.root / 'system'}
 roots.gate={self.root / 'gates'}
+roots.build={self.root / 'build'}
 roots.temporary=${{TMPDIR}}/builds
 roots.scratch={self.root / 'scratch'}
 roots.copies={self.root / 'copies'}
@@ -369,7 +371,7 @@ slots.unused_days=7
 slots.wait_seconds=30
 """,
         )
-        _ = Path(self.env["COPIES_CONFIG"]).write_text(
+        _ = write_config_fixture(Path(self.env["COPIES_CONFIG"]),
             f"""remote_registry={self.root / 'remote-mirrors'}
 wait_seconds=0.01
 git_timeout_seconds=10
@@ -1178,7 +1180,8 @@ owner.verify=verify
         self.assertTrue(any(row["value"] == "after" for row in self.observations("import")))
         for row in [*tests, *checks]:
             clone = Path(str(row["cwd"]))
-            self.assertEqual(clone.parent, self.root.resolve() / "slots")
+            self.assertEqual(clone.parent.parent, self.root.resolve() / "build/origin")
+            self.assertTrue(clone.name.isdecimal())
             self.assertNotIn(clone, (self.unit, self.checkout, self.promote))
             self.assertTrue(clone.exists())
             self.assertEqual(self.build_folder_state(clone), "free")

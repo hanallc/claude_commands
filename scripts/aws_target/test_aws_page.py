@@ -458,7 +458,8 @@ class AwsCombinedTableTests(PageCostFixture):
 """, blocked=True)
 
     def test_default_table_marks_and_shared_filters(self) -> None:
-        self.run_browser_checks('?prices=cost&runs=merge-gate', """
+        self.run_browser_checks('?prices=cost', """
+    check(scope === null && scopeCosts().scope === "gate", "The default scope shows gate prices");
     const table = () => document.querySelector("#price-table table");
     const click = selector => document.querySelector(selector).click();
     const spot = () => table().tBodies[0].rows[0].cells[5];
@@ -545,6 +546,27 @@ class AwsCombinedTableTests(PageCostFixture):
       const {colors} = scaleCells({values: values.map(value => [null, value])}, {rows: [0, 1, 2], columns: [1]});
       check(indices.every(index => colors.get(`${index},1`) === `var(--scale-${color})`), `Tied ${color} endpoint`);
     }
+""")
+
+    def test_old_merge_gate_url_selects_the_gate_scope(self) -> None:
+        self.run_browser_checks('?prices=cost&runs=merge-gate', """
+    check(scope === "gate" && scopeCosts().scope === "gate", "The old URL selects the gate scope");
+""")
+
+    def test_cost_switch_uses_the_configured_gate_name_without_standard_types(self) -> None:
+        ledger_test_support.text_setting(self.root / 'build_steps.conf', 'names.gate', 'fixture gate')
+        read_words = conf.ConfigRead.words
+
+        def words(settings: conf.ConfigRead, key: str) -> tuple[str, ...]:
+            if key in ('instance_types', 'price_compare_instance_types'):
+                return ()
+            return read_words(settings, key)
+
+        with mock.patch.object(conf.ConfigRead, 'words', new=words):
+            self.run_browser_checks('?prices=cost', """
+    check(scopeCosts().tables.length === 0, "The gate scope has no tables");
+    check(document.querySelector("#show [data-measure='cost']").textContent === "Cost per fixture gate",
+          "The switch uses the configured gate name");
 """)
 
     def test_quota_cells_and_gpu_summary_use_the_latest_request(self) -> None:

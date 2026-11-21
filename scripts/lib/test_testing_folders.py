@@ -54,7 +54,7 @@ class TestRunFolderTests(unittest.TestCase):
         return result
 
     def start(self, *options: str) -> tuple[subprocess.Popen[str], Path, Path]:
-        process = subprocess.Popen([str(SHIM), *options, "-m", "unittest", "discover", "-s", str(self.root),
+        process = subprocess.Popen([str(SHIM), *options, "-B", "-m", "unittest", "discover", "-s", str(self.root),
                                     "-p", "test_fixture.py"],
                                    cwd=self.root, env=self.environment(), text=True,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
