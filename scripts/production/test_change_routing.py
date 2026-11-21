@@ -296,7 +296,7 @@ class StaffRoutingTests(unittest.TestCase):
                 record = replace(staff.snapshot(), production=True)
                 result = subprocess.CompletedProcess(request, int(document_route == "remote unreadable"), "# Legacy", "")
                 with (mock.patch.object(remote, "machine_alias", return_value=remote.MachineAlias("remote-fixture")),
-                      mock.patch.object(change_routing.subprocess, "run", return_value=result) as transport):
+                      mock.patch.object(subprocess, "run", return_value=result) as transport):
                     assignment = change_routing.StaffRouting(record, documents).owner_and_production(listing, row)
                 if is_remote:
                     transport.assert_called_once_with(request, capture_output=True, text=True, timeout=2, check=False)
@@ -436,7 +436,7 @@ class StaffRoutingTests(unittest.TestCase):
                 record = replace(staff.snapshot(), production=True)
                 result = subprocess.CompletedProcess(request, 0, content, "")
                 with (mock.patch.object(remote, "machine_alias", return_value=remote.MachineAlias("remote-fixture")),
-                      mock.patch.object(change_routing.subprocess, "run", return_value=result) as transport):
+                      mock.patch.object(subprocess, "run", return_value=result) as transport):
                     router = change_routing.StaffRouting(record, {"child": supplied})
                     assignment = router.owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
                 if is_remote:
