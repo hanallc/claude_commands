@@ -1606,22 +1606,28 @@ class StaffTests(StaffCommandTestCase):
         _ = doc.write_text("- **Merge checkout:** /fixture/main\n")
         alias = self.root / "alias.md"
         alias.symlink_to(doc)
-        binding = staff.LiveDoc("natedev", alias)
         another = fixture_member("showrunner", name="another")
-        before = self.staff_file.read_bytes()
-        for available in (True, False):
-            if not available:
+        for scenario in ("local alias", "missing local alias", "missing Mac live", "missing Mac wrapped"):
+            if scenario == "missing local alias":
                 doc.unlink()
+            if scenario.startswith("missing Mac"):
+                self.assertFalse(doc.exists())
+                location = staff.LiveDoc("mac", doc) if scenario == "missing Mac live" else staff.WrappedDoc("mac", doc)
+                _ = staff.set_doc(runner.id, location)
+                binding = staff.LiveDoc("mac", doc)
+            else:
+                binding = staff.LiveDoc("natedev", alias)
+            before = self.staff_file.read_bytes()
             for action, claim in (
                 ("set", lambda: staff.set_doc(another.id, binding)),
                 ("ensure", lambda: staff.ensure("showrunner", name="new", doc=binding,
                                                 runtime_id=fixture_runtime_id("duplicate-doc"))),
                 ("promote", lambda: staff.promote_unit(other.id, name="other", parent=runner.id, doc=binding)),
             ):
-                with (self.subTest(action=action, available=available),
+                with (self.subTest(action=action, scenario=scenario),
                       self.assertRaisesRegex(staff.StaffRefused, "already owns this document")):
                     _ = claim()
-        self.assertEqual(self.staff_file.read_bytes(), before)
+            self.assertEqual(self.staff_file.read_bytes(), before)
 
 
     def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:

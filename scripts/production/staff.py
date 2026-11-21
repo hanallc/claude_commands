@@ -1725,13 +1725,15 @@ def _document_for_owner(rows: list[StaffRow], owner: StaffId,
                         doc: LiveDoc | WrappedDoc) -> LiveDoc | WrappedDoc:
     from scripts.agents import remote
 
-    if doc.machine != remote.local_machine():
-        return doc
-    path = doc.path.resolve()
+    local = doc.machine == remote.local_machine()
+    path = doc.path.resolve() if local else doc.path
     if any(other.id != owner and isinstance(other.doc, LiveDoc | WrappedDoc)
-           and other.doc.machine == doc.machine and other.doc.path.resolve() == path
+           and other.doc.machine == doc.machine
+           and (other.doc.path.resolve() if local else other.doc.path) == path
            for other in rows):
         raise StaffRefused(f"{path}: another staff row already owns this document")
+    if not local:
+        return doc
     try:
         enrolled = declares_merge_checkout(path.read_text(encoding="utf-8").splitlines())
     except FileNotFoundError:

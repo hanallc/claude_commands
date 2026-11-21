@@ -625,6 +625,12 @@ class DemoteShowrunnerTests(StaffTestCase):
         child_text = self.child_doc.read_text()
         snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "fixture"
         _ = shutil.copytree(self.root, snapshot, symlinks=True)
+
+        def stop_enrolled_child(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> bool:
+            self.assertTrue(self.stop_child(name, marked, claude))
+            _ = self.git("-C", str(self.child_tree), "switch", "temporary-branch")
+            return True
+
         for scenario in ("legacy", "saved completion", "enrolled"):
             with self.subTest(scenario=scenario):
                 if scenario != "legacy":
@@ -632,9 +638,9 @@ class DemoteShowrunnerTests(StaffTestCase):
                     _ = shutil.copytree(snapshot, self.root, symlinks=True)
                     self.events.clear()
                     self.account.reset_mock()
-                self.assertEqual(self.git("-C", str(self.child_tree), "branch", "--show-current"), "temporary-branch")
                 saved_completion = scenario == "saved completion"
                 if scenario == "enrolled":
+                    _ = self.git("-C", str(self.child_tree), "switch", self.child_branch)
                     integration = self.root / "parent-integration"
                     _ = self.git("worktree", "add", "-qb", "parent-integration", str(integration), "main")
                     parent_live = self.checkout / "parent-production-live.md"
@@ -650,8 +656,8 @@ class DemoteShowrunnerTests(StaffTestCase):
                         _ = output.write("\n/*-production-live.md\n/log.md\n/child.log\n")
                     _ = staff.set_doc(self.parent.id, staff.LiveDoc(remote.local_machine(), parent_live))
                     self.doc, self.child_doc = parent_live, child_live
-                if scenario == "enrolled":
                     _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.child_doc))
+                    self.stop.side_effect = stop_enrolled_child
                 if saved_completion:
                     demote.save(self.journal(), fields, demote.Step.PLACED)
                 main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
