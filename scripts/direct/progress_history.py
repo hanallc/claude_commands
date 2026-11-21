@@ -25,16 +25,20 @@ from contextlib import AbstractContextManager, contextmanager, redirect_stderr, 
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
-from enum import Enum, StrEnum
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, NoReturn, Protocol, TextIO, TypedDict, cast
 
-from scripts.agents import remote, worker_lifecycle  # noqa: E402
+from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import pass_record as pass_recorder
 from scripts.direct import phase_table, plan_history, recorder_state  # noqa: E402
 from scripts.direct.pass_record import DispatchDelivery as DispatchDelivery, SCHEMA_VERSION as SCHEMA_VERSION
 from scripts.direct.pass_record import CompletionActions as CompletionActions, MatchedDispatch as MatchedDispatch
+from scripts.direct.pass_record import HookCompletion as HookCompletion, NoHookCompletion as NoHookCompletion
+from scripts.direct.pass_record import StoppedReplyDisposition as StoppedReplyDisposition
+from scripts.direct.pass_record import dispatch_delivery as dispatch_delivery, hook_completion as hook_completion
+from scripts.direct.pass_record import require_ordinary_review_run as require_ordinary_review_run
 from scripts.direct.pass_record import worker_artifact as worker_artifact
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.lib import git_files, unit_runs  # noqa: E402
@@ -316,52 +320,11 @@ _recorder_artifacts: ContextVar[RunArtifactWriter | OrdinaryRecorderRun] = Conte
 _NO_PREPARED_OWNER = unit_runs.RunOwnerUnrecorded("no prepared run end")
 
 
-def _run_owner(session_dir: Path, state: dict[str, object], record: staff.StaffSnapshot, *,
-               starting_director: str = "") -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
-    folder = session_dir.resolve()
-    owners = [row for row in record.rows if row.kind in ("unit", "showrunner")
-              and isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == folder]
-    if len(owners) > 1:
-        raise ValueError(f"{session_dir}: more than one staff member owns the run")
-    saved = unit_runs.run_owner(state, record)
-    if owners:
-        if isinstance(saved, staff.StaffRow) and saved.id != owners[0].id:
-            raise ValueError(f"{session_dir}: saved owner {saved.name} conflicts with the run pointer of {owners[0].name}")
-        return owners[0]
-    if isinstance(saved, staff.StaffRow) or not starting_director:
-        return saved
-    caller = record.owner_of(starting_director)
-    return caller if caller is not None and caller.kind in ("unit", "showrunner") else saved
-
-
-def _read_run_owner(session_dir: Path, *, starting_director: str = "") -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
-    """Resolve the run owner before either caller writes an artifact."""
-    try:
-        state = recorder_state.read_state(pass_recorder.state_path(session_dir))
-    except FileNotFoundError:
-        state = {}
-    owner = _run_owner(session_dir, state, staff.initial_snapshot(), starting_director=starting_director)
-    if isinstance(owner, staff.StaffRow) and owner.kind == "showrunner" and isinstance(
-            owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-        if owner.doc.machine != remote.local_machine():
-            raise ValueError(f"{owner.name}: the staff document is on {owner.doc.machine}")
-    return owner
-
-
-def require_ordinary_review_run(session_dir: Path) -> None:
-    """Refuse the alternate launcher before any artifacts exist."""
-    owner = _read_run_owner(session_dir)
-    if isinstance(owner, staff.StaffRow) and owner.kind == "showrunner" and isinstance(
-            owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-        if staff.declares_merge_checkout(owner.doc.path.read_text(encoding="utf-8").splitlines()):
-            raise ValueError(f"{owner.name}: enrolled showrunners must use the assigned review launcher")
-
-
 def _protected_recorder(
     session_dir: Path, *, director: str = "",
     prepared_owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded = _NO_PREPARED_OWNER,
 ) -> RunArtifactWriter | OrdinaryRecorderRun:
-    owner = _read_run_owner(session_dir, starting_director=director)
+    owner = pass_recorder.read_run_owner(session_dir, starting_director=director)
     ending_prepared_run = isinstance(prepared_owner, staff.StaffRow)
     if ending_prepared_run and (not isinstance(owner, staff.StaffRow) or owner.id != prepared_owner.id):
         raise ValueError(f"{session_dir}: prepared run owner changed")
@@ -821,34 +784,11 @@ def _ensure_project_timing(
 TEAM_SLOT_ENV = "UNIT_TEAM_ROLE"
 
 
-def _retained_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
-    records = pass_recorder.object_dict(state.get("finishing_passes")) or {}
-    return {instance: passed for instance, value in records.items() if (passed := pass_recorder.object_dict(value)) is not None}
-
-
-def _finalization_pending(passed: dict[str, object], *, protected: bool) -> bool:
-    delivery = dispatch_delivery(passed)
-    required = (delivery.actions.finish_run or (protected and bool(delivery.line))
-                or (passed.get("dispatch_kind") == "astra" and passed.get("kind") == "astra-reviewer"))
-    completion = hook_completion(passed)
-    return required and (isinstance(completion, NoHookCompletion) or not completion.finished)
-
-
-def _retain_replaced_pass(state: dict[str, object], passed: dict[str, object]) -> None:
-    instance = pass_recorder.string(passed.get("instance_id"))
-    completion = hook_completion(passed)
-    if instance and (_finalization_pending(passed, protected=True)
-                     or isinstance(completion, HookCompletion) and not completion.finished):
-        retained = _retained_passes(state)
-        retained[instance] = passed
-        state["finishing_passes"] = retained
-
-
 def pass_for_finalization(run: Path, instance: str) -> dict[str, object]:
     """Read the exact pass even after its slot changes."""
     state = _read_state(run, resolve_staff=False)
     return next((passed for passed in pass_recorder.pass_slots(state).values() if passed.get("instance_id") == instance),
-                _retained_passes(state).get(instance, {}))
+                pass_recorder.retained_passes(state).get(instance, {}))
 
 
 @dataclass(frozen=True)
@@ -1271,7 +1211,7 @@ def _start_run(args: argparse.Namespace) -> None:
             "Unable to detect the unit director's model and effort; pass explicit --main-* values"
         )
     record = staff.initial_snapshot()
-    owner = _run_owner(session_dir, {}, record, starting_director=main_agent["session_id"])
+    owner = pass_recorder.resolve_run_owner(session_dir, {}, record, starting_director=main_agent["session_id"])
     private_helper = pass_recorder.optional_arg(args, "private_helper")
     if private_helper and (session_dir.resolve().parent != unit_runs.ASTRA_RUN_ROOT.resolve()
             or isinstance(owner, staff.StaffRow) and unit_runs.points_to_run(owner, session_dir)):
@@ -1415,7 +1355,7 @@ def _start_phase(args: argparse.Namespace) -> None:
         if closed is not None:
             _close_active_activity(session_dir, state, closed, "interrupted", "", now)
         for passed in pass_recorder.pass_slots(state).values():
-            _retain_replaced_pass(state, passed)
+            pass_recorder.retain_replaced_pass(state, passed)
         state["pass"] = {}
     phase: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
@@ -1547,12 +1487,7 @@ def _checked_launch(
     args: argparse.Namespace, state: dict[str, object], session_dir: Path,
 ) -> tuple[dict[str, object], LaunchCheck]:
     """Validate a named open phase and its launch without changing any pass."""
-    if unit_runs.terminal_run(state):
-        raise SystemExit(f"{session_dir}: the run has ended dispatch admission")
-    helper = pass_recorder.string(state.get(unit_runs.PRIVATE_HELPER_SLOT))
-    slot = pass_recorder.optional_arg(args, "team_slot") if hasattr(args, "team_slot") else os.environ.get(TEAM_SLOT_ENV, "solo")
-    if helper and slot != helper:
-        raise SystemExit(f"{session_dir}: only {helper} can dispatch in this private helper run")
+    pass_recorder.require_launch_admission(args, state, session_dir)
     phase_id = pass_recorder.optional_arg(args, "phase_id")
     if not phase_id:
         _ = recorder_state.only_open_phase(state)
@@ -1843,7 +1778,7 @@ def _start_pass(args: argparse.Namespace,
         current_pass["assign_status_file"] = status_file
     slots = pass_recorder.pass_slots(state)
     if previous := slots.get(team_slot):
-        _retain_replaced_pass(state, previous)
+        pass_recorder.retain_replaced_pass(state, previous)
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
     worker_id = staff.StaffId(pass_recorder.optional_arg(args, "worker_id"))
@@ -2105,7 +2040,7 @@ def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: objec
             if notice is not None and notice.get("delivered") is not True:
                 notice["delivered"] = True
                 changed = True
-        for passed in (*pass_recorder.pass_slots(state).values(), *_retained_passes(state).values()):
+        for passed in (*pass_recorder.pass_slots(state).values(), *pass_recorder.retained_passes(state).values()):
             if passed.get("instance_id") == instance_id:
                 if isinstance(value, pass_recorder.DispatchDelivery):
                     if status_file := pass_recorder.string(passed.get("assign_status_file")):
@@ -2121,53 +2056,6 @@ def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: objec
 
 def save_dispatch_delivery(session_dir: Path, instance_id: str, delivery: pass_recorder.DispatchDelivery) -> None:
     _update_dispatch(session_dir, instance_id, "delivery", delivery)
-
-
-def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
-    delivery = pass_recorder.dispatch_delivery(passed)
-    if status_file := pass_recorder.string(passed.get("assign_status_file")):
-        return replace(delivery, actions=replace(delivery.actions, status_file=status_file))
-    return delivery
-
-
-class StoppedReplyDisposition(StrEnum):
-    PENDING = "pending"
-    SAVED = "saved"
-    ENDED_WITHOUT_DONE = "ended without DONE"
-
-
-@dataclass(frozen=True)
-class HookCompletion:
-    """Keep each unfinished completion step available to the next event."""
-
-    outcome: str
-    reply_file: str
-    details: tuple[str, ...] = ()
-    actions_done: bool = False
-    pane_closed: bool = False
-    role_released: bool = False
-    finished: bool = False
-    recording_done: bool = False
-    sender_native_id: str = ""
-    stopped_reply: StoppedReplyDisposition = StoppedReplyDisposition.PENDING
-
-
-class NoHookCompletion(Enum):
-    UNRECORDED = "no terminal outcome recorded"
-
-
-def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookCompletion:
-    fields = pass_recorder.object_dict(passed.get("hook_completion"))
-    if fields is None:
-        return NoHookCompletion.UNRECORDED
-    details = fields.get("details", [])
-    disposition = next((value for value in StoppedReplyDisposition if value.value == fields.get("stopped_reply")),
-                       StoppedReplyDisposition.PENDING)
-    return HookCompletion(pass_recorder.string(fields.get("outcome")), pass_recorder.string(fields.get("reply_file")),
-        tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
-        fields.get("actions_done") is True, fields.get("pane_closed") is True,
-        fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True,
-        pass_recorder.string(fields.get("sender_native_id")), disposition)
 
 
 def save_hook_completion(run: Path, instance_id: str, completion: HookCompletion) -> None:
@@ -2350,7 +2238,7 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
         record = staff.initial_snapshot()
         state = _read_state(session_dir, record=record)
         worker = record.by_id(worker_id)
-        owner = _run_owner(session_dir, state, record)
+        owner = pass_recorder.resolve_run_owner(session_dir, state, record)
         if (worker is None or not isinstance(owner, staff.StaffRow)
                 or not worker.reports_to(owner.id)):
             raise ValueError(f"{worker_id}: cannot resolve the stopped worker's run owner")
@@ -6982,7 +6870,7 @@ def _run_execution_blocker(session_dir: Path, state: dict[str, object], record: 
     from scripts.agents import detached_run_process
 
     workers: set[staff.StaffId] = set()
-    for passed in (*pass_recorder.pass_slots(state).values(), *_retained_passes(state).values()):
+    for passed in (*pass_recorder.pass_slots(state).values(), *pass_recorder.retained_passes(state).values()):
         if identity := pass_recorder.string(passed.get("worker_id")):
             workers.add(staff.StaffId(identity))
         pid = int(pass_recorder.number(passed.get("launcher_pid")))
@@ -7067,7 +6955,7 @@ def end_run(session_dir: Path, request: RunEndRequested | RetryRunEnd,
         record = staff.initial_snapshot()
         owner = _run_pointer(session_dir, record)
         ending = _run_end_stamp(state)
-    stopped_workers = (staff.StaffId(identity) for passed in (*pass_recorder.pass_slots(state).values(), *_retained_passes(state).values())
+    stopped_workers = (staff.StaffId(identity) for passed in (*pass_recorder.pass_slots(state).values(), *pass_recorder.retained_passes(state).values())
                        if (identity := pass_recorder.string(passed.get("worker_id"))) and passed.get("status") == "interrupted")
     cleanup = InterruptedWorkerPasses(session_dir, tuple(dict.fromkeys((*passes.worker_ids, *stopped_workers))))
     _close_interrupted_workers(cleanup)
@@ -7537,19 +7425,10 @@ def _run_recorder_command(args: argparse.Namespace) -> None:
             _close_interrupted_workers(passes)
 
 
-class FormerPassCommand(argparse.Namespace):
-    session_dir: Path | None = None
-
-
 def main() -> None:
     try:
         # Keep older launchers through 2026-11-23.
         if sys.argv[1:2] and sys.argv[1] in ("check-launch", "start-pass", "finish-pass"):
-            parser = argparse.ArgumentParser(add_help=False)
-            _ = parser.add_argument("--session-dir", type=Path)
-            values, _ = parser.parse_known_args(namespace=FormerPassCommand())
-            if values.session_dir is not None:
-                require_ordinary_review_run(values.session_dir.expanduser().absolute())
             pass_recorder.main()
             return
         _run_recorder_command(_build_parser().parse_args())

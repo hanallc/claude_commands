@@ -8646,6 +8646,60 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(event["prompt_file"], prompt_file)
         self.assertFalse(any(row["event_type"] == "pass_started" for row in records))
 
+    def test_pass_recorder_refuses_an_enrolled_owner_before_it_creates_the_run(self) -> None:
+        doc = self.root / "production-live.md"
+        _ = doc.write_text("- **Merge checkout:** `/fixture/main`\n", encoding="utf-8")
+        owner = fixture_member("showrunner", name="enrolled-recorder", doc=staff.LiveDoc(remote.local_machine(), doc))
+        run = self.root / "enrolled-run"
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
+        commands = (
+            ("check-launch", "--pass-kind", "review", "--phase-id", "3"),
+            ("start-pass", "--pass-kind", "review", "--phase-id", "3", "--activity", "review",
+             "--called-task", "direct.review", "--called-family", "codex", "--called-model", "fixture"),
+            ("finish-pass", "--status", "completed"),
+        )
+        for command, *arguments in commands:
+            with self.subTest(command=command):
+                result = self.run_failing_command(command, "--session-dir", str(run), *arguments,
+                                                  at=42_530, complete_launch=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("enrolled showrunners must use the assigned review launcher", result.stderr)
+                self.assertFalse(run.exists())
+
+    def test_pass_recorder_checks_run_admission_before_starting_a_pass(self) -> None:
+        cases = (
+            ("ended", {"status": "completed", "finished_at": 42_520}, "the run has ended dispatch admission"),
+            ("helper", {unit_runs.PRIVATE_HELPER_SLOT: "review"}, "only review can dispatch in this private helper run"),
+        )
+        for name, fields, message in cases:
+            with self.subTest(run=name):
+                run = self.start_run(name, 42_500)
+                self.start_phase(run, 42_510)
+                path = pass_recorder.state_path(run)
+                _ = path.write_text(json.dumps({**self.read_state(run), **fields}), encoding="utf-8")
+                before = path.read_bytes()
+                self.team_slot = "impl"
+                result = self.launch_probe(run, "--phase-id", "3")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(self.pass_events(name, "pass_started"), [])
+
+    def test_pass_recorder_retains_replaced_passes_with_pending_completion(self) -> None:
+        run = self.start_run("replaced-pass", 42_500)
+        self.start_phase(run, 42_510)
+        self.start_slot_pass(run, "review", "review", 42_520)
+        first = self.pass_slots(run)["review"]
+        instance = cast(str, first["instance_id"])
+        delivery = progress_history.DispatchDelivery(
+            line="Review the change", completion_id="fixture-completion", reply_file="reply.txt")
+        progress_history.save_dispatch_delivery(run, instance, delivery)
+        self.start_slot_pass(run, "review", "impl", 42_530)
+        self.assertNotEqual(self.pass_slots(run)["review"]["instance_id"], instance)
+        retained = progress_history.pass_for_finalization(run, instance)
+        self.assertEqual(retained["instance_id"], instance)
+        self.assertEqual(progress_history.dispatch_delivery(retained), delivery)
+
     def test_launch_without_an_explicit_phase_records_a_refusal(self) -> None:
         for phase_open in (False, True):
             with self.subTest(phase_open=phase_open):

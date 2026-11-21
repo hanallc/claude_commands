@@ -21,11 +21,12 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
+from scripts.agents import remote
 from scripts.direct import recorder_state
 from scripts.lib import conf_reads, transcripts, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -832,10 +833,21 @@ def _launch_check(
             "prompt_phase_line": prompt_phase_line, "fix_cause": fix_cause}
 
 
+def require_launch_admission(args: argparse.Namespace, state: dict[str, object], session_dir: Path) -> None:
+    """Check whether the run still permits this slot to launch."""
+    if unit_runs.terminal_run(state):
+        raise SystemExit(f"{session_dir}: the run has ended dispatch admission")
+    helper = string(state.get(unit_runs.PRIVATE_HELPER_SLOT))
+    slot = optional_arg(args, "team_slot") if hasattr(args, "team_slot") else _team_slot()
+    if helper and slot != helper:
+        raise SystemExit(f"{session_dir}: only {helper} can dispatch in this private helper run")
+
+
 def _checked_launch(
     args: argparse.Namespace, state: dict[str, object], session_dir: Path,
 ) -> tuple[dict[str, object], LaunchCheck]:
     """Validate a named open phase and its launch without changing any pass."""
+    require_launch_admission(args, state, session_dir)
     phase_id = optional_arg(args, "phase_id")
     if not phase_id:
         _ = recorder_state.only_open_phase(state)
@@ -1100,6 +1112,8 @@ def start_pass(args: argparse.Namespace,
     if status_file:
         current_pass["assign_status_file"] = status_file
     slots = pass_slots(state)
+    if previous := slots.get(team_slot):
+        retain_replaced_pass(state, previous)
     slots[team_slot] = current_pass
     write_state(session_dir, state)
     worker_id = staff.StaffId(optional_arg(args, "worker_id"))
@@ -1180,7 +1194,8 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
         line=string(fields.get("line")), completion_id=string(fields.get("completion_id")),
         reply_file=string(fields.get("reply_file")), early_ready=string(fields.get("early_ready")),
         actions=CompletionActions(
-            summary_file=string(actions.get("summary_file")), status_file=string(actions.get("status_file")),
+            summary_file=string(actions.get("summary_file")),
+            status_file=string(passed.get("assign_status_file")) or string(actions.get("status_file")),
             report_file=string(actions.get("report_file")), style_directory=string(actions.get("style_directory")),
             end_worker=actions.get("end_worker") is True, held_role=string(actions.get("held_role")),
             resolve_fix=actions.get("resolve_fix") is True, review_pass=int(number(actions.get("review_pass"), 1)),
@@ -1191,6 +1206,12 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
 def worker_artifact(path: Path, slot: str, worker: str) -> Path:
     """Keep artifacts with the worker selected for the recorded slot."""
     return path.with_name(worker + path.name.removeprefix(slot)) if path.name.startswith(slot + "_") else path
+
+
+class StoppedReplyDisposition(StrEnum):
+    PENDING = "pending"
+    SAVED = "saved"
+    ENDED_WITHOUT_DONE = "ended without DONE"
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1227,7 @@ class HookCompletion:
     finished: bool = False
     recording_done: bool = False
     sender_native_id: str = ""
+    stopped_reply: StoppedReplyDisposition = StoppedReplyDisposition.PENDING
 
 
 class NoHookCompletion(Enum):
@@ -1217,11 +1239,35 @@ def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookComplet
     if fields is None:
         return NoHookCompletion.UNRECORDED
     details = fields.get("details", [])
+    disposition = next((value for value in StoppedReplyDisposition if value.value == fields.get("stopped_reply")),
+                       StoppedReplyDisposition.PENDING)
     return HookCompletion(string(fields.get("outcome")), string(fields.get("reply_file")),
         tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
         fields.get("actions_done") is True, fields.get("pane_closed") is True,
         fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True,
-        string(fields.get("sender_native_id")))
+        string(fields.get("sender_native_id")), disposition)
+
+
+def retained_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
+    records = object_dict(state.get("finishing_passes")) or {}
+    return {instance: passed for instance, value in records.items()
+            if (passed := object_dict(value)) is not None}
+
+
+def retain_replaced_pass(state: dict[str, object], passed: dict[str, object]) -> None:
+    """Keep the pass available until its completion actions finish."""
+    instance = string(passed.get("instance_id"))
+    completion = hook_completion(passed)
+    if isinstance(completion, HookCompletion):
+        pending = not completion.finished
+    else:
+        delivery = dispatch_delivery(passed)
+        pending = (delivery.actions.finish_run or bool(delivery.line)
+                   or (passed.get("dispatch_kind") == "astra" and passed.get("kind") == "astra-reviewer"))
+    if instance and pending:
+        retained = retained_passes(state)
+        retained[instance] = passed
+        state["finishing_passes"] = retained
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
@@ -1351,16 +1397,61 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_run_owner(session_dir: Path, state: dict[str, object], record: staff.StaffSnapshot, *,
+                      starting_director: str = "") -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
+    folder = session_dir.resolve()
+    owners = [row for row in record.rows if row.kind in ("unit", "showrunner")
+              and isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == folder]
+    if len(owners) > 1:
+        raise ValueError(f"{session_dir}: more than one staff member owns the run")
+    saved = unit_runs.run_owner(state, record)
+    if owners:
+        if isinstance(saved, staff.StaffRow) and saved.id != owners[0].id:
+            raise ValueError(f"{session_dir}: saved owner {saved.name} conflicts with the run pointer of {owners[0].name}")
+        return owners[0]
+    if isinstance(saved, staff.StaffRow) or not starting_director:
+        return saved
+    caller = record.owner_of(starting_director)
+    return caller if caller is not None and caller.kind in ("unit", "showrunner") else saved
+
+
+def read_run_owner(session_dir: Path, *, starting_director: str = "") -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
+    """Resolve the run owner before either caller writes an artifact."""
+    try:
+        state = recorder_state.read_state(state_path(session_dir))
+    except FileNotFoundError:
+        state = {}
+    owner = resolve_run_owner(session_dir, state, staff.initial_snapshot(), starting_director=starting_director)
+    if isinstance(owner, staff.StaffRow) and owner.kind == "showrunner" and isinstance(
+            owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if owner.doc.machine != remote.local_machine():
+            raise ValueError(f"{owner.name}: the staff document is on {owner.doc.machine}")
+    return owner
+
+
+def require_ordinary_review_run(session_dir: Path) -> None:
+    """Refuse the alternate launcher before any artifacts exist."""
+    owner = read_run_owner(session_dir)
+    if isinstance(owner, staff.StaffRow) and owner.kind == "showrunner" and isinstance(
+            owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if staff.declares_merge_checkout(owner.doc.path.read_text(encoding="utf-8").splitlines()):
+            raise ValueError(f"{owner.name}: enrolled showrunners must use the assigned review launcher")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     handler = cast(Callable[[argparse.Namespace], None], args.handler)
     session_dir = argument_session_dir(args)
-    session_dir.mkdir(parents=True, exist_ok=True)
     try:
+        require_ordinary_review_run(session_dir)
+        session_dir.mkdir(parents=True, exist_ok=True)
         with recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            handler(args)
-    except recorder_state.OldRecorderState as error:
+            try:
+                handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError, recorder_state.OldRecorderState, staff.StaffRefused) as error:
         raise SystemExit(str(error)) from error
 
 
