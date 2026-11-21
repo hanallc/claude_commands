@@ -49,6 +49,25 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## Restore deployment records after a wipe
+
+1. Restore the AWS credentials on natedev, including `~/.config/aws-build/plan.gpg`.
+2. Run `github-warmup` if the GPG agent is cold.
+3. Restore the private Budget notification address.
+4. Run `deploy.py prepare` to create the local preparation bundle.
+5. Run `deploy.py recover`.
+
+Preparation uses the administrator credentials to discover the network.
+Recovery uses the plan key to read the existing CloudFormation stacks, the scaler identity, and the network settings.
+It reports the nixpkgs revision from `/etc/nixos/flake.lock`.
+When every configured stack is complete, recovery can create `deployment.json` and `gate-deployment.json` under `~/.local/state/build-targets/aws`.
+`prepare` can create a provisional `deployment.json` after a wipe.
+If a record differs, review the reported fields and run `deploy.py recover --write` to accept the replacement.
+When the preparation bundle has a different deployment ID, `recover --write` rebuilds it with the deployment ID from the stack.
+Recovery runs the same preparation checks as `prepare` and records the current time and spending decision.
+
+Restore the cost ledger, launch history, charges, timing history, and Hana lifecycle and setup records from the separate backup.
+
 ## AWS plan identity
 
 Run this command in a terminal on natedev.

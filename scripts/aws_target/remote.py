@@ -1,4 +1,4 @@
-"""Read saved AWS deployment records."""
+"""Encode and read saved AWS deployment records."""
 from __future__ import annotations
 
 from bisect import bisect_right
@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import cast
+
+
+def record_text(record: dict[str, object]) -> str:
+    return json.dumps(record, sort_keys=True) + '\n'
+
 
 def read_record(path: Path) -> dict[str, object]:
     value = cast(object, json.loads(path.read_text()))

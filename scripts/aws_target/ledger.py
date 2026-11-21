@@ -816,7 +816,7 @@ def mapping(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def text(row: dict[str, object], key: str) -> str:
+def text(row: Mapping[str, object], key: str) -> str:
     value = row.get(key)
     if not isinstance(value, str) or not value:
         raise LedgerUnavailable(f"{key}: expected nonempty text")

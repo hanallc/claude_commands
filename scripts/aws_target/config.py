@@ -10,7 +10,9 @@ import os
 import json
 from zoneinfo import ZoneInfo
 
+from scripts.aws_target import remote
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets import target_config
 
 
@@ -25,7 +27,6 @@ def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tup
 
 def gate_deployment(path: Path, home: str) -> dict[str, object]:
     """Migrate the single-region record once and read the regional form."""
-    from scripts.lib.atomic_file import write_text_atomic
     value = cast(dict[str, object], json.loads(path.read_text()))
     if 'regions' not in value:
         regional = {key: value.pop(key) for key in ('image', 'subnets', 'template', 'version', 'security_group') if key in value}
@@ -193,6 +194,10 @@ def deployment_record(directory: Path | None = None) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError('deployment.json: expected a deployment record')
     return cast(dict[str, object], value)
+
+
+def save_deployment_record(directory: Path, record: dict[str, object]) -> None:
+    write_text_atomic(directory / 'deployment.json', remote.record_text(record))
 
 
 def deployment_outputs(directory: Path | None = None) -> dict[str, str]:
