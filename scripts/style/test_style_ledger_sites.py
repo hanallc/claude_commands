@@ -105,7 +105,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
         _ = ledger.follow_declarations((finding.finding_id,), tip, lambda _: True)
         followed, = ledger.named_held((finding.finding_id,))
         self.assertEqual((followed.path, followed.line), (MOVED_FILE, 3))
-        self.assertEqual((followed.path, followed.line), (MOVED_FILE, 3))
         evidence = ledger.finding_site(followed, tip)
         self.assertIsInstance(evidence, style_ledger.UnchangedSite)
         assert isinstance(evidence, style_ledger.UnchangedSite)

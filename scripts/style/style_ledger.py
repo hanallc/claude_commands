@@ -49,7 +49,6 @@ from scripts.style import declarations
 from scripts.style import finding_sites
 from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
                            FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
-                           RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 from scripts.style import style_rules
 from scripts.style import style_config
@@ -4380,21 +4379,6 @@ class Ledger:
                         pending.append(identity)
         return tuple(YieldedFinding(identity, reason) for identity, reason in reasons.items())
 
-    def bulk_ticket(self, id: str) -> TicketRecord:
-        """The assigned proposal ticket a bulk batch may edit."""
-        ticket = self._ticket(id)
-        if ticket["kind"] != "proposal" or ticket["state"] != "assigned":
-            raise LedgerError(f"{id}: bulk rename requires an assigned proposal ticket")
-        return ticket
-
-    def bulk_findings(self, id: str) -> tuple[HeldFinding, ...]:
-        """The bulk ticket's findings, each still filed and held by this ticket."""
-        ticket = self.bulk_ticket(id)
-        findings = tuple(self._held(identity) for identity in ticket["finding_ids"])
-        if any(not isinstance(finding.state, Filed) or finding.build_ticket != BuildTicket(id) for finding in findings):
-            raise LedgerError(f"{id}: a bulk finding is no longer filed under this build ticket")
-        return findings
-
     def bulk_refusals(self, ticket: str) -> tuple[BulkRefusal, ...]:
         rows = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT finding_id,ticket,reason,at FROM bulk_refusals WHERE ticket=? ORDER BY finding_id", (ticket,),
@@ -8098,38 +8082,6 @@ class Ledger:
                   finding.kind, finding.before, finding.after, finding.ticket,
                   asdict(finding.follow), asdict(self._finding_history(finding)))
         return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
-
-    def rename_judgment_site(self, finding: HeldFinding, at: str) -> RenameJudgmentSite | NeedsJudgment:
-        """Offer only changed owners/lines for a fresh proof, preserving every history barrier.
-
-        This does not judge a rename. The shared executor must still prove rule applicability,
-        references and all safety constraints before publishing fresh evidence.
-        """
-        evidence = self._site_proof(finding, at)
-        if not isinstance(evidence, NeedsJudgment):
-            return NeedsJudgment("site does not require a fresh judgment")
-        if evidence.reason not in {"unchanged source site not proved",
-                                   "enclosing item, owner, imports or original inputs changed"}:
-            return evidence
-        definition = next((rule for rule in self._load_rules() if rule.rule_id == base_rule(finding.rule)), None)
-        if definition is None or definition.blob != finding.rule_blob:
-            return NeedsJudgment("rule changed since judged")
-        if definition.name != "prefer-type-named-fields-and-bindings" or finding.kind != "rename":
-            return NeedsJudgment("rule applicability is not machine-checkable")
-        tip = self._tip(at)
-        try:
-            self._check_cell_path(definition, finding.path, tip)
-        except LedgerError as error:
-            return NeedsJudgment(str(error))
-        anchor = self.finding_anchor(finding)
-        if isinstance(anchor, NeedsJudgment):
-            return anchor
-        # Use the shared diff mapper, including replacement hunks. A location is only a
-        # candidate: no coordinate mapping by itself licenses changed code.
-        mapped = self._outside_mapping(anchor.commit, tip.commit, finding.path, anchor.line)
-        if not isinstance(mapped, declarations.MappedDeclaration):
-            return NeedsJudgment("current declaration location is unproved")
-        return RenameJudgmentSite(FindingAnchor(tip.commit, mapped.path, mapped.line))
 
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],
