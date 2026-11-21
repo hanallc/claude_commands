@@ -31,6 +31,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -206,7 +207,7 @@ esac
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
             # covered separately and need not spawn its two interpreters here.
-            "IN_NIX_SHELL": "pure",
+            **fixture_nix_shell(self.root),
             "CLAUDE_PYTHON": "",
             "RUSTUP_HOME": str(self.root / "rustup"),
             "PACKAGE_ROOT": str(self.root),

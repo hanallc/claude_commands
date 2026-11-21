@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 
 from scripts.direct.verify_mac_offload_test_support import stub_build_tool_path
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -315,7 +316,7 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         cls.fixture_environment = builder.environment.copy()
         # The fixture supplies the entire toolchain and 64 GiB of free memory.
         # Host Nix discovery and Python version probing are separate contracts.
-        cls.fixture_environment.update({"IN_NIX_SHELL": "pure"})
+        cls.fixture_environment.update(fixture_nix_shell(builder.root))
         seed_interpreter_cache(builder.root / "cache")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(builder.root)

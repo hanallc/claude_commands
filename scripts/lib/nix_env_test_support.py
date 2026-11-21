@@ -17,6 +17,12 @@ from scripts.lint.memory_test_support import copy_config_fixture, write_config_f
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/lib/nix_env.py"
 
+
+def fixture_nix_shell(directory: Path, shell: str = "pure") -> dict[str, str]:
+    """Name the fixture's envrc as the source of its toolchain."""
+    return {"IN_NIX_SHELL": shell, "NIX_ENV_ENVRC": str((directory / ".envrc").resolve())}
+
+
 DIRENV = '''import json, os, sys
 from pathlib import Path
 with Path(os.environ["DIRENV_LOG"]).open("a") as stream:
@@ -50,10 +56,7 @@ class NixFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         configuration = self.root / "settings"
-        _ = copy_config_fixture(ROOT / "config", configuration)
-        write_private_slot_roots(configuration / "build_folders.conf", self.root, host_name())
-        _ = write_config_fixture(configuration / "nix_env.conf",
-                                 "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")
+        self.configure(configuration)
         self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),
@@ -63,6 +66,12 @@ class NixFixture(unittest.TestCase):
                     "KEEP": "caller", "REMOVE": "old"}
         self.script(self.bin / "direnv", DIRENV)
         _ = cast(object, self.enterContext(patch.dict(os.environ, self.env, clear=True)))
+
+    def configure(self, configuration: Path) -> None:
+        _ = copy_config_fixture(ROOT / "config", configuration)
+        write_private_slot_roots(configuration / "build_folders.conf", self.root, host_name())
+        _ = write_config_fixture(configuration / "nix_env.conf",
+                                 "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")
 
     def script(self, path: Path, body: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

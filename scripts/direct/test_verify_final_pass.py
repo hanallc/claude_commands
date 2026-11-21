@@ -8,6 +8,7 @@ from scripts.direct.test_verify_untested_examples import VERIFY
 import unittest
 
 from scripts.direct.verify_final_pass_test_support import FinalPassFixture
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 
 
 class FinalPassTests(FinalPassFixture):
@@ -34,7 +35,7 @@ class FinalPassTests(FinalPassFixture):
                 self.assertEqual(json.loads(answer.stdout), row)
         self.assertEqual(self.calls_made(), calls)
         self.assertEqual(self.metadata_count(), metadata_count)
-        self.environment["IN_NIX_SHELL"] = "1"
+        self.environment.update(fixture_nix_shell(self.root, "1"))
         self.environment["BUILD_TARGETS_SCRIPT"] = str(VERIFY.parent.parent / "build_targets/build_targets.py")
         again = self.verify("final")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)

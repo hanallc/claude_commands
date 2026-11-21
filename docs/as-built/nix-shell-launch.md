@@ -54,12 +54,14 @@ checked and may differ from the source commit.
 
 Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
-command uses `command_timeout_seconds`, which starts at 600 seconds. `direnv export json` runs in the requested
-directory with the supplied base environment. Strings replace variables;
-JSON null removes them. Failures retain direnv's last stderr line. The proof
-failure is `nix_env: <dir>: .envrc loaded but no nix shell (IN_NIX_SHELL unset)`.
-An empty successful export means no variables changed: the caller's environment
-is retained and still must supply the `IN_NIX_SHELL` proof.
+command uses `command_timeout_seconds`, which starts at 600 seconds.
+Direnv commands run in the physical directory and receive that path in `PWD`.
+The helper applies the JSON export to the supplied environment.
+Strings replace variables. JSON null removes variables.
+Failures retain direnv's last stderr line.
+The proof failure is `nix_env: <dir>: .envrc loaded but no nix shell (IN_NIX_SHELL unset)`.
+An empty successful export leaves the supplied environment unchanged.
+The environment must still contain nonempty `IN_NIX_SHELL`.
 
 `nix_env.py ensure <directory>` prints the full environment as one JSON object
 and exits 0, or prints one `nix_env: ...` stderr line and exits 1.
@@ -104,18 +106,27 @@ The existing `start_agent` APIs retain their signatures and prompt proof.
 `PreparedAgentEnvironment` binds a proved environment to its exact directory;
 `launch_prepared_agent` opens that directory without another direnv load.
 
-Before tool setup or record access, `verify.sh` repairs a missing nix shell.
-When `IN_NIX_SHELL` is empty or unset, it sets `VERIFY_NIX_ENV_REEXEC` and re-execs
-once through the sibling `lib/py -S` and `nix_env.py exec`, preserving the absolute
-script path, cwd and every original argument, including empty arguments. The
-helper owns the nearest `.envrc` search, including ancestors, and runs direnv
-export at most once. In the re-run, shell proof triggers one stderr notice;
-no `.envrc` means no direnv call or notice. A helper refusal exits nonzero with
-only its `nix_env:` line before verification runs. A caller already in the nix
-shell takes the original path silently. If the re-run loses shell proof while
-`NIX_ENV_ENVRC` still names the loaded file, it refuses with one line instead
-of another re-exec. The internal marker is removed before tool setup.
-The final command's exit status passes through.
+Before tool setup or record access, `verify.sh` checks the inherited nix shell.
+`nix_shell_status` in `lint/invoke.sh` searches the physical directory and its parents for the nearest `.envrc`.
+With an `.envrc`, the check requires nonempty `IN_NIX_SHELL` and one of these proofs:
+
+- `NIX_ENV_ENVRC` equals the resolved path of the nearest `.envrc`.
+- `DIRENV_DIR` contains a hyphen and an absolute path that identifies the same directory as the `.envrc` parent.
+  The check follows directory symlinks.
+
+Without an `.envrc`, a nonempty `IN_NIX_SHELL` still suffices.
+A matching shell proceeds without a notice or a Python call.
+For a missing or unproved shell, `verify.sh` sets `VERIFY_NIX_ENV_REEXEC` and runs `lib/py -S nix_env.py exec` once.
+The command preserves the absolute script path, the working directory, and all arguments.
+Direnv uses the inherited `DIRENV_DIFF` to reverse the old tree's changes before it loads the current tree.
+After a successful load, `verify.sh` prints one notice on stderr.
+Without an `.envrc`, the helper skips direnv and the re-exec is silent.
+If the helper refuses, its `nix_env:` error appears before tool setup.
+If the re-exec still lacks shell proof for an `.envrc`, `verify.sh` exits with one error.
+`verify.sh` clears its re-exec marker before tool setup and returns the final command's exit status.
+
+`lint_dev_shell_path` uses the same check to decide if a nextest step needs the flake's program folders.
+
 `user_clock` runs `user_zone.py` with `python3 -S`; that helper and `/zone` share
 the `stored_zone` configuration reader.
 

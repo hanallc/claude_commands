@@ -10,7 +10,7 @@ import sys
 from typing import TypedDict, cast, override
 import unittest
 
-from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lib.nix_env_test_support import NixFixture, fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -59,6 +59,14 @@ class VerifyNixShellTests(NixFixture):
     python_log: Path = Path()
 
     @override
+    def configure(self, configuration: Path) -> None:
+        configuration.mkdir()
+        _ = (configuration / "nix_env.conf").write_text(
+            "# range: 0.001..\ncommand_timeout_seconds=30\n"
+            + "trusted_home_folders=worktrees\ntrusted_home_prefix=.claude\n")
+        _ = (configuration / "build_folders.conf").write_text(f"roots.slots={self.root}/slots\n")
+
+    @override
     def setUp(self) -> None:
         super().setUp()
         _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
@@ -73,7 +81,6 @@ class VerifyNixShellTests(NixFixture):
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")
         (scripts / "lib/conf_record.sh").symlink_to(SCRIPTS / "lib/conf_record.sh")
         (scripts / "lint").mkdir()
-        _ = shutil.copy2(SCRIPTS / "lint/invoke.sh", scripts / "lint/invoke.sh")
         _ = shutil.copy2(SCRIPTS / "lib/build_folders.py", scripts / "lib/build_folders.py")
         guards = scripts / "build_hold"
         guards.mkdir()
@@ -155,7 +162,7 @@ class VerifyNixShellTests(NixFixture):
         self.assertFalse(self.setup_log.exists())
         self.assertEqual([call[1] for call in self.helper_calls()], ["exec"])
 
-    def test_no_envrc_has_no_notice_no_reexec_and_no_direnv_call(self) -> None:
+    def test_no_envrc_clears_stale_proof_without_notice_or_direnv(self) -> None:
         self.env["NIX_ENV_ENVRC"] = "/stale/worktree/.envrc"
         result = self.invoke("check", "", "sample with spaces")
         self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
@@ -168,15 +175,82 @@ class VerifyNixShellTests(NixFixture):
         self.assertEqual(self.verification_start()["keep"], "caller")
         self.assertEqual(self.verification_start()["loop_marker"], "")
 
-    def test_existing_shell_is_silent_and_never_calls_the_helper(self) -> None:
+    def test_no_envrc_keeps_an_inherited_shell(self) -> None:
+        self.env.update(fixture_nix_shell(self.work.with_name("other")))
+        result = self.invoke("doc")
+        self.assertEqual((result.returncode, result.stderr), (37, ""))
+        self.assertEqual(self.helper_calls(), [])
+        self.assertEqual(self.verification_start()["nix_shell"], "pure")
+
+    def test_shell_from_another_tree_reexecs(self) -> None:
+        envrc = self.envrc(self.work)
+        other = self.envrc(self.work.with_name("other"))
+        self.env.update({"IN_NIX_SHELL": "pure", "NIX_ENV_ENVRC": str(other),
+                         "DIRENV_DIR": f"-{other.parent}", "NIX_LDFLAGS": "-Lother"})
+        result = self.invoke("doc")
+        self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, NOTICE)
+        self.assertEqual(self.verification_start()["ldflags"], "-Lfixture")
+        self.assertEqual(self.verification_start()["envrc"], str(envrc.resolve()))
+        self.assertEqual([call[1] for call in self.helper_calls()], ["exec"])
+
+    def test_reexec_loads_the_physical_ancestor_envrc(self) -> None:
+        envrc = self.envrc(self.work.parent)
+        _ = envrc.write_text("-Lphysical")
+        logical = self.envrc(self.root / "logical")
+        _ = logical.write_text("-Llogical")
+        alias = logical.parent / self.work.name
+        alias.symlink_to(self.work, target_is_directory=True)
+        self.env["PWD"] = str(alias)
+        self.script(self.bin / "direnv", """import json, os, sys
+from pathlib import Path
+
+if sys.argv[1] == "export":
+    directory = Path(os.environ.get("PWD", os.getcwd()))
+    envrc = next(parent / ".envrc" for parent in (directory, *directory.parents)
+                 if (parent / ".envrc").is_file())
+    print(json.dumps({"IN_NIX_SHELL": "pure", "NIX_LDFLAGS": envrc.read_text()}))
+""")
+        result = self.invoke("doc")
+        self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
+        start = self.verification_start()
+        self.assertEqual(start["ldflags"], "-Lphysical")
+        self.assertEqual(start["envrc"], str(envrc))
+
+    def test_existing_shell_with_matching_envrc_is_silent(self) -> None:
+        envrc = self.envrc(self.work)
+        target = envrc.with_name("linked envrc")
+        _ = envrc.rename(target)
+        envrc.symlink_to(target.name)
+        self.env.update(fixture_nix_shell(self.work))
+        self.assert_existing_shell_is_silent()
+
+    def test_existing_shell_with_matching_direnv_dir_is_silent(self) -> None:
+        envrc = self.envrc(self.work.parent)
+        self.env.update({"IN_NIX_SHELL": "pure", "DIRENV_DIR": f"-{envrc.parent}"})
+        self.assert_existing_shell_is_silent()
+
+    def test_existing_shell_with_a_symlinked_direnv_dir_is_silent(self) -> None:
+        envrc = self.envrc(self.work.parent)
+        alias = self.root / "alias"
+        alias.symlink_to(envrc.parent, target_is_directory=True)
+        self.env.update({"IN_NIX_SHELL": "pure", "DIRENV_DIR": f"-{alias}", "PWD": str(alias / self.work.name)})
+        self.assert_existing_shell_is_silent()
+
+    def test_nonempty_shell_without_proof_reexecs(self) -> None:
         _ = self.envrc(self.work)
         self.env["IN_NIX_SHELL"] = "pure"
+        result = self.invoke("doc")
+        self.assertEqual((result.returncode, result.stderr), (37, NOTICE))
+        self.assertEqual([call[1] for call in self.helper_calls()], ["exec"])
+
+    def assert_existing_shell_is_silent(self) -> None:
         self.env["DIRENV_FAIL"] = "1"
         result = self.invoke("doc")
         self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.direnv_calls(), [])
-        self.assertEqual(self.helper_calls(), [])
+        self.assertEqual(self.python_calls(), [])
         self.assertEqual(self.verification_start()["nix_shell"], "pure")
 
     def test_reexec_losing_proof_refuses_without_another_exec(self) -> None:
@@ -188,6 +262,18 @@ class VerifyNixShellTests(NixFixture):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stderr, LOOP_REFUSAL)
         self.assertEqual(result.stdout, "")
+        self.assertFalse(self.setup_log.exists())
+        self.assertEqual([call[1] for call in self.helper_calls()], ["exec"])
+        self.assertEqual(sum(call["args"] == ["export", "json"] for call in self.direnv_calls()), 1)
+
+    def test_reexec_with_stale_proof_refuses_without_another_exec(self) -> None:
+        _ = self.envrc(self.work)
+        startup = self.root / "replace-proof.sh"
+        _ = startup.write_text("export NIX_ENV_ENVRC=/other/.envrc\n", encoding="utf-8")
+        self.env["DIRENV_DIFF"] = json.dumps({"IN_NIX_SHELL": "impure", "BASH_ENV": str(startup)})
+        result = self.invoke("doc")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "verify.sh: nix_env.py re-exec did not prove the nix shell for this tree\n")
         self.assertFalse(self.setup_log.exists())
         self.assertEqual([call[1] for call in self.helper_calls()], ["exec"])
         self.assertEqual(sum(call["args"] == ["export", "json"] for call in self.direnv_calls()), 1)

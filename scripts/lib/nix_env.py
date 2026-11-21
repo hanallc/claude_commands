@@ -230,10 +230,12 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         trusted = trusted_envrc(envrc)
         commands = (["direnv", "allow", str(envrc)], ["direnv", "export", "json"]) if trusted else (
             ["direnv", "export", "json"],)
+        # Direnv can use PWD to find the ancestors of its working directory.
+        direnv_environment = {**environment, "PWD": str(directory)}
         exported = ""
         try:
             for command in commands:
-                result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
+                result = subprocess.run(command, cwd=directory, env=direnv_environment, capture_output=True,
                                         text=True, timeout=_remaining_timeout(timeout), check=False)
                 if result.returncode:
                     reason = last_line(result.stderr, f"direnv exit {result.returncode}")

@@ -262,7 +262,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
-            "IN_NIX_SHELL": "pure",
             "UNIT_DETACHED_RUN": "1",
             "ROSTER_RUN_ROOT": str(builder.root / "unit"),
             "UNIT_RUN_ROOT": str(builder.root / "unit"),

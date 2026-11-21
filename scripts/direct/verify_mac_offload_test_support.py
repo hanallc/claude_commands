@@ -43,6 +43,7 @@ from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -1254,7 +1255,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "PATH": stub_build_tool_path(self.bin_directory),
             "RUSTUP_HOME": str(self.root / "rustup"),
             # The private toolchain is complete; host Nix discovery is unrelated.
-            "IN_NIX_SHELL": "pure",
+            **fixture_nix_shell(self.root),
             "PACKAGE_ROOT": str(self.root),
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),

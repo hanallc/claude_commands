@@ -12,6 +12,7 @@ from typing import ClassVar, override
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_untested_examples import ExampleWorkspaceFixture, VERIFY, workspace_metadata
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -64,7 +65,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         _ = self.package()
         with (self.root / "Cargo.toml").open("a") as stream:
             _ = stream.write('\n[workspace.metadata.dev]\nfeatures = ["extra", "extra"]\n')
-        self.environment.update({"PACKAGE_ROOT": str(self.root), "IN_NIX_SHELL": "1",
+        self.environment.update({"PACKAGE_ROOT": str(self.root), **fixture_nix_shell(self.root, "1"),
                                  "VERIFY_STATE_DIR": str(fixture / "verify-state"),
                                  "UNIT_SESSION_DIR": "", "NEXTEST_TEST_THREADS": "2"})
         _ = self.git("init", "--quiet")

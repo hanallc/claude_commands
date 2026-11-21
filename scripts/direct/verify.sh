@@ -530,14 +530,20 @@ VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$VERIFY_INVOKE_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_INVOKE_DIR=.
 source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp || exit 2
 # Load the environment once through the shared helper, before tool setup or records.
+VERIFY_NIX_SHELL_STATUS=0
+nix_shell_status . || VERIFY_NIX_SHELL_STATUS=$?
 if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
-    if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+    if (( VERIFY_NIX_SHELL_STATUS == 0 )); then
         printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
-    elif [[ -n "${NIX_ENV_ENVRC:-}" ]]; then
-        printf '%s\n' 'verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)' >&2
+    elif (( VERIFY_NIX_SHELL_STATUS == 1 )) || [[ -n "${NIX_ENV_ENVRC:-}" ]]; then
+        if [[ -z "${IN_NIX_SHELL:-}" ]]; then
+            printf '%s\n' 'verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)' >&2
+        else
+            printf '%s\n' 'verify.sh: nix_env.py re-exec did not prove the nix shell for this tree' >&2
+        fi
         exit 1
     fi
-elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
+elif (( VERIFY_NIX_SHELL_STATUS != 0 )); then
     VERIFY_NIX_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
@@ -545,7 +551,7 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
         exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
-unset VERIFY_NIX_ENV_REEXEC
+unset VERIFY_NIX_ENV_REEXEC VERIFY_NIX_SHELL_STATUS
 
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.

@@ -1178,6 +1178,17 @@ placement_once
         other = self.root / "other-trusted"
         _ = copies.git(tools.root, "clone", "-q", str(tools.root), str(other))
         tools.write_executable(tools.bin_directory / "direnv", "#!/bin/sh\nexit 1\n")
+        slot_shell = dedent(f"""
+            import os
+            from pathlib import Path
+            import sys
+
+            sys.path.insert(0, {str(CHECKOUT)!r})
+            from scripts.lib.nix_env_test_support import fixture_nix_shell
+
+            environment = {{**os.environ, **fixture_nix_shell(Path.cwd())}}
+            os.execvpe(sys.argv[1], sys.argv[1:], environment)
+            """)
         for scenario in ("prepared", "modified", "clean-linux", "linux-doc", "trusted-linux",
                          "untrusted-linux", "trusted-envrc",
                          "untrusted-envrc", "mismatched-linux", "source-record", "retry"):
@@ -1201,6 +1212,8 @@ placement_once
                 ready = self.root / f"remote-{scenario}-ready"
                 words = ("bash", str(verify), "doc" if doc else "check", "sample",
                          "--target", "peer" if linux else "mac")
+                if envrc:
+                    words = (sys.executable, "-c", slot_shell, *words)
                 if scenario == "modified" or (linux and scenario != "clean-linux"):
                     dirty_command = "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs"
                     if mismatch:

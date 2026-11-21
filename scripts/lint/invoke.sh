@@ -12,6 +12,33 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
+# Return 1 for an unproved shell with an envrc, or 2 for no shell and no envrc.
+nix_shell_status() {
+    local directory envrc direnv_dir="${DIRENV_DIR:-}"
+    directory=$(cd -P -- "$1" >/dev/null && pwd -P) || return 1
+    while :; do
+        envrc="${directory%/}/.envrc"
+        if [[ -f "$envrc" ]]; then
+            [[ -n "${IN_NIX_SHELL:-}" ]] || return 1
+            if [[ "$direnv_dir" == -/* && "$directory" -ef "${direnv_dir#-}" ]]; then
+                return 0
+            fi
+            [[ -n "${NIX_ENV_ENVRC:-}" ]] || return 1
+            if [[ -L "$envrc" ]]; then
+                envrc=$(realpath -- "$envrc") || return 1
+            fi
+            [[ "$NIX_ENV_ENVRC" == "$envrc" ]]
+            return
+        fi
+        if [[ "$directory" == / ]]; then
+            [[ -z "${IN_NIX_SHELL:-}" ]] && return 2
+            return 0
+        fi
+        directory="${directory%/*}"
+        directory="${directory:-/}"
+    done
+}
+
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 
 BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
@@ -754,17 +781,18 @@ lint_prebuild_prefix() {
     done < "$manifest"
 }
 
-# A test can need a program that the workspace's flake development shell
-# declares (SpacetimeDB for hana_catalyst). verify.sh on natedev runs inside
-# that shell; the Mac route and a bare lint call do not. Outside a nix shell,
-# dev_shell.py prints the shell's program folders, and the step adds them to
-# the END of PATH, so every tool the host has stays first. A workspace without
-# flake.nix, or a step inside a nix shell, starts no process. The evaluation
-# is cached per flake input change; a failed one fails the step.
+# Tests can use programs from the workspace's flake.
+# A matching shell or a missing flake skips evaluation.
+# Otherwise dev_shell.py reads the flake's program folders.
+# Append the folders to PATH so host tools stay first.
+# A failed evaluation stops the step.
 lint_dev_shell_path() {
     local root=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} folders
     root=${root%/*}
-    [[ -z "${IN_NIX_SHELL:-}" && -f "$root/flake.nix" ]] || return 0
+    [[ -f "$root/flake.nix" ]] || return 0
+    if nix_shell_status "$root"; then
+        return 0
+    fi
     # On a failure the helper prints the one line that names the cause.
     folders=$("${BUILD_FOLDERS_SCRIPT%/*}/py" "${BUILD_FOLDERS_SCRIPT%/*}/dev_shell.py" path --root "$root") ||
         return 1

@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 
@@ -48,7 +49,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()
-        _ = (lint / "invoke.sh").write_text("return 0\n")
+        (lint / "invoke.sh").symlink_to(VERIFY.parent.parent / "lint/invoke.sh")
         _ = copy_helpers(fixture.root, *VERIFY_HELPERS)
         probe = direct / "probe.py"
         _ = probe.write_text('''import json, os, sys
@@ -81,7 +82,7 @@ fi
         environment = verify_test_environment()
         _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, env=environment, check=True,
                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        environment.update({"IN_NIX_SHELL": "fixture", "HOME": str(script.parents[2]), **changes})
+        environment.update({**fixture_nix_shell(repository, "fixture"), "HOME": str(script.parents[2]), **changes})
         process = subprocess.Popen(["bash", str(script), name, *words], cwd=repository, env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)

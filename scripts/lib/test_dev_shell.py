@@ -15,6 +15,7 @@ from typing import final, override
 
 from scripts.build_hold.override_guard import require_checkout
 from scripts.lib import dev_shell
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.shell_test_support import shell_functions
 
 require_checkout(Path(__file__))
@@ -94,7 +95,10 @@ class DevShellTests(unittest.TestCase):
             _ = dev_shell.prepare_shell(self.root / 'workspace', self.root / 'cache', 'default', 3)
         self.assertEqual(evaluate.call_args.kwargs['pass_fds'], ())
 
-    def test_invoke_adds_the_folders_last_and_only_outside_a_nix_shell(self) -> None:
+    def test_invoke_adds_folders_last_without_the_worktree_shell(self) -> None:
+        workspace = self.root / "workspace"
+        envrc = workspace / ".envrc"
+        _ = envrc.write_text("use flake\n")
         library = self.root / "lib"
         library.mkdir()
         fake_py = library / "py"
@@ -103,21 +107,29 @@ class DevShellTests(unittest.TestCase):
         _ = fake_py.write_text(f'#!{shutil.which("bash")}\n[[ "$2 $3 $4" == "{expected}" ]] || exit 9\n'
                                + '[[ -z "${HELPER_FAILS:-}" ]] || exit 1\necho /nix/store/x-tools/bin\n')
         fake_py.chmod(0o755)
-        script = (shell_functions(INVOKE, "lint_dev_shell_path")
+        script = (shell_functions(INVOKE, "nix_shell_status", "lint_dev_shell_path")
                   + f"\nBUILD_FOLDERS_SCRIPT={library}/build_folders.py\nPATH=/host/bin:{library}\n"
                   + 'lint_dev_shell_path; status=$?; printf "%s %s\\n" "$status" "$PATH"\n')
         rows: tuple[tuple[dict[str, str], str, str], ...] = (
             ({}, f"0 /host/bin:{library}:/nix/store/x-tools/bin\n", ""),
-            ({"IN_NIX_SHELL": "impure"}, f"0 /host/bin:{library}\n", ""),
-            ({"HELPER_FAILS": "1"}, f"1 /host/bin:{library}\n", ""),
+            (fixture_nix_shell(workspace), f"0 /host/bin:{library}\n", ""),
+            ({"IN_NIX_SHELL": "impure", "DIRENV_DIR": f"-{workspace.resolve()}"}, f"0 /host/bin:{library}\n", ""),
+            (fixture_nix_shell(self.root / "other"), f"0 /host/bin:{library}:/nix/store/x-tools/bin\n", ""),
+            ({"IN_NIX_SHELL": "impure"}, f"0 /host/bin:{library}:/nix/store/x-tools/bin\n", ""),
+            ({**fixture_nix_shell(self.root / "other"), "HELPER_FAILS": "1"}, f"1 /host/bin:{library}\n", ""),
         )
+        environment = {name: value for name, value in self.environment.items()
+                       if name not in ("IN_NIX_SHELL", "NIX_ENV_ENVRC", "DIRENV_DIR", "LINT_WORKSPACE_MANIFEST")}
         for extra, stdout, stderr in rows:
             with self.subTest(extra=extra):
-                environment = {name: value for name, value in os.environ.items() if name != "IN_NIX_SHELL"}
                 result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False,
                                         cwd=self.root / "workspace", env={**environment, **extra})
                 self.assertEqual((result.stdout, result.stderr), (stdout, stderr))
-        (self.root / "workspace/flake.nix").unlink()
+        envrc.unlink()
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False,
+                                cwd=workspace, env={**environment, "IN_NIX_SHELL": "impure"})
+        self.assertEqual((result.stdout, result.stderr), (f"0 /host/bin:{library}\n", ""))
+        (workspace / "flake.nix").unlink()
         # No flake: the empty PATH proves the check starts no process.
         result = subprocess.run(["bash", "-c", script.replace(f"PATH=/host/bin:{library}", "PATH=/nonexistent")],
                                 capture_output=True, text=True, check=False, cwd=self.root / "workspace")

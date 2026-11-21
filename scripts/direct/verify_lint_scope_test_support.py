@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
+from scripts.lib.nix_env_test_support import fixture_nix_shell
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -318,7 +319,7 @@ if __name__ == "__main__":
         self.environment.update({
             # The fixture supplies its complete toolchain; Nix discovery is unrelated
             # to lint scope, formatting, fix convergence or cache assertions.
-            "IN_NIX_SHELL": "pure",
+            **fixture_nix_shell(self.root),
             "HOME": str(home),
             "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
             "CLAUDE_PYTHON": "",
