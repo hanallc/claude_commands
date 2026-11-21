@@ -598,19 +598,41 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry name
-    local names=()
-    local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
-        has_input=1
+        set -- 1 "$@"
+    else
+        set -- 0 "$@"
+    fi
+    if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
+        if [[ "$2" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$2" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
+            export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
+        fi
+        # Read caller values before local variables can replace them.
+        if [[ ! -v verify_helper_names && ! -v verify_helper_name && ! -v verify_helper_environment ]] &&
+                compgen -V verify_helper_names -e 2>/dev/null; then
+            verify_helper_environment=()
+            for verify_helper_name in "${verify_helper_names[@]}"; do
+                [[ -v "$verify_helper_name" && "${!verify_helper_name@a}" != *[aA]* ]] || continue
+                verify_helper_environment+=("$verify_helper_name=${!verify_helper_name}")
+            done
+            verify_helper_environment+=("")
+        else
+            # Bash opens the stream before it declares the array.
+            {
+                local -a verify_helper_environment=()
+                mapfile -d '' -t verify_helper_environment
+            } < <(command env -0 && printf '\0')
+        fi
+    fi
+    local input="" has_input=$1 status output errors entry
+    local forwarded=()
+    shift
+    if [[ "$has_input" == 1 ]]; then
         input="$(cat; printf '\001')"
         input="${input%$'\001'}"
     fi
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
-        if [[ "$1" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$1" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
-            export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
-        fi
         if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
             # The empty list's NUL terminator does not represent an environment entry.
             while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do
@@ -618,11 +640,16 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
+        # An incomplete environment must not reach the request pipe.
+        if [[ ${#verify_helper_environment[@]} -gt 0 && -z "${verify_helper_environment[-1]}" ]] &&
+                lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            for name in "${names[@]}"; do
-                [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
-                printf '%s=%s\0' "$name" "${!name}"
+            for entry in "${verify_helper_environment[@]}"; do
+                # Match Bash's exported variables. Skip function entries and the external command's _.
+                case "${entry%%=*}" in
+                    ''|_|[0-9]*|*[!a-zA-Z0-9_]*) continue ;;
+                esac
+                printf '%s\0' "$entry"
             done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
@@ -1835,22 +1862,31 @@ collect_hold_wait() {
 }
 
 interrupt_hold_wait() {
-    if [[ -n "$HOLD_WAITER_PID" ]]; then
-        if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
-            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$HOLD_WAITER_PID" TERM 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$HOLD_WAITER_PID" >&2; }
-            if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
-                kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
-                VERIFY_HELPER_PID=""
-            fi
-            exec 70>&- 71<&-
-            VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
-            PLACEMENT_CLIENT_ACTIVE=0
-        else
-            kill -TERM "$HOLD_WAITER_PID" 2>/dev/null || true
+    local waiter_pid=$HOLD_WAITER_PID last_job_pid=${!:-}
+    if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
+        # A signal can arrive after Bash starts the job and before Verify saves its PID.
+        if [[ -z "$waiter_pid" && -n ${placement_previous_job_pid+x} &&
+                "$last_job_pid" != "$placement_previous_job_pid" ]]; then
+            waiter_pid=$last_job_pid
         fi
-        # Bash can wait for log readers after the waiter exits.
-        HOLD_WAITER_PID=""
+        if [[ -n "$waiter_pid" ]]; then
+            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" \
+                "$waiter_pid" TERM 2>/dev/null || {
+                [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$waiter_pid" >&2
+            }
+        fi
+        # Stop the helper before cleanup makes another request.
+        if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
+            kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
+            VERIFY_HELPER_PID=""
+        fi
+        exec 70>&- 71<&-
+        VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
+        PLACEMENT_CLIENT_ACTIVE=0
+    elif [[ -n "$waiter_pid" ]]; then
+        kill -TERM "$waiter_pid" 2>/dev/null || true
     fi
+    HOLD_WAITER_PID=""
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
         verify_helper "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
     fi
@@ -2221,7 +2257,8 @@ LINT_MAC_FIX=0
 MAC_FIX_RESULT=""
 # The local lint fix pass runs on a private copy in a repository that cargo-berth
 # configures (lint_copy_begin). LINT_COPY_MODE is empty until the first pass asks.
-LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET=""
+LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET="" LINT_COPY_REPO=""
+LINT_COPY_ALLOCATION=""
 LINT_COPY_ARGS=()
 
 forward_mac_runner_signal() {
@@ -2906,7 +2943,8 @@ placement_once() {
         return 0
     fi
     [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
-    # A builtin wait lets the parent handle TERM during a service outage.
+    # A builtin wait lets the parent handle signals during a service outage.
+    local placement_previous_job_pid=${!:-}
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
@@ -2915,8 +2953,7 @@ placement_once() {
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
     wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID=""
-    PLACEMENT_CLIENT_ACTIVE=0
+    HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
     reply=$(< "$HOLD_WAIT_DIR/placement-reply")
     while IFS= read -r line; do
         case "$line" in
@@ -4406,14 +4443,22 @@ lint_copy_begin() {
     [[ "${LINT_COPY_MODE:-}" != in-place ]] || return 0
     local answer manifest
     load_metadata
+    LINT_COPY_REPO="$(git rev-parse --show-toplevel)" || exit 2
     answer="$(verify_helper --stdin "$FIX_RETURN_SCRIPT" copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --owner "$$" <<< "$GATE_METADATA")" || exit 2
+        --repo-root "$LINT_COPY_REPO" --owner "$$" <<< "$GATE_METADATA")" || exit 2
     if [[ "$answer" == in-place ]]; then
         LINT_COPY_MODE=in-place
         return 0
     fi
     LINT_COPY_MODE=copy
-    { read -r _; read -r LINT_COPY_DIR; read -r LINT_COPY_TREE; read -r manifest; read -r LINT_COPY_TARGET; } <<< "$answer"
+    {
+        read -r _
+        read -r LINT_COPY_DIR
+        read -r LINT_COPY_TREE
+        read -r manifest
+        read -r LINT_COPY_TARGET
+        read -r LINT_COPY_ALLOCATION
+    } <<< "$answer"
     LINT_COPY_ARGS=(--manifest-path "$manifest")
 }
 
@@ -4429,15 +4474,15 @@ lint_rewrite() {
     "$@" "${LINT_COPY_ARGS[@]}"
 }
 
-# Write the held changes of the copy into the worktree and delete the copy.
+# Write the held changes into the worktree and close the lint copy.
 # A fixed path that no reservation holds fails the pass.
 lint_copy_return() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    local folder="$LINT_COPY_DIR" status
-    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    local folder="$LINT_COPY_DIR" allocation_id="$LINT_COPY_ALLOCATION" status
+    LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_ALLOCATION=""
     LINT_COPY_ARGS=()
     verify_helper "$FIX_RETURN_SCRIPT" return-copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --folder "$folder" || {
+        --repo-root "$LINT_COPY_REPO" --folder "$folder" --allocation-id "$allocation_id" || {
         status=$?
         LINT_FIX_INCOMPLETE=1
         return "$status"
@@ -4446,9 +4491,10 @@ lint_copy_return() {
 
 lint_copy_drop() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    rm -rf -- "$LINT_COPY_DIR"
-    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    local folder="$LINT_COPY_DIR"
+    LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_ALLOCATION=""
     LINT_COPY_ARGS=()
+    verify_helper "$FIX_RETURN_SCRIPT" drop-copy --repo-root "$LINT_COPY_REPO" --folder "$folder" || true
 }
 
 # The clippy fix loop stops when its tree stops changing: the copy or the worktree.

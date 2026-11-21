@@ -1,8 +1,11 @@
 """One fake stop-and-resume boundary for account move callers."""
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from scripts.accounts import moves
 from scripts.agents import stop_resume
@@ -10,6 +13,14 @@ from scripts.production import staff
 
 
 _NO_SOURCES: Mapping[str, str] = MappingProxyType({})
+_FIXTURE_REFRESH_EXPIRY = datetime(2100, 1, 1, tzinfo=timezone.utc)
+
+
+def write_claude_move_credentials(directory: Path, *, expires_at: datetime = _FIXTURE_REFRESH_EXPIRY) -> None:
+    """Write synthetic sign-in evidence in a fixture account directory."""
+    _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "refreshToken": "fixture", "refreshTokenExpiresAt": int(expires_at.timestamp() * 1000),
+    }}))
 
 
 @dataclass(frozen=True)
