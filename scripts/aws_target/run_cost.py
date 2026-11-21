@@ -16,10 +16,10 @@ from scripts.aws_target import hana_spend, ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
+from scripts.lib.build_steps import read_step_names
 
-KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
-EVERY_KIND = tuple(mode for mode, _label in KINDS)
-_MODE_ALIASES = {'gate': 'merge-gate', 'test-affected': 'targeted-test'}
+KINDS = ('gate', 'test-affected')
+_MODE_ALIASES = {'merge-gate': 'gate', 'targeted-test': 'test-affected'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
 _NO_RESERVED_HOURS = Decimal(0)
@@ -79,9 +79,11 @@ class RunScope:
     modes: tuple[str, ...]
 
 
-SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
-          RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
-          RunScope('both', 'Both', 'run', EVERY_KIND))
+def scopes() -> tuple[RunScope, ...]:
+    gate = read_step_names().shown('gate')
+    return (RunScope('gate', gate.capitalize() + 's', gate, ('gate',)),
+            RunScope('test-affected', 'Targeted runs', 'targeted test', ('test-affected',)),
+            RunScope('both', 'Both', 'run', KINDS))
 
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
@@ -391,7 +393,7 @@ class RunEvidence:
         Requests without a mode count only when the modes cover every kind.
         """
         kinds = tuple(dict.fromkeys(map(_run_kind, modes)))
-        counted = (*kinds, NO_MODE) if set(EVERY_KIND) <= set(kinds) else kinds
+        counted = (*kinds, NO_MODE) if set(KINDS) <= set(kinds) else kinds
         refused = sum(self.refused.get((size, region, mode), 0) for mode in counted)
         launched = sum(self.launched.get((size, region, mode), 0) for mode in counted)
         if not refused + launched:
@@ -408,7 +410,7 @@ class RunEvidence:
         box = ((Decimal(median(seconds)) if seconds else default_seconds)
                + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
         # Capacity refusals do not depend on the run kind, so every request counts.
-        refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
+        refusals = self.refusals_per_launch(size, region, KINDS)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
 
 
@@ -598,17 +600,17 @@ def gate_variant_eligibility(
     return GateVariantEligibility(variants, deployed_gate_prices(variants, zone_prices), slow)
 
 
-def merge_gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,
-                           policy: conf.ConfigRead, *, gate_pricing: GatePricingInputs | None = None,
-                           ) -> tuple[GateTimeComparison, ...]:
-    """Compare the cheapest priced 16-vCPU and 32-vCPU merge gates in each region."""
+def gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,
+                     policy: conf.ConfigRead, *, gate_pricing: GatePricingInputs | None = None,
+                     ) -> tuple[GateTimeComparison, ...]:
+    """Compare the lowest costs for 16-vCPU and 32-vCPU gates in each region."""
     regions = tuple(dict.fromkeys(values.words('regions')))
     home = policy.text('region')
     missing = NoPricedGateVariant()
     inputs = gate_pricing if gate_pricing is not None else read_gate_pricing_inputs(directory, now, values, policy)
     if not inputs.prices:
         return tuple(GateTimeComparison(region, missing, missing) for region in regions)
-    modes = ('merge-gate',)
+    modes = ('gate',)
     slow = slow_gate_types(inputs.deployed, inputs.evidence, modes, values.whole('max_gate_minutes'))
     pricing = GateRunPricing.from_config(values, inputs.evidence, home, modes)
     estimates: dict[tuple[str, int], list[GateRunEstimate]] = defaultdict(list)

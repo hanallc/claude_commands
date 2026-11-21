@@ -828,7 +828,7 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
-With `enabled.aws-gate=off` in `build_targets.conf`, the route sends new gates and targeted tests to natedev.
+With `enabled.aws-gate=off` in `build_targets.conf`, the route sends new gates and affected tests to natedev.
 The route checks the switch at entry and before each new attempt. The worker checks it before each launch request.
 Running gates and status reads continue. Manual AWS gate commands do not read the switch.
 A confirmed Spot interruption before a final result starts another cloud attempt.
@@ -1164,7 +1164,7 @@ The user approved the combined table on 2026-11-18.
    A ban icon with the title `Not sold here` identifies a type that the region does not sell.
    Unavailable values show a dash with the reason where known.
 4. The Runs chips show when Cost per gate is on.
-   Merge gates, Targeted runs, and Both select the Gate estimates and the run tables.
+   Gates, Targeted runs, and Both select the Gate estimates and the run tables.
    The choice also selects the refused and launched tables.
    The billed hours table does not depend on the run choice.
    The run tables omit Spot price and estimate because the Prices and quotas card shows them.

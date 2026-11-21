@@ -231,6 +231,12 @@ def past_end(record: SilenceRecord) -> bool:
     return until is not None and datetime.fromisoformat(until) <= datetime.now(user_zone())
 
 
+def active() -> bool:
+    with locked():
+        record = read_state()
+        return record is not None and not past_end(record)
+
+
 def keep_here(push: KeptPush, runner: Run | None = None, deliver: Deliver | None = None) -> Kept | NotSilent:
     _ = end_if_past(runner, deliver)
     with locked():

@@ -201,6 +201,7 @@ class MacRouteTests(unittest.TestCase):
         self.assertEqual(scope.call_count, 2)
 
     def test_a_kept_claim_does_not_hold_its_repository_while_another_runs(self) -> None:
+        self.use_target_config()
         first = claim_state.RepositoryScope("first")
         second = claim_state.RepositoryScope("second")
         live = claim(second, "live check")

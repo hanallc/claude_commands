@@ -197,6 +197,7 @@ mount_timeout_seconds=15
         guest.write_permit(settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
         arguments = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
             mounted=True, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
+        self.assertIn('--collect', arguments[:arguments.index('--')])
         self.assertIn('--slice=hana-work-' + self.generation + '.slice', arguments)
         self.assertIn('--uid=hana-runner', arguments)
         self.assertIn('--property=CPUQuota=' + str(settings.step_cpu_limit * 100) + '%', arguments)

@@ -53,7 +53,7 @@ sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
 from scripts.build_queue.queue_place import queue_place
 
 for phase in range(2):
-    with queue_place('merge-gate', Path.cwd()):
+    with queue_place('gate', Path.cwd()):
         print(json.dumps({'phase': phase, 'cwd': str(Path.cwd()), 'run': os.environ.get('BUILDLOG_RUN', ''), 'at': time.monotonic()}), flush=True)
         if not sys.stdin.buffer.read(1):
             break
@@ -119,7 +119,7 @@ class SlotOrderTests(unittest.TestCase):
         super().setUpClass()
         seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="slot-order-seed-")))
         cls.repository_seed = ImmutableGitSeed.create(seed, "main", "Slot Tests", "slots@example.invalid",
-            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "merge_gate.py": GATE_COMMAND,
+            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "gate.py": GATE_COMMAND,
              ".gitignore": "target/\n"})
 
     @override
@@ -299,7 +299,7 @@ class SlotOrderTests(unittest.TestCase):
         production = Production(self.root / "production.md", owner.name, "main", self.source,
                                 self.root / "production.log", ZoneInfo("UTC"), owner)
         unit = waiting.Unit("scratch-unit", "", "main", self.source, None, owner.id)
-        command = shlex.join((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
+        command = shlex.join((sys.executable, str(self.source / "gate.py"), "--tests-only"))
         execute = mock.Mock(side_effect=AssertionError("the scratch command started before admission"))
         with (mock.patch.object(waiting, "named_unit", return_value=unit),
               mock.patch.object(waiting, "subprocess", SimpleNamespace(run=execute, STDOUT=subprocess.STDOUT)),
@@ -310,7 +310,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue.hold_starts()
         tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
-        command = [sys.executable, str(self.source / "merge_gate.py"), "--tests-only"]
+        command = [sys.executable, str(self.source / "gate.py"), "--tests-only"]
         record: checkpoint_gate.BumpGateRecord = {
             "tip": tip, "checkpoint": tip, "production_doc": str(self.root / "production.md"),
             "owner_id": self.owner, "unit_id": self.owner, "name": "fixture", "merge_branch": "main",
@@ -369,7 +369,7 @@ class SlotOrderTests(unittest.TestCase):
                         os.environ["UNIT_DETACHED_RUN"] = previous
                     else:
                         _ = os.environ.pop("UNIT_DETACHED_RUN", None)
-                    command = (sys.executable, str(self.source / "merge_gate.py"), "--tests-only")
+                    command = (sys.executable, str(self.source / "gate.py"), "--tests-only")
                     with self.assertRaisesRegex(ValueError, "private command failed") if fails else nullcontext():
                         with first_step.admitted_run(command, self.source) as admitted:
                             self.assertEqual(os.environ["UNIT_DETACHED_RUN"], "1")
@@ -382,6 +382,21 @@ class SlotOrderTests(unittest.TestCase):
                         self.assertEqual(os.environ["UNIT_DETACHED_RUN"], previous)
                     else:
                         self.assertNotIn("UNIT_DETACHED_RUN", os.environ)
+
+    def test_affected_commands_reserve_memory_for_the_affected_gate(self) -> None:
+        gate = str(self.source / "gate.py")
+        for command, expected in (
+            ((sys.executable, gate, "--affected", "--full"), "test-affected"),
+            ((sys.executable, str(self.source / "targeted_test.py")), "test-affected"),
+            ((sys.executable, "-X", "--affected", gate, "--tests-only"), "gate"),
+        ):
+            with self.subTest(command=command):
+                offset = len(self.requests)
+                with first_step.admitted_run(command, self.source) as admitted:
+                    admitted.handoff(self.source)
+                requests = [request for request in self.requests[offset:] if isinstance(request, wire.AdmitRequest)]
+                self.assertTrue(requests)
+                self.assertEqual({request.profile.step for request in requests}, {expected})
 
     def test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time(self) -> None:
         arguments_file = self.root / "placement-arguments"
@@ -435,7 +450,7 @@ placement_once
 
     def test_waiting_and_stopped_runs_leave_no_slot_or_lease(self) -> None:
         self.queue.hold_starts()
-        process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+        process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
                              separate_command=False)
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the copy run did not enter the memory queue")
         with self.queue.loop_turn():
@@ -478,7 +493,7 @@ placement_once
             + f'exec {shlex.quote(binary)} "$@"\n')
         wrapper.chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": str(scripts) + os.pathsep + os.environ["PATH"]}):
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
                 "--apply-uncommitted", str(self.source))
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
         self.assertFalse(self.slot_root.exists())
@@ -506,7 +521,7 @@ placement_once
         self.assertEqual((tree / "tracked.txt").read_text(), "applied after admission\n")
         self.assertEqual(build_folders.build_folder_state(tree), "held")
         memory_requests = [request for request in self.requests if isinstance(request, wire.AdmitRequest)
-            and request.profile.step == "merge-gate"]
+            and request.profile.step == "gate"]
         self.assertGreaterEqual(len(memory_requests), 2)
         self.assertEqual({request.run for request in memory_requests},
             {wire.RunIdentity(process.pid, first["run"].split(":", 1)[1])})
@@ -528,13 +543,25 @@ placement_once
 
     def test_leaving_before_admission_returns_without_a_slot(self) -> None:
         leave = self.root / "leave"
-        _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
         self.queue.hold_starts()
         with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
-        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the caller did not enter the memory queue")
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"))
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the queue did not report a wait")
+        # The client prints this notice after it receives the wait reply.
+        assert process.stderr is not None
+        descriptor = process.stderr.fileno()
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        notice = bytearray()
+        while b"waiting for memory since " not in notice:
+            remaining = deadline - time.monotonic()
+            self.assertTrue(remaining > 0 and select.select([descriptor], [], [], remaining)[0],
+                notice.decode(errors="replace"))
+            chunk = os.read(descriptor, 4096)
+            self.assertTrue(chunk, notice.decode(errors="replace"))
+            notice.extend(chunk)
         leave.touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        errors = notice.decode(errors="replace") + errors
         self.assertEqual(process.returncode, 75, output + errors)
         self.assertFalse(self.slot_root.exists())
         self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
@@ -563,7 +590,7 @@ placement_once
 
         with mock.patch.object(self.queue.server, "reply_filter", side_effect=pause_grant):
             started_at = time.time()
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"), since_age=since_age)
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"), since_age=since_age)
             self.assertTrue(granted.wait(TEST_HANG_GUARD_SECS))
             with build_slots.take_copy(self.source, "HEAD", showrunner="builds", unit="slot-order",
                     work="race", purpose="competing run") as peer:
@@ -592,7 +619,7 @@ placement_once
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         started, release = self.pause_cargo_check(tools)
-        gate = self.root / "merge_gate.py"
+        gate = self.root / "gate.py"
         _ = gate.write_text(GATE_COMMAND)
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
         with locked_environment({**os.environ, **environment}, self.queue.loop_access):
@@ -685,7 +712,8 @@ placement_once
         environment = {**tools.environment, **{key: os.environ[key] for key in (
             "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
             "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
-            "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": ""}
+            "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "LINT_SKIP_SWEEP": "1"}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
         _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:

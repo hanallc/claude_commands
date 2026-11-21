@@ -33,20 +33,21 @@ def admission_policy_fixture() -> AdmissionPolicy:
 
 
 def _template(name: str) -> Path:
+    if name == ADMISSION_CONFIG_FIXTURE.name:
+        return ADMISSION_CONFIG_FIXTURE
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
-# Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
+def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
+    """Merge the template, existing settings, and explicit overrides in that order.
 
-
-def write_config_fixture(path: Path, overrides: str = "", *, template: str | Path | None = None) -> int:
-    """Merge fixture defaults, test defaults, existing settings and explicit overrides. Keep each setting's limit."""
-    source = template if isinstance(template, Path) else _template(f"{template}.conf" if template else path.name)
+    Keep each setting's explicit limit.
+    """
+    source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer in (TEST_CONFIG_DEFAULTS.get(source.name, ""), existing, overrides):
+    for layer in (existing, overrides):
         previous = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
@@ -140,12 +141,7 @@ def config_environment(root: Path, *, fixture_defaults_only: bool = False) -> di
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if fixture_defaults_only:
-                _ = write_config_fixture(destination, template=ADMISSION_CONFIG_FIXTURE)
-            elif name in TEST_CONFIG_DEFAULTS:
-                _ = write_config_fixture(destination)
-            else:
-                _ = destination.write_bytes(_template(name).read_bytes())
+            _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 

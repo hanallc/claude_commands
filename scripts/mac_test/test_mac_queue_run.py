@@ -16,6 +16,7 @@ from typing import TextIO, cast
 import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
@@ -247,22 +248,35 @@ class QueueRunTests(unittest.TestCase):
                 os.close(reader)
                 os.close(writer)
 
-    def test_stale_callback_does_not_stop_the_next_placement(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            environment = queue_fixture(root)
-            stale = root / mac_queue_run.RUNS / "stale"
-            stale.mkdir(parents=True)
-            (stale / "lock").touch()
-            saved = stale / "run.json"
-            _ = saved.write_text(json.dumps({"lifecycle_script": str(root / "gone"),
-                                            "arguments": [], "host": "fake-mac"}))
-            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
-                                    text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("cleanup of an ended run failed", result.stderr)
-            self.assertTrue(saved.exists())
-            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+    def test_ended_gate_uses_the_installed_script_with_an_old_or_missing_callback(self) -> None:
+        for old_exists in (False, True):
+            with self.subTest(old_exists=old_exists), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root)
+                stale = root / mac_queue_run.RUNS / "stale"
+                stale.mkdir(parents=True)
+                (stale / "lock").touch()
+                receipt = root / mac_queue_run.RECEIPTS / "stale.json"
+                receipt.parent.mkdir(parents=True)
+                _ = receipt.write_text("{}")
+                old = root / "old worktree/mac_gate.py"
+                if old_exists:
+                    old.parent.mkdir()
+                    write_stdlib_tool(old, "raise SystemExit('The queue used the old callback')\n")
+                installed = root / ".claude/scripts/mac_test/mac_gate.py"
+                installed.parent.mkdir(parents=True)
+                write_stdlib_tool(installed, "import os, sys\nprint(os.environ['MAC_QUEUE_HOST'], *sys.argv[1:])\n")
+                attempt = root / "mac-gate-fixture"
+                _ = (stale / "run.json").write_text(json.dumps({"lifecycle_script": str(old),
+                    "arguments": [str(attempt), "1"], "host": "saved-mac"}))
+                result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
+                                        text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"saved-mac cleanup-ended {stale / 'argv.json'} {attempt} 1", result.stdout)
+                self.assertNotIn("cleanup of an ended run failed", result.stderr)
+                self.assertFalse(stale.exists())
+                self.assertFalse(receipt.exists())
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
 
     def test_failed_cleanup_leaves_the_record_for_the_next_run(self) -> None:
         lifecycle = """
@@ -273,15 +287,17 @@ if phase == 'prepare':
     Path(argv_file).write_text(json.dumps(command))
 else:
     with (Path(os.environ['FAKE_QUEUE_STATE']) / 'cleanup_calls').open('a') as out:
-        print(argv_file, file=out)
+        print(sys.argv[0], phase, argv_file, file=out)
     raise SystemExit(int(os.environ.get('FAKE_CLEANUP_STATUS', '0')))
 """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = queue_fixture(root)
-            callback = root / "lifecycle"
-            _ = callback.write_text(f"#!{sys.executable}\n" + lifecycle)
-            callback.chmod(0o755)
+            callback = root / "mac_gate.py"
+            installed = root / ".claude/scripts/mac_test/mac_gate.py"
+            installed.parent.mkdir(parents=True)
+            for script in (callback, installed):
+                write_stdlib_tool(script, lifecycle)
             command = self.command(root, "run")
             command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
             result = subprocess.run(command, env={**environment, "FAKE_CLEANUP_STATUS": "19"},
@@ -292,8 +308,26 @@ else:
                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
             called = str(saved.with_name("argv.json"))
-            self.assertEqual((root / "cleanup_calls").read_text().splitlines(), [called, called])
+            self.assertEqual((root / "cleanup_calls").read_text().splitlines(),
+                             [f"{callback} cleanup {called}", f"{installed} cleanup-ended {called}"])
             self.assertFalse(saved.exists())
+
+    def test_ended_custom_callback_uses_its_saved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            directory = root / mac_queue_run.RUNS / "ended"
+            directory.mkdir(parents=True)
+            (directory / "lock").touch()
+            callback = root / "custom_callback"
+            write_stdlib_tool(callback, "import sys\nprint(*sys.argv[1:])\n")
+            _ = (directory / "run.json").write_text(json.dumps({"lifecycle_script": str(callback),
+                "arguments": ["fixture-argument"], "host": "fake-mac"}))
+            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"cleanup {directory / 'argv.json'} fixture-argument", result.stdout)
+            self.assertFalse(directory.exists())
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),

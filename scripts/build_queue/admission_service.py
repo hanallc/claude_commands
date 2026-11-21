@@ -57,7 +57,7 @@ from scripts.production import staff
 from scripts.buildlog import store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
+from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -218,6 +218,7 @@ class Clock(Protocol):
 class Readings(Protocol):
     def host(self) -> records.HostMemory | records.ReadingUnavailable: ...
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure: ...
+    def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold: ...
     def compilers(self) -> list[records.StepMemory]: ...
     def reservation(self, path: Path, row: records.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path, policy: records.AdmissionPolicy) -> records.StepMemory: ...
@@ -238,6 +239,19 @@ class SystemReadings:
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         return gate.read_pressure(host, policy=policy)
+
+    def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold:
+        from scripts.lib.build_slots import slot_cargo_root
+
+        try:
+            root = slot_cargo_root(conf.read("build_folders"))
+            reading = os.statvfs(root)
+        except (OSError, conf.Unusable) as error:
+            hold = records.BuildSpaceUnreadable(str(error))
+            print(f"memory admission: {records.build_space_text(hold)}", file=sys.stderr)
+            return hold
+        free = reading.f_bavail * reading.f_frsize // records.GIB
+        return records.BuildSpaceLow(free, floor) if free < floor else records.NoBuildSpaceHold()
 
     def compilers(self) -> list[records.StepMemory]:
         return gate.sccache_memory()
@@ -424,7 +438,7 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
     if isinstance(request.identity.job, StepJob):
         return request.identity.job
     step = request.profile.step
-    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity) and step in GATE_PROGRAMS:
+    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity):
         job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
         if isinstance(job, StepJob):
             return job
@@ -2233,10 +2247,10 @@ class AdmissionServer:
                 continue
             sidecar = Path(row["sidecar"])
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
-            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
+            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
             if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
-                    and row["step"] != "merge-gate" and self.boot_id):
+                    and row["step"] != "gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -2403,6 +2417,8 @@ class AdmissionServer:
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
         inputs = captured.local
+        if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
+            inputs = replace(inputs, build_space=self.readings.build_space(floor))
         ci_holds = self._ci_hold_reasons()
         held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
         if held_owners:
@@ -2806,7 +2822,7 @@ class AdmissionServer:
             stem = stem.with_name(stem.name + "0")
         if profile.step == "build":
             shape = build_shape(list(request.argv)).key
-        elif profile.step == "merge-gate":
+        elif profile.step in {"gate", "merge-gate"}:
             shape = gate.merge_gate_shape(request.argv)
         else:
             shape = ""
@@ -3842,7 +3858,7 @@ done
         if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
             reason = waiting.last_reply.reason
             cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-            if isinstance(cause, placement.CargoFolderWait):
+            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired):
                 return wire.PlacementWait(request.episode, request.since, position, candidates,
                     waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
@@ -3935,6 +3951,7 @@ done
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
                     continue
                 if (initial_readiness_unchecked and destination.provider == "local"
+                        and isinstance(inputs.build_space, records.NoBuildSpaceHold)
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
@@ -5272,6 +5289,7 @@ ADMISSION_CALLERS = {
     "invoke.sh": "lint/invoke.sh",
     "pre-tool-use-brp-launch-gate.sh": "hooks/pre-tool-use-brp-launch-gate.sh",
     "merge_gate.py": "production/merge_gate.py",
+    "gate.py": "production/gate.py",
     "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",
     "queue_place.py": "build_queue/queue_place.py",
