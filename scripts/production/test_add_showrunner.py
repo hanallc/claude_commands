@@ -25,6 +25,7 @@ from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.production import add_showrunner
 from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.production import showrunners
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
@@ -273,13 +274,14 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         current = staff.native_id(fixture_runtime_id("owned-launch-after-account-move"))
         _ = staff.update_current_session(owner.current_session, current)
         _ = staff.rename(owner.id, "renamed-kid")
-        document = self.root / "renamed-kid-production.md"
-        _ = self.doc("kid").rename(document)
+        previous = self.doc("kid")
+        document = previous.with_name("renamed-" + previous.name)
+        _ = previous.rename(document)
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
         home = self.named_account()
         _ = staff.set_home(owner.id, staff.SessionHome(home))
         for copied_facts, stale_owner in (({"session_id": native}, False),
-                                         ({"doc": str(self.root / "kid-production.md")}, False),
+                                         ({"doc": str(previous)}, False),
                                          ({"config_dir": str(Path(self.env["HOME"]) / ".claude2")}, False),
                                          ({"config_dir": str(Path(self.env["HOME"]) / ".claude2")}, True)):
             with self.subTest(copied_facts=copied_facts, stale_owner=stale_owner):
@@ -1092,6 +1094,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             _ = subprocess.run(["git", "-C", str(main), *command], check=True, capture_output=True)
         (main / "sub").mkdir()
         self.trust(main)
+        document = self.doc("kid")
+        _ = document.write_text("\n".join(line for line in document.read_text().splitlines()
+                                           if not line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**")) + "\n")
         for folder in (main / "sub", self.root / "side"):
             with self.subTest(folder=folder.name):
                 result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(folder), "--account", "claude2", "--check")

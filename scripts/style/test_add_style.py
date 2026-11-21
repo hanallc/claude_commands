@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib import build_folders
 from scripts.lib.test_models_registry import write_registry
 
 import json
@@ -29,9 +28,11 @@ from scripts.style import style_rules
 from scripts.production.production_doc import production_field, read_production
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
-from scripts.production import change_review, staff
+from scripts.production import change_review, production_doc, staff
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
+from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, recorded_showrunner
 
 from scripts.style.style_reader_test_support import oracle_reader
 
@@ -63,7 +64,7 @@ elif name == "launch.py":
     if os.environ.get("TEST_BOOTSTRAP_AT_LAUNCH"):
         Path(os.environ["TEST_BOOTSTRAP_AT_LAUNCH"]).write_text(json.dumps({
             "production": doc.read_text(),
-            "plans": {path.name: path.read_text() for path in (doc.parent / "style-production/units").glob("*.md")},
+            "plans": {path.name: path.read_text() for path in (production.checkout / "docs/style-production/units").glob("*.md")},
         }))
     destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Proposals:**"))
     with Path(os.environ["TEST_LAUNCH_DESTINATIONS"]).open("a") as destinations:
@@ -94,8 +95,10 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+from scripts.production import production_doc
 from scripts.style import add_style
 
+production_doc.GUARD_REPOSITORY = Path.cwd()
 real_run_script = add_style._run_script
 def run_script(script, *arguments):
     if script.name == "style_sync.py":
@@ -132,6 +135,8 @@ class AddStyleTests(unittest.TestCase):
     parent: Path = Path()
     doc: Path = Path()
     initial_tip: str = ""
+    merge_name = "fixture-merges"
+    style_branch = "fixture-merges-integration-sample-style"
     env: dict[str, str] = {}
 
     repository_seed: Path = Path()
@@ -167,8 +172,9 @@ class AddStyleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="add-style-")))
         self.repo = self.root / "sample"
-        self.checkout = self.root / "sample-style"
-        self.doc = self.checkout / "docs/sample-style-production.md"
+        home = self.root / "home"
+        self.checkout = home / "worktrees" / self.repo.name / self.merge_name / "integration-sample-style"
+        self.doc = self.repo / "docs" / f"sample-style-production{LIVE_DOCUMENT_SUFFIX}"
         _ = shutil.copytree(self.repository_seed, self.repo)
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
@@ -181,6 +187,7 @@ class AddStyleTests(unittest.TestCase):
         (self.root / "live-sessions").mkdir()
         self.env = {
             **os.environ,
+            "HOME": str(home),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "ledger"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners"),
@@ -200,6 +207,9 @@ class AddStyleTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         self.parent = self.parent_doc("parent")
+        write_guard_proof(self.root, Path(self.env["SHOWRUNNER_STATE_DIR"]), self.repo)
+        self.checkout.parent.mkdir(parents=True)
+        _ = self.git("worktree", "add", "-qb", self.style_branch, str(self.checkout), "main")
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
@@ -220,6 +230,12 @@ class AddStyleTests(unittest.TestCase):
             fields.append(f"- **Proposals:** `{self.root / (name + '-issues')}`")
         _ = path.write_text("\n".join([*fields, ""]))
         owner = recorded_showrunner(name, path)
+        if proposals:
+            staging = self.root / name / "staging"
+            staging.mkdir(parents=True)
+            _ = staff.ensure("unit", name=self.merge_name, parent=staff.ReportsTo(owner.id),
+                             worktree=staff.PresentWorktree("natedev", staging), unit_type="merge",
+                             runtime_id=fixture_runtime_id(f"{name}/{self.merge_name}"))
         timer = self.root / "notifier" / f"showrunner-{owner.id}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
         _ = timer.write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
@@ -256,12 +272,14 @@ class AddStyleTests(unittest.TestCase):
             return (Path(self.env["TEST_LIVE_SESSIONS"]) / name).exists()
 
         with (
+            mock.patch.object(production_doc, "GUARD_REPOSITORY", self.repo),
             mock.patch.object(add_style, "LAUNCHER", Path(self.env["ADD_STYLE_LAUNCHER"])),
             mock.patch.object(add_style, "SHOWRUNNERS", Path(self.env["ADD_STYLE_SHOWRUNNERS"])),
             mock.patch.object(add_style, "_run_script", run_script),
             mock.patch.object(add_style, "herdr_tab_open", live_session_open),
         ):
-            result = invoke_cli(add_style, lambda: add_style.main(argv), argv, self.env, self.repo)
+            result = invoke_cli(add_style, lambda: add_style.main(argv), argv, self.env, self.repo,
+                                production_state=True)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -282,7 +300,7 @@ class AddStyleTests(unittest.TestCase):
     def resume_call(self) -> ScriptCall:
         return {"command": "style_sync.py", "arguments": [
             "resume", "--repo", str(self.checkout), "--production", "sample-style",
-            "--branch-point", "main", "--style-branch", "style/main",
+            "--branch-point", "main", "--style-branch", self.style_branch,
         ]}
 
     def sync(self) -> tuple[str, str, str]:
@@ -316,7 +334,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertFalse(path.exists())
         finished = self.run_bootstrap()
         self.assertEqual(finished.returncode, 0, finished.stderr)
-        self.assertEqual(read_production("sample-style").merge_branch, "style/main")
+        self.assertEqual(read_production("sample-style").merge_branch, self.style_branch)
         self.assertEqual(len(list((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
         self.assertIn("## Phases", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md").read_text())
         self.assertEqual(sum(call["command"] == "launch.py" for call in self.calls()), 1)
@@ -382,7 +400,7 @@ class AddStyleTests(unittest.TestCase):
                     result = self.run_bootstrap(*arguments, *extra, success=False)
                     self.assertEqual(result.returncode, 2)
                     self.assertIn(bad, result.stderr)
-                    self.assertFalse(self.checkout.exists())
+                    self.assertFalse((self.checkout / add_style.PLAN_DIRECTORY).exists())
                     self.assertFalse((self.root / "ledger").exists())
                     self.assertEqual(self.calls(), [])
 
@@ -398,7 +416,7 @@ class AddStyleTests(unittest.TestCase):
         names_before = names_plan.read_bytes(), names_plan.stat().st_mtime_ns
         types_plan = self.checkout / add_style.PLAN_DIRECTORY / "sample-style-types-unit.md"
         _ = types_plan.write_text(types_plan.read_text() + "\nUnlaunched notes retained.\n")
-        log = self.checkout / "docs/sample-style-log.md"
+        log = self.repo / "docs/sample-style-log.md"
         _ = log.write_text("Interrupted bootstrap notes.\n")
         sync, excluded = self.sync(), (self.repo / ".git/info/exclude").read_bytes()
         del self.env["TEST_FAIL_LAUNCH"]
@@ -427,7 +445,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertIn("sample-style-names: cargo-handler", lines[4])
         self.assertIn("sample-style-types: cargo-port", lines[4])
         self.assertNotIn("values", lines[3] + lines[4])
-        self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.checkout / add_style.PLAN_DIRECTORY).exists())
         self.assertFalse((self.root / "ledger").exists())
         self.assertEqual(self.calls(), [])
 
@@ -436,14 +454,14 @@ class AddStyleTests(unittest.TestCase):
                   for name in ("names", "names", "sample-style-names")]
         self.assertEqual(checks[1:], [checks[0], checks[0]])
         self.assertIn("sample-style-names: sample", checks[0])
-        self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.checkout / add_style.PLAN_DIRECTORY).exists())
         self.assertFalse((self.root / "ledger").exists())
 
     def test_pilot_aliases_cannot_select_the_same_family_twice(self) -> None:
         result = self.run_bootstrap("--check", "--pilot", "names=sample",
                                     "--pilot", "sample-style-names=sample", success=False)
         self.assertEqual(result.returncode, 2)
-        self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.checkout / add_style.PLAN_DIRECTORY).exists())
         self.assertEqual(self.calls(), [])
 
     def test_lookup_from_main_and_linked_worktree_finds_the_same_standing_production(self) -> None:
@@ -481,19 +499,19 @@ class AddStyleTests(unittest.TestCase):
                           (self.repo / ".git/info/exclude").read_bytes()), before)
 
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
-        self.checkout.mkdir()
         self.checkout.chmod(0o700)
         self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
         _ = self.run_bootstrap_process()
 
         self.assertEqual(stat.S_IMODE(self.checkout.stat().st_mode), 0o700)
-        self.assertEqual(self.git("rev-parse", "style/main"), self.initial_tip)
+        self.assertEqual(self.git("rev-parse", self.style_branch), self.initial_tip)
         self.assertIn(str(self.checkout), self.git("worktree", "list", "--porcelain"))
         production = read_production("sample-style")
-        self.assertEqual((production.name, production.merge_branch, production.checkout), ("sample-style", "style/main", self.checkout))
+        self.assertEqual((production.name, production.merge_branch, production.checkout), ("sample-style", self.style_branch, self.checkout))
         lines = self.doc.read_text().splitlines()
         for field, value in {
             "Kind": "style", "Repository": str(self.repo), "Branch point": "main",
+            MERGE_CHECKOUT_FIELD: str(self.repo),
             "Proposals": str(self.root / "parent-issues"),
             "Log": "docs/sample-style-log.md", "Updates": "on demand", "Push": "git",
         }.items():
@@ -511,16 +529,16 @@ class AddStyleTests(unittest.TestCase):
             self.assertNotIn("### Phase", text)
             for verb in ("check", "test", "lint"):
                 self.assertIn(f"verify.sh {verb} [<package>]", text)
-            ignored = self.git("-C", str(self.checkout), "check-ignore", "--", str(plan), str(self.doc), str(self.checkout / "docs/sample-style-log.md"))
-            self.assertIn(str(plan), ignored)
+            self.assertIn(str(plan), self.git("-C", str(self.checkout), "check-ignore", "--", str(plan)))
+        self.assertEqual(self.git("check-ignore", "--", str(self.doc), str(self.repo / "docs/sample-style-log.md")).splitlines(),
+                         [str(self.doc), str(self.repo / "docs/sample-style-log.md")])
         excluded = (self.repo / ".git/info/exclude").read_text()
         self.assertIn("/docs/style-production/\n", excluded)
         self.assertNotIn("/docs/style/\n", excluded)
-        self.assertEqual(self.git("-C", str(self.checkout), "ls-files", "--", str(self.doc),
-                                  "docs/style-production/"), "")
+        self.assertEqual(self.git("ls-files", "--", str(self.doc), "docs/style-production/"), "")
         self.assertEqual(self.git("status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.git("-C", str(self.checkout), "status", "--porcelain", "--untracked-files=all"), "")
-        self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))
+        self.assertEqual(self.sync()[:2], (self.initial_tip, f"refs/heads/{self.style_branch}"))
         self.assertEqual(self.parent_document(), self.parent)
         self.assertEqual(self.calls(), [{
             "command": "launch.py",
@@ -529,13 +547,9 @@ class AddStyleTests(unittest.TestCase):
         }, {"command": "showrunners.py", "arguments": ["attach", "sample-style", "parent"]}])
 
     def test_launch_with_an_existing_staff_row_uses_its_doc_without_a_doc_argument(self) -> None:
-        _ = self.git("branch", "style/main", self.initial_tip)
         _ = self.git("commit", "--allow-empty", "-qm", "Advance the parent branch")
-        with mock.patch.object(build_folders, "create_build_folder", wraps=build_folders.create_build_folder) as create:
-            _ = self.run_bootstrap()
-        create.assert_called_once_with(build_folders.LinkedEditableRepository(
-            self.checkout, self.repo, build_folders.ExistingWorktreeBranch("style/main")))
-        self.assertEqual(self.git("rev-parse", "style/main"), self.initial_tip)
+        _ = self.run_bootstrap()
+        self.assertEqual(self.git("rev-parse", self.style_branch), self.initial_tip)
         self.assertNotEqual(self.git("rev-parse", "main"), self.initial_tip)
         self._timer_conf().unlink()
         _ = self.run_bootstrap()
@@ -557,7 +571,7 @@ class AddStyleTests(unittest.TestCase):
         rows = cast(list[rules.RuleListing], json.loads(listing.stdout))
         self.assertEqual({row["rule_id"] for row in rows}, {rule.rule_id for rule in catalog})
         with style_ledger.open_ledger(self.checkout) as ledger:
-            ledger.set_tip(self.initial_tip, "style/main")
+            ledger.set_tip(self.initial_tip, self.style_branch)
             self.assertIn("local:docs/style/local.md", {row.rule_id for row in ledger.rule_counts(style_ledger.WholeRepository())})
 
     def test_create_refreshes_an_older_ledger_before_pinning_its_style_branch(self) -> None:
@@ -565,6 +579,7 @@ class AddStyleTests(unittest.TestCase):
         _ = self.git("add", "--all")
         _ = self.git("commit", "-qm", "Advance branch point before creating style production")
         branch_tip = self.git("rev-parse", "main")
+        _ = self.git("-C", str(self.checkout), "merge", "--ff-only", branch_tip)
         for previous_branch in ("", "style/previous"):
             with self.subTest(previous_branch=previous_branch):
                 with style_ledger.open_ledger(self.repo) as ledger:
@@ -573,7 +588,7 @@ class AddStyleTests(unittest.TestCase):
                     else:
                         ledger.set_tip(self.initial_tip)
                 _ = self.run_bootstrap()
-                self.assertEqual(self.sync()[:2], (branch_tip, "refs/heads/style/main"))
+                self.assertEqual(self.sync()[:2], (branch_tip, f"refs/heads/{self.style_branch}"))
                 with style_ledger.open_ledger(self.checkout) as ledger:
                     self.assertIn("src/new.rs", {cell.path for cell in ledger.cells()})
                 self._timer_conf().unlink()
@@ -583,7 +598,7 @@ class AddStyleTests(unittest.TestCase):
         failed = self.run_bootstrap(success=False)
         self.assertEqual(failed.returncode, 2)
         before = self.sync()
-        self.assertEqual(before[:2], (self.initial_tip, "refs/heads/style/main"))
+        self.assertEqual(before[:2], (self.initial_tip, f"refs/heads/{self.style_branch}"))
         del self.env["TEST_FAIL_LAUNCH"]
 
         _ = self.run_bootstrap()
@@ -658,7 +673,7 @@ class AddStyleTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("Proposals", result.stderr)
                 self.assertEqual(len(result.stderr.splitlines()), 1)
-                self.assertFalse(self.checkout.exists())
+                self.assertFalse((self.checkout / add_style.PLAN_DIRECTORY).exists())
                 self.assertFalse((self.root / "ledger").exists())
                 self.assertEqual(self.calls(), [])
                 self.assertEqual((self.git("show-ref"), self.git("worktree", "list", "--porcelain"), (self.repo / ".git/info/exclude").read_text()), before)
@@ -671,9 +686,9 @@ class AddStyleTests(unittest.TestCase):
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 7)
         self.assertEqual([line.split(".", 1)[0] for line in lines], [str(number) for number in range(1, 8)])
-        for expected in ("style/main", "docs/style-production/units", "info/exclude", "add_showrunner.py"):
+        for expected in (self.style_branch, "docs/style-production/units", "info/exclude", "add_showrunner.py"):
             self.assertIn(expected, result.stdout)
-        self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.checkout / add_style.PLAN_DIRECTORY).exists())
         self.assertFalse((self.root / "ledger").exists())
         self.assertEqual(self.calls(), [])
         self.assertEqual((self.git("show-ref"), (self.repo / ".git/info/exclude").read_text()), before)
@@ -792,9 +807,9 @@ class AddStyleTests(unittest.TestCase):
 
         _ = self.run_bootstrap(parent=parent)
 
-        self.assertEqual(self.git("rev-parse", "style/init-catalyst"), self.initial_tip)
+        self.assertEqual(self.git("rev-parse", self.style_branch), self.initial_tip)
         self.assertEqual(production_field(self.doc.read_text().splitlines(), "Repository"), str(self.repo))
-        self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/init-catalyst"))
+        self.assertEqual(self.sync()[:2], (self.initial_tip, f"refs/heads/{self.style_branch}"))
         self.assertFalse((self.root / "product-checkout-style").exists())
 
     def test_retry_after_failed_launch_preserves_open_plan_and_keeps_ledger_at_style_branch_commit(self) -> None:
@@ -814,10 +829,10 @@ class AddStyleTests(unittest.TestCase):
         _ = self.run_bootstrap()
 
         self.assertEqual(plan.read_text(), original_plan)
-        style_tip = self.git("rev-parse", "refs/heads/style/main")
+        style_tip = self.git("rev-parse", f"refs/heads/{self.style_branch}")
         self.assertEqual(style_tip, self.initial_tip)
         self.assertNotEqual(style_tip, branch_tip)
-        self.assertEqual(self.sync()[:2], (style_tip, "refs/heads/style/main"))
+        self.assertEqual(self.sync()[:2], (style_tip, f"refs/heads/{self.style_branch}"))
         with style_ledger.open_ledger(self.checkout) as ledger:
             self.assertNotIn("src/new.rs", {cell.path for cell in ledger.cells()})
         self.assertEqual([call["command"] for call in self.calls()], ["launch.py", "launch.py", "showrunners.py"])
@@ -839,16 +854,6 @@ class AddStyleTests(unittest.TestCase):
         for family in add_style.FAMILIES:
             self.assertIn(f"global:rust/{family}.md", plan.read_text())
         self.assertIn("# cargo-liner-style", plan.read_text())
-
-    def test_retry_completes_worktree_left_before_production_doc_was_written(self) -> None:
-        _ = self.git("worktree", "add", "-q", "-b", "style/main", str(self.checkout), self.initial_tip)
-
-        _ = self.run_bootstrap()
-
-        self.assertTrue(self.doc.exists())
-        self.assertEqual(len(tuple((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
-        self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))
-        self.assertEqual(len(self.calls()), 2)
 
     def test_interrupted_bootstrap_rewrites_destination_for_the_next_parent_only(self) -> None:
         self.env["TEST_FAIL_LAUNCH"] = "1"

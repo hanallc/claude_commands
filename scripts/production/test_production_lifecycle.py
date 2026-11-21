@@ -34,9 +34,13 @@ from scripts.production import showrunner_tree
 from scripts.production.fake_unit_host import HostedUnit
 
 
-from scripts.production import staff, unit_config
+from scripts.production import log_backup, staff, unit_config
 from scripts.production.production_doc import Refusal, read_production
-from scripts.production.production_names import CARGO_LINER_PRODUCTION, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, MOVE_RECORD
+from scripts.production.production_names import (
+    BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
+    MERGE_CHECKOUT_FIELD, MOVE_RECORD,
+)
+from scripts.worktree import worktrees
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.production.cli_fixture import production_paths
@@ -92,6 +96,12 @@ class LifecycleTests(LifecycleFixture):
         common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         with (common / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write(f"\n/{self.log.name}\n/{live_doc.relative_to(self.checkout).as_posix()}\n")
+        made = worktrees.WorktreeRecord(1, str(staging), "merge-staging", str(self.checkout),
+                                         "main", "main", merge_name, "2026-11-20T00:00:00Z")
+        self.env["WORKTREES_STATE_DIR"] = str(self.state / "worktrees")
+        with mock.patch.dict(os.environ, self.env):
+            worktrees.write_record(made)
+            made_path = worktrees.record_file(staging)
         tip, index = self.git("rev-parse", "main"), (common / "index").read_bytes()
         offset = timezone(timedelta(hours=-5))
         now = datetime.now(UTC).astimezone(offset)
@@ -104,9 +114,11 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(approval["status"], {"kind": "open"})
         self.assertEqual(approval["executor_staff_id"], executor.id)
         self.assertEqual(approval["destinations"], {"live_doc": str(live_doc), "log": str(self.log)})
+        _ = self.env.pop("CODEX_THREAD_ID", None)
         self.env["CLAUDE_CODE_SESSION_ID"] = executor.current_session
         moved = self.run_lifecycle("move-files", "--production", target.name)
         self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assertEqual(worktrees.read_record(made_path), replace(made, merge_branch=f"{merge_name}-integration"))
         approval_path = self.state / "showrunner" / target.id / MOVE_RECORD
         saved = cast(dict[str, object], json.loads(approval_path.read_text()))
         self.assertEqual(cast(dict[str, object], saved["status"])["kind"], "closed")
@@ -119,6 +131,9 @@ class LifecycleTests(LifecycleFixture):
             _ = output.write(b"Entry after the move\n")
         assert isinstance(target.doc, staff.LiveDoc)
         _ = staff.set_doc(target.id, target.doc)
+        reversed_move = self.run_lifecycle("move-files", "--production", target.name, "--reverse")
+        self.assertEqual(reversed_move.returncode, 0, reversed_move.stdout + reversed_move.stderr)
+        self.assertEqual(worktrees.read_record(made_path), made)
         restored = read_production(target.id)
         self.assertEqual((restored.doc, restored.log), (self.doc, self.log))
         self.assertEqual((restored.log.read_bytes(), restored.log.stat().st_ino),
@@ -142,7 +157,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.by_id(child.id), child)
 
-    def test_enrolled_wrap_retires_merge_staging_and_keeps_integration(self) -> None:
+    def test_enrolled_wrap_preserves_integration_and_the_unpushed_backup(self) -> None:
         self.merged_units()
         integration = self.root / "integration"
         legacy = self.doc.read_text()
@@ -166,6 +181,23 @@ class LifecycleTests(LifecycleFixture):
             _ = unit_config.write(staging, unit_config.UnitConfig(
                 unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.NoAppPort(), ()))
         refs = self.git("rev-parse", "production", "origin/production")
+        state = self.state / "showrunner"
+        old_log = state / runner.id / LEGACY_COPIES / "old-log.md"
+        self.write(old_log, "")
+        old_bytes = b"Legacy LOG\r\n"
+        _ = old_log.write_bytes(old_bytes)
+        backups = self.root / "backups"
+        repository = backups / runner.id / BACKUP_CHECKOUT
+        mirror = self.root / "mac-backup.git"
+        document_bytes, log_bytes = live.read_bytes(), self.log.read_bytes()
+
+        def destination(_identity: str) -> log_backup.BackupMirror:
+            return log_backup.BackupMirror(str(mirror), lambda _repack: "fixture")
+
+        with mock.patch.dict(os.environ, self.env):
+            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), destination, 10), 1)
+        tip = log_backup.git(repository, "rev-parse", "HEAD")
+        self.assertFalse(mirror.exists())
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(staging.exists())
@@ -174,6 +206,17 @@ class LifecycleTests(LifecycleFixture):
         self.assertTrue(integration.is_dir())
         self.assertEqual(self.git("rev-parse", "production", "origin/production"), refs)
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), live)))
+        self.assertFalse(old_log.exists())
+        self.assertFalse((state / runner.id).exists())
+        _ = log_backup.command("git", "init", "--bare", "--initial-branch=main", str(mirror))
+        with mock.patch.dict(os.environ, self.env):
+            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), destination, 10), 0)
+        self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), tip)
+        restored = self.root / "restored-backup"
+        _ = log_backup.command("git", "clone", "--quiet", str(mirror), str(restored))
+        self.assertEqual((restored / "document" / live.name).read_bytes(), document_bytes)
+        self.assertEqual((restored / "log" / self.log.name).read_bytes(), log_bytes)
+        self.assertEqual((backups / runner.id / LEGACY_COPIES / old_log.name).read_bytes(), old_bytes)
 
     def test_wrap_refuses_a_permanent_child_before_any_file_or_staff_change(self) -> None:
         runner, alpha, beta, child, permanent = self.permanent_staff_tree()

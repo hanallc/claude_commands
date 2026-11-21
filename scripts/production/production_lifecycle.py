@@ -34,7 +34,7 @@ from scripts.production import showrunners
 from scripts.production import showrunner_tree
 from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
-from scripts.production.production_doc import Production, Refusal, production_field, read_production
+from scripts.production.production_doc import Production, Refusal, production_field, read_production, staged_notes_directory
 from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
     PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
@@ -50,6 +50,7 @@ from scripts.production.update_registration import QuestionStaff, RegistrationFa
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
+from scripts.worktree import worktrees
 from scripts.worktree.worktrees import main_checkout, release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
@@ -382,7 +383,8 @@ def write_move_copy(path: Path, data: bytes, mode: int) -> None:
         write_bytes_atomic(path, data, mode=mode)
 
 
-def move_files(production: Production, lines: list[str], record: staff.StaffSnapshot) -> None:
+def move_files(production: Production, lines: list[str], record: staff.StaffSnapshot, *,
+               reverse: bool = False) -> None:
     caller = move_caller(record)
     plan = move_plan(production, lines)
     targets = plan.destinations
@@ -393,6 +395,13 @@ def move_files(production: Production, lines: list[str], record: staff.StaffSnap
         if (approval.production != production.name or approval.target_staff_id != production.owner.id
                 or approval.executor_staff_id != caller.id or approval.destinations != targets):
             raise Refusal(f"{path}: approval must name this production, executor, and both destinations")
+        receipt = path.with_name(f"worktrees-{approval.approved_at:%Y%m%dT%H%M%S%fZ}.json")
+        if reverse:
+            if production.name != CARGO_LINER_PRODUCTION:
+                raise Refusal("only cargo-liner has worktree records to reverse")
+            count = worktrees.retarget_cargo_liner_records(plan.main, plan.merge_branch, receipt, reverse=True)
+            print(f"Restored {count} cargo-liner worktree records.")
+            return
         _ = require_move_window(approval)
         for destination in (targets.live_doc, targets.log):
             require_untracked_ignored(plan.main, destination.relative_to(plan.main).as_posix())
@@ -414,6 +423,9 @@ def move_files(production: Production, lines: list[str], record: staff.StaffSnap
         if (not isinstance(verified, production_doc.EnrolledPaths) or verified.live_doc != targets.live_doc
                 or verified.log != targets.log or verified.integration != plan.integration):
             raise Refusal("the moved document does not resolve to the approved destinations")
+        if production.name == CARGO_LINER_PRODUCTION:
+            _ = require_move_window(approval)
+            _ = worktrees.retarget_cargo_liner_records(plan.main, plan.merge_branch, receipt)
         closed = replace(approval, status=MoveClosed(require_move_window(approval)))
         write_text_atomic(path, closed.encode())
         print(f"Moved {targets.live_doc} and {targets.log}.")
@@ -429,21 +441,27 @@ def stage_notes(production: Production, lines: list[str], record: staff.StaffSna
     if source != source.resolve() or destination != destination.resolve():
         raise Refusal("notes must use canonical paths")
     ensure_excluded(plan.main, "/" + relative.as_posix())
-    if not source.exists() or (destination.exists() and source.samefile(destination)):
+    if not source.exists():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    staged = staged_notes_directory(production.doc)
+    if staged is None or staged != destination:
+        raise Refusal(f"{destination}: the production notes folder does not match")
+    if source.samefile(staged):
         return
     copies: list[tuple[Path, bytes, int]] = []
     for entry in sorted(source.rglob("*")):
         if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
             raise Refusal(f"{entry}: the notes folder must contain regular files and directories")
         if entry.is_file():
-            target = destination / entry.relative_to(source)
+            target = staged / entry.relative_to(source)
             require_untracked_ignored(plan.main, target.relative_to(plan.main).as_posix())
             data = entry.read_bytes()
             check_copy_target(target, data)
             copies.append((target, data, entry.stat().st_mode & 0o777))
     for target, data, mode in copies:
         write_move_copy(target, data, mode)
-    print(f"Staged {len(copies)} notes in {destination}.")
+    print(f"Staged {len(copies)} notes in {staged}.")
 
 
 def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | ProductionWrapped:
@@ -763,7 +781,11 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
             report("post-push", "ok", land_main.hook_report(landed.hook))
         else:
             for destination in promotion.checkouts:
-                result = promote_local_checkout(destination, production.merge_branch, tip)
+                if destination.resolve() == production.merge_checkout:
+                    result = promote_local_checkout(destination, production.merge_branch, tip,
+                                                    integration=production.checkout)
+                else:
+                    result = promote_local_checkout(destination, production.merge_branch, tip)
                 if isinstance(result, PromotionNotPushed):
                     raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
                 if isinstance(result, PromotionAlreadyAtTip):
@@ -1164,6 +1186,8 @@ def main() -> int:
     _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap",
                                                "approve-move", "move-files", "stage-notes"))
     _ = parser.add_argument("--production", required=True, type=str)
+    _ = parser.add_argument("--reverse", action="store_true",
+                            help="move-files: restore cargo-liner worktree records after restoring its legacy document")
     _ = parser.add_argument("--executor")
     _ = parser.add_argument("--window-start")
     _ = parser.add_argument("--window-end")
@@ -1182,6 +1206,9 @@ def main() -> int:
         executor = cast(str | None, args.executor)
         start = cast(str | None, args.window_start)
         end = cast(str | None, args.window_end)
+        reverse = cast(bool, args.reverse)
+        if reverse and action != "move-files":
+            raise Refusal("only move-files accepts --reverse")
         if action == "approve-move":
             require_approval_terminal()
             if executor is None or start is None or end is None:
@@ -1201,7 +1228,7 @@ def main() -> int:
             production = read_production(name, record)
             lines = doc_lines(production)
             if action == "move-files":
-                move_files(production, lines, record)
+                move_files(production, lines, record, reverse=reverse)
             else:
                 stage_notes(production, lines, record)
             return 0
@@ -1229,7 +1256,8 @@ def main() -> int:
         report(error.step, error.state, error.detail.replace("\n", "; "))
     except Stop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))
-    except (staff.StaffRefused, staff.StaffNotFound, Refusal, OSError, ValueError, OverflowError) as error:
+    except (staff.StaffRefused, staff.StaffNotFound, Refusal, worktrees.Refused,
+            OSError, ValueError, OverflowError) as error:
         report("input", "failed", str(error).replace("\n", "; "))
     return 2
 
