@@ -840,6 +840,14 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         _ = path.write_text('scripts/fixture/test_absent.py\nscripts/fixture/test_one.py\n')
         self.assertEqual(mac_gate.read_modules(self.repo), MacGateExclusions(('scripts/fixture/test_one.py',)))
 
+    def test_listed_production_modules_exist(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        entries = (checkout / mac_gate.MODULE_LIST).read_text().splitlines()
+        missing = [name for line in entries
+                   if (name := line.partition('#')[0].strip()).startswith('scripts/production/')
+                   and not (checkout / name).is_file()]
+        self.assertEqual(missing, [])
+
     def test_list_writer_excludes_failures_and_count_mismatches(self) -> None:
         mac = (module_job('one'), module_job('tests', tests=11), module_job('skips', skips=1),
                module_job('mac_failure', status=1), module_job('natedev_failure'))
