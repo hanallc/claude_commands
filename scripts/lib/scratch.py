@@ -2594,8 +2594,29 @@ def unsaved_work(path: Path, *,
     return work.reason if isinstance(work, KeptFolder) else None
 
 
+def retained_folder_exists(path: Path) -> bool:
+    """Keep a path in the report unless lstat confirms it is absent."""
+    try:
+        _ = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+_RETAINED_TASK_FOLDER_PREFIX = "kept for a manual removal list: "
+_RETAINED_TASK_FOLDER_REASON = " (scratch, "
+
+
 def retained_task_folder_notice(path: Path, reason: str) -> str:
-    return f"kept for a manual removal list: {path} (scratch, {reason})"
+    return f"{_RETAINED_TASK_FOLDER_PREFIX}{path}{_RETAINED_TASK_FOLDER_REASON}{reason})"
+
+
+def is_retained_task_folder_notice(detail: str) -> bool:
+    """Recognize the format of a saved scratch notice."""
+    return (detail.startswith(_RETAINED_TASK_FOLDER_PREFIX)
+            and _RETAINED_TASK_FOLDER_REASON in detail and detail.endswith(")"))
 
 
 def report_retained_task_folder(path: Path, reason: str) -> None:
@@ -2643,14 +2664,16 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
             write_holds(found, scratch_settings=scratch_settings)
 
     for path in paths.values():
+        if not retained_folder_exists(path):
+            continue
         reason = "selected by the keep rule" if path in protected else f"task {task} ended"
-        if path not in protected and not path.is_symlink():
-            current = copy_record.read_record(path / copy_record.RECORD)
-            if isinstance(current, copy_record.Registered) and current.task == task:
-                try:
+        try:
+            if path not in protected and not path.is_symlink():
+                current = copy_record.read_record(path / copy_record.RECORD)
+                if isinstance(current, copy_record.Registered) and current.task == task:
                     record_task_end(path, task, moment, scratch_settings=scratch_settings)
-                except (ScratchError, OSError) as error:
-                    reason = " ".join(str(error).splitlines())
+        except (ScratchError, OSError) as error:
+            reason = " ".join(str(error).splitlines())
         report_retained_task_folder(path, reason)
         kept.append(KeptFolder(path, reason))
     return kept
