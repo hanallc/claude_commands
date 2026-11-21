@@ -28,10 +28,9 @@ from scripts.production.production_doc import (
     EnrolledPaths, Refusal, production_backup_checkout, production_backup_root, read_production, resolve_production_paths,
     staged_notes_directory,
 )
-from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY, BACKUP_ROOT, LEGACY_COPIES, MAC_BACKUP_REPOSITORY
 
 
-LEGACY_COPIES = "log-backups"
 SNAPSHOT_FOLDERS = (BACKUP_DOCUMENT_DIRECTORY, "log", "notes")
 BACKUP_BRANCH = "refs/heads/main"
 SSH_OPTIONS = ("ssh", "-o", "BatchMode=yes")
@@ -112,7 +111,7 @@ def backup(sources: BackupSources, repository: Path) -> None:
 
 
 def mac_mirror(identity: staff.StaffId, peer: str) -> BackupMirror:
-    relative = production_backup_checkout(identity).with_suffix(".git").relative_to(Path.home()).as_posix()
+    relative = (BACKUP_ROOT / identity / MAC_BACKUP_REPOSITORY).as_posix()
     remote_path = '"$HOME"/' + shlex.quote(relative)
 
     def maintenance(repack: bool) -> str:

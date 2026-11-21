@@ -15,7 +15,7 @@ from unittest.mock import patch
 from scripts.agents import remote
 from scripts.production import log_backup, staff
 from scripts.production.production_doc import production_backup_checkout, production_backup_root
-from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY, LEGACY_COPIES
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
@@ -72,7 +72,7 @@ class LogBackupTests(unittest.TestCase):
                 owner = fixture_member("showrunner", name="backup-owner",
                                        doc=staff.LiveDoc(remote.local_machine(), document))
                 live = staff.local_snapshot()
-                legacy = state / owner.id / log_backup.LEGACY_COPIES
+                legacy = state / owner.id / LEGACY_COPIES
                 legacy.mkdir(parents=True)
                 _ = (legacy / "log-old.md").write_bytes(b"Original copy\r\n")
                 backup_root = production_backup_root()
@@ -88,7 +88,7 @@ class LogBackupTests(unittest.TestCase):
                     wrapped = staff.StaffSnapshot(())
                     self.assertEqual(log_backup.backup_all(backup_root, state, wrapped, destination, 1), 0)
                     self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), first)
-                    self.assertEqual((backup_root / owner.id / log_backup.LEGACY_COPIES / "log-old.md").read_bytes(),
+                    self.assertEqual((backup_root / owner.id / LEGACY_COPIES / "log-old.md").read_bytes(),
                                      b"Original copy\r\n")
 
                     _ = document.write_bytes(document_bytes)

@@ -24,7 +24,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import demote_showrunner, promote_showrunner, staff
-from scripts.production.production_doc import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes

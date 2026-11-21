@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
+from stat import S_ISDIR
 from typing import NamedTuple, cast, override
 from zoneinfo import ZoneInfo
 
@@ -14,27 +15,25 @@ from scripts.agents import remote
 from scripts.lib import git_files
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff, showrunners
+from scripts.production.production_names import (
+    BACKUP_CHECKOUT, BACKUP_ROOT, GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY,
+)
 
 
 WRAPPED = "> **Status: PRODUCTION — wrapped.**"
 DEMOTED = ("> **Status: ended {date}.** The user demoted this production to the one unit {child} under {parent}. "
            "That unit's plan is `{plan}`. This doc is a record and no session reads it as live state.")
-MERGE_CHECKOUT_FIELD = "Merge checkout"
-LIVE_DOCUMENT_SUFFIX = "-live.md"
-NOTES_DIRECTORY = ".showrunner-notes"
-GUARD_READY_FILE = "guard-ready.json"
-BACKUP_DOCUMENT_DIRECTORY = "document"
 GUARD_REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 def production_backup_root() -> Path:
     """Return the folder that contains the production backup repositories."""
-    return Path.home() / ".local" / "state" / "production-backups"
+    return Path.home() / BACKUP_ROOT
 
 
 def production_backup_checkout(owner: staff.StaffId) -> Path:
     """Return the local Git backup for this production."""
-    return production_backup_root() / owner / "backup"
+    return production_backup_root() / owner / BACKUP_CHECKOUT
 
 
 class Refusal(Exception):
@@ -224,11 +223,15 @@ def local_production_documents() -> tuple[staff.StaffRow, ...]:
         raise ProductionPathsError(f"cannot read the local staff record: {error}") from error
 
 
+def _notes_path(main: Path, owner: staff.StaffRow) -> Path:
+    notes = main / NOTES_DIRECTORY / owner.id
+    if notes.resolve() != notes or not notes.is_relative_to(main):
+        raise ProductionPathsError(f"{notes}: notes must use a canonical path below the main checkout")
+    return notes
+
+
 def _enrolled_paths(document: ProductionDocument, main: Path, owner: staff.StaffRow) -> EnrolledPaths:
-    notes = (main / NOTES_DIRECTORY / owner.id).resolve()
-    if not notes.is_relative_to(main) or notes == main:
-        raise ProductionPathsError(f"{document.doc}: notes must stay below the main checkout")
-    return EnrolledPaths(main, document.doc, document.log, notes, document.checkout)
+    return EnrolledPaths(main, document.doc, document.log, _notes_path(main, owner), document.checkout)
 
 
 def legacy_document_path(doc: Path) -> Path:
@@ -236,6 +239,28 @@ def legacy_document_path(doc: Path) -> Path:
     if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
         return doc.with_name(doc.name.removesuffix(LIVE_DOCUMENT_SUFFIX) + ".md")
     return doc
+
+
+def _bound_owner(doc: Path, *previous: Path) -> staff.StaffRow:
+    rows = [(row, row.doc.path.resolve()) for row in local_production_documents()
+            if isinstance(row.doc, staff.LiveDoc)]
+    owners = [row for row, path in rows if path == doc] or [row for row, path in rows if path in previous]
+    if len(owners) != 1:
+        raise ProductionPathsError(f"{doc}: expected one showrunner with this document")
+    return owners[0]
+
+
+def _resolve_enrolled_paths(doc: Path, lines: list[str], declared: FieldPresent) -> EnrolledPaths:
+    document = _read_enrolled(doc, doc.stem, lines, declared)
+    main = document.merge_checkout
+    assert isinstance(main, Path)
+    if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
+        # The move writes the live document before it updates the staff binding.
+        old = legacy_document_path(doc).relative_to(main)
+        owner = _bound_owner(doc, main / old, document.checkout / old)
+    else:
+        owner = _bound_owner(doc)
+    return _enrolled_paths(document, main, owner)
 
 
 def resolve_production_paths(doc: Path) -> EnrolledPaths | LegacyProduction:
@@ -246,20 +271,43 @@ def resolve_production_paths(doc: Path) -> EnrolledPaths | LegacyProduction:
         declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
         if isinstance(declared, FieldAbsent):
             return LegacyProduction()
-        document = _read_enrolled(live_doc, live_doc.stem, lines, declared)
-        main = document.merge_checkout
-        assert isinstance(main, Path)
-        rows = [(row, row.doc.path.resolve()) for row in local_production_documents()
-                if isinstance(row.doc, staff.LiveDoc)]
-        owners = [row for row, path in rows if path == live_doc]
-        if not owners and live_doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
-            # The move writes the live document before updating its staff binding.
-            old = legacy_document_path(live_doc).relative_to(main)
-            owners = [row for row, path in rows if path in (main / old, document.checkout / old)]
-        if len(owners) != 1:
-            raise ProductionPathsError(f"{live_doc}: expected one showrunner with this document")
-        return _enrolled_paths(document, main, owners[0])
+        return _resolve_enrolled_paths(live_doc, lines, declared)
     except (OSError, UnicodeError, RuntimeError, ValueError) as error:
+        raise ProductionPathsError(f"{doc}: {error}") from error
+
+
+def _existing_notes_directory(notes: Path) -> Path | None:
+    try:
+        status = notes.stat()
+    except FileNotFoundError:
+        return None
+    if not S_ISDIR(status.st_mode):
+        raise ProductionPathsError(f"{notes}: expected a notes directory")
+    return notes
+
+
+def staged_notes_directory(doc: Path) -> Path | None:
+    """Return the production's notes directory in main when it exists."""
+    try:
+        live_doc = doc.expanduser().resolve(strict=True)
+        lines = live_doc.read_text(encoding="utf-8").splitlines()
+        declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
+        if isinstance(declared, FieldPresent):
+            return _existing_notes_directory(_resolve_enrolled_paths(live_doc, lines, declared).notes)
+        if isinstance(optional_field(lines, "Repository"), FieldAbsent):
+            return None
+        main = Path(production_field(lines, "Repository")).expanduser().resolve()
+        notes = _existing_notes_directory(_notes_path(main, _bound_owner(live_doc)))
+        if notes is None:
+            return None
+        main_git = git_files.at(main)
+        source = git_files.locate(live_doc.parent)
+        if main_git.git_dir != main_git.common_dir or source.common_dir != main_git.common_dir:
+            raise ProductionPathsError(f"{notes}: expected the main checkout of the production repository")
+        return notes
+    except ProductionPathsError:
+        raise
+    except (Refusal, OSError, UnicodeError, RuntimeError, ValueError) as error:
         raise ProductionPathsError(f"{doc}: {error}") from error
 
 

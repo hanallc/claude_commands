@@ -35,7 +35,8 @@ from scripts.production.fake_unit_host import HostedUnit
 
 
 from scripts.production import staff, unit_config
-from scripts.production.production_doc import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, read_production, Refusal
+from scripts.production.production_doc import Refusal, read_production
+from scripts.production.production_names import CARGO_LINER_PRODUCTION, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, MOVE_RECORD
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.production.cli_fixture import production_paths
@@ -70,7 +71,7 @@ class ProductionReaderTests(StaffTestCase):
 @final
 class LifecycleTests(LifecycleFixture):
     def test_move_and_reverse_keep_the_original_cargo_liner_log_in_main(self) -> None:
-        target = staff.rename(self.owner_id(), staff.CARGO_LINER_PRODUCTION)
+        target = staff.rename(self.owner_id(), CARGO_LINER_PRODUCTION)
         executor = fixture_member("showrunner", name="executor")
         merge_name = f"{target.name}-merges"
         integration = self.root / merge_name / "integration"
@@ -106,7 +107,7 @@ class LifecycleTests(LifecycleFixture):
         self.env["CLAUDE_CODE_SESSION_ID"] = executor.current_session
         moved = self.run_lifecycle("move-files", "--production", target.name)
         self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
-        approval_path = self.state / "showrunner" / target.id / production_lifecycle.MOVE_RECORD
+        approval_path = self.state / "showrunner" / target.id / MOVE_RECORD
         saved = cast(dict[str, object], json.loads(approval_path.read_text()))
         self.assertEqual(cast(dict[str, object], saved["status"])["kind"], "closed")
         self.assertEqual((self.doc.read_bytes(), self.log.read_bytes(), self.log.stat().st_ino),

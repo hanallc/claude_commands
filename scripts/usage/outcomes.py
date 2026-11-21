@@ -16,8 +16,9 @@ from typing import BinaryIO, Literal, cast
 
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import (
-    MERGE_CHECKOUT_FIELD, FieldPresent, Refusal, cell_value, optional_field, read_new_production,
+    FieldPresent, Refusal, cell_value, optional_field, read_new_production,
 )
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out

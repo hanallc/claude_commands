@@ -26,8 +26,10 @@ from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
 from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
 from scripts.production.production_doc import (
-    BACKUP_DOCUMENT_DIRECTORY, Refusal, legacy_document_path, production_backup_checkout, production_field,
+    Refusal, legacy_document_path, production_backup_checkout, production_field,
 )
+
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
 
 
 class RecordText(NamedTuple):

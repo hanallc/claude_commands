@@ -45,9 +45,10 @@ from scripts.production import (
     unit_names,
 )
 from scripts.production.production_doc import (
-    MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY, FieldPresent, Production, ProductionPathsError, Refusal,
+    FieldPresent, Production, ProductionPathsError, Refusal,
     optional_field, read_new_production, read_production, require_removable_checkout,
 )
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.worktree.worktrees import release_worktree_pair

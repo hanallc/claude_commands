@@ -20,8 +20,9 @@ from typing import NamedTuple, cast
 
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
-from scripts.production import merge_gate, staff
+from scripts.production import merge_gate
 from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
 
 
@@ -239,7 +240,7 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
         paths = resolve_production_paths(production.doc)
     except ProductionPathsError as error:
         raise PointFailure("ci collect", str(error)) from error
-    cargo_liner = isinstance(paths, EnrolledPaths) and production.name == staff.CARGO_LINER_PRODUCTION
+    cargo_liner = isinstance(paths, EnrolledPaths) and production.name == CARGO_LINER_PRODUCTION
     if no_ci:
         if cargo_liner:
             raise PointFailure("ci collect", "cargo-liner requires CI on its integration tip")

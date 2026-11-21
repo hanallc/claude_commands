@@ -15,6 +15,7 @@ from typing import cast
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX
 from scripts.agents.stop_results import shutdown_state_root
 
 
@@ -33,8 +34,6 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
             if isinstance(document, session_staff.ProductionDoc):
                 return document.machine, session_staff.enrolled_launch_directory(
                     document.text.splitlines(), document.path.parent)
-            from scripts.production.production_doc import LIVE_DOCUMENT_SUFFIX
-
             if row.doc.path.name.endswith(LIVE_DOCUMENT_SUFFIX):
                 raise ValueError(f"{row.name}: {document.reason}")
         return row.doc.machine, row.doc.path.parent

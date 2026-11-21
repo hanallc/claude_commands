@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.production import production_doc, showrunners, staff
+from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.lib.user_zone import user_zone
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 
@@ -17,7 +18,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member
 def enrolled_document(doc: Path, main: Path, integration: Path, branch: str, *, log: str = "production.log") -> None:
     doc.parent.mkdir(parents=True, exist_ok=True)
     _ = doc.write_text(
-        f"- **{production_doc.MERGE_CHECKOUT_FIELD}:** `{main}`\n"
+        f"- **{MERGE_CHECKOUT_FIELD}:** `{main}`\n"
         + f"- **Repository:** `{main}`\n- **Showrunner checkout:** `{integration}`\n"
         + f"- **Merge branch:** `{branch}`\n- **Log:** `{log}`\n")
 
@@ -60,23 +61,29 @@ class ProductionDocumentTests(StaffTestCase):
         environment = fixture_git_environment(self.root)
         _ = subprocess.run(["git", "init", "-qb", "main", str(repository)], env=environment, check=True)
         _ = commit_repository(repository, "Fixture", allow_empty=True, env=environment)
-        for name in ("alpha", "beta"):
+        for name, staged in (("alpha", False), ("beta", False), ("gamma", True)):
             with self.subTest(production=name):
                 integration = self.root / name
                 _ = subprocess.run(["git", "-C", str(repository), "worktree", "add", "-qb", name, str(integration)],
                                    env=environment, check=True)
                 document = repository / f"{name}-production-live.md"
                 old = integration / f"{name}-production.md"
-                _ = old.write_text("# Legacy production\n")
+                _ = old.write_text(f"# Legacy production\n- **Repository:** `{repository}`\n")
                 owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", old))
                 self.assertIsInstance(production_doc.resolve_production_paths(old), production_doc.LegacyProduction)
+                notes = repository / NOTES_DIRECTORY / owner.id
+                self.assertIsNone(production_doc.staged_notes_directory(old))
+                if staged:
+                    notes.mkdir(parents=True)
+                    self.assertEqual(production_doc.staged_notes_directory(old), notes)
                 enrolled_document(document, repository, integration, name, log=f"logs/{name}.md")
                 paths = production_doc.EnrolledPaths(repository, document, repository / f"logs/{name}.md",
-                    repository / production_doc.NOTES_DIRECTORY / owner.id, integration)
+                                                     notes, integration)
                 self.assertEqual(production_doc.resolve_production_paths(document), paths)
                 _ = staff.set_doc(owner.id, replace(owner.doc, path=document) if isinstance(owner.doc, staff.LiveDoc)
                                   else staff.LiveDoc("natedev", document))
                 self.assertEqual(production_doc.resolve_production_paths(document), paths)
+                self.assertEqual(production_doc.staged_notes_directory(document), notes if staged else None)
                 parsed = production_doc.read_production(owner.id)
                 self.assertEqual((parsed.checkout, parsed.log), (integration, paths.log))
 
@@ -105,7 +112,7 @@ class ProductionDocumentTests(StaffTestCase):
 
         _ = settings.write_text(registrations(claude, "matcher"))
         hooks = codex_home / "hooks.json"
-        proof = state / production_doc.GUARD_READY_FILE
+        proof = state / GUARD_READY_FILE
         with patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state), patch.object(production_doc, "GUARD_REPOSITORY", repo):
             for tip, drift, ready in ((revision, False, True), (revision, True, False), (other, False, False)):
                 with self.subTest(revision=tip, drift=drift):

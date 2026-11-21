@@ -24,7 +24,7 @@ from scripts.production import showrunners, staff
 from scripts.lib import build_folders
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
-from scripts.production import production_doc
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
@@ -101,7 +101,7 @@ class NoStyleProduction:
 
     @property
     def doc(self) -> Path:
-        return self.repository / "docs" / f"{self.name}-production{production_doc.LIVE_DOCUMENT_SUFFIX}"
+        return self.repository / "docs" / f"{self.name}-production{LIVE_DOCUMENT_SUFFIX}"
 
 
 @dataclass(frozen=True)
@@ -227,7 +227,7 @@ def _production_text(style: StyleProduction) -> str:
         "- **Kind:** style",
         f"- **Branch point:** {style.branch_point}",
         f"- **Showrunner checkout:** {style.checkout}",
-        f"- **{production_doc.MERGE_CHECKOUT_FIELD}:** {style.repository}",
+        f"- **{MERGE_CHECKOUT_FIELD}:** {style.repository}",
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
