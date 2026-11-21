@@ -2479,6 +2479,51 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
             self.assertNotIn('<span data-list-count', source)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_empty_state_filter_names_the_state_and_resets_to_all(self) -> None:
+        deadline = datetime(2099, 1, 1, tzinfo=user_zone())
+        for key in ('page-owner/C1', 'page-owner/C2', 'page-owner/C3'):
+            review_later.save(key, deadline)
+        markup = browser_markup(self.root)
+        probe = r'''<script>
+const failures=[];
+const clock=Date.now;
+try{
+ const ordinary=document.querySelector('[data-empty]');
+ if(index.size!==3 || [...index.values()].some(entry=>entry.hiddenUntil<=Date.now()))
+  failures.push('All three items are parked.');
+ const checkEmpty=()=>{
+  if(ordinary.hidden || ordinary.textContent!=='No items in this view.' ||
+   document.querySelector('[data-empty-result]'))
+   failures.push('The page shows its usual empty text while every item is parked.');
+ };
+ checkEmpty();
+ const search=document.querySelector('#list-search');
+ search.value='no match';
+ search.dispatchEvent(new Event('input',{bubbles:true}));
+ checkEmpty();
+ const all=document.querySelector('#review-show-all');
+ all.click();
+ checkEmpty();
+
+ Date.now=()=>AFTER_LATER;
+ search.value='';
+ search.dispatchEvent(new Event('input',{bubbles:true}));
+ document.querySelector('#review-show-validating').click();
+ const table=document.querySelector('.review-queue table');
+ const empty=table.querySelector('[data-empty-result]');
+ if(empty?.querySelector('[role="status"]').textContent!=='No item matches State: Validating.')
+  failures.push('The table names the empty State filter.');
+ empty.querySelector('[data-reset-empty-filters]').click();
+ if(table.querySelector('[data-empty-result]') || !table.querySelector('[data-list-item]:not([hidden])') ||
+  all.getAttribute('aria-pressed')!=='true' || document.activeElement!==search)
+  failures.push('Show all items reveals the Review rows and focuses search.');
+}catch(error){failures.push(String(error));}
+finally{Date.now=clock;}
+fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''.replace("AFTER_LATER", str(int(deadline.timestamp() * 1000) + 1))
+        self.assertEqual(firefox_probe_results(markup.replace("</body>", probe + "</body>", 1).encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_show_chips_keep_counts_address_reload_and_refresh(self) -> None:
         self.maxDiff: int | None = None
         proposals = self.decisions()

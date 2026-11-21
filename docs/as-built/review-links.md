@@ -433,6 +433,13 @@ Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the ow
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
+It also supplies the empty filter row for Review, The List and Disks.
+When a filter has no matches, the row names the selected filters and search text.
+**Clear search** clears the text, keeps the other filters and focuses the search box.
+**Show all items** resets the filters and focuses the first filter control.
+The row shows only when a reset would show a result.
+Review and The List keep their usual empty text when a reset would show no results.
+Disks keeps the rows that group smaller folders or sessions.
 When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
 The copy fades and collapses while the rows below slide up.
 `card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.

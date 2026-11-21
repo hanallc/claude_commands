@@ -26,7 +26,8 @@ from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
-from scripts.review_links import page_frame, test_page_frame
+from scripts.review_links import page_frame, record_table, test_page_frame
+from scripts.review_links.test_accounts_page import firefox_probe_results
 
 GIB = 1 << 30
 KEEP = 256 << 20
@@ -663,8 +664,55 @@ const localStorage={getItem:()=>null};
         self.assertEqual(re.findall(r'<i style="width:([0-9.]+)%">', html), ["100.0", "25.0", "3.6"])
         self.assertEqual(re.findall(r'data-tip="([^"]*)"', cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, {5 * GIB})"))),
                          ["session:fps", "session:lfo", "smaller:sessions"])
-        self.assertEqual(self.run_page(f"[sessionRange({json.dumps(SESSIONS)}, {KEEP}), sessionLimitAt(0, {{min: 1, max: 2}})]"),
+        self.assertEqual(self.run_page(f"[sessionRange({json.dumps(SESSIONS)}, {KEEP}), sizeLimitAt(0, {{min: 1, max: 2}})]"),
                          [{"min": KEEP, "max": 28 * GIB}, 0])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_empty_folder_size_filter_keeps_the_other_row_and_resets_the_limit(self) -> None:
+        small = folder("hana", GIB // 2)
+        small_folders = [small, folder("nate", GIB // 2)]
+        trees = {
+            "empty": folder("/build", GIB, small_folders),
+            "single": folder("/build", GIB // 2, [small]),
+            "minimum": folder("/build", 62 * GIB, [folder("cargo", 60 * GIB), folder("exact", GIB), *small_folders]),
+        }
+        probe = r'''<script>
+const failures=[];
+try{
+ const card=document.createElement('section');document.body.append(card);
+ const trees=TREES;
+ data={keep_bytes:256*1024**2};
+ const update=driveView(card);
+ const showTree=tree=>update({mount:'/build',tree,total:100*GIB,used:tree.size,free:100*GIB-tree.size,floor:null});
+ showTree(trees.empty);
+ const empty=card.querySelector('table > [data-empty-result]');
+ if(empty?.querySelector('[role="status"]').textContent!=='No folder matches the 1.0 GiB minimum size.' ||
+  !card.querySelector('[data-path^="other:"]'))
+  failures.push('The empty row names the size filter and keeps Other.');
+ empty.querySelector('[data-reset-empty-filters]').click();
+ const slider=card.querySelector('input');
+ if(card.querySelector('[data-empty-result], [data-path^="other:"]') ||
+  card.querySelectorAll('.tree tbody tr > td.path').length!==2 || slider.value!=='0' || document.activeElement!==slider)
+  failures.push('Show all items names every folder and focuses the slider.');
+
+ showTree(trees.single);
+ slider.value='1';
+ slider.dispatchEvent(new Event('input'));
+ if(card.querySelector('output').textContent!=='1.0 GiB' ||
+  card.querySelector('.tree tbody tr > td.path')?.textContent!=='/build/hana' ||
+  card.querySelector('[data-empty-result]'))
+  failures.push('The only folder stays visible below the minimum size.');
+
+ showTree(trees.minimum);
+ slider.value='1';
+ slider.dispatchEvent(new Event('input'));
+ if(card.querySelector('output').textContent!=='1.0 GiB' ||
+  !card.querySelector('.tree td.path[title="/build/exact"]'))
+  failures.push('Step 1 keeps the folder at the exact minimum size visible.');
+}catch(error){failures.push(String(error));}
+fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''.replace("TREES", json.dumps(trees))
+        self.assertEqual(firefox_probe_results(self.page_html().replace("</body>", probe + "</body>", 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_session_rows_and_the_full_tooltip_fit_in_the_browser(self) -> None:
@@ -1179,7 +1227,7 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
             const localStorage = {getItem: key => saved.has(key) ? saved.get(key) : null, setItem: (key, value) => saved.set(key, value)};
             let result = null;
         """)
-        javascript = fake + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
+        javascript = fake + record_table.EMPTY_RESULT_SCRIPT + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP, "storage": storage,
                                                                                 **(extra or {})}),

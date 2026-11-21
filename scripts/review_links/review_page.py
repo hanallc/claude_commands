@@ -1616,6 +1616,13 @@ const view=createRecordTable({content:()=>content,
  resolveItem:value=>resolveShownRecordId(index,value),
  hasKey:key=>index.has(key),
  shows:showValues,
+ emptyFilters:(root,{show,keys})=>[
+  ...activeChipLabels(root,'[aria-pressed="true"]:is([data-type-chip]:not([data-type-chip=""]),'
+   +'[data-owner-chip]:not([data-owner-chip=""])'
+   +(show==='all' ? '' : ',[data-show-chip]')+')'),
+  ...(keys.size ? ['Linked reviews'] : []),
+ ],
+ firstFilter:root=>root.querySelector('#list-search'),
  visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
  applied:(_items,filters)=>{

@@ -81,7 +81,62 @@ def date_time_picker(*, field: str, action: str, value: str) -> str:
             +'</div></div>')
 
 
-STYLE = '''<style>
+EMPTY_RESULT_STYLE = '''<style>
+[data-empty-result] button[hidden]{display:none!important}
+[data-empty-result] td.empty-result-cell{padding:12px 16px;text-align:left;white-space:normal;color:var(--ink-2)}
+.empty-result-content,.empty-result-actions{display:flex;align-items:center;flex-wrap:wrap}
+.empty-result-content{gap:8px 16px;overflow-wrap:anywhere}.empty-result-actions{gap:8px}
+.empty-result-actions button{font:inherit;min-height:44px;margin:0;padding:6px 12px;
+border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer}
+.empty-result-actions button:hover{background:var(--hover)}
+@media(max-width:960px){.list-table [data-empty-result] :is(tr,td){display:block}}
+</style>'''
+
+EMPTY_RESULT_SCRIPT = r'''
+const emptyResultRows=new WeakMap();
+const emptyResultList=new Intl.ListFormat('en',{type:'conjunction'});
+function updateEmptyResult(table,{empty,noun='item',search='',labels=[],clearSearch,resetFilters}){
+ const words=search.trim();
+ let row=emptyResultRows.get(table);
+ if(!empty || (!words && !labels.length)){
+  row?.remove();
+  return false;
+ }
+ if(!row){
+  row=table.createTBody();
+  row.dataset.emptyResult='';
+  const cell=row.insertRow().insertCell();
+  cell.className='empty-result-cell';
+  cell.colSpan=[...table.tHead.rows[0].cells].reduce((width,heading)=>width+heading.colSpan,0);
+  cell.innerHTML='<div class="empty-result-content"><span role="status"></span>'
+   +'<div class="empty-result-actions"><button type="button" data-clear-empty-search>Clear search</button>'
+   +'<button type="button" data-reset-empty-filters>Show all items</button></div></div>';
+  emptyResultRows.set(table,row);
+ }
+ if(row.parentElement!==table) table.append(row);
+ const filters=emptyResultList.format(labels);
+ const status=row.querySelector('[role="status"]');
+ const clear=row.querySelector('[data-clear-empty-search]');
+ const reset=row.querySelector('[data-reset-empty-filters]');
+ const subject='No '+noun;
+ const text=words ? subject+' contains "'+words+'"'+(filters ? ' and matches '+filters : '')+'.'
+  : subject+' matches '+filters+'.';
+ clear.hidden=!words;
+ clear.onclick=clearSearch ?? null;
+ reset.hidden=!filters;
+ reset.onclick=resetFilters ?? null;
+ if(status.textContent!==text) status.textContent=text;
+ return true;
+}
+'''
+
+
+def with_empty_result(source: str) -> str:
+    """Include the shared empty row in a published page."""
+    return source.replace('</head>', EMPTY_RESULT_STYLE + '<script>' + EMPTY_RESULT_SCRIPT + '</script></head>', 1)
+
+
+STYLE = EMPTY_RESULT_STYLE + '''<style>
 [hidden]{display:none!important}body{background:var(--bg);color:var(--ink)}
 main{font-size:15px;line-height:1.5}
 .list-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
@@ -213,7 +268,14 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 </style>'''
 
 
-SCRIPT = r'''const filterControl={
+SCRIPT = EMPTY_RESULT_SCRIPT + r'''
+function activeChipLabels(content,selector){
+ return [...content.querySelectorAll(selector)].map(button=>{
+  const label=[...button.childNodes].filter(node=>node.nodeName!=='B').map(node=>node.textContent).join('').trim();
+  return button.closest('[role="group"]').getAttribute('aria-label')+': '+label;
+ });
+}
+const filterControl={
  wordValues:new WeakMap(),
  getWords(control){return this.wordValues.get(control) ?? '';},
  setWords(control,value){
@@ -601,7 +663,7 @@ function canRevealLinked(item,selection){
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
 function matches(item,selection,counts){
- if(!isSelected(item)) return false;
+ if(selection.keys.size && !selection.keys.has(item.dataset.key)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
  const values=options.filterValues(item.dataset,selection.query,selection);
  if(!values) return false;
@@ -734,7 +796,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || missing.length>0;
+ const noResults=count===0 && missing.length===0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -749,6 +811,14 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
  options.applied?.(selection,active);
+ const reset=options.emptyFilters && noResults ? resetSelection(active.now) : null;
+ const canResetToResults=reset!==null && rows.some(item=>matches(item,reset));
+ const filteredEmpty=options.emptyFilters && updateEmptyResult(table,{
+  empty:canResetToResults,search:query,
+  labels:canResetToResults ? options.emptyFilters(content,active) : [],
+  clearSearch,resetFilters
+ });
+ empty.hidden=!noResults || Boolean(filteredEmpty);
  if(write || location.hash===placeHash &&
   (revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
    filterNames.some(name=>filters[name]!==previousFilters[name])))
@@ -842,6 +912,24 @@ function closeCard(key,write=true){
 }
 function ownerChipSelection(selection,nextOwner){
  return nextOwner===selection.owner ? selection : {...selection,owner:nextOwner,sourceOwner:''};
+}
+function clearSearch(){
+ query='';
+ if(sharedWords()) filterControl.setWords(words(),query);
+ apply(true);
+ words().focus({preventScroll:true});
+}
+function resetSelection(now){
+ return {owner:'',sourceOwner:'',show:'all',type:'',query:'',keys:new Set(),
+  filters:Object.fromEntries(filterNames.map(name=>[name,''])),now};
+}
+function resetFilters(){
+ const reset=resetSelection();
+ ({owner,sourceOwner,show,type,query,keys}=reset);
+ Object.assign(filters,reset.filters);
+ if(sharedWords()) filterControl.setWords(words(),query);
+ apply(true);
+ options.firstFilter(content).focus({preventScroll:true});
 }
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
