@@ -1,8 +1,9 @@
 """Repository slots retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime, timedelta
 import io
 import json
@@ -14,12 +15,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, copy_record, git_rescue, scratch
+from scripts.lib import build_folders, build_slots, copy_record, file_lock, git_rescue, scratch
 from scripts.copies import copies
 from scripts.build_queue import admission_client, admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -321,6 +323,54 @@ class BuildSlotsTests(unittest.TestCase):
             with self.subTest(number=number), self.assertRaises(ValueError), exact(number):
                 self.fail('The request exceeded its configured pool')
         self.assertFalse((self.slot_root / 'widget-slot3').exists())
+
+    def test_two_slots_share_one_git_config_migration(self) -> None:
+        common = self.source / ".git"
+        first_read, resume_first = threading.Event(), threading.Event()
+        git = cast(Callable[..., str], getattr(build_slots, "_git"))
+        exclusive = file_lock.exclusive
+
+        def pause_after_read(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
+                             accepted: tuple[int, ...] = (0,)) -> str:
+            result = git(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
+            if folder == self.slot_root / "widget-slot1" and arguments == ("config", "--local", "--get", "core.bare"):
+                first_read.set()
+                self.assertTrue(resume_first.wait(TEST_HANG_GUARD_SECS), "The second caller did not reach the migration.")
+            return result
+
+        @contextmanager
+        def observe_contention(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
+            # Resume the first caller when the real lock makes the second caller wait.
+            if path.parent == common and wait:
+                with exclusive(path, wait=False) as result:
+                    if result is file_lock.LockResult.ACQUIRED:
+                        yield result
+                        return
+                resume_first.set()
+            with exclusive(path, wait=wait) as result:
+                yield result
+
+        def take(number: int) -> Path:
+            with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
+                    work="proof", purpose="test", selection=build_slots.ExactSlotRequest(number)) as slot:
+                return slot.path
+
+        with (mock.patch.object(build_slots, "_git", side_effect=pause_after_read),
+              mock.patch.object(file_lock, "exclusive", new=observe_contention),
+              ThreadPoolExecutor(max_workers=1) as worker):
+            first = worker.submit(take, 1)
+            try:
+                self.assertTrue(first_read.wait(TEST_HANG_GUARD_SECS), "The first caller did not read core.bare.")
+                second_path = take(2)
+            finally:
+                resume_first.set()
+            first_path = first.result(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual((first_path, second_path), (self.slot_root / "widget-slot1", self.slot_root / "widget-slot2"))
+        self.assertEqual(self.git(self.source, "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
+        self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
+        self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
+                                  "--get-all", "core.bare"), "false")
 
     def test_repository_limit_uses_own_or_default_maximum_without_output(self) -> None:
         for maximum in (1, UseDefaultMaximum()):

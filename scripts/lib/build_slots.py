@@ -26,7 +26,7 @@ from typing import BinaryIO, cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
+from scripts.lib import build_folders, conf, copy_record, file_lock, git_files, git_rescue
 from scripts.lib.slot_root import SlotsNotConfigured as SlotsNotConfigured, configured_slot_root as configured_slot_root
 from scripts.lib.slot_root import slot_root as slot_root
 
@@ -265,16 +265,17 @@ def _rescue(path: Path) -> None:
 def _exclude_slot_target(source: Path, path: Path, descriptor: int) -> None:
     """Keep build output ignored only in this slot's worktree."""
     checkout = git_files.at(path)
-    if _git(source, "config", "--local", "--type=bool", "--get", "extensions.worktreeConfig",
-            accepted=(0, 1), pass_fds=(descriptor,)) != "true":
-        # Preserve the main checkout's location when Git enables worktree configuration.
-        for key in ("core.worktree", "core.bare"):
-            value = _git(source, "config", "--local", "--get", key, accepted=(0, 1), pass_fds=(descriptor,))
-            if value:
-                _ = _git(source, "config", "--file", str(checkout.common_dir / "config.worktree"),
-                         key, value, pass_fds=(descriptor,))
-                _ = _git(source, "config", "--local", "--unset", key, pass_fds=(descriptor,))
-        _ = _git(source, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=(descriptor,))
+    with file_lock.exclusive(checkout.common_dir / "slot-worktree-config.lock"):
+        if _git(source, "config", "--local", "--type=bool", "--get", "extensions.worktreeConfig",
+                accepted=(0, 1), pass_fds=(descriptor,)) != "true":
+            # Preserve the main checkout's location when Git enables worktree configuration.
+            for key in ("core.worktree", "core.bare"):
+                value = _git(source, "config", "--local", "--get", key, accepted=(0, 1), pass_fds=(descriptor,))
+                if value:
+                    _ = _git(source, "config", "--file", str(checkout.common_dir / "config.worktree"),
+                             key, value, pass_fds=(descriptor,))
+                    _ = _git(source, "config", "--local", "--unset", key, pass_fds=(descriptor,))
+            _ = _git(source, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=(descriptor,))
     exclude = checkout.git_dir / "info/exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     text = exclude.read_text() if exclude.exists() else ""
