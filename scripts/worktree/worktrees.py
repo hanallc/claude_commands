@@ -9,13 +9,17 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import stat
 import subprocess
+import time
 import sys
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Literal, TypedDict, cast
+from uuid import uuid4
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
@@ -66,10 +70,16 @@ class OriginBranchAbsent:
 
 
 @dataclass(frozen=True)
+class OriginBranchRetained:
+    reason: str
+
+
+@dataclass(frozen=True)
 class CheckedOriginTip:
     """The origin tip is contained in the local branch or the target."""
 
     sha: str
+    push_url: str
 
 
 @dataclass(frozen=True)
@@ -85,7 +95,7 @@ class CheckedLocalTip:
 @dataclass(frozen=True)
 class CleanupReady:
     local: CheckedLocalTip
-    origin: OriginBranchAbsent | CheckedOriginTip
+    origin: OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip
 
 
 class Refused(Exception):
@@ -94,8 +104,9 @@ class Refused(Exception):
         self.code: int = code
 
 
-def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(["git", "-C", str(repo), *arguments],
+def git(repo: Path, *arguments: str, check: bool = True,
+        input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(["git", "-C", str(repo), *arguments], input=input_text,
                             capture_output=True, text=True, check=False)
     if check and result.returncode:
         raise Refused(1, failure_detail(result))
@@ -303,12 +314,52 @@ def local_branch_tip(repo: Path, branch: str) -> LocalBranchAbsent | CheckedLoca
     return CheckedLocalTip(git(repo, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip())
 
 
-def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedOriginTip | Kept:
+def origin_push_urls(repo: Path) -> tuple[str, ...]:
+    if "origin" not in git(repo, "remote").stdout.splitlines():
+        return ()
+    urls = tuple(git(repo, "remote", "get-url", "--push", "--all", "origin").stdout.splitlines())
+    if not urls or any(not url for url in urls):
+        raise Refused(1, "origin has no usable push destination")
+    return urls
+
+
+def single_push_url(urls: tuple[str, ...]) -> str:
+    if len(urls) != 1:
+        raise Refused(1, "origin deletion requires one push destination")
+    return urls[0]
+
+
+def origin_retention(ref: str) -> str:
+    try:
+        return production_doc.origin_ref_protection(ref)
+    except production_doc.ProductionPathsError as error:
+        return str(error)
+
+
+def push_destination_heads(repo: Path, url: str, *patterns: str) -> dict[str, str]:
+    if git(repo, "ls-remote", "--get-url", "--", url).stdout.rstrip("\n") != url:
+        raise Refused(1, "Git rewrites the resolved push destination")
+    heads = git(repo, "ls-remote", "--heads", "--", url, *patterns).stdout.splitlines()
+    return {name: tip for tip, name in (line.split("\t", 1) for line in heads)}
+
+
+def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip | Kept:
     repo = Path(record.repo)
-    remote_branch = git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{record.branch}").stdout
-    if not remote_branch:
+    ref = f"refs/heads/{record.branch}"
+    if reason := origin_retention(ref):
+        return OriginBranchRetained(reason)
+    urls = origin_push_urls(repo)
+    if not urls:
         return OriginBranchAbsent()
-    tip = remote_branch.split()[0]
+    url = single_push_url(urls)
+    tip = push_destination_heads(repo, url, ref).get(ref)
+    if tip is None:
+        return OriginBranchAbsent()
+    return check_origin_landing(record, CheckedOriginTip(tip, url))
+
+
+def check_origin_landing(record: WorktreeRecord, origin: CheckedOriginTip) -> CheckedOriginTip | Kept:
+    repo, tip = Path(record.repo), origin.sha
     reason = f"origin has commits that the local branch lacks: {tip}"
     commit = git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False)
     if commit.returncode in (1, 128):
@@ -324,10 +375,10 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
         return Kept(Path(record.path), reason)
     if ancestor.returncode:
         raise Refused(1, ancestor.stderr.strip())
-    return CheckedOriginTip(tip)
+    return origin
 
 
-def cleanup(path: Path) -> CleanupReady | Kept:
+def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | Kept:
     head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if head.returncode not in (0, 1):
         raise Refused(1, head.stderr.strip())
@@ -362,11 +413,19 @@ def cleanup(path: Path) -> CleanupReady | Kept:
     result = landed(record)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
+    if local_branch_tip(repo, branch) != local:
+        return Kept(path, "the local branch changed during the cleanup check")
+    return local, record
+
+
+def cleanup(path: Path) -> CleanupReady | Kept:
+    local_check = check_local_cleanup(path)
+    if isinstance(local_check, Kept):
+        return local_check
+    local, record = local_check
     origin = origin_branch_state(record)
     if isinstance(origin, Kept):
         return origin
-    if local_branch_tip(repo, branch) != local:
-        return Kept(path, "the local branch changed during the cleanup check")
     return CleanupReady(local, origin)
 
 
@@ -382,6 +441,20 @@ def release_worktree_pair(path: Path) -> None:
         print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
 
 
+def recorded_worktree_change(path: Path, repo: Path, branch: str) -> str:
+    if path.exists():
+        if git_files.at(path).common_dir != git_files.at(repo).common_dir:
+            return "the worktree belongs to a different repository"
+        dirty = git(path, "status", "--porcelain", "--untracked-files=all").stdout
+        if dirty:
+            return f"dirty worktree: {dirty.rstrip()}"
+        head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
+        expected = f"refs/heads/{branch}"
+        if head.returncode or head.stdout.strip() != expected:
+            return head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
+    return ""
+
+
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
     try:
@@ -392,15 +465,10 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     member = resolver.member_by_folder(remote.local_machine(), path)
     if isinstance(member, session_staff.MemberFound):
         return Kept(path, f"staff member {member.row.name} holds this worktree")
-    if path.exists():
-        dirty = git(path, "status", "--porcelain").stdout
-        if dirty:
-            return Kept(path, f"dirty worktree: {dirty.rstrip()}")
-        head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
-        expected = f"refs/heads/{record.branch}"
-        if head.returncode or head.stdout.strip() != expected:
-            reason = head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
-            return Kept(path, reason)
+    if reason := recorded_worktree_change(path, repo, record.branch):
+        return Kept(path, reason)
+    if any(peer != path and name == record.branch for peer, name in worktree_branches(repo).items()):
+        return Kept(path, "a different worktree holds this branch")
     if has_branch(repo, record.branch) and not git(
             repo, "rev-list", "-n", "1", f"{record.base}..refs/heads/{record.branch}").stdout.strip():
         # A tree with no commit of its own can be in use before its first commit.
@@ -421,9 +489,15 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
             _guard_cargo_cleanup(path, guards)
         except (OSError, ValueError) as error:
             return Kept(path, f"Cargo output kept: {error}")
-        if isinstance(origin, CheckedOriginTip):
-            ref = f"refs/heads/{record.branch}"
-            deletion = origin_deletion.delete(repo, "origin", ref, origin.sha)
+        ref = f"refs/heads/{record.branch}"
+        if local_branch_tip(repo, record.branch) != local:
+            return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
+        if reason := recorded_worktree_change(path, repo, record.branch):
+            return Kept(path, reason)
+        if isinstance(origin, OriginBranchRetained):
+            print(f"Kept origin ref {ref}: {origin.reason}")
+        elif isinstance(origin, CheckedOriginTip):
+            deletion = origin_deletion.delete(repo, "origin", ref, origin.sha, expected_push_url=origin.push_url)
             if isinstance(deletion, origin_deletion.Kept):
                 if deletion.cause is origin_deletion.RetentionCause.GIT_FAILURE:
                     return Kept(path, f"origin branch deletion failed; the worktree stays: {deletion.reason}")
@@ -531,6 +605,201 @@ def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.Staf
     print(f"made worktree {path} on {branch}")
 
 
+
+class DeletionLocalIdentity(TypedDict):
+    worktree_path: str
+    repository: str
+    common_dir: str
+    branch_ref: str
+    local_commit: str
+
+
+class DeletionPreview(TypedDict):
+    local: DeletionLocalIdentity
+    push_urls: list[str]
+    remote_ref: str
+    origin_action: Literal["keep", "absent", "delete"]
+    origin_commit: str
+    retention_reason: str
+    unpushed_count: int
+    remote_only_count: int
+    has_uncommitted: bool
+    cleanup: bool
+    created_at: int
+    expires_at: int
+
+
+def deletion_local_identity(path: Path, repository: Path, branch: str) -> DeletionLocalIdentity:
+    path = path.resolve(strict=True)
+    repository = main_checkout(repository)
+    local = git_files.at(path)
+    if local.common_dir != git_files.at(repository).common_dir:
+        raise Refused(1, "the worktree belongs to a different repository")
+    if path == repository or Path.cwd().resolve().is_relative_to(path):
+        raise Refused(1, "cannot delete the main or current worktree")
+    if branch == "main":
+        raise Refused(1, "cannot delete main")
+    if git_files.head(local) != git_files.OnBranch(branch) or worktree_branches(repository).get(path) != branch:
+        raise Refused(1, f"the worktree branch does not match {branch}")
+    ref = f"refs/heads/{branch}"
+    tip = git(repository, "rev-parse", "--verify", ref).stdout.strip()
+    return DeletionLocalIdentity(worktree_path=str(path), repository=str(repository),
+                                 common_dir=str(local.common_dir), branch_ref=ref, local_commit=tip)
+
+
+def preview_origin(repo: Path, urls: tuple[str, ...], ref: str) -> tuple[
+    OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip, tuple[str, ...]
+]:
+    if reason := origin_retention(ref):
+        return OriginBranchRetained(reason), ()
+    if not urls:
+        return OriginBranchAbsent(), ()
+    url = single_push_url(urls)
+    refs = push_destination_heads(repo, url)
+    other_tips = sorted({sha for name, sha in refs.items() if name != ref})
+    objects = git(repo, "cat-file", "--batch-check", input_text="".join(f"{sha}\n" for sha in other_tips)).stdout
+    local_heads = tuple(sha for sha, kind, *_ in (line.split() for line in objects.splitlines())
+                        if kind == "commit")
+    tip = refs.get(ref)
+    if tip is None:
+        return OriginBranchAbsent(), local_heads
+    # Count loss from the exact commit that the deletion lease will use.
+    if git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False).returncode != 0:
+        _ = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", url, tip)
+    return CheckedOriginTip(tip, url), local_heads
+
+
+def deletion_preview(path: Path, directory: Path, ttl: int) -> dict[str, object]:
+    path = path.resolve(strict=True)
+    head = git_files.head(git_files.at(path))
+    if not isinstance(head, git_files.OnBranch):
+        raise Refused(1, "the worktree HEAD is detached")
+    identity = deletion_local_identity(path, Path.cwd(), head.name)
+    repo, ref = Path(identity["repository"]), identity["branch_ref"]
+    production_doc.require_removable_checkout(path, repo, head.name)
+    dirty = bool(git(path, "status", "--porcelain", "--untracked-files=all").stdout)
+    try:
+        local_check = check_local_cleanup(path)
+    except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+        local_check = Kept(path, str(error))
+    urls = origin_push_urls(repo)
+    origin, other_heads = preview_origin(repo, urls, ref)
+    retained = isinstance(origin, OriginBranchRetained)
+    deletes = isinstance(origin, CheckedOriginTip)
+    origin_tip = origin.sha if deletes else ""
+    if urls:
+        # Use known origin heads as exclusions. An unknown head cannot hide loss.
+        exclusions = (*other_heads, origin_tip) if deletes else other_heads
+        unpushed = int(git(repo, "rev-list", "--count", identity["local_commit"], "--not", *exclusions).stdout)
+    else:
+        unpushed = int(git(repo, "rev-list", "--count", identity["local_commit"], "--not",
+                           f"--exclude={ref.removeprefix('refs/heads/')}", "--branches").stdout)
+    remote_only = int(git(repo, "rev-list", "--count", origin_tip, "--not", *other_heads).stdout) if deletes else 0
+    if deletion_local_identity(path, repo, head.name) != identity:
+        raise Refused(1, "the local worktree changed during preview")
+    cleanup_reason = "cleanup: all work is on the target branch"
+    can_clean = not dirty and not isinstance(local_check, Kept) and local_check[0].sha == identity["local_commit"]
+    if isinstance(local_check, Kept):
+        cleanup_reason = local_check.reason
+    elif deletes and isinstance(checked := check_origin_landing(local_check[1], origin), Kept):
+        can_clean = False
+        cleanup_reason = checked.reason
+    preview_id = uuid4().hex
+    now = int(time.time())
+    record = DeletionPreview(
+        local=identity, push_urls=list(urls), remote_ref=ref,
+        origin_action="delete" if deletes else "keep" if retained else "absent",
+        origin_commit=origin_tip, retention_reason=origin.reason if retained else "",
+        unpushed_count=unpushed, remote_only_count=remote_only, has_uncommitted=dirty,
+        cleanup=can_clean, created_at=now, expires_at=now + ttl,
+    )
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not create_text_atomic(deletion_record(directory, preview_id, "preview"), json.dumps(record)):
+        raise Refused(1, "the preview identifier already exists")
+    return {
+        "status": "success", "preview_id": preview_id, "worktree_path": str(path),
+        "target_branch": head.name, "has_uncommitted": dirty, "has_unpushed": unpushed > 0,
+        "unpushed_count": unpushed, "has_remote_branch": deletes, "keep_origin": retained,
+        "origin_action": record["origin_action"], "origin_commit": origin_tip,
+        "retention_reason": record["retention_reason"], "has_remote_only": remote_only > 0,
+        "remote_only_count": remote_only, "cleanup": can_clean, "cleanup_reason": cleanup_reason,
+    }
+
+
+def deletion_record(directory: Path, preview_id: str, state: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", preview_id):
+        raise Refused(1, "invalid deletion preview identifier")
+    metadata = directory.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        raise Refused(1, "the deletion preview directory is not private to the current user")
+    return directory / f"{preview_id}.{state}"
+
+
+def read_deletion_preview(file: Path) -> DeletionPreview:
+    try:
+        preview = cast(DeletionPreview, json.loads(file.read_text()))
+    except FileNotFoundError as error:
+        raise Refused(1, "the deletion preview is missing or already used; create a new preview") from error
+    if not preview["created_at"] <= int(time.time()) < preview["expires_at"]:
+        raise Refused(1, "the deletion preview expired; create a new preview")
+    return preview
+
+
+def confirm_deletion(directory: Path, preview_id: str) -> None:
+    file = deletion_record(directory, preview_id, "preview")
+    preview = read_deletion_preview(file)
+    if preview["has_uncommitted"]:
+        raise Refused(1, "the preview shows uncommitted changes")
+    _ = file.rename(deletion_record(directory, preview_id, "confirmed"))
+
+
+def consume_deletion(directory: Path, preview_id: str, path: Path, repo: Path, branch: str, *,
+                     automatic: bool) -> tuple[CheckedLocalTip, OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip]:
+    file = deletion_record(directory, preview_id, "preview" if automatic else "confirmed")
+    used = deletion_record(directory, preview_id, "used")
+    try:
+        _ = file.rename(used)
+    except FileNotFoundError as error:
+        raise Refused(1, "the deletion preview is missing or already used; create a new preview") from error
+    try:
+        preview = read_deletion_preview(used)
+    finally:
+        used.unlink()
+    identity = deletion_local_identity(path, repo, branch)
+    if preview["local"] != identity or preview["remote_ref"] != identity["branch_ref"]:
+        raise Refused(1, "the local worktree identity changed after preview")
+    if preview["has_uncommitted"] or git(path, "status", "--porcelain", "--untracked-files=all").stdout:
+        raise Refused(1, "the worktree has uncommitted changes; create a new preview")
+    local = CheckedLocalTip(identity["local_commit"])
+    if automatic:
+        if not preview["cleanup"]:
+            raise Refused(1, "the preview requires confirmation")
+        checked = check_local_cleanup(path.resolve())
+        if isinstance(checked, Kept):
+            raise Refused(1, checked.reason)
+        if checked[0] != local:
+            raise Refused(1, "the local branch changed after preview")
+    action = preview["origin_action"]
+    if action == "keep":
+        return local, OriginBranchRetained(preview["retention_reason"])
+    if action == "absent":
+        return local, OriginBranchAbsent()
+    if action != "delete":
+        raise Refused(1, "invalid origin action in deletion preview")
+    url = single_push_url(tuple(preview["push_urls"]))
+    return local, CheckedOriginTip(preview["origin_commit"], url)
+
+
+def print_retirement(local: CheckedLocalTip, origin: OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip) -> None:
+    print(local.sha)
+    if isinstance(origin, CheckedOriginTip):
+        print("delete", origin.sha, origin.push_url, sep="\n")
+    elif isinstance(origin, OriginBranchRetained):
+        print("keep", " ".join(origin.reason.splitlines()), sep="\n")
+    else:
+        print("absent")
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -544,7 +813,20 @@ def main() -> int:
     _ = protection.add_argument("path")
     _ = protection.add_argument("branch")
     _ = protection.add_argument("repository")
-    _ = protection.add_argument("--preview-origin", action="store_true")
+    preview = commands.add_parser("deletion-preview")
+    _ = preview.add_argument("path", type=Path)
+    _ = preview.add_argument("directory", type=Path)
+    _ = preview.add_argument("ttl", type=int)
+    confirm = commands.add_parser("confirm-deletion")
+    _ = confirm.add_argument("directory", type=Path)
+    _ = confirm.add_argument("preview_id")
+    consume = commands.add_parser("consume-deletion")
+    _ = consume.add_argument("directory", type=Path)
+    _ = consume.add_argument("preview_id")
+    _ = consume.add_argument("path", type=Path)
+    _ = consume.add_argument("repository", type=Path)
+    _ = consume.add_argument("branch")
+    _ = consume.add_argument("--automatic", action="store_true")
     release = commands.add_parser("release-pair")
     _ = release.add_argument("path")
     retarget = commands.add_parser("cargo-liner-target")
@@ -553,6 +835,27 @@ def main() -> int:
     _ = retarget.add_argument("receipt")
     _ = retarget.add_argument("--reverse", action="store_true")
     arguments = parser.parse_args()
+    command = cast(str, arguments.command)
+    if command in ("deletion-preview", "confirm-deletion", "consume-deletion"):
+        try:
+            directory = cast(Path, arguments.directory)
+            if command == "deletion-preview":
+                print(json.dumps(deletion_preview(cast(Path, arguments.path), directory, cast(int, arguments.ttl))))
+            elif command == "confirm-deletion":
+                confirm_deletion(directory, cast(str, arguments.preview_id))
+                print("Confirmation recorded.")
+            else:
+                local, origin = consume_deletion(directory, cast(str, arguments.preview_id),
+                                                 cast(Path, arguments.path), cast(Path, arguments.repository),
+                                                 cast(str, arguments.branch), automatic=cast(bool, arguments.automatic))
+                print_retirement(local, origin)
+        except (Refused, production_doc.ProductionPathsError, OSError, ValueError, KeyError, TypeError) as error:
+            if command == "deletion-preview":
+                print(json.dumps({"status": "error", "message": str(error)}))
+            else:
+                print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if cast(str, arguments.command) == "cargo-liner-target":
         try:
             count = retarget_cargo_liner_records(
@@ -568,9 +871,6 @@ def main() -> int:
             branch = cast(str, arguments.branch)
             production_doc.require_removable_checkout(
                 Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), branch)
-            if cast(bool, arguments.preview_origin):
-                reason = production_doc.origin_ref_protection(f"refs/heads/{branch}")
-                print("keep-origin" if reason else "delete-origin")
         except production_doc.ProductionPathsError as error:
             print(str(error), file=sys.stderr)
             return 1
@@ -581,15 +881,14 @@ def main() -> int:
     if cast(str, arguments.command) == "cleanup":
         try:
             result = cleanup(Path(cast(str, arguments.path)).expanduser().resolve())
-        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+        except (Refused, production_doc.ProductionPathsError, OSError, ValueError, KeyError, TypeError) as error:
             print(str(error), file=sys.stderr)
             return 2
         if isinstance(result, Kept):
             print(result.reason)
             return 1
         if cast(bool, arguments.checked_tips):
-            origin_tip = result.origin.sha if isinstance(result.origin, CheckedOriginTip) else ""
-            print(f"{result.local.sha} {origin_tip}")
+            print_retirement(result.local, result.origin)
         else:
             print("cleanup: all work is on the target branch")
         return 0

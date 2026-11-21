@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
@@ -102,6 +103,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
+            **fixture_git_environment(self.root),
             **config_environment(self.root / "settings"),
             "HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
@@ -111,7 +113,6 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex"),
             **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": "/nonexistent/herdr",
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
             "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
@@ -321,7 +322,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertEqual(lease["purpose"], tree.name)
 
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
-        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config", "protected-origin"):
+        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config",
+                       "protected-origin", "protected-origin-ahead", "protected-origin-unknown-commit"):
             with self.subTest(branch=branch):
                 if branch != "checkpoint":
                     self.setUp()
@@ -347,17 +349,29 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
                 if branch == "without-branch-config":
                     _ = self.git(self.repository, "config", "--local", "--remove-section", f"branch.{branch}")
+                protected = branch.startswith("protected-origin")
+                if branch in ("protected-origin-ahead", "protected-origin-unknown-commit"):
+                    writer = self.root / "writer"
+                    _ = self.git(self.root, "clone", "--branch", branch, str(self.origin), str(writer))
+                    advance = self.commit(writer, "remote-only.txt", "Only on origin.\n")
+                    self.publish(writer, branch)
+                    if branch == "protected-origin-ahead":
+                        _ = self.git(self.repository, "fetch", "origin", branch)
+                    else:
+                        missing = self.command(self.repository, ["git", "cat-file", "-e", f"{advance}^{{commit}}"])
+                        self.assertNotEqual(missing.returncode, 0)
                 before = self.git(self.origin, "rev-parse", f"refs/heads/{branch}")
-                if branch == "protected-origin":
+                if protected:
                     document = self.root / "other-production.md"
                     _ = document.write_text(f"- **Merge branch:** {branch}\n")
                     with patch.dict(os.environ, self.environment, clear=True):
                         identity = staff.StaffId(str(uuid4()))
                         _ = staff.ensure("showrunner", name="other", runtime_id=identity,
                                          doc=staff.LiveDoc(socket.gethostname().split(".", 1)[0], document))
-                cleanup = self.cleanup_result(tree)
-                self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
-                self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
+                if branch != "protected-origin-unknown-commit":
+                    cleanup = self.cleanup_result(tree)
+                    self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+                    self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
                 results = self.finish_landed()
 
                 self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
@@ -365,7 +379,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "checkpoint\n")
                 else:
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "later target work\n")
-                if branch == "protected-origin":
+                if protected:
                     self.assertFalse(tree.exists())
                     self.assertFalse(self.record_path(tree).exists())
                     self.assertEqual(self.git(self.repository, "branch", "--list", branch), "")

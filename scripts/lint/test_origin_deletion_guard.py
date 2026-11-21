@@ -7,9 +7,11 @@ import re
 import shlex
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Literal
 from unittest.mock import patch
 
 from scripts.agents import remote
@@ -22,6 +24,10 @@ from scripts.production.staff_test_support import fixture_member
 ROOT = Path(__file__).resolve().parents[2]
 OPERATION = Path("scripts/lib/origin_deletion.py")
 SHELL_COMMAND = re.compile(r"(?<![\w.-])(?:git|gh)(?=\s)")
+SHELL_LEXEMES = re.compile(r"""\\.|[$][(]|['"#()\x60]|""" + SHELL_COMMAND.pattern)
+FENCE = re.compile(r"^[ \t]*(?P<marker>\x60{3,}|~{3,})[ \t]*(?P<language>[^\s\x60~]*).*")
+INLINE_DELIMITER = re.compile(r"(?<![\\\x60])\x60+(?!\x60)")
+SHELL_LANGUAGES = {"", "bash", "console", "fish", "sh", "shell", "shell-session", "zsh"}
 UNKNOWN_WORD = "?"
 
 
@@ -58,10 +64,48 @@ def changes_origin_branch(words: Sequence[str]) -> bool:
     return False
 
 
+def shell_command_offsets(source: str) -> Iterator[int]:
+    quote = ""
+    substitutions: list[tuple[str, str]] = []
+    comment_end = 0
+    for match in SHELL_LEXEMES.finditer(source):
+        offset = match.start()
+        token = match.group()
+        if offset < comment_end or token.startswith("\\") and quote != "'":
+            continue
+        if quote == "'":
+            if token.endswith(quote):
+                quote = ""
+        elif token == "$(":
+            substitutions.append((")", quote))
+            quote = ""
+        elif token == "\x60":
+            if not quote and substitutions and substitutions[-1][0] == token:
+                _, quote = substitutions.pop()
+            else:
+                substitutions.append((token, quote))
+                quote = ""
+        elif quote:
+            if token == quote:
+                quote = ""
+        elif token in ("'", '"'):
+            quote = token
+        elif token == "#" and (offset == 0 or source[offset - 1] in " \t\r\n;&|()"):
+            comment_end = source.find("\n", offset)
+            if comment_end < 0:
+                return
+        elif substitutions and token == "(":
+            substitutions.append((")", ""))
+        elif substitutions and token == substitutions[-1][0]:
+            _, quote = substitutions.pop()
+        elif token in ("git", "gh"):
+            yield offset
+
+
 def shell_mutations(source: str) -> Iterator[tuple[int, list[str]]]:
-    source = source.replace("\\\n", " ")
-    for match in SHELL_COMMAND.finditer(source):
-        rest = source[match.start():].split("\n", 1)[0]
+    joined = source.replace("\\\n", "  ")
+    for offset in shell_command_offsets(joined):
+        rest = joined[offset:].split("\n", 1)[0]
         lexer = shlex.shlex(rest, posix=True, punctuation_chars=";&|()<>")
         lexer.whitespace_split = True
         words: list[str] = []
@@ -71,10 +115,10 @@ def shell_mutations(source: str) -> Iterator[tuple[int, list[str]]]:
                     break
                 words.append(token)
         except ValueError:
-            # A command substitution can end inside a double-quoted assignment.
+            # A command substitution can end inside a quoted assignment.
             pass
         if changes_origin_branch(words):
-            yield source.count("\n", 0, match.start()) + 1, words
+            yield source.count("\n", 0, offset) + 1, words
 
 
 def python_mutations(source: str) -> Iterator[tuple[int, list[str]]]:
@@ -88,23 +132,82 @@ def python_mutations(source: str) -> Iterator[tuple[int, list[str]]]:
         words = list(map(word, items))
         if changes_origin_branch(words):
             yield node.lineno, words
-        for value in words:
-            for _line, shell_words in shell_mutations(value):
+        if words and Path(words[0]).name in SHELL_LANGUAGES and "-c" in words:
+            script = words[words.index("-c") + 1:]
+        elif isinstance(node, ast.Call) and any(
+            arg.arg == "shell" and isinstance(arg.value, ast.Constant) and arg.value.value is True
+            for arg in node.keywords
+        ):
+            script = words[:1]
+        else:
+            continue
+        if script:
+            for _line, shell_words in shell_mutations(script[0]):
                 yield node.lineno, shell_words
+
+
+def inline_shell_nodes(source: str, first_line: int) -> Iterator[tuple[int, str]]:
+    delimiters = list(INLINE_DELIMITER.finditer(source))
+    index = 0
+    while index < len(delimiters):
+        opening = delimiters[index]
+        index += 1
+        for closing_index in range(index, len(delimiters)):
+            closing = delimiters[closing_index]
+            if closing.group() == opening.group():
+                yield first_line + source.count("\n", 0, opening.end()), source[opening.end():closing.start()]
+                index = closing_index + 1
+                break
+
+
+def markdown_code_nodes(source: str) -> Iterator[tuple[int, Literal["shell", "python"], str]]:
+    lines = source.splitlines(keepends=True)
+    index = 0
+    prose_start = 0
+    while index < len(lines):
+        opening = FENCE.match(lines[index])
+        if opening is None:
+            index += 1
+            continue
+        for first_line, inline in inline_shell_nodes("".join(lines[prose_start:index]), prose_start + 1):
+            yield first_line, "shell", inline
+        marker = opening["marker"]
+        close = re.compile(r"^[ \t]*" + re.escape(marker[0]) + r"{" + str(len(marker)) + r",}[ \t]*$")
+        start = index + 1
+        index = start
+        while index < len(lines) and not close.match(lines[index]):
+            index += 1
+        body = textwrap.dedent("".join(lines[start:index]))
+        language = opening["language"].casefold()
+        if language in SHELL_LANGUAGES:
+            yield start + 1, "shell", body
+        elif language in ("py", "python", "python3"):
+            yield start + 1, "python", body
+        index += 1
+        prose_start = index
+    for first_line, inline in inline_shell_nodes("".join(lines[prose_start:]), prose_start + 1):
+        yield first_line, "shell", inline
+
+
+def markdown_mutations(source: str) -> Iterator[tuple[int, list[str]]]:
+    for first_line, language, code in markdown_code_nodes(source):
+        mutations = python_mutations(code) if language == "python" else shell_mutations(code)
+        for line, words in mutations:
+            yield first_line + line - 1, words
 
 
 class OriginDeletionGuardTests(unittest.TestCase):
     def test_origin_mutations_use_the_operation(self) -> None:
         faults: list[str] = []
+        detectors = {".py": python_mutations, ".sh": shell_mutations, ".md": markdown_mutations}
         for folder in (ROOT / "scripts", ROOT / "commands", ROOT / ".github"):
             for path in folder.rglob("*"):
                 relative = path.relative_to(ROOT)
-                if (path.suffix not in (".py", ".sh") or path.name.startswith("test_")
+                if (path.suffix not in detectors or path.name.startswith("test_")
                         or relative == OPERATION or not path.is_file()):
                     continue
                 source = path.read_text(encoding="utf-8")
-                mutations = python_mutations(source) if path.suffix == ".py" else shell_mutations(source)
-                for line, words in mutations:
+                for line, words in detectors[path.suffix](source):
                     # This caller lists only refs/simplify/claim/* before deleting a claim.
                     if relative == Path("scripts/direct/simplify_daily.py") and words[-1:] in ([":?"], ["?:?"]):
                         continue
@@ -112,26 +215,39 @@ class OriginDeletionGuardTests(unittest.TestCase):
         self.assertEqual(faults, [])
 
     def test_guard_recognizes_git_and_gh_command_forms(self) -> None:
-        for source, python, forbidden in (
-            ('git push origin --delete topic', False, True),
-            ('/usr/bin/git -C /tmp/checkout push origin :refs/heads/topic', False, True),
-            ('git push origin --delete refs/simplify/claim/day', False, False),
-            ('git push origin :refs/heads/topic', False, True),
-            ('git push origin :refs/simplify/claim/day', False, False),
-            ('git push origin +HEAD:refs/heads/topic', False, True),
-            ('git push origin HEAD:refs/heads/topic', False, False),
-            ('OUT="$(gh pr merge 12 --delete-branch 2>&1)"', False, True),
-            ('git push origin :', False, False),
-            ('subprocess.run(["git", "push", "origin", "--delete", branch])', True, True),
-            ('git(path, "push", "origin", f":refs/heads/{branch}")', True, True),
-            ('git(path, "push", "origin", f"+{tip}:refs/heads/{branch}")', True, True),
-            ('git(path, "push", "origin", "--force", f"{tip}:refs/heads/{branch}")', True, True),
-            ('git(path, "push", "origin", "+HEAD:refs/simplify/last")', True, False),
-            ('subprocess.run(["gh", "pr", "merge", "--delete-branch"])', True, True),
+        for source, form, expected in (
+            ('git push origin --delete topic', "shell", (1,)),
+            ('/usr/bin/git -C /tmp/checkout push origin :refs/heads/topic', "shell", (1,)),
+            ('git push origin --delete refs/simplify/claim/day', "shell", ()),
+            ('git push origin :refs/heads/topic', "shell", (1,)),
+            ('git push origin :refs/simplify/claim/day', "shell", ()),
+            ('git push origin +HEAD:refs/heads/topic', "shell", (1,)),
+            ('git push origin HEAD:refs/heads/topic', "shell", ()),
+            ('OUT="$(gh pr merge 12 --delete-branch 2>&1)"', "shell", (1,)),
+            ('git push origin :', "shell", ()),
+            ('subprocess.run(["git", "push", "origin", "--delete", branch])', "python", (1,)),
+            ('git(path, "push", "origin", f":refs/heads/{branch}")', "python", (1,)),
+            ('git(path, "push", "origin", f"+{tip}:refs/heads/{branch}")', "python", (1,)),
+            ('git(path, "push", "origin", "--force", f"{tip}:refs/heads/{branch}")', "python", (1,)),
+            ('git(path, "push", "origin", "+HEAD:refs/simplify/last")', "python", ()),
+            ('subprocess.run(["gh", "pr", "merge", "--delete-branch"])', "python", (1,)),
+            ('# git push origin --delete topic', "shell", ()),
+            ('printf "%s" "git push origin --delete topic"', "shell", ()),
+            ('print("git push origin --delete topic")', "python", ()),
+            ('Run `git push origin --delete [branch-name]`.', "markdown", (1,)),
+            ('Delete with\n`git push origin --delete direct/<plan-slug>`.', "markdown", (2,)),
+            ('```bash\n# Delete the release branch\ngit push origin :release-$VERSION\n```', "markdown", (3,)),
+            ('```bash\n# Comment\ngit push origin \\\n --delete refs/heads/topic\n```', "markdown", (3,)),
+            ('```python\nsubprocess.run(["git", "push", "origin", "--delete", branch])\n```', "markdown", (2,)),
+            ('Use `~/.claude/scripts/lib/py ~/.claude/scripts/lib/origin_deletion.py "$PWD" origin ' +
+             'refs/heads/topic "$EXPECTED_COMMIT"`.', "markdown", ()),
+            ('Do not run git push origin --delete topic.', "markdown", ()),
+            ('```text\nRun `git push origin --delete topic`.\n```', "markdown", ()),
+            ('```sh\n# git push origin --delete topic\necho "git push origin --delete topic"\n```', "markdown", ()),
         ):
             with self.subTest(source=source):
-                matches = python_mutations(source) if python else shell_mutations(source)
-                self.assertEqual(bool(list(matches)), forbidden)
+                detectors = {"shell": shell_mutations, "python": python_mutations, "markdown": markdown_mutations}
+                self.assertEqual(tuple(line for line, _ in detectors[form](source)), expected)
 
     def test_deletion_checks_the_lease_and_current_staff_authority(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

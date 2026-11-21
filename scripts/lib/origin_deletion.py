@@ -15,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+from uuid import uuid4
 
 from scripts.lib import cancellation, process_group
 from scripts.lib.process_failure import failure_detail
@@ -59,7 +60,7 @@ def _git(repository: Path, timeout: float, *args: str) -> subprocess.CompletedPr
 
 
 def delete(repository: Path, destination: str, ref: str, expected: str, *,
-           timeout: float = 30) -> Deleted | Absent | Kept:
+           timeout: float = 30, expected_push_url: str = "") -> Deleted | Absent | Kept:
     """Read current staff authority just before the push. Use a lease on the expected commit."""
     try:
         if (timeout <= 0 or not ref.startswith("refs/heads/") or not destination or destination.startswith("-")
@@ -69,15 +70,31 @@ def delete(repository: Path, destination: str, ref: str, expected: str, *,
             return Kept("invalid time limit, destination, branch ref, or expected commit", RetentionCause.GIT_FAILURE)
         if reason := production_doc.origin_ref_protection(ref):
             return Kept(reason)
-        pushed = _git(repository, timeout, "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
-                      destination, "--delete", ref)
+        push_destination = destination
+        push_config: tuple[str, ...] = ()
+        if expected_push_url:
+            urls = _git(repository, timeout, "remote", "get-url", "--push", "--all", destination)
+            if urls.returncode or urls.stdout.splitlines() != [expected_push_url]:
+                return Kept("the configured push destination changed", RetentionCause.GIT_FAILURE)
+            resolved = _git(repository, timeout, "ls-remote", "--get-url", "--", expected_push_url)
+            if resolved.returncode or resolved.stdout.rstrip("\n") != expected_push_url:
+                return Kept("Git rewrites the approved push destination", RetentionCause.GIT_FAILURE)
+            # Pin the push destination for this process. An explicit push URL bypasses pushInsteadOf.
+            push_destination = f"origin-deletion-{uuid4().hex}"
+            push_config = ("-c", f"remote.{push_destination}.url={expected_push_url}",
+                           "-c", f"remote.{push_destination}.pushurl={expected_push_url}")
+        pushed = _git(repository, timeout, *push_config, "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
+                      push_destination, "--delete", ref)
         if pushed.returncode == 0:
             if any(line.startswith("-\t") for line in pushed.stdout.splitlines()):
                 return Deleted()
             return Absent()
         if "stale info" in pushed.stdout or "remote ref does not exist" in pushed.stderr:
-            urls = _git(repository, timeout, "remote", "get-url", "--push", "--all", destination)
-            targets = urls.stdout.splitlines() if urls.returncode == 0 else [destination]
+            if expected_push_url:
+                targets = [expected_push_url]
+            else:
+                urls = _git(repository, timeout, "remote", "get-url", "--push", "--all", destination)
+                targets = urls.stdout.splitlines() if urls.returncode == 0 else [destination]
             if targets and all(_git(repository, timeout, "ls-remote", "--exit-code", "--heads", "--", target, ref)
                                .returncode == 2 for target in targets):
                 return Absent()
@@ -94,20 +111,25 @@ def main() -> int:
     _ = parser.add_argument("destination")
     _ = parser.add_argument("ref")
     _ = parser.add_argument("expected")
+    _ = parser.add_argument("--expected-push-url", default="")
     class Arguments(argparse.Namespace):
         repository: Path = Path()
         destination: str = ""
         ref: str = ""
         expected: str = ""
+        expected_push_url: str = ""
 
     args = parser.parse_args(namespace=Arguments())
-    result = delete(args.repository, args.destination, args.ref, args.expected)
+    result = delete(args.repository, args.destination, args.ref, args.expected,
+                    expected_push_url=args.expected_push_url)
     if isinstance(result, Kept):
         failed = result.cause is RetentionCause.GIT_FAILURE
         print(f"Kept origin ref {args.ref}: {result.reason}", file=sys.stderr if failed else sys.stdout)
         return int(failed)
     if isinstance(result, Deleted):
         print(f"Deleted origin ref {args.ref}.")
+    else:
+        print(f"Origin ref {args.ref} is absent.")
     return 0
 
 

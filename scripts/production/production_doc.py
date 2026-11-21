@@ -191,12 +191,10 @@ def read_new_production(doc: Path, name: str, *, resume_branch: str = "",
 
 
 def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresent,
-                   *, resume_branch: str = "") -> ProductionDocument:
+                   *, resume_branch: str = "",
+                   identity: tuple[git_files.Checkout, git_files.Checkout] | None = None) -> ProductionDocument:
     try:
-        main_path = Path(cell_value(declared.text))
-        if not main_path.is_absolute():
-            raise Refusal(f"{MERGE_CHECKOUT_FIELD} must be absolute")
-        main = git_files.at(main_path.resolve(strict=True))
+        main, integration = identity if identity is not None else _enrolled_checkout_identity(lines, declared)
         if main.git_dir != main.common_dir or git_files.head(main) != git_files.OnBranch("main"):
             raise Refusal(f"{main.toplevel}: expected the main checkout on main")
         if not doc.is_relative_to(main.toplevel) or git_files.locate(doc.parent) != main:
@@ -205,7 +203,6 @@ def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresen
         if isinstance(repository, FieldPresent):
             if Path(cell_value(repository.text)).expanduser().resolve(strict=True) != main.toplevel:
                 raise Refusal(f"Repository must name {main.toplevel}")
-        integration = git_files.at(Path(production_field(lines, "Showrunner checkout")).expanduser().resolve(strict=True))
         branch = production_field(lines, "Merge branch")
         if integration == main or integration.common_dir != main.common_dir:
             raise Refusal("Showrunner checkout must be a separate worktree of the same repository")
@@ -463,7 +460,27 @@ def _merge_branch(lines: list[str]) -> str:
     return cell_value(field.text) if isinstance(field, FieldPresent) else ""
 
 
-def _local_protected_checkouts(row: staff.StaffRow) -> tuple[ProtectedCheckout, ...]:
+@dataclass(frozen=True)
+class _RemovalTarget:
+    path: Path
+    repository: Path
+
+
+def _enrolled_checkout_identity(lines: list[str], declared: FieldPresent) -> tuple[git_files.Checkout, git_files.Checkout]:
+    main = Path(cell_value(declared.text))
+    if not main.is_absolute():
+        raise ProductionPathsError(f"{MERGE_CHECKOUT_FIELD} must be absolute")
+    integration = Path(production_field(lines, "Showrunner checkout")).expanduser()
+    return git_files.at(main.resolve(strict=True)), git_files.at(integration.resolve(strict=True))
+
+
+def _overlaps(left: Path, right: Path) -> bool:
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def _local_protected_checkouts(
+    row: staff.StaffRow, *, removal: _RemovalTarget | None = None,
+) -> tuple[ProtectedCheckout, ...]:
     assert isinstance(row.doc, staff.LiveDoc)
     try:
         doc = row.doc.path.resolve()
@@ -483,14 +500,19 @@ def _local_protected_checkouts(row: staff.StaffRow) -> tuple[ProtectedCheckout, 
             lines = []
         declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
         if isinstance(declared, FieldPresent):
-            document = _read_enrolled(doc, row.name, lines, declared)
-            main = document.merge_checkout
-            assert isinstance(main, Path)
-            repository = git_files.at(main).common_dir
-            return (ProtectedCheckout(main, repository, "main"),
-                    ProtectedCheckout(document.checkout, repository, document.merge_branch))
+            main, integration = _enrolled_checkout_identity(lines, declared)
+            if removal is not None and all(
+                identity.common_dir != removal.repository and not _overlaps(identity.toplevel, removal.path)
+                for identity in (main, integration)
+            ) and not _overlaps(doc, removal.path):
+                return ()
+            document = _read_enrolled(doc, row.name, lines, declared, identity=(main, integration))
+            return (ProtectedCheckout(main.toplevel, main.common_dir, "main"),
+                    ProtectedCheckout(document.checkout, main.common_dir, document.merge_branch))
         return _legacy_checkouts(row, lines)
-    except (OSError, UnicodeError, RuntimeError, ValueError) as error:
+    except ProductionPathsError:
+        raise
+    except (OSError, UnicodeError, RuntimeError, ValueError, Refusal) as error:
         raise ProductionPathsError(f"{row.doc.path}: {error}") from error
 
 
@@ -563,17 +585,20 @@ def origin_ref_protection(ref: str) -> str:
 def require_removable_checkout(path: Path, repository: Path, branch: str) -> None:
     """Check the local worktree path and the branch in its Git common directory."""
     try:
-        protected = protected_checkouts()
         candidate = path.resolve()
+        common = git_files.locate(repository).common_dir
+        target = _RemovalTarget(candidate, common)
+        protected = tuple(checkout for row in _registered_production_documents()
+                          if isinstance(row.doc, staff.LiveDoc)
+                          and isinstance(_protection_host(row.doc.machine), LocalProtectionHost)
+                          for checkout in _local_protected_checkouts(row, removal=target))
         for checkout in protected:
             if checkout.path.is_relative_to(candidate):
                 raise ProductionPathsError(f"{candidate}: contains protected production checkout {checkout.path}")
             if candidate.is_relative_to(checkout.path):
                 raise ProductionPathsError(f"{candidate}: inside protected production checkout {checkout.path}")
-        if branch:
-            common = git_files.locate(repository).common_dir
-            if any(item.repository == common and item.branch == branch for item in protected):
-                raise ProductionPathsError(f"{repository}: protected production branch {branch}")
+        if branch and any(item.repository == common and item.branch == branch for item in protected):
+            raise ProductionPathsError(f"{repository}: protected production branch {branch}")
     except ProductionPathsError:
         raise
     except (OSError, RuntimeError, ValueError, Refusal) as error:

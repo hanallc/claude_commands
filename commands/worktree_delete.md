@@ -12,7 +12,7 @@ Set each step to `in_progress` before execution and `completed` after execution.
     1. Execute <DiscoverWorktrees/>.
     2. Execute <ValidateDeletionTarget/>.
     3. If `cleanup` is true, say: "This tree is cleanup; all work is on the target branch."
-       Skip <GetFinalConfirmation/>, execute <PerformDeletion/>, and stop.
+       Execute <PerformDeletion/> with the preview identifier and `--automatic`. Stop after deletion.
     4. Execute <CheckUncommittedChanges/>.
     5. Execute <CheckUnpushedCommits/>.
     6. Execute <GetFinalConfirmation/>.
@@ -34,7 +34,7 @@ Set each step to `in_progress` before execution and `completed` after execution.
     1. Run `bash ~/.claude/scripts/worktree_delete/worktree_delete_validation.sh "$SELECTED_WORKTREE"`.
     2. Read the JSON status.
     3. If the status is `error`, display the message and stop.
-    4. Store the validation fields, including `cleanup` and `cleanup_reason`.
+    4. Store the validation fields, including `preview_id` as `PREVIEW_ID`.
 </ValidateDeletionTarget>
 
 <CheckUncommittedChanges>
@@ -42,9 +42,8 @@ Set each step to `in_progress` before execution and `completed` after execution.
 </CheckUncommittedChanges>
 
 <CheckUnpushedCommits>
-    If `has_unpushed` is true and `unpushed_count` exceeds zero, warn that deletion would lose those commits and request confirmation.
-    If `has_remote_only` is true, warn that deletion removes `origin/[BRANCH_NAME]` and its `remote_only_count` commits.
-    Request confirmation for that loss.
+    If `has_unpushed` is true, show the count of commits without a known copy on origin.
+    If `has_remote_only` is true, show the count of commits without a known copy on another origin branch.
 </CheckUnpushedCommits>
 
 <GetFinalConfirmation>
@@ -52,24 +51,23 @@ Set each step to `in_progress` before execution and `completed` after execution.
 
     1. The worktree path.
     2. The local branch name.
-    3. `origin/[BRANCH_NAME]`, if `has_remote_branch` is true.
-    4. The unpushed commits and the commits that only `origin/[BRANCH_NAME]` holds.
+    3. The `origin_action`. For `delete`, show the origin branch and `origin_commit`.
+    4. The `unpushed_count` and `remote_only_count` from the same preview.
 
     Ask the user to enter `confirm` for deletion or `cancel` to stop.
     Wait for the response.
     If the user enters `cancel`, stop.
     If the user enters `confirm`, run:
-    `bash ~/.claude/scripts/worktree_delete/record_confirmation.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH"`.
-    Continue to <PerformDeletion/>.
+    `bash ~/.claude/scripts/worktree_delete/record_confirmation.sh "$PREVIEW_ID"`.
+    Continue to <PerformDeletion/> only after confirmation succeeds.
 </GetFinalConfirmation>
 
 <PerformDeletion>
     1. Use `dangerouslyDisableSandbox: true` when sandbox limits prevent deletion outside the permitted paths.
-    2. Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH"`.
+    2. Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH" "$PREVIEW_ID"`.
+       Append `--automatic` for a preview that permits cleanup.
     3. Report the result.
 
-    The script checks and consumes an existing nonce.
-    Without a nonce, it repeats the cleanup check before deletion.
-    If it reports "no confirmation nonce", repeat validation and the change checks before <GetFinalConfirmation/>.
-    If origin deletion fails, report that the worktree and local branch remain.
+    Each preview permits one execution before it expires. If it expires or the files or refs change, create a new preview.
+    A `keep` or `absent` preview requires a new preview and confirmation before any later origin deletion.
 </PerformDeletion>
