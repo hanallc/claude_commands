@@ -48,6 +48,7 @@ STATE_ENV = "MAIN_SYNC_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
 SYNC_LOG = "sync.jsonl"
 FETCH_TIMEOUT_SECONDS = 120
+TRACKING_REF = "refs/remotes/origin/main"
 IN_PROGRESS = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply")
 # A job has no terminal: git and ssh must fail rather than ask.
 GIT_ENVIRONMENT = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=20"}
@@ -221,7 +222,17 @@ def sync(checkout: Path) -> Outcome:
             conflicts = live_file_conflicts(checkout, tip)
             if conflicts:
                 return Outcome("live-file-conflict", "\n".join(str(conflict) for conflict in conflicts))
-            tracked = _git(checkout, "update-ref", "refs/remotes/origin/main", tip)
+            tracking = _git(checkout, "rev-parse", "--verify", "--quiet", TRACKING_REF)
+            if tracking.returncode not in (0, 1):
+                return Outcome("fetch-failed", _first_line(tracking))
+            old_tip = tracking.stdout.strip()
+            if old_tip and old_tip != tip:
+                ancestor = _git(checkout, "merge-base", "--is-ancestor", old_tip, tip)
+                if ancestor.returncode == 1:
+                    return Outcome("diverged", f"{TRACKING_REF} cannot fast-forward to the fetched tip {tip}")
+                if ancestor.returncode:
+                    return Outcome("fetch-failed", _first_line(ancestor))
+            tracked = _git(checkout, "update-ref", TRACKING_REF, tip, old_tip or "0" * len(tip))
             if tracked.returncode:
                 return Outcome("fetch-failed", _first_line(tracked))
             move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)

@@ -60,11 +60,31 @@ class DeletionRerunTests(unittest.TestCase):
         _ = git(repo, "push", "-q", "origin", "main", "integration")
         doc = repo / "fixture-production-live.md"
         enrolled_document(doc, repo, tree, "integration")
-        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
+        local = remote.local_machine()
+        owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(local, doc))
         clone = self.root / "clone"
         clone_tree = self.root / "clone-integration"
         _ = git(self.root, "clone", "-q", origin.as_uri(), str(clone))
         _ = git(clone, "worktree", "add", "-qb", "integration", str(clone_tree), "origin/integration")
+        other_origin, other_repo = self.root / "other.git", self.root / "other"
+        other_tree = self.root / "other-integration"
+        _ = git(self.root, "clone", "-q", "--bare", str(origin), str(other_origin))
+        _ = git(self.root, "clone", "-q", str(other_origin), str(other_repo))
+        _ = git(other_repo, "worktree", "add", "-qb", "integration", str(other_tree), "origin/integration")
+
+        config = self.root / "machines"
+        config.mkdir()
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/machines.conf", config / "machines.conf")
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
+                                                 "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}))
+        other_host = remote.other_machine()
+        ssh = binaries / "ssh"
+        _ = ssh.write_text("#!/bin/sh\n"
+                           + f'[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = {other_host} ] || exit 255\n'
+                           + 'exec sh -c "$4"\n')
+        ssh.chmod(0o755)
 
         def attempt(checkout: Path, worktree: Path, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(["bash", str(self.scripts / script), str(worktree), *arguments], cwd=checkout,
@@ -72,22 +92,33 @@ class DeletionRerunTests(unittest.TestCase):
 
         pattern = ("for-each-ref", "--format=%(refname) %(objectname)")
         refs = tuple(git(folder, *pattern) for folder in (repo, clone, origin))
-        for checkout, worktree, confirmed in ((repo, tree, False), (repo, tree, True),
-                                              (clone, clone_tree, False), (clone, clone_tree, True)):
-            with self.subTest(checkout=checkout, confirmed=confirmed):
+        for host, checkout, worktree, confirmed, protected in (
+                (local, repo, tree, False, True),
+                (local, repo, tree, True, True),
+                (local, clone, clone_tree, False, True),
+                (local, clone, clone_tree, True, True),
+                (other_host, clone, clone_tree, False, True),
+                (other_host, clone, clone_tree, True, True),
+                (other_host, other_repo, other_tree, True, False)):
+            with self.subTest(host=host, checkout=checkout, confirmed=confirmed):
+                _ = staff.set_doc(owner.id, staff.LiveDoc(host, doc))
                 validation = attempt(checkout, worktree, "worktree_delete_validation.sh")
-                self.assertEqual(validation.returncode, 1, validation.stderr)
-                self.assertIn("protected production", validation.stdout)
+                self.assertEqual(validation.returncode, int(protected), validation.stdout + validation.stderr)
                 if confirmed:
                     result = attempt(checkout, worktree, "record_confirmation.sh", "integration")
                     self.assertEqual(result.returncode, 0, result.stderr)
                 nonces = {path: path.read_bytes() for path in self.nonce_dir.glob("*")}
                 result = attempt(checkout, worktree, "perform_deletion.sh", "integration")
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("protected production", result.stderr)
-                self.assertTrue(worktree.is_dir())
+                self.assertEqual(result.returncode, int(protected), result.stdout + result.stderr)
+                self.assertEqual(worktree.is_dir(), protected)
+                if protected:
+                    self.assertIn("protected production", validation.stdout)
+                    self.assertIn("protected production", result.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
+                else:
+                    self.assertEqual(git(checkout, "branch", "--list", "integration"), "")
+                    self.assertEqual(git(other_origin, "branch", "--list", "integration"), "")
                 self.assertEqual(tuple(git(folder, *pattern) for folder in (repo, clone, origin)), refs)
-                self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
 
     def test_confirmed_removal_releases_the_pair_when_the_lock_is_free(self) -> None:
         scripts = self.scripts

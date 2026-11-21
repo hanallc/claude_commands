@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from stat import S_ISDIR
 from typing import NamedTuple, cast, override
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 from scripts.agents import remote
+from scripts.buildlog.repository import remote_identity
 from scripts.lib import git_files
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
@@ -413,11 +416,27 @@ def require_no_live_file_conflicts(checkout: Path, incoming: str) -> None:
         raise OSError("\n".join(str(conflict) for conflict in conflicts))
 
 
+def _registered_production_documents() -> tuple[staff.StaffRow, ...]:
+    try:
+        rows = staff.authority_snapshot().find(kind="showrunner")
+        return tuple(row for row in rows if isinstance(row.doc, staff.LiveDoc))
+    except staff.StaffAbsent:
+        return ()
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        raise ProductionPathsError(f"cannot read the staff record: {error}") from error
+
+
 def protected_checkouts() -> frozenset[ProtectedCheckout]:
-    """Read the main and integration checkouts that the removal tools must keep."""
+    """Read the registered main and integration checkouts on this host."""
+    return _protected_checkouts(_registered_production_documents(), remote.local_machine())
+
+
+def _protected_checkouts(rows: tuple[staff.StaffRow, ...], machine: str) -> frozenset[ProtectedCheckout]:
     protected: set[ProtectedCheckout] = set()
-    for row in local_production_documents():
+    for row in rows:
         assert isinstance(row.doc, staff.LiveDoc)
+        if row.doc.machine != machine:
+            continue
         try:
             doc = row.doc.path.resolve()
             try:
@@ -449,24 +468,120 @@ def protected_checkouts() -> frozenset[ProtectedCheckout]:
     return frozenset(protected)
 
 
+@dataclass(frozen=True)
+class LocalOrigin:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NetworkOrigin:
+    identity: str
+
+
+def _protection_command(host: remote.MachineAlias | None, *args: str) -> subprocess.CompletedProcess[str]:
+    command = list(args) if host is None else [
+        "ssh", "-o", "BatchMode=yes", host.alias, shlex.join(args),
+    ]
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, check=False)
+
+
+def _origins(checkout: Path, host: remote.MachineAlias | None = None) -> frozenset[LocalOrigin | NetworkOrigin]:
+    origins: set[LocalOrigin | NetworkOrigin] = set()
+    for options in ((), ("--push",)):
+        result = _protection_command(host, "git", "-C", str(checkout), "remote", "get-url", "--all",
+                                     *options, "origin")
+        if result.returncode == 2 and not options:
+            return frozenset()
+        if result.returncode or not result.stdout.strip():
+            raise ProductionPathsError(f"{checkout}: cannot read origin")
+        for url in result.stdout.splitlines():
+            location = urlsplit(url) if url.startswith("file://") else None
+            if location is not None or url.startswith(("/", ".", "~")) or (":" not in url):
+                path = unquote(location.path) if location is not None else url
+                if host is None:
+                    origins.add(LocalOrigin((checkout / Path(path).expanduser()).resolve()))
+                else:
+                    resolved = _protection_command(host, "sh", "-c",
+                        'cd -- "$1" && cd -- "$2" && pwd -P', "origin-path", str(checkout), path)
+                    if resolved.returncode or not Path(resolved.stdout.strip()).is_absolute():
+                        raise ProductionPathsError(f"{host.alias}: cannot resolve the file origin for {checkout}")
+                    origins.add(LocalOrigin(Path(resolved.stdout.strip())))
+            else:
+                identity = remote_identity(url, str(checkout))
+                if identity.startswith("https://github.com/"):
+                    identity = identity.lower()
+                origins.add(NetworkOrigin(identity))
+    return frozenset(origins)
+
+
+def _remote_branch_origins(row: staff.StaffRow, branch: str) -> frozenset[LocalOrigin | NetworkOrigin]:
+    assert isinstance(row.doc, staff.LiveDoc)
+    host = remote.machine_alias(row.doc.machine)
+    if isinstance(host, remote.MachineNameRefused):
+        raise ProductionPathsError(host.reason)
+    read = _protection_command(host, "cat", str(row.doc.path))
+    if read.returncode:
+        raise ProductionPathsError(f"{row.doc.machine}: cannot read {row.doc.path}")
+    lines = read.stdout.splitlines()
+    declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
+    checkout_field = optional_field(lines, "Showrunner checkout")
+    branch_field = optional_field(lines, "Merge branch")
+    merge_branch = cell_value(branch_field.text) if isinstance(branch_field, FieldPresent) else ""
+    if isinstance(declared, FieldPresent):
+        main = production_field(lines, MERGE_CHECKOUT_FIELD)
+        protected_branch = production_field(lines, "Merge branch")
+        if not Path(main).is_absolute():
+            raise ProductionPathsError(f"{row.doc.path}: {MERGE_CHECKOUT_FIELD} must be absolute")
+        if branch == "main":
+            return _origins(Path(main), host)
+        if branch == protected_branch:
+            return _origins(Path(main), host) | _origins(Path(production_field(lines, "Showrunner checkout")), host)
+        return frozenset()
+    if merge_branch and branch != merge_branch:
+        return frozenset()
+    paths: set[Path] = set()
+    if isinstance(checkout_field, FieldPresent) and (path := cell_value(checkout_field.text)):
+        paths.add(Path(path))
+    if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.machine == row.doc.machine:
+        paths.add(row.worktree.path)
+    origins: set[LocalOrigin | NetworkOrigin] = set()
+    for path in paths:
+        if not merge_branch:
+            head = _protection_command(host, "git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD")
+            if head.returncode not in (0, 1):
+                raise ProductionPathsError(f"{row.doc.machine}: cannot read the branch in {path}")
+            if head.returncode or head.stdout.strip() != branch:
+                continue
+        origins.update(_origins(path, host))
+    return frozenset(origins)
+
+
 def require_removable_checkout(path: Path, repository: Path, branch: str) -> None:
     """Keep protected checkout paths and branches that removal can delete on origin."""
     try:
-        protected = protected_checkouts()
+        machine = remote.local_machine()
+        rows = _registered_production_documents()
+        protected = _protected_checkouts(rows, machine)
         candidate = path.resolve()
-        matching = [checkout for checkout in protected if branch and checkout.branch == branch]
-        if matching:
-            common = git_files.locate(repository).common_dir
-            if any(checkout.repository == common for checkout in matching):
-                raise ProductionPathsError(f"{repository}: protected production branch {branch}")
-            # A separate clone or URL can name the same origin.
-            raise ProductionPathsError(f"{repository}: protected production origin branch {branch}")
         for checkout in protected:
             if checkout.path.is_relative_to(candidate):
                 raise ProductionPathsError(f"{candidate}: contains protected production checkout {checkout.path}")
             if candidate.is_relative_to(checkout.path):
                 raise ProductionPathsError(f"{candidate}: inside protected production checkout {checkout.path}")
-    except (OSError, RuntimeError, ValueError) as error:
+        matching = [checkout for checkout in protected if branch and checkout.branch == branch]
+        remote_rows = [row for row in rows if isinstance(row.doc, staff.LiveDoc) and row.doc.machine != machine]
+        if not branch or not (matching or remote_rows):
+            return
+        checkout = git_files.locate(repository)
+        if any(keep.repository == checkout.common_dir for keep in matching):
+            raise ProductionPathsError(f"{repository}: protected production branch {branch}")
+        origins = _origins(checkout.toplevel)
+        if origins and (any(origins & _origins(keep.path) for keep in matching)
+                        or any(origins & _remote_branch_origins(row, branch) for row in remote_rows)):
+            raise ProductionPathsError(f"{repository}: protected production origin branch {branch}")
+    except ProductionPathsError:
+        raise
+    except (OSError, RuntimeError, ValueError, Refusal, subprocess.TimeoutExpired) as error:
         raise ProductionPathsError(f"{path}: cannot check production protection: {error}") from error
 
 

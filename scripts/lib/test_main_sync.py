@@ -171,6 +171,34 @@ class MainSyncTests(unittest.TestCase):
         with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
             self.assertEqual(main_sync.sync(self.checkout).state, "diverged")
         self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), newer)
+        self.assertEqual(git(self.checkout, "rev-parse", "origin/main"), newer)
+
+        run_git = main_sync._git  # pyright: ignore[reportPrivateUsage]
+        for race, expected in (("after fetch", "diverged"), ("before update-ref", "fetch-failed")):
+            with self.subTest(race=race):
+                _ = self.commit(f"old {race}")
+                new_tip = ""
+
+                def another_sync(checkout: Path, *arguments: str,
+                                 timeout: float = 30) -> subprocess.CompletedProcess[str]:
+                    nonlocal new_tip
+                    fetch = race == "after fetch" and arguments[0] == "fetch"
+                    replace_ref = race == "before update-ref" and arguments[:2] == ("update-ref", main_sync.TRACKING_REF)
+                    if replace_ref:
+                        new_tip = self.commit(f"new {race}")
+                        _ = git(checkout, "fetch", "-q", "origin")
+                        _ = git(checkout, "merge", "--ff-only", "-q", new_tip)
+                    result = run_git(checkout, *arguments, timeout=timeout)
+                    if fetch:
+                        new_tip = self.commit(f"new {race}")
+                        _ = git(checkout, "fetch", "-q", "origin")
+                        _ = git(checkout, "merge", "--ff-only", "-q", new_tip)
+                    return result
+
+                with unittest.mock.patch.object(main_sync, "_git", side_effect=another_sync):
+                    self.assertEqual(main_sync.sync(self.checkout).state, expected)
+                self.assertTrue(new_tip)
+                self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(), [new_tip, new_tip])
 
     def test_claude_sync_restores_the_accepted_save_when_head_is_current(self) -> None:
         (self.writer / "config").mkdir()

@@ -21,8 +21,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=confirm_gate.sh
 source "$SCRIPT_DIR/confirm_gate.sh"
 
+# Check the repository from which this script deletes the refs.
+MAIN_WORKTREE="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
+DELETION_REPOSITORY="$PWD"
+if [[ -n "$MAIN_WORKTREE" && -d "$MAIN_WORKTREE" ]]; then
+    DELETION_REPOSITORY="$MAIN_WORKTREE"
+fi
 "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
-    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$PWD"
+    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$DELETION_REPOSITORY"
 
 HAS_CONFIRMATION=false
 CHECKED_LOCAL_TIP=""
@@ -89,12 +95,10 @@ fi
 # through and git aborts with "Unable to read current working directory". Move
 # to the main worktree first — it is the first entry of `git worktree list`, and
 # it is never the deletion target.
-MAIN_WORKTREE="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
-if [[ -n "$MAIN_WORKTREE" && -d "$MAIN_WORKTREE" ]]; then
-    cd "$MAIN_WORKTREE"
-else
+if [[ -z "$MAIN_WORKTREE" || "$DELETION_REPOSITORY" != "$MAIN_WORKTREE" ]]; then
     echo "Warning: could not resolve the main worktree; staying in $PWD"
 fi
+cd "$DELETION_REPOSITORY"
 
 if [[ "$HAS_CONFIRMATION" == true ]]; then
     REMOTE_NAMES=$(git remote)
