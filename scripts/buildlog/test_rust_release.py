@@ -109,7 +109,8 @@ class RustReleaseTests(unittest.TestCase):
         source = self.scratch / "hana"
         source.mkdir()
         for arguments in (("init", "-q"), ("config", "user.name", "Trial tests"),
-                          ("config", "user.email", "trial@example.invalid")):
+                          ("config", "user.email", "trial@example.invalid"),
+                          ("remote", "add", "origin", (self.scratch / "origin/hana.git").as_uri())):
             _ = subprocess.run(["git", "-C", str(source), *arguments], check=True, capture_output=True)
         _ = (source / ".gitignore").write_text("/target/\n/mend-target/\n/mend-root/\n")
         _ = (source / "Cargo.toml").write_text("[workspace]\n")

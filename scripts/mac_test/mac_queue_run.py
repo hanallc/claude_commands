@@ -12,7 +12,6 @@ try:
 except FileNotFoundError:
     pass
 
-import argparse
 import codecs
 from collections.abc import Callable, Generator
 import contextlib
@@ -1094,7 +1093,7 @@ def run_assigned(args: Arguments, encoded: str) -> int:
         return status
 
 
-class Arguments(argparse.Namespace):
+class Arguments:
     what: str = ""
     kind: str = ""
     package: str = ""
@@ -1498,6 +1497,8 @@ def main(argv: list[str] | None = None) -> int:
     if len(words) in (3, 4) and words[0] == "watch-caller":
         cancel = int(words[3]) if len(words) == 4 else -1
         return watch_caller(int(words[1]), int(words[2]), cancel)
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)

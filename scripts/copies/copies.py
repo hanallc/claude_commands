@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
@@ -44,9 +45,10 @@ from scripts.lib.copy_record import (
 from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
-from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
-from scripts.build_queue import first_step, slot_wait
-from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
+from scripts.build_queue import first_step
+from scripts.lib.build_steps import (
+    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names, verify_command,
+)
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -473,9 +475,8 @@ def fallback_owner(role: str) -> str:
 
 
 def gates_root() -> Path:
-    from scripts.lib import build_slots
-
-    return build_slots.configured_slot_root()
+    """Return the root that contains numbered test copies."""
+    return build_folders.build_root()
 
 
 def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
@@ -868,8 +869,10 @@ def workspace_path(owner: str, repo: str | Path, name: str) -> Path:
 
 @contextmanager
 def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
-              task: str = "", path: Path | None = None, run_manifest: Path | None = None) -> Generator[Path]:
+              task: str = "", path: Path | None = None, run_manifest: Path | None = None,
+              on_create: build_folders.FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold a registered editable copy without resetting edits during recovery."""
+    _ = on_create
     source = Path(repo).expanduser().resolve()
     for active in ACTIVE_GATES.get():
         if active.tree == source:
@@ -883,18 +886,21 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
     identity = repository_name(source)
     tree = copy_record.copies_root() / f"{identity}-{owner}" / name if path is None else path.resolve()
     legacy = copy_record.copy_folder(tree) != tree
-    if legacy and not tree.is_dir():
-        raise CopyError(f"{tree}: a legacy workspace must already exist")
+    if tree.is_symlink() or not tree.is_dir() or (legacy and path is None and not (tree / ".git").is_dir()):
+        raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
+    if not legacy and not isinstance(copy_record.read_record(tree / copy_record.RECORD), copy_record.Registered):
+        raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
     branch = branch.removeprefix("refs/heads/")
     _ = git(source, "check-ref-format", f"refs/heads/{branch}")
+    descriptors: list[int] = []
     with ExitStack() as lifetime:
-        descriptors: list[int] = []
-        if path is None:
-            spec = build_folders.BuildFolderSpec(kind="editable", parent=copy_record.copies_root(),
-                suffix_length=0, repository=identity, owner=owner, purpose=name)
-            tree = lifetime.enter_context(build_folders.leased_build_folder(spec))
-            descriptors.append(build_folders.build_folder_lock_fd(tree))
-        with claim_tree(tree, create=True, inherited_fds=descriptors) as state:
+        if not legacy:
+            lease = lifetime.enter_context(build_folders.folder_removal_lease(tree))
+            if isinstance(lease, build_folders.RefusedRemovalLease):
+                raise CopyError(f"{tree}: workspace is busy")
+            if isinstance(lease, build_folders.HeldFolderRemovalLease):
+                descriptors.append(lease.descriptor)
+        with claim_tree(tree, create=False, inherited_fds=descriptors) as state:
             if state is not ClaimState.ACQUIRED:
                 raise CopyError(f"{tree}: workspace is busy")
             token = COMMAND_LOCKS.set(tuple(descriptors))
@@ -943,11 +949,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     register(commit_at(tree, "HEAD"))
                     record = scratch.task_of(tree)
                 else:
-                    if not isinstance(record, copy_record.NotRegistered) or any(
-                            child.name != scratch.BUSY for child in tree.iterdir()):
-                        raise CopyError(f"{tree}: refusing an unregistered workspace")
-                    register("")
-                    record = scratch.task_of(tree)
+                    raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
                 assert isinstance(record, copy_record.Registered)
                 if record.fields.get("copy_commit"):
                     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
@@ -999,6 +1001,7 @@ class AcquireCrateRunLock:
 
 CrateRunRemovalLock = HeldCrateRunLock | AcquireCrateRunLock
 ACQUIRE_CRATE_RUN_LOCK = AcquireCrateRunLock()
+NO_CREATED_WORKSPACES: Mapping[Path, os.stat_result] = MappingProxyType({})
 
 
 def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
@@ -1028,57 +1031,46 @@ def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
 
 
 def end_workspaces(task: str, paths: list[Path], *,
-                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> None:
-    """End workspace records and remove copies linked to terminal crates."""
-    holds = scratch.holds()
-    changed = False
+                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK,
+                   created: Mapping[Path, os.stat_result] = NO_CREATED_WORKSPACES) -> None:
+    """End workspace records and remove terminal folders made by this run."""
+    moment = time.time()
     selected = {str(path.resolve()) for path in paths}
-    for path, hold in holds.items():
-        if path in selected and hold["task"] == task:
-            hold["ended"] = time.time()
-            changed = True
-    if changed:
-        scratch.write_holds(holds)
-    for tree in paths:
-        record = scratch.task_of(tree)
-        if (copy_record.copy_folder(tree) != tree.resolve()
-                and not (isinstance(record, copy_record.Registered) and "crate_run" in record.fields)):
-            if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
-                    or scratch.end_copy(tree, task, time.time())):
-                hold = scratch.holds().get(str(tree.resolve()))
-                if hold is not None and hold["task"] == task:
-                    _ = scratch.release(tree)
+    with scratch.locked_holds() as holds:
+        changed = False
+        for path, hold in holds.items():
+            if path in selected and hold["task"] == task and not hold["ended"]:
+                hold["ended"] = moment
+                changed = True
+        if changed:
+            scratch.write_holds(holds)
+
+    for tree in dict.fromkeys(paths):
+        if not os.path.lexists(tree):
             continue
-        if not tree.exists():
-            if isinstance(record, copy_record.Registered) and record.task == task:
-                with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, scratch.removal_lock(tree) as idle:
-                    if not idle:
-                        raise CopyError(f"{tree}: workspace is busy during task completion")
-                    validate()
-                    scratch.remove_marked(tree)
-            hold = scratch.holds().get(str(tree.resolve()))
-            if hold is not None and hold["task"] == task:
-                _ = scratch.release(tree)
+        record = scratch.task_of(tree)
+        if isinstance(record, copy_record.NotRegistered):
+            scratch.report_retained_task_folder(tree, "the workspace has no task record")
             continue
         if not isinstance(record, copy_record.Registered) or record.task != task:
             raise CopyError(f"{tree}: workspace task differs")
+        removed = False
         with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
               scratch.removal_lock(tree) as idle,
               scratch.copy_record_lock(tree)):
             if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
-            def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(current, copy_record.Registered) or current.task != task:
-                    raise CopyError(f"{tree}: workspace task differs")
-                return {**current.fields, "ended": time.time(), "ended_task": task}
             validate()
-            # A deletion intent preserves ownership but does not certify saved work.
             if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
-                _ = scratch.update_record(tree, ended)
-            if "crate_run" not in record.fields:
-                continue
-            scratch.remove_marked(tree)
-        _ = scratch.release(tree)
+                scratch.record_task_end(tree, task, moment)
+            if ("crate_run" in record.fields and tree in created
+                    and os.path.samestat(tree.lstat(), created[tree])):
+                scratch.remove_marked(tree, source_deletion=scratch.SourceDeletion.CRATE_WORKSPACE_ONLY)
+                removed = True
+        if removed:
+            _ = scratch.release(tree)
+        else:
+            scratch.report_retained_task_folder(tree, f"task {task} ended")
 
 
 def slot_source(source: Path) -> Path:
@@ -1362,13 +1354,9 @@ def remote_step_source(source: Path, tree_id: str, caller: Path, trust: SshSourc
 
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
-             merge: MergePolicy = NO_MERGE, step: str = "", command: Sequence[str] = (),
-             queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION,
-             wait_policy: build_slots.SlotWaitPolicy = build_slots.SlotWaitPolicy.QUEUE) -> Generator[Path]:
-    """Hold one repository slot through preparation and the caller's use.
-
-    step is the build_steps key of the work, such as integrate or lint; the lease shows its configured name.
-    """
+             merge: MergePolicy = NO_MERGE, step: str = "", command: Sequence[str] = ()) -> Generator[Path]:
+    """Hold a numbered copy through preparation and use."""
+    del command
     from scripts.production import staff
 
     owner = checked_owner(owner)
@@ -1391,24 +1379,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     if isinstance(caller, StaffOwner):
         try:
             rows = staff.local_snapshot()
-            member = rows.by_id(staff.StaffId(caller.row_id))
+            member = rows.owner_of(caller.row_id)
             if member is not None:
+                unit = member.name
                 parent = rows.parent_of(member)
                 showrunner = parent.name if parent is not None else member.name
         except staff.StaffUnreadable:
             pass
     with ExitStack() as held_slot:
-        staff_id = caller.row_id if isinstance(caller, StaffOwner) else ""
-        with _slot_preparation(), slot_wait.slot_caller(staff_id, showrunner, source, command, step):
-            slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work=work, purpose=purpose, report=lambda line: print(line, file=sys.stderr),
-                queue_position=queue_position, wait_policy=wait_policy))
-        tree = slot.path
-        descriptor = build_folders.build_folder_lock_fd(tree)
-        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
-        # A value under the slot cache root is another slot's lease, inherited from an outer gate or slot command.
-        defaults = {key: value for key, value in slot.env.items()
-                    if key not in os.environ or Path(os.environ[key]).resolve().parent == slot.cargo_dir.parent}
+        with _slot_preparation():
+            copy = held_slot.enter_context(build_slots.take_copy(canonical, base, showrunner=showrunner,
+                unit=unit, work=work, purpose=purpose))
+        tree = copy.path
+        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *copy.pass_fds))
+        defaults = copy.env
         active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner)))
         previous = {key: os.environ.get(key) for key in defaults}
         os.environ.update(defaults)
@@ -1438,21 +1422,6 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             COMMAND_LOCKS.reset(token)
 
 
-def slot_showrunner(owner: str) -> str:
-    from scripts.production import staff
-
-    identity = copy_owner(owner)
-    try:
-        rows = staff.local_snapshot()
-        member = rows.by_id(staff.StaffId(owner)) if isinstance(identity, StaffOwner) else None
-        if member is not None and isinstance(member.parent, staff.ReportsTo):
-            parent = rows.by_id(member.parent.id)
-            if parent is not None:
-                return parent.name
-    except staff.StaffUnreadable:
-        pass
-    return owner_name(identity)
-
 
 @contextmanager
 def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
@@ -1469,8 +1438,7 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                     policy = CommittedSource(commit_at(source, "HEAD"))
                     merge = NO_MERGE
                 admitted = scope.enter_context(first_step.admitted_run(command, source))
-                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command,
-                    queue_position=admitted.queue_position))
+                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command))
                 admitted.handoff(tree)
             else:
                 # OtherCommand has no first queue step to admit.
@@ -1483,28 +1451,27 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
 
 
 def list_trees() -> None:
-    root = gates_root()
     staff_names = ListStaffNames()
     print("number\towner\trepository\thost\tpath\tsession\tcommit\tstate\tholder_pid\ttarget")
     number = 0
-    # A slot lease names its machine by the short host name; a record without one uses the same name.
     host = host_name()
-    for record_path in sorted(root.glob("*-slot*.lease.json")):
-        tree = record_path.with_name(record_path.name.removesuffix(".lease.json"))
-        if not tree.is_dir():
-            continue
-        fields = cast(dict[str, object], json.loads(record_path.read_text()))
-        busy = build_folders.build_folder_state(tree) == "held"
-        state = "busy" if busy else "idle"
-        target = tree / "target"
+    held = {row.path: row for row in build_folders.held_folder_leases()}
+    for path, form in sorted(build_folders.copy_folders(gates_root()), key=lambda entry: entry[0]):
+        number += 1
+        owner = held.pop(path, None)
+        state = "busy" if isinstance(owner, build_folders.KnownFolderLease) else "unknown" if owner else "idle"
+        try:
+            fields = build_folders.folder_lease_fields(path)
+        except (OSError, ValueError):
+            fields = {}
+        target = path / "target"
         size = subprocess.run(["du", "-sh", str(target)], capture_output=True, text=True) if target.exists() else None
         disk = size.stdout.split()[0] if size is not None and size.returncode == 0 else "0"
+        pid = owner.pid if isinstance(owner, build_folders.KnownFolderLease) else "-"
+        print(f"{number}\t{form.unit}\t{form.repo}\t{host}\t{path}\t-\t{fields.get('commit', '')}\t{state}\t{pid}\t{disk}")
+    for path in held:
         number += 1
-        unit = fields.get("unit", "")
-        owner = _owner_display_text(list_owner_name(copy_owner(str(unit)), staff_names))
-        print("\t".join(map(str, (number, owner, fields.get("repository", ""),
-              fields.get("machine", host), tree, "-", fields.get("commit", ""), state,
-              fields.get("pid", "-") if busy else "-", disk))))
+        print(f"{number}\t-\t-\t{host}\t{path}\t-\t-\tunknown\t-\t-")
     mirrors = sorted(remote_mirrors(), key=lambda mirror: (mirror.host, mirror.path))
     for mirror, lease in list_remote_leases(mirrors, staff_names):
         if mirror.host == "localhost" and not floor_claims.mirror_local_path(mirror.path).exists():
@@ -1535,8 +1502,16 @@ def workspace_repository(record: copy_record.Registered) -> str:
     return identity
 
 
-def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[tuple[Path, copy_record.Registered]]:
-    """Select registered copies and adopted copies without depending on a live source."""
+class WorkspaceScanPurpose(Enum):
+    """Choose the checks for removal or session reporting."""
+
+    REMOVE = auto()
+    REPORT = auto()
+
+
+def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES, *,
+                     purpose: WorkspaceScanPurpose = WorkspaceScanPurpose.REMOVE) -> list[tuple[Path, copy_record.Registered]]:
+    """Select registered workspaces for the owner."""
     root = copy_record.copies_root()
     paths = set(scratch.registered_copy_paths())
     paths.update(scratch.pending_copy_paths(root))
@@ -1545,19 +1520,24 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
     found: list[tuple[Path, copy_record.Registered]] = []
     for tree in sorted(paths):
         record = scratch.task_of(tree)
-        if isinstance(record, copy_record.UnreadableRecord):
-            raise CopyError(record.reason)
         if isinstance(record, copy_record.NotRegistered):
             hold = held.get(str(tree))
             if (copy_record.copy_folder(tree) != tree.resolve()
                     and (hold is None or hold["reason"] != LEGACY_WORKER_HOLD_REASON)):
                 continue
-            raise CopyError(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+            record = copy_record.UnreadableRecord(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+        if isinstance(record, copy_record.UnreadableRecord):
+            if purpose is WorkspaceScanPurpose.REMOVE:
+                raise CopyError(record.reason)
+            print(f"copies: {' '.join(record.reason.splitlines())}", file=sys.stderr)
+            continue
         if copy_owner(str(record.fields.get("owner_unit", ""))) != copy_owner(owner):
             continue
         if isinstance(scope, SelectedRepository) and workspace_repository(record) != scope.name:
             continue
         found.append((tree, record))
+    if purpose is WorkspaceScanPurpose.REPORT:
+        return found
     selected = dict(found)
     ordered: list[tuple[Path, copy_record.Registered]] = []
     visited: set[Path] = set()
@@ -1705,6 +1685,9 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join(failures))
 
 
+REMOTE_MIRROR_PROBE_TIMEOUT_S = 5
+
+
 class RemoteRemoval(Enum):
     KEEP = "keep"
     DEFERRED = "deferred"
@@ -1720,6 +1703,7 @@ class RemoteMirror:
     path: str
     session: str
     removal: RemoteRemoval = RemoteRemoval.KEEP
+    task: str = ""
 
 
 @dataclass(frozen=True)
@@ -1839,12 +1823,15 @@ def register_remote(mirror: RemoteMirror) -> None:
     _ = checked_owner(mirror.owner)
     _ = repository_scope(mirror.repository)
     remote_registry().mkdir(parents=True, exist_ok=True)
+    fields: dict[str, object] = {
+        "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
+        "host": mirror.host, "path": mirror.path, "session": mirror.session,
+        "holder_pid": os.getpid(), "last_use": time.time(),
+    }
+    if mirror.task:
+        fields["task"] = mirror.task
     with file_lock.exclusive(remote_registry() / "records.lock"):
-        write_text_atomic(remote_record_path(mirror), json.dumps({
-            "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
-            "host": mirror.host, "path": mirror.path, "session": mirror.session,
-            "holder_pid": os.getpid(), "last_use": time.time(),
-        }) + "\n")
+        write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
     remove_deferred_mirrors(mirror.host)
 
 
@@ -1881,19 +1868,26 @@ def unregister_remote(host: str, path: str) -> None:
         (remote_registry() / (key + ".json")).unlink(missing_ok=True)
 
 
+def decode_remote_mirror(record: str) -> RemoteMirror:
+    raw = cast(object, json.loads(record))
+    if not isinstance(raw, dict):
+        raise ValueError("expected a remote mirror record")
+    fields = cast(dict[str, object], raw)
+    values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError("invalid remote mirror record")
+    task = fields.get("task", "")
+    if not isinstance(task, str):
+        raise ValueError("invalid remote mirror task")
+    unit, repo, host, remote, session = cast(list[str], values)
+    return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                        RemoteRemoval(fields.get("removal", "keep")), task=task)
+
+
 def read_remote_mirror(path: Path) -> RemoteMirror:
     """Decode one registry record without scanning other records."""
     try:
-        raw = cast(object, json.loads(path.read_text()))
-        if not isinstance(raw, dict):
-            raise ValueError("expected a remote mirror record")
-        fields = cast(dict[str, object], raw)
-        values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
-        if not all(isinstance(value, str) for value in values):
-            raise ValueError("invalid remote mirror record")
-        unit, repo, host, remote, session = cast(list[str], values)
-        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
-                            RemoteRemoval(fields.get("removal", "keep")))
+        return decode_remote_mirror(path.read_text())
     except (OSError, ValueError) as error:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
@@ -1925,6 +1919,99 @@ def remote_lease(mirror: RemoteMirror) -> Generator[None]:
             session = read_remote_mirror(record).session if record.exists() else mirror.session
             raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
+
+
+def path_missing_command(path: str) -> str:
+    """Build a remote check that succeeds only when lstat reports a missing path."""
+    program = "\n".join((
+        "import os, sys",
+        "try:",
+        "    os.lstat(sys.argv[1])",
+        "except FileNotFoundError:",
+        "    sys.exit(0)",
+        "sys.exit(1)",
+    ))
+    return '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join([program, path])
+
+
+@dataclass(frozen=True)
+class IdleRemoteMirror:
+    """The record of a mirror that was idle before the probe."""
+
+    mirror: RemoteMirror
+    record_path: Path
+    record: str
+
+
+def idle_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> list[IdleRemoteMirror]:
+    candidates: list[IdleRemoteMirror] = []
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            record = path.read_text()
+            mirror = decode_remote_mirror(record)
+            if (mirror.host != host or mirror.removal is not RemoteRemoval.KEEP
+                    or path != remote_record_path(mirror) or not select(mirror)):
+                continue
+            with remote_lease(mirror):
+                if path.read_text() == record:
+                    candidates.append(IdleRemoteMirror(mirror, path, record))
+        except (CopyError, OSError, ValueError):
+            continue
+    return candidates
+
+
+def probe_remote_mirrors(host: str, candidates: Sequence[IdleRemoteMirror]) -> list[IdleRemoteMirror]:
+    """Use one remote command to check the paths on this host."""
+    program = "\n".join((
+        "import os, sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        "from scripts.lib import scratch",
+        "from scripts.mac_test import floor_claims",
+        "def missing(path):",
+        "    try:",
+        "        os.lstat(path)",
+        "    except FileNotFoundError:",
+        "        return True",
+        "    return False",
+        "for path in sys.argv[1:]:",
+        "    tree = floor_claims.mirror_local_path(path)",
+        "    paths = (tree, floor_claims.removal_authority_path(tree),",
+        "             scratch.removal_mark(tree), scratch.cargo_removal_mark(tree))",
+        "    print('absent' if all(missing(item) for item in paths) else 'present')",
+    ))
+    command = '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join(
+        [program, *(candidate.mirror.path for candidate in candidates)])
+    answer = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", "--", host, command],
+                            capture_output=True, text=True, timeout=REMOTE_MIRROR_PROBE_TIMEOUT_S)
+    if answer.returncode:
+        raise CopyError(failure_detail(answer))
+    states = answer.stdout.splitlines()
+    if len(states) != len(candidates) or any(state not in ("present", "absent") for state in states):
+        raise CopyError("the host did not confirm the state of every path")
+    return [candidate for candidate, state in zip(candidates, states, strict=True) if state == "absent"]
+
+
+def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> None:
+    """Unregister a selected, unchanged mirror only after the host confirms its removal."""
+    try:
+        candidates = idle_remote_mirrors(host, select)
+        if not candidates:
+            return
+        missing = probe_remote_mirrors(host, candidates)
+    except (CopyError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+        detail = ("the probe timed out" if isinstance(error, subprocess.TimeoutExpired)
+                  else " ".join(str(error).split()))
+        print(f"anomaly: remote mirror check on {host}: {detail}", file=sys.stderr)
+        return
+    for candidate in missing:
+        path = candidate.record_path
+        try:
+            with remote_lease(candidate.mirror), file_lock.exclusive(path.parent / "records.lock"):
+                if path.read_text() == candidate.record:
+                    path.unlink()
+        except (CopyError, OSError, UnicodeError):
+            continue
 
 
 def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
@@ -2237,33 +2324,44 @@ def command_tail(command: list[str]) -> list[str]:
 
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
-    """Give commands a private source snapshot and retain the merge gate's slot."""
+    """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
+    verification = verify_command(command)
     with ExitStack() as scope:
         captured = ""
-        if command_program(command) == "merge_gate.py":
-            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
-            environment = dict(os.environ)
-            target = tree / "target"
-            locks = COMMAND_LOCKS.get()
-        else:
+        if isinstance(verification, VerifyCommand):
             tree = scope.enter_context(requested_source(source, policy, merge))
             environment = {**os.environ, "COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
                            "COPIES_STEP_REPOSITORY": str(source),
                            "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(os.getpid()), "UNIT_DETACHED_RUN": "1"}
-            target = tree / environment.setdefault("CARGO_TARGET_DIR", str(tree / "target"))
-            locks = (*COMMAND_LOCKS.get(), build_folders.build_folder_lock_fd(tree.parent))
+            target = tree / "target"
+            environment.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(target))
+            source_lock = build_folders.build_folder_lock_fd(tree.parent)
+            environment["COPIES_STEP_SOURCE_LOCK_FD"] = str(source_lock)
+            locks = (*COMMAND_LOCKS.get(), source_lock)
             if args.publish:
                 output = tree.parent / "step-output"
                 output.mkdir()
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
+        else:
+            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
+            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
+                           "BUILDLOG_PREPARED_COPY": str(tree)}
+            target = tree / "target"
+            locks = COMMAND_LOCKS.get()
         arguments = [part.replace("{tree}", str(tree)) for part in command]
+        environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
         before = publication_candidates(tree, target, arguments, args.publish)
         result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env=environment)
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
-        publish_files(tree, args.publish, before, command_exit, captured=captured)
+        selection = PublicationSelection.CHANGED
+        if command_exit == 0 and not isinstance(verification, VerifyCommand):
+            tool = tuple(build_call_arguments(command)[:1])
+            if tool in (("cargo",), ("cargo-nextest",)) or isinstance(command_job(command), StepJob):
+                selection = PublicationSelection.AVAILABLE
+        publish_files(tree, args.publish, before, command_exit, selection=selection, captured=captured)
         return command_exit
 
 
@@ -2275,6 +2373,11 @@ class PublicationState(Enum):
     MISSING = auto()
     DIRECTORY = auto()
     UNREADABLE = auto()
+
+
+class PublicationSelection(Enum):
+    AVAILABLE = auto()
+    CHANGED = auto()
 
 
 def publication_digest(path: Path) -> bytes | PublicationState:
@@ -2332,10 +2435,14 @@ def publication_candidates(tree: Path, target: Path, command: Sequence[str],
     return groups
 
 
-def changed_publication(candidates: PublicationCandidates) -> Path | None:
-    """Return the first candidate that changed or became readable."""
+def select_publication(candidates: PublicationCandidates, selection: PublicationSelection) -> Path | None:
+    """Select the first available or changed candidate in target order."""
     for path, before in candidates.items():
         try:
+            if selection is PublicationSelection.AVAILABLE:
+                if path.is_file() or path.is_dir():
+                    return path
+                continue
             after = publication_digest(path)
             if isinstance(after, bytes) and after != before:
                 return path
@@ -2352,7 +2459,7 @@ def capture_step_files(output: Path, paths: Sequence[str], before: Sequence[Publ
         if Path(word).is_absolute():
             continue
         try:
-            source = changed_publication(candidates)
+            source = select_publication(candidates, PublicationSelection.CHANGED)
             if source is None:
                 continue
             destination = captured_path(output, number, Path(word))
@@ -2369,7 +2476,7 @@ def capture_step_files(output: Path, paths: Sequence[str], before: Sequence[Publ
 
 
 def publish_files(tree: Path, paths: Sequence[str], before: Sequence[PublicationCandidates],
-                  command_exit: int, *, captured: str = "") -> None:
+                  command_exit: int, *, selection: PublicationSelection, captured: str = "") -> None:
     """Copy requested build files into one scratch folder with a deadline."""
     if not paths:
         return
@@ -2379,7 +2486,7 @@ def publish_files(tree: Path, paths: Sequence[str], before: Sequence[Publication
             try:
                 if captured and (saved := captured_path(Path(captured), number, Path(path))).exists():
                     sources.append(saved)
-                elif (built := changed_publication(candidates)) is not None:
+                elif (built := select_publication(candidates, selection)) is not None:
                     sources.append(built)
                 else:
                     print(f"copies: publish: {path} not built", file=sys.stderr)
@@ -2391,8 +2498,7 @@ def publish_files(tree: Path, paths: Sequence[str], before: Sequence[Publication
         repository = repository_name(tree)
         with ExitStack() as cleanup:
             publication = scratch.new(word="gate-binary", throwaway=True)
-            record = cast(copy_record.Registered, scratch.task_of(publication))
-            _ = cleanup.callback(scratch.end, record.task)
+            _ = cleanup.callback(shutil.rmtree, publication)
             for source in sources:
                 destination = publication / source.name
                 temporary = publication / f".{source.name}.tmp"
@@ -2416,10 +2522,10 @@ def step_owner(source: Path) -> str:
 
 
 def run_slot_step(source: Path, args: CopyArguments) -> int:
-    """Try the slot once and pass its lease to the command tree."""
+    """Run the step under a numbered copy's lease."""
     command = command_tail(args.command)
-    if not command or not args.capacity_file:
-        raise CopyError("a slot step needs a capacity file and a command")
+    if not command or not args.tree:
+        raise CopyError("a copy step needs a tree and command")
     # Print the tree from the same commit object that supplies the commit ID.
     revisions = git(source, "log", "-1", "--format=%H%n%T", "--no-show-signature", "--no-notes",
                     "--no-decorate", "--no-color", "--encoding=UTF-8", "HEAD", "--").decode().splitlines()
@@ -2427,34 +2533,28 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
         raise CopyError(f"{source}: cannot read the HEAD commit and tree")
     head, head_tree = revisions
     policy = CommittedSource(head) if head_tree == args.tree else StagedSource(args.tree)
-    try:
-        with standing(step_owner(source), source, policy, step=args.step,
-                      wait_policy=build_slots.SlotWaitPolicy.REFUSE) as checkout:
-            if args.step == "doc" and staged_tree(source) != args.tree:
-                print("verify.sh: the staged tree changed before doc ran; no doc pass record was written.", file=sys.stderr)
-                return 77
-            if (len(command) >= 5 and command[2:4] == ["--manifest", str(source / "Cargo.toml")]
-                    and Path(command[1]).name == "prebuild.py"):
-                command[3] = str(checkout / "Cargo.toml")
-            output = Path(os.environ["COPIES_STEP_OUTPUT"]) if (
-                str(source) == os.environ.get("COPIES_STEP_SOURCE") and "COPIES_STEP_OUTPUT" in os.environ
-            ) else checkout
-            paths: list[str] = []
-            if output != checkout:
-                try:
-                    paths = cast(list[str], json.loads((output / "paths.json").read_text()))
-                except OSError as error:
-                    print(f"copies: publish: {error}", file=sys.stderr)
-            target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
-            before = publication_candidates(checkout, target, command, paths)
-            status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
-                                                     pass_fds=COMMAND_LOCKS.get())
-            capture_step_files(output, paths, before)
-            return status
-    except build_slots.SlotsFull:
-        expires_at = time.time() + conf.read_or_repository("build_folders").number("slots.wait_seconds")
-        write_text_atomic(Path(args.capacity_file), str(expires_at))
-        return 75
+    with standing(step_owner(source), source, policy, step=args.step) as checkout:
+        if args.step == "doc" and staged_tree(source) != args.tree:
+            print("verify.sh: the staged tree changed before doc ran; no doc pass record was written.", file=sys.stderr)
+            return 77
+        if (len(command) >= 5 and command[2:4] == ["--manifest", str(source / "Cargo.toml")]
+                and Path(command[1]).name == "prebuild.py"):
+            command[3] = str(checkout / "Cargo.toml")
+        output = Path(os.environ["COPIES_STEP_OUTPUT"]) if (
+            str(source) == os.environ.get("COPIES_STEP_SOURCE") and "COPIES_STEP_OUTPUT" in os.environ
+        ) else checkout
+        paths: list[str] = []
+        if output != checkout:
+            try:
+                paths = cast(list[str], json.loads((output / "paths.json").read_text()))
+            except OSError as error:
+                print(f"copies: publish: {error}", file=sys.stderr)
+        target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
+        before = publication_candidates(checkout, target, command, paths)
+        status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
+                                                 pass_fds=COMMAND_LOCKS.get())
+        capture_step_files(output, paths, before)
+        return status
 
 
 def watch_copy_owner(owner: int, verify: int) -> None:
@@ -2541,7 +2641,6 @@ class CopyArguments(argparse.Namespace):
     since: float = 0
     step: str = "hold"
     tree: str = ""
-    capacity_file: str = ""
     deadline: float = 0
     pid: int = 0
     verify_pid: int = 0
@@ -2549,8 +2648,6 @@ class CopyArguments(argparse.Namespace):
 
 
 def main(argv: list[str] | None = None) -> int:
-    from scripts.build_queue.slot_wait import SlotWaitExpired
-    from scripts.lib.build_slots import SlotsNotConfigured
 
     parser = CopyParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -2587,16 +2684,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = hold.add_argument("--repo", required=True)
     _ = hold.add_argument("--tree", default="")
     _ = hold.add_argument("--step", default="hold")
-    _ = hold.add_argument("--capacity-file", default="")
     _ = hold.add_argument("--scratch", action="store_true")
     _ = hold.add_argument("command", nargs=argparse.REMAINDER)
-    wait_slot = commands.add_parser("wait-slot")
-    _ = wait_slot.add_argument("--repo", required=True)
-    _ = wait_slot.add_argument("--episode", required=True)
-    _ = wait_slot.add_argument("--since", type=float, required=True)
-    _ = wait_slot.add_argument("--deadline", type=float, required=True)
-    _ = wait_slot.add_argument("--pid", type=int, required=True)
-    _ = wait_slot.add_argument("--step", required=True)
     snapshot_tree = commands.add_parser("snapshot-tree")
     _ = snapshot_tree.add_argument("--repo", required=True)
     watch_owner = commands.add_parser("watch-owner")
@@ -2637,18 +2726,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(checkout, flush=True)
                 _ = sys.stdin.read(1)
             return 0
-        if args.action == "wait-slot":
-            source = Path(args.repo or "").expanduser().resolve()
-            owner = step_owner(source)
-            caller = copy_owner(owner)
-            showrunner = slot_showrunner(owner)
-            caller_context = (slot_wait.slot_caller(caller.row_id, showrunner, source, (), args.step)
-                              if isinstance(caller, StaffOwner) else nullcontext())
-            with caller_context:
-                build_slots.wait_for_capacity(slot_source(source), SlotQueuePosition(args.episode, args.since), args.deadline,
-                    showrunner=showrunner, unit=owner, work=args.step, purpose=read_step_names().shown(args.step),
-                    owner_pid=args.pid)
-            return 0
         if args.action == "snapshot-tree":
             source = Path(args.repo or "").expanduser().resolve()
             tree = staged_tree(source, include_worktree=True)
@@ -2685,11 +2762,9 @@ def main(argv: list[str] | None = None) -> int:
             scope = (ALL_REPOSITORIES if args.repo is None else
                      SelectedRepository(repository_name(Path(args.repo).expanduser().resolve())))
             remove_trees(caller_owner(), scope)
-    except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, SlotWaitExpired, SlotsNotConfigured,
-            SlotGitFailure, subprocess.SubprocessError) as error:
+    except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, build_folders.InvalidFolderForm,
+            SlotGitFailure, conf.Unusable, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
-        if isinstance(error, SlotWaitExpired):
-            return 75
         return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else 2
     return 0
 

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import fcntl
 import io
@@ -18,7 +18,7 @@ from unittest import mock
 import unittest
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import aws_trial, config, ledger
+from scripts.aws_target import aws_trial, config, ledger, run_cost, spend
 from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
@@ -39,6 +39,290 @@ class LedgerTests(CostFixture):
     def inventory(self, at: int, monthly: str = "0") -> None:
         self.book.record_inventory(ledger.ResourceInventory(
             at, (ledger.PricedResource("retained-storage", Decimal(monthly)),), "priced fixture inventory"))
+
+    def test_november_20_carries_storage_when_the_dispatch_record_proves_refusal(self) -> None:
+        self.replace('limit_reserve_usd', '0')
+        bill_start = instant('2026-11-18T00:00:00+00:00')
+        today = bill_start + 2 * 86400
+        now = today + 7200
+        self.book.record_inventory(ledger.ResourceInventory(bill_start, (), 'fixture', builder_removed=True))
+        self.observe(bill_start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-11-18', now, bill_start, bill_start + 86400,
+            Decimal('7.73'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal('6.00'), Decimal(2), 'Hrs'),
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('1.16')),
+                ledger.UsageTypeCost('USE2-EBS:SnapshotUsage', Decimal('.01')),
+                ledger.UsageTypeCost('USE2-TimedStorage-ByteHrs', Decimal('.01')),
+                ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.20')),
+                ledger.UsageTypeCost('USE2-DataTransfer-Out-Bytes', Decimal('.07')),
+                ledger.UsageTypeCost('USE2-PublicIPv4:InUseAddress', Decimal('.26')),
+                ledger.UsageTypeCost('CostExplorer-APIRequest', Decimal('.02')),
+            )))
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        starts: list[tuple[Path, dict[str, object]]] = []
+        with self.book.transaction() as evidence:
+            for generation in range(1, 27):
+                at = today + 142 * generation
+                evidence.hana_compute.append(ledger.HanaComputeExposure(at, at + 600, generation,
+                    Decimal('.288'), ledger.HanaExposureClosed(at + 136), region='us-east-2'))
+                _ = (journal / f'bootstrap-{generation}.json').write_text(json.dumps({
+                    'version': 1, 'token': f'bootstrap-{generation}', 'deployment': 'fixture',
+                    'action': 'bootstrap', 'generation': generation, 'dispatched': True,
+                    'dispatched_at': at, 'accepted': True, 'accepted_at': at + 1, 'acceptance_source': 'direct',
+                    'bootstrap_puts': 3, 'descriptor': {},
+                }))
+                path = journal / f'start-{generation}.json'
+                start: dict[str, object] = {'version': 1, 'token': f'start-{generation}', 'deployment': 'fixture',
+                         'action': 'start', 'generation': generation, 'dispatched': True,
+                         'dispatched_at': at + 2, 'cancelled': True,
+                         'cancellation_at': at + 122, 'cancelled_at': float(at + 122)}
+                starts.append((path, start))
+                _ = path.write_text(json.dumps(start))
+            evidence.gate_reservations.append(ledger.GateReservation('refused', today, today + 600,
+                Decimal(3), Decimal(1), state=ledger.GateAbsent(today + 60), region='us-east-2'))
+
+        legacy = spend.read_spend(self.settings, self.state, now, '2026-11-20')
+        assert isinstance(legacy, spend.Spend)
+        # Base 740aae528 counts every dispatch without evidence of refusal.
+        self.assertEqual(legacy.days[0].usd, Decimal('2.01288'))
+        legacy_guard = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(legacy_guard.cost, Decimal('.28288'))
+
+        for path, record in starts:
+            _ = path.write_text(json.dumps({**record, 'start_refusal_code': 'Blocked'}))
+
+        published = spend.read_spend(self.settings, self.state, now, '2026-11-20')
+        assert isinstance(published, spend.Spend)
+        self.assertEqual([(day.day, day.usd) for day in published.days], [
+            ('2026-11-20', Decimal('1.18')), ('2026-11-19', Decimal('1.18')), ('2026-11-18', Decimal('7.73'))])
+        self.assertEqual(published.days[0].runs, 0)
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual((accrued.cost, accrued.limit_count), (Decimal('1.18'), Decimal('1.18')))
+        costs = self.guard(now).evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal('1.18'), Decimal('10.09')))
+        scope = run_cost.SpotHoursScope(('m7a.4xlarge',), {'us-east-2': ('m7a.4xlarge',)})
+        hours = run_cost.day_hours_checks(self.book, datetime.fromtimestamp(today, UTC),
+            datetime.fromtimestamp(today + 86400, UTC), 'us-east-2', 'm7a.8xlarge', scope, Decimal(1))
+        self.assertEqual(sum((row.hana_reserved_hours for row in hours.values()), Decimal(0)), Decimal(0))
+
+    def test_run_related_usage_stays_on_run_days_and_unknown_usage_stays_on_idle_days(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        end = self.start + 86400
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', end, self.start, end,
+            Decimal(21), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal(1)),
+                ledger.UsageTypeCost('USE2-EBS:VolumeP-IOPS.gp3', Decimal(3)),
+                ledger.UsageTypeCost('USE2-PublicIPv4:InUseAddress', Decimal(5)),
+                ledger.UsageTypeCost('UnknownUsage', Decimal(9)),
+                ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal(3)),
+            )))
+        now = end + 2 * 86400 + 7200
+        with self.book.transaction() as evidence:
+            evidence.gate_reservations.append(ledger.GateReservation(
+                'completed', end, end + 86400, Decimal(2), Decimal(0),
+                state=ledger.GateTerminated(end + 86400, 'fixture'), region='us-east-2'))
+        settings = config.read_settings(self.settings)
+        days = {row.day: row for row in self.book.spend_days(settings, now)}
+        # The completed run uses the estimate from base 740aae528.
+        self.assertEqual(days['2026-01-16'].usd, Decimal(69))
+        self.assertEqual(days['2026-01-17'].usd, Decimal(21))
+        self.assertEqual(days['2026-01-18'].usd, Decimal(13))
+
+    def test_dispatch_and_observed_acceptance_keep_the_original_hana_hours(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        now = self.start + 3600
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'renewed-start.json').write_text(json.dumps({
+            'action': 'start', 'generation': 2, 'dispatched': True, 'start_refusal_code': 'Blocked',
+        }))
+        scope = run_cost.SpotHoursScope(('m7a.4xlarge',), {'us-east-2': ('m7a.4xlarge',)})
+        for record in (
+                {'action': 'start', 'generation': 1, 'dispatched': True},
+                {'action': 'start', 'generation': 1, 'cancelled': True},
+                {'action': 'start', 'generation': 1, 'dispatched': True, 'cancelled': True},
+                {'action': 'start', 'generation': 1, 'accepted': True, 'accepted_at': now - 1800}):
+            with self.subTest(record=record):
+                _ = (journal / 'start.json').write_text(json.dumps(record))
+                with self.book.transaction() as evidence:
+                    evidence.hana_compute = [ledger.HanaComputeExposure(
+                        self.start, now, 2, Decimal(2), ledger.HanaExposureClosed(now), region='us-east-2')]
+                accrued = self.book.accrued_cost(self.settings, now, window='day')
+                # A possible start in an earlier generation keeps the full hour.
+                self.assertEqual((accrued.cost, accrued.reserves, accrued.limit_count),
+                                 (Decimal(2), Decimal(0), Decimal(5)))
+                hours = run_cost.day_hours_checks(self.book, datetime.fromtimestamp(self.start, UTC),
+                    datetime.fromtimestamp(self.start + 86400, UTC), 'us-east-2', 'm7a.8xlarge', scope, Decimal(1))
+                self.assertEqual(sum((row.hana_reserved_hours for row in hours.values()), Decimal(0)), Decimal(1))
+
+    def test_legacy_start_cancellation_keeps_the_base_exposure(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        now = self.start + 3600
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'start.json').write_text(json.dumps({
+            'action': 'start', 'generation': 1, 'cancelled': True, 'cancelled_at': self.start + 1,
+        }))
+        _ = (journal / 'stop.json').write_text(json.dumps({
+            'action': 'stop', 'generation': 1, 'dispatched': True, 'accepted': True, 'accepted_at': now - 1,
+        }))
+        with self.book.transaction() as state:
+            state.hana_compute.append(ledger.HanaComputeExposure(
+                self.start, now, 1, Decimal(2), ledger.HanaExposureClosed(now), region='us-east-2'))
+
+        published = spend.read_spend(self.settings, self.state, now, '2026-01-15')
+        assert isinstance(published, spend.Spend)
+        self.assertEqual(published.days[0].usd, Decimal(2))
+        preview = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, now)
+        self.assertIsInstance(preview, ledger.SpendingAllowed)
+        costs = preview.evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(2), Decimal(2)))
+        scope = run_cost.SpotHoursScope(('m7a.4xlarge',), {'us-east-2': ('m7a.4xlarge',)})
+        hours = run_cost.day_hours_checks(self.book, datetime.fromtimestamp(self.start, UTC),
+            datetime.fromtimestamp(self.start + 86400, UTC), 'us-east-2', 'm7a.8xlarge', scope, Decimal(1))
+        self.assertEqual(sum((row.hana_reserved_hours for row in hours.values()), Decimal(0)), Decimal(1))
+
+    def test_active_builder_at_utc_midnight_keeps_the_base_estimate(self) -> None:
+        midnight = self.start + 86400
+        self.inventory(self.start)
+        self.observe(self.start, 'stopped')
+        self.observe(midnight - 3600, 'running')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', midnight, self.start, midnight,
+            Decimal('.50'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('.40')),
+                ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.10')),
+            )))
+
+        published = spend.read_spend(self.settings, self.state, midnight, '2026-01-16')
+        assert isinstance(published, spend.Spend)
+        self.assertEqual(published.days[0].usd, Decimal('.50'))
+        preview = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, midnight)
+        self.assertIsInstance(preview, ledger.SpendingAllowed)
+        costs = preview.evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(0), Decimal(1)))
+
+    def test_unconfirmed_expiry_at_utc_midnight_keeps_base_admission(self) -> None:
+        self.costs({'daily_limit_usd': '.45', 'limit_reserve_usd': '0'})
+        midnight = self.start + 86400
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', midnight, self.start, midnight,
+            Decimal('.50'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('.40')),
+                ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.10')),
+            )))
+        for kind in ('Hana permit', 'gate reservation'):
+            with self.subTest(kind=kind):
+                with self.book.transaction() as state:
+                    state.gate_reservations = []
+                    state.hana_compute = []
+                    if kind == 'Hana permit':
+                        state.hana_compute.append(ledger.HanaComputeExposure(
+                            midnight - 3600, midnight, 1, Decimal(0), region='us-east-2'))
+                    else:
+                        state.gate_reservations.append(ledger.GateReservation(
+                            'fixture', midnight - 3600, midnight, Decimal(0), Decimal(0),
+                            ledger.GateRunning('fixture'), region='us-east-2'))
+
+                published = spend.read_spend(self.settings, self.state, midnight, '2026-01-16')
+                assert isinstance(published, spend.Spend)
+                self.assertEqual(published.days[0].usd, Decimal('.50'))
+                preview = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, midnight)
+                assert isinstance(preview, ledger.SpendingRefused)
+                self.assertEqual(preview.reason, 'daily_limit')
+                costs = preview.evidence.costs
+                assert isinstance(costs, ledger.CostEstimate)
+                self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(0), Decimal(0)))
+
+    def test_idle_carry_uses_new_run_exposures_without_a_kind_check(self) -> None:
+        midnight = self.start + 86400
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', midnight, self.start, midnight,
+            Decimal('.50'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('.40')),
+                ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.10')),
+            )))
+        for end, amount in (
+                (ledger.RunEndUnconfirmed(), Decimal('.50')),
+                (ledger.RunEndConfirmed(midnight), Decimal('.50')),
+                (ledger.RunEndConfirmed(midnight - 1), Decimal('.40'))):
+            with self.subTest(end=end):
+                exposure = ledger.RunExposure(midnight - 60, end)
+                with mock.patch.object(ledger.LedgerEvidence, 'run_exposures', return_value=(exposure,)):
+                    published = spend.read_spend(self.settings, self.state, midnight, '2026-01-16')
+                assert isinstance(published, spend.Spend)
+                self.assertEqual(published.days[0].usd, amount)
+
+    def test_pending_gate_keeps_the_base_estimate_with_retained_volume_usage(self) -> None:
+        self.costs({'limit_reserve_usd': '0'})
+        day = self.start + 86400
+        now = day + 3600
+        self.inventory(self.start, '744')
+        self.observe(self.start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', now, self.start, day,
+            Decimal('.50'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('.20')),
+                ledger.UsageTypeCost('USE2-EBS:VolumeP-IOPS.gp3', Decimal('.20')),
+                ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.10')),
+            )))
+        pending = ledger.GateReservation('pending', day, now + 3600, Decimal(1), Decimal('.25'), region='us-east-2')
+        with self.book.transaction() as state:
+            state.gate_reservations.append(pending)
+        published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+        assert isinstance(published, spend.Spend)
+        # Base 740aae528 includes the previous bill's retained volume usage.
+        self.assertEqual(published.days[0].usd, Decimal('1.50'))
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual((accrued.cost, accrued.reserves, accrued.limit_count),
+                         (Decimal('2.25'), Decimal('23.75'), Decimal(26)))
+        month = self.book.accrued_cost(self.settings, now, window='month')
+        self.assertEqual((month.cost, month.reserves, month.limit_count),
+                         (Decimal('26.25'), Decimal('719.75'), Decimal(746)))
+        proposed = ledger.GateReservation('next', now, now + 3600, Decimal(1), Decimal('.25'), region='us-east-2')
+        self.costs({'daily_limit_usd': '4'})
+        self.assertEqual(self.book.reserve_gate(self.settings, proposed), ledger.GateCapReached('daily_limit'))
+
+    def test_launch_second_keeps_the_allowance_in_the_base_reserve(self) -> None:
+        self.costs({'limit_reserve_usd': '0'})
+        self.inventory(self.start, '744')
+        self.observe(self.start, 'terminated')
+        with self.book.transaction() as evidence:
+            evidence.gate_reservations.append(ledger.GateReservation('launch', self.start, self.start + 3600,
+                Decimal(0), Decimal('.25'), state=ledger.GateRunning('fixture'), region='us-east-2'))
+        accrued = self.book.accrued_cost(self.settings, self.start, window='day')
+        # Base 740aae528 places the allowance in reserve at the launch second.
+        self.assertEqual((accrued.cost, accrued.reserves, accrued.limit_count),
+                         (Decimal(0), Decimal('24.25'), Decimal('24.25')))
+        month = self.book.accrued_cost(self.settings, self.start, window='month')
+        self.assertEqual((month.cost, month.reserves, month.limit_count),
+                         (Decimal(0), Decimal('744.25'), Decimal('744.25')))
+
+    def test_gap_between_bills_keeps_the_base_guard_total(self) -> None:
+        self.costs({'limit_reserve_usd': '0', 'cost_explorer_unchanged_reads': '1'})
+        second = self.start + 86400
+        third = second + 86400
+        now = third + 86400
+        self.inventory(self.start)
+        self.observe(self.start, 'stopped')
+        self.observe(second, 'running')
+        self.observe(second + 10800, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-15', now, self.start, second, Decimal(2), Decimal(0), Decimal(0)))
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-17', now, third, now, Decimal(5), Decimal(0), Decimal(0)))
+        published = spend.read_spend(self.settings, self.state, now, '2026-01-18')
+        assert isinstance(published, spend.Spend)
+        # Base 740aae528 hides the gap on the page and counts the gap in the guard.
+        self.assertEqual(sum((day.usd for day in published.days if day.day < '2026-01-18'), Decimal(0)), Decimal(7))
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').cost, Decimal(10))
 
     def test_quota_refusal_without_saved_time_is_expired(self) -> None:
         pool = ledger.SpotQuotaPool('us-west-2', ledger.SpotQuotaClass.STANDARD)
@@ -389,6 +673,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(ledger.gate_allowance(self.book.priced_snapshot(self.start + 60).gate_reservations[0]).usd,
                          Decimal('.02'))
         self.book.resolve_gate(request.attempt, ledger.GateTerminated(request.expires, 'i-allowance'))
+        # Base 740aae528 prices the closed gate from the previous bill.
         expected = ledger.GateAllowance(Decimal('.047'), 'AWS bill 2026-01-14')
         self.assertEqual(ledger.gate_allowance(self.book.read_snapshot().gate_reservations[0]), expected)
         before = replace(request, attempt='before', at=old.period_start - 3600, expires=old.period_start,
@@ -833,9 +1118,13 @@ class LedgerTests(CostFixture):
         self.assertIsInstance(self.book.reserve_gate(self.settings, pending), ledger.GateReserved)
         self.write_complete_bill_fixture(ledger.ChargeRead(
             '2026-01-15', now, start, end, Decimal('.50'), Decimal(0), Decimal(0)))
-        costs = self.guard(now).evidence.costs
+        evidence = self.guard(now).evidence
+        costs = evidence.costs
         assert isinstance(costs, ledger.CostEstimate)
-        self.assertEqual(costs.monthly.usd, Decimal('1.50'))
+        # Base 740aae528 keeps the open gate charge in the monthly total.
+        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(0), Decimal('1.50')))
+        self.assertEqual((evidence.reserved_daily_fixed_usd, evidence.reserved_monthly_fixed_usd),
+                         (Decimal(0), Decimal(0)))
 
     def test_complete_bill_keeps_open_allowance_and_query_fees(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'cost_explorer_read_usd': '.01'})
@@ -848,10 +1137,13 @@ class LedgerTests(CostFixture):
         self.assertIsInstance(self.book.reserve_gate(self.settings, opened), ledger.GateReserved)
         bill = ledger.ChargeRead('2026-01-15', now, start, end, Decimal(2), Decimal(0), Decimal(0))
         self.write_complete_bill_fixture(bill)
-        costs = self.guard(now).evidence.costs
+        evidence = self.guard(now).evidence
+        costs = evidence.costs
         assert isinstance(costs, ledger.CostEstimate)
-        self.assertEqual(costs.monthly.usd, Decimal('5.03'))
-        self.assertEqual(costs.daily.usd, Decimal(0))
+        # Base 740aae528 keeps the allowance and the query fees.
+        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(0), Decimal('5.03')))
+        self.assertEqual((evidence.reserved_daily_fixed_usd, evidence.reserved_monthly_fixed_usd),
+                         (Decimal(0), Decimal(0)))
 
     def test_accrued_cost_uses_each_day_source_and_the_guard_limit_count(self) -> None:
         self.costs({'monthly_limit_usd': '10.03',
@@ -880,6 +1172,7 @@ class LedgerTests(CostFixture):
             ledger.AccruedDay(date(2026, 1, 2), Decimal('3.01'), 'estimate', Decimal(5), fee),
             ledger.AccruedDay(date(2026, 1, 3), Decimal('1.01'), 'estimate', None, fee),
         ))
+        # Base 740aae528 keeps the estimate for the unsettled bill.
         self.assertEqual(accrued.cost, Decimal('6.03'))
         self.assertEqual(sum((day.cost for day in accrued.days), Decimal(0)), accrued.cost)
         self.assertEqual(accrued.reserves, Decimal(1))
@@ -948,7 +1241,9 @@ class LedgerTests(CostFixture):
                 ledger.GateTerminated(now, 'fixture'), region='us-east-2'))
 
         accrued = self.book.accrued_cost(self.settings, now, window='day')
-        self.assertEqual(accrued.cost, Decimal('.01'))
+        # Base 740aae528 books the completed gate's minimum charge at the launch second.
+        self.assertEqual((accrued.cost, accrued.reserves, accrued.limit_count),
+                         (Decimal('.01'), Decimal(0), Decimal('3.01')))
         self.assertEqual(accrued.days, (
             ledger.AccruedDay(date(2026, 1, 15), Decimal('.01'), 'estimate', None, Decimal(0)),
         ))

@@ -23,7 +23,7 @@ from types import CodeType, ModuleType
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
-                     "scripts/lib/boot_identity.py",
+                     "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf")
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
@@ -210,8 +210,9 @@ class DataclassCodeFinder:
 def start_process(arguments: list[str]) -> str:
     """Select the checkout at interpreter startup and give a direct test run its folder."""
     selected = select_checkout(arguments)
-    if "dataclasses" not in sys.modules and not any(
-            type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path):
+    if (os.environ.get("CLAUDE_DISABLE_DATACLASS_CODE_CACHE") != "1"
+            and "dataclasses" not in sys.modules
+            and not any(type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path)):
         sys.meta_path.insert(0, DataclassCodeFinder())
     _start_test_run(selected, arguments)
     return selected

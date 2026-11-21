@@ -6,7 +6,7 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import fcntl
-import io
+from io import StringIO
 import json
 import os
 import signal
@@ -30,6 +30,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import conf, process_group, scratch
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -176,7 +177,13 @@ if phase == 'prepare':
     cloud_gate.save(folder / 'checkout.json', {'path': checkout})
     command = [sys.executable, __file__]
     argv_file.write_text(json.dumps([*command, 'guest']))
-    argv_file.with_suffix('.json.close').write_text(shlex.join([*command, 'close']))
+    close = shlex.join([*command, 'close'])
+    log = shlex.quote(str(root / 'close.log'))
+    status = shlex.quote(str(root / 'close_status'))
+    pending = shlex.quote(str(root / 'close_status.new'))
+    # The close hook runs under zsh with the fixture PATH, which has no mv.
+    argv_file.with_suffix('.json.close').write_text(
+        f'{close} >{log} 2>&1; rc=$?; printf "%s" "$rc" >{pending}; {shlex.quote(sys.executable)} -c "import os, sys; os.replace(*sys.argv[1:])" {pending} {status}; exit "$rc"')
 elif phase == 'guest':
     with (root / 'guest.log').open('w') as output:
         os.dup2(output.fileno(), sys.stdout.fileno())
@@ -188,14 +195,19 @@ elif phase == 'guest':
         cloud_gate.save(root / 'interrupted', record)
         raise
 else:
-    (root / 'close_started').touch()
+    if phase == 'close':
+        (root / 'close_started').touch()
     if phase == 'cleanup' and (root / 'close_refusal').exists():
         source = Path(sys.argv[3])
         print(f'{mac_gate.CLEANUP_ERROR_PREFIX}{source.name}:The Mac kept its gate folder', flush=True)
         raise SystemExit(1)
-    with patch.object(scratch, 'end', return_value=scratch.TaskCleanup()):
+    if phase == 'close' and (root / 'fail_close_hook').exists():
+        raise RuntimeError('fixture close hook failed')
+    kept = []
+    if (folder / 'checkout.json').exists():
+        kept = [scratch.KeptFolder(mac_gate.read_checkout(folder), 'fixture task ended')]
+    with patch.object(scratch, 'end', return_value=kept):
         mac_gate.stop_checkout(folder)
-    (root / 'close_finished').touch()
 """
 
 CALL_RUN_REMOTE = """\
@@ -427,7 +439,7 @@ class MacGateTests(unittest.TestCase):
             with (mock.patch.object(subprocess, 'Popen', return_value=process),
                   mock.patch.object(subprocess, 'run', side_effect=AssertionError('Watcher start has an implicit wait')),
                   mock.patch.object(process_group, 'send_process_group', side_effect=kill_watcher),
-                  redirect_stderr(io.StringIO()) as warning):
+                  redirect_stderr(StringIO()) as warning):
                 mac_test.start_claim_watcher(paths)
             self.assertIn('claim watcher could not be started', warning.getvalue())
             self.assertEqual(len(process.wait_deadlines), 1)
@@ -522,27 +534,28 @@ class MacGateTests(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=True):
             folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-locked'
             folder.mkdir(parents=True)
-            cloud_gate.save(folder / 'checkout.json', {'path': str(self.repo)})
+            checkout = self.root / 'removed-checkout'
+            cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
             registry = copies.remote_registry()
             mirror = copies.RemoteMirror('fixture', copies.SelectedRepository('fixture'), 'localhost',
-                                         str(self.repo), 'locked')
+                                         str(checkout), 'locked')
             copies.register_remote(mirror)
             record = copies.remote_record_path(mirror)
-            with (mock.patch.object(scratch, 'end', return_value=scratch.TaskCleanup()),
+            with (mock.patch.object(scratch, 'end', return_value=[]),
                   ThreadPoolExecutor(max_workers=1) as pool,
                   (registry / 'records.lock').open('a') as lock):
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 cleanup = pool.submit(mac_gate.stop_checkout, folder)
                 try:
                     with self.assertRaises(TimeoutError):
-                        cleanup.result(timeout=2 * mac_gate.checkout_cleanup_seconds())
+                        _ = cleanup.result(timeout=2 * mac_gate.checkout_cleanup_seconds())
                     self.assertTrue(cleanup.done(), 'The remote cleanup waited beyond its deadline')
                     self.assertTrue(record.exists())
                     self.assertTrue((folder / 'checkout.json').exists())
                 finally:
                     fcntl.flock(lock, fcntl.LOCK_UN)
-            with mock.patch.object(scratch, 'end', return_value=scratch.TaskCleanup()):
-                mac_gate.stop_checkout(folder)
+            with mock.patch.object(scratch, 'end', return_value=[]):
+                self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.REMOVED)
             self.assertFalse(record.exists())
             self.assertFalse(folder.exists())
 
@@ -575,7 +588,7 @@ Path(os.environ['FAKE_QUEUE_STATE'], 'removal-started').write_text(f'{pid} {owne
 signal.pause()
 """)
         remove.chmod(0o755)
-        output = io.StringIO()
+        output = StringIO()
         with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(output):
             budget = mac_gate.checkout_cleanup_seconds()
             started = time.monotonic()
@@ -617,7 +630,7 @@ signal.pause()
         _ = shim.write_text(f"#!{sys.executable}\n" + source)
         shim.chmod(0o755)
         with mock.patch.dict(os.environ, {'PATH': str(self.root) + os.pathsep + os.environ['PATH']}):
-            self.exercise_bundle(clone, folder, argv_file, request, expected=True)
+            _ = self.exercise_bundle(clone, folder, argv_file, request, expected=True)
         rows = [cast(tuple[int, list[str]], json.loads(line)) for line in log.read_text().splitlines()]
         writes = [(group, words) for group, words in rows if words[0] in ('update-ref', 'bundle')]
         self.assertTrue(any(words[:2] == ['bundle', 'create'] for _, words in writes))
@@ -644,7 +657,7 @@ signal.pause()
         identity = claim_state.ClaimIdentity('claim', 'episode', 'attempt')
         budget = conf.read('mac_gate').number('terminate_grace_seconds')
         process = StalledCleanupProcess(budget, exits_after_kill=False)
-        warning = io.StringIO()
+        warning = StringIO()
         with (mock.patch.object(mac_test, 'read_block', return_value=mock.Mock(spec=claim_state.PendingMacBlock)),
               mock.patch.dict(os.environ, {'MAC_TEST_MESSAGE_TIMEOUT_S': str(budget)}),
               mock.patch.object(subprocess, 'Popen', return_value=process),
@@ -753,7 +766,7 @@ signal.pause()
                 cloud_gate.save(folder / 'request.json', request)
                 cloud_gate.save(folder / 'checkout.json', {'path': str(clone)})
                 _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# fixture\n')
-                self.exercise_bundle(clone, folder, folder / 'argv.json', request, expected=kind != 'current')
+                _ = self.exercise_bundle(clone, folder, folder / 'argv.json', request, expected=kind != 'current')
 
                 bundle = folder / 'source.bundle'
                 if kind != 'current':
@@ -767,6 +780,45 @@ signal.pause()
                 self.assertEqual(gate.checked_git(clone, 'rev-parse', 'HEAD'), request['commit'])
                 self.assertEqual(gate.checked_git(clone, 'rev-parse', 'origin/main'), base)
                 self.assertEqual(gate.checked_git(clone, 'remote', 'get-url', 'origin'), origin)
+
+    def test_remote_commands_set_pythonpath_in_zsh(self) -> None:
+        folder = self.root / 'mac-gate-fixture'
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        cloud_gate.save(folder / 'request.json', request)
+        clone = self.exercise_bundle(self.repo, folder, folder / 'argv.json', request, expected=False)
+
+        home = self.root / 'mac home'
+        remote = home / mac_gate.REMOTE_ROOT / folder.name
+        entry = remote / 'mac_gate.py'
+        remote.mkdir(parents=True)
+        entry.with_suffix('.py.new').touch()
+        shim = home / '.claude/scripts/lib/py'
+        shim.parent.mkdir(parents=True)
+        write_stdlib_tool(shim, """\
+import json, os, sys
+if sys.argv[1] == "-c":
+    os.environ["PYTHONPATH"] = os.environ["MAC_GATE_FIXTURE_ROOT"]
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
+""")
+        environment = {**os.environ, 'HOME': str(home), 'ZDOTDIR': str(home),
+                       'PYTHONPATH': str(self.root / 'local-pythonpath'),
+                       'MAC_GATE_FIXTURE_ROOT': str(Path(mac_gate.__file__).resolve().parents[2])}
+        argv_file = folder / 'argv.json'
+        stage = cast(list[str], json.loads(argv_file.read_text()))
+        self.assertEqual(stage[:2], ['/bin/zsh', '-c'])
+        stop = argv_file.with_suffix('.json.close').read_text()
+        for action, command, arguments in (
+            ('clone', ['/bin/zsh', '-c', clone], ['fixture-owner', 'fixture-project', folder.name]),
+            ('stage', stage, ['1']),
+            ('remove-checkout', ['/bin/zsh', '-c', stop], []),
+        ):
+            with self.subTest(action=action):
+                result = subprocess.run(command, cwd=home, env=environment, capture_output=True,
+                                        text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout),
+                                 [str(home / '.claude'), str(entry), action, str(remote), *arguments])
 
     def test_interrupted_ref_writes_keep_the_plan_until_deletion_succeeds(self) -> None:
         clone = self.root / 'mac-checkout'
@@ -814,7 +866,7 @@ signal.pause()
             with (mock.patch.object(gate, 'git', side_effect=interrupt_ref_write),
                   mock.patch.object(mac_gate, 'bounded_bundle_git', side_effect=interrupt_ref_write, create=True)):
                 with self.assertRaisesRegex(GateRefused, 'update-ref -d|Git did not remove'):
-                    self.exercise_bundle(clone, folder, directory / 'argv.json', request, expected=True)
+                    _ = self.exercise_bundle(clone, folder, directory / 'argv.json', request, expected=True)
                 self.assertEqual(tuple(plans_at_write), (first_ref, next_ref))
                 for plan in plans_at_write.values():
                     self.assertEqual(plan, {'repository': str(self.repo.resolve()), 'refs': [first_ref, next_ref]},
@@ -891,10 +943,11 @@ signal.pause()
             self.assertNotEqual(late.returncode, 0)
 
     def exercise_bundle(self, clone: Path, folder: Path, argv_file: Path,
-                        request: dict[str, object], *, expected: bool) -> None:
+                        request: dict[str, object], *, expected: bool) -> str:
         _ = (folder / 'local-repo').write_text(str(self.repo))
         _ = (folder / 'module_seconds.json').write_text('{}')
         captured = subprocess.run
+        clone_commands: list[str] = []
 
         def reply(command: list[str], *, text: bool, pass_fds: tuple[int, ...]) -> str:
             self.assertTrue(text)
@@ -904,6 +957,7 @@ signal.pause()
                 return captured(['/bin/sh', '-c', remote], capture_output=True, check=True, text=True).stdout
             if ' clone ' in remote:
                 self.assertIn('fixture-owner fixture-project', remote)
+                clone_commands.append(remote)
                 return f'mac_gate_checkout={clone}'
             return 'created'
 
@@ -919,19 +973,32 @@ signal.pause()
                 sends.append(command)
             return subprocess.CompletedProcess(command, 0)
 
+        registered: list[copies.RemoteMirror] = []
+        reconciled_hosts: list[str] = []
+
+        def reconcile(host: str, select: Callable[[copies.RemoteMirror], bool]) -> None:
+            self.assertEqual(len(registered), 1)
+            self.assertIs(select, mac_gate.is_mac_gate_checkout)
+            reconciled_hosts.append(host)
+
         lease = self.root / 'lease'
         with ((folder / 'creation.lock').open('w') as creation,
-              mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac',
+              mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac', 'MAC_QUEUE_SESSION': folder.name,
                                            mac_gate.CREATION_LEASE_FD: str(creation.fileno())}),
               mac_gate.hold_gate_creation_commands(),
               mock.patch.object(copies, 'source_owner', return_value='fixture-owner'),
               mock.patch.object(copies, 'repository_name', return_value='fixture-project'),
               mock.patch.object(copies, 'remote_lease_path', return_value=lease),
-              mock.patch.object(copies, 'register_remote') as register,
+              mock.patch.object(copies, 'register_remote', registered.append),
+              mock.patch.object(copies, 'reconcile_remote_mirrors', reconcile),
               mock.patch.object(subprocess, 'check_output', side_effect=reply),
               mock.patch.object(subprocess, 'run', side_effect=send)):
             self.assertEqual(mac_gate.lifecycle('prepare', argv_file, folder, '1'), 0)
-        register.assert_called_once()
+        self.assertEqual(reconciled_hosts, ['fixture-mac'])
+        self.assertEqual(registered, [
+            copies.RemoteMirror('fixture-owner', copies.SelectedRepository('fixture-project'),
+                                'fixture-mac', str(clone), folder.name, task='gate:' + folder.name),
+        ])
         self.assertEqual(argv_file.with_suffix('.json.checkout').read_text(), str(clone))
         self.assertEqual(argv_file.with_suffix('.json.lease').read_text(), str(lease))
         sources = [source for send in sends[1:] for source in send]
@@ -940,6 +1007,8 @@ signal.pause()
         self.assertIn(' stage ', argv_file.read_text())
         self.assertIn(' remove-checkout ', argv_file.with_suffix('.json.close').read_text())
         self.assertEqual(request['source_key'], '')
+        clone_command, = clone_commands
+        return clone_command
 
     def test_checkout_probe_rejects_a_nonzero_remote_status(self) -> None:
         folder = self.root / 'mac-gate-fixture'
@@ -973,19 +1042,117 @@ signal.pause()
         guest.kill()
         _ = guest.wait(timeout=TEST_HANG_GUARD_SECS)
         with (mock.patch.object(Path, 'home', return_value=self.root),
-              mock.patch.object(scratch, 'end', return_value=scratch.TaskCleanup()) as end):
+              mock.patch.object(scratch, 'end', return_value=[]) as end):
             with self.assertRaisesRegex(GateRefused, 'Cannot prove ownership'):
-                mac_gate.stop_checkout(root)
+                _ = mac_gate.stop_checkout(root)
             end.assert_not_called()
             self.assertIsNone(job.poll())
             self.assertTrue(temporary.exists())
             recovery.add_group(job.pid)
-            mac_gate.stop_checkout(root)
+            self.assertEqual(mac_gate.stop_checkout(root), mac_gate.CheckoutCleanup.REMOVED)
         end.assert_called_once_with('gate:mac-gate-fixture')
         self.assertEqual(job.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGKILL)
         self.assertIsNone(unrelated.poll())
         self.assertFalse(temporary.exists())
         self.assertFalse(root.exists())
+
+    def test_retained_checkout_keeps_its_registration_until_removal(self) -> None:
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        folder.mkdir(parents=True)
+        task = mac_gate.checkout_task(folder)
+        with mock.patch.dict(os.environ, copies_environment(self.root)):
+            checkout = scratch.new(task, 'checkout')
+            cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
+            mirror = copies.RemoteMirror('fixture', copies.SelectedRepository('fixture'),
+                                         'localhost', str(checkout), folder.name)
+            with copies.remote_lease(mirror):
+                copies.register_remote(mirror)
+            registration = copies.remote_record_path(mirror)
+            with redirect_stderr(StringIO()) as notices:
+                for _ in range(2):
+                    self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.RETAINED)
+                    self.assertEqual(mac_gate.read_checkout(folder), checkout)
+                    self.assertTrue(registration.is_file())
+            self.assertEqual(notices.getvalue().splitlines(), [
+                scratch.retained_task_folder_notice(checkout, f'task {task} ended'),
+            ])
+            with self.assertRaisesRegex(GateRefused, 'checkout task has ended'), mac_gate.record_guest(folder, checkout):
+                self.fail('The closed gate started a guest')
+            shutil.rmtree(checkout)
+            self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.REMOVED)
+            self.assertFalse(registration.exists())
+            self.assertFalse(folder.exists())
+
+    def test_stop_checkout_accepts_pre_promotion_task_cleanup(self) -> None:
+        class LegacyTaskCleanup(list[Path]):
+            def __init__(self, removed: Path, kept: scratch.KeptFolder) -> None:
+                super().__init__([removed])
+                self.kept: list[scratch.KeptFolder] = [kept]
+
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        folder.mkdir(parents=True)
+        removed = self.root / 'removed'
+        kept = self.root / 'kept'
+        kept.mkdir()
+        cloud_gate.save(folder / 'checkout.json', {'path': str(removed)})
+        result = LegacyTaskCleanup(removed, scratch.KeptFolder(kept, 'fixture hold'))
+        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+              mock.patch.object(scratch, 'end', return_value=result) as end,
+              mock.patch.object(copies, 'unregister_remote') as unregister,
+              redirect_stderr(StringIO()) as notices):
+            for _ in range(2):
+                self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.RETAINED)
+        end.assert_called_once_with(mac_gate.checkout_task(folder))
+        unregister.assert_called_once_with('localhost', str(removed))
+        self.assertEqual(notices.getvalue().splitlines(), [
+            scratch.retained_task_folder_notice(kept, 'fixture hold'),
+        ])
+        self.assertTrue(kept.is_dir())
+        self.assertEqual(cloud_gate.read(folder / 'task-ended.json'), {str(kept): 'fixture hold'})
+
+    def test_lifecycle_unregisters_only_after_remote_removal(self) -> None:
+        folder = self.root / 'mac-gate-fixture'
+        argv = self.root / 'argv.json'
+        checkout = '/fixture/remote/checkout'
+        _ = argv.with_suffix('.json.checkout').write_text(checkout)
+        notice = scratch.retained_task_folder_notice(Path(checkout), 'fixture task ended')
+        retained = subprocess.CompletedProcess(['ssh'], 0, mac_gate.CheckoutCleanup.RETAINED + '\n', notice + '\n')
+        removed = subprocess.CompletedProcess(['ssh'], 0, mac_gate.CheckoutCleanup.REMOVED + '\n', '')
+        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac'}),
+              mock.patch.object(mac_gate, 'capture_cleanup_command', side_effect=[retained, removed]),
+              mock.patch.object(copies, 'unregister_remote') as unregister,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
+            unregister.assert_not_called()
+            self.assertEqual(errors.getvalue().splitlines(), [notice])
+            self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
+            unregister.assert_called_once_with('fixture-mac', checkout)
+
+    def test_missing_close_script_checks_the_mac_checkout_path(self) -> None:
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        argv = self.root / 'argv.json'
+        receipt = argv.with_suffix('.json.checkout')
+        checkout = self.root / "Mac's gate checkout"
+        with (mock.patch.dict(os.environ, self.remote_checkout_environment()),
+              mock.patch.object(copies, 'unregister_remote') as unregister):
+            checkout.mkdir()
+            for case in ('no receipt', 'folder', 'dangling symlink', 'gone'):
+                with self.subTest(case=case):
+                    folder.mkdir(parents=True)
+                    if case == 'folder':
+                        _ = receipt.write_text(str(checkout))
+                    elif case == 'dangling symlink':
+                        checkout.rmdir()
+                        checkout.symlink_to(self.root / 'missing')
+                    elif case == 'gone':
+                        checkout.unlink()
+                    self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
+                    self.assertFalse(folder.exists())
+                    if case == 'gone':
+                        unregister.assert_called_once_with('fixture-mac', str(checkout))
+                    else:
+                        unregister.assert_not_called()
+            self.assertFalse(checkout.is_symlink())
 
     def install_held_module(self) -> None:
         shim = self.repo / 'scripts/lib/py'
@@ -1005,6 +1172,12 @@ signal.pause()
     def test_run_remote_cancellation_reports_a_close_failure(self) -> None:
         self.install_held_module()
         self.cancel_remote(self.root, explicit=True, cleanup_refused=True)
+
+    def test_run_remote_fixture_reports_a_failed_close_hook(self) -> None:
+        self.install_held_module()
+        (self.root / 'fail_close_hook').touch()
+        with self.assertRaisesRegex(AssertionError, 'RuntimeError: fixture close hook failed'):
+            self.cancel_remote(self.root, explicit=True)
 
     def test_run_remote_cancellation_stops_bundle_git_and_removes_refs(self) -> None:
         self.cancel_remote(self.root, explicit=True, prepare_bundle=True)
@@ -1063,7 +1236,9 @@ signal.pause()
                         self.assertFalse(isinstance(process_start(child_pid), Started), result.read_text())
                         self.assertEqual(gate.checked_git(self.repo, 'for-each-ref', 'refs/cloud-gates/'), '')
                         return
-                    wait_until((root / 'close_finished').exists, root)
+                    close_status = root / 'close_status'
+                    wait_until(close_status.exists, root)
+                    self.assertEqual(int(close_status.read_text()), 0, (root / 'close.log').read_text())
                     self.assertTrue((root / 'close_started').exists())
                     self.assertFalse(isinstance(process_start(child_pid), Started))
                     record = cloud_gate.read(root / 'interrupted')
