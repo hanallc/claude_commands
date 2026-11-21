@@ -17,7 +17,7 @@ from unittest.mock import patch
 from scripts.lib.process_start import Gone, ProcessStart, Started, Unreadable, process_start
 from scripts.build_queue import landing_test_gate
 from scripts.production.production_doc import ProductionDocument
-from scripts.production import checkpoint_gate, land_queue, land_runs, merge_checkpoint, merge_gate
+from scripts.production import checkpoint_gate, gate, land_queue, land_runs, merge_checkpoint
 
 
 class LandRunTests(unittest.TestCase):
@@ -26,10 +26,38 @@ class LandRunTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
+        self.enterContext(patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root)}))
+
+    def test_default_state_requires_the_folder_move(self) -> None:
+        for label, old_exists, new_exists, explicit in (
+            ("move required", True, False, False),
+            ("explicit state", True, False, True),
+            ("neither folder", False, False, False),
+            ("new folder", True, True, False),
+        ):
+            with self.subTest(state=label), patch.dict(os.environ, {"HOME": str(self.root / label)}):
+                _ = os.environ.pop("GATE_STATE_DIR", None)
+                old = Path.home() / ".local/state/merge-gate"
+                new = Path.home() / ".local/state/gate"
+                if old_exists:
+                    old.mkdir(parents=True)
+                if new_exists:
+                    new.mkdir(parents=True)
+                if explicit:
+                    os.environ["GATE_STATE_DIR"] = str(self.root / "selected")
+                    self.assertEqual(land_runs.state_dir(), self.root / "selected")
+                elif old_exists and not new_exists:
+                    with self.assertRaises(land_runs.GateStateMoveRequired) as refused:
+                        _ = land_runs.state_dir()
+                    self.assertIn("bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh",
+                                  str(refused.exception))
+                    self.assertIn("/build:hold drain natedev", str(refused.exception))
+                    self.assertFalse(new.exists())
+                else:
+                    self.assertEqual(land_runs.state_dir(), new)
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
-        self.assertEqual(merge_gate.gate_state_dir(), self.root)
+        self.assertEqual(gate.gate_state_dir(), self.root)
         self.assertEqual(land_runs.running_lands(), {})
         with land_runs.landing(["a" * 40, "b" * 9], ["shelled images-card"]):
             self.assertEqual(land_runs.running_lands(), {"a" * 40: "shelled images-card", "b" * 9: ""})

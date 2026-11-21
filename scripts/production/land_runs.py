@@ -25,6 +25,11 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 
 # The results file keeps only this many newest rows.
 KEPT_RESULTS = 300
+DEFAULT_STATE_DIR = "~/.local/state/gate"
+
+
+class GateStateMoveRequired(Exception):
+    """The default gate state still requires the deploy move."""
 
 
 class LandRecord(TypedDict):
@@ -82,9 +87,22 @@ class LandResult(TypedDict):
     time: str
 
 
+def default_state_dir() -> Path:
+    """Return the default gate state folder after the deploy move."""
+    directory = Path(DEFAULT_STATE_DIR).expanduser()
+    # Chunk 6 removes this guard and the old folder path.
+    old = Path("~/.local/state/merge-gate").expanduser()
+    if os.path.lexists(old) and not os.path.lexists(directory):
+        raise GateStateMoveRequired(
+            "Gate state move required: set /build:hold drain natedev, then run "
+            + "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh")
+    return directory
+
+
 def state_dir() -> Path:
-    """The merge gate state folder; `merge_gate.gate_state_dir` returns this one."""
-    return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
+    """Return the selected gate state folder."""
+    selected = os.environ.get("GATE_STATE_DIR")
+    return default_state_dir() if selected is None else Path(selected).expanduser()
 
 
 def lands_dir() -> Path:

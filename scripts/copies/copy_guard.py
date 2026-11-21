@@ -35,10 +35,10 @@ SHELL = cast(ShellCommands, cast(object, load_file_module(
 # Fixture repositories are disposable test inputs, never operational gate checkouts.
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
-    "Repository trees must be made by copies.py run. "
+    "Run a fixed commit with copies.py run. "
     + "Example: python3 ~/.claude/scripts/copies/copies.py run "
     + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
-    + "A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository."
+    + "Make an editable worktree with worktrees.py make <repo> <unit> <short-name>."
 )
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"})
 COPY_VALUE_OPTIONS = frozenset({"-t", "--target-directory", "-e", "--rsh", "--exclude", "--include",

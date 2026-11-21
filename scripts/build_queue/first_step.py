@@ -18,7 +18,10 @@ from scripts.direct.local_release_wait import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.lib.build_steps import VerifyCommand, build_call_arguments, command_job, command_program, verify_command
+from scripts.lib.build_steps import (
+    MERGE_GATE_PROGRAMS, OtherCommand, VerifyCommand, build_call_arguments, command_job, parse_command_program,
+    verify_command,
+)
 from scripts.production import land_runs
 from scripts.production.merge_gate_arguments import GateArguments, gate_parser, missing_landing_fields
 
@@ -141,7 +144,10 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
                    position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
-    name = 'targeted-test' if command_program(command) == 'targeted_test.py' else 'merge-gate'
+    program = parse_command_program(command)
+    script, script_arguments = ('', ()) if isinstance(program, OtherCommand) else program
+    affected = script == 'targeted_test.py' or '--affected' in script_arguments
+    name = 'test-affected' if affected else 'gate'
     resolved_job = command_job(command)
     job = resolved_job if isinstance(resolved_job, StepJob) else GATE_JOB_NOT_RECORDED
     config = records.read_memory_config()
@@ -151,10 +157,10 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
     profile = records.ProgramProfile(name, str(Path.home() / '.claude'), str(source),
         records.HistoryPeakSizing(first, records.FirstProgramPeak(first), 0.0))
     arguments = [name]
-    for index, word in enumerate(command):
+    for index, word in enumerate(script_arguments):
         if word in ('--type-dirs', '--type-dir'):
             arguments.append('--type-dirs')
-            for directory in command[index + 1:]:
+            for directory in script_arguments[index + 1:]:
                 if directory.startswith('-'):
                     break
                 arguments.append(directory)
@@ -179,8 +185,12 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
 def _copy_landing(command: Sequence[str]) -> Generator[None]:
     """Register the merge before the copy requests its first step."""
     program = build_call_arguments(command)
-    if program[:1] == ("merge_gate.py",) and program[1:2] not in (("nightly-assigned",), ("nightly-check",)):
-        options, unknown = gate_parser().parse_known_args(program[1:], namespace=GateArguments())
+    if program and program[0] in MERGE_GATE_PROGRAMS:
+        arguments = program[1:]
+        if "--affected" in arguments or (arguments and arguments[0] in {"nightly-assigned", "nightly-check"}):
+            yield
+            return
+        options, unknown = gate_parser().parse_known_args(arguments, namespace=GateArguments())
         if (not unknown and not options.modules and not (options.tests_only or options.promote_only or options.nightly)
                 and not missing_landing_fields(options)):
             with land_runs.landing([options.checkpoint], [f"{options.unit} {options.phase}"]):

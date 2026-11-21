@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.build_queue import admission_wire as wire
+from scripts.lib.build_steps import GATE_PROGRAMS
 from scripts.production import land_runs
 
 
 REPOSITORY_KEY = "https://github.com/natepiano/claude_commands"
-TEST_STEPS = frozenset({"merge-gate", "targeted-test", "test", "t", "nextest"})
+TEST_STEPS = frozenset(GATE_PROGRAMS) | {"test", "t", "nextest"}
 
 
 @dataclass(frozen=True)

@@ -151,7 +151,7 @@ class SnapshotCodecTests(unittest.TestCase):
                 reservation = fixture_reservation(42, GIB)
                 reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
                     "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": reserved})
-                facts = records.EndedStepFacts("merge-gate", "hana", "hana", "/fixture/hana", member.id,
+                facts = records.EndedStepFacts("gate", "hana", "hana", "/fixture/hana", member.id,
                                                caller_name=stored)
                 held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
                 current = replace(inputs, reservations=(reservation,), slots=(held,))
@@ -350,6 +350,8 @@ class SnapshotCodecTests(unittest.TestCase):
             records.BehindHead: records.BehindHead("organon", 900.0, "session"),
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
             placement.CargoFolderWait: placement.CargoFolderWait(),
+            records.BuildSpaceLow: records.BuildSpaceLow(125, 150),
+            records.BuildSpaceUnreadable: records.BuildSpaceUnreadable("fixture disk offline"),
             records.ReadyForAdmission: records.ReadyForAdmission(),
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
@@ -371,9 +373,12 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_reason = cast(object, getattr(parse_reply(line), "reason"))
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
-                        legacy = isinstance(cause, (records.GpuSlotWait, records.NatedevHeld,
-                            records.WaitsForLandingTest, placement.CargoFolderWait))
-                        self.assertEqual(type(older_cause).__name__, "BehindHead" if legacy else type(cause).__name__)
+                        legacy_wait = (records.GpuSlotWait | records.NatedevHeld | placement.CargoFolderWait
+                                       | records.BuildSpaceHold | records.WaitsForLandingTest)
+                        self.assertEqual(type(older_cause).__name__,
+                                         "BehindHead" if isinstance(cause, legacy_wait) else type(cause).__name__)
+                        if isinstance(cause, records.BuildSpaceHold):
+                            self.assertEqual(cast(str, getattr(older_cause, "head_name")), "the build space floor")
                         if isinstance(cause, records.WaitsForLandingTest):
                             self.assertEqual(cast(str, getattr(older_cause, "head_name")), cause.gate_name)
 
@@ -393,7 +398,7 @@ class SnapshotCodecTests(unittest.TestCase):
 
     def test_the_previous_v3_client_reads_a_cloud_row_waiting_for_the_land(self) -> None:
         reading = head_reading()
-        row = wire.CloudRow(wire.Owner(42, "123"), wire.Identity("", "", "merge-gate", "/fixture"),
+        row = wire.CloudRow(wire.Owner(42, "123"), wire.Identity("", "", "gate", "/fixture"),
             wire.CloudPlace("aws"), 1000.0, 0.0, cloud_progress.NoCloudProgress(), progress_profile.NoCounter(),
             records.WaitsForLandingTest())
         reply = wire.ViewReply(wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,

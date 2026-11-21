@@ -245,8 +245,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .wrow.wait .row-label .name { white-space: normal; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
 .row-memory { min-width: 0; position: relative; }
-.wait-note { position: absolute; top: 0; left: 0; display: block; width: var(--wait-note-width, 100%); font-size: 0.75rem; line-height: 18px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wait-note.above { position: static; }
+.row-label .build-space-note { font-size: 0.75rem; color: var(--ink-2); }
+.row-memory .wait-note { position: absolute; top: 0; left: 0; display: block; width: var(--wait-note-width, 100%); font-size: 0.75rem; line-height: 18px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-memory .wait-note.above { position: static; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
 .cloud-status .amounts { height: auto; min-height: 16px; overflow-wrap: anywhere; }
@@ -834,11 +835,11 @@ function stepTooltip(key, data) {
   const call = verify?.call || row.call;
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
-    || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
+    || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
     : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
-  if (row.about) rows.push(field('', row.about, 'caption'));
+  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
   const reasonFields = waiting && row.reason ? [field('Reason', row.reason, 'reason')] : [];
   if (unavailable) return [...rows, ...stepFields, ...reasonFields, ...callFields];
@@ -1011,7 +1012,6 @@ function rowUnit(row) {
 }
 function rowOwner(row, waiting = false) {
   if (row.caller) return row.caller;
-  if (row.kind === "repository-slot") return "";
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
@@ -1020,9 +1020,10 @@ function rowOwner(row, waiting = false) {
   const owner = publicText(row.showrunner || "");
   return owner;
 }
-function rowLabel(name, owner = "") {
+function rowLabel(name, owner = "", diskReason = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${roleName(owner)}</span></span>`;
+    `<span class="owner">${roleName(owner)}</span>` +
+    (diskReason ? `<span class="wait-note build-space-note">${esc(diskReason)}</span>` : "") + "</span>";
 }
 function waitNote(reason) {
   return reason ? `<span class="wait-note">${esc(reason)}</span>` : "";
@@ -1406,8 +1407,10 @@ function renderWalk(d) {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true))}` +
-      (w.kind === "cloud" ? cloudStatus(w, tip, w.reason) : rowMemory(tip, w.reason)) +
+    const diskWait = w.why === "build space";
+    const note = diskWait ? "" : w.reason;
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), diskWait ? w.reason : "")}` +
+      (w.kind === "cloud" ? cloudStatus(w, tip, note) : rowMemory(tip, note)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
@@ -1671,7 +1674,7 @@ function placeMemoryBars(d) {
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = stepRow(row.dataset.tip, d);
-    const note = row.querySelector(".wait-note");
+    const note = row.querySelector(".row-memory .wait-note");
     if (waiter.kind === "cloud") {
       if (note) note.style.setProperty("--wait-note-width", `${Math.max(0, chartEdge - LABEL_GAP)}px`);
       continue;

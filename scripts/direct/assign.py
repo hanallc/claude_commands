@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Claim a unit worker and submit one named dispatch."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import argparse
 from collections.abc import Callable
@@ -41,6 +44,7 @@ from scripts.whoami import quota_state
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
 PROGRESS = str(SCRIPTS / "progress_history.py")
+PASS_RECORD = str(SCRIPTS / "pass_record.py")
 RULES = """
 Rules for this dispatch:
 Run only commands that finish within one call. Never poll, sleep, call wait,
@@ -162,6 +166,8 @@ def parse_arguments() -> Arguments:
         parser.error("consultation-pane requires --new-worker")
     if args.target == "durable-design-role" and not args.parent:
         parser.error("durable-design-role requires --parent and an Astra policy")
+    if args.target == "durable-design-role" and not (args.to or args.new_worker):
+        parser.error("durable-design-role requires --to or --new-worker")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
     if args.operation == AssignmentOperation.ASTRA_REVIEW and not args.new_worker:
@@ -285,7 +291,7 @@ class AssignmentResult:
     style_assignment: NoStyleAssignment | StyleAssignment = field(default_factory=NoStyleAssignment)
 
     def failed_pass_command(self) -> list[str]:
-        return [PYTHON, PROGRESS, "finish-pass", "--session-dir", str(self.run), "--status", "error"]
+        return [PYTHON, PASS_RECORD, "finish-pass", "--session-dir", str(self.run), "--status", "error"]
 
     def capture_style(self, code: int) -> None:
         assignment = self.style_assignment
@@ -337,7 +343,7 @@ class CompletionApplied(StrEnum):
 
 
 def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
-                   actions: progress_history.CompletionActions, reply: Path, *, completed: bool = True) -> CompletionApplied | CompletionFailed:
+                   actions: pass_recorder.CompletionActions, reply: Path, *, completed: bool = True) -> CompletionApplied | CompletionFailed:
     """Run the saved completion actions after the hook proves DONE."""
     if actions.summary_file:
         write_text_atomic(Path(actions.summary_file), reply.read_text())
@@ -372,7 +378,7 @@ def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
     return CompletionFailed(failure) if failure else CompletionApplied.APPLIED
 
 
-def finish_herdr_recording(run: Path, actions: progress_history.CompletionActions, *,
+def finish_herdr_recording(run: Path, actions: pass_recorder.CompletionActions, *,
                            completed: bool) -> CompletionApplied | CompletionFailed:
     """Record the phase and run ends after the hook completes the pass."""
     commands = [["finish-phase", "--phase-id", actions.finish_phase]] if actions.finish_phase else []
@@ -527,7 +533,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     number = sum(entry.get("event_type") == "pass_started" for entry in recorded_passes(run)) + 1
     write_text_atomic(directory / f"dispatch_{number}_paths.json",
                       json.dumps({"worker": slot, "round": number, "paths": paths}))
-    actions = progress_history.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
+    actions = pass_recorder.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
         style_directory=str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
     instance = uuid.uuid4()
@@ -639,7 +645,13 @@ def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy, *
     """Start the named target with the supplied policy."""
     if isinstance(target, worker_panes.ConsultationPane):
         return side_pane.open(target.label, policy, question=target.question, cwd=target.cwd, delivery=target.delivery)
-    return staff_worker.launch(target, policy, lock=lock)
+    try:
+        started = staff_worker.launch(target, policy, lock=lock)
+    except staff.StaffRefused as error:
+        started = worker_panes.AdmissionRefused(str(error))
+    if isinstance(started, worker_panes.AdmissionRefused):
+        return worker_panes.AdmissionRefused(" ".join(started.reason.splitlines()))
+    return started
 
 
 def execute_consultation(args: Arguments, cwd: Path) -> int:
@@ -718,7 +730,7 @@ def execute_durable(args: Arguments) -> int:
     result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
         slot=name.value, phase=args.phase, kind="astra",
         reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
-        completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
+        completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
         launcher_command=launcher_command())
     return result
 
@@ -729,7 +741,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
     command = launcher_command()
     matched = progress_history.dispatch_worker(run, slot=args.new_worker, phase="astra-review", role="astra-reviewer",
                                                prompt=prompt, launcher_command=command)
-    if (isinstance(matched, progress_history.MatchedDispatch)
+    if (isinstance(matched, pass_recorder.MatchedDispatch)
             and progress_history.dispatch_completed(run, args.new_worker, matched.instance_id)):
         parent = worker_admission.parent(staff.snapshot(), run=run)
         passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
@@ -765,7 +777,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             result = staff_worker.dispatch(target.parent, target.name, target.role, prompt,
                 session_dir=run, slot=args.new_worker, phase="astra-review", kind="astra",
                 reply=Path(args.reply_file), policy=policy, started=current,
-                completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
+                completion_actions=pass_recorder.CompletionActions(end_worker=True, held_role=role["staff_id"],
                     finish_phase="astra-review", finish_run=True),
                 launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold, notices=notices)
             if result is staff_worker.DispatchSubmission.SUBMITTED:
@@ -825,7 +837,7 @@ def main() -> int:
     paths = authorized_paths(args, cwd)
     run, phase = prepare_run(args, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
-    check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
+    check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
     if args.lens:
         check += ["--lens", args.lens]

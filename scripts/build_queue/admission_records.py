@@ -150,7 +150,7 @@ class GpuTestSlots:
 
 
 # These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "targeted-test", "merge-gate"})
+GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 
 
@@ -943,6 +943,25 @@ class StartSpacingWait:
 
 
 @dataclass(frozen=True)
+class BuildSpaceLow:
+    free_gib: int
+    floor_gib: int
+
+
+@dataclass(frozen=True)
+class BuildSpaceUnreadable:
+    error: str
+
+
+BuildSpaceHold = BuildSpaceLow | BuildSpaceUnreadable
+
+
+@dataclass(frozen=True)
+class NoBuildSpaceHold:
+    """The pass has no disk space hold."""
+
+
+@dataclass(frozen=True)
 class NeedsMemory:
     """The memory wait holds the need, free bytes, threshold, growth, and reserve."""
     need: int = 0
@@ -994,7 +1013,7 @@ class WaitsForLandingTest:
     gate_name: str = "the landing queue"
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | BuildSpaceHold | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -1007,11 +1026,17 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld | WaitsForLandingTest | placement.CargoFolderWait)
+              | NatedevHeld | WaitsForLandingTest | BuildSpaceHold | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
     return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+
+
+def build_space_text(wait: BuildSpaceHold) -> str:
+    if isinstance(wait, BuildSpaceUnreadable):
+        return f"cannot read /build free space: {wait.error}"
+    return f"/build has {wait.free_gib} GiB free, below the {wait.floor_gib} GiB floor"
 
 
 def gpu_slot_text(wait: GpuSlotWait) -> str:
@@ -1024,6 +1049,8 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + cause.reason
     if isinstance(cause, MemoryPressure):
         return "head: " + pressure_text(cause)
+    if isinstance(cause, BuildSpaceHold):
+        return "head: " + build_space_text(cause)
     if isinstance(cause, StartSpacingWait):
         return "head: next start at " + datetime.fromtimestamp(cause.at, zone).strftime("%H:%M:%S")
     if isinstance(cause, EstimateExpired):
@@ -1281,6 +1308,7 @@ class QueueInputs:
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     landing_test_waits: frozenset[str] = field(default=frozenset(), kw_only=True)
     landing_wait_reason: WaitsForLandingTest = field(default=WaitsForLandingTest(), kw_only=True)
+    build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1425,6 +1453,7 @@ class MemoryConfig:
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
+    free_floor_gib: int | None = field(default=None, kw_only=True)
     diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
@@ -1524,7 +1553,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 source_settle_seconds=number("source_settle_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
-                peak_wave_seconds=number("peak_wave_seconds"))
+                peak_wave_seconds=number("peak_wave_seconds"),
+                free_floor_gib=whole("free_floor_gib")
+                    if settings_read.effective_key("free_floor_gib") in values else None)
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)
@@ -1720,6 +1751,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return reason.reason
         case StartSpacingWait():
             return "another step just started; the queue waits a few seconds between starts"
+        case BuildSpaceLow() | BuildSpaceUnreadable():
+            return build_space_text(reason)
         case NeedsMemory():
             return "free memory"
         case placement.CargoFolderWait():

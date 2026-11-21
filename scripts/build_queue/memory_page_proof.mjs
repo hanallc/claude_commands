@@ -63,7 +63,7 @@ try {
   await mkdir(folder, {recursive:true});
   const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
     'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))'
-      + (landingWaitProof ? '; from scripts.build_queue.test_queue_view import write_running_gate_fixture; write_running_gate_fixture(Path(sys.argv[1]))' : '')
+      + (landingWaitProof ? '; from scripts.build_queue.test_memory_feed import write_running_gate_fixture; write_running_gate_fixture(Path(sys.argv[1]))' : '')
       + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
@@ -1996,7 +1996,7 @@ try {
               return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
                 waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
             })()`);
-            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
@@ -2547,10 +2547,9 @@ try {
                   {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
                 waiters:[{key:'fractional-wait',name:'fractional',first_in_line:true,need:1.06,free:1.04,head_room:{rows:[
                   {label:'Queue cap',gib:5.2},{label:'− Builds',gib:3.12},
-                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}},
-                  {key:'fractional-slot',name:'slot',kind:'repository-slot',need:0,runs_on:'natedev'}]};
+                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}}]};
               window.renderReading(fractional);
-              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait','wait:fractional-slot']
+              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait']
                 .map(key=>[key,tooltipRows(key,fractional)])),
                 legend:Object.fromEntries(['builds','reserved','room'].map(key=>[key,document.querySelector('#v-cap-'+key).textContent]))};
             })()`);
@@ -2573,8 +2572,6 @@ try {
             assert.equal(swap['Swap coming back'],'1.0 GiB');
             assert.equal(swap.Target,'2.0 GiB');
             assert.equal(amounts(review.walkhead).Priority,'research, cables');
-            assert.equal(amounts(review['wait:fractional-slot'])['Waits for'],'build slot');
-            assert.ok(!review['wait:fractional-slot'].some(row=>['Needs','Free','Short by'].includes(row.label)));
             assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 123 · 2 min'));
             assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 456 · 2 min'));
             const reserveProof = await evaluate(`(() => {

@@ -261,7 +261,9 @@ GPU_SLOT_SUFFIX = "_gpu_slot"
 NATEDEV_HOLD_SUFFIX = "_natedev_hold"
 CARGO_FOLDER_SUFFIX = "_cargo_folder"
 LANDING_TEST_SUFFIX = "_landing_test"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, LANDING_TEST_SUFFIX)
+BUILD_SPACE_SUFFIX = "_build_space"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, LANDING_TEST_SUFFIX,
+                        BUILD_SPACE_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -300,6 +302,8 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
         elif wait.get("kind") == "WaitsForLandingTest":
             head, suffix = str(wait["gate_name"]), LANDING_TEST_SUFFIX
+        elif wait.get("kind") in ("BuildSpaceLow", "BuildSpaceUnreadable"):
+            head, suffix = "the build space floor", BUILD_SPACE_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}

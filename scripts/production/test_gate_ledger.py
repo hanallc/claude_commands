@@ -18,14 +18,14 @@ from collections.abc import Sequence
 from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
-from scripts.production import merge_gate
+from scripts.production import gate, land_runs
 from scripts.lib import build_folders
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
 from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.buildlog.store import host_name
-from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MERGE_GATE_TEST_SETTINGS, MergeGateFixture, gate_suites
+from scripts.production.gate_test_support import FIXTURE_FOLDERS, GATE_TEST_SETTINGS, MergeGateFixture, gate_suites
 
 
 # Run the same fixture test in one child. The suite tests cover the full runner.
@@ -46,7 +46,7 @@ import os
 from pathlib import Path
 import sys
 
-state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+state = Path(os.environ["GATE_TEST_STATE"])
 with (state / "tools.jsonl").open("a") as output:
     output.write(json.dumps({"tool": "basedpyright", "args": sys.argv[1:],
                              "cwd": os.getcwd(), "pid": os.getpid()}) + "\n")
@@ -66,7 +66,7 @@ INDEX_SPILL_PAGES=65536
 INDEX_TOUCH_MINUTES=60
 """,
     "codex_daemon": "# range: 0.001..\ntimeout_seconds=5\n",
-    "merge_gate": MERGE_GATE_TEST_SETTINGS + """# one of: on, off
+    "gate": GATE_TEST_SETTINGS + """# one of: on, off
 nightly_result_push=on
 # whole: 1..
 nightly_result_modules=8
@@ -115,8 +115,7 @@ SLOW_TEST_S=0.5
 # whole: 1..
 TOP_RUNS=5
 """,
-    "build_steps": """names.targeted-test=targeted test
-names.merge-gate=gate
+    "build_steps": """names.gate=gate
 names.integrate=integrate
 names.test-all=test all
 names.test-modules=test named
@@ -126,16 +125,16 @@ names.fast-track=fast track
 names.toolchain-trial=toolchain trial
 names.promote=promote
 names.ci=CI
-prose.merge-gate=the gate
+prose.gate=the gate
 prose.build=release build
 owned.default={unit} {step}
 owned.showrunner-default=showrunner {step}
 owned.ci-default=CI {step}
-about.integrate=Merges the {unit} checkpoint into the {branch} branch, tests every module, then pushes {branch}.
-about.test-all=Tests every module of {unit}.
-about.test-modules=Tests {modules} named modules of {unit}.
+about.integrate=Merges the checkpoint into the {branch} branch, runs every test module, then pushes {branch}
+about.test-all=Runs every test module
+about.test-modules=Runs {modules} named test modules
 about.test-modules-without-unit=Tests {modules} named modules.
-about.test-affected=Tests the modules that the {unit} change affects.
+about.test-affected=Runs the test modules that the change affects
 about.test-nightly=Tests the {branch} branch each night and records a red result with its owner.
 changes.integrate={branch} branch
 changes.promote=main branch
@@ -158,11 +157,11 @@ peak_history_share_percent=10
 # range: 0..
 progress_profile_sweep_seconds=0.05
 # range: 5e-324..
-program_first_peak_gib.targeted-test=4
+program_first_peak_gib.test-affected=4
 # whole: 1..
-peak_hold_seconds.merge-gate=180
+peak_hold_seconds.gate=180
 # whole: 1..
-peak_hold_seconds.targeted-test=180
+peak_hold_seconds.test-affected=180
 # whole: 1..
 agent_swap_window_seconds=600
 # range: 1..
@@ -177,6 +176,8 @@ request_slow_seconds=0.25
         f"""roots.system=/tmp
 roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
+roots.build={root / 'build'}
+roots.build.{host_name()}={root / 'build'}
 roots.slots={root / 'slots'}
 roots.slot_cargo={root / 'cargo'}
 roots.workspace={root / 'workspaces'}
@@ -185,6 +186,8 @@ roots.copies={root / 'copies'}
 roots.scratch={root / 'scratch'}
 roots.mirror={root / 'mirrors'}
 roots.shell={root / 'shells'}
+# whole: 1..
+folders.unused_days=2
 # whole: 1..
 slots.{host_name()}.default_max=2
 # whole: 1..
@@ -228,6 +231,7 @@ seed.min_free_gib=350
     _ = (directory / "copies.conf").write_text(
         f"""remote_registry={root / 'remote-mirrors'}
 wait_seconds=0.01
+# range: 5e-324..
 git_timeout_seconds=10
 guard_timeout_seconds=10
 guard_choice_limit=32
@@ -243,12 +247,12 @@ class LedgerJobCompletion:
     """Wait for a real child exit when the gate has a fixture job running."""
 
     def __init__(self) -> None:
-        self.jobs: list[merge_gate.RunningGateJob] = []
-        self.start = merge_gate.start_gate_job
+        self.jobs: list[gate.RunningGateJob] = []
+        self.start = gate.start_gate_job
 
     def observe_start(self, suite: str, path: Path, argv: Sequence[str], repo: Path,
                       environment: dict[str, str], log: Path, *,
-                      kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+                      kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE) -> gate.RunningGateJob:
         job = self.start(suite, path, argv, repo, environment, log, kind=kind)
         self.jobs.append(job)
         return job
@@ -277,7 +281,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     @override
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = super().fixture_configuration(directory)
-        pin_ledger_settings(directory, directory, Path("/dev/shm"))
+        pin_ledger_settings(directory, directory, Path("/tmp").resolve())
         return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
 
     @override
@@ -287,7 +291,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     @override
     def bind_fixture(self, root: Path) -> None:
         super().bind_fixture(root)
-        self.environment["MERGE_GATE_PYTHON"] = sys.executable
+        self.environment["GATE_PYTHON"] = sys.executable
 
     @override
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -300,23 +304,25 @@ class MergeGateLedgerTests(MergeGateFixture):
     def build_fixture(self, root: Path) -> None:
         super().build_fixture(root)
         write_stdlib_tool(self.bin / "basedpyright", LEDGER_TYPE_CHECKER)
-        venv = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "typecheck-venv"
+        venv = Path(self.environment["GATE_STATE_DIR"]) / "typecheck-venv"
         self.write(venv / "bin/python", "")
-        self.write(venv / "gate-requirements.txt", "\n".join(merge_gate.TYPECHECK_REQUIREMENTS) + "\n")
+        self.write(venv / "gate-requirements.txt", "\n".join(gate.TYPECHECK_REQUIREMENTS) + "\n")
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
+        _ = cast(object, self.enterContext(mock.patch.object(gate, "push_nightly_result")))
+        _ = cast(object, self.enterContext(mock.patch.object(gate, "_sweep_nightly_build_folders")))
         # The memory tests measure real processes. The ledger tests need only available capacity.
-        _ = self.enterContext(mock.patch.object(merge_gate, "process_memory_mib", new=fixture_job_memory))
+        _ = self.enterContext(mock.patch.object(gate, "process_memory_mib", new=fixture_job_memory))
         completion = LedgerJobCompletion()
         clock = SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=completion.wait_for_exit)
-        _ = self.enterContext(mock.patch.object(merge_gate, "start_gate_job", new=completion.observe_start))
-        _ = self.enterContext(mock.patch.object(merge_gate, "time", new=clock))
+        _ = self.enterContext(mock.patch.object(gate, "start_gate_job", new=completion.observe_start))
+        _ = self.enterContext(mock.patch.object(gate, "time", new=clock))
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
+        self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.state / "build-targets/aws/cloud-gate-launches.jsonl").is_file())
@@ -334,7 +340,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     def test_dirty_and_failed_runs_do_not_record_a_pass(self) -> None:
         for state in ("tracked", "staged", "untracked", "failed"):
             with self.subTest(state=state):
-                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / state)
+                self.environment["GATE_PASSED_DIR"] = str(self.state / state)
                 self.clear_gate_events()
                 if state == "tracked":
                     self.write(self.checkout / "subject.txt", "edited\n")
@@ -390,7 +396,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_all_modules_started()
         record = self.gate_run_records()[-1]
-        self.assertEqual(record["step"], "merge-gate")
+        self.assertEqual(record["step"], "gate")
         self.assertEqual(record["selection"], "full")
 
     def test_dirty_path_record_keeps_fifty_names_and_the_total(self) -> None:
@@ -468,7 +474,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         original = self.pass_records()[0]
-        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
         for mismatch in ("host", "suites", "dirty"):
             with self.subTest(mismatch=mismatch):
                 record = dict(original)
@@ -487,9 +493,21 @@ class MergeGateLedgerTests(MergeGateFixture):
 
     @gate_suites("lib", "hooks")
     def test_base_search_uses_only_newest_full_same_host_suite_ancestor_and_accepts_legacy_records(self) -> None:
-        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", merge_gate.clean_test_tree(self.checkout),
+        ledger = gate.PassedTreeLedger(self.checkout, "tests-only", gate.clean_test_tree(self.checkout),
                                             sorted(self.suites))
         with mock.patch.dict(os.environ, self.environment):
+            with mock.patch.dict(os.environ, {"HOME": str(self.state / "default-home")}):
+                old = Path.home() / ".local/state/merge-gate"
+                old.mkdir(parents=True)
+                _ = os.environ.pop("GATE_PASSED_DIR", None)
+                with self.assertRaises(land_runs.GateStateMoveRequired):
+                    _ = ledger.path
+                with self.assertRaises(land_runs.GateStateMoveRequired):
+                    _ = gate.push_record_path(self.checkout, "checkpoint", "fixture")
+                os.environ["GATE_PASSED_DIR"] = str(self.state / "explicit-passes")
+                self.assertEqual(ledger.path, self.state / "explicit-passes/passed-trees.jsonl")
+                self.assertEqual(gate.push_record_path(self.checkout, "checkpoint", "fixture").parent,
+                                 self.state / "explicit-passes/push-recovery")
             ledger.record_pass(FullSuite("no certified base"))
             original = self.pass_records()[0]
             _ = original.pop("kind")  # Older full certifications remain usable.
@@ -517,7 +535,7 @@ class MergeGateLedgerTests(MergeGateFixture):
             assert isinstance(selected, CertifiedBase)
             self.assertEqual(selected.commit, head)
 
-    def test_nightly_without_a_build_cache_sends_the_result_and_removes_its_copy(self) -> None:
+    def test_nightly_without_a_build_cache_sends_the_result_and_releases_its_copy(self) -> None:
         from scripts.production import showrunners
 
         _ = self.git(self.checkout, "rm", "Cargo.toml")
@@ -537,7 +555,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertNotEqual(checkout, self.checkout)
         self.assertTrue(checkout.exists())
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
         record = cast(dict[str, object], json.loads(marker.read_text()))
         tree = self.git(self.checkout, "rev-parse", f"{tip}^{{tree}}")
         self.assertEqual(record["tree"], tree)
@@ -556,29 +574,30 @@ class MergeGateLedgerTests(MergeGateFixture):
         before_branches = self.git(self.checkout, "show-ref", "--heads")
         copies: list[Path] = []
         caches: list[Path] = []
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
                 def suite_run(repo: Path, type_dirs: tuple[str, ...], *, module_time_limit_s: float,
-                              full: bool) -> merge_gate.GateRun:
+                              full: bool) -> gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git").is_file())
-                    self.assertEqual(merge_gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
-                    self.assertEqual(merge_gate.checked_git(repo, "status", "--porcelain"), "")
+                    self.assertEqual(gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
+                    self.assertEqual(gate.checked_git(repo, "status", "--porcelain"), "")
                     self.assertTrue(full)
                     self.assertGreater(module_time_limit_s, 0)
                     self.assertEqual(type_dirs, ("scripts",))
                     self.write(repo / "subject.txt", "only the copy changes\n")
                     copies.append(repo)
                     caches.append((repo / "target").resolve())
-                    return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)
+                    return gate.GateRun((gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)
 
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(merge_gate, "run_suites", side_effect=suite_run), \
-                        mock.patch.object(merge_gate, "tell_nightly_red", return_value=merge_gate.NightlyNoticeUnreceived()) as notice, \
-                        mock.patch.object(merge_gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
-                    code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
+                        mock.patch.object(gate, "run_suites", side_effect=suite_run), \
+                        mock.patch.object(gate, "tell_nightly_red", return_value=gate.NightlyNoticeUnreceived()) as notice, \
+                        mock.patch.object(gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
+                    code = gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration",
+                                            "--unit", "fixture-merge"])
                 self.assertEqual(code, int(red), output.getvalue())
                 self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), before_head)
                 self.assertEqual(self.git(self.checkout, "status", "--porcelain"), before_status)
@@ -598,32 +617,31 @@ class MergeGateLedgerTests(MergeGateFixture):
                 else:
                     notice.assert_not_called()
 
-    def test_nightly_without_an_identified_production_runs_in_the_configured_role_pool(self) -> None:
-        from scripts.copies import copies
+    def test_nightly_without_an_identified_production_uses_the_callers_unit(self) -> None:
         from scripts.production import change_review, showrunners
 
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         observed: list[Path] = []
         retained: list[Path] = []
 
-        def suite_run(repo: Path, *_args: object, **_kwargs: object) -> merge_gate.GateRun:
+        def suite_run(repo: Path, *_args: object, **_kwargs: object) -> gate.GateRun:
             observed.append(repo)
             retained.append((repo / "target").resolve().parent)
             lease = cast(dict[str, object], json.loads(repo.with_name(repo.name + ".lease.json").read_text()))
-            self.assertEqual(lease["unit"], "configured-nightly")
+            self.assertEqual(lease["unit"], "fixture-merge")
             self.assertTrue((repo / ".git").is_file())
-            return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", 0, 0, "fixture"),), 0, 0)
+            return gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 0, "fixture"),), 0, 0)
 
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(change_review, "production_doc", side_effect=change_review.ChangeReviewError("none")),
               mock.patch.object(showrunners, "timer_docs", return_value={}),
-              mock.patch.object(copies, "fallback_owner", return_value="configured-nightly"),
-              mock.patch.object(merge_gate, "run_suites", side_effect=suite_run),
+              mock.patch.object(gate, "run_suites", side_effect=suite_run),
               redirect_stdout(io.StringIO())):
-            code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
+            code = gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration",
+                                    "--unit", "fixture-merge"])
         self.assertEqual(code, 0)
         checkout, = observed
-        self.assertEqual(checkout.name, "origin-slot1")
+        self.assertEqual(checkout, self.root / "build/origin/fixture-merge/1")
         self.assertTrue(checkout.exists())
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertEqual(retained[0], checkout)
@@ -644,7 +662,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                 mock.patch.object(showrunners, "timer_docs", return_value={"quiet": production}), \
                 mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \
                 redirect_stdout(output):
-            _ = merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
+            _ = gate.tell_nightly_red(gate.GateArguments(merge_branch="integration"),
                                         "fixture-tree", ["hooks/test_first.py"])
         send.assert_called_once()
         arguments = send.call_args
@@ -654,7 +672,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertIn("could not tell quiet: offline", output.getvalue())
 
     def test_unavailable_ledger_runs_all_modules_and_reports_once(self) -> None:
-        directory = Path(self.environment["MERGE_GATE_PASSED_DIR"])
+        directory = Path(self.environment["GATE_PASSED_DIR"])
         first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         path = directory / "passed-trees.jsonl"
@@ -673,15 +691,15 @@ class MergeGateLedgerTests(MergeGateFixture):
                 self.assert_all_modules_started()
 
     def test_changed_checkout_or_failed_append_cannot_record_a_pass(self) -> None:
-        finish = merge_gate.finish_gate_job
+        finish = gate.finish_gate_job
         for state in ("dirty-at-end", "dirty-at-start", "new-head", "append-fails"):
             with self.subTest(state=state):
-                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / state)
+                self.environment["GATE_PASSED_DIR"] = str(self.state / state)
                 self.clear_gate_events()
                 if state == "dirty-at-start":
                     self.write(self.checkout / "subject.txt", "temporary edit\n")
 
-                def finish_and_change(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+                def finish_and_change(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
                     result = finish(job, status)
                     if state == "dirty-at-end":
                         self.write(self.checkout / "subject.txt", "edit during run\n")
@@ -691,15 +709,15 @@ class MergeGateLedgerTests(MergeGateFixture):
                         self.write(self.checkout / "subject.txt", "new commit during run\n")
                         _ = self.commit(self.checkout, "changed during tests")
                     else:
-                        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+                        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
                         path.unlink()
                         path.mkdir()
                     return result
 
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(merge_gate, "finish_gate_job", side_effect=finish_and_change), redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout)
+                        mock.patch.object(gate, "finish_gate_job", side_effect=finish_and_change), redirect_stdout(output):
+                    run = gate.run_suites(self.checkout)
                 self.assertTrue(run.passed, output.getvalue())
                 self.assertEqual(len(run.jobs), 1)
                 if state == "append-fails":

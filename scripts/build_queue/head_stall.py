@@ -77,6 +77,7 @@ class HeadStall:
     quiet: float
     holders: tuple[Holder, ...]
     compiler_scan: CompilerScan
+    build_space: records.BuildSpaceHold | records.NoBuildSpaceHold = records.NoBuildSpaceHold()
 
 
 @dataclass(frozen=True)
@@ -176,22 +177,38 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
     return CompilerScanCountUnavailable()
 
 
-def find_stall(decision: records.QueueExplanation, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
+def find_stall(sample: records.QueueExplanation | QueueSnapshot, admitted: float,
+               now: float, limit: float) -> HeadStall | NoStall:
+    decision = gate.queue_read_from(sample.inputs, sample.policy).explanation if isinstance(sample, QueueSnapshot) else sample
+    inputs = decision.decided_from
+    disk_hold = inputs.build_space
+    if isinstance(disk_hold, records.BuildSpaceHold):
+        excluded = inputs.landing_test_waits | inputs.pending_remote_starts
+        eligible = [(path, row) for path, row in inputs.ordered if gate.can_use_natedev(row)
+                    and records.waiter_owner(row) not in excluded]
+        local = gate.first_queued_waiter((row for _, row in eligible), frozenset())
+        if not isinstance(local, gate.QueuedWaiter):
+            return NoStall()
+        selected = replace(inputs, ordered=[(path, row) for path, row in eligible if row is local.waiter])
+        decision = gate.queue_read_from(selected, decision.policy).explanation
     head = decision.head
     if not isinstance(head, records.HeadExplanation) or head.cause == records.ADMISSION_DECISION_PENDING:
         return NoStall()
-    inputs = decision.decided_from
     last_running_start = max((step.started_at for step in inputs.running if step.promise > 0), default=0.0)
     last_start = max(admitted, last_running_start)
+    if isinstance(disk_hold, records.BuildSpaceHold) and not last_start:
+        last_start = head.waiter.since
     quiet = now - last_start
     waited = now - head.waiter.since
     if quiet < limit or waited < limit:
         return NoStall()
 
+    head_room = head.room if isinstance(decision.room, records.MemoryRoom) else decision.room
+    if isinstance(disk_hold, records.BuildSpaceHold):
+        return HeadStall(last_start, head, head_room, waited, quiet, (), CompilerScanCountUnavailable(), disk_hold)
     holders = memory_holders(decision, now)
     if not holders:
         return NoStall()
-    head_room = head.room if isinstance(decision.room, records.MemoryRoom) else decision.room
     return HeadStall(last_start, head, head_room, waited, quiet, holders, _compiler_scan(inputs.running))
 
 
@@ -263,6 +280,9 @@ def builds_text(stall: HeadStall) -> str:
     waiter = stall.head.waiter
     lines = [f"The build queue head has waited {stall.waited / 60:.0f} min. No step started for {stall.quiet / 60:.0f} min.",
              f"Head: {waiter.step or 'step'} in {_folder_name(waiter.folder)} (pid {waiter.pid}) needs {gib(waiter.need)}."]
+    if isinstance(stall.build_space, records.BuildSpaceHold):
+        lines.append(records.build_space_text(stall.build_space) + ".")
+        return "\n".join(lines)
     room = stall.room
     if isinstance(room, records.RoomCheck):
         lines.append(f"Admission room: {gib(room.room)} for {gib(room.need)} of need.")

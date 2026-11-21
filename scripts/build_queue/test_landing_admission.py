@@ -56,12 +56,12 @@ def local_test_clone(root: Path, source_name: str = "source", upstream: str = RE
 
 
 def running_gate_request(fixture: AdmissionFixture, *, run: bool = False) -> wire.AdmitRequest:
-    request = fixture.request(step="merge-gate", need=GIB)
-    profile = records.ProgramProfile("merge-gate", "fixture", request.cwd,
+    request = fixture.request(step="gate", need=GIB)
+    profile = records.ProgramProfile("gate", "fixture", request.cwd,
         records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now()))
     identity = wire.RunIdentity(request.owner.pid, request.owner.start_time) if run else wire.NO_RUN
     with patch.object(client, "CLOCK", fixture.clock):
-        request = client.step_request(["merge-gate"], request.cwd, request.owner, request.since, "",
+        request = client.step_request(["gate"], request.cwd, request.owner, request.since, "",
                                       request.episode, profile, run=identity)
     return replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY))
 
@@ -84,9 +84,9 @@ class LandingAdmissionTests(unittest.TestCase):
                   land_runs.landing([COMMIT], ["builds bb15"])):
                 config = fixture.root / "build_steps.conf"
                 _ = config.write_text(f"names.{key}={step}\nowned.default={{unit}} {{step}}\n")
-                running = running_gate_request(fixture)
-                self.assertEqual(running.run, wire.NO_RUN)
-                command = ("python3", "/fixture/merge_gate.py", "--unit", "builds", *options)
+                running = running_gate_request(fixture, run=True)
+                self.assertEqual(running.run, wire.RunIdentity(running.owner.pid, running.owner.start_time))
+                command = ("python3", "/fixture/gate.py", "--unit", "builds", *options)
                 _ = (fixture.proc.path / str(running.owner.pid) / "cmdline").write_text("\0".join(command) + "\0")
                 grant = only_admitted(fixture.connect(running).replies())
                 peer = fixture.connect(request_behind_gate(fixture))
@@ -114,7 +114,7 @@ class LandingAdmissionTests(unittest.TestCase):
 
     def test_a_copy_first_step_has_the_landing_reference_before_its_child_starts(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
-            fixture.configure(**{"program_first_peak_gib.merge-gate": 4.0})
+            fixture.configure(**{"program_first_peak_gib.gate": 4.0})
             queue_land()
 
             def admit(refreshed: queue_place.RefreshedRequest, _output: client.WaitOutput) -> wire.Admitted:
@@ -126,7 +126,7 @@ class LandingAdmissionTests(unittest.TestCase):
                 self.assertIn(reference, land_runs.running_test_references())
                 return grant
 
-            command = ("python3", "/fixture/merge_gate.py", "--merge-branch", "merge", "--unit-branch", "topic",
+            command = ("python3", "/fixture/gate.py", "--merge-branch", "merge", "--unit-branch", "topic",
                        "--checkpoint", COMMIT, "--previous-checkpoint", "b" * 40, "--unit", "queue", "--phase", "44eb")
             with (patch.object(client, "CLOCK", fixture.clock),
                   patch.object(repository, "repository_key", return_value=REPOSITORY.key),
@@ -137,10 +137,10 @@ class LandingAdmissionTests(unittest.TestCase):
                     self.assertIsInstance(admission.grant, wire.Admitted)
                     admission.handoff(fixture.root)
                     fixture.allow_next_start()
-                    child = fixture.request(step="merge-gate", need=GIB)
+                    child = fixture.request(step="gate", need=GIB)
                     sizing = records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now())
-                    profile = records.ProgramProfile("merge-gate", "fixture", child.cwd, sizing)
-                    child = client.step_request(["merge-gate"], child.cwd, child.owner, child.since, "",
+                    profile = records.ProgramProfile("gate", "fixture", child.cwd, sizing)
+                    child = client.step_request(["gate"], child.cwd, child.owner, child.since, "",
                                                 child.episode, profile)
                     fixture.release(only_admitted(fixture.connect(child).replies()))
             self.assertFalse(land_runs.running_test_references())
@@ -474,7 +474,7 @@ class LandingAdmissionTests(unittest.TestCase):
             clone = local_test_clone(fixture.root)
             queue_land()
             requests: list[wire.AdmitRequest] = []
-            for index, step in enumerate(("merge-gate", "targeted-test", "test", "t")):
+            for index, step in enumerate(("gate", "test-affected", "test", "t")):
                 request = fixture.request(need=GIB, step=step, since=fixture.clock.now() - 40 + index)
                 requests.append(replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY)))
             peers = [fixture.connect(request) for request in reversed(requests)]
@@ -500,14 +500,14 @@ class LandingAdmissionTests(unittest.TestCase):
             with patch.object(land_runs, "process_start", return_value=Started("10")):
                 self.assertEqual(land_queue.take_next(123), "builds first")
                 with land_runs.landing([COMMIT]):
-                    request = fixture.request(need=GIB, step="merge-gate")
+                    request = fixture.request(need=GIB, step="gate")
                     sizing = records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now())
-                    profile = records.ProgramProfile("merge-gate", "fixture", request.cwd, sizing)
+                    profile = records.ProgramProfile("gate", "fixture", request.cwd, sizing)
                     transport = ScriptedTransport(fixture.clock, Exchange(reply_bytes(admitted_reply())))
                     with (patch.object(client, "CLOCK", fixture.clock),
                           patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
                           patch.object(client, "DefaultSelector", side_effect=transport.selector)):
-                        landing = client.step_request(["merge-gate"], str(clone), request.owner, request.since,
+                        landing = client.step_request(["gate"], str(clone), request.owner, request.since,
                                                       "", request.episode, profile)
                         _ = client.admit(landing, lambda reply: self.fail(str(reply.reason)), lambda: landing)
                     sent, = transport.requests
@@ -529,7 +529,7 @@ class LandingAdmissionTests(unittest.TestCase):
     def test_cloud_work_reports_the_landing_wait_and_yields_the_slot(self) -> None:
         with AdmissionFixture() as fixture, patch.object(land_runs, "process_start", return_value=Started("10")):
             queue_land()
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             request = replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY),
                               place=wire.CloudPlace("aws"))
             wait, = fixture.connect(request).replies()
@@ -546,7 +546,7 @@ class LandingAdmissionTests(unittest.TestCase):
             self.assertEqual(work.state, WAIT_TEXT)
             _ = land_queue.take_next(123)
             with land_runs.landing([COMMIT]):
-                landing = fixture.request(step="merge-gate")
+                landing = fixture.request(step="gate")
                 identity = replace(landing.identity, landing_test=land_runs.test_reference(),
                                    landing_repository=LANDING_REPOSITORY)
                 landing = replace(landing, identity=identity, profile=request.profile, place=request.place)

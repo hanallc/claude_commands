@@ -22,8 +22,16 @@ require_checkout(Path(__file__))
 
 
 SCRIPTS = Path(__file__).resolve().parent
-CARGO_STUB = """import json, os, sys
+CARGO_STUB = """import fcntl, json, os, sys
 from pathlib import Path
+if lock := os.environ.get('CHECK_CARGO_OUTPUT_LOCK'):
+    with open(lock, 'rb') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise SystemExit('Cargo started without the output lock')
 Path(os.environ['CARGO_LOG']).write_text(json.dumps({
     'argv': sys.argv[1:], 'cwd': os.getcwd(),
     'env': os.environ['CARGO_TEST_VALUE'], 'stdin': sys.stdin.read(),
@@ -59,6 +67,19 @@ elif status == 2:
     print('hold state cannot be read', file=sys.stderr)
 sys.exit(status)
 """
+FOLDER_STUB = """import os, sys
+from pathlib import Path
+with Path(os.environ['FOLDER_LOG']).open('a') as stream:
+    stream.write('checked\\n')
+status = int(os.environ.get('FOLDER_EXIT', '0'))
+if not status and sys.argv[1:2] == ['--exec-checked']:
+    route, program, *arguments = sys.argv[2:]
+    if route == 'queue':
+        queue = Path(__file__).parent.parent / 'build_queue/queue_place.py'
+        os.execv(sys.executable, [sys.executable, str(queue), '--', program, *arguments])
+    os.execv(program, [program, *arguments])
+sys.exit(status)
+"""
 
 
 class CargoWrapperTest(unittest.TestCase):
@@ -79,6 +100,7 @@ class CargoWrapperTest(unittest.TestCase):
     hold_log: Path = Path()
     python_log: Path = Path()
     queue_log: Path = Path()
+    folder_log: Path = Path()
     env: dict[str, str] = {}
 
     @override
@@ -95,6 +117,7 @@ class CargoWrapperTest(unittest.TestCase):
         self.installer = self.wrapper.with_name("install_cargo_wrapper.sh")
         _ = shutil.copy2(SCRIPTS / self.installer.name, self.installer)
         _ = self.wrapper.with_name("hold_applies.py").write_text(HOLD_STUB)
+        _ = self.wrapper.with_name("cargo_folder.py").write_text(FOLDER_STUB)
         queue = self.root / "build_queue"
         queue.mkdir()
         _ = (queue / "queue_place.py").write_text(QUEUE_STUB)
@@ -130,6 +153,7 @@ class CargoWrapperTest(unittest.TestCase):
         self.hold_log = self.root / "hold.log"
         self.python_log = self.root / "python.log"
         self.queue_log = self.root / "queue.json"
+        self.folder_log = self.root / "folder.log"
         self.env = {
             "HOME": str(self.home),
             "PATH": os.pathsep.join(map(str, (self.front, self.real_bin, self.tools))),
@@ -144,6 +168,7 @@ class CargoWrapperTest(unittest.TestCase):
             "HOLD_LOG": str(self.hold_log),
             "PYTHON_LOG": str(self.python_log),
             "QUEUE_LOG": str(self.queue_log),
+            "FOLDER_LOG": str(self.folder_log),
             "CARGO_TEST_VALUE": "spaces and $variables ${HOME} $$",
         }
 
@@ -153,7 +178,7 @@ class CargoWrapperTest(unittest.TestCase):
         path.chmod(0o755)
 
     def invoke(self, *args: str) -> subprocess.CompletedProcess[str]:
-        for log in (self.cargo_log, self.scope_log, self.hold_log, self.python_log, self.queue_log):
+        for log in (self.cargo_log, self.scope_log, self.hold_log, self.python_log, self.queue_log, self.folder_log):
             log.unlink(missing_ok=True)
         return subprocess.run(
             [str(self.front / "cargo"), *args], env=self.env, cwd=self.cwd,
@@ -211,6 +236,108 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertEqual(done.stdout, "cargo stdout\n")
                 self.assertEqual(done.stderr, "cargo stderr\n")
 
+    def test_full_clean_runs_the_folder_helper_before_cargo(self) -> None:
+        _ = self.cgroup.write_text("0::/user.slice/builds.slice/run-42.scope\n")
+        self.env["CARGO_FOLDER_CHECKED"] = "1"
+        args = ["clean"]
+        for status in ("0", "1", "3"):
+            with self.subTest(status=status):
+                self.env["FOLDER_EXIT"] = status
+                done = self.invoke(*args)
+                self.assertEqual(done.returncode, 1 if status == "1" else 0, done.stderr)
+                self.assertTrue(self.folder_log.exists())
+                self.assertFalse(self.queue_log.exists())
+                if status == "3":
+                    self.assert_cargo(args)
+                else:
+                    self.assertFalse(self.cargo_log.exists())
+
+    def test_narrowed_clean_goes_directly_to_cargo(self) -> None:
+        self.env["FOLDER_EXIT"] = "1"
+        for options in (["-Z", "unstable-options"], ["--manifest-path", "Cargo.toml"], ["-p", "crate"], ["-pcrate"], ["--package=crate"], ["--doc"], ["--release"],
+                        ["--profile", "dev"], ["--target=aarch64-unknown-linux-gnu"],
+                        ["--target-dir", "somewhere"], ["--dry-run"], ["--help"]):
+            with self.subTest(options=options):
+                args = ["clean", *options]
+                done = self.invoke(*args)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertFalse(self.folder_log.exists())
+                self.assertFalse(self.queue_log.exists())
+                self.assert_cargo(args)
+
+    def test_fast_path_keeps_the_output_lock_through_cargo_exec(self) -> None:
+        for name in ("hostname", "flock", "stat", "touch"):
+            executable = shutil.which(name)
+            if executable is None:
+                self.skipTest(f"{name} is unavailable")
+            (self.tools / name).symlink_to(executable)
+        workspace = self.root / "workspace"
+        build = self.root / "build"
+        self.cwd = workspace / "origin/demo/director"
+        self.cwd.mkdir(parents=True)
+        common_git = self.root / "checkout.git"
+        git_dir = common_git / "worktrees/director"
+        git_dir.mkdir(parents=True)
+        _ = (self.cwd / ".git").write_text(f"gitdir: {git_dir}\n")
+        _ = (git_dir / "commondir").write_text("../..\n")
+        git_config = common_git / "config"
+        _ = git_config.write_text("[remote \"origin\"]\nurl = /repos/origin.git\n")
+        manifest = self.cwd / "Cargo.toml"
+        usual_manifest = "[workspace]\nmembers = []\n"
+        _ = manifest.write_text(usual_manifest)
+        output = build / "origin/demo/director"
+        output.mkdir(parents=True)
+        lock = output.with_suffix(".lock")
+        lock.touch()
+        (self.cwd / "target").symlink_to(output, target_is_directory=True)
+        config = self.home / ".claude/config"
+        config.mkdir(parents=True)
+        _ = (config / "build_folders.conf").write_text(f"roots.workspace={workspace}\nroots.build={build}\n")
+        stamp = output / ".lint-sweep-used"
+        self.env["FOLDER_EXIT"] = "1"
+        for evidence in (None, f"{workspace}/other\n", f"{self.cwd}\nextra\n",
+                         f"{self.cwd}\0\n", f"{self.cwd}\n\0", str(self.cwd)):
+            with self.subTest(evidence=evidence):
+                if evidence is not None:
+                    _ = stamp.write_text(evidence)
+                result = self.invoke("build")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue(self.folder_log.is_file())
+                self.assertFalse(self.cargo_log.exists())
+        _ = stamp.write_text(f"{self.cwd}\n")
+        before = stamp.stat()
+        os.utime(git_config, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        result = self.invoke("build")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertTrue(self.folder_log.is_file())
+        self.assertFalse(self.cargo_log.exists())
+        os.utime(git_config, ns=(before.st_atime_ns, before.st_mtime_ns - 1_000_000_000))
+        for setting in ('package = { workspace = "../.." }\n', 'package."workspace" = "../.."\n'):
+            with self.subTest(setting=setting):
+                _ = manifest.write_text(setting)
+                result = self.invoke("build")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue(self.folder_log.is_file())
+                self.assertFalse(self.cargo_log.exists())
+        _ = manifest.write_text(usual_manifest)
+        self.env["CHECK_CARGO_OUTPUT_LOCK"] = str(lock)
+        for runtime in (self.runtime, self.root / "no-bus"):
+            self.env["XDG_RUNTIME_DIR"] = str(runtime)
+            result = self.invoke("build")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self.folder_log.exists())
+            self.assertTrue((output / ".lint-sweep-used").is_file())
+            self.assert_cargo(["build"])
+
+    def test_clean_with_toolchain_or_global_option_goes_to_cargo(self) -> None:
+        self.env["FOLDER_EXIT"] = "1"
+        for args in (["+missing", "clean"], ["-Zinvalid", "clean"], ["-C", ".", "clean"]):
+            with self.subTest(args=args):
+                result = self.invoke(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.folder_log.exists())
+                self.assert_cargo(args)
+
     def test_toolchain_and_options_before_subcommand(self) -> None:
         for args in (
             ["+nightly", "build"], ["-C", "dir", "test"],
@@ -235,6 +362,23 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertFalse(self.hold_log.exists())
         self.assertFalse(self.python_log.exists())
         self.assertFalse(self.queue_log.exists())
+        self.assertFalse(self.folder_log.exists())
+
+    def test_layout_refusal_stops_before_queue_admission(self) -> None:
+        self.env["FOLDER_EXIT"] = "1"
+        result = self.invoke("test")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.folder_log.read_text(), "checked\n")
+        self.assertFalse(self.queue_log.exists())
+        self.assertFalse(self.cargo_log.exists())
+
+    def test_install_and_nested_cargo_skip_the_folder_check(self) -> None:
+        self.env["FOLDER_EXIT"] = "1"
+        self.assertEqual(self.invoke("install", "crate").returncode, 0)
+        self.assertFalse(self.folder_log.exists())
+        self.env["CARGO_FOLDER_CHECKED"] = "1"
+        self.assertEqual(self.invoke("test").returncode, 0)
+        self.assertFalse(self.folder_log.exists())
 
     def test_hold_refuses_build(self) -> None:
         _ = (self.hold / "holder").write_text("held")
@@ -317,7 +461,8 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_cargo(["build"])
         self.assertFalse(self.queue_log.exists())
-        self.assertFalse(self.python_log.exists())
+        self.assertTrue(self.folder_log.exists())
+        self.assertFalse(self.hold_log.exists())
 
     def test_skips_all_paths_that_resolve_to_wrapper(self) -> None:
         alias = self.root / "alias"
