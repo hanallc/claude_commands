@@ -194,6 +194,7 @@ scripts/lib/test_build_slots.py
 scripts/lib/test_cargo_seed.py
 scripts/lib/test_py_root.py
 scripts/lib/test_session_move.py
+scripts/lib/test_zone.py
 scripts/lint/test_invoke_scope.py
 scripts/lint/test_memory_admit.py
 scripts/lint/test_memory_gate_wait.py
