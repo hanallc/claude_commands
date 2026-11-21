@@ -5,6 +5,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
+from typing import cast
+import unittest
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
@@ -110,6 +113,48 @@ if sys.argv[1] == "fmt":
         _ = shutil.copy2(lint, target)
         _ = self.stub("taplo", "pass\n")
         self.environment["VALIDATE_QUICK"] = "1"
+
+    @unittest.skipUnless(sys.platform == "linux", "requires a Linux process start")
+    def test_full_validation_shares_one_run_place_with_local_ci(self) -> None:
+        calls = self.root / "ci-steps"
+        record = f'''import json, os, sys
+from pathlib import Path
+with Path({str(calls)!r}).open("a") as log:
+    log.write(json.dumps([Path(sys.argv[0]).name, sys.argv[1:], os.getppid(),
+                          os.environ.get("BUILDLOG_RUN", "")]) + "\\n")
+'''
+        lint = self.stub("lint", record)
+        installed = self.home / ".claude/scripts/lint/lint"
+        installed.parent.mkdir(parents=True)
+        _ = shutil.copy2(lint, installed)
+        _ = self.stub("taplo", record)
+        _ = self.stub("record-ci-step", record)
+        target = "x86_64-pc-windows-gnu"
+        _ = self.stub("rustup", f"print({target!r})\n")
+        _ = self.write(self.repo / ".claude/config/cross_targets", target + "\n")
+        _ = self.write(self.repo / ".claude/config/local_ci.sh", "record-ci-step first\nrecord-ci-step second\n")
+        self.seed()
+        _ = self.environment.pop("BUILDLOG_RUN", None)
+
+        result = self.script("validate_and_push/validate_ci.sh")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [cast(tuple[str, list[str], int, str], json.loads(line)) for line in calls.read_text().splitlines()]
+        self.assertEqual([(tool, args) for tool, args, _, _ in rows], [
+            ("lint", ["mend", "--workspace", "--fix"]),
+            ("lint", ["fmt"]),
+            ("taplo", ["fmt"]),
+            ("lint", ["clippy", "--workspace", "--all-features"]),
+            ("lint", ["clippy", "--workspace", "--all-features", "--target", target]),
+            ("lint", ["doc", "--workspace", "--all-features"]),
+            ("lint", ["nextest", "--workspace", "--all-features", "--tests"]),
+            ("lint", ["mend", "--workspace", "--fail-on-warn"]),
+            ("record-ci-step", ["first"]),
+            ("record-ci-step", ["second"]),
+        ])
+        _, _, owner, run = rows[0]
+        self.assertRegex(run, rf"^{owner}:[0-9]+$")
+        self.assertEqual({step_run for _, _, _, step_run in rows}, {run})
 
     def test_a_synced_default_branch_retries_its_failed_post_push_hook(self) -> None:
         hook = '''#!/usr/bin/env bash

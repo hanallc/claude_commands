@@ -221,20 +221,29 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
         except ProcessLookupError:
             pass
 
-    def test_mac_startup_reads_no_proc_and_creates_no_run_identity(self) -> None:
+    def test_startup_keeps_an_inherited_run_identity(self) -> None:
         with AdmissionFixture() as fixture:
-            script = self.script(fixture)
-            shim = fixture.root / "scripts/lib/py"
-            shim.unlink()
-            _ = shim.write_text(python_tool_source('''import os, sys
-if sys.argv[2:3] == ["start"]:
-    raise SystemExit("Mac startup requested a process start time")
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-'''))
-            shim.chmod(0o755)
-            process = self.start(script, "mac", OSTYPE="darwin23")
-            probe = self.probe(process)
-            self.assertEqual(probe["run"], "")
+            inherited = "321:987654"
+            process = self.start(self.script(fixture), "inherited", BUILDLOG_RUN=inherited)
+            self.assertEqual(self.probe(process)["run"], inherited)
             self.proceed(process)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_non_linux_startup_reads_no_proc_and_creates_no_run_identity(self) -> None:
+        for os_type in ("darwin23", "freebsd14"):
+            with self.subTest(os_type=os_type), AdmissionFixture() as fixture:
+                script = self.script(fixture)
+                shim = fixture.root / "scripts/lib/py"
+                shim.unlink()
+                _ = shim.write_text(python_tool_source('''import os, sys
+if sys.argv[2:3] == ["start"]:
+    raise SystemExit("Non-Linux startup requested a process start time")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+'''))
+                shim.chmod(0o755)
+                process = self.start(script, "non-linux", OSTYPE=os_type)
+                self.assertEqual(self.probe(process)["run"], "")
+                self.proceed(process)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, 0, output + errors)

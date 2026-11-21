@@ -1540,12 +1540,9 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != 
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
-if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
-    BUILDLOG_RUN_START="$(verify_helper "$STEP_RECORD_SCRIPT" start "$$")"
-    if [[ -n "$BUILDLOG_RUN_START" ]]; then
-        export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
-    fi
-fi
+# shellcheck source=/dev/null
+source "$VERIFY_START_DIR/../lib/buildlog_run.sh"
+buildlog_initialize_run verify_helper "$STEP_RECORD_SCRIPT"
 
 shift
 if [[ "$CMD" == example-test ]]; then
