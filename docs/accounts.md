@@ -630,7 +630,10 @@ It also records waits, failures, and renewed room.
 
 ## Automatic group rules
 
-The account moves log on natedev holds ordered, one-shot moves for Claude groups and Codex workers in `~/.local/state/accounts/next_moves.json`. Use `/account_moves` in ordinary words, or:
+The Accounts page shows the next move for each selected group.
+Use its `next` control to set the first move for a Claude group.
+Natedev stores the ordered moves for Claude groups and Codex workers in `~/.local/state/accounts/next_moves.json`.
+Use `accounts.py next` for workers, holds, and changes to later entries.
 
 ```sh
 accounts.py next add units 1 claude4 --hold-minutes 30

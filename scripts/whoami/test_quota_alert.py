@@ -28,7 +28,7 @@ from scripts.message import send_budget
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush
-from scripts.notify.user_action import ActionRequired, NoActionRequired
+from scripts.notify.user_action import NoActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -155,11 +155,9 @@ always=always-there
             self.assertEqual(len(self.noted), 0 if minute == 0 else 1)
         push = self.noted[0]
         self.assertEqual(push.id, "quota.codex_next_move")
-        self.assertEqual(push.title, "codex1 Codex workers will use paid credits")
-        self.assertEqual(push.body,
-            "codex1 has 2% of its weekly usage left, and no move is set up for its workers. When it runs out, they spend its paid credits, then move to Claude. Nothing is needed.")
-        self.assertEqual(push.action, ActionRequired(
-            "Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to Claude"))
+        self.assertEqual(push.title, "codex1 has 2% left; paid credits next")
+        self.assertEqual(push.body, "")
+        self.assertEqual(push.action, NoActionRequired())
         self.assertEqual(self.sent, [])
         _ = self.alert([self.note("codex1.md", "active", "80")], self.now + timedelta(minutes=34))
         self.sent.clear()  # Restoration notices remain in Phase54.
