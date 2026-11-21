@@ -355,7 +355,8 @@ class SnapshotCodecTests(unittest.TestCase):
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
         snapshot = wait_reply(records.NeedsMemory()).snapshot
         reasons: list[records.WaitReason] = [*causes.values(), records.TokenWaitingWaiter(1000.0),
-                                             records.NatedevHeld("fps", "Phase 3 timing"), records.WaitsForLandingTest()]
+                                             records.NatedevHeld("fps", "Phase 3 timing"),
+                                             records.WaitsForLandingTest("natemerge integrate")]
         reasons += [snapshot_with_head_cause(snapshot, cause).head_reason for cause in causes.values()]
         self.assertEqual({type(reason) for reason in reasons}, set(get_args(records.WaitReason)))
         for revision in OLDER_CLIENTS:
@@ -373,6 +374,8 @@ class SnapshotCodecTests(unittest.TestCase):
                         legacy = isinstance(cause, (records.GpuSlotWait, records.NatedevHeld,
                             records.WaitsForLandingTest, placement.CargoFolderWait))
                         self.assertEqual(type(older_cause).__name__, "BehindHead" if legacy else type(cause).__name__)
+                        if isinstance(cause, records.WaitsForLandingTest):
+                            self.assertEqual(cast(str, getattr(older_cause, "head_name")), cause.gate_name)
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
         held = records.NatedevHeld("fps", "Phase 3 timing")

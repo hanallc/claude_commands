@@ -13,6 +13,7 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --landing-wait as the third argument for the queued reason proof.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -51,7 +52,8 @@ if (gateMode) args.shift();
 const [callerFolder, previousPage, comparison] = args;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const focusedProof = verifyCallProof || buildToolsProof;
+const landingWaitProof = previousPage === '--landing-wait';
+const focusedProof = verifyCallProof || buildToolsProof || landingWaitProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
@@ -259,6 +261,64 @@ try {
           fitLabels();
           })()`);
         };
+        if (landingWaitProof) {
+          const reading = structuredClone(base);
+          const running = reading.walk.find(row => row.queued && !row.ci);
+          Object.assign(running, {name:'builds bb15', unit:'natemerge', showrunner:'natemerge',
+            title:{unit:'natemerge',step:'integrate'}, machine:'natedev'});
+          reading.walk = [running];
+          const waiting = reading.waiters[0];
+          const reason = 'waits for natemerge integrate';
+          Object.assign(waiting, {name:'queue nextest', unit:'queue', showrunner:'builds',
+            why:'gate job', reason, need:4, targets:['natedev']});
+          reading.waiters = [waiting];
+          reading.ram.build_tools_bytes = 0;
+          servedReading = reading;
+          await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          const result = await evaluate(`(() => {
+            const running = document.querySelector('.wrow[data-run]');
+            const waiting = document.querySelector('.wrow.wait');
+            const note = waiting.querySelector('.wait-note');
+            const bar = waiting.querySelector('.waitb').getBoundingClientRect();
+            const bounds = note?.getBoundingClientRect();
+            const left = Math.floor(running.getBoundingClientRect().left) - 8;
+            const top = Math.floor(running.getBoundingClientRect().top + scrollY) - 6;
+            const bottom = Math.ceil(waiting.getBoundingClientRect().bottom + scrollY) + 6;
+            return {
+              text:note?.textContent, oneLine:note && getComputedStyle(note).whiteSpace === 'nowrap',
+              fits:note && note.scrollWidth <= note.clientWidth,
+              inGap:bounds && bounds.left >= waiting.querySelector('.row-label').getBoundingClientRect().right
+                && bounds.right <= bar.left + 1,
+              clip:{x:left,y:top,width:innerWidth-2*left,height:bottom-top,scale:1}
+            };
+          })()`);
+          assert.equal(result.text, reason);
+          assert.ok(result.oneLine && result.fits && result.inGap, JSON.stringify(result));
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
+          await writeFile(join(folder,'builds-waits-for-natemerge-integrate-dark.png'),Buffer.from(shot.data,'base64'));
+
+          const longReason = 'waits for the build in the same Cargo folder '.repeat(12).trim();
+          Object.assign(waiting, {why:'the build in the same Cargo folder',reason:longReason,need:reading.total});
+          await call('Emulation.setDeviceMetricsOverride',{width:390,height:1000,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          const long = await evaluate(`(() => {
+            const row = document.querySelector('.wrow.wait');
+            const note = row.querySelector('.wait-note');
+            const style = getComputedStyle(note);
+            showTip(row.dataset.tip,innerWidth/2,700);
+            const reason = document.querySelector('#tip dd.reason');
+            const tooltip = reason.closest('.tip');
+            return {ellipsis:style.textOverflow === 'ellipsis' && style.whiteSpace === 'nowrap'
+                && note.clientWidth > 0 && note.scrollWidth > note.clientWidth,
+              reason:reason.textContent,tooltipFits:reason.scrollWidth <= reason.clientWidth
+                && tooltip.scrollWidth <= tooltip.clientWidth
+                && tooltip.getBoundingClientRect().right <= innerWidth};
+          })()`);
+          assert.deepEqual(long,{ellipsis:true,reason:longReason,tooltipFits:true});
+          console.log(JSON.stringify({pass:true,views:2,reason,output:folder}));
+          break browserProof;
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
@@ -1555,13 +1615,16 @@ try {
             const folderWait = await evaluate(`(() => {
               const tip = proofTip('wait', 0);
               const row = document.querySelector('.wrow.wait[data-tip="' + tip + '"]');
-              const result={note:row.querySelector('.wait-note')?.textContent,reason:tipText(tip,latest)[1]};
+              const note = row.querySelector('.row-memory .wait-note');
+              const result={note:note?.textContent,oneLine:note && getComputedStyle(note).whiteSpace === 'nowrap',
+                reason:tipText(tip,latest)[1]};
               if (!${comparisonImages}) return result;
               row.scrollIntoView({block:'center'});
               const box = row.getBoundingClientRect();
               return {...result,clip:{x:box.x+scrollX,y:box.y+scrollY,width:box.width,height:box.height,scale:1}};
             })()`);
             assert.equal(folderWait.note, 'waits for the build in the same Cargo folder');
+            assert.equal(folderWait.oneLine, true);
             assert.match(folderWait.reason, /the build in the same Cargo folder/);
             if (theme === 'dark' && width === 1400) {
               await saveScreenshot('cargo-folder-dark-desktop',{captureBeyondViewport:true,clip:folderWait.clip});

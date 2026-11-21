@@ -299,7 +299,7 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
         elif wait.get("kind") == "CargoFolderWait":
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
         elif wait.get("kind") == "WaitsForLandingTest":
-            head, suffix = "the merge test", LANDING_TEST_SUFFIX
+            head, suffix = str(wait["gate_name"]), LANDING_TEST_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}

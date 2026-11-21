@@ -30,7 +30,7 @@ from scripts.production import land_queue, land_runs
 REPOSITORY = records.RepositoryIdentity("https://github.com/natepiano/claude_commands", "claude_commands")
 LANDING_REPOSITORY = wire.LandingRepositoryKey(REPOSITORY.key)
 COMMIT = "a" * 40
-WAIT_TEXT = "waits for the merge test"
+WAIT_TEXT = "waits for the landing queue"
 
 
 class LandingWaitObserved(Exception):
@@ -55,6 +55,35 @@ def local_test_clone(root: Path, source_name: str = "source", upstream: str = RE
 
 
 class LandingAdmissionTests(unittest.TestCase):
+    def test_wait_names_the_live_gate_job_from_its_command_and_configuration(self) -> None:
+        for options, key, step in (((), "integrate", "integrate"), (("--tests-only",), "test-all", "test all")):
+            with (self.subTest(options=options), AdmissionFixture(skip_idle_spacing=True) as fixture,
+                  land_runs.landing([COMMIT], ["builds bb15"])):
+                config = fixture.root / "build_steps.conf"
+                _ = config.write_text(f"names.{key}={step}\nowned.default={{unit}} {{step}}\n")
+                running = fixture.request(step="merge-gate", need=GIB)
+                command = ("python3", "/fixture/merge_gate.py", "--unit", "builds", *options)
+                _ = (fixture.proc.path / str(running.owner.pid) / "cmdline").write_text("\0".join(command) + "\0")
+                running = replace(running, run=wire.RunIdentity(running.owner.pid, running.owner.start_time),
+                    identity=replace(running.identity, unit="natemerge", landing_test=land_runs.test_reference(),
+                                     landing_repository=LANDING_REPOSITORY))
+                grant = only_admitted(fixture.connect(running).replies())
+                waiting = fixture.request(step="test", need=GIB)
+                waiting = replace(waiting, identity=replace(waiting.identity, unit="queue",
+                    landing_repository=LANDING_REPOSITORY))
+                peer = fixture.connect(waiting)
+                reply, = peer.replies()
+                assert isinstance(reply, wire.Wait), reply
+                self.assertEqual(reply.text, f"waits for natemerge {step}")
+
+                _ = config.write_text(f"names.{key}=check the batch\nowned.default={{unit}} {{step}}\n")
+                _ = fixture.run_pass()
+                view, = fixture.connect(wire.ViewRequest()).replies()
+                assert isinstance(view, wire.ViewReply)
+                row, = view.reading.view.waiting
+                self.assertEqual(records.reason_phrase(row.reason, ()), "waits for natemerge check the batch")
+                fixture.release(grant)
+
     def assert_landing_wait(self, fixture: AdmissionFixture, request: wire.AdmitRequest,
                             check: Callable[[], None] = lambda: None) -> None:
         def wait(reply: wire.Wait) -> None:
@@ -442,7 +471,7 @@ class LandingAdmissionTests(unittest.TestCase):
             self.assertEqual([row.since for row in view.reading.view.waiting], [request.since for request in requests])
             reason = view.reading.view.waiting[0].reason
             self.assertEqual(records.reason_phrase(reason, ()), WAIT_TEXT)
-            self.assertEqual(memory_feed.wait_why(reason), "the merge test")
+            self.assertEqual(memory_feed.wait_why(reason), "gate job")
             other = only_admitted(fixture.connect(fixture.request(need=GIB, step="test")).replies())
             after_grant, = fixture.connect(wire.ViewRequest()).replies()
             assert isinstance(after_grant, wire.ViewReply)

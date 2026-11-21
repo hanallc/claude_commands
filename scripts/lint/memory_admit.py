@@ -2218,7 +2218,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         remote_start_pending = owner in inputs.pending_remote_starts
         local_wait = inputs.local_waits.get(owner)
         if owner in inputs.landing_test_waits:
-            reason: WaitReason = records.WaitsForLandingTest()
+            reason: WaitReason = inputs.landing_wait_reason
         elif isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason = entry.state
         else:

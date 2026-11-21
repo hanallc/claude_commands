@@ -52,12 +52,13 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 from scripts.build_hold import override_guard
-from scripts.production import staff
+from scripts.production import land_runs, staff
 
 from scripts.buildlog import store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
+from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process, read_step_names
+from scripts.message.owner_role import OwnerRole
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -417,6 +418,7 @@ class ReservationRecord:
     cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     cloud_launch_seen: bool = False
+    landing_test: land_runs.LandingTestReference | land_runs.NoLandingTestReference = land_runs.NoLandingTestReference()
 
 
 def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJobNotRecorded:
@@ -2392,6 +2394,21 @@ class AdmissionServer:
               if request.episode in unstarted or self._placement_waiting(request)))
             if self._waits_for_landing(protected, request))
 
+    def _landing_wait_reason(self, protected: landing_test_gate.LandingTests) -> records.WaitsForLandingTest:
+        """Name the active gate job that holds landing precedence."""
+        if isinstance(protected, landing_test_gate.RunningLandingTests):
+            for record in self.reservations.values():
+                job = record.gate_job
+                unit = record.queue_waiter.get("unit", "")
+                if (isinstance(record.landing_test, land_runs.LandingTestReference)
+                        and record.landing_test in protected.references and isinstance(job, StepJob) and unit):
+                    try:
+                        names = read_step_names()
+                    except conf.Unusable:
+                        break
+                    return records.WaitsForLandingTest(names.for_owner(job.step, unit, OwnerRole.UNIT))
+        return records.WaitsForLandingTest()
+
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
@@ -2433,11 +2450,13 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         protection = landing_test_gate.PassProtection()
-        landing_waits = self._landing_waits(protection.read())
-        self._prepare_placements(evidence_keys, remote_start_hold_seconds, landing_waits)
+        protected = protection.read()
+        landing_waits = self._landing_waits(protected)
+        landing_reason = self._landing_wait_reason(protected) if landing_waits else records.WaitsForLandingTest()
+        self._prepare_placements(evidence_keys, remote_start_hold_seconds, landing_waits, landing_reason)
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds, landing_waits)
-        inputs = captured.local
+        inputs = replace(captured.local, landing_wait_reason=landing_reason)
         ci_holds = self._ci_hold_reasons()
         held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
         if held_owners:
@@ -2484,7 +2503,8 @@ class AdmissionServer:
             self.spacing = proposed.spacing
             self._admit([waiting], [prepared], config)
         if late_holds:
-            inputs = replace(inputs, landing_test_waits=inputs.landing_test_waits | late_holds)
+            inputs = replace(inputs, landing_test_waits=inputs.landing_test_waits | late_holds,
+                landing_wait_reason=self._landing_wait_reason(protection.read()))
             result = gate.admission_pass(inputs, inputs.now, policy)
             self.last_inputs, self.last_result = inputs, result
             for reservation in result.policy.returned_claims:
@@ -2654,7 +2674,7 @@ class AdmissionServer:
                 else:
                     blocked = True
             position += 1
-            reason = records.WaitsForLandingTest() if landing_held else wire.CloudSlotWait(used, slots)
+            reason = self._landing_wait_reason(protected) if landing_held else wire.CloudSlotWait(used, slots)
             text = reason.text if isinstance(reason, wire.CloudSlotWait) else reason_phrase(reason, ())
             snapshot = AdmissionWaitSnapshot(records.AdmissionDecision("hold", 0, 0, 0, 0),
                 replace(waiting.request.profile.peak, bytes=0), (), 0,
@@ -2974,7 +2994,7 @@ class AdmissionServer:
             profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
             profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
             shape, run=request.run, place=request.place, cargo_folder=cargo_folder,
-            gate_job=admitted_gate_job(request, self.proc.path))
+            gate_job=admitted_gate_job(request, self.proc.path), landing_test=request.identity.landing_test)
         self.writes.register(record)
         if cloud:
             return record
@@ -3779,7 +3799,7 @@ done
                 _ = self.host_requests.pop(key, None)
 
     def _prepare_placements(self, keys: PlacementEvidenceKeys, remote_start_hold_seconds: int,
-                            landing_waits: frozenset[str]) -> None:
+                            landing_waits: frozenset[str], landing_reason: records.WaitsForLandingTest) -> None:
         """Refresh provider evidence and prepare waiting placement rows on the loop thread."""
         self._refresh_host_observations()
         # Keep the current holder label without retaining local process evidence.
@@ -3807,7 +3827,7 @@ done
             landing_held = request.episode in landing_waits
             if (landing_held and saved is not None and isinstance(saved.permission, placement.PermissionAvailable)
                     and not self._start_pending(saved)):
-                _ = self._defer_placement_for_landing(saved)
+                _ = self._defer_placement_for_landing(saved, landing_reason)
                 saved = None
             pending_remote = saved is not None and self._update_remote_start_hold(
                 request, key, saved, remote_start_hold_seconds)
@@ -4191,8 +4211,9 @@ done
         if (submitted is None or submitted.constraints.source_key != assignment.source_key
                 or submitted.owner != assignment.owner or not self._placement_owner_live(assignment.owner)):
             return self._placement_status(assignment, "assignment owner or source is no longer valid")
-        if self._waits_for_landing(landing_test_gate.read(), submitted):
-            return self._defer_placement_for_landing(saved)
+        protected = landing_test_gate.read()
+        if self._waits_for_landing(protected, submitted):
+            return self._defer_placement_for_landing(saved, self._landing_wait_reason(protected))
         reference = request.claim
         destination = assignment.destination
         if (not reference.claim_id or reference.episode != assignment.episode or reference.attempt != assignment.attempt
@@ -4257,8 +4278,9 @@ done
                      else self.proc.processes())
         return holder.pid in gate.process_tree({owner.pid: owner.start_time}, processes)
 
-    def _defer_placement_for_landing(self, saved: records.SavedPlacementAssignment) -> wire.DispatchStatus:
-        reason = reason_phrase(records.WaitsForLandingTest(), ())
+    def _defer_placement_for_landing(self, saved: records.SavedPlacementAssignment,
+                                     landing_reason: records.WaitsForLandingTest) -> wire.DispatchStatus:
+        reason = reason_phrase(landing_reason, ())
         self._close_placement(saved, reason, placement.RetryAt(self.clock.now()))
         return self._placement_status(saved.assignment, reason)
 

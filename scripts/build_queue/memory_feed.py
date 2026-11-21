@@ -1570,7 +1570,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
 
 
 WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder", "the merge test"]
+                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder", "gate job"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1595,7 +1595,7 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
         case admission_records.NatedevHeld():
             return "build hold"
         case admission_records.WaitsForLandingTest():
-            return "the merge test"
+            return "gate job"
         case admission_records.ReadingUnavailable() | admission_records.PressureUnavailable():
             return "memory"
         case admission_records.ReadyForAdmission():

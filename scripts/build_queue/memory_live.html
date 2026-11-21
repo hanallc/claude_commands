@@ -124,6 +124,7 @@ __PAGE_FRAME_STYLE__
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
+.tip dd.reason { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
 .tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
 .tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
@@ -244,8 +245,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
 .wrow.wait .row-label .name { white-space: normal; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
-.row-label .wait-note { font-size: 0.75rem; color: var(--ink-2); }
-.row-memory { min-width: 0; }
+.row-memory { min-width: 0; position: relative; }
+.wait-note { position: absolute; top: 0; left: 0; display: block; width: var(--wait-note-width, 100%); font-size: 0.75rem; line-height: 18px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wait-note.above { position: static; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
 .cloud-status .amounts { height: auto; min-height: 16px; overflow-wrap: anywhere; }
@@ -851,8 +853,10 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.reason === 'waits for the merge test' ? 'the merge test' : row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
+    rows.push(field('Waits for', row.why || (row.kind === 'cloud' ? 'AWS slot' :
+      row.kind === 'repository-slot' ? 'build slot' : 'its turn')));
+    if (row.reason) rows.push(field('Reason', row.reason, 'reason'));
+    rows.push(...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
@@ -1014,18 +1018,21 @@ function rowOwner(row, waiting = false) {
   const owner = publicText(row.showrunner || "");
   return owner;
 }
-function rowLabel(name, owner = "", note = "") {
+function rowLabel(name, owner = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${roleName(owner)}</span>` +
-    (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
+    `<span class="owner">${roleName(owner)}</span></span>`;
 }
-function rowMemory(tip, bars = "") {
-  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
+function waitNote(reason) {
+  return reason ? `<span class="wait-note">${esc(reason)}</span>` : "";
+}
+function rowMemory(tip, reason = "") {
+  return `<div class="row-memory" data-tip="${tip}">${waitNote(reason)}<div class="track" data-tip="${tip}"></div>` +
     `<div class="amounts"></div></div>`;
 }
-function cloudStatus(row, tip) {
-  return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
-    (row.stale ? `${row.status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
+function cloudStatus(row, tip, reason = "") {
+  const status = reason && row.status === reason ? "" : row.status || "";
+  return `<div class="row-memory cloud-status" data-tip="${tip}">${waitNote(reason)}<div class="track" data-tip="${tip}"></div><div class="amounts">${esc(status)}` +
+    (row.stale ? `${status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
 }
 function memoryText(text) {
   return text.replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
@@ -1397,9 +1404,8 @@ function renderWalk(d) {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
-    const note = w.why === "the build in the same Cargo folder" || w.why === "the merge test" ? w.reason : "";
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
-      (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true))}` +
+      (w.kind === "cloud" ? cloudStatus(w, tip, w.reason) : rowMemory(tip, w.reason)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
@@ -1550,6 +1556,9 @@ function fitWalkDetails() {
     ? walk.getBoundingClientRect().right - naturalWidth
     : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
   walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
+}
+
+function alignWalkRows(walk, table) {
   for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
     const metadata = table.querySelector(row.dataset.tip ? `tr[data-tip="${row.dataset.tip}"]` : "tr.room");
     if (!metadata) continue;
@@ -1573,7 +1582,8 @@ function fitWalkDetails() {
 
 function placeMemoryBars(d) {
   const shown = shownReading(d);
-  const track = $("walk").querySelector(".track");
+  const walk = $("walk");
+  const track = walk.querySelector(".track");
   if (!track) return;
   const range = track.getBoundingClientRect();
   const width = range.width;
@@ -1659,15 +1669,26 @@ function placeMemoryBars(d) {
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = stepRow(row.dataset.tip, d);
-    if (waiter.kind === "cloud") continue;
+    const note = row.querySelector(".wait-note");
+    if (waiter.kind === "cloud") {
+      if (note) note.style.setProperty("--wait-note-width", `${Math.max(0, chartEdge - LABEL_GAP)}px`);
+      continue;
+    }
     // A wait bar stops at the room end or the cap line, whichever is first.
     const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
     const waitWidth = Math.min(waitEnd, waiter.need * unit);
     const waitAt = !hasCap(d) ? roomAt : waitEnd - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
+    if (note) {
+      const gap = (drawnWidth > 0 ? waitAt : chartEdge) - LABEL_GAP;
+      const above = gap < 24;
+      note.classList.toggle("above", above);
+      note.style.setProperty("--wait-note-width", `${Math.max(0, (above ? chartEdge - LABEL_GAP : gap))}px`);
+    }
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
     placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: stepRow(row.dataset.tip, shown).need}] : []);
   }
+  alignWalkRows(walk, walk.querySelector(".walk-table"));
   const roomRow = roomTrack.closest(".wrow");
   const placeDivider = (row, top) => row.style.setProperty("--divider-top", `${top - row.getBoundingClientRect().top}px`);
   let dividerTop = Math.round(roomRow.getBoundingClientRect().top);

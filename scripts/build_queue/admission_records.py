@@ -991,6 +991,7 @@ class NatedevHeld:
 @dataclass(frozen=True)
 class WaitsForLandingTest:
     """A test waits while a checkpoint land has precedence."""
+    gate_name: str = "the landing queue"
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
              | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
@@ -1279,6 +1280,7 @@ class QueueInputs:
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     landing_test_waits: frozenset[str] = field(default=frozenset(), kw_only=True)
+    landing_wait_reason: WaitsForLandingTest = field(default=WaitsForLandingTest(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1711,7 +1713,7 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
         case NatedevHeld():
             return held_text(reason)
         case WaitsForLandingTest():
-            return "waits for the merge test"
+            return f"waits for {reason.gate_name}"
         case MemoryPressure():
             return "memory pressure"
         case PressureUnavailable():
