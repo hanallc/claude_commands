@@ -208,18 +208,34 @@ class SharedGateAdmissionTests(ServiceGateFixture):
     def test_gate_reservation_uses_the_shared_place_with_first_peak_and_hold(self) -> None:
         self.configure_gate("program_first_peak_gib.merge-gate=0.5")
         hold = merge_gate.BuildHoldWait()
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(merge_gate, "queue_place", wraps=queue.queue_place) as acquire, \
-             mock.patch.object(hold, "wait_until_free", wraps=hold.wait_until_free) as before_check:
+        calls: list[str] = []
+        admits = hold.admits
+        connect = client.AcquisitionSockets.open
+
+        def check_hold() -> bool:
+            calls.append("hold check")
+            return admits()
+
+        def open_connection(sockets: client.AcquisitionSockets, request: client.AdmissionRequest,
+                            deadline: client.CheckDeadline) -> client.DeadlineStop | None:
+            calls.append("connection attempt")
+            return connect(sockets, request, deadline)
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(merge_gate, "queue_place", wraps=queue.queue_place) as acquire,
+              mock.patch.object(hold, "wait_until_free", wraps=hold.wait_until_free) as before_check,
+              mock.patch.object(hold, "admits", check_hold),
+              mock.patch.object(client.AcquisitionSockets, "open", open_connection)):
             with merge_gate.gate_reservation(self.checkout, self.state, hold) as place:
                 path, row = self.reservation()
                 self.assertEqual(place.path, path)
                 self.assertEqual((row["step"], row["need"]), ("merge-gate", 512 * 1024 * 1024))
                 place.observe(123 * 1024 * 1024, 123 * 1024 * 1024)
                 place.status = 0
+            self.assertEqual(calls, ["hold check", "connection attempt", "hold check"])
             acquire.assert_called_once_with("merge-gate", self.checkout,
                 before_check=client.AdmissionHoldCheck(hold.wait_until_free, hold.admits))
-            before_check.assert_called_once_with()
+            before_check.assert_not_called()
         self.assert_gate_released()
         row, = self.gate_history()
         self.assertEqual(row["anon_peak_bytes"], 123 * 1024 * 1024)

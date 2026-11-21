@@ -5,7 +5,6 @@ import tempfile
 import unittest
 import io
 import json
-import tempfile
 from contextlib import redirect_stdout
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -18,8 +17,11 @@ from scripts.build_queue import target_availability
 from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets, target_config
 from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalTarget, SshTarget
+from scripts.build_targets.target_test_support import mac_target_settings
 from scripts.mac_test import claim_state, eligibility, mac_test
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lib import process_start as process_identity
+from scripts.lint.memory_test_support import config_environment
 from scripts.message import unit_labels
 from scripts.build_queue.admission_records import NeedsMemory, WaitingStep
 
@@ -116,14 +118,11 @@ class AvailabilityRowTests(unittest.TestCase):
 class MacRouteTests(unittest.TestCase):
     def use_target_config(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        (root / "mac.conf").touch()
-        _ = (root / "build_targets.conf").write_text(
-            "targets=mac,natedev\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n",
-            encoding="utf-8",
-        )
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root)})))
+        environment = config_environment(root, fixtures={
+            "build_targets.conf": mac_target_settings(),
+            "mac_test.conf": MAC_RUN_SETTINGS,
+        })
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
 
     def routes(self, *mac_states: targets.TargetState) -> target_availability.MacRoutes:
         return target_availability.MacRoutes((snapshot(MAC, *mac_states), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
@@ -161,6 +160,7 @@ class MacRouteTests(unittest.TestCase):
         self.assertEqual(scope.call_count, 2)
 
     def test_a_kept_claim_does_not_hold_its_repository_while_another_runs(self) -> None:
+        self.use_target_config()
         first = claim_state.RepositoryScope("first")
         second = claim_state.RepositoryScope("second")
         live = claim(second, "live check")

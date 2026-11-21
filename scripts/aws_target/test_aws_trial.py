@@ -41,7 +41,7 @@ from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, install_admission_fixture, write_config_fixture
 from scripts.test_times.gate_record_test_support import gate_timing_settings
 
 
@@ -61,6 +61,7 @@ class GuestTests(unittest.TestCase):
         write_guest_config(root)
         _ = (root / 'merge_gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
         _ = write_config_fixture(root / 'buildlog.conf', defaults=BUILDLOG_INDEX_SETTINGS)
+        install_admission_fixture(root)
         _ = (root / 'build_folders.conf').write_text(
             f'roots.system={root}\nroots.gate={root}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'
@@ -307,7 +308,7 @@ class GuestTests(unittest.TestCase):
             self.assertEqual(payload['max_running_jobs'], 2)
             self.assertEqual(payload['vcpus'], 2)
             busy = 400 / os.sysconf('SC_CLK_TCK')
-            self.assertEqual(payload['busy_cpu_s'], busy)
+            self.assertEqual(payload['busy_cpu_s'], busy, payload.get('error'))
             seconds = float(str(payload['gate_finished_at'])) - float(str(payload['gate_started_at']))
             self.assertEqual(payload['gate_s'], seconds)
             self.assertAlmostEqual(float(str(payload['cpu_use_percent'])), 100 * busy / (2 * seconds))

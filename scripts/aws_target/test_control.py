@@ -65,6 +65,7 @@ class ControlTests(CostFixture):
             "console.conf": page_status_settings(),
             "review_links.conf": REVIEW_ENDPOINT_SETTINGS,
         })
+        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
         self.clock = TestClock()
         self.calls = []
         self.failure = ''

@@ -49,6 +49,7 @@ from scripts.production import merge_gate as gate
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
+from scripts.lib.build_folders_test_support import BUILD_PREFIX_SETTINGS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
@@ -3693,8 +3694,9 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
     def test_service_command_omits_conf_dir_without_caller_override(self) -> None:
         configuration = cloud_gate.settings()
+        credentials = {'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'fixture-credentials')}
         for paired in (False, True):
-            with (self.subTest(paired=paired), mock.patch.dict(os.environ),
+            with (self.subTest(paired=paired), mock.patch.dict(os.environ, credentials),
                   mock.patch.object(cloud_gate, 'settings', return_value=configuration)):
                 _ = os.environ.pop('CONF_DIR', None)
                 command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
@@ -3775,10 +3777,11 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
     def test_service_command_preserves_caller_conf_dir(self) -> None:
         configuration = cloud_gate.settings()
+        credentials = {'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'fixture-credentials')}
         for paired in (False, True):
             for directory in ('', str(self.root / 'caller-config')):
                 with (self.subTest(paired=paired, directory=directory),
-                      mock.patch.dict(os.environ, {'CONF_DIR': directory}),
+                      mock.patch.dict(os.environ, {**credentials, 'CONF_DIR': directory}),
                       mock.patch.object(cloud_gate, 'settings', return_value=configuration)):
                     command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
                     overrides = [argument for argument in command if argument.startswith('--setenv=CONF_DIR=')]
@@ -4012,6 +4015,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(request.run, wire.RunIdentity(request.owner.pid, request.owner.start_time))
 
     def test_cloud_fallback_releases_before_local_memory_admission(self) -> None:
+        _ = write_config_fixture(self.root / 'build_folders.conf', defaults=BUILD_PREFIX_SETTINGS)
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         def service(command: Sequence[str]) -> int:
             record, = self.admission.caller_reservations().values()

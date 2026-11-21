@@ -21,8 +21,10 @@ from unittest import mock
 from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
-from scripts.aws_target import hana_placement as hana
+from scripts.aws_target import hana_box, hana_placement as hana
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import install_cost_settings, write_hana_config
+from scripts.aws_target.test_hana_box import record_lifecycle_image
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, queue_snapshot
@@ -1804,9 +1806,6 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             read.assert_not_called()
 
     def idle_hana(self, fixture: PlacementFixture) -> tuple[Path, wire.PlacementRequest]:
-        from scripts.aws_target import hana_box
-        from scripts.aws_target.test_hana_box import record_lifecycle_image
-
         settings, request, _destination = self.target_settings_fixture(fixture)
         _ = write_hana_config(settings)
         repository = "https://github.com/example/hana"
@@ -1821,6 +1820,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                                              hana_box.ProviderNotInstalled())
         identity = hana_box.DeploymentIdentity("fixture", "box", "spot", "us-east-2")
         controller.register(identity)
+        fixture.enter_context(guest_digest_fixture(fixture.root))
         _ = record_lifecycle_image(controller.directory, settings, identity=identity)
         from scripts.aws_target import hana_placement_adapter
         from scripts.mac_test import eligibility

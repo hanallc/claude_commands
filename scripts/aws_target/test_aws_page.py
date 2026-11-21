@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from html import unescape
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -22,11 +23,15 @@ from scripts.review_links import page_frame
 from scripts.review_links.test_page_frame import page_status_settings
 
 
-class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
+class AwsPageFixture(ledger_test_support.CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = (self.root / "console.conf").write_text(page_status_settings())
+        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+
+
+class AwsPageQuotaHelpTests(AwsPageFixture):
 
     def test_quota_help_is_closed_and_contains_the_ordered_steps_and_case_link(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
@@ -75,11 +80,10 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
                 self.assertEqual(aws_page.quota_request_age(request, now), 'age unknown')
 
 
-class PageCostFixture(ledger_test_support.CostFixture):
+class PageCostFixture(AwsPageFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = (self.root / "console.conf").write_text(page_status_settings())
         self.costs({'spend_pace_days': '3', 'run_cost_days': '5', 'billed_hours_gap_max_ratio': '0.2'})
         self.configure_gate("""
 regions=us-east-1
@@ -255,7 +259,7 @@ class AwsPageLaunchStateTests(PageCostFixture):
         self.assertEqual(conf.read('cloud_gate').words('spot_candidate_regions'), ('us-east-1',))
 
 
-class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
+class AwsPageSettledAmountsTests(AwsPageFixture):
     def test_spend_shows_the_settled_summary_and_changed_amounts(self) -> None:
         self.text_setting('accounting_zone', 'America/Los_Angeles')
         checked = ledger_test_support.instant('2026-11-19T00:15:00Z')
@@ -740,7 +744,7 @@ class AwsCombinedTableTests(PageCostFixture):
 """)
 
 
-class AwsPagePlacementScoresTests(ledger_test_support.CostFixture):
+class AwsPagePlacementScoresTests(AwsPageFixture):
     def test_page_shows_latest_median_count_and_missing_or_stale_scores(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         region, missing_region = 'us-east-2', 'eu-north-1'
@@ -785,7 +789,7 @@ class AwsPagePlacementScoresTests(ledger_test_support.CostFixture):
                       + 'Compare the 32-vCPU column with recorded launch results.', source)
 
 
-class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
+class AwsPageGateTimePriceTests(AwsPageFixture):
     def test_page_compares_the_lowest_run_cost_for_each_size_in_each_region(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'

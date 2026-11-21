@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
-from functools import lru_cache, partial
+from functools import lru_cache
 from hashlib import sha256
 from io import StringIO
 import json
@@ -30,6 +30,7 @@ from unittest import mock
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -448,17 +449,7 @@ class HanaSetupFailureTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        checkout = self.root / 'guest-image'
-        _ = write_config_fixture(checkout / 'config/build_targets.conf',
-                                 defaults='# range: 1..\nloopback.command_timeout_s=23\n')
-        _ = write_config_fixture(checkout / 'config/build_folders.conf',
-                                 defaults='# range: 0..\nlocks.probe_wait_seconds=0.25\n'
-                                          + '# range: 0.001..\nlocks.probe_retry_seconds=0.005\n')
-        (checkout / hana_render.IMAGE_FILE_LIST).parent.mkdir(parents=True)
-        _ = (checkout / hana_render.IMAGE_FILE_LIST).write_text('scripts/fixture.py\n')
-        _ = (checkout / 'scripts/fixture.py').write_text('fixture = True\n')
-        guest_digest = partial(hana_render.guest_digest, checkout=checkout)
-        _ = self.enterContext(mock.patch.object(hana_render, 'guest_digest', side_effect=guest_digest))
+        self.enterContext(guest_digest_fixture(self.root))
         self.clock = TestClock()
         self.workload = write_hana_config()
         self.setup_path = self.state / 'hana/setup.json'
