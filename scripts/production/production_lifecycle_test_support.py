@@ -191,7 +191,7 @@ class LifecycleFixture(unittest.TestCase):
                          ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
         self.env = {**fixture_git_environment(self.root.parent), "HOME": str(self.home),
-                    "LIFECYCLE_TEST_STATE": str(self.state),
+                    "LIFECYCLE_TEST_STATE": str(self.state), "GIT_CONFIG_SYSTEM": os.devnull,
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",

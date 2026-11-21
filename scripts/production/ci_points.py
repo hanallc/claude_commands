@@ -20,7 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
-from scripts.production import merge_gate
+from scripts.production import merge_gate, promotion
 from scripts.production.checkpoint_gate import CiRecord as CiRecord, InvalidCiRecord, NoCiRecord, read_ci_record
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import CARGO_LINER_PRODUCTION
@@ -182,6 +182,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
             raise PointFailure("validation", str(error)) from error
         validated = required(git(checkout, "rev-parse", "HEAD"), "ci start")
         push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CI_VALIDATED_BASE={tip}",
+                f"PRODUCTION_INTEGRATION_PUSH={promotion.integration_push_script(production)}",
                 f"CANCEL_PRIOR={str(cancel_prior).lower()}", "bash",
                 str(script.resolve().with_name("push_direct.sh")))
         with merge_lock(production.checkout, production.name):

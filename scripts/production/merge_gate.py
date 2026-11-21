@@ -69,9 +69,9 @@ from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib.build_steps import gate_job_for_command, read_step_names
-from scripts.production import affected_modules, change_review, land_runs, session_staff, staff, unit_config, unit_names  # noqa: E402
+from scripts.production import affected_modules, change_review, land_runs, promotion, session_staff, staff, unit_config, unit_names  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -162,6 +162,7 @@ class GateArguments(argparse.Namespace):
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     enrolled: bool = False
+    legacy_direct_main: bool = False
 
 
 class SuiteMode(Enum):
@@ -1955,6 +1956,20 @@ def push_record_path(repo: Path, operation: str, source: str) -> Path:
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
 
+def promotion_record_path(repo: Path, branch: str, tip: str) -> Path:
+    return push_record_path(repo, "promotion", f"{branch}:{tip}")
+
+
+def promotion_retry_record(source: Path, main: Path, branch: str, tip: str) -> RecordedPush | NoRecordedPush:
+    """Find the receipt for the local tip in either checkout."""
+    for checkout in dict.fromkeys((source, main)):
+        for path in (promotion_record_path(checkout, branch, tip), push_record_path(checkout, "promotion", branch)):
+            record = read_push_record(path)
+            if isinstance(record, RecordedPush) and record.commit == tip and record.source_commit == tip:
+                return record
+    return NoRecordedPush()
+
+
 def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -2004,7 +2019,7 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str, *, legacy:
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
-    from scripts.production.checkpoint_gate import Stop, require_cargo_liner_promotion_ci
+    from scripts.production.checkpoint_gate import Stop
 
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
     source = Path(args.repo).resolve() if args.enrolled else main_repo
@@ -2018,51 +2033,59 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         fetch_branches(source, "main", args.merge_branch)
         head = checked_git(source, "rev-parse", "refs/heads/main")
         origin = checked_git(source, "rev-parse", "origin/main")
-        path = push_record_path(source, "promotion", args.merge_branch)
         target = checked_git(source, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
-            record = read_push_record(path)
-            if isinstance(record, NoRecordedPush) and args.enrolled:
-                record = read_push_record(push_record_path(main_repo, "promotion", args.merge_branch))
-            if (not isinstance(record, RecordedPush) or head != record.commit
-                    or record.source_commit != record.commit
+            record = promotion_retry_record(source, main_repo, args.merge_branch, head)
+            if (isinstance(record, NoRecordedPush)
                     or git(source, "merge-base", "--is-ancestor", origin, head).returncode
                     or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
-            target = record.commit
-        if git(source, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
+        if git(source, "merge-base", "--is-ancestor", origin, target).returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
-        try:
-            require_cargo_liner_promotion_ci(main_repo, args.merge_branch, target)
-        except Stop as error:
-            raise GateRefused(str(error)) from error
         if refusal := live_file_refusal(source, target):
             raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
         if refusal := live_state_refusal(source, target):
             raise GateRefused(refusal)
-        write_push_record(path, RecordedPush(origin, target, target))
+        def install(approved: promotion.ApprovedPromotion) -> None:
+            # Keep the receipt for HEAD if the process stops before the ref update.
+            path = promotion_record_path(source, args.merge_branch, approved.sha)
+            if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
+                existing = read_push_record(path)
+                if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
+                    raise GateRefused(f"promotion receipt changed: {path}")
+            try:
+                approved.install(main_repo, head)
+            except (OSError, UnicodeError) as error:
+                raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
+            landed = approved.land(source)
+            print(land_main.hook_report(landed.hook), flush=True)
+
         try:
-            waiting_rows.move_to(main_repo, target)
-        except (OSError, UnicodeError) as error:
-            raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
-        try:
-            landed = land_main.land(source, target)
-        except land_main.LandError as error:
+            if args.legacy_direct_main:
+                published = promotion.publish_legacy_main(source, target, install)
+            else:
+                document = change_review.production_doc(args.production)
+                published = promotion.publish(promotion.CollectedCi(document), source, args.merge_branch, target, install)
+        except (Stop, change_review.ChangeReviewError, land_main.LandError, ValueError) as error:
             raise GateRefused(str(error)) from error
-        print(land_main.hook_report(landed.hook), flush=True)
-        promoted = checked_git(source, "rev-parse", "refs/heads/main")
+    promote_mac(args, main_repo, published)
+
+
+def promote_mac(args: GateArguments, main_repo: Path, published: promotion.PublishedMain) -> None:
+    promoted = published.sha
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + f" {shlex.quote(promoted)}"
     waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
-              "if [ -f scripts/lib/waiting_rows.py ]; "
-              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward origin/main; "
-              f"else {check} && git merge --ff-only -q origin/main; fi); rc=$?; "
+              f"if git merge-base --is-ancestor {shlex.quote(promoted)} HEAD; then :; "
+              "elif [ -f scripts/lib/waiting_rows.py ]; "
+              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward {shlex.quote(promoted)}; "
+              f"else {check} && git merge --ff-only -q {shlex.quote(promoted)}; fi); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, args.mac_host, remote],
@@ -2130,6 +2153,14 @@ def check_local_doc_commits(repo: Path, origin: str) -> None:
         print(f"Local doc commit goes out with this merge: {hashes.split()[0][:12]} {subject}", flush=True)
 
 
+def merge_for_gate(repo: Path, checkpoint: str, message: str) -> str:
+    result = git(repo, "merge", "--no-overwrite-ignore", "--no-ff", "-m", message, checkpoint)
+    if result.returncode:
+        conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+        raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}")
+    return checked_git(repo, "rev-parse", "HEAD")
+
+
 def merge_checkpoint(args: GateArguments) -> int:
     hold = BuildHoldWait()
     hold.wait_until_free()
@@ -2177,19 +2208,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         recovery.save()
     try:
         hold.wait_until_free()
-        result = git(repo, "merge", "--no-overwrite-ignore", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
-        if result.returncode:
-            conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
-            raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}")
-        merged = checked_git(repo, "rev-parse", "HEAD")
+        receipt = push_record_path(repo, "checkpoint", origin + ":" + checkpoint)
+        message = f"{subject}\n\n{args.body}"
+        merged = merge_for_gate(repo, checkpoint, message)
         if isinstance(recovery, GateRecovery):
             recovery.rollback_head = merged
             recovery.save()
         if isinstance(producer, str):
             change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
-            write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
-                              RecordedPush(baseline, merged, checkpoint))
+            write_push_record(receipt, RecordedPush(baseline, merged, checkpoint))
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
@@ -2204,11 +2232,13 @@ def merge_checkpoint(args: GateArguments) -> int:
             if suites.time_limit_report:
                 tell_time_limit(args.unit, repo, suites)
             raise GateRefused("RED: " + (suites.time_limit_report or "types or suites failed"))
+        if checked_git(repo, "rev-parse", "HEAD") != merged:
+            raise GateRefused(f"checkout changed after the gate selected {merged}")
         fetch_branches(repo, "main")
-        if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
+        if git(repo, "merge-base", "--is-ancestor", "origin/main", merged).returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
         hold.wait_until_free()
-        if refusal := live_file_refusal(repo, checked_git(repo, "rev-parse", "HEAD")):
+        if refusal := live_file_refusal(repo, merged):
             raise GateRefused(refusal)
     except (KeyboardInterrupt, SystemExit):
         raise
@@ -2221,9 +2251,16 @@ def merge_checkpoint(args: GateArguments) -> int:
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
-    _ = checked_git(repo, "push", "origin", str(args.merge_branch))
-    notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
-    print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
+    if args.legacy_direct_main:
+        _ = checked_git(repo, "push", "origin", "main")
+    else:
+        from scripts.production.checkpoint_gate import Stop
+        try:
+            promotion.push_integration(repo, merged, args.merge_branch)
+        except Stop as error:
+            raise GateRefused(error.detail) from error
+    notify_style(repo, str(args.merge_branch), merged)
+    print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', merged)}", flush=True)
     if args.promote:
         promote(args)
     if review_list is not None:
@@ -2235,20 +2272,25 @@ def merge_checkpoint(args: GateArguments) -> int:
 
 def gate_production(args: GateArguments) -> Path:
     """Resolve the publication checkout from the exact staff document."""
-    from scripts.production.production_doc import EnrolledPaths, Refusal, production_field, resolve_production_paths
+    from scripts.production.production_doc import EnrolledPaths, LegacyProduction, Refusal, production_field, resolve_production_paths
 
     try:
         document = change_review.production_doc(args.production)
         paths = resolve_production_paths(document)
+        merge_branch = production_field(document.read_text(encoding="utf-8").splitlines(), "Merge branch")
+        if args.merge_branch != merge_branch:
+            raise GateRefused(f"{document}: expected merge branch {merge_branch}")
+        args.legacy_direct_main = isinstance(paths, LegacyProduction) and merge_branch == "main"
         if isinstance(paths, EnrolledPaths):
-            merge_branch = production_field(paths.live_doc.read_text(encoding="utf-8").splitlines(), "Merge branch")
-            if args.merge_branch != merge_branch:
-                raise GateRefused(f"{paths.live_doc}: expected merge branch {merge_branch}")
+            if promotion.is_main_branch(merge_branch):
+                raise GateRefused(f"{document}: main is not an integration branch")
             args.repo = str(paths.integration)
             args.main_repo = str(paths.main)
             args.enrolled = True
         return document
-    except (change_review.ChangeReviewError, Refusal) as error:
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
+    except Refusal as error:
         raise GateRefused(str(error)) from error
 
 
@@ -3049,7 +3091,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--tests-only", action="store_true")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
-                            help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
+                            help="promote origin/<merge-branch> to main and the Mac with a collected CI verdict")
     args = cast(GateArguments, parser.parse_args(arguments))
     args.gate_job = gate_job_for_command(["merge_gate.py", *arguments])
     if args.promote_only and not args.merge_branch:

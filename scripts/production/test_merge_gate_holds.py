@@ -13,14 +13,16 @@ import signal
 import sys
 import time
 from types import SimpleNamespace
-from typing import final, override
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.merge_gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
+from scripts.production.test_merge_gate_promotion import green_ci_after_merge
 
 
 @final
@@ -39,6 +41,8 @@ class MergeGateHoldTests(TemporaryHoldTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         hold_environment = {name: os.environ[name] for name in (
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "MAC_TEST_STATE_DIR",
             "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
@@ -92,6 +96,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
                 output = io.StringIO()
                 with mock.patch.object(merge_gate, "local_release_waiter", return_value=events), \
                         mock.patch.object(events, "wait", side_effect=release), \
+                        green_ci_after_merge(self.gate), \
                         redirect_stdout(output):
                     code = merge_gate.main([*arguments, *mode])
                 self.assertEqual(code, 0, output.getvalue())
