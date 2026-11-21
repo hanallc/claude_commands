@@ -2595,6 +2595,98 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(status, 409, reply)
         self.assertEqual(path.read_bytes(), before)
 
+    def test_review_rejects_an_unavailable_assignee_before_saving(self) -> None:
+        case = self.review_fixture()
+        proposal, efficiency = case.decisions()
+        worker = fixture_member('worker', name='worker', parent=case.fixture.unit.id)
+        wrapped = fixture_member('showrunner', name='wrapped',
+                                 doc=staff.WrappedDoc(local_machine(), case.fixture.temporary / 'wrapped.md'))
+        orphan = fixture_member('unit', name='without-showrunner', parent=wrapped.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        snapshot = cache.get()
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_page, 'send_to_staff') as send):
+            for key in (proposal, efficiency):
+                item = snapshot.records[key]
+                path = review_items.source_path(item)
+                before = path.read_bytes()
+                request = case.card_body(snapshot, key, 'approve')
+                for assignee in ('unknown', worker.id, wrapped.id):
+                    with self.subTest(key=key, assignee=assignee):
+                        status, reply = self.post(review_page.PAGE_PATH, request+'&'+urlencode({'assignee': assignee}))
+                        self.assertEqual(status, 400, reply)
+                        self.assertIn(b'Choose a current showrunner or unit director.', reply)
+                if key == proposal:
+                    status, reply = self.post(review_page.PAGE_PATH, request+'&'+urlencode({'assignee': orphan.id}))
+                    self.assertEqual(status, 400, reply)
+                    self.assertIn(b'The selected unit director has no current parent showrunner.', reply)
+                self.assertEqual(path.read_bytes(), before)
+                current = review_items.read_current(case.root, item, staff.snapshot())
+                self.assertEqual(current.state, item.state)
+                self.assertEqual(current.log, item.log)
+            send.assert_not_called()
+
+    def test_review_shows_a_refused_unit_approval_without_saving(self) -> None:
+        case = self.review_fixture()
+        proposal, _ = case.decisions()
+        path = Path(proposal.removeprefix('proposal/'))
+        before = path.read_bytes()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = case.card_body(cache.get(), proposal, 'approve')+'&'+urlencode({'assignee': case.fixture.unit.id})
+        row = path.stem
+        page = change_page.ReviewPage(path, path.parent, (row,), '')
+        reason = 'The issue changed before approval.'
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(proposal_issue, 'write_issue', side_effect=proposal_issue.Refusal(reason)) as write,
+              patch.object(change_page, 'send_to_staff') as send):
+            status, reply = self.post(review_page.PAGE_PATH, request)
+            self.assertEqual(status, 400, reply)
+            self.assertEqual(json.loads(reply), {'reason': reason})
+            write.assert_called_once()
+            send.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(case.status.path(page, row).exists())
+        self.assertFalse(case.status.request_attempts)
+
+    def test_review_unit_approval_uses_the_parent_after_a_transfer(self) -> None:
+        case = self.review_fixture()
+        proposal, _ = case.decisions()
+        path = Path(proposal.removeprefix('proposal/'))
+        previous_parent = fixture_member('showrunner', name='former-parent')
+        current_parent = fixture_member('showrunner', name='current-parent')
+        unit = fixture_member('unit', name='implementation', parent=previous_parent.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        snapshot = cache.get()
+        request = case.card_body(snapshot, proposal, 'approve')+'&'+urlencode({'assignee': unit.id})
+        issue_lock = proposal_issue.issue_lock
+
+        @contextmanager
+        def transfer_under_lock(target: Path) -> Generator[None]:
+            with issue_lock(target):
+                if target == path:
+                    previous = staff.snapshot()
+                    _ = staff.move(unit.id, staff.ReportsTo(current_parent.id))
+                    with staff.supplied_snapshot(previous):
+                        yield
+                else:
+                    yield
+
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(proposal_issue, 'issue_lock', transfer_under_lock),
+              patch.object(change_page, 'deliver')):
+            status, reply = self.post(review_page.PAGE_PATH, request)
+            self.assertEqual(status, 200, reply)
+        saved = review_items.read_current(case.root, snapshot.records[proposal], staff.snapshot())
+        assert isinstance(saved.source, review_items.ProposalSource)
+        self.assertEqual(saved.source.record.value('unit'), unit.id)
+        self.assertEqual(saved.source.record.value('approved_in'), current_parent.id)
+
     def test_review_rejects_the_old_form_after_a_new_revision_is_published(self) -> None:
         case = self.review_fixture()
         proposal, _ = case.decisions()

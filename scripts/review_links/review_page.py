@@ -771,8 +771,16 @@ def waiting_change(item: ReviewItem) -> bool:
     return item.type == ReviewType.CHANGE and item.state == ReviewState.WAITING
 
 
+def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
+    shown = review_items.name(item.owner, names.members)
+    options = ''.join(f'<option value="{html.escape(member.id, quote=True)}"{names.style(member.id)}>'
+                      +f'{html.escape(member.name)}</option>'
+                      for member in review_actions.approval_assignees(names.members))
+    return page_frame.action_select('assignee', 'Assign', f'<option value="">{html.escape(shown)} decides</option>'+options)
+
+
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         soon: str = "In 1 hour", owner: str = '', validator: str = '') -> str:
+         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '') -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -790,6 +798,8 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 and not validator else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
          else closes).append(button)
+        if action == 'approve':
+            closes.append(assignment)
     heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
                else page_frame.ReturningActionHeading.ITEM_RETURNS)
     later = ''
@@ -907,7 +917,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
-                  owner=owner, validator=validator)+footer+'</div>')
+                  owner=owner, validator=validator,
+                  assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 
 def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
@@ -990,7 +1001,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
 def review_fields(body: str) -> dict[str, list[str]]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     required = {'row', 'token', 'outcome', 'feedback'}
-    if not required <= fields.keys() <= required | {'later', 'revision'} or any(len(values)!=1 for values in fields.values()):
+    if not required <= fields.keys() <= required | {'later', 'revision', 'assignee'} or any(len(values)!=1 for values in fields.values()):
         raise question_record.AnswerRefused('use the answer form on this page')
     return fields
 
@@ -1093,7 +1104,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     elif isinstance(source, review_items.InvestigationSource):
         delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
     else:
-        delivery, answer = review_actions.decision_action(item, outcome, words, status, verify_revision=validate)
+        delivery, answer = review_actions.decision_action(
+            item, outcome, words, status, assignee=fields.get('assignee', [''])[0], verify_revision=validate)
     if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
         with review_items.after_store_write(item.key):
             delivery = review_actions.track_question(delivery, key, words, status)
@@ -1142,12 +1154,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
             raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
                             if isinstance(item.source, review_items.InvestigationSource) else
-                            review_actions.decision_action(item,outcome,words,status))
+                            review_actions.decision_action(item,outcome,words,status,assignee=fields.get('assignee', [''])[0]))
         if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
             delivery = review_actions.track_question(delivery, key, words, status)
         return delivery, answer
     _ = fields.pop('later',None)
     _ = fields.pop('revision',None)
+    _ = fields.pop('assignee',None)
     item = question_item
     if item is not None and item.state == ReviewState.WAITING:
         if outcome not in item.actions:
@@ -1321,7 +1334,7 @@ function installReviewBody(row,text){
 }
 const reviewDrafts=new Map();
 function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(form,true),send}){
- const words=form.elements.feedback,later=form.elements.later;
+ const words=form.elements.feedback,later=form.elements.later,assignee=form.elements.assignee;
  const row=form.closest('[data-list-item]');
  const stored=reviewDrafts.get(row.dataset.key);
  if(stored) restoreReviewDraft(form,stored.draft);
@@ -1329,10 +1342,11 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
  const submit=(outcome,until)=>{
   const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
   if(outcome==='later') data.set('later',until);
+  if(outcome!=='approve') data.delete('assignee');
   void send(outcome,data);
  };
  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
- [words,later].filter(Boolean).forEach(field=>{
+ [words,later,assignee].filter(Boolean).forEach(field=>{
   field.addEventListener('input',remember);field.addEventListener('change',remember);
  });
  form.addEventListener('submit',event=>{
@@ -1351,7 +1365,9 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
 function readReviewDraft(form){
  if(!form?.elements.feedback) return null;
  const choices=[...form.closest('[data-list-item]').querySelectorAll('input[name=choice]')];
+ const assignee=form.elements.assignee?.selectedOptions[0];
  return {feedback:form.elements.feedback.value,later:form.elements.later?.value ?? '',
+  assignee:assignee?.value ?? '',assigneeName:assignee?.dataset.assigneeName ?? assignee?.textContent ?? '',
   choice:choices.find(choice=>choice.checked)?.value || ''};
 }
 function rememberReviewDraft(form,edited=false){
@@ -1368,6 +1384,15 @@ function rememberReviewDraft(form,edited=false){
 function restoreReviewDraft(form,draft){
  form.elements.feedback.value=draft.feedback;
  if(form.elements.later) form.elements.later.value=draft.later;
+ const assignee=form.elements.assignee;
+ if(assignee){
+  if(draft.assignee && ![...assignee.options].some(option=>option.value===draft.assignee)){
+   const unavailable=new Option((draft.assigneeName || draft.assignee)+' — not available',draft.assignee);
+   unavailable.dataset.assigneeName=draft.assigneeName || '';
+   assignee.add(unavailable);
+  }
+  assignee.value=draft.assignee;
+ }
  form.closest('[data-list-item]').querySelectorAll('input[name=choice]').forEach(choice=>choice.checked=choice.value===draft.choice);
 }
 async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true}){

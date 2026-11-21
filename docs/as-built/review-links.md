@@ -93,6 +93,10 @@ The List colors Owner, Producer, supporting unit names, staff names in log sourc
 List delivery notices color morty and the recorded showrunner through the same page renderer.
 They keep the notice words and time.
 Review colors Owner, Source, staff log names, and owner menu options.
+Proposal and efficiency cards show Assign next to Approve.
+The default shows the card owner's name and sends the approval to that owner.
+Assign lists current showrunners and unit directors by name in their role colors.
+Approve sends only to the selected assignee when you select a name.
 Images colors card owners and copies those colored names into the group links.
 Legacy question pages color each source and its parent separately.
 Branch pages color unit names. Rebuilds colors recorded requesters.
@@ -658,14 +662,22 @@ After a save, the page shows its result.
 A change with the showrunner appears in All as soon as the page reads the saved request.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
-Refresh retains the open row, scroll position and typed text.
+Refresh retains the open row, scroll position, typed text, and Assign choice.
+If the assignee becomes unavailable, Assign keeps the choice and shows “not available”.
+Approve refuses an unavailable assignee. Select another option to approve.
 The Review navigation entry marks new Open items.
 Every type can set this mark.
 Approved and declined proposals become Done in the shared reader.
 
 Approve and Decline make a proposal or an efficiency Done at once.
-Approve sends the words and the exact record command to the owner showrunner through the shared sender.
-For a proposal the command is `proposal_issue.py approve`; for an efficiency it is `candidates.py outcome E<n> accepted`.
+Approve sends the words through the shared sender.
+For a proposal assigned to a unit director, one save records the approval and the Review log.
+The approval records the unit director, their parent showrunner, and the user as approver.
+The unit director receives a confirmation.
+For other proposal approvals, the message includes the `proposal_issue.py approve` command.
+The showrunner chooses the unit when they run the proposal command.
+For an efficiency, the command is `candidates.py outcome E<n> accepted`.
+The saved answer and log show the selected name as “approved, assigned to <name>”.
 A proposal Decline stores the declined answer, as `proposal_issue.py decline-answer` does.
 Its message asks the owner to close the issue with `/close_issue`.
 An efficiency Decline writes `candidates.py outcome E<n> declined` on the ledger line and sends no message.

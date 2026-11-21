@@ -154,6 +154,16 @@ def review_mark(issue: Issue) -> ReviewMark | NoMark:
     return ReviewMark(value) if value else NoMark()
 
 
+def _with_review_log(text: str, path: Path, events: tuple[ReviewLog, ...]) -> str:
+    lines = record_store.lines_with_endings(text)
+    end = _closing_fence(lines, path)
+    start, stop = _key_span(lines, end, REVIEW_LOG_FIELD) or (end, end)
+    newline = lines[start][len(lines[start].rstrip("\r\n")):] or "\n"
+    lines[start:stop] = [f"{REVIEW_LOG_FIELD}:{newline}",
+                         *(f"  - {json.dumps(row, ensure_ascii=False)}{newline}" for row in review_events.rows(events))]
+    return "".join(lines)
+
+
 @dataclass(frozen=True)
 class ProposalSubmissionReply:
     owner: staff.StaffId
@@ -211,13 +221,8 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
             new_wait["review_submission"] = json.dumps(new_item_dialog.stored_submission(replace(details, reply_token=token)))
         if not new_wait and events == before and mark == review_mark(issue) and (not reason or reason == issue.value("waiting_why")):
             return False
-        lines = record_store.lines_with_endings(read_issue(path))
-        end = _closing_fence(lines, path)
-        start, stop = _key_span(lines, end, REVIEW_LOG_FIELD) or (end, end)
-        newline = lines[start][len(lines[start].rstrip("\r\n")):] or "\n"
-        lines[start:stop] = [f"{REVIEW_LOG_FIELD}:{newline}",
-                             *(f"  - {json.dumps(row, ensure_ascii=False)}{newline}" for row in review_events.rows(events))]
-        text, _ = remove_fields("".join(lines), (REVIEW_MARK_FIELD,), path)
+        text = _with_review_log(read_issue(path), path, events)
+        text, _ = remove_fields(text, (REVIEW_MARK_FIELD,), path)
         marked = {REVIEW_MARK_FIELD: mark.value} if isinstance(mark, ReviewMark) else {}
         why = {"waiting_why": reason} if reason else {}
         text, _ = set_fields(text, {**marked, **why, **new_wait, "date_modified": _vault_date(today)}, path)
@@ -642,6 +647,24 @@ def approve(path: Path, fields: dict[str, str], by: str, approved_in: str, today
         return _approve(path, fields, by, approved_in, today)
 
 
+def approve_from_review(path: Path, unit: staff.StaffId, today: date,
+                        words: tuple[str, ...], *, check: Callable[[], object] | None = None) -> None:
+    """Save the user's approval and Review answer in one write."""
+    with issue_lock(path):
+        if check is not None:
+            _ = check()
+        members = staff.authority_snapshot()
+        assignee = members.by_id(unit)
+        if assignee is None or assignee not in staff.active(members, "unit"):
+            raise Refusal("Choose a current showrunner or unit director.")
+        parent = members.parent_of(assignee)
+        if parent is None or parent not in staff.active(members, "showrunner"):
+            raise Refusal("The selected unit director has no current parent showrunner.")
+        issue = Issue(path, frontmatter(path))
+        fields = {"unit": assignee.id, "approved_by": USER, "approved_in": parent.id}
+        _ = _write_approval(issue, read_issue(path), fields, today, review_words=words)
+
+
 def approve_unanswered(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
     """Approve as approve does, only while no answer is recorded, read under the same lock as the write."""
     with issue_lock(path):
@@ -651,15 +674,31 @@ def approve_unanswered(path: Path, fields: dict[str, str], by: str, approved_in:
 
 
 def _approve(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
-    """The approval write; the caller holds the issue lock."""
     issue = Issue(path, frontmatter(path))
     kept = by == SHOWRUNNER and isinstance(decision_answer(issue), ApprovedDecision) and approver(issue) == USER
     actor = {} if kept else {"approved_by": by, "approved_in": staff_reference(approved_in, "showrunner").id}
-    text, removed = remove_fields(read_issue(path), REMOVED_FIELDS, path)
+    text = read_issue(path)
+    unit = staff_reference(fields["unit"], "unit").id
+    return _write_approval(issue, text, {"unit": unit, **actor}, today)
+
+
+def _write_approval(issue: Issue, text: str, fields: dict[str, str], today: date, *,
+                    review_words: tuple[str, ...] = ()) -> list[str]:
+    """Write the approval under the caller's issue lock."""
+    path = issue.path
+    text, removed = remove_fields(text, REMOVED_FIELDS, path)
     text, unmarked = _clear_waiting_mark(text, path)
     removed.extend(unmarked)
-    text, changed = set_fields(text, {"unit": staff_reference(fields["unit"], "unit").id, **actor, "stage": IN_PROGRESS_STAGE,
-                                             "date_modified": _vault_date(today)}, path)
+    text, changed = set_fields(text, {**fields, "stage": IN_PROGRESS_STAGE, "date_modified": _vault_date(today)}, path)
+    if review_words:
+        before = events = review_log(issue)
+        for words in review_words:
+            events = review_events.append(events, ReviewLog(datetime.now(timezone.utc), "nate", words))
+        if events != before:
+            text = _with_review_log(text, path, events)
+            changed.append(REVIEW_LOG_FIELD)
+        text, marked = set_fields(text, {REVIEW_MARK_FIELD: ReviewMark.DONE.value}, path)
+        changed.extend(marked)
     if removed or changed:
         write_issue(path, text)
     return [*removed, *changed]
