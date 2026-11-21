@@ -3296,7 +3296,7 @@ Evidence: at 10:50 the head-stall watch reported a 53 min stall. It was natemerg
 
 Tests: rows in the existing head-stall tests for a hold, no hold, and a hold past its release time. Each fails first where the behavior is new.
 
-### Phase 44dz — Fixture child runs carry the runner's session  · status: in progress
+### Phase 44dz — Fixture child runs carry the runner's session  · status: done (merged 4b2a2049c, on main aacad65c6)
 **From builds, 2026-11-20 11:15 EST (base red, urgent).** natemerge merge test 1 failed in `scripts/copies/test_slot_order.py` and `scripts/direct/test_verify_doc_checkout.py`.
 
 Cause: the fixtures gave their child runs a made-up session id. During natemerge's own build hold, the live hold enforcer saw those runs as another session's builds and stopped them.
@@ -3306,7 +3306,7 @@ Cause: the fixtures gave their child runs a made-up session id. During natemerge
 3. Part 3 (b268c1270a): the helper in `test_agent_exec.py` and `verify_token_wait_test_support.py`. In bb13.
 4. Left out: `test_verify_token_handoff.py` conflicts with `devtools-testorphans`; builds sent it to devtools through sdlc.
 
-### Phase 44ea — test_slot_order.py costs half as much CPU  · status: in progress
+### Phase 44ea — test_slot_order.py costs half as much CPU  · status: done (merged dfee9b0eb, on main aacad65c6)
 **From builds and natest, 2026-11-20 16:17 EST (natest phase 399, AWS gate CPU rise).** `scripts/copies/test_slot_order.py` is the largest AWS gate module: 155.6 CPU s median per gate.
 
 1. Cut the module CPU to half or less. Every check it makes now stays.
