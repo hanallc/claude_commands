@@ -1,6 +1,6 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import fixture_feed_code_settings, write_config_fixture
 
 from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
 from scripts.production.change_review_test_support import pictured_changes
@@ -20,10 +20,12 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
 from functools import partial
+from importlib import import_module
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -50,6 +52,18 @@ from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
+
+
+with fixture_feed_code_settings():
+    _ = import_module("scripts.build_queue.memory_feed")
+
+
+ROLE_COLOR_CONFIG = (
+    "role.showrunner=#a379fd\n"
+    "role.unit-director=#ffaf02\n"
+    "role.producer=#90fe42\n"
+    "role.worker=#ff0404\n"
+)
 
 
 def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
@@ -170,7 +184,12 @@ class ReviewPageTests(unittest.TestCase):
     def configure_review(self) -> None:
         config = self.fixture.temporary / 'config'
         _ = write_config_fixture(config / "production.conf", defaults=QUESTION_TITLE_SETTINGS)
+        _ = write_config_fixture(config / "statusline.conf", defaults=ROLE_COLOR_CONFIG)
+        _ = write_config_fixture(config / "build_folders.conf",
+                                 defaults=workspace_folder_settings(self.fixture.temporary))
         self.root = self.fixture.root
+        _ = write_config_fixture(config / "memory_feed.conf",
+                                 defaults=f"output_folder={self.root / 'builds'}\n")
         _ = change_page.console_folder(self.root)
         self.status = change_page.DeliveryStatus(self.root)
         document = self.fixture.production.read_text()
@@ -2987,6 +3006,92 @@ window.fetch=async(url,options)=>{
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_question_chip_counts_match_rows_while_a_saved_followup_awaits_refresh(self) -> None:
+        answered = self.question()
+        remaining = self.question('What should the header say?')
+        other_source = fixture_member('unit', name='other-source', parent=self.fixture.unit.parent)
+        _ = self.fixture.file_user_question('What should the footer say?', asker=other_source)
+        other_owner = fixture_member('showrunner', name='other-owner')
+        other_question = self.fixture.file_user_question('Which label should the button use?', asker=other_source)
+        records = [replace(item, owner=other_owner.id) if item.key == other_question else item
+                   for item in review_items.read(self.root)]
+        with patch.object(review_items, 'read', return_value=records):
+            markup = browser_markup(self.root)
+        place = '#' + urlencode({'show': 'all', 'type': 'question', 'owner': answered.split('/')[1],
+                                  'source-owner': self.fixture.unit.id})
+        setup = '<script>history.replaceState(null, "", '+json.dumps(place)+');</script>'
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const content=document.querySelector('[data-review]'),fetchPage=window.fetch;
+ const answered=ANSWERED,remaining=REMAINING;
+ const rows=()=>[...content.querySelectorAll('[data-list-item]:not([hidden])')];
+ const ownerChip=id=>content.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]');
+ const checkCounts=expected=>{
+  const shown=rows().length;
+  check(shown===expected,'Expected '+expected+' visible Questions, got '+shown+'.');
+  for(const kind of ['type','show','owner']){
+   const chip=content.querySelector('[data-'+kind+'-chip][aria-pressed="true"]');
+   check(chip?.querySelector('b')?.textContent===String(shown),
+    'The selected '+kind+' chip counts the visible Questions.');
+  }
+ };
+ let releaseRefresh;
+ const refreshResponse=new Promise(resolve=>{releaseRefresh=resolve;});
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST' && options.body.get('row')===answered && options.body.get('outcome')==='question')
+   return Promise.resolve(Response.json({answer:'question sent',state:'Waiting',type:'question',later:0}));
+  const params=new URL(url,location.href).searchParams;
+  if(params.has('version') && !params.has('body')) return refreshResponse;
+  return fetchPage(url,options);
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='720px';
+  check(content.dataset.show==='all' &&
+   content.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
+   'Review starts with Show All and the Question type.');
+  const row=rows().find(item=>item.dataset.key===answered);
+  const owner=ownerChip(row.dataset.owner);
+  check(owner.getAttribute('aria-pressed')==='true' && owner.querySelector('b').textContent==='2',
+   'The selected Owner chip excludes the Question from the other source.');
+  checkCounts(2);
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(!form.dataset.sending){observer.disconnect();resolve();}
+   });
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.elements.feedback.value='Can the compact layout show all controls?';
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  if(!form.dataset.sending) throw new Error('The Question follow-up did not start.');
+  await saved;
+  check(form.querySelector('[data-send-status]').textContent==='Saved: question sent',
+   'The Question follow-up saves before the next index arrives.');
+  check(rows()[0]?.dataset.key===remaining,'The other Question stays visible.');
+  checkCounts(1);
+  check(content.querySelector('[data-show-chip="Waiting"] b').textContent==='0',
+   'The Waiting chip excludes the saved Question until the index arrives.');
+  const other=ownerChip(OTHER_OWNER),all=ownerChip('');
+  const otherCount=Number(other.querySelector('b').textContent),allCount=Number(all.querySelector('b').textContent);
+  check(otherCount===1 && allCount===3,'The other Owner and All counts include Questions from the other source.');
+  other.click();
+  check(other.getAttribute('aria-pressed')==='true' && !new URLSearchParams(location.hash.slice(1)).has('source-owner'),
+   'Selecting another Owner clears the source filter.');
+  check(rows().length===otherCount && rows()[0]?.dataset.key===OTHER_QUESTION,
+   'The other Owner count equals the number of Questions after the click.');
+  all.click();
+  check(rows().length===allCount,'The All count equals the number of Questions after the click.');
+ }catch(error){failures.push(String(error));}
+ finally{releaseRefresh(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));}
+ await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace('ANSWERED', json.dumps(answered)).replace('REMAINING', json.dumps(remaining)).replace(
+            'OTHER_OWNER', json.dumps(other_owner.id)).replace('OTHER_QUESTION', json.dumps(other_question))
+        page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
