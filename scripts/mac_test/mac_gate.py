@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator, Sequence
+from array import array
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -21,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from typing import TYPE_CHECKING, cast, override
 
@@ -55,18 +57,7 @@ RESULT_PREFIX = 'mac_gate_result='
 TESTS_STARTED_PREFIX = 'mac_gate_tests_started='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
-QUEUE_WAIT_LIMIT_KEY = 'time_limit.queue_wait_seconds'
-TEST_RUN_LIMIT_KEY = 'time_limit.test_run_seconds'
-
-
-@dataclass(frozen=True)
-class MacGateTimes:
-    queue_wait_seconds: float
-    test_run_seconds: float
-
-
-class MacGateTimeout(GateRefused):
-    """The Mac queue wait or test run reached its bound."""
+QUEUE_READ_BYTES = 65536
 
 
 class CheckoutCleanup(StrEnum):
@@ -429,7 +420,7 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
         run = gate.run_suites(repo, full=full, mode=gate.SuiteMode(ledger.text(request, 'mode')),
                               machine=gate.WholeMachine(timings),
                               module_time_limit_s=float(cast(float, request['module_time_limit_s'])),
-                              time_limit=gate_record.NoGateTimeLimit('the Mac queue call has a time limit'),
+                              time_limit=gate_record.NoGateTimeLimit('the Mac gate has no overall time limit'),
                               selected=gate.SelectedModules(tuple(cast(list[str], request['modules']))))
     return {'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'gate': gate_box.encode_run(run)}
 
@@ -440,6 +431,7 @@ class MacGateDiagnostics:
     queue_failures: list[str] = field(default_factory=list)
     gate_failures: list[str] = field(default_factory=list)
     queue_status: int = 0
+    queue_still_running: bool = False
 
     def read_failure_record(self, path: Path) -> None:
         from scripts.mac_test.mac_queue_run import QueueFailureStep, read_queue_failures
@@ -475,61 +467,155 @@ def report_interrupted_gate(report: str) -> None:
             _ = sys.stderr.write(report)
 
 
-def wait_for_queue_exit(pid: int, deadline: float) -> bool:
-    """Detect exit by the deadline and keep the PID reserved for group cleanup.
+@dataclass(frozen=True)
+class QueueExitWatch:
+    descriptor: int
 
-    Cleanup after the kill is outside this deadline.
-    """
-    while (remaining := deadline - time.monotonic()) > 0:
-        status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        if (status is not None and status.si_pid == pid
-                and status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)):
-            return True
-        time.sleep(min(0.01, remaining))
-    return False
+    @classmethod
+    def open(cls, pid: int, cleanup: ExitStack) -> QueueExitWatch:
+        if hasattr(select, 'kqueue'):
+            events = select.kqueue()
+            _ = cleanup.callback(events.close)
+            _ = events.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                              flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                              fflags=select.KQ_NOTE_EXIT)], 0)
+            return cls(events.fileno())
+        open_pidfd = cast(Callable[[int], int] | None, getattr(os, 'pidfd_open', None))
+        if open_pidfd is None:
+            raise GateRefused('The Mac gate needs kqueue or pidfd process exit events')
+        descriptor = open_pidfd(pid)
+        _ = cleanup.callback(os.close, descriptor)
+        return cls(descriptor)
 
 
-def capture_queue(process: subprocess.Popen[bytes], output: bytearray, requested_at: float, attempt: str, *,
-                  queue_wait_limit: int, test_run_limit: int) -> MacGateTimes:
-    """Capture queue output and change the deadline when the Mac starts its tests."""
+def queue_has_exited(pid: int) -> bool:
+    status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    return (status is not None and status.si_pid == pid
+            and status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED))
+
+
+def read_queue_until_exit(pid: int, fd: int, output: bytearray) -> None:
+    with ExitStack() as cleanup:
+        try:
+            watch = QueueExitWatch.open(pid, cleanup)
+        except ProcessLookupError:
+            if queue_has_exited(pid):
+                return
+            raise
+        ready = cleanup.enter_context(DefaultSelector())
+        _ = ready.register(watch.descriptor, EVENT_READ)
+        _ = ready.register(fd, EVENT_READ)
+        while True:
+            events = ready.select()
+            if any(key.fd == watch.descriptor for key, _ in events):
+                return
+            if not events:
+                continue
+            with suppress(BlockingIOError):
+                chunk = os.read(fd, QUEUE_READ_BYTES)
+                if chunk:
+                    output.extend(chunk)
+                else:
+                    _ = ready.unregister(fd)
+
+
+class MacQueueStillRunning(GateRefused):
+    """The gate could not stop the queue or prove that it exited."""
+
+
+@dataclass(frozen=True)
+class QueueNotStarted:
+    """The request folder has no queue process."""
+
+
+@dataclass(frozen=True)
+class QueueLaunching:
+    """The queue launch has no recorded process."""
+
+
+@dataclass
+class QueueRequest:
+    directory: tempfile.TemporaryDirectory[str]
+    process: QueueNotStarted | QueueLaunching | subprocess.Popen[bytes] = field(default_factory=QueueNotStarted)
+    capture_complete: bool = False
+
+    @property
+    def failure_file(self) -> Path:
+        return Path(self.directory.name) / 'queue-failure'
+
+    def close(self, diagnostics: MacGateDiagnostics) -> None:
+        process = self.process
+        removable = isinstance(process, QueueNotStarted)
+        try:
+            if isinstance(process, (QueueNotStarted, QueueLaunching)):
+                return
+            assert process.stdout is not None
+            with process.stdout as pipe:
+                stopped = False
+                try:
+                    try:
+                        stop_queue(process.pid, diagnostics)
+                        stopped = True
+                    finally:
+                        if self.capture_complete:
+                            drain_queue_snapshot(pipe.fileno(), diagnostics.output)
+                finally:
+                    if stopped:
+                        # Uninterruptible kernel sleep can delay this wait without a time bound.
+                        status = os.waitid(os.P_PID, process.pid, os.WEXITED)
+                        if status is None:
+                            raise ChildProcessError
+                        process.returncode = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+                        removable = True
+        except ChildProcessError:
+            diagnostics.gate_failures.append('The Mac gate could not finish: The Mac queue exit is unknown')
+        finally:
+            try:
+                diagnostics.read_failure_record(self.failure_file)
+            finally:
+                if removable:
+                    self.directory.cleanup()
+                else:
+                    diagnostics.queue_still_running = True
+                    diagnostics.gate_failures.append(f'The Mac gate kept the request folder {self.directory.name}')
+
+
+def stop_queue(pid: int, diagnostics: MacGateDiagnostics) -> None:
+    # Verify child ownership. The unreaped child reserves its PID until both signals finish.
+    _ = queue_has_exited(pid)
+    try:
+        process_group.send_process_group(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception as error:
+        diagnostics.gate_failures.append(f'The Mac gate could not stop the queue call: {error}')
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as error:
+        raise OSError(f'The Mac gate could not stop the queue process: {error}') from error
+
+
+def drain_queue_snapshot(fd: int, output: bytearray) -> None:
+    count = array('i', [0])
+    _ = cast(int, fcntl.ioctl(fd, termios.FIONREAD, count))
+    remaining = count[0]
+    while remaining > 0:
+        try:
+            chunk = os.read(fd, min(remaining, QUEUE_READ_BYTES))
+        except BlockingIOError as error:
+            raise OSError('The Mac queue output capture is incomplete') from error
+        if not chunk:
+            raise OSError('The Mac queue output capture is incomplete')
+        output.extend(chunk)
+        remaining -= len(chunk)
+
+
+def capture_queue(process: subprocess.Popen[bytes], diagnostics: MacGateDiagnostics) -> None:
+    """Capture the queue output until the exit event."""
     assert process.stdout is not None
     fd = process.stdout.fileno()
-    start_line = (TESTS_STARTED_PREFIX + attempt + '\n').encode()
-    line_start = scanned = 0
-    test_started: float | None = None
-    deadline = requested_at + queue_wait_limit
-    expired_bound = f'{QUEUE_WAIT_LIMIT_KEY} ({queue_wait_limit}s)'
-    exited = False
-    with DefaultSelector() as readable:
-        _ = readable.register(fd, EVENT_READ)
-        while (remaining := deadline - time.monotonic()) > 0:
-            if not readable.select(remaining):
-                continue
-            chunk = os.read(fd, 65536)
-            output.extend(chunk)
-            received_at = time.monotonic()
-            if received_at >= deadline:
-                break
-            if not chunk:
-                exited = wait_for_queue_exit(process.pid, deadline)
-                break
-            if test_started is None:
-                while (newline := output.find(b'\n', scanned)) != -1:
-                    if output.startswith(start_line, line_start):
-                        test_started = received_at
-                        deadline = test_started + test_run_limit
-                        expired_bound = f'{TEST_RUN_LIMIT_KEY} ({test_run_limit}s)'
-                        break
-                    line_start = scanned = newline + 1
-                scanned = len(output)
-    finished = time.monotonic()
-    times = MacGateTimes((finished if test_started is None else test_started) - requested_at,
-                         0.0 if test_started is None else finished - test_started)
-    if not exited or finished >= deadline:
-        raise MacGateTimeout(
-            f'The Mac gate exceeded {expired_bound}. '
-            + f'Queue wait {times.queue_wait_seconds:.3f}s. Test run {times.test_run_seconds:.3f}s.')
-    return times
+    os.set_blocking(fd, False)
+    read_queue_until_exit(process.pid, fd, diagnostics.output)
 
 
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
@@ -569,6 +655,8 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
     if deferred_exit is not None:
         report_interrupted_gate(report)
         raise deferred_exit
+    if diagnostics.queue_still_running:
+        raise MacQueueStillRunning(report) from attempt_error
     return report
 
 
@@ -591,10 +679,10 @@ def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagn
     cancelled.register(caller, select.POLLIN)
     if cancelled.poll(0):
         return 'The Mac gate was cancelled'
-    folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix=ATTEMPT_PREFIX)))
-    failure_file = folder / 'queue-failure'
-    # Read the record before the stack removes the temporary folder.
-    _ = cleanup.callback(diagnostics.read_failure_record, failure_file)
+    owner = QueueRequest(tempfile.TemporaryDirectory(prefix=ATTEMPT_PREFIX, delete=False))
+    request_cleanup = cleanup.enter_context(ExitStack())
+    _ = request_cleanup.callback(owner.close, diagnostics)
+    folder = Path(owner.directory.name)
     request = cloud_gate.prepare_request(repo, folder, mode, module_time_limit_s, selected=selected)
     cloud_gate.save(folder / 'request.json', request)
     _ = (folder / 'local-repo').write_text(str(repo))
@@ -603,37 +691,22 @@ def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagn
     timings = gate.read_measures(gate.gate_state_dir() / 'module_seconds.json')
     _ = (folder / 'module_seconds.json').write_text(json.dumps(timings))
     command = [*QUEUE_COMMAND, '--what', 'gate tests', '--kind', 'run', '--package', '',
-               '--worktree', str(repo), '--owned-close', '--failure-file', str(failure_file),
+               '--worktree', str(repo), '--owned-close', '--failure-file', str(owner.failure_file),
                '--lifecycle-script', str(Path(__file__).resolve()),
                '--', str(folder), str(int(full))]
     command[2:2] = ['--caller-fd', str(caller)]
-    settings = conf.read('mac_gate')
-    queue_wait_limit = settings.whole(QUEUE_WAIT_LIMIT_KEY)
-    test_run_limit = settings.whole(TEST_RUN_LIMIT_KEY)
     if cancelled.poll(0):
         return 'The Mac gate was cancelled'
-    requested_at = time.monotonic()
-    process = cleanup.enter_context(subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                      start_new_session=True, pass_fds=(caller,)))
-    owns_queue_pid = True
-    try:
-        times = capture_queue(process, diagnostics.output, requested_at, attempt_name(folder),
-                              queue_wait_limit=queue_wait_limit, test_run_limit=test_run_limit)
-    except ChildProcessError:
-        owns_queue_pid = False
-        raise GateRefused('The Mac queue exit is unknown') from None
-    except MacGateTimeout as error:
-        diagnostics.gate_failures.append(str(error))
+    owner.process = QueueLaunching()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               start_new_session=True, pass_fds=(caller,))
+    owner.process = process
+    capture_queue(process, diagnostics)
+    owner.capture_complete = True
+    request_cleanup.close()
+    status = process.returncode
+    if status is None:
         return ''
-    finally:
-        if owns_queue_pid:
-            try:
-                process_group.send_process_group(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except Exception as error:
-                diagnostics.gate_failures.append(f'The Mac gate could not stop the queue call: {error}')
-    status = process.wait()
     if cancelled.poll(0):
         return 'The Mac gate was cancelled'
     if status:
@@ -646,8 +719,6 @@ def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagn
     row = ledger.mapping(cast(object, json.loads(results[0])))
     run = cloud_gate.decode_requested_run(row, request)
     cloud_gate.validate_run_modules(run, request)
-    row['queue_wait_seconds'] = times.queue_wait_seconds
-    row['test_run_seconds'] = times.test_run_seconds
     return MacGateResult(row, run)
 
 

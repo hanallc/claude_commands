@@ -1,23 +1,22 @@
 """Exercise the Mac gate route and the module list with private fixtures."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout, suppress
-from dataclasses import replace
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
+from dataclasses import dataclass, replace
 import io
 import json
 import os
 import select
-from selectors import DefaultSelector, SelectorKey
 import signal
 import shutil
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 from types import SimpleNamespace
-from typing import cast, final, override
+from typing import BinaryIO, cast, final, override
 import unittest
 from unittest import mock
 
@@ -41,7 +40,7 @@ from scripts.test_times import gate_record
 RAW_QUEUE_OUTPUT = 'first\r\nsecond\u2028last\n'.encode() + b'\xff\n'
 
 FAKE_QUEUE = f"RAW_QUEUE_OUTPUT = {RAW_QUEUE_OUTPUT!r}\n" + """\
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -55,24 +54,21 @@ case = os.environ['MAC_GATE_CASE']
 if case != 'cleanup-refused':
     assert '--no-wait' not in args
 marker = 'mac_gate_tests_started=' + folder.name
-if case in ('raw-output', 'timeout-after-guest', 'invalid-result'):
-    if case == 'timeout-after-guest':
+if case in ('raw-output', 'guest-failure', 'invalid-result', 'read-error', 'held-queue'):
+    if case == 'guest-failure':
         print(marker, flush=True)
         Path(args[args.index('--failure-file') + 1]).write_text('guest 23\\n')
-    sys.stdout.buffer.write(RAW_QUEUE_OUTPUT)
+    sys.stdout.buffer.write(RAW_QUEUE_OUTPUT * (2 if case == 'read-error' else 1))
     sys.stdout.flush()
-    if case == 'raw-output':
+    if case == 'held-queue':
+        sys.stdin.buffer.read(1)
+    if case in ('raw-output', 'read-error', 'held-queue'):
         sys.exit(2)
+    if case == 'guest-failure':
+        sys.exit(23)
     if case == 'invalid-result':
         print('mac_gate_result=invalid', flush=True)
         sys.exit(0)
-if case in ('other-start', 'late-start'):
-    record = marker if case == 'late-start' else marker + '-other'
-    os.write(1, f'mac_gate_tests_started\\n{record}\\n'.encode())
-if case in ('wait-timeout', 'other-start', 'late-start'):
-    print('The placement is still queued', flush=True)
-if case in ('timeout', 'timeout-after-guest', 'wait-timeout', 'other-start', 'late-start'):
-    time.sleep(60)
 if case == 'lost':
     print('The Mac returned partial output', flush=True)
     sys.exit(0)
@@ -98,18 +94,17 @@ if case in ('cleanup-refused', 'cleanup-after-guest'):
     sys.exit(2)
 
 payload = Path(os.environ['MAC_GATE_RESULT'])
-if case == 'descendant':
+if case in ('descendant', 'pipe-holder'):
     with payload.with_suffix('.fifo').open('wb', buffering=0) as witness:
+        stdout = None if case == 'pipe-holder' else subprocess.DEVNULL
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
-                                 stdin=witness, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdin=witness, stdout=stdout, stderr=subprocess.DEVNULL)
         payload.with_suffix('.pid').write_text(str(child.pid))
+    if case == 'pipe-holder':
+        sys.stdout.buffer.write(RAW_QUEUE_OUTPUT)
+        sys.exit(2)
 
-if case == 'unknown-exit':
-    payload.with_suffix('.attempt').write_text(folder.name)
 print(marker, flush=True)
-if case == 'run-timeout':
-    print('The guest started a test module', flush=True)
-    time.sleep(60)
 
 row = {key: request[key] for key in ('attempt', 'tree', 'commit')}
 row['gate'] = json.loads(payload.read_text())
@@ -301,6 +296,12 @@ def module_path(job: gate.GateJobResult) -> str:
     return f'scripts/{job.suite}/{job.module}'
 
 
+@dataclass(frozen=True)
+class LaunchedFixtureQueue:
+    folder: Path
+    process: subprocess.Popen[bytes]
+
+
 @final
 class MacGateTests(unittest.TestCase):
     root = Path()
@@ -331,15 +332,7 @@ class MacGateTests(unittest.TestCase):
         _ = command.write_text(FAKE_QUEUE)
         payload = self.root / 'gate.json'
         _ = payload.write_text(json.dumps(gate_box.encode_run(gate.GateRun((job,), 1, 0))))
-        config = self.root / 'queue-config' / case
-        queue_seconds = 1 if case in ('timeout', 'wait-timeout', 'other-start', 'late-start') else 15
-        run_seconds = 1 if case in ('run-timeout', 'other-start', 'late-start', 'late-exit') else 15
-        if case == 'timeout-after-guest':
-            run_seconds = 2
-        _ = write_config_fixture(config / 'mac_gate.conf', f'time_limit.queue_wait_seconds={queue_seconds}\n'
-                                 + f'time_limit.test_run_seconds={run_seconds}\n')
-        with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload),
-                                          'CONF_DIR': str(config)}),
+        with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload)}),
               mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command)))):
             selection = gate.TreeSelection((module_path(job),), self.tree)
             return mac_gate.run_remote(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
@@ -354,69 +347,26 @@ class MacGateTests(unittest.TestCase):
                 assert isinstance(result, mac_gate.MacGateResult), result
                 self.assertEqual(result.run.jobs, (job,))
                 self.assertEqual(result.run.passed, status == 0)
+                self.assertEqual(set(result.row), {'attempt', 'tree', 'commit', 'gate'})
 
-    def test_wait_timeout_keeps_queue_output(self) -> None:
-        result = self.run_case('wait-timeout', module_job('one'))
+    def test_queue_returns_output_and_exit_after_a_long_quiet_gap(self) -> None:
+        quiet_gap = 24 * 60 * 60.0
+        elapsed = 0.0
+
+        def advance_fixture_clock() -> None:
+            nonlocal elapsed
+            elapsed = quiet_gap
+
+        self.watch_queue_reads(on_output=advance_fixture_clock)
+        clock = SimpleNamespace(monotonic=lambda: elapsed)
+        with mock.patch.object(mac_gate, 'time', clock):
+            result = self.run_case('raw-output', module_job('one'))
+        self.assertEqual(elapsed, quiet_gap)
         assert isinstance(result, str), result
-        self.assertIn('The placement is still queued', result)
-        self.assertIn('exceeded time_limit.queue_wait_seconds (1s)', result)
-        self.assertRegex(result, r'Queue wait \d+\.\d{3}s\. Test run 0\.000s\.')
+        self.assertEqual(result.encode('utf-8', errors='surrogateescape'),
+                         b'The Mac queue call ended with status 2\n' + RAW_QUEUE_OUTPUT)
 
-    def test_run_timeout_keeps_test_output(self) -> None:
-        result = self.run_case('run-timeout', module_job('one'))
-        assert isinstance(result, str), result
-        self.assertIn('The guest started a test module', result)
-        self.assertIn('exceeded time_limit.test_run_seconds (1s)', result)
-        self.assertRegex(result, r'Queue wait \d+\.\d{3}s\. Test run [1-9]\d*\.\d{3}s\.')
-
-    def test_wait_ignores_a_start_marker_for_another_attempt(self) -> None:
-        result = self.run_case('other-start', module_job('one'))
-        assert isinstance(result, str), result
-        self.assertIn('exceeded time_limit.queue_wait_seconds (1s)', result)
-        self.assertIn('Test run 0.000s.', result)
-
-    def test_wait_rejects_a_start_marker_received_after_the_deadline(self) -> None:
-        with DefaultSelector() as selector:
-            select_ready = selector.select
-            offset = 0.0
-
-            def receive_after_deadline(timeout: float | None = None) -> list[tuple[SelectorKey, int]]:
-                nonlocal offset
-                ready = select_ready(timeout)
-                if ready:
-                    offset = 2.0
-                return ready
-
-            clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset)
-            with (mock.patch.object(mac_gate, 'DefaultSelector', return_value=selector),
-                  mock.patch.object(selector, 'select', side_effect=receive_after_deadline),
-                  mock.patch.object(mac_gate, 'time', clock)):
-                result = self.run_case('late-start', module_job('one'))
-        assert isinstance(result, str), result
-        self.assertIn('exceeded time_limit.queue_wait_seconds (1s)', result)
-        self.assertIn('Test run 0.000s.', result)
-        self.assertIn('mac_gate_tests_started=mac-gate-', result)
-
-    def test_wait_rejects_a_queue_exit_observed_after_the_deadline(self) -> None:
-        waitid = os.waitid
-        offset = 0.0
-
-        def report_late_exit(idtype: int, pid: int, options: int) -> os.waitid_result | None:
-            nonlocal offset
-            status = waitid(idtype, pid, options)
-            if status is not None:
-                offset = 2.0
-            return status
-
-        clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset, sleep=time.sleep)
-        with (mock.patch.object(os, 'waitid', side_effect=report_late_exit),
-              mock.patch.object(mac_gate, 'time', clock)):
-            result = self.run_case('late-exit', module_job('one'))
-        assert isinstance(result, str), result
-        self.assertIn('exceeded time_limit.test_run_seconds (1s)', result)
-        self.assertIn('mac_exit=0', result)
-
-    def test_wait_requires_a_terminal_status_for_the_queue_pid(self) -> None:
+    def test_exit_probe_requires_a_terminal_status_for_the_queue_pid(self) -> None:
         pid = os.getpid()
         statuses = [
             SimpleNamespace(si_pid=pid, si_code=os.CLD_STOPPED),
@@ -424,61 +374,358 @@ class MacGateTests(unittest.TestCase):
             SimpleNamespace(si_pid=pid + 1, si_code=os.CLD_EXITED),
             SimpleNamespace(si_pid=pid, si_code=os.CLD_EXITED),
         ]
-        with mock.patch.object(os, 'waitid', side_effect=statuses) as waitid:
-            self.assertTrue(mac_gate.wait_for_queue_exit(pid, time.monotonic() + TEST_HANG_GUARD_SECS))
-        self.assertEqual(waitid.call_count, len(statuses))
+        with mock.patch.object(os, 'waitid', side_effect=statuses):
+            self.assertEqual([mac_gate.queue_has_exited(pid) for _ in statuses],
+                             [False, False, False, True])
 
     def test_queue_exit_is_unknown_when_the_gate_loses_the_child(self) -> None:
-        with (mock.patch.object(os, 'waitid', side_effect=ChildProcessError()),
+        waitid = os.waitid
+
+        def lose_exit(idtype: int, pid: int, options: int) -> None:
+            _ = waitid(idtype, pid, options & ~(os.WNOWAIT | os.WNOHANG))
+            raise ChildProcessError
+
+        with (self.watch_remote_queue() as (queues, workers),
+              mock.patch.object(os, 'waitid', side_effect=lose_exit),
               mock.patch.object(process_group, 'send_process_group',
-                                wraps=process_group.send_process_group) as stop):
-            result = self.run_case('unknown-exit', module_job('one'))
+                                wraps=process_group.send_process_group) as stop,
+              mock.patch.object(os, 'kill', wraps=os.kill) as stop_pid):
+            with self.assertRaises(mac_gate.MacQueueStillRunning) as raised:
+                _ = self.run_case('completed', module_job('one'))
+            (queue,) = queues
+            self.assertTrue(queue.folder.exists())
+            self.assert_capture_closed(queue.process)
+            self.assertEqual(workers, [])
         stop.assert_not_called()
+        stop_pid.assert_not_called()
         payload_path = self.root / 'gate.json'
-        attempt = payload_path.with_suffix('.attempt').read_text()
+        attempt = queue.folder.name
         payload = cast(dict[str, object], json.loads(payload_path.read_text()))
         row = {'attempt': attempt, 'tree': self.tree, 'commit': gate.checked_git(self.repo, 'rev-parse', 'HEAD'),
                'gate': payload}
-        self.assertEqual(result, 'The Mac gate could not finish: The Mac queue exit is unknown\n'
+        self.assertEqual(str(raised.exception), 'The Mac gate could not finish: The Mac queue exit is unknown\n'
+                         + f'The Mac gate kept the request folder {queue.folder}\n'
                          + f'mac_gate_tests_started={attempt}\n'
                          + f'mac_gate_result={json.dumps(row)}\n'
                          + 'mac_exit=0\n')
 
-    def test_successful_queue_exit_stops_its_descendant_without_a_pidfd(self) -> None:
+    def watch_queue_descendant(self) -> BinaryIO:
         witness = self.root / 'gate.fifo'
         os.mkfifo(witness)
-        with os.fdopen(os.open(witness, os.O_RDONLY | os.O_NONBLOCK), 'rb') as reader:
-            child_file = self.root / 'gate.pid'
-            try:
-                with (mock.patch.object(process_group, 'send_process_group',
-                                        wraps=process_group.send_process_group) as stop,
-                      mock.patch.object(os, 'pidfd_open', create=True) as pidfd):
-                    delattr(os, 'pidfd_open')
-                    try:
-                        result = self.run_case('descendant', module_job('one'))
-                    finally:
-                        setattr(os, 'pidfd_open', pidfd)
-                ready, _, _ = select.select([reader], [], [], TEST_HANG_GUARD_SECS)
-            finally:
-                if child_file.exists():
-                    try:
-                        _ = os.read(reader.fileno(), 1)
-                    except BlockingIOError:
-                        with suppress(ProcessLookupError):
-                            os.kill(int(child_file.read_text()), signal.SIGKILL)
-            stop.assert_called_once()
-            assert isinstance(result, mac_gate.MacGateResult), result
-            self.assertTrue(result.run.passed)
-            self.assertTrue(ready, 'The queue descendant is still running')
-            self.assertEqual(reader.read(), b'')
+        reader = self.enterContext(os.fdopen(os.open(witness, os.O_RDONLY | os.O_NONBLOCK), 'rb'))
+        child_file = self.root / 'gate.pid'
 
-    def test_result_records_wait_and_run_times(self) -> None:
-        result = self.run_case('completed', module_job('one'))
+        def stop_fixture_child() -> None:
+            if child_file.exists():
+                try:
+                    _ = os.read(reader.fileno(), 1)
+                except BlockingIOError:
+                    with suppress(ProcessLookupError):
+                        os.kill(int(child_file.read_text()), signal.SIGKILL)
+
+        self.addCleanup(stop_fixture_child)
+        return reader
+
+    def assert_queue_descendant_stopped(self, reader: BinaryIO) -> None:
+        ready, _, _ = select.select([reader], [], [], TEST_HANG_GUARD_SECS)
+        self.assertTrue(ready, 'The queue descendant is still running')
+        self.assertEqual(reader.read(), b'')
+
+    def test_successful_queue_exit_stops_its_descendant(self) -> None:
+        reader = self.watch_queue_descendant()
+        with mock.patch.object(process_group, 'send_process_group',
+                               wraps=process_group.send_process_group) as stop:
+            result = self.run_case('descendant', module_job('one'))
+        stop.assert_called_once()
         assert isinstance(result, mac_gate.MacGateResult), result
-        for field in ('queue_wait_seconds', 'test_run_seconds'):
-            seconds = result.row[field]
-            assert isinstance(seconds, float), seconds
-            self.assertGreater(seconds, 0)
+        self.assertTrue(result.run.passed)
+        self.assert_queue_descendant_stopped(reader)
+
+    def start_capture_child(self, source: str, writer: int) -> subprocess.Popen[bytes]:
+        child = self.enterContext(subprocess.Popen([sys.executable, '-c', source], stdin=subprocess.PIPE,
+                                                   stdout=writer, start_new_session=True))
+        self.addCleanup(child.kill)
+        return child
+
+    def capture_fixture(self, *, hold_queue: bool = False, output: bytes = RAW_QUEUE_OUTPUT,
+                        outside_writer: Callable[[int], None] = lambda _writer: None) -> subprocess.Popen[bytes]:
+        reader, writer = os.pipe()
+        pipe = self.enterContext(os.fdopen(reader, 'rb'))
+        hold = 'sys.stdin.buffer.read()\n'
+        source = f'import sys\nsys.stdout.buffer.write({output!r})\nsys.stdout.flush()\n'
+        try:
+            outside_writer(writer)
+            process = self.start_capture_child(source + (hold if hold_queue else '') + 'sys.exit(2)\n', writer)
+        finally:
+            os.close(writer)
+        process.stdout = pipe
+        return process
+
+    def assert_capture_closed(self, queue: subprocess.Popen[bytes]) -> None:
+        assert queue.stdout is not None
+        self.assertTrue(queue.stdout.closed, 'The queue output descriptor is still open')
+        with self.assertRaises(ChildProcessError):
+            _ = os.waitid(os.P_PID, queue.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+    def capture_with_cleanup(self, process: subprocess.Popen[bytes], diagnostics: mac_gate.MacGateDiagnostics) -> None:
+        owner = mac_gate.QueueRequest(tempfile.TemporaryDirectory(dir=self.root, delete=False), process)
+        try:
+            mac_gate.capture_queue(process, diagnostics)
+            owner.capture_complete = True
+        finally:
+            owner.close(diagnostics)
+
+    def test_queue_exit_drains_without_waiting_for_a_writer_outside_the_group(self) -> None:
+        def keep_pipe_open(writer: int) -> None:
+            _ = self.start_capture_child('import sys\nsys.stdin.buffer.read()\n', writer)
+
+        queue = self.capture_fixture(outside_writer=keep_pipe_open)
+
+        def refuse_blocking_read(fd: int) -> None:
+            if os.get_blocking(fd) and not select.select([fd], [], [], 0)[0]:
+                raise AssertionError('The final pipe read would wait for a writer outside the queue group')
+
+        self.watch_queue_reads(before_next_read=refuse_blocking_read)
+        diagnostics = mac_gate.MacGateDiagnostics()
+        self.capture_with_cleanup(queue, diagnostics)
+        self.assertEqual(diagnostics.output, RAW_QUEUE_OUTPUT)
+        self.assertEqual(queue.returncode, 2)
+        self.assert_capture_closed(queue)
+
+    def test_final_drain_reads_only_the_initial_bytes_with_an_active_outside_writer(self) -> None:
+        payload = RAW_QUEUE_OUTPUT * 2
+        writer = -1
+
+        def keep_writer(descriptor: int) -> None:
+            nonlocal writer
+            writer = os.dup(descriptor)
+            self.addCleanup(os.close, writer)
+
+        queue = self.capture_fixture(output=payload, outside_writer=keep_writer)
+        reads: list[int] = []
+        read = os.read
+
+        def short_read(descriptor: int, count: int) -> bytes:
+            reads.append(count)
+            self.assertLessEqual(len(reads), 2, 'The drain reads bytes written after the snapshot')
+            return read(descriptor, min(count, len(RAW_QUEUE_OUTPUT)))
+
+        def write_more() -> None:
+            _ = os.write(writer, RAW_QUEUE_OUTPUT)
+
+        def observe_exit(pid: int, _descriptor: int, _output: bytearray) -> None:
+            _ = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+
+        self.watch_queue_reads(on_output=write_more, before_next_read=lambda _fd: write_more(), read_chunk=short_read)
+        diagnostics = mac_gate.MacGateDiagnostics()
+        with mock.patch.object(mac_gate, 'read_queue_until_exit', side_effect=observe_exit):
+            self.capture_with_cleanup(queue, diagnostics)
+        self.assertEqual(diagnostics.output, payload)
+        self.assertEqual(reads, [len(payload), len(RAW_QUEUE_OUTPUT)])
+        self.assertEqual(queue.returncode, 2)
+        self.assert_capture_closed(queue)
+
+    def test_read_error_checks_ownership_before_signaling_the_queue_group(self) -> None:
+        queue = self.capture_fixture(hold_queue=True)
+        assert queue.stdin is not None
+        stdin = queue.stdin
+
+        def lose_child_and_fail_read() -> None:
+            stdin.close()
+            self.assertEqual(queue.wait(timeout=TEST_HANG_GUARD_SECS), 2)
+            raise OSError('fixture read failed after the queue was reaped')
+
+        self.watch_queue_reads(on_output=lose_child_and_fail_read)
+        diagnostics = mac_gate.MacGateDiagnostics()
+        with (mock.patch.object(process_group, 'send_process_group') as stop,
+              self.assertRaisesRegex(OSError, 'fixture read failed')):
+            self.capture_with_cleanup(queue, diagnostics)
+        self.assertFalse(stop.called, 'The gate signaled a queue group after it lost the child')
+        self.assertIn('The Mac gate could not finish: The Mac queue exit is unknown', diagnostics.gate_failures)
+        self.assert_capture_closed(queue)
+
+    def test_read_error_with_failed_group_stop_reaps_the_queue(self) -> None:
+        queue = self.capture_fixture(hold_queue=True)
+        assert queue.stdin is not None
+        stdin = queue.stdin
+        waitid = os.waitid
+        group_failed = threading.Event()
+
+        def release_obsolete_blocking_observer(idtype: int, pid: int, options: int) -> os.waitid_result | None:
+            if options & os.WNOWAIT and not options & os.WNOHANG:
+                self.assertTrue(group_failed.wait(TEST_HANG_GUARD_SECS))
+                stdin.close()
+            return waitid(idtype, pid, options)
+
+        def fail_group_stop(pid: int, signum: int) -> None:
+            self.assertEqual((pid, signum), (queue.pid, signal.SIGKILL))
+            self.assertIsNone(waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG))
+            group_failed.set()
+            raise PermissionError('fixture group stop failed')
+
+        def fail_read() -> None:
+            raise OSError('fixture read failed with a live queue')
+
+        self.watch_queue_reads(on_output=fail_read)
+        diagnostics = mac_gate.MacGateDiagnostics()
+        with (mock.patch.object(os, 'waitid', side_effect=release_obsolete_blocking_observer),
+              mock.patch.object(process_group, 'send_process_group', side_effect=fail_group_stop) as stop,
+              self.assertRaisesRegex(OSError, 'fixture read failed')):
+            self.capture_with_cleanup(queue, diagnostics)
+        stop.assert_called_once()
+        self.assertEqual(queue.returncode, -signal.SIGKILL, 'The gate did not stop and reap the live queue')
+        self.assertIn('The Mac gate could not stop the queue call: fixture group stop failed',
+                      diagnostics.gate_failures)
+        self.assert_capture_closed(queue)
+
+    @contextmanager
+    def watch_remote_queue(self, *, after_launch: Callable[[], None] = lambda: None
+                           ) -> Generator[tuple[list[LaunchedFixtureQueue], list[threading.Thread]]]:
+        queues: list[LaunchedFixtureQueue] = []
+        workers: list[threading.Thread] = []
+        popen = subprocess.Popen
+        thread = threading.Thread
+
+        def launch(command: list[str], *, stdout: int, stderr: int, start_new_session: bool,
+                   pass_fds: tuple[int, ...]) -> subprocess.Popen[bytes]:
+            process = popen(command, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
+                            start_new_session=start_new_session, pass_fds=pass_fds)
+            queues.append(LaunchedFixtureQueue(Path(command[-2]), process))
+            after_launch()
+            return process
+
+        def record_worker(*, target: Callable[[], None], name: str, daemon: bool) -> threading.Thread:
+            worker = thread(target=target, name=name, daemon=daemon)
+            workers.append(worker)
+            return worker
+
+        try:
+            commands = SimpleNamespace(Popen=launch, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT)
+            with (mock.patch.object(mac_gate, 'subprocess', commands),
+                  mock.patch.object(threading, 'Thread', side_effect=record_worker)):
+                yield queues, workers
+        finally:
+            for queue in queues:
+                assert queue.process.stdin is not None
+                queue.process.stdin.close()
+            for worker in workers:
+                worker.join(TEST_HANG_GUARD_SECS)
+                self.assertFalse(worker.is_alive())
+            for queue in queues:
+                assert queue.process.stdout is not None
+                queue.process.stdout.close()
+                if queue.process.returncode is None:
+                    queue.process.kill()
+                    _ = queue.process.wait(timeout=TEST_HANG_GUARD_SECS)
+                self.assert_capture_closed(queue.process)
+
+    def test_failed_pid_signal_keeps_the_request_without_a_reaper_thread(self) -> None:
+        def fail_read() -> None:
+            raise OSError('fixture queue read failed')
+
+        self.watch_queue_reads(on_output=fail_read)
+        with (self.watch_remote_queue() as (queues, workers),
+              mock.patch.object(process_group, 'send_process_group', side_effect=PermissionError('group denied')),
+              mock.patch.object(os, 'kill', side_effect=PermissionError('process denied')) as stop):
+            with self.assertRaises(mac_gate.MacQueueStillRunning) as raised:
+                _ = self.run_case('held-queue', module_job('one'))
+            (queue,) = queues
+            stop.assert_called_once_with(queue.process.pid, signal.SIGKILL)
+            self.assertTrue((queue.folder / 'request.json').is_file())
+            self.assertIsNone(os.waitid(os.P_PID, queue.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT))
+            assert queue.process.stdout is not None
+            self.assertTrue(queue.process.stdout.closed)
+            self.assertEqual(workers, [], 'The gate started a reaper thread after the PID signal failed')
+            self.assertIn(str(queue.folder), str(raised.exception))
+            self.assertIn('fixture queue read failed', str(raised.exception))
+            self.assertIn('group denied', str(raised.exception))
+            self.assertIn('process denied', str(raised.exception))
+        self.assertTrue(queue.folder.exists())
+
+    def test_lost_reap_keeps_the_request_without_a_reaper_thread(self) -> None:
+        waitid = os.waitid
+
+        def lose_reap(idtype: int, pid: int, options: int) -> os.waitid_result | None:
+            result = waitid(idtype, pid, options)
+            if options == os.WEXITED:
+                raise ChildProcessError
+            return result
+
+        with self.watch_remote_queue() as (queues, workers), mock.patch.object(os, 'waitid', side_effect=lose_reap):
+            with self.assertRaises(mac_gate.MacQueueStillRunning, msg='An unknown reap must raise') as raised:
+                _ = self.run_case('completed', module_job('one'))
+            (queue,) = queues
+            self.assertTrue((queue.folder / 'request.json').is_file())
+            self.assert_capture_closed(queue.process)
+            self.assertEqual(workers, [])
+            self.assertIn(str(queue.folder), str(raised.exception))
+            self.assertIn('The Mac queue exit is unknown', str(raised.exception))
+
+    def test_interrupted_launch_keeps_the_request_before_the_process_is_recorded(self) -> None:
+        interruption = KeyboardInterrupt()
+
+        def interrupt_launch() -> None:
+            raise interruption
+
+        stderr = io.StringIO()
+        with (self.watch_remote_queue(after_launch=interrupt_launch) as (queues, workers),
+              redirect_stderr(stderr), self.assertRaises(KeyboardInterrupt) as raised):
+            _ = self.run_case('held-queue', module_job('one'))
+        (queue,) = queues
+        self.assertIs(raised.exception, interruption)
+        self.assertTrue((queue.folder / 'request.json').is_file(), 'Cleanup removed the request during launch')
+        self.assertIn(str(queue.folder), stderr.getvalue())
+        self.assertEqual(workers, [])
+
+    def test_interrupt_before_capture_stops_and_reaps_the_recorded_process(self) -> None:
+        interruption = KeyboardInterrupt()
+        with (self.watch_remote_queue() as (queues, workers), redirect_stderr(io.StringIO()),
+              mock.patch.object(mac_gate, 'capture_queue', side_effect=interruption),
+              mock.patch.object(process_group, 'send_process_group',
+                                wraps=process_group.send_process_group) as stop_group,
+              mock.patch.object(os, 'kill', wraps=os.kill) as stop_pid):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                _ = self.run_case('held-queue', module_job('one'))
+            (queue,) = queues
+            self.assertIs(raised.exception, interruption)
+            self.assertFalse(queue.folder.exists(), 'Cleanup did not remove the stopped queue request')
+            stop_group.assert_called_once_with(queue.process.pid, signal.SIGKILL)
+            stop_pid.assert_called_once_with(queue.process.pid, signal.SIGKILL)
+            self.assertEqual(queue.process.returncode, -signal.SIGKILL)
+            self.assert_capture_closed(queue.process)
+            self.assertEqual(workers, [])
+
+    def test_normal_queue_exit_removes_the_request(self) -> None:
+        with (self.watch_remote_queue() as (queues, workers),
+              mock.patch.object(os, 'kill', wraps=os.kill) as stop_pid):
+            result = self.run_case('completed', module_job('one'))
+            self.assertIsInstance(result, mac_gate.MacGateResult)
+            (queue,) = queues
+            self.assertFalse(queue.folder.exists())
+            self.assertEqual(queue.process.returncode, 0)
+            self.assert_capture_closed(queue.process)
+            self.assertEqual(workers, [])
+            self.assertTrue(stop_pid.called, 'Normal cleanup must also stop the queue PID')
+            stop_pid.assert_called_once_with(queue.process.pid, signal.SIGKILL)
+
+    def test_queue_exit_stops_a_descendant_with_the_output_pipe(self) -> None:
+        reader = self.watch_queue_descendant()
+        with mock.patch.object(process_group, 'send_process_group',
+                               wraps=process_group.send_process_group) as stop:
+            def require_group_cleanup(descriptor: int) -> None:
+                if os.get_blocking(descriptor) and not stop.called:
+                    child_pid = int((self.root / 'gate.pid').read_text())
+                    _ = os.waitid(os.P_PID, os.getpgid(child_pid), os.WEXITED | os.WNOWAIT)
+                    ready, _, _ = select.select([descriptor], [], [], 0)
+                    self.assertTrue(ready, 'A pipe read would block before cleanup could stop its writer')
+
+            self.watch_queue_reads(before_next_read=require_group_cleanup)
+            result = self.run_case('pipe-holder', module_job('one'))
+        stop.assert_called_once()
+        assert isinstance(result, str), result
+        self.assertEqual(result.encode('utf-8', errors='surrogateescape'),
+                         b'The Mac queue call ended with status 2\n' + RAW_QUEUE_OUTPUT, repr(result))
+        self.assert_queue_descendant_stopped(reader)
 
     def test_guest_returns_a_failed_module_without_the_failure_log_limit(self) -> None:
         copy_test_runner(self.repo)
@@ -508,7 +755,6 @@ class MacGateTests(unittest.TestCase):
 
     def test_queue_failure_uses_natedev(self) -> None:
         for case, reason in (('status', 'The Mac queue call ended with status 23'),
-                             ('timeout', 'exceeded time_limit.queue_wait_seconds (1s)'),
                              ('lost', 'no unique gate result')):
             with self.subTest(case=case):
                 result = self.run_case(case, module_job('one'))
@@ -1103,12 +1349,11 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                          ['place-step', 'prepare', 'cleanup', 'cancel-placement'])
         self.assertFalse(any((self.root / mac_queue_run.RECEIPTS).iterdir()))
 
-    def test_queue_timeout_keeps_the_guest_failure_and_captured_bytes(self) -> None:
-        result = self.run_case('timeout-after-guest', module_job('one'))
+    def test_queue_exit_keeps_the_guest_failure_and_captured_bytes(self) -> None:
+        result = self.run_case('guest-failure', module_job('one'))
         assert isinstance(result, str), result
-        guest, timeout, output = result.split('\n', 2)
+        guest, output = result.split('\n', 1)
         self.assertEqual(guest, 'The Mac gate guest ended with status 23')
-        self.assertIn('exceeded time_limit.test_run_seconds (2s)', timeout)
         marker, _, raw_output = output.partition('\n')
         self.assertTrue(marker.startswith(mac_gate.TESTS_STARTED_PREFIX))
         self.assertEqual(raw_output.encode('utf-8', errors='surrogateescape'), RAW_QUEUE_OUTPUT)
@@ -1158,11 +1403,10 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                     raise OSError('fixture folder cleanup failed')
 
         with mock.patch.object(tempfile, 'TemporaryDirectory', FailingCleanup):
-            result = self.run_case('timeout-after-guest', module_job('one'))
+            result = self.run_case('guest-failure', module_job('one'))
         assert isinstance(result, str), result
-        reason, timeout, local_error, output = result.split('\n', 3)
+        reason, local_error, output = result.split('\n', 2)
         self.assertEqual(reason, 'The Mac gate guest ended with status 23')
-        self.assertIn('exceeded time_limit.test_run_seconds (2s)', timeout)
         self.assertIn('fixture folder cleanup failed', local_error)
         marker, _, raw_output = output.partition('\n')
         self.assertTrue(marker.startswith(mac_gate.TESTS_STARTED_PREFIX))
@@ -1175,24 +1419,37 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertEqual(result.splitlines()[0], 'The Mac gate cleanup failed')
         self.assertIn('mac_gate_result=', result)
 
-    def fail_read_after_queue_output(self, error: BaseException) -> None:
-        read = os.read
+    def watch_queue_reads(self, *, on_output: Callable[[], None] = lambda: None,
+                          before_next_read: Callable[[int], None] = lambda _descriptor: None,
+                          read_chunk: Callable[[int, int], bytes] = os.read) -> None:
         queue_descriptor = -1
 
-        def fail_after_output(descriptor: int, count: int) -> bytes:
+        def observe_read(descriptor: int, count: int) -> bytes:
             nonlocal queue_descriptor
             if descriptor == queue_descriptor:
-                raise error
-            output = read(descriptor, count)
-            if output.startswith(RAW_QUEUE_OUTPUT):
+                before_next_read(descriptor)
+            output = read_chunk(descriptor, count)
+            if queue_descriptor < 0 and output.startswith(RAW_QUEUE_OUTPUT):
                 queue_descriptor = descriptor
+                on_output()
             return output
 
-        _ = self.enterContext(mock.patch.object(os, 'read', side_effect=fail_after_output))
+        _ = self.enterContext(mock.patch.object(os, 'read', side_effect=observe_read))
+
+    def fail_read_after_queue_output(self, error: BaseException) -> None:
+        read = os.read
+
+        def read_one_chunk(descriptor: int, count: int) -> bytes:
+            return read(descriptor, min(count, len(RAW_QUEUE_OUTPUT)))
+
+        def fail(_descriptor: int) -> None:
+            raise error
+
+        self.watch_queue_reads(before_next_read=fail, read_chunk=read_one_chunk)
 
     def test_gate_keeps_the_bytes_when_reading_the_pipe_fails(self) -> None:
         self.fail_read_after_queue_output(OSError('fixture queue read failed'))
-        result = self.run_case('raw-output', module_job('one'))
+        result = self.run_case('read-error', module_job('one'))
         assert isinstance(result, str), result
         header, _, output = result.partition('\n')
         self.assertIn('fixture queue read failed', header)
@@ -1203,7 +1460,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.fail_read_after_queue_output(error)
         stderr = io.StringIO()
         with redirect_stderr(stderr), self.assertRaises(KeyboardInterrupt) as raised:
-            _ = self.run_case('raw-output', module_job('one'))
+            _ = self.run_case('read-error', module_job('one'))
         self.assertIs(raised.exception, error)
         self.assertIn('KeyboardInterrupt', stderr.getvalue())
         self.assertEqual(stderr.getvalue().partition('\n')[2].encode('utf-8', errors='surrogateescape'),

@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TextIO, TypedDict, cast, final
+from typing import BinaryIO, TextIO, TypedDict, cast, final
 import uuid
 
 from scripts.lib import conf, process_group
@@ -298,9 +298,15 @@ printf 'mac_stopped=%s\\n' "$group"
 
 def own_command[Output: (str, bytes)](process: subprocess.Popen[Output],
                                       steps: QueueSteps, *,
-                                      close_step: QueueFailureStep = QueueFailureStep.COMMAND_CLOSE
+                                      close_step: QueueFailureStep = QueueFailureStep.COMMAND_CLOSE,
+                                      before_stdout_close: Callable[[], None] = lambda: None,
                                       ) -> subprocess.Popen[Output]:
     kill_sent = False
+
+    def close_stdout() -> None:
+        assert process.stdout is not None
+        before_stdout_close()
+        process.stdout.close()
 
     def terminate() -> None:
         if process.poll() is None:
@@ -321,9 +327,11 @@ def own_command[Output: (str, bytes)](process: subprocess.Popen[Output],
         if kill_sent or process.poll() is not None:
             _ = process.wait()
 
-    for stream in (process.stdin, process.stderr, process.stdout):
+    for stream in (process.stdin, process.stderr):
         if stream is not None:
             _ = steps.defer(close_step, stream.close)
+    if process.stdout is not None:
+        _ = steps.defer(close_step, close_stdout)
     _ = steps.defer(QueueFailureStep.COMMAND_REAP, reap)
     _ = steps.defer(QueueFailureStep.COMMAND_KILL, kill)
     _ = steps.defer(QueueFailureStep.COMMAND_GRACE, wait_for_termination)
@@ -689,6 +697,14 @@ def watch_caller(caller: int, queue: int) -> int:
 def caller_watch(caller: int, failed: threading.Event, steps: QueueSteps) -> None:
     queue_thread = threading.get_ident()
     closing = threading.Event()
+    monitor_thread: threading.Thread | None = None
+
+    def join_monitor() -> None:
+        if monitor_thread is not None and monitor_thread.ident is not None:
+            if watcher.returncode is None:
+                raise ValueError("the Mac queue caller watch has no exit status")
+            monitor_thread.join()
+
     _ = own_descriptor(steps, QueueFailureStep.CALLER_WATCH_SHUTDOWN, caller)
     if os.getpgrp() != os.getpid():
         raise ValueError("the Mac queue must own its process group")
@@ -698,16 +714,34 @@ def caller_watch(caller: int, failed: threading.Event, steps: QueueSteps) -> Non
     watcher = own_command(subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "watch-caller", str(caller), str(reader)],
         pass_fds=(caller, reader), start_new_session=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE), steps)
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT), steps,
+        before_stdout_close=join_monitor)
     assert watcher.stdout is not None
-    output = watcher.stdout.fileno()
+    watch_output = cast(BinaryIO, watcher.stdout)
+    output = watch_output.fileno()
+
+    def report_watch_output(message: bytes | bytearray) -> None:
+        if message:
+            with contextlib.suppress(OSError, UnicodeError):
+                _ = sys.stderr.write(message.decode(errors="replace"))
+                _ = sys.stderr.flush()
+
     readiness = select.poll()
     readiness.register(output, select.POLLIN)
     grace = conf.read("mac_gate").number("terminate_grace_seconds")
-    if not readiness.poll(math.ceil(grace * 1000)) or os.read(output, 6) != b"ready\n":
+    marker = b"ready\n"
+    initial = os.read(output, len(marker)) if readiness.poll(math.ceil(grace * 1000)) else b""
+    if initial != marker:
+        pending = bytearray(initial)
+        os.set_blocking(output, False)
+        with contextlib.suppress(BlockingIOError):
+            while chunk := os.read(output, 65536):
+                pending.extend(chunk)
+        report_watch_output(pending)
         raise ValueError("the Mac queue caller watch did not start")
 
     def check_watcher() -> int:
+        report_watch_output(watch_output.read())
         status = watcher.wait()
         return 0 if closing.is_set() or status == CALLER_EXITED else status or 2
 
@@ -737,7 +771,8 @@ def caller_watch(caller: int, failed: threading.Event, steps: QueueSteps) -> Non
     _ = steps.defer(QueueFailureStep.CALLER_WATCH_SHUTDOWN, wait_for_watcher)
     steps.finish_first(queue_input)
     _ = steps.defer(QueueFailureStep.CALLER_WATCH_SHUTDOWN, closing.set)
-    threading.Thread(target=monitor, daemon=True).start()
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
 
 
 def main(argv: list[str] | None = None) -> int:

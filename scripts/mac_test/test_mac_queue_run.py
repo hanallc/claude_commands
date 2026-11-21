@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import TextIO, cast
+from typing import TextIO, cast, override
 from unittest import mock
 import unittest
 
@@ -206,6 +206,104 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("caller watch did not start", result.stderr)
             self.assertFalse((root / "events").exists())
+
+    def test_caller_watch_relays_stderr_from_its_own_pipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            fixture = root / "watch.py"
+            _ = fixture.write_text('import sys\nprint("fixture watcher error", file=sys.stderr)\n')
+            reader, writer = os.pipe()
+            os.close(writer)
+            output = io.StringIO()
+            steps = mac_queue_run.QueueSteps(None)
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(mac_queue_run, "__file__", str(fixture)),
+                  mock.patch.object(os, "getpgrp", return_value=os.getpid()),
+                  redirect_stderr(output)):
+                status = steps.execute(mac_queue_run.QueueFailureStep.CALLER_WATCH_START,
+                                       lambda: mac_queue_run.caller_watch(reader, threading.Event(), steps),
+                                       finalize=True)
+            self.assertEqual(status, 2)
+            self.assertIn("fixture watcher error\n", output.getvalue())
+
+    def check_delayed_caller_watch(self, *, requires_termination: bool) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            fixture = root / "watch.py"
+            pid_file = fixture.with_suffix(".pid")
+            lifetime_arg = 2 if requires_termination else 3
+            _ = fixture.write_text(
+                "import os, sys\nfrom pathlib import Path\n"
+                + "Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))\n"
+                + "print('ready', flush=True)\n"
+                + f"with os.fdopen(int(sys.argv[{lifetime_arg}]), 'rb') as lifetime:\n"
+                + "    lifetime.read()\n")
+            ready_to_read = threading.Event()
+            monitors: list[threading.Thread] = []
+            join_after_exit: list[bool] = []
+            check = self
+
+            class DelayedMonitor(threading.Thread):
+                @override
+                def start(self) -> None:
+                    monitors.append(self)
+                    super().start()
+
+                @override
+                def run(self) -> None:
+                    if ready_to_read.wait(TEST_HANG_GUARD_SECS):
+                        super().run()
+
+                @override
+                def join(self, timeout: float | None = None) -> None:
+                    pid = int(pid_file.read_text())
+                    try:
+                        _ = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                    except ChildProcessError:
+                        join_after_exit.append(True)
+                        ready_to_read.set()
+                        super().join(TEST_HANG_GUARD_SECS if timeout is None else timeout)
+                        check.assertFalse(self.is_alive(), "The monitor did not finish")
+                    else:
+                        join_after_exit.append(False)
+
+            reader, writer = os.pipe()
+            output = io.StringIO()
+            steps = mac_queue_run.QueueSteps(None)
+            failed = threading.Event()
+            join = threading.Thread.join
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(mac_queue_run, "__file__", str(fixture)),
+                  mock.patch.object(os, "getpgrp", return_value=os.getpid()),
+                  mock.patch.object(threading, "Thread", DelayedMonitor),
+                  redirect_stderr(output)):
+                try:
+                    status = steps.execute(mac_queue_run.QueueFailureStep.CALLER_WATCH_START,
+                                           lambda: mac_queue_run.caller_watch(reader, failed, steps),
+                                           finalize=True)
+                finally:
+                    os.close(writer)
+                    ready_to_read.set()
+                    for monitor in monitors:
+                        join(monitor, TEST_HANG_GUARD_SECS)
+            self.assertEqual(len(monitors), 1, output.getvalue())
+            self.assertFalse(monitors[0].is_alive())
+            with self.assertRaises(ChildProcessError):
+                _ = os.waitid(os.P_PID, int(pid_file.read_text()), os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            if requires_termination:
+                self.assertEqual(join_after_exit, [True], "Cleanup must reap the watcher before it joins the monitor.")
+            expected = [mac_queue_run.QueueFailureStep.CALLER_WATCH_SHUTDOWN] if requires_termination else []
+            self.assertEqual([failure.step for failure in steps.failures], expected, output.getvalue())
+            self.assertEqual(join_after_exit, [True], "Cleanup must join the monitor before it closes stdout.")
+            self.assertEqual(status, 2 if requires_termination else 0)
+
+    def test_caller_watch_keeps_stdout_open_for_a_late_monitor(self) -> None:
+        self.check_delayed_caller_watch(requires_termination=False)
+
+    def test_caller_watch_terminates_before_it_joins_the_monitor(self) -> None:
+        self.check_delayed_caller_watch(requires_termination=True)
 
     def test_a_caller_watch_failure_after_ready_stops_the_queue_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
