@@ -123,6 +123,8 @@ Both paths compute the evidence key from the submitted request and current confi
 Settlement schedules the probe before it reads the shared evidence result.
 Local placements release their reader subscriptions when their reservations end.
 
+`RepositorySlotReady()` advises a retry because `/proc/locks` can omit a held slot, and only the caller's successful `flock` proves it acquired the slot.
+
 ### Cloud gates
 
 `AdmitRequest.place` defaults to `LocalPlace()`.
@@ -939,6 +941,11 @@ A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
 `detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+The launcher accepts `--kind python-tests` before `--` and defaults to `detect`.
+It records the kind and creates the scope `detached-<kind>-<run-id>.scope` when systemd is available.
+The scope name omits the worker suffix from the run ID.
+The Builds page reads the kind from the scope name.
+For a `detect` scope or an unmarked scope, the page estimates memory use from live Python test processes and their descendants.
 Orphan reaping uses the same runs-folder lock as start, including the `reap` verb and launcher reaping.
 The reaper cannot finish a record while start publishes its supervisor PID.
 Only running records with their matching supervisor hold a place.
@@ -1012,14 +1019,25 @@ The sender prints each send outcome header to the journal.
 
 `build_queue/head_stall.py` watches for a stalled queue head. `buildlog sample` runs it each minute on natedev.
 It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
-A stall needs three facts: the head waited `head_stall_alert_minutes` (`build_admission.conf`), a step with a promise above zero runs, and no step with need above zero started in that time.
-Merge gates and targeted tests start with zero need, so they do not hide a stall.
-A snapshot older than `silence_seconds` is not a stall; `down-alert` covers a silent service.
-The watch sends one message to `builds` with the head and each holder's promise and use.
-It also sends one `alert.blocked` phone push with the key `head-stall-<pid>:<start time>:<last start>`.
-The push clears when `head_stall.py cleared --head <key>` exits 0: the head started, left, or no longer stalls.
-`~/.local/state/buildlog/head_stall.json` records the alerted key, so each stall alerts once. A step start ends a stall; a later stall alerts again. A failed send retries the next minute.
-The 2026-11-17 stall held the head from 00:36 to 03:46 EST; no alert reached anyone.
+The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
+The head must wait at least that long. At least one step must hold memory.
+The last admission or step start with a memory need above zero must also be at least that old.
+Merge gates and targeted tests start with a memory need of zero.
+The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
+
+The watch sends one alert per stall to each of the `builds` and `bob` sessions.
+The alert names the head and lists each holder's time since admission, memory promise, and memory use.
+It adds a note when an incomplete sccache scan can make the use values too low.
+The stall key is the most recent admission or step start with a memory need above zero.
+A head change keeps the same key. A new admission or step start ends the stall.
+The sender uses the stall key to keep one queued copy per recipient.
+The watch accepts `SENT`, `SKIPPED`, `QUEUED`, and `KEPT` as delivery outcomes.
+After each accepted send, the watch records the recipient and stall key in `~/.local/state/buildlog/head_stall.json`.
+An old shared key counts for `builds` only.
+If a state write fails, the watch continues to the next recipient and reports one write error after the sends.
+If the stall continues, the watch retries each unaccepted send the next minute.
+
+The 2026-11-17 stall held the head from 00:36 to 03:46 EST. No alert reached anyone.
 
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
@@ -1407,7 +1425,7 @@ Those workers may build.
 
 | Command | Behavior |
 | --- | --- |
-| `clear [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Default natedev. A missing ETA returns exit 2 without changes. Use `HH:MM` for later today or `YYYY-MM-DDTHH:MM` for a later date. Starts the enforcer and prints its notice, keep list, and audit. Stops every test and build outside the allow rules. Each stopped session gets one release notice. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
+| `clear [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Default natedev. A missing ETA returns exit 2 without changes. Use `HH:MM` for later today or `YYYY-MM-DDTHH:MM` for a later date. Starts the enforcer and prints its notice, keep list, and audit. Stops every test and build outside the allow rules. Registers each stopped session for release. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
 | `drain [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Requires the same future ETA as clear. Keeps existing work and holds new work until explicit release. |
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
@@ -1452,19 +1470,29 @@ These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 
-After the file is gone, `notify_release` sends one notice to each recorded recipient.
+After the file is gone, `notify_release` checks each recorded recipient before it sends.
 The notice says to start builds and BRP launches now; the memory gate orders them.
 No answer is needed.
 Claude session keys use `socket_for`, which returns `RecipientLive | RecipientGone | RecipientLookupFailed`.
-Lookup exit 1 means gone; other lookup failures retry three times with one second between tries.
-`codex:` keys bypass socket lookup and use `session_send.send_argv` with `send.py --to codex:<thread> --text <notice>`.
+Lookup exit 1 means the session is gone. Other lookup failures retry up to three times, one second apart.
+Release reads one staff snapshot per cycle with notices to send.
+Release sends Codex notices through `send.py --skip-closed --to codex:<thread> --text <notice>`.
+The sender checks both machines for a route when it has no usable local route.
+With `--skip-closed`, a complete search with no match returns `ABSENT` with exit 8.
+An unknown Codex thread identity prevents the sender from confirming absence.
+After automatic forwarding, the sender accepts a peer's `ABSENT` result only if its local search also proved absence.
+When the roster shows only closed or stopped worker panes, send returns `CLOSED` with exit 7.
+Release records `WorkerClosed`. The next assignment resumes the worker.
+Release records a confirmed missing session as `RecipientGone`.
+If the staff row is also absent, release removes the recipient from the cycle's recipient list.
+Release recovery uses each session's first saved outcome to decide whether to restore a removed recipient.
 Both routes use the same notice text.
-The sender handles a closed worker pane through its holder.
-Send exit 0 gives `Delivered`; exit 1 gives `QueuedUnconfirmed`; other exits give `DeliveryFailed`.
+Send exit 0 gives `Delivered`. Exit 1 gives `QueuedUnconfirmed`. Other failures give `DeliveryFailed`.
 A failed Codex send prints the sender's error detail on stderr.
 The cycle saves the outcome after the sender returns.
 A stopped send stays pending and can repeat the notice on retry.
-`Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries.
+`Not reached, tell them yourself: <session name> (<reason>)` names failed and unconfirmed deliveries.
+It also names a recipient whose staff row remains after its session is gone.
 `cycle_status_lines` prints delivery outcomes.
 Release waits for no answer, build or memory allocation.
 

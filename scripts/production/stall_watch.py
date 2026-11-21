@@ -62,6 +62,7 @@ PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / 
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
+WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
@@ -331,7 +332,8 @@ def process_session(pid: int) -> str:
             environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
             return ""
-        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment
+                      if item.startswith((b"CODEX_THREAD_ID=", b"CLAUDE_CODE_SESSION_ID=")))
     return values.get("CODEX_THREAD_ID", "") or values.get("CLAUDE_CODE_SESSION_ID", "")
 
 
@@ -646,7 +648,7 @@ def prompt_alert_seconds() -> float:
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> Mapping[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
-    defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+    defaults = WATCH_DEFAULTS
     path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
     fields: dict[str, str] = {}

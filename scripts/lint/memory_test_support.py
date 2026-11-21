@@ -111,7 +111,6 @@ TEST_CONFIG_DEFAULTS = {
         "queue_timeout_seconds=30\n"
     ),
     "copies.conf": (
-        "wait_seconds=1\n"
         "git_timeout_seconds=30\n"
         "guard_timeout_seconds=10\n"
     ),

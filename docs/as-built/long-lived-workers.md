@@ -43,6 +43,15 @@ Usage reports compare checkpointed phases through the usage store.
 Text, relative paths, and empty values exit 2 before dispatch.
 The old `--summary` option exits 2 and names `--reply-file`.
 Both reply writes and dispatch reply paths use the checked `Arguments.reply_file` value.
+Worker lists and automatic selection check all saved passes for each worker.
+An older pass can hold the worker while it waits for `DONE`.
+Automatic selection skips a held worker even if its pane is idle.
+If all reusable panes are held, the selector can choose a free worker name.
+The launcher checks the selected worker under its lock before it records a new pass or starts compaction.
+Detached run records identify the owner by staff ID.
+Legacy records without a staff ID identify the owner by worker name.
+If a live supervisor names a missing or unreadable record, the check holds the workers that share its run folder.
+Explicit assignments check the current pass.
 The early return prints `compaction runs detached; the prompt follows` with the worker name.
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.
@@ -452,27 +461,12 @@ A later assignment retains the worker identity and selects its current native se
 A prompt names its expected HEAD and asks the worker to read the current tree.
 Review prompts retain the Three Gods sentence and the Type Design Contract.
 
-`assign.py.end_failed_launch` ends a failed launch's run only when these conditions hold:
-
-1. No recorded pass has status `completed`.
-2. Every recorded pass belongs to the failed recorder slot.
-3. No other worker appears in the roster, launch records or native staff children.
-4. The director holds only that run.
-
-The native worker command must return exit 2.
-Exits 3 through 8 retain the run.
-A Claude launch must add its slot's `pass_started` event before a failed return qualifies.
-The held Codex path requires an error from its worker process.
-A signal that interrupts the launcher does not reach this cleanup call.
-Each recorder slot counts separately, including a pass without a worker name.
-Cleanup records `finish-run --status error`, then calls `end_session.sh`.
-Both commands use `call(check=False)`.
-Cleanup errors preserve the launch exit code.
+A failed launch keeps the run open.
+The launcher records failure only for the pass that it started.
+A retry without `--session-dir` uses the current run from the run pointer or the environment.
+The director records `finish-run` and calls `end_session.sh` when the run ends.
 The phase reservation stays until a checkpoint releases it.
 `prepare_session.sh` and `end_session.sh` select `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, as `staff.runtime_id()` does.
-A retry without `--session-dir` uses a current marker or run environment when available.
-Otherwise `prepare_session.sh` creates a new run.
-An explicit run folder retains its existing retry behavior.
 
 ### Choosing a worker for a review
 
@@ -690,21 +684,58 @@ Ending an active unbound design records `finish-run --status completed` under th
 A phase-bound design uses the unit run and records no separate design phase.
 The one-shot managed review closes its phase and run in `assign.py` after worker cleanup.
 `worker.dispatch` owns successful pass completion; `assign.py` records pass failure only.
-Detached command results use `detached_runs.deliver` and `send.deliver_worker_text`.
+Detached worker results use `detached_runs.deliver` and `send.deliver_worker_text`.
+A unit director or showrunner gives `detached_runs.py start` its own folder with `--session-dir`.
+The run record saves the caller's staff ID. The supervisor starts in a separate process session.
+`send.py` uses the saved staff ID to deliver the result to the current session or queue it during a move.
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
-The supervisor waits for this process before it marks the run finished.
+The supervisor records the command exit before it starts delivery.
+After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
+A failed push saves the send error as pending delivery.
+The finished run leaves the live-run limit and keeps its record and log.
+The reaper saves an ended orphan as finished before it makes one delivery attempt.
+The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
+Before the reaper alerts for an unconfirmed push, it checks for a receipt.
+A failed turn-end replay waits for the next start or launcher reap to send its alert.
+A deferred replay keeps a saved push failure.
+The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
+The supervisor sends again only when the previous attempt sent nothing.
+If a pane or relay does not confirm delivery, the supervisor checks only for a receipt.
+After the last retry, the supervisor sends the delivery state to the director.
+The alert holds the delivery lock through submission and records the outcome after sender acceptance or a logged failure.
+The next reap can recover an alert if the process exits before the record saves its outcome.
+A rare exit or a retirement can repeat the alert once. It never repeats the result.
+The alert for an unconfirmed push says that the result may have arrived.
+If an alert fails, the sender prints one anomaly and keeps the result pending.
 The command runs in its own session, including through a systemd scope prefix.
+`detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
+Other `systemd-run` forms return exit 2.
+The guard skips `env` assignments and the two-word `-u` and `--unset` options.
+If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
+To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group only.
-Each checks the supervisor and the command leader identity first, and saves a stop reason.
-The supervisor stays alive, records the exit status and delivers the result.
-A result with a stop reason reads `STOPPED (exit <n>)` and carries a `Stop reason:` line.
+`detached_runs.py stop` and a build hold stop send TERM to the command group.
+Each checks the supervisor and the command leader identity before it signals the group.
+Each stages the stop reason before it sends TERM.
+The supervisor stays alive to record the exit status and deliver the result.
+A run with a saved stop reason reports `STOPPED` and includes the reason.
+The result includes the command's exit status.
+Exits 76 and 77 also include instructions for the next action.
+A self-stop requires a native Claude session record or Codex pane report for the caller.
+The caller's worker staff ID must match the run's owner.
+Missing records, unreadable records, and conflicting identities prevent a self-stop.
+The self-stop saves `self_stop: true` with the stop reason.
+The supervisor keeps the pass active and sends the result to the owning worker.
+Delivery stays pending if the worker cannot receive the result.
+If the worker's staff row is gone, the director receives the run result.
+A stop from another caller can cancel the owning pass.
 New worker runs save the recorder pass ID or the reason the lookup failed.
-An unavailable pass ID prevents cancellation.
+An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-After an explicit stop, the supervisor records the leader's exit status and waits for the entire group to end.
+For either stop kind, the supervisor records the leader's exit status.
+The supervisor waits for the entire group to end.
 The supervisor starts delivery once the group ends.
 The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
 The folder reader finds pending stops by index and verifies their status in the run record.
@@ -734,8 +765,8 @@ The recorder retains the original prompt and reply path after a replacement pass
 If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
 The hook records an unreadable archived reply in `turn-end-ignored.jsonl` and continues with the current pass.
 A run without a pane pass uses the ordinary result delivery.
-A newer run of the same command suppresses the older orphan result.
-A repeated stop sends no additional signal or notice.
+A newer run of the same command suppresses the older orphan result for an ordinary run.
+A repeated request to stop a pass sends no additional signal or notice.
 If the supervisor dies, the orphan reaper finishes the record and delivers the result.
 The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.

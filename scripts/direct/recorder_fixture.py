@@ -34,14 +34,16 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 
 def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
-                        workers: Mapping[str, str]) -> None:
+                        workers: Mapping[str, str], *, runtime_ids: Mapping[str, str] | None = None) -> None:
     """Publish private staff references before the recorder attributes a wait."""
     with isolated_staff_file(root / "staff.json", environment):
         owner = fixture_member("showrunner", name="wait-owner")
         parent = fixture_member("unit", name="wait", parent=owner.id,
                                 runtime_id=fixture_runtime_id("fixture-director"),
                                 worktree=staff.PresentWorktree("natedev", root))
-        entries = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
+        identities = runtime_ids or {}
+        entries = {name: {"staff_id": fixture_worker(name, parent.id,
+                    runtime_id=identities.get(name) or fixture_runtime_id(identity)).id}
                   for name, identity in workers.items()}
     session.mkdir(parents=True, exist_ok=True)
     for name, entry in entries.items():
@@ -62,7 +64,9 @@ if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
             _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
         _fixture_state = _fixture_json.loads(
             (_fixture_session / "progress_history_state.json").read_text())
-        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
+        _fixture_phases = _fixture_state.get("open_phases", [])
+        if len(_fixture_phases) == 1:
+            _fixture_sys.argv.extend(["--phase-id", _fixture_phases[0]["id"]])
 
 """
 

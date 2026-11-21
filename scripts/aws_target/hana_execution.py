@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from scripts.build_queue import execution_identity
 from scripts.aws_target.hana_guest import WorkPermit
 from scripts.aws_target.hana_placement import HanaClaimRelease, HanaClaimReleaseRefused
-from scripts.aws_target import hana_protocol, hana_result, hana_source
+from scripts.aws_target import hana_protocol, hana_result
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.build_queue import placement
 
@@ -273,7 +273,8 @@ class NoMissingBasis:
     """The observation has no valid request for complete captured source."""
 
 
-def missing_basis(observation: hana_protocol.HanaCommandObservation, request: hana_protocol.HanaExecutionRequest) -> hana_source.MissingBasis | NoMissingBasis:
+def missing_basis(observation: hana_protocol.HanaCommandObservation,
+                  request: hana_protocol.HanaExecutionRequest) -> hana_protocol.MissingBasis | NoMissingBasis:
     """Decode the guest diagnostic without accepting a different repository or basis."""
     evidence = observation.evidence
     if (not isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable)
@@ -287,7 +288,7 @@ def missing_basis(observation: hana_protocol.HanaCommandObservation, request: ha
         values = cast(list[object], commits)
         if not all(isinstance(value, str) and value in request.manifest.basis_commits for value in values):
             return NoMissingBasis()
-        return hana_source.MissingBasis(request.manifest.repository, tuple(cast(list[str], values)))
+        return hana_protocol.MissingBasis(request.manifest.repository, tuple(cast(list[str], values)))
     except (ValueError, KeyError, TypeError):
         return NoMissingBasis()
 
@@ -694,6 +695,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
         guest_ended = False
         refusal = admission_refusal
         fence_needed = False
+        fence_observation: hana_protocol.HanaExecutionObservation | None = None
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
             if (isinstance(objects, SavedTerminalProofOnly) and (_journal_request(row) != request
@@ -749,6 +751,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             observation = _await_fence_acknowledgement(request, objects, fence_window)
             if isinstance(observation, HanaSettlementPending):
                 return pending(observation.reason)
+            fence_observation = observation
             evidence = observation.evidence
             reported_refusal = hana_protocol.command_admission_refusal(observation)
             if isinstance(reported_refusal, execution_identity.HanaCommandAdmissionRefused):
@@ -757,6 +760,13 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             row = _read_journal(directory, execution)
             if row['phase'] == 'settled':
                 return _settled_dispatch(row)
+            if fence_observation is not None and fence_observation.timing:
+                saved_observation = _checked_observation(row, request)
+                if isinstance(saved_observation, hana_protocol.HanaExecutionObservation):
+                    timing: hana_protocol.HanaCommandTiming = {**saved_observation.timing, **fence_observation.timing}
+                    fence_observation = replace(fence_observation, timing=timing)
+                row['observation'] = hana_result.object_fields(cast(object,
+                    json.loads(hana_protocol.encode_observation(fence_observation))))
             if 'outcome' not in row:
                 if isinstance(command, HanaSettled) and isinstance(command.outcome, placement.AttemptCompleted):
                     outcome: dict[str, object] = {'kind': 'completed', 'status': command.outcome.status}

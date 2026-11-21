@@ -84,10 +84,8 @@ def _source_account(row: staff.StaffRow) -> str:
     return accounts.claude_config_label(Path(environment.get("CLAUDE_CONFIG_DIR", str(accounts.main_config_dir()))))
 
 
-def _own_policy(move: WorkerMove, role: staff.WorkerRole) -> worker_panes.LaunchPolicy:
-    """Keep the worker's own family and model; a move changes only the account."""
-    family = "codex" if move.family == "codex" else "claude" if move.family == "claude" else "assigned"
-    policy = worker_panes.launch_policy(role, family)
+def _own_policy(move: WorkerMove, policy: worker_panes.LaunchPolicy) -> worker_panes.LaunchPolicy:
+    """Apply the stopped worker's settings to its role policy."""
     try:
         kind, _, arguments = restart.session_launch(str(move.row.current_session), move.row.name)
     except OSError:
@@ -134,8 +132,9 @@ def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, polic
 def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker,
                         role: staff.WorkerRole, hold: worker_panes.WorkerLockHold,
                         detached: str = "") -> SessionMoveOutcome:
+    family = "codex" if move.family == "codex" else "claude" if move.family == "claude" else "assigned"
     try:
-        policy = _own_policy(move, role)
+        fallback_policy = worker_panes.launch_policy(role, family)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: worker launch settings are unreadable: {error}")
     terminal = state.terminal if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) else ""
@@ -150,6 +149,14 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
             reason = "anomaly: stop did not prove the worker stopped"
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
             return accounts.SessionMoveRefused(move.row.id, reason)
+    try:
+        policy = _own_policy(move, fallback_policy)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        reason = f"anomaly: worker launch settings are unreadable: {error}"
+        if isinstance(state, worker_panes.OpenWorker):
+            reason += f"; {_recover_source(move, source, role, fallback_policy, hold)}"
+        moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
+        return accounts.SessionMoveRefused(move.row.id, reason)
     result = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
                 account=worker_panes.DestinationWorkerAccount(move.target), lock=hold, policy=policy)
     if isinstance(result, worker_panes.OpenWorker):

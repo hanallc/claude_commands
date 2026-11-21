@@ -979,6 +979,8 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
             _ = self.persist(self.attempt("other flood", at=at))
         clock = [0.0]
         completed: list[str] = []
+        limits = replace(self.limits, drain_timeout_seconds=90, notice_timeout_seconds=60)
+
         def deliver(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
             self.assert_notice(state, notice, limits)
             clock[0] += 60 if notice.text == "Morty: worker stopped" else 45
@@ -986,7 +988,9 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
                 completed.append(notice.text)
                 return "delivered"
             return "unknown"
-        with patch.object(time, "monotonic", side_effect=lambda: clock[0]):
+        with (patch.object(guard, "configuration", return_value=limits),
+              patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              patch.dict(os.environ, {"SEND_REPEAT_NOTICE_DEADLINE": "inf"})):
             guard.drain(self.root, deliver, 3, cleanup_seconds=20)
             self.assertEqual(completed, [])
             state = guard.decode(next(self.root.glob("*.json")).read_text())

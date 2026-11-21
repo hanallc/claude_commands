@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
+from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
 
 import unittest
 import fcntl
 
-import json
 import io
 import os
 from pathlib import Path
@@ -23,7 +23,7 @@ from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
@@ -48,7 +48,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
         exclude = exclude if exclude.is_absolute() else self.unit / exclude
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
-        runner = recorded_showrunner("fixture-showrunner", doc)
+        runner = fixture_member("showrunner", name="fixture-showrunner", runtime_id=staff.caller_identity(),
+                                doc=staff.LiveDoc(remote.local_machine(), doc))
+        self.environment.update(build_fixture_sessions(runner.current_session))
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
         unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
@@ -113,6 +115,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                             0, 0, tests_reused=True)
 
                     def merge(arguments: merge_gate.GateArguments) -> int:
+                        self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
                             return checkpoint(arguments)
                         finally:
@@ -218,9 +221,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 with mock.patch.object(merge_gate, "test_module_environment", side_effect=prepare_module):
                     if fails:
                         with self.assertRaisesRegex(RuntimeError, "module preparation failed"):
-                            _ = self.run_gate("--tests-only", "--full", type_dirs=())
+                            _ = self.run_gate("--tests-only", "--full")
                     else:
-                        result = self.run_gate("--tests-only", "--full", type_dirs=())
+                        result = self.run_gate("--tests-only", "--full")
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
@@ -281,11 +284,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.checkout / "docs" / "plans" / "build-followups-log.md").read_text(), "log\n")
 
-    def test_missing_type_dir_is_refused_before_any_suite_runs(self) -> None:
-        result = self.run_gate("--type-dirs", "accounts")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("type dirs not found", result.stderr)
-        self.assertIn("accounts", result.stderr)
+    def test_merge_refuses_type_check_options_before_any_suite_runs(self) -> None:
+        result = self.run_gate("--type-dirs", "scripts")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("unrecognized arguments: --type-dirs scripts", result.stderr)
         self.assertEqual(self.module_events(), [])
         self.assert_not_pushed()
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
@@ -472,19 +474,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
-        self.write(self.state / "types-barrier", "overlap")
-        self.write(self.state / "types-hold", "hold")
-        memory = merge_gate.process_memory_mib
-
-        def sample_and_release(roots: set[int]) -> dict[int, float]:
-            measured = memory(roots)
-            for call in self.calls():
-                if call["tool"] == "basedpyright" and measured.get(call["pid"], 0) > 0:
-                    (self.state / "types-sampled").touch()
-            return measured
-
-        with mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample_and_release):
-            result = self.run_gate()
+        result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
@@ -502,14 +492,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(len({row["pid"] for row in starts}), self.module_count)
         self.assertEqual(len({row["tmpdir"] for row in starts}), self.module_count)
         self.assertTrue(all(not Path(row["tmpdir"]).exists() for row in starts))
-        type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
-        self.assertEqual(len(type_calls), 1)
-        venv = self.state / "runner" / "typecheck-venv"
-        self.assertEqual(type_calls[0]["args"], ["--pythonpath", str(venv / "bin" / "python"), "scripts/production"])
-        peaks = cast(dict[str, float], json.loads((self.state / "runner" / "types_peak_mib.json").read_text()))
-        self.assertEqual(list(peaks), ["scripts/production"])
-        self.assertGreater(peaks["scripts/production"], 0)
-        self.assertEqual(type_calls[0]["cwd"], str(self.checkout))
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
         for suite in self.suites:
             self.assertRegex(result.stdout, rf"(?m)^{suite}: OK \d+\.\d+s$")
         peak = re.search(r"peak memory: ([\d.]+) GiB", result.stdout)
@@ -555,7 +538,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
                      "--previous-checkpoint", self.base, "--unit", "fixture", "--phase", "phase-2",
-                     "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+                     "--body", "Fixture checkpoint gate.",
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()

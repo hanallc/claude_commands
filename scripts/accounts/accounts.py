@@ -28,7 +28,7 @@ import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, OrderedDict
 from contextvars import Context, ContextVar
-from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -1743,9 +1743,9 @@ def _validate_role(role: str) -> None:
         raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner, producer and workers are supported")
 
 
-def read_role_map() -> RoleMap:
+def read_role_map(*, fresh: bool = False) -> RoleMap:
     try:
-        return role_map.read_role_map()
+        return role_map.read_role_map(fresh=fresh)
     except role_map.RoleMapUnavailable as error:
         raise AccountsError(str(error)) from error
 
@@ -2439,36 +2439,49 @@ def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
 
 
 @dataclass(frozen=True)
+class LiveStaffMoveMember:
+    row: staff.StaffRow
+    session: LiveGroupMember
+
+
+@dataclass(frozen=True)
 class GroupMoveMembers:
-    live: tuple[LiveGroupMember, ...]
+    live: tuple[LiveStaffMoveMember, ...]
     without_live_account: tuple[staff.StaffRow, ...]
     claude_registry_unreadable: bool
     running_sessions: frozenset[str]
+    busy: frozenset[staff.StaffId] = frozenset()
 
 
 @settings_report_scope()
 def group_move_members(group: ClaudeGroup) -> GroupMoveMembers:
-    """Keep verified members and report an incomplete registry read."""
+    """Use staff rows for membership and the registry for live accounts."""
     from scripts.production import staff
 
-    observed = _read_local_role_sessions(GroupAccounts(), include_workers=False)
-    live = tuple(observed.members[group])
-    running = observed.running_claude_sessions.union(member.session_id for member in live)
     try:
         membership = staff.local_snapshot()
     except staff.StaffUnreadable:
-        return GroupMoveMembers(live, (), observed.claude_registry_unreadable, running)
-    if group == "producers":
-        candidates = {row.id: row for row in eligible_producers(membership, "claude")}
-    else:
-        kind = "unit" if group == "units" else "showrunner"
-        candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
-    live = tuple(member for member in live if (owner := membership.by_current_session(member.session_id)) is None
-                 or owner.kind != "producer" or owner.id in candidates)
-    verified = {member.session_id for member in live}
-    unresolved = tuple(row for row in candidates.values() if row.current_session not in verified
-                       and (not observed.claude_registry_unreadable or row.current_session in running))
-    return GroupMoveMembers(live, unresolved, observed.claude_registry_unreadable, running)
+        membership = staff.StaffSnapshot(())
+    rows = (eligible_producers(membership, "claude") if group == "producers"
+            else membership.find(kind="unit" if group == "units" else "showrunner"))
+    candidates: dict[str, staff.StaffRow] = {row.current_session: row for row in rows}
+    # Read the row locks before the registry can observe a stopped member.
+    busy = frozenset(row.id for row in candidates.values()
+                     if not isinstance(staff.row_activity(row.id), staff.RowAvailable))
+    observed = _read_local_role_sessions(GroupAccounts(), include_workers=False)
+    live = tuple(LiveStaffMoveMember(owner, replace(member, name=owner.name)) for member in observed.members[group]
+                 if (owner := candidates.get(member.session_id)) is not None)
+    running = observed.running_claude_sessions.union(member.session_id for member in observed.members[group])
+    verified = {member.session.session_id for member in live}
+    unresolved: list[staff.StaffRow] = []
+    for identity, row in candidates.items():
+        if identity in verified:
+            continue
+        if identity in running or (group == "producers" and not observed.claude_registry_unreadable):
+            unresolved.append(row)
+        elif row.id in busy or not isinstance(staff.row_activity(row.id), staff.RowAvailable):
+            unresolved.append(row)
+    return GroupMoveMembers(live, tuple(unresolved), observed.claude_registry_unreadable, running, busy)
 
 
 def session_account_label(session: ListedSession | LiveGroupMember) -> str:
@@ -2526,6 +2539,17 @@ def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConf
     return note_file.canonical_label(label) if isinstance(label, str) else label
 
 
+def current_move_account(group: ClaudeGroup) -> str:
+    """Read the current group account before stopping a member."""
+    reading = role_map.read_role_map(fresh=True)
+    if not isinstance(reading.provenance, role_map.CurrentRoleMap):
+        raise AccountsError("the current group account is unavailable")
+    target = group_label(_group_accounts(reading.groups), group)
+    if not isinstance(target, str) or not _label_is(target, "claude"):
+        raise AccountsError(group_configuration_line(group))
+    return target
+
+
 def group_configuration_line(group: ClaudeGroup) -> str:
     return f"{group}: not configured — accounts.py move {group} <claudeN>"
 
@@ -2547,10 +2571,13 @@ def group_note_labels() -> dict[ClaudeGroup, str]:
     return labels
 
 
-def group_accounts() -> GroupAccounts:
+def group_accounts(*, fresh: bool = False) -> GroupAccounts:
     """Read only explicit group selections."""
+    return _group_accounts(read_role_map(fresh=fresh).groups)
+
+
+def _group_accounts(stored: StoredGroupSelections) -> GroupAccounts:
     result = GroupAccounts()
-    stored = _stored_groups()
     for group in CLAUDE_GROUPS:
         selection = cast(str | StoredGroupSelection | GroupNotConfigured, stored.get(group, GROUP_NOT_CONFIGURED))
         if isinstance(selection, GroupNotConfigured):
@@ -2892,7 +2919,7 @@ class SessionIdlePaneClosed:
     session_id: str
 
 
-SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused | SessionIdlePaneClosed
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | moves.MoveWaitingForRow | SessionMoveRefused | SessionIdlePaneClosed
 
 
 class WorkerResumePreview(Protocol):
@@ -2939,10 +2966,16 @@ class AccountPaneReader(Protocol):
 
 class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause,
-                 source_accounts: Mapping[str, str]) -> list[stop_results.MoveResult]: ...
+                 source_accounts: Mapping[str, str], batch_id: str = "",
+                 intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
+                 moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
+                 staff_members: Collection[staff.StaffId] = ()) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS, batch_id: str = "",
+                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
+                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
+                  staff_members: tuple[staff.StaffRow, ...] = ()) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     account_config = read_account_settings(account_config)
@@ -2951,27 +2984,45 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     else:
         inventory = import_module("scripts.agents.inventory")
 
-    checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
-    if isinstance(checked, MoveRefused):
-        return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
+    if isinstance(intent, moves.ExplicitMoveTarget):
+        checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
+        if isinstance(checked, MoveRefused):
+            return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
+        target = checked.destination.label
     live = inventory.listing() if live is None else live
     selected = list(dict.fromkeys(ids))
     refused: dict[str, SessionMoveRefused] = {}
     eligible: list[str] = []
+    sources: dict[str, str] = {}
+    conversations = {str(row.id): row.current_session for row in staff_members}
     for identity in selected:
-        matches = [item for item in live if item.session_id == identity]
+        conversation = conversations.get(identity, identity)
+        matches = [item for item in live if item.session_id == conversation]
         if len(matches) > 1:
             refused[identity] = SessionMoveRefused(identity, "session has several live processes")
         else:
             eligible.append(identity)
+            if matches:
+                sources[identity] = claude_config_label(matches[0].config_dir)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
     batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
-    sources = {item.session_id: claude_config_label(item.config_dir) for item in live if item.session_id in eligible}
-    results = batch(eligible, checked.destination.label, why=why, cause=cause, source_accounts=sources)
+    if staff_members:
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
+                        batch_id=batch_id, intent=intent, staff_members=frozenset(row.id for row in staff_members))
+    elif isinstance(intent, moves.FollowGroupAccount):
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
+                        batch_id=batch_id, intent=intent)
+    elif batch_id:
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, batch_id=batch_id)
+    else:
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
-            account_anomaly(f"{identity}: no saved session was found")
-        elif isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+            if batch_id:
+                outcomes[identity] = SessionMoveRefused(identity, "no saved session was found")
+            else:
+                account_anomaly(f"{identity}: no saved session was found")
+        elif isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending, moves.MoveWaitingForRow)):
             outcomes[identity] = result
         else:
             outcomes[identity] = SessionMoveRefused(identity, result.reason)
@@ -2985,6 +3036,10 @@ def move_result_line(result: SessionMoveOutcome) -> str:
         return f"{result.session_id}: not moved: {result.reason}"
     if isinstance(result, stop_results.ResumePending):
         return f"{result.session_id}: stopped, resume pending on {result.account}: {next(iter(result.reason.splitlines()), 'unknown error')}"
+    if isinstance(result, moves.MoveInProgress):
+        return f"{result.session_id}: move to {result.account} already in progress"
+    if isinstance(result, moves.MoveWaitingForRow):
+        return f"{result.session_id}: move pending: {result.reason}"
     if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
     return stop_results.claude_up_line(result)
@@ -3128,7 +3183,7 @@ def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.S
             result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={})[0]
             if isinstance(result, stop_results.SessionNotFound):
                 return SessionMoveRefused(row.current_session, "no saved session was found")
-            if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+            if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending, moves.MoveWaitingForRow)):
                 return result
             return SessionMoveRefused(row.current_session, result.reason)
         run = pane_moves.run_for_worker(row, record)
@@ -3217,6 +3272,34 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
 
 
 
+def _move_target_sign_in_refusal(destination: NamedAccount) -> MoveRefused:
+    return MoveRefused(f"accounts: {destination.label} has no sign-in on this machine; sign in first. "
+                       + f"Run {_claude_login_command(destination.dir)}, then /login")
+
+
+def _check_move_target_directory(destination: NamedAccount) -> NamedAccount | MoveRefused:
+    """Require a real directory and regular files for local sign-in."""
+    unavailable = MoveRefused(f"accounts: {destination.label} has no usable account directory")
+    try:
+        if not stat.S_ISDIR(destination.dir.lstat().st_mode):
+            return unavailable
+    except OSError:
+        return unavailable
+    config = agent_accounts.claude_config_file(destination.dir)
+    credentials = destination.dir / ".credentials.json"
+    for path in (config, credentials):
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):
+                continue
+        except FileNotFoundError:
+            if path == credentials:
+                continue  # The credential reader can use the keychain.
+        except OSError:
+            pass
+        return _move_target_sign_in_refusal(destination)
+    return destination
+
+
 def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefused:
     target = note_file.canonical_label(target)
     try:
@@ -3228,7 +3311,7 @@ def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefu
         destination = NamedAccount(target, claude_account_dir(target))
     except AccountsError as error:
         return MoveRefused(str(error).partition("\n")[0])
-    return destination
+    return _check_move_target_directory(destination)
 
 
 @dataclass(frozen=True)
@@ -3243,13 +3326,65 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MoveTargetTokensMissing:
+    """The destination credential store has no usable sign-in token."""
+
+
+def _move_target_login_end(directory: Path) -> agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown | MoveTargetTokensMissing:
+    credentials = cast(object, agent_accounts.claude_credentials(directory))
+    if not isinstance(credentials, dict):
+        return MoveTargetTokensMissing()
+    oauth = cast(dict[str, object], credentials).get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return MoveTargetTokensMissing()
+    fields = cast(dict[str, object], oauth)
+    refresh = fields.get("refreshToken")
+    access = fields.get("accessToken")
+    if isinstance(refresh, str) and refresh:
+        expires = fields.get("refreshTokenExpiresAt")
+    elif isinstance(access, str) and access:
+        expires = fields.get("expiresAt")
+    else:
+        return MoveTargetTokensMissing()
+    if not isinstance(expires, int) or isinstance(expires, bool):
+        return agent_accounts.LoginEndUnknown()
+    try:
+        return agent_accounts.LoginEndKnown(datetime.fromtimestamp(expires / 1000, timezone.utc))
+    except (OverflowError, OSError, ValueError):
+        return agent_accounts.LoginEndUnknown()
+
+
+def move_target_sign_in(destination: NamedAccount, now: datetime) -> agent_accounts.NumberedAccount | MoveRefused:
+    """Check the local identity and the available token's expiry."""
+    checked = _check_move_target_directory(destination)
+    if isinstance(checked, MoveRefused):
+        return checked
+    refusal = _move_target_sign_in_refusal(destination)
+    identity = account_identity(destination.dir)
+    if not isinstance(identity, agent_accounts.NumberedAccount) or identity.label != destination.label:
+        return refusal
+    try:
+        login_end = _move_target_login_end(destination.dir)
+    except (agent_accounts.ClaudeCredentialsUnavailable, ValueError):
+        return refusal
+    if isinstance(login_end, MoveTargetTokensMissing):
+        return refusal
+    if isinstance(login_end, agent_accounts.LoginEndUnknown):
+        return MoveRefused(f"{refusal.reason}. Login end date is unknown.")
+    return identity if login_end.at > now else refusal
+
+
 def check_move_target(target: str, now: datetime, *, repair: bool = True, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
     account_config = read_account_settings(account_config)
     destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
-    reading = refusals.stored_reading("claude", claude_login(destination.dir), now)
+    identity = move_target_sign_in(destination, now)
+    if isinstance(identity, MoveRefused):
+        return identity
+    reading = refusals.stored_reading("claude", identity.login, now)
     if isinstance(reading, FreshReading):
         try:
             credits = float(reading.credits or "0")
@@ -3300,17 +3435,18 @@ def move_preview_line(member: ListedSession | LiveGroupMember, target: str) -> s
 
 
 def _move_output(results: tuple[SessionMoveOutcome, ...],
-                 notices: tuple[str, ...]) -> tuple[str, str, int]:
+                 notices: tuple[str, ...], *, names: Mapping[str, str] | None = None) -> tuple[str, str, int]:
     stdout = "" if results else "".join(line + "\n" for line in notices)
     stderr = ""
     for result in results:
-        line = move_result_line(result) + ("; " + "; ".join(notices) if notices else "") + "\n"
-        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending)):
+        display = replace(result, session_id=names.get(result.session_id, "unknown member")) if names is not None else result
+        line = move_result_line(display) + ("; " + "; ".join(notices) if notices else "") + "\n"
+        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending, moves.MoveWaitingForRow)):
             stderr += line
         else:
             stdout += line
     return stdout, stderr, max((item.returncode if isinstance(item, SessionMoveRefused) else
-                               int(isinstance(item, stop_results.ResumePending)) for item in results), default=0)
+                               int(isinstance(item, (stop_results.ResumePending, moves.MoveWaitingForRow))) for item in results), default=0)
 
 
 @role_map.role_map_command
@@ -3325,11 +3461,16 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
+    reason = why or f"{group} moved by hand"
+    transition = NoGroupTransition() if dry_run else group_transition(group)
+    if not dry_run and (isinstance(transition, NoGroupTransition) or group_label(group_accounts(), group) != target):
+        transition = set_group_account(group, target, why=reason)
     members = group_move_members(group)
     stopped = members.without_live_account
-    selected = [session for session in members.live if not session_on_account(session, target)]
-    ids = (*tuple(session.session_id for session in selected), *(row.current_session for row in stopped))
-    reason = why or f"{group} moved by hand"
+    selected = [member for member in members.live if not session_on_account(member.session, target)
+                or (not dry_run and member.row.id in members.busy)]
+    rows = (*(member.row for member in selected), *stopped)
+    ids = tuple(row.current_session for row in rows)
     if members.claude_registry_unreadable:
         notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
     else:
@@ -3347,14 +3488,16 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             for runner in inventory.showrunner_registrations().entries if runner.session_id not in members.running_sessions)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
-            *(move_preview_line(item, target) for item in selected),
+            *(move_preview_line(item.session, target) for item in selected),
             *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
               for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
-    _ = set_group_account(group, target, why=reason)
-    results = move_sessions(ids, target, why=reason, account_config=account_config) if ids else ()
-    stdout, stderr, code = _move_output(results, (*checked.notices, *notices))
+    assert isinstance(transition, GroupTransition)
+    results = move_sessions(tuple(row.id for row in rows), target, why=reason, account_config=account_config,
+                            batch_id=transition.move_id, intent=moves.FollowGroupAccount(group), staff_members=rows) if rows else ()
+    names = {result.session_id: row.name for result, row in zip(results, rows)}
+    stdout, stderr, code = _move_output(results, (*checked.notices, *notices), names=names)
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
-    return outcome(ids, target, stdout, stderr, code)
+    return outcome(ids, target, stdout, stderr, code, outcomes=results)
 
 
 def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> bool:

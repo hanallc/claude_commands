@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -33,7 +33,7 @@ from scripts.lint.memory_test_support import write_config_fixture, write_pressur
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
@@ -538,11 +538,16 @@ class PlacementTests(unittest.TestCase):
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:
         for operation in ("claim", "cleanup"):
             with self.subTest(operation=operation), PlacementFixture() as fixture:
+                fixture.enter_context(mock.patch.dict(os.environ, {
+                    "MAC_TEST_STATE_DIR": str(fixture.root / "blocked-provider"),
+                }))
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 reference = adopt_assignment(fixture, request, assignment)
-                paths = mac_test.StatePaths(fixture.root / "blocked-provider")
+                paths = claim_state.state_paths(assignment.destination.target)
                 paths.directory.mkdir()
                 record: mac_test.RemoteJobClaim = {"claim_id": reference.claim_id, "episode": reference.episode,
                     "attempt": reference.attempt, "submitting_session": "submitting-session",
@@ -551,47 +556,42 @@ class PlacementTests(unittest.TestCase):
                 mac_test.write_json(paths.run, record)
                 before = paths.run.read_bytes()
                 granted = only_admitted(fixture.connect(fixture.request()).replies())
-                locked, started, finish = threading.Event(), threading.Event(), threading.Event()
+                lock_requested = threading.Event()
+                provider_lock = mac_test.locked
 
-                def hold_provider_lock() -> None:
-                    with mac_test.locked(paths.lock):
-                        locked.set()
-                        if not finish.wait(TEST_HANG_GUARD_SECS):
-                            raise AssertionError("The fixture did not release the provider lock")
+                def observe_lock_request(path: Path) -> AbstractContextManager[None]:
+                    if path == paths.lock:
+                        lock_requested.set()
+                    return provider_lock(path)
 
                 def adapter() -> int:
                     args = mac_test.CliArguments()
                     args.pid, args.worktree, args.remote = request.owner.pid, str(fixture.root), assignment.destination.host
                     args.claim_id, args.episode, args.attempt = reference.claim_id, reference.episode, reference.attempt
-                    started.set()
                     with redirect_stdout(io.StringIO()):
                         if operation == "cleanup":
                             return mac_test.command_release(args, paths)
                         return mac_test.command_claim(args, paths, watch_claim=False,
                             session=assignment.session, assignment=assignment)
 
-                with ThreadPoolExecutor(max_workers=2) as workers:
-                    lock_owner = workers.submit(hold_provider_lock)
-                    try:
-                        self.assertTrue(locked.wait(1))
+                with (ThreadPoolExecutor(max_workers=2) as workers,
+                      mock.patch.object(mac_test, "locked", new=observe_lock_request)):
+                    with provider_lock(paths.lock):
                         pending = workers.submit(adapter)
-                        self.assertTrue(started.wait(1))
+                        LauncherHangGuard(f"Provider {operation} lock request").event(lock_requested)
                         self.assertFalse(pending.done())
                         fixture.allow_next_start()
                         for message in (wire.ViewRequest(), wire.ReleaseRequest("release-responsive", granted.reservation, 0),
                                         fixture.request()):
-                            began = time.monotonic()
-                            replies = fixture.connect(message).replies()
-                            self.assertLess(time.monotonic() - began, 1, type(message).__name__)
+                            reply_guard = LauncherHangGuard(
+                                f"{type(message).__name__} while provider {operation} waits for the lock")
+                            replies = reply_guard.result(workers.submit(fixture.connect(message).replies))
                             self.assertTrue(replies)
                             self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(message, wire.ViewRequest)
                                 else wire.Ok if isinstance(message, wire.ReleaseRequest) else wire.Admitted)
-                        self.assertFalse(pending.done())
+                            self.assertFalse(pending.done())
                         self.assertEqual(paths.run.read_bytes(), before)
-                    finally:
-                        finish.set()
-                    _ = lock_owner.result(timeout=TEST_HANG_GUARD_SECS)
-                    _ = pending.result(timeout=TEST_HANG_GUARD_SECS)
+                    _ = LauncherHangGuard(f"Provider {operation} completion").result(pending)
 
     def test_speculative_placement_keeps_the_newest_live_candidate_and_its_local_parent_charge(self) -> None:
         cases = (
@@ -818,6 +818,11 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(reply, wire.PlacementWait)
                 self.assertEqual(fixture.caller_reservations(), {})
                 self.assertEqual(fixture.queue_pids(), [head.owner.pid, later.owner.pid])
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [head.owner.pid, later.owner.pid])
+                self.assertEqual(snapshot.inputs.pending_remote_starts, frozenset({
+                    records.run_owner(head.owner.pid, head.owner.start_time)}))
 
                 claim = adopt_assignment(fixture, head, remote)
                 if ending in ("busy after authorization", "busy after estimate expiry", "confirmed",
@@ -1777,13 +1782,13 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(fixture.server.host_evidence_key(request, destination), before)
             read.assert_not_called()
 
-    def idle_hana(self, fixture: PlacementFixture) -> tuple[Path, wire.PlacementRequest]:
+    def idle_hana(self, fixture: PlacementFixture, *, overrides: str = "") -> tuple[Path, wire.PlacementRequest]:
         from scripts.aws_target import hana_box
         from scripts.aws_target.test_hana_box import record_lifecycle_image
 
         settings, request, _destination = self.target_settings_fixture(fixture)
         settings.unlink()
-        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n",
+        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n" + overrides,
                                  template="hana_aws")
         assert isinstance(request.profile, records.StepProfile)
         request = replace(request, profile=replace(request.profile, step="check"),
@@ -2014,7 +2019,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         from scripts.aws_target import hana_box, hana_spend
 
         with PlacementFixture() as fixture:
-            settings, request = self.idle_hana(fixture)
+            settings, request = self.idle_hana(fixture, overrides="daily_budget_usd=6\nguard_grace_seconds=60\n")
             good = settings.read_text()
             self.commit_settings(settings)
 
@@ -2520,7 +2525,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
     def test_blocked_remote_evidence_keeps_socket_requests_fast_and_retains_the_claim(self) -> None:
         with PlacementFixture() as fixture:
             fixture.configure(waiting_pass_seconds=0.05)
-            _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=0.05\n", template="mac_test")
+            _ = (fixture.root / "mac_test.conf").write_text("# range: 0.001..60\nprobe_timeout_s=0.05\n")
             _ = fixture.run_pass()
             request = placement_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -2539,46 +2544,58 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             granted = only_admitted(fixture.server.handle_request(local))
             entered, finish = threading.Event(), threading.Event()
             read_started: list[float] = []
+            evidence_key = fixture.server.host_evidence_key(request, assignment.destination)
+
+            class FirstProbeWorker(service.HostEvidenceWorker):
+                @override
+                def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                    if key == evidence_key and entered.is_set():
+                        return False
+                    return super()._probe(key, subscription)
 
             def blocked_probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
                 read_started.append(fixture.clock.now())
                 entered.set()
-                if not finish.wait(5):
-                    raise AssertionError("the test did not release the blocked probe")
-                return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", placement.AllowedHost())
+                _ = finish.wait()
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "late-generation", placement.AllowedHost())
 
             fixture.server.host_probe = blocked_probe
-            key = fixture.server.host_evidence_key(request, assignment.destination)
             fixture.clock.advance(0.09)
-            self.assertIsInstance(fixture.server.host_evidence(key), placement.FreshHostEvidence)
+            self.assertIsInstance(fixture.server.host_evidence(evidence_key), placement.FreshHostEvidence)
             fixture.clock.advance(0.02)
-            self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
+            self.assertIsInstance(fixture.server.host_evidence(evidence_key), placement.StaleHostEvidence)
             waiter = placement_request(fixture)
-            try:
-                reply, = fixture.connect(waiter).replies()
-                self.assertIsInstance(reply, wire.PlacementWait)
-                self.assertTrue(entered.wait(1), "the background probe did not start")
-                fixture.allow_next_start()
-                for operation in (wire.ViewRequest(), wire.ReleaseRequest("release-local", granted.reservation, 0),
-                                  fixture.request()):
-                    started = time.monotonic()
-                    replies = fixture.connect(operation).replies()
-                    self.assertLess(time.monotonic() - started, 1, type(operation).__name__)
-                    self.assertTrue(replies)
-                    self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(operation, wire.ViewRequest)
-                                          else wire.Ok if isinstance(operation, wire.ReleaseRequest) else wire.Admitted)
-                self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
-                self.assertEqual(provider.read_bytes(), before)
-                self.assertEqual([item.record["claim_id"] for item in mac_test.live_claims(paths)], [claim.claim_id])
-                self.assertEqual(assignment_for(fixture, request), assignment)
-            finally:
-                reader = fixture.server.host_readers[key]
-                reader.close()
-                fixture.clock.advance(1)
-                finish.set()
-                reader.thread.join(timeout=5)
-                self.assertFalse(reader.thread.is_alive())
-            observed = fixture.server.host_evidence(key)
+            with (ThreadPoolExecutor(max_workers=1) as workers,
+                  mock.patch.object(service, "HostEvidenceWorker", FirstProbeWorker)):
+                try:
+                    probe_guard = LauncherHangGuard("Remote evidence probe start")
+                    reply, = probe_guard.result(workers.submit(fixture.connect(waiter).replies))
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    probe_guard.event(entered)
+                    fixture.allow_next_start()
+                    for operation in (wire.ViewRequest(), wire.ReleaseRequest("release-local", granted.reservation, 0),
+                                      fixture.request()):
+                        reply_guard = LauncherHangGuard(f"{type(operation).__name__} while remote evidence is blocked")
+                        replies = reply_guard.result(workers.submit(fixture.connect(operation).replies))
+                        self.assertTrue(replies)
+                        self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(operation, wire.ViewRequest)
+                                              else wire.Ok if isinstance(operation, wire.ReleaseRequest) else wire.Admitted)
+                    self.assertIsInstance(fixture.server.host_evidence(evidence_key), placement.StaleHostEvidence)
+                    self.assertEqual(provider.read_bytes(), before)
+                    self.assertEqual([item.record["claim_id"] for item in mac_test.live_claims(paths)], [claim.claim_id])
+                    self.assertEqual(assignment_for(fixture, request), assignment)
+                finally:
+                    fixture.clock.advance(1)
+                    finish.set()
+                    reader = fixture.server.host_readers.get(evidence_key)
+                    if reader is not None:
+                        reader.close()
+                        LauncherHangGuard("Remote evidence probe cleanup").join(reader.thread)
+            assert reader is not None
+            published = reader.latest
+            assert isinstance(published, placement.FreshHostEvidence)
+            self.assertEqual(published.generation, "late-generation")
+            observed = fixture.server.host_evidence(evidence_key)
             self.assertIsInstance(observed, placement.StaleHostEvidence)
             self.assertLessEqual(observed.observed_at, read_started[0])
 

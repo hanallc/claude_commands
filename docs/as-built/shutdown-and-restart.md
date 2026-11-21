@@ -89,7 +89,11 @@ Unknown Codex process evidence prints an anomaly and does not block resume.
 A pane with the session id and a foreground program counts as already running.
 Without process evidence, its account remains unknown.
 Unknown process evidence without a pane that reports the id can allow a second process on the same conversation.
-A pane at its shell does not prevent resume.
+A unit pane at its shell permits resume when no remaining process blocks it.
+Direct resume and watchdog recovery use the same wait while non-agent processes block the pane.
+`HOLDER_EXIT_SECONDS` in `config/shutdown.conf` allows 5 seconds by default.
+A live agent in the holder list causes an immediate refusal.
+The `no foreground agent` refusal lists each blocking command and its position relative to the shell tree.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved environment, arguments, and folder.
@@ -167,22 +171,58 @@ Delegated callers and sessions proved live on the target write nothing.
 
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
+A resume in the same pane skips the source close check.
+A resume in a different pane checks that the source contains no other work before it closes the source.
+A layout scan retains a pane without a notice when a new Claude process in its foreground group lacks arguments during `START_SECONDS`.
+If the arguments stay unreadable after that period, the next scan reports unknown evidence once per scan run.
+
 The notes timer delegates account moves to this detached batch before any stop.
 An automatic move (cause `auto`, `refusal` or `credits off`) reads the admission queue and verify records before any stop.
 A session with a running, waiting or cloud build step keeps its process and queue place.
 A live verify call also prevents a move while it waits for the cargo token or enters the queue.
 The reader checks each verify PID and saved start time.
 Unreadable queue, verify record or process evidence defers the move without a stop.
-Free sessions move at once; the detached batch waits for build owners.
+Free sessions move first.
+The detached batch waits for build owners.
 The batch checks ownership every `MOVE_BUILD_POLL_SECONDS` and moves an owner after its steps end.
 At `MOVE_BUILD_WAIT_MINUTES`, remaining owners receive a deferred result and keep their processes.
-The saved group destination remains unchanged.
+A later group account selection applies to the next stop attempt.
 A later `refusal_watch` check retries the move after the build ends.
 A move by hand does not read build ownership.
 The batch writes its wait lines to its move log.
 The supervisor needs a restart request; an exited child alone does not cause a restart.
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
+
+The staff row lock covers each member through its build wait, stop, and resume.
+The batch verifies each reference and reads the current conversation while it holds the row lock.
+If a native session gains a staff row, the batch acquires the staff row lock before it acts.
+References to the same member share one move and receive the same result.
+Each build check uses the current conversation.
+The batch reports a move to the same account as in progress.
+Other busy rows remain pending while the batch moves available members.
+The pending result is final for the batch and gives the user a retry command.
+The batch omits busy members from both the self-move and build handoffs.
+Each attempt reads the member's live account while it holds the row lock.
+The batch reads the current role map for a group move.
+A single-session move uses the explicit account.
+The batch keeps a member running when its live account matches the target.
+The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
+The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.
+The batch refuses a member if its live source read fails.
+The stop verifies the live source PID and process start time before it records the source and sends a signal.
+A refused destination leaves the members running and goes in the batch result.
+The handoff carries the group name or explicit account and the results already collected.
+The child saves and reports the carried failures even if a startup read fails.
+The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.
+
+The batch keeps the showrunner notices and sends one phone push for the members that still need help.
+The push shows qualified names and gives a short command to retry the batch.
+If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
+The saved batch result holds every pending name and its fixed reference.
+The sender uses the same key for retries of the batch.
+`MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
+A standalone resume failure still sends its own keyed push.
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 
@@ -612,6 +652,7 @@ Herdr waits for the native session identity and uses that identity to check the 
 A starting agent can lack its registry record, its process start time or its argv.
 Herdr retries the identity read and the target check until the launch deadline.
 The pause between tries starts at `PANE_POLL_SECONDS` and doubles up to `START_RETRY_MAX_SECONDS`.
+Herdr reports each reason for retaining a target once per target during an opening prompt attempt.
 Only a failure at the deadline prints the native session error.
 Herdr checks the requested and discovered transcripts before typing, sending Enter or reporting a failure.
 If the send gate finds a different native ID, the failure check includes that ID's transcript.
@@ -628,6 +669,10 @@ Staff publication uses the remaining launch time.
 The result reports a staff publication error in a separate field.
 A change in the recipient does not cancel a matching turn.
 Herdr requires one registered foreground agent and a recorded recipient for the same process.
+The registered agent must lead the foreground group or be a Claude child of the group leader.
+Herdr accepts the child only when its direct parent runs the package's resolved `scripts/lib/relaunch.py` with the `run` argument.
+Herdr reads the live child and parent identities before and after it reads the parent command.
+Herdr reads the parent command again and refuses input if either identity or the command changes.
 Herdr limits the slash-command record lock to the remaining launch time.
 Herdr prepares the slash-command record before it reads the transcript.
 After the gate accepts the send, Herdr writes the record.
@@ -776,8 +821,10 @@ The command runs in its own session, including through the scope prefix.
 The record saves the command's process group.
 The supervisor uses default TERM, INT, and HUP dispositions.
 It installs no signal handler.
-`detached_runs.py stop` checks the supervisor and command identity, then signals the command group.
-The supervisor stays alive, records the exit status and delivers the result.
+`detached_runs.py stop` checks the supervisor and the command identity before it signals the command group.
+The supervisor stays alive to record the exit status and deliver the result.
+A worker that stops its own run keeps its pass active.
+A stop from another caller can end the pass and notify the director.
 The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
 The supervisor writes "done" to the pipe after the command ends.
 If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.

@@ -13,20 +13,138 @@ from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.direct import assign, phase_table
+from scripts.direct.assign_claude_test_support import direct_launcher_helpers
+from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message import process_table
 from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
 from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
+
+ASSIGNMENT_SETTINGS = {
+    "direct": """\
+# whole: 1..
+MIN_REPAIR_BUDGET=3
+# range: 5e-324..
+REPAIR_ROUNDS_PER_FINDING=0.5
+# whole: 1..
+RUNAWAY_ROUNDS=5
+# whole: 1..
+MAX_FIX_ATTEMPTS=2
+# whole: 1..
+MAX_REOPENS=2
+# whole: 1..
+STALLED_ROUNDS=4
+# whole: 1..
+MAX_CONSECUTIVE_SAME_KIND_PASSES=4
+# whole: 1..
+MAX_REVIEW_CANCELLATIONS=1
+# whole: 1..
+UNIT_COMPACT_ABOVE_TOKENS=200000
+# whole: 1..
+ROUTING_FROM_ROUND=4
+# whole: 1..
+ASTRA_AFTER_FAILED_FIXES=2
+# range: 0.1..0.9
+WORKER_SPLIT_RATIO=0.667
+WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+# range: 1..600
+WORKER_FIRST_TURN_SECONDS=120
+# range: 1..600
+WORKER_SETTLE_SECONDS=30
+# range: 1..1800
+WORKER_COMPACT_SECONDS=300
+# range: 1..600
+PANE_AGENT_START_SECONDS=90
+# range: 0.01..600
+WORKER_PUBLISH_LOCK_SECONDS=15
+""",
+    "build_folders": """\
+# whole: 1..
+names.suffix_length=11
+# whole: 1..64
+names.repository_key_length=8
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+roots.system=/tmp
+roots.temporary=${TMPDIR}/builds
+roots.gate=/dev/shm
+roots.scratch=~/scratch
+roots.copies=~/copies
+roots.workspace=~/worktrees
+roots.session=~/session
+patterns.named={showrunner}-{unit}/{work}-{purpose}
+patterns.legacy-stable={purpose}
+patterns.legacy-unique={purpose}{suffix}
+patterns.scratch={purpose}-{suffix}
+patterns.tool={purpose}{suffix}
+prefixes.style-review={owner}-
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""",
+    "scratch": """\
+visible_root=~/repro
+holds_file=~/.local/state/scratch/holds.json
+# whole: 1..
+default_life_seconds=86400
+# whole: 1..
+repo_depth=3
+# whole: 1..
+suffix_length=6
+repo_skip=target node_modules .git
+# whole: 1..
+record_lock_attempts=3
+# whole: 1..
+removal_remote_timeout_seconds=30
+""",
+    "send": """\
+# range: 0.001..
+waits_review_seconds=30
+# range: 0.001..
+delivery_timeout=40
+# range: 0.001..
+kill_grace=10
+# range: 0.001..
+caller_margin_seconds=15
+# range: 0.001..
+remote_transport_seconds=30
+""",
+    "staff": """\
+# range: 0.001..
+OPERATION_LOCK_SECONDS=30
+# range: 0.001..
+REMOTE_SECONDS=20
+PRODUCER_WORKSPACE=producers
+PRODUCER_FOLDER_ROOT=~/productions
+""",
+    "copies": """\
+remote_registry=~/.local/state/copies/remote-mirrors
+wait_seconds=1
+git_timeout_seconds=600
+guard_timeout_seconds=10
+guard_choice_limit=32
+""",
+    "lint": "style_review=off\n",
+    "showrunners": """\
+# range: 0..100
+threshold_percent=2
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=00000000-0000-4000-8000-000000000001
+always=00000000-0000-4000-8000-000000000001
+""",
+}
 
 
 def backend_fixture_command(directory: Path, command: list[str],
@@ -70,14 +188,31 @@ def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subp
 
 
 @contextmanager
-def assignment_helpers() -> Generator[None]:
-    """Keep helper parsers and handlers in the fixture process."""
-    from scripts.direct.assign_claude_test_support import direct_launcher_helpers
-    from scripts.direct.findings_test_support import invoke_findings
-
+def assignment_environment(bytecode_setting: str) -> Generator[None]:
+    """Pin settings and use only the fixture's Git configuration."""
+    config = Path(os.environ["CONF_DIR"])
+    for stem, settings in ASSIGNMENT_SETTINGS.items():
+        _ = (config / f"{stem}.conf").write_text(settings)
     cache = Path.home() / ".cache"
     seed_interpreter_cache(cache)
-    with patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}), direct_launcher_helpers():
+    environment = {
+        **fixture_git_environment(config),
+        "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache),
+        "PYTHONDONTWRITEBYTECODE": bytecode_setting,
+        "STAFF_CONFIG": str(config / "staff.conf"),
+        "COPIES_CONFIG": str(config / "copies.conf"),
+        "LINT_CONFIG_FILE": str(config / "lint.conf"),
+        "USER_ZONE": "America/New_York",
+        "PROCESS_TABLE_PS": "sh -c :",
+    }
+    with patch.dict(os.environ, environment, clear=True), patch.object(process_table, "PS", ["sh", "-c", ":"]):
+        yield
+
+
+@contextmanager
+def assignment_helpers(bytecode_setting: str) -> Generator[None]:
+    """Keep helper parsers and handlers in the fixture process."""
+    with assignment_environment(bytecode_setting), direct_launcher_helpers():
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -122,14 +257,10 @@ class AssignLauncherFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
         self.native.setUp()
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf",
-                                 "patterns.legacy-stable={purpose}\n")
-        config = Path(os.environ["CONF_DIR"]) / "direct.conf"
-        _ = copy_config_file_fixture(ROOT / "config/direct.conf", config)
-        _ = copy_config_file_fixture(ROOT / "config/shutdown.conf", config.with_name("shutdown.conf"))
         self.addCleanup(self.native.doCleanups)
-        _ = self.enterContext(assignment_helpers())
+        _ = self.enterContext(assignment_helpers(bytecode_setting))
         self.home = Path.home()
         self.session_dir = self.native.run_dir
         self.project = self.session_dir.parent / "project"
@@ -226,10 +357,15 @@ class AssignLauncherFixture(unittest.TestCase):
         command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))", *arguments]
         if isolate_ancestors:
             command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", *command]
+        result = self.run_command(command)
+        return subprocess.CompletedProcess(arguments, result.returncode, result.stdout, result.stderr)
+
+    def run_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run the command in a process group that the test owns."""
         with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
+            return subprocess.CompletedProcess(command, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
@@ -247,10 +383,7 @@ class AssignLauncherFixture(unittest.TestCase):
 
     def prepare_style_project(self) -> None:
         self.commit_project()
-        config = self.session_dir.parent / "lint.conf"
-        _ = write_config_fixture(config, "style_review=on\n")
-        _ = config_environment(config.parent)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(config.parent)})))
+        _ = Path(os.environ["LINT_CONFIG_FILE"]).write_text("style_review=on\n")
 
     def events(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in

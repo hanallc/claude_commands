@@ -15,7 +15,7 @@ import unittest
 from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.copies import copies
@@ -286,6 +286,17 @@ if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
 
 @final
 class MacRunTests(unittest.TestCase):
+    helper_home: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="mac-run-helpers-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.helper_home = Path(temporary.name)
+        _ = copy_helpers(cls.helper_home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -302,9 +313,11 @@ class MacRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
-        self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
-                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+        installed = self.home / ".claude"
+        installed.mkdir(parents=True)
+        helpers = self.helper_home / ".claude"
+        (installed / "scripts").symlink_to(helpers / "scripts", target_is_directory=True)
+        _ = shutil.copytree(helpers / "config", installed / "config", symlinks=True)
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -325,7 +338,7 @@ class MacRunTests(unittest.TestCase):
             + "\nterminate_grace_seconds=3\n")
         copies_config = self.config_path.parent / "copies.conf"
         _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
-                                 + "owner.verify=verify\nwait_seconds=0.01\n"
+                                 + "owner.verify=verify\n"
                                  + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
@@ -342,6 +355,7 @@ class MacRunTests(unittest.TestCase):
             **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
             "HOME": str(self.home),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
             "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
@@ -357,10 +371,11 @@ class MacRunTests(unittest.TestCase):
         }
 
         _ = self.environment.pop("CLAUDE_PYTHON", None)
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
 
     def write_production_config(self, **overrides: str) -> None:
         settings = MAC_RUN_CONFIG | overrides
-        _ = (self.config_path.parent / "production.conf").write_text(
+        _ = write_config_fixture(self.config_path.parent / "production.conf",
             "".join(f"{name}={value}\n" for name, value in settings.items())
         )
 
@@ -447,6 +462,15 @@ class MacRunTests(unittest.TestCase):
             output, errors = process.communicate()
             self.fail("mac_run exited before the build marker: " + output + errors)
         self.assertTrue(path.exists())
+
+    def test_mac_run_refuses_a_port_above_65535(self) -> None:
+        self.write_production_config(mac_run_port="65536")
+
+        result = self.mac_run()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("mac_run_port='65536': outside range 1..65535", result.stderr)
+        self.assert_no_build_started()
 
     def test_blocked_mac_exits_nine_without_starting_build(self) -> None:
         blocked = self.state_command(
@@ -939,7 +963,7 @@ cleanup_mac_run
                 else:
                     self.assertEqual(ends, [], self.events())
                     self.assertIn("cleanup of an ended run failed", after.stderr)
-                    self.assertEqual(len(self.ended_runs()), 1)
+                    self.assertEqual(len(self.ended_runs()), 2)
                     for kept in self.ended_runs():
                         shutil.rmtree(kept)
                 self.assert_claim_released()

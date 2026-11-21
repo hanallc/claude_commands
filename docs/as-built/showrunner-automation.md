@@ -101,7 +101,13 @@ Other options include `--permanent`, `--account`, `--model`, `--port`, `--resume
   A failed trust write prints one anomaly and prevents the start.
 
 - **Steps**, each skipped when already done: the brief stub beside the production doc at `<its directory>/<branch>.md` (`## Source`, a zone stamp and the user's words); the unit staff row and its `.unit.toml`; commit `production(<showrunner name>): add unit <unit> (<plan|brief|standby|permanent>)` on the merge branch for a brief stub or a brief-to-plan switch, which is not pushed here and goes out with the next merge push (user, 2026-10-08); `git worktree add` from the local merge branch, with no push of the unit branch (the unit's first checkpoint push sets its upstream), plus `branch.<branch>.cargoBerthTarget` when the repo has `.claude/config/berth.toml`; the herdr session (Launch below); the wait for `/remote-control is active` (default 90 s, last 15 pane lines on timeout); one LOG line `added <unit> (<mode>), worktree <path>`. It prints `<unit> started: herdr session attach <name>`. Shutdown restart resumes the staff session directly.
- New units select the configured units account through `accounts.account_for_group_launch("unit", ...)`. Resumes use the pane launch’s account when available, else the configured units account. `--source-fallback` must name the pane launch’s account. Resume model selection uses explicit `--model`, then the pane launch, then the last assistant model from the unit session (`transcript_model`); otherwise it uses the director model.
+ New units use the configured units account through `accounts.account_for_group_launch("unit", ...)`.
+ Resumes use the pane launch's account when available and the configured units account otherwise.
+ `--source-fallback` must name the pane launch's account.
+ A resume uses the model and effort from the latest real assistant turn across the Claude homes.
+ An explicit `--model` overrides the turn's model.
+ If no turn supplies a model, the pane launch supplies the fallback model.
+ The director settings supply any model or effort that remains unset.
 
 - **Launch.** `launch_session` starts the shared herdr server and opens the unit's tab in its production workspace.
   The tab title uses the unit name. The agent name uses the production and unit names.
@@ -136,6 +142,7 @@ A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
+Recovery prefers a value that also passes the current setting's limit.
 No usable value raises `conf.Unusable` with the source, key, and reason.
 `ConfigRead.origin` returns live, recovered, or unavailable evidence without printing a warning.
 The [accounts configuration section](accounts.md#runtime-configuration-and-constraints) defines repository defaults and explicit-folder behavior.
@@ -203,7 +210,11 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `[assignments]` has `production=claude`; `[production.claude]` has `director=opus:xhigh`. There is no `[production.codex]`: unit directors launch only on Claude, and the showrunner is whichever session runs `/showrunner:produce`. The header Consumers list names `production unit directors (add_unit.py)`.
 - `director_agent(request) -> DirectorAgent(model, effort: DefaultEffort | Effort(value))` runs `bash -c 'source "$1" && agents_resolve production.director && printf …'` with the `models_config.sh` from the script's own checkout (`Path(__file__).resolve().parents[1] / "agents/models_config.sh"`); `MODELS_CONFIG_FILE` comes from the caller (default `~/.claude/config/models.conf`). A resolver failure is exit 2 with its first `ERROR:` line; a family other than `claude` is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`. Both happen in `preflight`, so `--check` refuses too. `--effort` is passed only for `Effort(value)`.
 - **One-family pinning** (`scripts/agents/models_config.sh`): a function with exactly one family set is pinned to it (`_agents_pinned_family`). Every-function switches (`agents_set_all_assignments <family>`, `agents_set_model <agent>` with no function) leave it as it is and add it to `AGENT_KEPT_FUNCTIONS`; `default_models.sh` prints `# kept production on claude: its only set`. A switch aimed at it (`agents_set_assignment production codex`, `agents_set_model <codex agent> production`, `agents_set_row production.director <codex agent>`) prints `ERROR: 'production' runs only on claude: [production.claude] is its only set.`, returns 1 and leaves the file untouched. `/default_models production.director <model>:<effort>` changes the row.
-- **Resume** in `<LaunchUnits/>` uses add_unit’s live session and pane launch checks. Its Claude arguments come from `models_config.sh`, `agents_resolve production.director` and `agents_claude_args`, then `--resume <session-id> --remote-control <session> -n <session>`. No shutdown hold is read.
+- **Resume** in `<LaunchUnits/>` uses `add_unit.py` and checks the live session and pane launch.
+  It uses the model and effort from the latest real assistant turn.
+  An explicit `--model` overrides the turn's model.
+  The pane launch supplies the fallback model.
+  The director role supplies any missing model or effort.
 
 ### Phase end on the unit side
 
@@ -224,7 +235,10 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
 
-`produce.md` `<MergeCheckpoint/>` runs the command in the background after the showrunner's judgments.
+`produce.md` `<MergeCheckpoint/>` sends the command to a merge unit when one serves the production.
+Otherwise, the showrunner starts single and batch merges with `detached_runs.py start --session-dir "<STATE_DIR>"`.
+The showrunner also uses this start command for child handoffs.
+The run continues across an account move. Stop the run with `detached_runs.py stop --reason "<why>" <record>`.
 `--as-built` merges a unit's closing documentation commit without tests or a review-ledger row.
 It requires an earlier code checkpoint merge for that phase.
 It accepts only `.md` paths and requires a change to or deletion of the unit's plan.
@@ -276,7 +290,7 @@ Each local Promote checkout must exist before the command pushes.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
 - **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
   The [simplify lens](simplify-lens.md#findings-and-decisions) defines which items require user questions and which items the director settles.
-- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands.
+- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
@@ -489,7 +503,7 @@ Each local Promote checkout must exist before the command pushes.
   It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
-  Basedpyright runs only with `--nightly` or an explicit `--type-dirs`.
+  Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
   After the parallel pass, up to eight failed test modules run once more, alone.
@@ -553,7 +567,7 @@ Quoted log values preserve line endings as JSON escapes.
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking sets a time without changing the state.
 The List hides an item with unanswered questions while each send is pending or successful.
-If any unanswered question needs a resend, the item appears with its resend control.
+If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
@@ -996,6 +1010,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    The board shows census shell commands when the conversation, machine, PID, and process start match the checked director.
+    It compares the start from the owner proof in the format from `scripts/lib/process_start.py`.
+    A matching empty shell list confirms no shell work when the checked director reports no shell activity.
+    When the checked director reports shell activity, an empty list leaves shell work unverified.
+    If no row matches the checked director, a census row for the conversation leaves shell work unverified.
+    This includes empty shell lists and older rows with no process identity.
+    A shell name that contains only whitespace appears as `Unnamed background command`.
+    A missing machine field gives `CensusMachineUnreported` on a legacy row.
+    A reported process identity requires a PID, a process start, and a nonempty machine name.
+    An unreadable census leaves shell work unverified for a checked live owner, including a paused unit.
+    If the census cannot reach the local machine, the board cannot verify shell work for its units.
+    A remote machine timeout leaves the local census evidence usable.
+    Unverified shell work prevents an idle result.
     With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
     The director's busy status does not change this result.
     Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
@@ -1311,7 +1338,7 @@ An unreadable registry preserves `ClaudeUnknown(reason)`.
 A registered Claude without its messaging socket also remains unknown.
 
 Units launch in herdr and restore through `add_unit.py --host-session`.
-Resume models come from transcripts.
+Resumes use the latest assistant turn's settings with the overrides and fallbacks described above.
 Native runtime ids select staff rows.
 New launches carry no copied staff identity.
 Promotion waits for Claude to exit before it starts the replacement.

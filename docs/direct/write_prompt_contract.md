@@ -37,6 +37,8 @@ Codex review prompts also include section 3's command block.
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --label "<what>" -- <command>`.
+   For Python test runs, pass `--kind python-tests` before `--`.
+   To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
    A successful start returns at once with the run, its pid and its log.
    A live twin takes priority over config/detached_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.
@@ -49,12 +51,12 @@ Codex review prompts also include section 3's command block.
    The run's record and log stay until your pass ends; then they are deleted.
    Status 77 means cancelled because the tree changed: resubmit after your
    edits are done; it is not a test failure.
-   When a later edit or result makes a run of yours useless, cancel it in
-   the same turn: run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>`,
-   where `<record>` is the run's `.json` beside its log.
-   The command checks the supervisor and the command identity, then stops the command's process group.
-   The supervisor stays alive and delivers the stopped result with your reason.
+   Cancel your run in the same turn if a later edit or result makes it obsolete.
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>`.
+   Use the run's `.json` file beside its log as `<record>`.
+   The command checks the supervisor and command identity before it stops the command group.
+   Your pass stays active if your native session record verifies the run's owner staff ID.
+   The supervisor sends you the STOPPED result with your reason.
    If the supervisor dies, the next start or worker restore reaps the record and delivers its result.
    To recover it directly, run
    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py reap --session-dir <run>`.

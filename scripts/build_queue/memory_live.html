@@ -126,7 +126,11 @@ __PAGE_FRAME_STYLE__
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
 .tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
+.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
+.tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; white-space: normal; }
+.tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
@@ -520,8 +524,25 @@ function shownReading(data) {
   const ram = Object.fromEntries(Object.entries(source).map(([key, value]) =>
     [key, key.endsWith('_bytes') && !totals.has(key) ? leaf(value) : value]));
   ram.programs = (source.programs || []).map(program => ({...program, bytes:leaf(program.bytes)}));
+  const splitTools = recorded(source.python_tests_bytes) && recorded(source.waiting_runs_bytes);
+  const otherTools = splitTools
+    ? leaf(source.python_tests_bytes + source.waiting_runs_bytes + source.other_build_tools_bytes)
+    : ram.other_build_tools_bytes;
   ram.build_tools_bytes = recorded(source.build_tools_bytes)
-    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,ram.other_build_tools_bytes]) : source.build_tools_bytes;
+    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,otherTools]) : source.build_tools_bytes;
+  ram.build_tool_parts = [['rust-analyzer', ram.rust_analyzer_bytes, source.rust_analyzer_bytes],
+    ['+ sccache', ram.sccache_bytes, source.sccache_bytes]];
+  if (splitTools) {
+    // Round cumulative amounts so the split keeps the previous displayed total.
+    const tests = leaf(source.python_tests_bytes);
+    const testsAndWaiting = leaf(source.python_tests_bytes + source.waiting_runs_bytes);
+    ram.build_tool_parts.push(['+ Python tests', tests, source.python_tests_bytes],
+      ['+ Waiting runs', testsAndWaiting - tests, source.waiting_runs_bytes]);
+    if (source.other_build_tools_bytes > 0)
+      ram.build_tool_parts.push(['+ Other build tools', otherTools - testsAndWaiting, source.other_build_tools_bytes]);
+  } else {
+    ram.build_tool_parts.push(['+ Other build tools', otherTools, source.other_build_tools_bytes]);
+  }
   ram.other_programs_bytes = recorded(source.other_programs_bytes)
     ? sum([...ram.programs.map(program => program.bytes),ram.smaller_programs_bytes]) : source.other_programs_bytes;
   ram.kernel_bytes = recorded(source.kernel_bytes)
@@ -556,7 +577,7 @@ function shownReading(data) {
   return shown;
 }
 function memoryRows(parts) {
-  return parts.map(([label, bytes]) => field(label, ramAmount(bytes)));
+  return parts.map(([label, bytes, measuredBytes]) => field(label, ramAmount(bytes, measuredBytes)));
 }
 function queueCapMemory(d) {
   return {builds:legendBytes(d.ram,'builds'),reserved:d.ram.build_covered_bytes,free:d.ram.room_bytes};
@@ -571,8 +592,7 @@ function legendTip(name, bytes, caption, parts = []) {
 const TIPS = {
   'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
     ['Build tools', d.ram.build_tools_bytes], ['+ Queued builds', d.ram.queued_builds_bytes], ['+ hana CI', d.ram.ci_bytes]])),
-  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows([
-    ['rust-analyzer', d.ram.rust_analyzer_bytes], ['+ sccache', d.ram.sccache_bytes], ['+ Other build tools', d.ram.other_build_tools_bytes]])),
+  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows(d.ram.build_tool_parts)),
   queued: d => legendTip('Queued builds', d.ram.queued_builds_bytes, 'RAM of builds the queue started'),
   ci: d => legendTip('hana CI', d.ram.ci_bytes, 'RAM of hana CI programs'),
   'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', memoryRows([
@@ -684,9 +704,10 @@ function tokenPoolRows(pool) {
   return pool?.kind === 'TokenPool' ? [field('Total', pool.total), field('Available', pool.free)]
     : [field('Status', 'unavailable')];
 }
-function ramAmount(bytes) {
+function ramAmount(bytes, measuredBytes = bytes) {
   if (!recorded(bytes)) return "unavailable";
-  return `${Object.is(bytes,-0) ? "-0.0" : f1(bytes / GIB)} GiB`;
+  const rounded = Object.is(bytes,-0) ? "-0.0" : f1(bytes / GIB);
+  return rounded === "0.0" && measuredBytes > 0 ? "<0.1 GiB" : `${rounded} GiB`;
 }
 function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
@@ -809,14 +830,17 @@ function stepTooltip(key, data) {
   const verify = row.verify;
   const stepFields = verify ? [field('Step', verify.total > 1
     ? `${verify.step} (${verify.position} of ${verify.total})` : verify.step)] : [];
-  const callFields = verify ? [field('Call', verify.call, 'call', true)] : [];
+  const call = verify?.call || row.call;
+  const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
-  if (unavailable) return [stepTitle(row, 'unavailable'), ...stepFields, ...callFields];
-  const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
-  // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts}, field('Changes', row.changes));
-  if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
+  const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
+    : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+  const rows = [title];
+  if (row.about) rows.push(field('', row.about, 'caption'));
+  if (row.changes) rows.push(field('Changes', row.changes));
+  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
         .filter(Boolean).join(' · ');
@@ -908,9 +932,11 @@ function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
-    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : esc(row.value)}</dd>`
-      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` +
-        `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value)}</dd>`;
+    const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
+      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
+    const cell = `<dd${attr}>${value}</dd>`;
+    return ['caption','long'].includes(row.kind) ? cell
+      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` + cell;
   }).join('')+'</dl>';
 }
 function tipText(key, data) {
@@ -1744,7 +1770,7 @@ addEventListener("keydown", event => {
 });
 async function tick(supersede=false,current=()=>true) {
   if (consoleHidden() || paused) return;
-  const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
+  const r = await fetch("memory.json", { cache: "no-cache" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   if (!current() || paused) return;
