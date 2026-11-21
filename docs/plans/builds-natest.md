@@ -757,7 +757,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** a grep of each deleted name on the tree finds no reader; the full gate that builds runs for the merge passes on the tip; basedpyright gives zero errors and zero warnings on changed files; one blind review. After the phase is merged to main, the director writes the CPU of the removed modules, with host, in the next file.
 
-### Phase 406 — an AWS merge gate runs the affected modules, and one full gate runs each night  · status: todo (held 2026-11-20: waits for the go of nate through bob)
+### Phase 406 — an AWS merge gate runs the affected modules, and one full gate runs each night  · status: dropped (user 2026-11-21: "i want merge to do a test all"; the merge gate keeps the full suite; branch natest-affected406 is not merged)
 **Depends on:** none
 
 #### Work Order
