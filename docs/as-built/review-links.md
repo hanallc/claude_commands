@@ -1196,19 +1196,10 @@ After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
 Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
-When morty records Delivered, the List writer clears this parking condition in the same write.
-The Review snapshot worker checks each snapshot after it publishes it.
-It checks linked change rows that the snapshot shows as ready for the user.
-Requests can use the published snapshot while the worker checks the parked items.
-The worker tries the List lock, the Review delivery lock, and the change list lock in that order.
-List Ask takes the List lock before the Review delivery lock.
-The worker skips a busy lock or unreadable change row and can retry after a later snapshot.
-List GET reads saved items and published question delivery records without the release locks.
-Console news reads the saved List records.
-The worker holds all three locks while it checks the current Review row and saves a release.
-The same parking event and link must still be current.
-The writer clears parking, sets Delivered, and marks the item unread.
-Both delivery signals save an Unparked event with the reason.
+The List ends this park automatically when the producer sets the item state to Delivered.
+The same write clears the park, marks the item unread, and records an Unparked event.
+Linked changes supply review information on the List.
+The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
 After Mark read, an open question returns the item to Morty answering.
 A dated park remains active until its time or an explicit Unpark.
