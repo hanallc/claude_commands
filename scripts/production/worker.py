@@ -1488,7 +1488,10 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
                 _ = results.pop(row.id, None)
                 if enrolled:
                     try:
-                        _require_review_delivery(holder, row, run, worker_panes.worker_pass(row, run, record=record))
+                        passed = worker_panes.worker_pass(row, run, record=record)
+                        if passed.get("instance_id") != active.instance_id:
+                            raise ValueError("the saved review pass changed")
+                        _require_review_delivery(holder, row, run, passed)
                     except (OSError, ValueError, ProductionPathsError) as error:
                         print(f"anomaly: {row.name}: {error}", file=sys.stderr)
                         continue
