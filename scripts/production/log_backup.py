@@ -24,27 +24,28 @@ from scripts.agents import remote
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
-from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, Refusal, read_production, resolve_production_paths
+from scripts.production.production_doc import (
+    EnrolledPaths, Refusal, production_backup_checkout, production_backup_root, read_production, resolve_production_paths,
+    staged_notes_directory,
+)
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
 
 
-BACKUP_ROOT = Path(".local/state/production-backups")
-BACKUP_CHECKOUT = "backup"
-MAC_REPOSITORY = "backup.git"
 LEGACY_COPIES = "log-backups"
-SNAPSHOT_FOLDERS = ("document", "log", "notes")
+SNAPSHOT_FOLDERS = (BACKUP_DOCUMENT_DIRECTORY, "log", "notes")
 BACKUP_BRANCH = "refs/heads/main"
 SSH_OPTIONS = ("ssh", "-o", "BatchMode=yes")
 
 
-class LegacyNotes(Enum):
-    ABSENT = "legacy production has no enrolled notes directory"
+class NoStagedNotes(Enum):
+    ABSENT = "the production has no staged notes directory"
 
 
 @dataclass(frozen=True)
 class BackupSources:
     document: Path
     log: Path
-    notes: Path | LegacyNotes
+    notes: Path | NoStagedNotes
 
 
 @dataclass(frozen=True)
@@ -70,8 +71,8 @@ def production_sources(row: staff.StaffRow, doc: Path) -> BackupSources:
     if isinstance(paths, EnrolledPaths):
         return BackupSources(paths.live_doc, paths.log, paths.notes)
     production = read_production(row)
-    # Legacy productions have no enrolled notes path.
-    return BackupSources(production.doc, production.log, LegacyNotes.ABSENT)
+    notes = staged_notes_directory(production.doc)
+    return BackupSources(production.doc, production.log, notes if notes is not None else NoStagedNotes.ABSENT)
 
 
 def backup(sources: BackupSources, repository: Path) -> None:
@@ -97,7 +98,7 @@ def backup(sources: BackupSources, repository: Path) -> None:
             if isinstance(notes, Path) and notes.is_dir():
                 _ = shutil.copytree(notes, target, symlinks=True)
         else:
-            source = sources.document if folder == "document" else sources.log
+            source = sources.document if folder == BACKUP_DOCUMENT_DIRECTORY else sources.log
             target.mkdir()
             _ = shutil.copyfile(source, target / source.name)
     # Include tracked paths that disappeared and exclude incidental files.
@@ -110,8 +111,8 @@ def backup(sources: BackupSources, repository: Path) -> None:
                 "commit", "-m", "Save production files")
 
 
-def mac_mirror(identity: str, peer: str) -> BackupMirror:
-    relative = (BACKUP_ROOT / identity / MAC_REPOSITORY).as_posix()
+def mac_mirror(identity: staff.StaffId, peer: str) -> BackupMirror:
+    relative = production_backup_checkout(identity).with_suffix(".git").relative_to(Path.home()).as_posix()
     remote_path = '"$HOME"/' + shlex.quote(relative)
 
     def maintenance(repack: bool) -> str:
@@ -148,21 +149,21 @@ def publish(repository: Path, mirror: BackupMirror, repack_after_commits: int) -
 
 
 def backup_all(root: Path, state: Path, record: staff.StaffSnapshot,
-               mirror: Callable[[str], BackupMirror], repack_after_commits: int) -> int:
+               mirror: Callable[[staff.StaffId], BackupMirror], repack_after_commits: int) -> int:
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    standard_root = production_backup_root()
     failures = 0
     with (root / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         owners = {row.id: row for row in record.find(kind="showrunner")
                   if isinstance(row.doc, staff.LiveDoc) and row.doc.machine == remote.local_machine()}
-        identities = owners.keys() | {staff.StaffId(path.name) for path in root.iterdir()
-                                     if (path / BACKUP_CHECKOUT / ".git").is_dir()}
+        identities = owners.keys() | {staff.StaffId(path.name) for path in root.iterdir() if path.is_dir()}
         identities |= {staff.StaffId(path.parent.name) for path in state.glob(f"*/{LEGACY_COPIES}")}
         for identity in sorted(identities):
             if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identity):
                 continue
-            folder = root / identity
-            repository = folder / BACKUP_CHECKOUT
+            repository = root / production_backup_checkout(identity).relative_to(standard_root)
+            folder = repository.parent
             try:
                 old = state / identity / LEGACY_COPIES
                 if old.is_dir():
@@ -171,7 +172,7 @@ def backup_all(root: Path, state: Path, record: staff.StaffSnapshot,
                 owner = owners.get(identity)
                 if owner is not None and isinstance(owner.doc, staff.LiveDoc):
                     backup(production_sources(owner, owner.doc.path), repository)
-            except (OSError, ValueError, Refusal, ProductionPathsError) as error:
+            except (OSError, ValueError, Refusal) as error:
                 print(f"log_backup: {identity}: {error}", file=sys.stderr)
                 failures += 1
             if (repository / ".git").is_dir():
@@ -191,7 +192,7 @@ def main(arguments: list[str]) -> int:
         print("log_backup: run this job on natedev", file=sys.stderr)
         return 1
     try:
-        root = Path.home() / BACKUP_ROOT
+        root = production_backup_root()
         state = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
         peer = remote.other_machine()
         repack_after_commits = conf.read("production_backup").whole("repack_after_commits")
