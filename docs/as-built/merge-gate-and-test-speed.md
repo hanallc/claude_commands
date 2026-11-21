@@ -671,6 +671,7 @@ A nonzero exit refuses the promotion before main moves, and names the module and
 The checks only read live state. Local and checkpoint promotion run them; the Mac promotion does not.
 The first check is `scripts.build_queue.admission_service`, which reads admission `state.json` as `serve` does.
 It exists because the Phase 44 re-land on 2026-11-14 promoted a strict reader over old-shape rows and stopped the service.
+The gate reads only promotion push records and skips checkpoint push records from the removed integrate form.
 A retry can push its recorded local commit when origin/main remains its ancestor and the source still contains it.
 Tree equality alone does not authorize that push.
 The Mac command has a 25-second limit and must print exactly one successful `ff_rc=0` result.

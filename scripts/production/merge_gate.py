@@ -1909,18 +1909,13 @@ class NoRecordedPromotion:
     pass
 
 
-def push_recovery_dir() -> Path:
-    directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
-    return directory / "push-recovery"
-
-
 def promotion_record_path(repo: Path, branch: str) -> Path:
+    directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
     identity = json.dumps([str(repo.resolve()), "promotion", branch]).encode()
-    return push_recovery_dir() / (hashlib.sha256(identity).hexdigest() + ".json")
+    return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
 
 def read_promotion_record(path: Path) -> RecordedPromotion | NoRecordedPromotion:
-    """Read a promotion record and refuse a record from the removed integrate form."""
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -1929,17 +1924,11 @@ def read_promotion_record(path: Path) -> RecordedPromotion | NoRecordedPromotion
         raise GateRefused(f"push recovery record {path}: {error}") from error
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
-        hashes = [fields.get(key) for key in ("base", "commit", "source_commit")]
-        if all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{40,64}", item) for item in hashes):
-            base, commit, source = (cast(str, item) for item in hashes)
-            # A promotion records the same commit in both fields.
-            if source != commit:
-                archive = shlex.join(["mv", "-i", "--", str(path), str(path.with_suffix(".resolved"))])
-                raise GateRefused(
-                    f"{path} records an unpublished checkpoint merge from the removed integrate form. "
-                    + f"Check whether {commit} reached the production branch. "
-                    + f"If it did not, save {commit} on a recovery branch and restore the original checkout to {base}. "
-                    + f"Then archive the record with `{archive}` and retry.")
+        commit = fields.get("commit")
+        base = fields.get("base")
+        if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40,64}", commit)
+                and isinstance(base, str) and re.fullmatch(r"[0-9a-f]{40,64}", base)
+                and fields.get("source_commit") == commit):
             return RecordedPromotion(commit)
     raise GateRefused(f"invalid push recovery record: {path}")
 
@@ -1948,17 +1937,6 @@ def write_promotion_record(path: Path, previous_main: str, commit: str) -> None:
     # Older gates read the same promotion record.
     write_text_atomic(path, json.dumps({"base": previous_main, "commit": commit, "source_commit": commit}),
                       new_file_mode=0o600)
-
-
-def check_push_recovery() -> None:
-    """Refuse if the shared folder contains a checkpoint push record."""
-    try:
-        records = sorted(push_recovery_dir().iterdir())
-    except FileNotFoundError:
-        return
-    for path in records:
-        if path.suffix == ".json":
-            _ = read_promotion_record(path)
 
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
@@ -2930,7 +2908,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             result: str = ""
         options = nightly_parser.parse_args(arguments[1:], namespace=NightlyArguments())
         try:
-            check_push_recovery()
             return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
         except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
@@ -2964,10 +2941,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--module needs --tests-only")
     if not args.tests_only and not args.promote_only and not args.nightly:
         parser.error("choose --tests-only, --promote-only, or --nightly")
+    if args.tests_only:
+        return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
-        check_push_recovery()
-        if args.tests_only:
-            return run_tests_only(args, SuiteMode.MERGE_GATE)
         if args.nightly:
             args.unit = _nightly_unit(args)
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
