@@ -658,7 +658,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- const active=currentSelection();
+ // One clock read per pass, so rows and counts agree when a time passes mid-pass.
+ const active={...currentSelection(),now:Date.now()};
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
@@ -845,6 +846,9 @@ function closeCard(key,write=true){
  measured.delete(key);
  if(write && location.hash===placeHash) writePlace();
 }
+function ownerChipSelection(selection,nextOwner){
+ return nextOwner===selection.owner ? selection : {...selection,owner:nextOwner,sourceOwner:''};
+}
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
  const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
@@ -860,7 +864,11 @@ function bind(){
   event.preventDefault();
   jump(key);
  });
- filterSelection('owner').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changeFilter();});
+ filterSelection('owner').bind(value=>{
+  const current=currentSelection(),next=ownerChipSelection(current,value);
+  if(next===current) return;
+  owner=next.owner;sourceOwner=next.sourceOwner;changeFilter();
+ });
  filterSelection('show').bind(value=>{if(value===show) return;show=value;changeFilter();});
  for(const name of filterNames)
   filterSelection(name).bind(value=>{if(value===filters[name]) return;filters[name]=value;changeFilter();});
@@ -882,7 +890,7 @@ function bind(){
   type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
   const selection=currentSelection({query:currentWords().trim().toLowerCase()});
