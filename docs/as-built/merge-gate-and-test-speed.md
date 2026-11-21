@@ -525,7 +525,40 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
 - Before any job starts it refuses (and the merge rolls back) if the test list is empty or `/dev/shm` is not writable. The nightly runner also requires the `scripts` folder.
-- Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
+- Each module runs in its own session and process group with the checkout as its working directory.
+  One launch record owns the slot, the pipe, the output, and the temporary files before the gate starts the shell.
+  The gate blocks stop signals until the launch record owns the shell and the recovery file records its PID.
+  The gate records the start identity before it writes the start message.
+  EOF before the start message makes a waiting shell exit with status 125.
+  During cleanup, the gate sends SIGKILL immediately if it has not released the command.
+  The gate sends SIGTERM to running commands and reserves the second half of the grace period for SIGKILL and reaping.
+  The grace period starts at cleanup after the gate owns the child. It excludes process creation and launch identity lookup.
+  All cleanup waits for those jobs share one absolute deadline.
+  The gate must reap its direct child and check for live group members before the deadline.
+  A late result leaves the job unresolved for this attempt.
+  An unresolved job keeps its group, FIFO slot, and folder in the recovery file.
+  The recovery owner keeps the CPU descriptors, admission reservation, and gate folder while a job remains unresolved.
+  Before admission, a later gate in the same process retries cleanup with a fresh deadline.
+  The owner releases the reservation with the original failure status and closes the resources after completion.
+  A refused admission release leaves the owner available for another attempt.
+  The admission endpoint must stay the same until retained recovery completes.
+  A character device can reclaim slots when the gate exits.
+  The admission service can end a reservation after the gate exits if it finds no active scope.
+  A later gate confirms that the prior direct child disappeared and the group stopped.
+  Recovery performs a recorded merge rollback only after it proves that all recorded groups stopped.
+  A whole-machine run checks retained private records in the same temporary root.
+  The gate blocks SIGINT during cleanup and through the refusal report.
+  The merge gate and targeted-test CLIs keep that mask through exit.
+  A library call restores the incoming mask after its own cleanup.
+  The caller controls the mask during any cleanup it does after the library call returns.
+  A cleanup failure skips saves for the timing and peak files.
+  SIGTERM and SIGHUP keep their inherited dispositions.
+  The shell sets the command's stdin to `/dev/null` before exec.
+  The bootstrap unblocks SIGINT, SIGHUP, and SIGTERM before it executes the command.
+  On Linux, `SUITE_BOOTSTRAP` sets the parent-death signal until the module runner can watch the gate and reap its descendants.
+  A shell watcher kills the group when the owner pipe closes for type checks and ordinary macOS modules.
+  Native macOS verification of the owner-pipe watcher remains a follow-up.
+  The macOS runner cannot adopt test processes that leave the module session.
 - **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
   Targeted tests use step `targeted-test` through the same reservation path.
   It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
@@ -553,7 +586,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The gate checks holds again after the blocking read.
   If a hold prevents admission, the gate returns the slot before it waits for the hold.
   An absent pool keeps the existing behavior. `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests.
-  Launch and cleanup registration defer cancellation together. The child restores its signal mask before exec.
+  Cleanup includes jobs that have registered but have yet to enter the run loop.
+  The gate stops and reaps those jobs before it returns their CPU slots.
   The per-gate job limit still applies. Admission and token waits retain the checkout's shared busy lock.
   Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
@@ -1087,7 +1121,8 @@ Dailies parsing and its separate test module were retired on 2026-11-11.
 
 Example verification runs in `test_verify_untested_examples.py` (clean package) and `test_verify_example_acceptance.py` (accepted examples), `test_verify_example_markers.py` (test attributes and module files), `test_verify_example_manifest.py` (manifest refusal and diagnostic ordering), `test_verify_example_cache.py` (new tests invalidate passes) and `test_verify_example_edits.py` (edits during tests and session writes), `test_verify_example_dependencies.py` (dependency-scoped invalidation), and `test_verify_example_commands.py` (targeted tests and the removed verb), and `test_verify_example_final.py` (final command ordering). They share `verify_examples_test_support.py`, which seeds the private tools once per class and restores a copy at the original paths for every test. The seed pins the interpreter cache, marks its complete toolchain ready and matches its memory budget to its 64 GiB reading. Real Bash verification, Cargo metadata calls, command ordering and pass-cache writes remain exercised. Existing users of the unseeded workspace fixture keep their original lifecycle and environment through compatibility exports; the 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs.
 
-- **Inherited SIGINT.** A suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores. `SUITE_BOOTSTRAP` resets dispositions for gate jobs; a signal test still restores `SIG_DFL` itself.
+- **Inherited SIGINT.** A job launched from the background of a non-interactive shell can inherit SIGINT ignored.
+  Gate jobs keep that disposition. Launch a signal test in the foreground when it needs Python's default SIGINT behavior.
 
 - **The governor controls starts.** A job can exceed the governor after admission.
   A memory peak does not kill the job or fail the gate.

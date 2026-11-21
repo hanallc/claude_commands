@@ -14,12 +14,14 @@ from scripts.copies.copies_test_support import copies_environment
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
+from functools import wraps
 import json
 import contextlib
 import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -34,6 +36,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lib import build_folders
 from scripts.lib.git_test_support import fixture_git_environment, write_fixture_git_config
+from scripts.lib.process_start import ProcessExited, Unreadable, observe_process_exit
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
@@ -48,6 +51,44 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_gate.py")
+DEFAULT_SIGINT_EXEC = """import ctypes, os, signal, sys
+set_disposition = ctypes.CDLL(None, use_errno=True).signal
+set_disposition.argtypes = [ctypes.c_int, ctypes.c_void_p]
+set_disposition.restype = ctypes.c_void_p
+if set_disposition(signal.SIGINT, int(signal.SIG_DFL)) == ctypes.c_void_p(-1).value:
+    raise OSError(ctypes.get_errno(), "cannot set the fixture SIGINT disposition")
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+os.execvp(sys.argv[1], sys.argv[1:])
+"""
+
+
+def default_sigint_command(arguments: Sequence[str]) -> list[str]:
+    """Start the interpreter with the kernel default for SIGINT."""
+    return [sys.executable, "-c", DEFAULT_SIGINT_EXEC, *arguments]
+
+
+def gate_fixture_ignored_signals() -> str:
+    """Record the dispositions that survive exec into a fixture module."""
+    numbers = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+    return ",".join(str(int(number)) for number in numbers if signal.getsignal(number) == signal.SIG_IGN)
+
+
+def needs_default_sigint[Case: unittest.TestCase](test: Callable[[Case], None]) -> Callable[[Case], None]:
+    @wraps(test)
+    def run(case: Case) -> None:
+        if (signal.getsignal(signal.SIGINT) is signal.default_int_handler
+                and signal.SIGINT not in signal.pthread_sigmask(signal.SIG_BLOCK, [])):
+            test(case)
+            return
+        module = f"scripts.production.{test.__module__.rsplit('.', 1)[-1]}"
+        name = f"{module}.{type(case).__name__}.{test.__name__}"
+        result = subprocess.run(default_sigint_command([sys.executable, "-m", "unittest", name]),
+                                cwd=SCRIPT.parents[2], stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    return run
+
+
 # Fixture data, independent of the checkout's test folders.
 FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "fixture_b", "fixture_c")
 # Each folder holds test_first.py, and lib also holds test_second.py.
@@ -171,10 +212,13 @@ class FixtureTest(unittest.TestCase):
         import select
         self.assertTrue(select.select([sys.stdin], [], [], TEST_HANG_GUARD_SECS)[0], "module stdin did not close")
         self.assertEqual(sys.stdin.read(), "")
-        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
-        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
-        self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
-        self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
+        ignored = os.environ["MERGE_GATE_TEST_IGNORED_SIGNALS"].split(",")
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            if str(int(number)) in ignored:
+                expected = signal.SIG_IGN
+            else:
+                expected = signal.default_int_handler if number == signal.SIGINT else signal.SIG_DFL
+            self.assertEqual(signal.getsignal(number), expected, number)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
             self.assertNotIn(str(Path.cwd()), os.environ.get("PYTHONPATH", "").split(os.pathsep))
             self.assertIn(str(Path.cwd()), sys.path)
@@ -290,7 +334,7 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
 
 
 def pin_gate_root(configuration: Path, root: Path) -> None:
-    """Keep the fixture gate on its private tmpfs path."""
+    """Keep the fixture gate in its private folder."""
     _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
 
 
@@ -334,9 +378,7 @@ class MergeGateFixture(unittest.TestCase):
 
     @classmethod
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
-        environment = config_environment(directory)
-        pin_gate_root(directory / "build_folders.conf", Path("/dev/shm"))
-        return environment
+        return config_environment(directory)
 
     @classmethod
     @override
@@ -347,8 +389,8 @@ class MergeGateFixture(unittest.TestCase):
             _ = environment.pop(key, None)
         environment.update(cls.fixture_configuration(configuration))
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
-        tmpfs = build_folders.tmpfs_temporary_parent()
-        private = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mg-", dir=tmpfs)))
+        private = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mg-", dir="/tmp"))).resolve()
+        pin_gate_root(configuration / "build_folders.conf", private)
         parent = merge_gate.gate_test_parent(private)
         parent.mkdir(mode=0o700)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(
@@ -463,6 +505,7 @@ class MergeGateFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "MERGE_GATE_TEST_STATE": str(self.state),
+            "MERGE_GATE_TEST_IGNORED_SIGNALS": gate_fixture_ignored_signals(),
             "MERGE_GATE_FIXTURE_TMP": str(self.fixture_root.parent),
             "MERGE_GATE_TEST_REPO": str(SCRIPT.parents[2]),
             "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
@@ -645,18 +688,10 @@ class MergeGateFixture(unittest.TestCase):
         _ = path.write_text(content, encoding="utf-8")
 
     def assert_process_stopped(self, pid: int) -> None:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while True:
-            try:
-                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            # A process reaped between the open and the read is gone, so it is stopped.
-            except (FileNotFoundError, ProcessLookupError):
-                return
-            if state == "Z":
-                return
-            if time.monotonic() >= deadline:
-                self.fail(f"gate left running child {pid}")
-            time.sleep(0.01)
+        result = observe_process_exit(pid, time.monotonic() + TEST_HANG_GUARD_SECS)
+        if isinstance(result, Unreadable):
+            self.fail(f"cannot observe gate child {pid}: {result.reason}")
+        self.assertIsInstance(result, ProcessExited, f"gate left running child {pid}")
 
     def git(self, checkout: Path, *arguments: str) -> str:
         # Every caller supplies one of this fixture's disposable paths explicitly.
@@ -684,7 +719,7 @@ class MergeGateFixture(unittest.TestCase):
         return subject, self.commit(self.checkout, "dependency fixture")
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False, callers_production: bool = False,
+                 callers_production: bool = False,
                  own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
@@ -698,9 +733,9 @@ class MergeGateFixture(unittest.TestCase):
              *extra]
         if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
             arguments = ["--repo", str(self.checkout), *extra]
-        if own_process or ignored_signals:
+        if own_process:
             return subprocess.run(
-                [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
+                [*self.gate_command(preamble=preamble), *arguments], cwd=self.root,
                 env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         from scripts.production import showrunners
@@ -717,18 +752,19 @@ class MergeGateFixture(unittest.TestCase):
             return invoke_cli(entry, lambda: entry.main(arguments), arguments,
                               self.environment, self.root)
 
-    def gate_command(self, *, ignored_signals: bool = False, preamble: str = "") -> list[str]:
-        source = "import sys, signal; "
-        if ignored_signals:
-            source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
-                       "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
-        source += ("from scripts.production import merge_gate; \n"
+    def gate_command(self, *, preamble: str = "") -> list[str]:
+        return default_sigint_command(self.gate_entry_command(preamble=preamble))
+
+    def gate_entry_command(self, *, preamble: str = "") -> list[str]:
+        source = ("import sys, signal\nfrom scripts.production import merge_gate\n"
                    + "from pathlib import Path\nimport os\nfrom scripts.message import session_send\n"
+                   + "from scripts.production.merge_gate_test_support import gate_fixture_ignored_signals\n"
+                   + "os.environ['MERGE_GATE_TEST_IGNORED_SIGNALS'] = gate_fixture_ignored_signals()\n"
                    + "session_send.SEND_SCRIPT = Path(os.environ['MERGE_GATE_TEST_STATE']).parent / 'bin/send.py'\n"
                    + ("from scripts.production import targeted_test as entry\n"
                       if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else "entry = merge_gate\n")
                    + preamble + "\n"
-                   + "raise SystemExit(entry.main(sys.argv[1:]))")
+                   + "merge_gate.run_gate_cli(entry.main)")
         return [str(SCRIPT.parents[1] / "lib/py"), "-c", source]
 
     def run_promote_only(self, *extra: str, explicit_checkout: bool = True) -> subprocess.CompletedProcess[str]:
@@ -815,9 +851,8 @@ class MergeGateFixture(unittest.TestCase):
         lock = Path(self.environment["BUILD_HOLD_RELEASE_DIR"]) / "release.lock"
         self.write(lock, "")
         ready = self.state / "release-lock-held"
-        source = """import fcntl, signal, sys
+        source = """import fcntl, sys
 from pathlib import Path
-signal.signal(signal.SIGTERM, signal.SIG_DFL)
 with Path(sys.argv[1]).open("r+") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     Path(sys.argv[2]).touch()

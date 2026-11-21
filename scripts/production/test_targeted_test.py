@@ -46,6 +46,50 @@ class TargetedTestTests(MergeGateFixture):
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
 
+        for explicit_exit in (False, True):
+            with self.subTest(explicit_exit=explicit_exit):
+                reported_folder = self.state / "targeted-cleanup-folder"
+                reported_folder.unlink(missing_ok=True)
+                preamble = f"""from contextlib import contextmanager
+import runpy
+from scripts.lib import testing_folders
+
+open_folder = testing_folders.test_run_folder
+
+@contextmanager
+def interrupt_folder_cleanup():
+    with open_folder() as folder:
+        try:
+            yield folder
+        finally:
+            signal.raise_signal(signal.SIGINT)
+            assert signal.SIGINT in signal.sigpending()
+            Path({str(reported_folder)!r}).write_text(str(folder))
+
+def refuse_cleanup(*args, **kwargs):
+    boundary = merge_gate.ACTIVE_GATE_FAILURE.get()
+    boundary.begin_cleanup()
+    error = merge_gate.GateRefused("fixture cleanup deadline")
+    boundary.cleanup_failure = error
+    raise error
+
+run_tests = merge_gate.run_tests_only
+
+def exit_after_refusal(*args, **kwargs):
+    raise SystemExit(run_tests(*args, **kwargs))
+
+testing_folders.test_run_folder = interrupt_folder_cleanup
+merge_gate.run_gate_suites = refuse_cleanup
+if {explicit_exit!r}:
+    merge_gate.run_tests_only = exit_after_refusal
+runpy.run_path({str(Path(targeted_test.__file__).resolve())!r}, run_name="__main__")
+"""
+                result = self.run_gate(own_process=True, preamble=preamble)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("REFUSED: fixture cleanup deadline", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(Path(reported_folder.read_text()).exists())
+
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)

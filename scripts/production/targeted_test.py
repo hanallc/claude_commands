@@ -16,6 +16,7 @@ from scripts.lib.build_steps import gate_job_for_command
 from scripts.lib.testing_folders import test_run_folder
 
 
+@merge_gate.gate_failure_boundary()
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -27,4 +28,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    merge_gate.run_gate_cli(main)

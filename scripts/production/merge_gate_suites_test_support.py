@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-import select
 import sys
 from typing import override
 
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Keep the shared fixture unchanged for its other subjects. These jobs still run
@@ -77,26 +74,3 @@ class GateSuitesFixture(MergeGateFixture):
                 self.assertEqual(content.count(polling), 1)
                 content = content.replace(polling, event)
         super().write(path, content)
-
-    @override
-    def assert_process_stopped(self, pid: int) -> None:
-        def stopped() -> bool:
-            try:
-                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-            # A process reaped during the read gives ESRCH, not ENOENT.
-            except (FileNotFoundError, ProcessLookupError):
-                return True
-
-        if stopped():
-            return
-        try:
-            descriptor = os.pidfd_open(pid)
-        except ProcessLookupError:
-            return
-        try:
-            readable, _, _ = select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)
-            # The pidfd reports exit before /proc necessarily reports a zombie.
-            if not readable:
-                self.fail(f"gate left running child {pid}")
-        finally:
-            os.close(descriptor)

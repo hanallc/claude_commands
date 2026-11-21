@@ -14,11 +14,19 @@ CANCELLATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 def defer_cleanup_signals() -> Generator[None]:
     """Keep ownership changes atomic with respect to runner cancellation."""
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    failed = False
     try:
         _ = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
         yield
+    except BaseException:
+        failed = True
+        raise
     finally:
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        try:
+            _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        except KeyboardInterrupt:
+            if not failed:
+                raise
 
 
 def start_masked_thread(worker: threading.Thread) -> None:

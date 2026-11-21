@@ -323,12 +323,24 @@ class QueuePlace:
     peak_bytes: int = 0
     wave_at: float = 0.0
     status: int = 1
+    reservation: HeldReservation | UnreservedProgram = field(default_factory=UnreservedProgram, init=False)
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
     on_started: Callable[[], None] = no_hold_wait
     configuration: admission_records.MemoryConfig | wire.RunnerExecutionTiming = field(kw_only=True, repr=False)
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def record_failure(self, error: BaseException) -> None:
+        self.status = (128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else
+                       error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
+
+    def confirm_reservation_release(self) -> None:
+        if isinstance(self.reservation, HeldReservation):
+            self.reservation.status = self.status
+            reply = self.reservation.release()
+            if isinstance(reply, wire.Refused):
+                raise QueuePlaceRefused(reply.reason)
 
     def publish_sample(self, suffix: str, value: str) -> None:
         path = self.path.with_suffix(suffix)
@@ -500,6 +512,14 @@ def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> 
 class HeldReservation:
     grant: wire.Admitted
     status: int = 1
+    released: bool = field(default=False, init=False)
+
+    def release(self) -> wire.Ok | wire.Refused:
+        if self.released:
+            return wire.Ok()
+        reply = release_place(self.grant.reservation, self.status, self.grant.cleanup_timing)
+        self.released = isinstance(reply, wire.Ok)
+        return reply
 
 
 @contextmanager
@@ -518,7 +538,8 @@ def held_reservation(request: QueueRequest, *,
     try:
         yield held
     finally:
-        _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
+        if not sys.is_finalizing():
+            _ = held.release()
 
 
 @contextmanager
@@ -574,13 +595,13 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
                        else temporary / "program")
         place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
+        place.reservation = grant
         failed = False
         try:
             yield place
         except BaseException as error:
             failed = True
-            place.status = (128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else
-                            error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
+            place.record_failure(error)
             raise
         finally:
             with cancellation.defer_cleanup_signals():

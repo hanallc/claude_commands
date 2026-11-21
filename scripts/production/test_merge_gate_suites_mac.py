@@ -27,7 +27,7 @@ from scripts.production import mac_gate_process, merge_gate, targeted_test
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
-from scripts.production.merge_gate_test_support import gate_suites
+from scripts.production.merge_gate_test_support import gate_suites, needs_default_sigint
 
 
 MAC_MODULE = "scripts.production.test_merge_gate_suites_mac"
@@ -272,6 +272,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual(run.time_limit_report, "First natedev time limit\nnatedev time limit")
 
     @gate_suites("lib")
+    @needs_default_sigint
     def test_linux_exception_and_sigint_kill_and_reap_the_mac_child(self) -> None:
         self.exclude_modules(LIB_FIRST)
         for interrupt in (False, True):

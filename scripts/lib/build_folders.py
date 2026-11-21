@@ -19,6 +19,7 @@ import secrets
 import shutil
 import signal
 import stat
+import subprocess
 from enum import Enum
 from pathlib import Path
 import sys
@@ -999,7 +1000,12 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Generator[Path]:
     """Remove private work after the caller ends, including interrupted callers."""
     with ExitStack() as cleanup:
-        yield create_build_folder(_TemporaryFolderRequest(request, cleanup))
+        yield allocate_temporary_build_folder(request, cleanup)
+
+
+def allocate_temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec, cleanup: ExitStack) -> Path:
+    """Register removal on the caller's cleanup stack."""
+    return create_build_folder(_TemporaryFolderRequest(request, cleanup))
 
 
 def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[BuildFolderSpec], Path], *,
@@ -1056,61 +1062,96 @@ def tool_folder(tool: str, parent: Path | None = None) -> Generator[Path]:
     The parent is the caller's temporary parent unless the caller names one.
     """
     with ExitStack() as cleanup:
-        yield _claim_tool_folder(tool, parent, lambda spec: cleanup.enter_context(temporary_build_folder(spec)))
+        yield allocate_tool_folder(tool, parent, cleanup)
+
+
+def allocate_tool_folder(tool: str, parent: Path | None, cleanup: ExitStack) -> Path:
+    """Register removal of a tool folder on the caller's cleanup stack."""
+    def allocate(spec: BuildFolderSpec) -> Path:
+        attempt = ExitStack()
+        _ = cleanup.callback(attempt.close)
+        try:
+            return allocate_temporary_build_folder(spec, attempt)
+        except BaseException:
+            attempt.close()
+            raise
+
+    return _claim_tool_folder(tool, parent, allocate)
 
 
 OWNER_MARKER = ".build-folder-owner.json"
 
 
+def build_owner_boot_identity() -> str:
+    if sys.platform != "darwin":
+        return boot_identity()
+    try:
+        return subprocess.run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], check=True,
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except subprocess.SubprocessError as error:
+        raise OSError("cannot read the Mac boot identity") from error
+
+
+def start_macos_build_command(command: Sequence[str], path: Path, environment: Mapping[str, str],
+                              pass_fds: Sequence[int], cleanup: ExitStack) -> subprocess.Popen[bytes]:
+    """Keep the job group tied to the build owner through a pipe."""
+    reader, writer = os.pipe()
+    _ = cleanup.callback(os.close, writer)
+    try:
+        watcher = f'(read -r end <&{reader} || kill -KILL "-$$") & exec {reader}<&-; exec "$@"'
+        return subprocess.Popen(["/bin/sh", "-c", watcher, "build-job", *command],
+                                cwd=path, env=environment, pass_fds=(*pass_fds, reader), start_new_session=True)
+    finally:
+        os.close(reader)
+
+
 def run_build_command(command: Sequence[str], *, path: Path, environment: Mapping[str, str],
                       pass_fds: Sequence[int]) -> int:
     """Keep the caller until the command and its descendants stop."""
-    import subprocess
     from scripts.lib.descendants import adopt_descendants
     from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
     pid = os.getpid()
-    if sys.platform == "darwin":
-        child = subprocess.Popen(command, cwd=path, env=environment,
-                                 pass_fds=pass_fds, start_new_session=True)
-    else:
-        _ = adopt_descendants()
-        child = subprocess.Popen(command, cwd=path, env=environment,
-                                 pass_fds=pass_fds, process_group=os.getpgrp())
-    try:
-        status = child.wait()
-    finally:
-        try:
-            child.kill()
-        except ProcessLookupError:
-            pass
-        _ = child.wait()
+    with ExitStack() as cleanup:
         if sys.platform == "darwin":
-            # A descendant outside the group still holds the slot if it inherits the lock descriptor.
+            child = start_macos_build_command(command, path, environment, pass_fds, cleanup)
+        else:
+            _ = adopt_descendants()
+            child = subprocess.Popen(command, cwd=path, env=environment,
+                                     pass_fds=pass_fds, process_group=os.getpgrp())
+        try:
+            status = child.wait()
+        finally:
             try:
-                send_process_group(child.pid, signal.SIGKILL)
+                child.kill()
             except ProcessLookupError:
                 pass
-            while True:
+            _ = child.wait()
+            if sys.platform == "darwin":
                 try:
-                    send_process_group(child.pid, 0)
+                    send_process_group(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    break
-                time.sleep(0.01)
-        else:
-            while True:
-                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-                for descendant in children:
+                    pass
+                while True:
                     try:
-                        os.kill(int(descendant), signal.SIGKILL)
+                        send_process_group(child.pid, 0)
                     except ProcessLookupError:
-                        pass
-                try:
-                    _ = os.waitpid(-1, 0)
-                except ChildProcessError:
-                    break
+                        break
+                    time.sleep(0.01)
+            else:
+                while True:
+                    children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+                    for descendant in children:
+                        try:
+                            os.kill(int(descendant), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        _ = os.waitpid(-1, 0)
+                    except ChildProcessError:
+                        break
     return status if status >= 0 else 128 - status
 
 
@@ -1118,6 +1159,7 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
               work: str = "") -> int:
     """Keep the folder until the command and its descendants stop."""
     import json
+    from scripts.lib.process_start import Started, process_start
 
     settings = _settings()
     root = Path(os.path.expandvars(settings.text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent())))).expanduser().resolve()
@@ -1127,9 +1169,11 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
 
     with temporary_build_folder(spec) as path:
         pid = os.getpid()
-        start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        identity = process_start(pid)
+        if not isinstance(identity, Started):
+            raise OSError("cannot read the build folder owner's process start")
         information = path.stat()
-        marker = {"owner": owner, "pid": pid, "start_time": start_time, "boot_id": boot_identity(),
+        marker = {"owner": owner, "pid": pid, "start_time": identity.start, "boot_id": build_owner_boot_identity(),
                   "copy_path": str(path.resolve()), "copy_device": information.st_dev, "copy_inode": information.st_ino}
         _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
         descriptor = build_folder_lock_fd(path)

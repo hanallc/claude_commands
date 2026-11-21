@@ -6,7 +6,6 @@ from collections.abc import Callable, Generator
 import os
 import fcntl
 import json
-import select
 import signal
 import shutil
 from pathlib import Path
@@ -15,15 +14,18 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
-from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
+from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group, process_start
+from scripts.lib.descendants import descendant_adoption_available
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.production.merge_gate_test_support import default_sigint_command
 
 
 def _release_folder(path: Path) -> None:
@@ -676,6 +678,7 @@ from unittest import mock
 from scripts.lib import build_folders as f
 root = pathlib.Path(os.environ['TMPDIR'])
 stage = sys.argv[1]
+incoming_sigint = signal.getsignal(signal.SIGINT)
 spec = f.BuildFolderSpec(kind='temporary', parent=root, suffix_length=2, repository='repo',
                        owner='unit', purpose=stage, suffix='fixed')
 path = f.build_folder_path(spec)
@@ -687,7 +690,7 @@ def interrupt():
     if armed[0]:
         armed[0] = False
         if stage not in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
-            assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+            assert signal.getsignal(signal.SIGINT) is incoming_sigint
         os.kill(os.getpid(), signal.SIGINT)
 flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
 unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
@@ -762,14 +765,15 @@ for descriptor in descriptors:
         assert error.errno == errno.EBADF
     else:
         raise AssertionError('the interrupted open leaked a descriptor')
-assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+assert signal.getsignal(signal.SIGINT) is incoming_sigint
 assert f.remove_build_folder(path, lambda: shutil.rmtree(path) if path.exists() else None)
 assert not path.exists() and not lock.exists() and not lease_path.exists()
 print('free')
 """
         for stage in ("lock", "fstat", "lease", "mkdir", "publish", "removal", "folder_removed", "lease_removed", "lock_removed"):
             with self.subTest(stage=stage):
-                result = subprocess.run([sys.executable, "-c", probe, stage], capture_output=True, text=True, timeout=4)
+                result = subprocess.run(default_sigint_command([sys.executable, "-c", probe, stage]),
+                                        capture_output=True, text=True, timeout=4)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "free\n")
 
@@ -829,6 +833,7 @@ from unittest import mock
 from scripts.lib import build_folders as f
 root = pathlib.Path(os.environ['TMPDIR'])
 path = root / 'main-allocation'
+incoming_sigint = signal.getsignal(signal.SIGINT)
 reached, resume = threading.Event(), threading.Event()
 read, write = os.pipe()
 descriptors, status = [], []
@@ -849,7 +854,7 @@ def fork_from_worker():
     child = os.fork()
     if child == 0:
         signal.alarm(3)
-        assert signal.getsignal(signal.SIGINT) == signal.default_int_handler
+        assert signal.getsignal(signal.SIGINT) is incoming_sigint
         try:
             os.kill(os.getpid(), signal.SIGINT)
         except KeyboardInterrupt:
@@ -875,7 +880,8 @@ assert not worker.is_alive() and status == [0], status
 assert path.is_dir() and f.build_folder_state(path) == 'free'
 print('signals')
 """
-        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        result = subprocess.run(default_sigint_command([sys.executable, "-c", probe]),
+                                capture_output=True, text=True, timeout=6)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "signals\n")
 
@@ -1445,9 +1451,9 @@ assert not loaded, loaded
 
 
     def test_cancellation_during_allocation_or_removal_keeps_any_folder_recorded(self) -> None:
-        def interrupted(number: int, frame: object) -> None:
-            del frame
-            raise KeyboardInterrupt(signal.Signals(number).name)
+        def receive_cancel() -> Never:
+            self.assertIn(signal.SIGTERM, cast(set[signal.Signals], signal.sigpending()))
+            raise KeyboardInterrupt(signal.Signals(signal.sigwait({signal.SIGTERM})).name)
 
         for stage in ("allocation", "removal"):
             with self.subTest(stage=stage):
@@ -1456,22 +1462,21 @@ assert not loaded, loaded
                 remove = shutil.rmtree
                 cancel = threading.Event()
                 sent = threading.Event()
-                release = threading.Event()
+                receiver = threading.get_ident()
 
                 def send_from_thread() -> None:
-                    if cancel.wait(10) and not release.is_set():
-                        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+                    if cancel.wait(10):
+                        signal.pthread_kill(receiver, signal.SIGTERM)
                         sent.set()
-                        _ = release.wait(10)
 
                 worker = threading.Thread(target=send_from_thread)
-                worker.start()
 
                 def allocate_then_cancel(request: folders.BuildFolderRequest | folders.BuildFolderSpec) -> Path:
                     path = allocate(request)
                     paths.append(path)
                     if stage == "allocation":
-                        os.kill(os.getpid(), signal.SIGTERM)
+                        signal.pthread_kill(receiver, signal.SIGTERM)
+                        receive_cancel()
                     return path
 
                 def cancel_then_remove(path: str, *, dir_fd: int,
@@ -1479,15 +1484,18 @@ assert not loaded, loaded
                     if stage == "removal":
                         cancel.set()
                         self.assertTrue(sent.wait(10), "the worker did not send SIGTERM")
+                        receive_cancel()
                     remove(path, dir_fd=dir_fd, onexc=onexc)
 
-                previous = signal.signal(signal.SIGTERM, interrupted)
+                previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+                worker.start()
                 try:
                     with (mock.patch.object(folders, "create_build_folder", side_effect=allocate_then_cancel),
                           mock.patch.object(shutil, "rmtree", side_effect=cancel_then_remove),
                           self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM")):
                         with folders.temporary_build_folder(folders.UniqueBuildFolder("gate-proof-")):
-                            pass
+                            if stage == "allocation":
+                                self.fail("allocation returned after cancellation")
                     self.assertEqual(len(paths), 1)
                     path = paths[0]
                     lock = path.with_name(path.name + ".lock")
@@ -1499,10 +1507,11 @@ assert not loaded, loaded
                         self.assertEqual(record["purpose"], "gate-proof-")
                     self.assertEqual(folders.build_folder_state(path), "free")
                 finally:
-                    release.set()
                     cancel.set()
                     worker.join(timeout=10)
-                    _ = signal.signal(signal.SIGTERM, previous)
+                    if signal.SIGTERM in signal.sigpending():
+                        _ = signal.sigwait({signal.SIGTERM})
+                    _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
     def test_authority_readers_follow_current_scratch_copy_and_unit_roots(self) -> None:
@@ -1824,25 +1833,39 @@ assert not loaded, loaded
         self.assertEqual(folders.build_folder_path(spec), self.root / "repo" / "proof-unit-xyz")
 
     def test_run_removes_work_on_success_and_failure_and_records_owner(self) -> None:
+        expected_boot = (subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+                                                 text=True, timeout=5).strip()
+                         if sys.platform == "darwin" else "")
+        checkout = str(Path(folders.__file__).resolve().parents[2])
         probe = """import json, os, pathlib, sys
+sys.path.insert(0, sys.argv[3])
+from scripts.lib.process_start import Started, process_start
 path = pathlib.Path.cwd()
 assert str(path) == os.environ['BUILD_FOLDER']
 marker = json.loads((path / '.build-folder-owner.json').read_text())
 assert marker['pid'] == os.getppid()
-assert marker['start_time'] == pathlib.Path('/proc/%s/stat' % marker['pid']).read_text().rsplit(')',1)[1].split()[19]
-assert marker['boot_id'] == pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+if sys.platform == 'linux':
+    stat = pathlib.Path(f"/proc/{marker['pid']}/stat").read_text()
+    assert marker['start_time'] == stat.rsplit(')', 1)[1].split()[19]
+    assert marker['boot_id'] == pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+else:
+    identity = process_start(os.getppid())
+    assert isinstance(identity, Started)
+    assert marker['start_time'] == identity.start
+    assert marker['boot_id'] == sys.argv[2]
 print(json.dumps({'path': str(path), 'owner': marker['owner']}))
 sys.exit(int(sys.argv[1]))
 """
         for status in (0, 7):
             with self.subTest(status=status):
                 result = self.command("run", "--owner", "unit", "--name", "proof", "--", sys.executable,
-                                      "-c", probe, str(status))
+                                      "-c", probe, str(status), expected_boot, checkout)
                 self.assertEqual(result.returncode, status, result.stderr)
                 record = cast(dict[str, str], json.loads(result.stdout))
                 self.assertEqual(record["owner"], "unit")
                 self.assertFalse(Path(record["path"]).exists())
 
+    @unittest.skipUnless(descendant_adoption_available(), "the build runner cannot adopt orphans")
     def test_run_stops_and_reaps_an_escaped_descendant(self) -> None:
         probe = """import os, pathlib, subprocess, sys
 child = subprocess.Popen([sys.executable, '-c', 'import os, signal; os.setsid(); print(os.getpid(), flush=True); signal.pause()'], stdout=subprocess.PIPE, text=True)
@@ -1861,8 +1884,9 @@ os._exit(0)
         probe = "import os, pathlib, signal; print(str(pathlib.Path.cwd()), os.getpid(), flush=True); signal.pause()"
         for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGKILL):
             with self.subTest(signal=number):
-                process: subprocess.Popen[str] = subprocess.Popen([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
-                                            "--name", "proof", "--", sys.executable, "-c", probe],
+                command = default_sigint_command([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
+                                                  "--name", "proof", "--", sys.executable, "-c", probe])
+                process: subprocess.Popen[str] = subprocess.Popen(command,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
                 try:
                     assert process.stdout is not None
@@ -1874,17 +1898,8 @@ os._exit(0)
                     self.assertEqual(folders.build_folder_state(folder), "free")
                     if folder.exists():
                         self.assertTrue(folder.with_name(folder.name + ".lease.json").is_file())
-                    from scripts.lib import process_start
-
-                    try:
-                        descriptor = os.pidfd_open(int(child_pid))
-                    except ProcessLookupError:
-                        pass
-                    else:
-                        try:
-                            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0])
-                        finally:
-                            os.close(descriptor)
+                    stopped = process_start.observe_process_exit(int(child_pid), time.monotonic() + TEST_HANG_GUARD_SECS)
+                    self.assertIsInstance(stopped, process_start.ProcessExited)
                     self.assertIsInstance(process_start.process_start(int(child_pid)), (process_start.Gone, process_start.Zombie))
                     folders.sweep_temporary_build_folders(folder.parent)
                     self.assertFalse(folder.exists())
@@ -2013,6 +2028,20 @@ os._exit(0)
             self.assertEqual(path, self.root / "fast-track")
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
             _ = (path / "output").write_text("x")
+        self.assertEqual(sorted(entry.name for entry in self.root.iterdir()), [])
+
+        with self.subTest("interrupt during cleanup registration"), ExitStack() as destination:
+            register = destination.callback
+
+            def register_attempt(clean: Callable[[], None]) -> Callable[[], None]:
+                if path.exists():
+                    raise KeyboardInterrupt("cleanup registered after allocation")
+                return register(clean)
+
+            with (mock.patch.object(destination, "callback", side_effect=register_attempt),
+                  self.assertRaises(KeyboardInterrupt)):
+                self.assertEqual(folders.allocate_tool_folder("fast-track", self.root, destination), path)
+                raise KeyboardInterrupt("interrupt the allocated tool")
         self.assertEqual(sorted(entry.name for entry in self.root.iterdir()), [])
 
     def test_a_second_run_at_once_gets_a_number_and_the_name_is_free_again_after(self) -> None:

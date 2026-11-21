@@ -16,6 +16,7 @@ from pathlib import Path
 import resource
 import select
 import signal
+import subprocess
 import sys
 import time
 import threading
@@ -24,7 +25,8 @@ from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, wait_for_file
+from scripts.lib import descendants, process_group, process_start
+from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, needs_default_sigint, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -54,7 +56,7 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lib import cancellation, copy_record, scratch
+from scripts.lib import copy_record, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
 
@@ -99,21 +101,29 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 self.restore_fixture(("hooks",))
                 module = self.checkout / "scripts/hooks/test_first.py"
                 self.write(module, module.read_text().replace(
-                    '        if (state / "sample-module-memory").exists():',
-                    '        def exit_zero(signum, frame):\n'
-                    + '            del signum, frame\n'
-                    + '            print("Ran 0 tests in 0.000s", flush=True)\n'
-                    + '            print("NO TESTS RAN", flush=True)\n'
-                    + f'            os._exit({exit_status})\n'
-                    + '        signal.signal(signal.SIGTERM, exit_zero)\n'
-                    + '        if (state / "sample-module-memory").exists():', 1))
+                    '        death = state / ("signal-" + suite)',
+                    '        print("Ran 0 tests in 0.000s", flush=True)\n'
+                    + '        print("NO TESTS RAN", flush=True)\n'
+                    + f'        os._exit({exit_status})\n'
+                    + '        death = state / ("signal-" + suite)', 1))
                 self.configure_gate("merge_gate_governor_gib=4")
                 output = io.StringIO()
-                with mock.patch.dict(os.environ, self.environment), \
-                        self.sampling_module_memory({"hooks/test_first.py": (5120.0,)}), redirect_stdout(output):
+                send = process_group.send_process_group
+
+                def finish_on_term(pid: int, number: int) -> None:
+                    if number == signal.SIGTERM:
+                        (self.state / f"{pid}.memory-done").touch()
+                    else:
+                        send(pid, number)
+
+                with (mock.patch.dict(os.environ, self.environment),
+                      self.sampling_module_memory({"hooks/test_first.py": (5120.0,)}) as started,
+                      mock.patch.object(process_group, "send_process_group", side_effect=finish_on_term),
+                      redirect_stdout(output)):
                     run = merge_gate.run_suites(self.checkout)
                 self.assertFalse(run.passed, output.getvalue())
                 self.assertEqual(len(run.executions), 2)
+                self.assertEqual([job.process.returncode for job in started], [exit_status, exit_status])
                 for result in run.executions:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("peak memory 5.000 GiB", result.killed_for)
@@ -175,6 +185,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 self.assert_all_modules_started()
                 self.assertEqual(self.jobserver_tokens(), b"Q")
 
+    @needs_default_sigint
     def test_stop_during_a_blocking_read_returns_every_owned_slot(self) -> None:
         for delivery in ("before_wait", "process", "sender_thread"):
             with self.subTest(delivery=delivery):
@@ -211,6 +222,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                     _ = stopped.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(self.jobserver_tokens(), b"A")
 
+    @needs_default_sigint
     def test_stop_after_blocking_acquisition_returns_the_new_slot_too(self) -> None:
         for delivery in ("read", "return"):
             with self.subTest(delivery=delivery):
@@ -234,6 +246,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                         os.kill(os.getpid(), signal.SIGINT)
                 self.assertEqual(self.jobserver_tokens(), b"A\0")
 
+    @needs_default_sigint
     def test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup(self) -> None:
         jobs: list[merge_gate.RunningGateJob] = []
         for name, source in (("finished", "raise SystemExit(7)"),
@@ -245,17 +258,17 @@ class MergeGateResourcesTests(GateSuitesFixture):
             self.addCleanup(merge_gate.kill_job_group, job)
             jobs.append(job)
         finished, running = jobs
-        _ = os.waitid(os.P_PID, finished.process.pid, os.WEXITED | os.WNOWAIT)
+        self.assert_process_stopped(finished.process.pid)
         wait4 = os.wait4
 
         def interrupt_after_wait(pid: int, options: int) -> tuple[int, int, resource.struct_rusage]:
             result = wait4(pid, options)
-            os.kill(os.getpid(), signal.SIGINT)
+            signal.pthread_kill(threading.get_ident(), signal.SIGINT)
             return result
 
         stopped = threading.Event()
         worker = threading.Thread(target=stopped.wait, daemon=True)
-        cancellation.start_masked_thread(worker)
+        worker.start()
         try:
             with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
                 with self.assertRaises(KeyboardInterrupt):
@@ -454,7 +467,14 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.record_module_peaks({"lib/test_first.py": 48.0, "lib/test_second.py": 48.0})
         self.write(self.state / "barrier", "two")
         self.configure_gate("merge_gate_governor_gib=0.26171875")
-        result = self.run_gate("--tests-only", ignored_signals=True)
+        ignored = """assert all(signal.getsignal(number) == signal.SIG_IGN for number in
+           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT))
+"""
+        result = subprocess.run(
+            ["/bin/sh", "-c", "trap '' INT TERM HUP QUIT; exec \"$@\"", "gate-fixture",
+             *self.gate_entry_command(preamble=ignored), "--tests-only", "--repo", str(self.checkout)],
+            cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         active: set[int] = set()
         peak = 0
@@ -591,6 +611,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertEqual(merge_gate.read_measures(cpu_path), {"hooks/test_first.py": 12.0})
         self.assertGreater(result.jobs[0].cpu_seconds, 0.0)
 
+    @unittest.skipUnless(descendants.descendant_adoption_available(), "the module runner cannot adopt orphans")
     def test_module_time_limit_kills_and_reaps_a_detached_orphan(self) -> None:
         processes = OwnedTestProcesses()
         self.addCleanup(processes.finish)
@@ -626,7 +647,7 @@ class HeldModule(unittest.TestCase):
         output = io.StringIO()
         monotonic = time.monotonic
         deadline = monotonic() + TEST_HANG_GUARD_SECS
-        handles: dict[int, int] = {}
+        observed: dict[int, str] = {}
 
         def module_clock() -> float:
             if monotonic() >= deadline:
@@ -635,10 +656,10 @@ class HeldModule(unittest.TestCase):
             if not ready.exists():
                 return monotonic()
             pid = int(ready.read_text())
-            if pid not in handles:
-                descriptor = os.pidfd_open(pid)
-                handles[pid] = descriptor
-                self.addCleanup(os.close, descriptor)
+            if pid not in observed:
+                identity = process_start.process_start(pid)
+                assert isinstance(identity, process_start.Started)
+                observed[pid] = identity.start
             return monotonic() + 2000
 
         with mock.patch.dict(os.environ, self.environment), \
@@ -646,10 +667,12 @@ class HeldModule(unittest.TestCase):
             result = merge_gate.run_suites(self.checkout)
         self.assertFalse(result.passed, output.getvalue())
         self.assertIn("hooks/test_first.py killed: still running after 1800 s, the module time limit", output.getvalue())
-        observer = select.poll()
-        for descriptor in handles.values():
-            observer.register(descriptor, select.POLLHUP)
-        self.assertTrue(observer.poll(0), "The module time limit left the detached orphan alive or unreaped")
+        self.assertTrue(observed)
+        for pid, start in observed.items():
+            self.assertIsInstance(process_start.observe_process_exit(pid, deadline, expected_start=start),
+                                  process_start.ProcessExited)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
     def test_nonpositive_module_time_limit_refuses_without_running_modules(self) -> None:
         result = self.run_gate("--tests-only", "--module-time-limit-s", "0")
