@@ -46,6 +46,14 @@ mark_reply_ended(session_id: str, now: int) -> None
 
 It also maintains the scheduled-prompt record. Both hooks skip subagents. A retried Stop with `stop_hook_active` does not mark another reply end.
 
+On natedev, the hook finds file paths that start with `/Users/` in typed prompts.
+Quote a path that has punctuation followed by a space.
+The hook also accepts unquoted paths with escaped spaces and escaped backslashes.
+The hook adds one `scp` command per path to the same output as the pause reply.
+The hook reads the `mac_run_host` route from `production.conf` only when it finds a Mac path.
+The route read follows the prompt timestamp and pause handling.
+Replace `"<your scratch folder>/"` with the quoted path to the session's scratch folder.
+
 The pause record lives at `${CONVERSATION_PAUSE_STATE_DIR:-~/.local/state/conversation-pause}/<session-id>.json`:
 
 ```python
