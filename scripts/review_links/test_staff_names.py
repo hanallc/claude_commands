@@ -31,6 +31,27 @@ class StaffNameTests(unittest.TestCase):
             self.assertEqual(staff_names.parts_text(parts), names.for_owner("build", "builder", OwnerRole.UNIT))
             self.assertEqual(sum(part["kind"] == "staff" for part in parts), template.count("{unit}"))
 
+    def test_owned_step_parts_check_the_configured_step_and_owner(self) -> None:
+        for unit, shown, expected in (("panes", "type check", "panes type check"),
+                                      ("panes", "—", "panes"),
+                                      ("—", "type check", "type check"),
+                                      ("—", "—", "unregistered session")):
+            with self.subTest(unit=unit, shown=shown):
+                names = StepNames({"owned.default": "{unit} {step}", "names.check": shown})
+                parts = staff_names.owned_step_parts(names, "check", unit, OwnerRole.UNIT)
+                self.assertEqual(staff_names.parts_text(parts), expected)
+                self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
+                                 ["panes"] if unit == "panes" else [])
+
+    def test_owner_step_name_checks_the_configured_step_and_owner(self) -> None:
+        for unit, shown, expected in (("panes", "type check", "panes type check"),
+                                      ("panes", "—", "panes"),
+                                      ("—", "type check", "type check"),
+                                      ("—", "—", "unregistered session")):
+            with self.subTest(unit=unit, shown=shown):
+                names = StepNames({"owned.default": "{unit} {step}", "names.check": shown})
+                self.assertEqual(names.for_owner("check", unit, OwnerRole.UNIT), expected)
+
     def test_every_role_uses_the_accounts_keys_and_current_config(self) -> None:
         kinds: tuple[staff.Kind, ...] = ("showrunner", "unit", "worker", "producer")
         rows = tuple(staff.StaffRow(staff.StaffId(kind), kind, "Name " + kind, staff.StaffRoot(),

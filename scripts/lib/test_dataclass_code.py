@@ -4,17 +4,19 @@ from __future__ import annotations
 from collections.abc import Callable
 import marshal
 import os
+import hashlib
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import time
 from types import CodeType
 from typing import cast
 import unittest
+from unittest import mock
 
 from scripts.lib.python_startup import sitecustomize as startup
 from scripts.lint import tmp_sweep
+from scripts.lib import removal_guard
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -101,7 +103,7 @@ class DataclassCodeTests(unittest.TestCase):
         self.assertFalse(startup.dataclass_code_usable(root, os.getuid()))
         self.assertEqual(startup.dataclass_code_folder(root), "")
 
-    def test_the_prune_removes_unread_entries_and_an_emptied_old_python_folder(self) -> None:
+    def test_the_prune_lists_unread_entries_and_keeps_the_cache(self) -> None:
         root, folder = cache(self)
         _ = startup.dataclass_code(SOURCE, folder)
         old_python = os.path.join(root, "cpython-0")
@@ -110,8 +112,22 @@ class DataclassCodeTests(unittest.TestCase):
         Path(unread).touch()
         now = time.time()
         os.utime(unread, (now - 15 * DAY, now - 15 * DAY))
-        self.assertEqual(tmp_sweep.prune_dataclass_code(root, now, 14), 1)
-        self.assertEqual(sorted(os.listdir(root)), [sys.implementation.cache_tag])
+        fixture = Path(root).parent
+        home = fixture / "home"
+        home.mkdir()
+        top = fixture / "build"
+        top.mkdir()
+        _ = (fixture / "build_folders.conf").write_text(f"removal.forms={top}/<repo>/<unit>/<short>\n")
+        plan = removal_guard.RemovalList(removal_guard.Tool.DATACLASS)
+        with mock.patch.dict(os.environ, {"HOME": str(home), "CONF_DIR": str(fixture)}):
+            self.assertEqual(tmp_sweep.prune_dataclass_code(root, now, 14, tmp_sweep.Sweep(), plan=plan), 1)
+            output = plan.publish()
+            guard = removal_guard.read(build_top=top, mount_reader=lambda: (Path("/"), top),
+                                       names=removal_guard.KnownNames(frozenset(), frozenset()))
+            with mock.patch.object(removal_guard, "read", return_value=guard):
+                self.assertEqual(removal_guard.remove_list(output, hashlib.sha256(output.read_bytes()).hexdigest()), 0)
+        self.assertEqual(set(plan.rows), {Path(unread)})
+        self.assertTrue(Path(unread).is_file())
         self.assertEqual(len(os.listdir(folder)), 1)
 
 
