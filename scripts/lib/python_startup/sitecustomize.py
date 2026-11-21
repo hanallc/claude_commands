@@ -280,10 +280,7 @@ def finish_startup(filename: str, arguments: list[str]) -> None:
     state = sys.modules["_devtools_checkout"]
     # Python adds its automatic path after this hook returns.
     state.__dict__["completed_selection"] = (selected, _selection_inputs(automatic_paths))
-    _run_startup_callback(state.__dict__)
-
-
-def _run_startup_callback(attributes: _CheckoutStartupAttributes) -> None:
+    attributes: _CheckoutStartupAttributes = state.__dict__
     if "ready" in attributes:
         attributes.pop("ready")()
 
