@@ -37,7 +37,7 @@ from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, staged_notes_directory
 from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
-    PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
+    PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed, VerifiedIntegrationTip,
     branch_is_landed, git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
 )
 from scripts.production import production_doc
@@ -372,24 +372,27 @@ def migrated_document(production: Production, lines: list[str], plan: MovePlan) 
     return ("\n".join(result) + "\n").encode("utf-8")
 
 
-def check_copy_target(path: Path, data: bytes) -> None:
+def copy_already_present(path: Path, data: bytes) -> bool:
     if path != path.resolve():
         raise Refusal(f"{path}: cannot copy through a symlink")
-    if path.exists() and path.read_bytes() != data:
+    try:
+        existing = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    if existing != data:
         raise Refusal(f"{path}: the destination already has different bytes")
+    return True
 
 
 def write_move_copy(path: Path, data: bytes, mode: int) -> None:
-    check_copy_target(path, data)
-    if path.exists():
+    if copy_already_present(path, data):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with prepared_replacement(path, data, mode=mode) as temporary:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            check_copy_target(path, data)
-            if not path.exists():
+            if not copy_already_present(path, data):
                 raise
         else:
             sync_folder(path.parent)
@@ -420,9 +423,9 @@ def move_files(production: Production, lines: list[str], record: staff.StaffSnap
         document = migrated_document(production, lines, plan)
         log = production.log.read_bytes()
         same_log = targets.log.exists() and production.log.samefile(targets.log)
-        check_copy_target(targets.live_doc, document)
+        _ = copy_already_present(targets.live_doc, document)
         if not same_log:
-            check_copy_target(targets.log, log)
+            _ = copy_already_present(targets.log, log)
         _ = require_move_window(approval)
         write_move_copy(targets.live_doc, document, production.doc.stat().st_mode & 0o777)
         if not same_log:
@@ -469,16 +472,20 @@ def stage_notes(production: Production, lines: list[str], record: staff.StaffSna
             target = staged / entry.relative_to(source)
             require_untracked_ignored(plan.main, target.relative_to(plan.main).as_posix())
             data = entry.read_bytes()
-            check_copy_target(target, data)
+            _ = copy_already_present(target, data)
             copies.append((target, data, entry.stat().st_mode & 0o777))
     for target, data, mode in copies:
         write_move_copy(target, data, mode)
     print(f"Staged {len(copies)} notes in {staged}.")
 
 
+def status_line(lines: list[str]) -> re.Match[str] | None:
+    return next((re.search(r"^> \*\*Status: PRODUCTION — (planned|running|wrapped)\.\*\*", line)
+                 for line in lines if line.startswith("> **Status:")), None)
+
+
 def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | ProductionWrapped:
-    match = next((re.search(r"^> \*\*Status: PRODUCTION — (planned|running|wrapped)\.\*\*", line)
-                  for line in lines if line.startswith("> **Status:")), None)
+    match = status_line(lines)
     if match is None:
         raise LifecycleStop("input", "failed", "production doc lacks a valid status")
     status = match.group(1)
@@ -592,20 +599,23 @@ def require_new_document(document: production_doc.ProductionDocument) -> None:
             raise Refusal(str(error)) from error
 
 
-def require_planned_admission(production: Production, lines: list[str], record: staff.StaffSnapshot) -> None:
-    if (staff.declares_merge_checkout(lines)
-            or isinstance(showrunners.timer_for(production.owner, record), showrunners.NoTimer)):
+def require_planned_admission(production: Production, lines: list[str]) -> None:
+    status = status_line(lines)
+    if status is not None and status[1] == "planned" and (
+            staff.declares_merge_checkout(lines)
+            or isinstance(showrunners.timer_for(production.owner, staff.snapshot()), showrunners.NoTimer)):
         require_new_document(production)
 
 
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
-    if not resume and isinstance(doc_status(lines), ProductionPlanned):
-        require_planned_admission(production, lines, staff.snapshot())
+    status = ProductionRunning() if resume else doc_status(lines)
+    if isinstance(status, ProductionPlanned):
+        require_planned_admission(production, lines)
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
     if scratch is not None:
         move_session_state(production.name, scratch)
-    if not resume and not isinstance(doc_status(lines), ProductionRunning):
+    if not isinstance(status, ProductionRunning):
         return
     owed: tuple[str, ...] = ()
     try:
@@ -649,9 +659,8 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
+    require_planned_admission(production, lines)
     record = staff.snapshot()
-    if isinstance(status, ProductionPlanned):
-        require_planned_admission(production, lines, record)
     enrolled = production_doc.resolve_production_paths(production.doc)
     main = enrolled.main if isinstance(enrolled, production_doc.EnrolledPaths) else production.checkout
     if isinstance(enrolled, production_doc.EnrolledPaths):
@@ -800,12 +809,13 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
                 report("promote", "ok", f"already at {tip}")
             report("post-push", "ok", land_main.hook_report(landed.hook))
         else:
+            verified = VerifiedIntegrationTip(production.checkout, tip)
             for destination in promotion.checkouts:
                 if destination.resolve() == production.merge_checkout:
-                    result = promote_local_checkout(destination, production.merge_branch, tip,
+                    result = promote_local_checkout(destination, production.merge_branch, verified,
                                                     integration=production.checkout)
                 else:
-                    result = promote_local_checkout(destination, production.merge_branch, tip)
+                    result = promote_local_checkout(destination, production.merge_branch, verified)
                 if isinstance(result, PromotionNotPushed):
                     raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
                 if isinstance(result, PromotionAlreadyAtTip):
@@ -1144,14 +1154,20 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = command("notifier", production.checkout, str(notifier), "remove", showrunners.timer_name(production.name))
         report("notifier", "ok", "update timer removed")
         with investigation.recipient_locks(runner.id):
-            document = production.doc.read_text(encoding="utf-8", newline="")
+            original = production.doc.read_bytes()
+            document = original.decode("utf-8")
             current_status = doc_status(document.splitlines())
             if isinstance(current_status, ProductionPlanned):
                 raise LifecycleStop("wrap", "held", "production status changed to planned")
             if isinstance(current_status, ProductionRunning):
                 updated = re.sub(r"(?m)^> \*\*Status: PRODUCTION — running\.\*\*",
                                  "> **Status: PRODUCTION — wrapped.**", document, count=1)
-                write_text_atomic(production.doc, updated)
+                mode = production.doc.stat().st_mode & 0o777
+                with prepared_replacement(production.doc, updated.encode("utf-8"), mode=mode) as temporary:
+                    if production.doc.stat().st_mode & 0o777 != mode or production.doc.read_bytes() != original:
+                        raise LifecycleStop("wrap", "held", f"{production.doc}: document changed during wrap")
+                    os.replace(temporary, production.doc)
+                    sync_folder(production.doc.parent)
     doc_paths = [] if enrolled else [doc_path_in_checkout(production, production.doc)]
     archive = None if enrolled else archived_doc(production)
     if archive is not None:

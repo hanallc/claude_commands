@@ -75,6 +75,22 @@ class CheckpointOrigin(NamedTuple):
     already_merged: bool
 
 
+@dataclass(frozen=True)
+class VerifiedIntegrationTip:
+    checkout: Path
+    sha: str
+
+    def require_current(self, branch: str, fetched_checkout: Path) -> None:
+        current = good(git(self.checkout, "rev-parse", "--verify", f"refs/heads/{branch}"), "promote")
+        if current != self.sha:
+            raise checkpoint_gate.Stop("promote", "held", f"integration tip changed from {self.sha} to {current}",
+                                       "check CI for the current integration tip and retry")
+        remote_ref = f"refs/remotes/origin/{branch}"
+        if git(fetched_checkout, "merge-base", "--is-ancestor", remote_ref, self.sha).returncode:
+            raise checkpoint_gate.Stop("promote", "held", f"{remote_ref} has commits outside {self.sha}",
+                                       "check CI for the current integration tip and retry")
+
+
 class PromotionAlreadyAtTip(NamedTuple):
     tip: str
 
@@ -1103,64 +1119,58 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
     return tip
 
 
-def promote_local_checkout(checkout: Path, merge_branch: str, tip: str, *, integration: Path | None = None) -> (
+def promote_local_checkout(checkout: Path, merge_branch: str, tip: str | VerifiedIntegrationTip,
+                           *, integration: Path | None = None) -> (
         PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed):
-    """Fast-forward one main checkout and push any eligible unpushed tip."""
+    """Fast-forward a main checkout and publish the requested commit."""
     source = integration if integration is not None else checkout
+    target = tip
+    tip = target.sha if isinstance(target, VerifiedIntegrationTip) else target
     with main_push_lock.main_push_lock(source):
         _ = good(git(source, "fetch", "origin", f"+refs/heads/{merge_branch}:refs/remotes/origin/{merge_branch}"), "promote")
         current_branch = good(git(checkout, "branch", "--show-current"), "promote")
         if current_branch != "main":
             raise checkpoint_gate.Stop("promote", "failed", f"{checkout} is on {current_branch}, expected main",
                        "switch the promotion checkout to main and rerun this checkpoint")
-        current = good(git(source, "rev-parse", "main"), "promote")
+        current = good(git(source, "rev-parse", "refs/heads/main"), "promote")
         _ = good(git(source, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "promote")
         checkpoint_gate.require_cargo_liner_promotion_ci(checkout.resolve(), merge_branch, tip)
         require_live_files_clear(source, tip, "promote")
-        if current == tip:
-            unpushed = good(git(source, "rev-list", "refs/remotes/origin/main..main"), "promote")
-            foreign = good(git(source, "rev-list", "main", "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"),
-                           "promote")
-            if foreign:
-                return PromotionNotPushed(tip, True)
-            try:
-                landed = land_main.land(source, current)
-            except land_main.LandError as error:
-                raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
-            checkpoint_gate.report("post-push", "warning" if isinstance(landed.hook, land_main.HookFailed) else "ok",
-                                   land_main.hook_report(landed.hook))
-            if unpushed:
-                return PromotionOriginPushed(tip)
-            return PromotionAlreadyAtTip(tip)
-        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
-            raise checkpoint_gate.Stop("promote", "failed", conflict,
-                       "clear the listed checkout paths and rerun this checkpoint")
-        if refusal := merge_gate.live_state_refusal(source, tip):
-            raise checkpoint_gate.Stop("promote", "failed", refusal,
-                       "run the conversion that the refusal names, then rerun this checkpoint")
-        contained = not git(source, "merge-base", "--is-ancestor", tip, current).returncode
-        if not contained and git(source, "merge-base", "--is-ancestor", current, tip).returncode:
-            raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",
-                       "the showrunner will clear the listed checkout paths and rerun this checkpoint")
-        if not contained:
-            try:
-                waiting_rows.move_to(checkout, tip)
-            except (OSError, UnicodeError) as error:
-                status = git(checkout, "status", "--short").stdout.strip()
-                raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
-                           "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
+        at_tip = current == tip
+        unpushed = at_tip and bool(good(git(source, "rev-list", f"refs/remotes/origin/main..{tip}"), "promote"))
+        if not at_tip:
+            if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
+                raise checkpoint_gate.Stop("promote", "failed", conflict,
+                           "clear the listed checkout paths and rerun this checkpoint")
+            if refusal := merge_gate.live_state_refusal(source, tip):
+                raise checkpoint_gate.Stop("promote", "failed", refusal,
+                           "run the conversion that the refusal names, then rerun this checkpoint")
+            if git(source, "merge-base", "--is-ancestor", tip, current).returncode:
+                if git(source, "merge-base", "--is-ancestor", current, tip).returncode:
+                    raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",
+                               "the showrunner will clear the listed checkout paths and rerun this checkpoint")
+                if isinstance(target, VerifiedIntegrationTip):
+                    target.require_current(merge_branch, source)
+                try:
+                    waiting_rows.move_to(checkout, tip, fast_forward=True, expected_head=current)
+                except (OSError, UnicodeError) as error:
+                    status = git(checkout, "status", "--short").stdout.strip()
+                    raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
+                               "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
         head = good(git(source, "rev-parse", "refs/heads/main"), "promote")
         foreign = good(git(source, "rev-list", head, "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"), "promote")
+        if isinstance(target, VerifiedIntegrationTip):
+            target.require_current(merge_branch, source)
         if foreign:
-            return PromotionNotPushed(tip, False)
-        if head != tip:
-            require_live_files_clear(source, head, "promote")
+            return PromotionNotPushed(tip, at_tip)
         try:
-            landed = land_main.land(source, head)
+            landed = land_main.land(source, tip)
         except land_main.LandError as error:
             raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
         checkpoint_gate.report("post-push", "warning" if isinstance(landed.hook, land_main.HookFailed) else "ok",
                                land_main.hook_report(landed.hook))
+        if at_tip:
+            return PromotionOriginPushed(tip) if unpushed else PromotionAlreadyAtTip(tip)
         return PromotionAdvanced(tip)
 
 

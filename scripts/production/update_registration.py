@@ -813,9 +813,12 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
 
 
 def register(production: Production) -> None:
+    from scripts.production.production_lifecycle import doc_lines, require_planned_admission
+
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    require_planned_admission(production, doc_lines(production))
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:

@@ -1727,18 +1727,16 @@ def _document_for_owner(rows: list[StaffRow], owner: StaffId,
 
     if doc.machine != remote.local_machine():
         return doc
-    try:
-        enrolled = declares_merge_checkout(doc.path.read_text(encoding="utf-8").splitlines())
-    except FileNotFoundError:
-        return doc
-    if not enrolled:
-        return doc
-    path = doc.path.resolve(strict=True)
+    path = doc.path.resolve()
     if any(other.id != owner and isinstance(other.doc, LiveDoc | WrappedDoc)
            and other.doc.machine == doc.machine and other.doc.path.resolve() == path
            for other in rows):
         raise StaffRefused(f"{path}: another staff row already owns this document")
-    return replace(doc, path=path)
+    try:
+        enrolled = declares_merge_checkout(path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return replace(doc, path=path)
+    return replace(doc, path=path) if enrolled else doc
 
 
 def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo | StaffRoot, *,

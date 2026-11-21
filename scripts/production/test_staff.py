@@ -1609,14 +1609,18 @@ class StaffTests(StaffCommandTestCase):
         binding = staff.LiveDoc("natedev", alias)
         another = fixture_member("showrunner", name="another")
         before = self.staff_file.read_bytes()
-        for action, claim in (
-            ("set", lambda: staff.set_doc(another.id, binding)),
-            ("ensure", lambda: staff.ensure("showrunner", name="new", doc=binding,
-                                            runtime_id=fixture_runtime_id("duplicate-doc"))),
-            ("promote", lambda: staff.promote_unit(other.id, name="other", parent=runner.id, doc=binding)),
-        ):
-            with self.subTest(action=action), self.assertRaisesRegex(staff.StaffRefused, "already owns this document"):
-                _ = claim()
+        for available in (True, False):
+            if not available:
+                doc.unlink()
+            for action, claim in (
+                ("set", lambda: staff.set_doc(another.id, binding)),
+                ("ensure", lambda: staff.ensure("showrunner", name="new", doc=binding,
+                                                runtime_id=fixture_runtime_id("duplicate-doc"))),
+                ("promote", lambda: staff.promote_unit(other.id, name="other", parent=runner.id, doc=binding)),
+            ):
+                with (self.subTest(action=action, available=available),
+                      self.assertRaisesRegex(staff.StaffRefused, "already owns this document")):
+                    _ = claim()
         self.assertEqual(self.staff_file.read_bytes(), before)
 
 

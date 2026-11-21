@@ -17,8 +17,10 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
 import unittest
 from pathlib import Path
 from typing import cast, final, override
@@ -26,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import fake_unit_host
-from scripts.production import production_lifecycle
+from scripts.production import merge_checkpoint, production_lifecycle
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
 from scripts.agents import stop_resume
@@ -46,6 +48,7 @@ from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.lib.atomic_file import prepared_replacement
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.main_push_lock_test_support import publish_after_contender
@@ -673,11 +676,22 @@ class LifecycleTests(LifecycleFixture):
                 else:
                     live, integration = self.doc, self.checkout
                 before = live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)
-                with mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("new fixture")):
-                    for action in ("load", "open"):
-                        result = self.run_lifecycle(action)
-                        self.assert_step(result, "failed")
-                        self.assertIn(GUARD_READY_FILE, result.stdout)
+                timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
+                saved_timer = timer.rename(timer.with_name("saved-fixture-timer"))
+                calls = self.calls()
+                with mock.patch.object(agents_log, "append") as usage:
+                    registered = invoke_cli(update_registration, update_registration.main,
+                        ["register", "--production", "example"], self.env, integration, production_state=True)
+                    self.assert_step(registered, "failed")
+                    self.assertIn(GUARD_READY_FILE, registered.stdout)
+                    usage.assert_not_called()
+                self.assertFalse(timer.exists())
+                self.assertEqual(self.calls(), calls)
+                for action in ("load", "open"):
+                    result = self.run_lifecycle(action)
+                    self.assert_step(result, "failed")
+                    self.assertIn(GUARD_READY_FILE, result.stdout)
+                _ = saved_timer.rename(timer)
                 self.assertEqual((live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)), before)
                 if form == "enrolled":
                     write_guard_proof(self.root, self.state / "showrunner", self.checkout)
@@ -1227,7 +1241,8 @@ class LifecycleTests(LifecycleFixture):
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             staff_bytes = self.staff.staff_file.read_bytes()
-            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled"):
+            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled",
+                           "document edit at replace", "integration ref moves at promotion"):
                 with self.subTest(landed=landed):
                     shutil.rmtree(self.root)
                     _ = shutil.copytree(snapshot, self.root)
@@ -1244,11 +1259,28 @@ class LifecycleTests(LifecycleFixture):
                         _ = self.git("cherry-pick", "--no-commit", alpha)
                         _ = self.git("commit", "-m", "Copy alpha patch")
                     _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
-                    if landed == "enrolled":
+                    if landed in ("enrolled", "document edit at replace"):
                         _ = self.git("push", "origin", "production")
                         live, integration = self.enroll_document()
                         runner = staff.by_id(self.owner_id())
                         assert runner is not None
+                        if landed == "document edit at replace":
+                            edited = live.read_bytes() + b"\r\nOwner edit before replace.\r\n"
+
+                            @contextlib.contextmanager
+                            def edit_before_replace(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+                                with prepared_replacement(path, content, mode=mode) as temporary:
+                                    if path == live:
+                                        _ = path.write_bytes(edited)
+                                    yield temporary
+
+                            with mock.patch.object(production_lifecycle, "prepared_replacement", side_effect=edit_before_replace):
+                                result = self.run_lifecycle("wrap", "--no-ci")
+                            self.assert_step(result, "held")
+                            self.assertIn("document changed during wrap", result.stdout)
+                            self.assertEqual(live.read_bytes(), edited)
+                            self.assertEqual(staff.by_id(runner.id), runner)
+                            continue
                         staging = self.root / "merge-staging"
                         _ = self.git("worktree", "add", "-b", "merge-staging", str(staging), "production")
                         _ = self.git("push", "origin", "merge-staging")
@@ -1313,11 +1345,36 @@ class LifecycleTests(LifecycleFixture):
                         self.assertFalse(self.alpha.exists())
                         self.assertFalse(self.beta.exists())
                         continue
-                    if landed == "separate-promotion":
+                    if landed in ("separate-promotion", "integration ref moves at promotion"):
                         destination = self.promotion_checkout("installed")
                         self.production_doc("running", promote=f"`{destination}`")
                         _ = self.git("add", str(self.doc))
                         _ = self.git("commit", "-m", "Declare promotion")
+                        if landed == "integration ref moves at promotion":
+                            verified = self.git("rev-parse", "HEAD")
+                            later = self.git("commit-tree", "HEAD^{tree}", "-p", verified, "-m", "Later integration tip")
+                            _ = self.git("fetch", str(self.checkout), later, cwd=destination)
+                            _ = self.git("merge", "--ff-only", later, cwd=destination)
+                            main = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+                            original_git = merge_checkpoint.git
+
+                            def move_integration_after_check(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                                if checkout == destination and args == (
+                                        "fetch", "origin", "+refs/heads/production:refs/remotes/origin/production"):
+                                    _ = self.git("update-ref", "refs/heads/production", later, verified)
+                                    _ = self.git("push", "origin", "production")
+                                return original_git(checkout, *args)
+
+                            with mock.patch.object(merge_checkpoint, "git", side_effect=move_integration_after_check):
+                                result = self.run_lifecycle("wrap", "--ci-green", verified, "--smoke-passed", verified)
+                            self.assert_step(result, "held")
+                            self.assertIn("integration tip changed", result.stdout)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=destination), later)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), later)
+                            self.assertTrue(self.alpha.exists())
+                            self.assertTrue(self.beta.exists())
+                            continue
                     _ = self.git("push", "origin", "production")
                     result = self.run_lifecycle("wrap", "--no-ci")
                     self.assert_step(result, "ok")
