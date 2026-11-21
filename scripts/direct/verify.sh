@@ -5,7 +5,8 @@
 #   verify <command> [<package>] [flags]
 #   verify test,lint,doc [<package>]
 #
-# A verb list accepts test, lint, and doc in any order, with one optional package.
+# A verb list accepts test, lint, and doc in any order.
+# Give one package or omit it for the workspace.
 # On Linux, the verbs share a run identity. The first failure ends the list.
 #
 # Commands:
@@ -587,6 +588,7 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
+# shellcheck disable=SC2329 # The signal traps call this function.
 stop_verify_verb_list() {
     trap '' INT TERM HUP
     local child=${!:-}
