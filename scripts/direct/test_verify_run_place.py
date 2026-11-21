@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
+from scripts.build_queue.admission_records import GIB
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
@@ -189,13 +190,17 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             self.assertIsInstance(fixture.proc.owner_start(process.pid), service.OwnerProcessGone)
             first = fixture.request(run=run)
             _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            # Keep a live reservation so the continuation cannot start alone.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.free(0)
             fixture.clock.advance(1)
             peer = fixture.request()
             _ = fixture.server.handle_request(peer)
             fixture.clock.advance(1)
-            second = fixture.request(run=run)
-            _ = fixture.server.handle_request(second)
+            second = fixture.request(run=run, need=9 * GIB)
+            waiting, = fixture.server.handle_request(second)
+            self.assertIsInstance(waiting, wire.Wait)
             self.assertEqual(fixture.queue_pids(), [second.owner.pid, peer.owner.pid])
             _ = os.write(input_fd, b"continue\n")
 

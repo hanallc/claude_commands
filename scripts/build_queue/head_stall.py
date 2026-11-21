@@ -7,16 +7,20 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 import subprocess
 import sys
 from typing import Literal, cast
 
-from scripts.build_queue import admission_records as records
+from scripts.build_hold import build_hold
+from scripts.build_queue import admission_client, admission_records as records
+from scripts.build_queue.admission_wire import AdmissionUnavailable
 from scripts.build_queue.queue_evidence import gib
 from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot
+from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -27,7 +31,9 @@ TIMES_TAIL_BYTES = 1 << 20
 PROC = gate.PROC
 
 type AlertRecipient = Literal["builds", "bob"]
+type AlertDeliveries = dict[AlertRecipient, float | str]
 ALERT_RECIPIENTS: tuple[AlertRecipient, ...] = ("builds", "bob")
+DECISION_OUTAGE = "admission-decision"
 
 
 @dataclass(frozen=True)
@@ -55,22 +61,18 @@ class HolderAdmissionUnavailable:
 
 @dataclass(frozen=True)
 class Holder:
-    step: str
-    folder: str
-    pid: int | records.PidNotRecorded
-    promise: int
-    used: int | records.RunUseUnavailable
+    steps: tuple[records.RunningStep, ...]
+    memory: records.RunMemory
+    keep_aside: int | records.ReadingUnavailable
     held_for: float | HolderAdmissionUnavailable
 
 
 @dataclass(frozen=True)
 class HeadStall:
-    """The head waited at least the limit, steps hold memory, and no step started in that time."""
+    """The head waited at least the limit while reservations held memory and no step started."""
     last_start: float
-    step: str
-    folder: str
-    pid: int
-    need: int
+    head: records.HeadExplanation
+    room: records.RoomCheck | records.ReadingUnavailable
     waited: float
     quiet: float
     holders: tuple[Holder, ...]
@@ -80,6 +82,24 @@ class HeadStall:
 @dataclass(frozen=True)
 class NoStall:
     pass
+
+
+@dataclass(frozen=True)
+class AdmissionDecisionUnreadable:
+    reason: str
+    waited: float
+
+
+@dataclass(frozen=True)
+class NoDecisionOutage:
+    pass
+
+
+@dataclass(frozen=True)
+class WatchState:
+    alerted: AlertDeliveries = field(default_factory=dict)
+    outage_alerted: AlertDeliveries = field(default_factory=dict)
+    unreadable_since: float | NoDecisionOutage = NoDecisionOutage()
 
 
 @dataclass(frozen=True)
@@ -156,40 +176,98 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
     return CompilerScanCountUnavailable()
 
 
-def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
-    inputs = snapshot.inputs
-    running = tuple(step for step in inputs.running if step.promise > 0)
-    head = next((row for _, row in inputs.ordered
-                 if records.waiter_owner(row) not in inputs.landing_test_waits), None)
-    if head is None or not running:
+def find_stall(decision: records.QueueExplanation, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
+    head = decision.head
+    if not isinstance(head, records.HeadExplanation) or head.cause == records.ADMISSION_DECISION_PENDING:
         return NoStall()
-    waited = now - head["since"]
-    last_start = max(admitted, *(step.started_at for step in running))
+    inputs = decision.decided_from
+    last_running_start = max((step.started_at for step in inputs.running if step.promise > 0), default=0.0)
+    last_start = max(admitted, last_running_start)
     quiet = now - last_start
-    if waited < limit or quiet < limit:
+    waited = now - head.waiter.since
+    if quiet < limit or waited < limit:
         return NoStall()
-    holders = tuple(Holder(step.step, step.folder, step.pid, step.promise,
-                           attributed.use.bytes if isinstance(attributed.use, records.AnonymousRunUse) else attributed.use,
-                           max(0.0, now - step.started_at) if step.started_at > 0 else HolderAdmissionUnavailable())
-                    for _, step, attributed in gate.attributed_step_uses(inputs) if step.promise > 0)
-    return HeadStall(last_start, head.get("step", "step"), head.get("folder", ""),
-                     head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running))
+
+    holders = memory_holders(decision, now)
+    if not holders:
+        return NoStall()
+    head_room = head.room if isinstance(decision.room, records.MemoryRoom) else decision.room
+    return HeadStall(last_start, head, head_room, waited, quiet, holders, _compiler_scan(inputs.running))
 
 
-def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) -> HeadStall | NoStall:
+def memory_holders(decision: records.QueueExplanation, now: float) -> tuple[Holder, ...]:
+    """List the runs with active reservations or memory held between steps."""
+    inputs = decision.decided_from
+    steps_by_owner: dict[str, list[records.RunningStep]] = {}
+    reserved_steps = (step for step in inputs.running if gate.running_has_reservation(step))
+    for row, step in zip(inputs.reservations, reserved_steps, strict=True):
+        if step.promise <= 0:
+            continue
+        owner = gate.reservation_owner(row, step)
+        steps_by_owner.setdefault(owner, []).append(step)
+    room = decision.room
+    if isinstance(room, records.MemoryRoom):
+        charges = tuple((run.memory, run.bytes) for run in room.runs)
+    else:
+        if inputs.slots:
+            start = gate.start_spacing_after(inputs.now, decision.policy)
+            returned = gate.head_policy(inputs, inputs.now, decision.policy, start).returned_claims
+            inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
+                if gate.between_steps(slot).reservation not in returned))
+        charges = tuple((memory, room) for memory in gate.run_memories(inputs))
+    holders: list[Holder] = []
+    for memory, keep_aside in charges:
+        steps = steps_by_owner.get(memory.owner, [])
+        if not steps and not memory.held:
+            continue
+        started_at = min((step.started_at for step in steps), default=0.0)
+        held_for = max(0.0, now - started_at) if started_at > 0 else HolderAdmissionUnavailable()
+        holders.append(Holder(tuple(steps), memory, keep_aside, held_for))
+    return tuple(holders)
+
+
+def current_stall(paths: StallPaths, now: float, limit: float, freshest: float
+                  ) -> HeadStall | AdmissionDecisionUnreadable | NoStall:
     snapshot = read_queue_snapshot(paths.admission)
     if not isinstance(snapshot, QueueSnapshot) or now - snapshot.written_at > freshest:
         return NoStall()
-    return find_stall(snapshot, last_admission(paths.admission / "queue_times.jsonl"), now, limit)
+    if not any(now - row["since"] >= limit for _, row in snapshot.inputs.ordered):
+        return NoStall()
+    # The snapshot includes CI waiters that the admission decision excludes.
+    try:
+        decision = admission_client.explain()
+    except (AdmissionUnavailable, OSError, ValueError) as error:
+        reason = " ".join(str(error).splitlines()) or type(error).__name__
+    else:
+        age = now - decision.now
+        if age <= freshest:
+            return find_stall(decision, last_admission(paths.admission / "queue_times.jsonl"), now, limit)
+        reason = f"the admission decision is {age:.0f} s old"
+    inputs = snapshot.inputs
+    head = gate.first_queued_waiter((row for _, row in gate.ranked_queue_waiters(inputs)),
+                                    inputs.pending_remote_starts)
+    waited = now - head.waiter["since"] if isinstance(head, gate.QueuedWaiter) else 0.0
+    return AdmissionDecisionUnreadable(reason, waited)
 
 
 def _folder_name(folder: str) -> str:
     return folder.rstrip("/").rpartition("/")[2] or "unknown folder"
 
 
+def _holder_step(step: records.RunningStep) -> str:
+    pid = f"pid {step.pid}" if isinstance(step.pid, int) else "pid unknown"
+    return f"{step.step} in {_folder_name(step.folder)} ({pid})"
+
+
 def builds_text(stall: HeadStall) -> str:
+    waiter = stall.head.waiter
     lines = [f"The build queue head has waited {stall.waited / 60:.0f} min. No step started for {stall.quiet / 60:.0f} min.",
-             f"Head: {stall.step} in {_folder_name(stall.folder)} (pid {stall.pid}) needs {gib(stall.need)}."]
+             f"Head: {waiter.step or 'step'} in {_folder_name(waiter.folder)} (pid {waiter.pid}) needs {gib(waiter.need)}."]
+    room = stall.room
+    if isinstance(room, records.RoomCheck):
+        lines.append(f"Admission room: {gib(room.room)} for {gib(room.need)} of need.")
+    else:
+        lines.append("Admission room: unavailable.")
     scan = stall.compiler_scan
     if isinstance(scan, UnreadableCompilers):
         compilers = "compiler" if scan.count == 1 else "compilers"
@@ -198,13 +276,43 @@ def builds_text(stall: HeadStall) -> str:
         lines.append("sccache: compiler scan incomplete; uses can be low")
     lines.append("Holders:")
     for holder in stall.holders:
-        used = gib(holder.used) if isinstance(holder.used, int) else "unknown"
-        pid = f"pid {holder.pid}" if isinstance(holder.pid, int) else "pid unknown"
+        memory = holder.memory
+        if not holder.steps:
+            run = memory.run
+            name = f"Run pid {run.pid}" if isinstance(run, LiveBuildRun) else memory.owner
+            lines.append(f"- {name}: held between steps, keep-aside {gib(memory.held)}")
+            continue
+        used = gib(memory.use.bytes) if isinstance(memory.use, records.AnonymousRunUse) else "unknown"
+        keep_aside = gib(holder.keep_aside) if isinstance(holder.keep_aside, int) else "unknown"
+        original_grant = sum(step.promise for step in holder.steps)
         duration = f"{holder.held_for / 60:.0f} min" if isinstance(holder.held_for, float) else "unknown"
-        lines.append(f"- {holder.step} in {_folder_name(holder.folder)} ({pid}): "
-                     + f"promise {gib(holder.promise)}, uses {used}, held for {duration}")
-    lines.append("The head starts only when a holder ends. Check each holder that uses much less than its promise.")
+        steps = " + ".join(_holder_step(step) for step in holder.steps)
+        held = f", {gib(memory.held)} held between steps" if memory.held else ""
+        lines.append(f"- {steps}: effective need {gib(memory.need)}, keep-aside {keep_aside}, "
+                     + f"uses {used}, original grant {gib(original_grant)}, held for {duration}{held}")
+    cause = stall.head.cause
+    if isinstance(cause, records.NeedsMemory) and isinstance(room, records.RoomCheck):
+        lines.append(f"Memory shortfall: {gib(max(0, room.need - room.room))}.")
+    elif isinstance(cause, records.BehindHead) and isinstance(stall.head.decision.order_hold, records.NoOrderHold):
+        # Admission uses BehindHead without an order hold for the head's own remote start.
+        lines.append("Reason: waiting for its remote start.")
+    else:
+        lines.append(f"Reason: {records.reason_phrase(cause, ())}.")
     return "\n".join(lines)
+
+
+def _alert_text(stall: HeadStall, now: float) -> str:
+    instant = datetime.fromtimestamp(now, UTC)
+    directory = build_hold.holder_directory()
+    try:
+        holds = build_hold.natedev_holds(directory)
+    except OSError:
+        return builds_text(stall)
+    for holder in holds.in_force:
+        if not build_hold.release_overdue(holder.release, instant):
+            release_time = build_hold.release_eta_text(holder.release)
+            return f"A build hold by {holder.name} is active for {holder.purpose}. The release time is {release_time}."
+    return builds_text(stall)
 
 
 def _run(command: list[str], text: str = "") -> bool:
@@ -225,56 +333,102 @@ def _run(command: list[str], text: str = "") -> bool:
     return False
 
 
-def _delivered_stalls(state: Path) -> dict[AlertRecipient, float | str]:
+def _read_state(path: Path) -> WatchState:
     try:
-        raw = cast(object, json.loads(state.read_text()))
+        raw = cast(object, json.loads(path.read_text()))
     except (OSError, ValueError):
-        return {}
-    saved = cast(dict[str, object], raw).get("alerted") if isinstance(raw, dict) else None
+        return WatchState()
+    if not isinstance(raw, dict):
+        return WatchState()
+    fields = cast(dict[str, object], raw)
+    saved = fields.get("alerted")
     # An old key covers builds only. It cannot confirm delivery to bob.
     values = cast(dict[str, object], saved) if isinstance(saved, dict) else {"builds": saved}
-    delivered: dict[AlertRecipient, float | str] = {}
+    outages = fields.get("outage_alerted")
+    outage_values = cast(dict[str, object], outages) if isinstance(outages, dict) else {}
+    alerted: AlertDeliveries = {}
+    outage_alerted: AlertDeliveries = {}
     for recipient in ALERT_RECIPIENTS:
         value = values.get(recipient)
+        outage = outage_values.get(recipient)
+        if isinstance(value, dict):
+            # Keep the latest delivery from the old format that stored one timestamp per head.
+            heads = cast(dict[str, object], value)
+            outage = heads.get(DECISION_OUTAGE, outage)
+            value = max((at for key, at in heads.items() if key != DECISION_OUTAGE
+                         and isinstance(at, (int, float)) and not isinstance(at, bool)), default=None)
         if isinstance(value, (int, float, str)) and not isinstance(value, bool):
-            delivered[recipient] = value
-    return delivered
+            alerted[recipient] = value
+        if isinstance(outage, (int, float)) and not isinstance(outage, bool):
+            outage_alerted[recipient] = outage
+    since = fields.get("unreadable_since")
+    return WatchState(alerted, outage_alerted, float(since) if isinstance(since, (int, float))
+                      and not isinstance(since, bool) else NoDecisionOutage())
 
 
-def _already_alerted(value: float | str, last_start: float) -> bool:
+def _write_state(path: Path, state: WatchState, now: float) -> None:
+    fields: dict[str, object] = {"alerted": state.alerted, "at": now}
+    if state.outage_alerted:
+        fields["outage_alerted"] = state.outage_alerted
+    if isinstance(state.unreadable_since, float):
+        fields["unreadable_since"] = state.unreadable_since
+    write_text_atomic(path, json.dumps(fields) + "\n")
+
+
+def _already_alerted(value: float | str, event_at: float) -> bool:
     if isinstance(value, str):
-        # The previous key ended with the last start in whole seconds.
+        # The old key stored the last start in whole seconds.
         _, separator, second = value.rpartition(":")
-        return bool(separator) and second.isdecimal() and int(last_start) <= int(second)
-    return last_start <= value
+        return bool(separator) and second.isdecimal() and len(second) <= 20 and int(event_at) <= int(second)
+    return event_at <= value
 
 
-def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[str], str], bool]) -> None:
+def _send_alert(path: Path, state: WatchState, delivered: AlertDeliveries, now: float,
+                key: str, event_at: float, text: Callable[[], str],
+                run: Callable[[list[str], str], bool]) -> None:
     """Record each accepted alert before sending to the next recipient."""
     from scripts.message.session_send import session_send_argv
 
-    delivered = _delivered_stalls(state)
-    text = builds_text(stall)
+    pending: tuple[AlertRecipient, ...] = tuple(recipient for recipient in ALERT_RECIPIENTS
+        if recipient not in delivered or not _already_alerted(delivered[recipient], event_at))
+    if not pending:
+        return
+    report = text()
     write_errors: list[OSError] = []
-    for recipient in ALERT_RECIPIENTS:
-        if recipient in delivered and _already_alerted(delivered[recipient], stall.last_start):
-            continue
+    for recipient in pending:
         command = session_send_argv(recipient, sender=SENDER)
-        command.extend(["--key", f"head-stall-{stall.last_start}"])
-        if run(command, text):
-            delivered[recipient] = stall.last_start
+        command.extend(["--key", key])
+        if run(command, report):
+            delivered[recipient] = event_at
             try:
-                write_text_atomic(state, json.dumps({"alerted": delivered, "at": now}) + "\n")
+                _write_state(path, state, now)
             except OSError as error:
                 write_errors.append(error)
     if write_errors:
         raise write_errors[0]
 
 
-def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bool] = _run) -> HeadStall | NoStall:
-    """Alert once for each stall. A new step start permits another alert."""
+def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bool] = _run
+               ) -> HeadStall | AdmissionDecisionUnreadable | NoStall:
+    """Alert once per stall. Report prolonged failures to read the decision."""
     limit, freshest = configured_limits()
     stall = current_stall(paths, now, limit, freshest)
+    state = _read_state(paths.state)
+    if isinstance(stall, AdmissionDecisionUnreadable):
+        print(f"head-stall watch: skipped sample: {stall.reason}", file=sys.stderr)
+        since = state.unreadable_since
+        if isinstance(since, NoDecisionOutage):
+            _write_state(paths.state, replace(state, unreadable_since=now), now)
+        elif now - since >= limit and stall.waited >= limit:
+            _send_alert(paths.state, state, state.outage_alerted, now, f"head-stall-{DECISION_OUTAGE}-{since}", since,
+                        lambda: "The head-stall check cannot read the admission decision. "
+                        + f"The queue snapshot shows a head that has waited {stall.waited / 60:.0f} min.\n"
+                        + stall.reason, run)
+        return stall
+    if isinstance(state.unreadable_since, float):
+        state = replace(state, unreadable_since=NoDecisionOutage())
+        _write_state(paths.state, state, now)
     if isinstance(stall, HeadStall):
-        send_alert(stall, paths.state, now, run)
+        _send_alert(paths.state, state, state.alerted, now, f"head-stall-{stall.last_start}", stall.last_start,
+                    lambda: _alert_text(stall, now), run)
     return stall

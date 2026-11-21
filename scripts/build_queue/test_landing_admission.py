@@ -396,6 +396,10 @@ class LandingAdmissionTests(unittest.TestCase):
             self.assertEqual(records.reason_phrase(reason, ()), WAIT_TEXT)
             self.assertEqual(memory_feed.wait_why(reason), "the merge test")
             other = only_admitted(fixture.connect(fixture.request(need=GIB, step="test")).replies())
+            after_grant, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(after_grant, wire.ViewReply)
+            self.assertIsInstance(after_grant.reading.explanation.head, records.NoWaiter)
+            self.assertEqual(after_grant.reading.view.waiting, view.reading.view.waiting)
             fixture.release(other)
             fixture.allow_next_start()
             with patch.object(land_runs, "process_start", return_value=Started("10")):

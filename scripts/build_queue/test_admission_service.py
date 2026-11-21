@@ -1674,6 +1674,80 @@ class ProcessRunEvidenceTests(unittest.TestCase):
 
 
 class ReplyPublicationTests(unittest.TestCase):
+    def test_the_promoted_head_waits_for_a_decision_after_its_blocker_starts(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_cargo_request
+
+        with PlacementFixture() as fixture:
+            fixture.hold_starts()
+            server = fixture.server
+            folder = placement.CargoFolder(fixture.root / "target")
+            first = local_cargo_request(fixture)
+            first = replace(first, constraints=replace(first.constraints, cargo_folder=folder))
+            self.assertIsInstance(fixture.connect(first).replies()[0], wire.PlacementWait)
+            fixture.clock.advance(1)
+            second = local_cargo_request(fixture)
+            second = replace(second, constraints=replace(second.constraints, cargo_folder=folder))
+            self.assertIsInstance(fixture.connect(second).replies()[0], wire.PlacementWait)
+
+            write_pressure_reading(fixture.root / "pressure")
+            with mock.patch.object(gate, "start_spacing_after", return_value=records.NextStartAt(fixture.clock.now())):
+                result = fixture.run_pass()
+            self.assertIn(first.episode, server.reservations)
+            self.assertIn(second.episode, server.waiters)
+            self.assertIsInstance(result.rows[1].reason, records.BehindHead)
+
+            viewed, = server.handle_request(wire.ViewRequest())
+            explained, = server.handle_request(wire.ExplainRequest())
+            assert isinstance(viewed, wire.ViewReply)
+            assert isinstance(explained, wire.ExplainReply)
+            head = explained.explanation.head
+            assert isinstance(head, records.HeadExplanation)
+            self.assertEqual(head.waiter.pid, second.owner.pid)
+            self.assertEqual(head.cause, records.ReadingUnavailable("admission decision pending"))
+            self.assertEqual(head.decision.order_hold, records.NoOrderHold())
+            self.assertEqual(viewed.reading.view.waiting, (head.waiter,))
+            self.assertEqual(viewed.reading.explanation.head, head)
+            self.assertEqual(wire.parse_reply(wire.encode_reply(explained)), explained)
+
+            _ = fixture.run_pass()
+            explained, = server.handle_request(wire.ExplainRequest())
+            assert isinstance(explained, wire.ExplainReply)
+            head = explained.explanation.head
+            assert isinstance(head, records.HeadExplanation)
+            self.assertEqual(head.cause, placement.CargoFolderWait())
+
+    def test_the_published_head_excludes_waiters_the_pass_granted(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            fixture.hold_starts()
+            first = fixture.request(need=0, since=fixture.clock.now() - 3600)
+            second = fixture.request(need=GIB, since=fixture.clock.now() - 3500)
+            for request in (first, second):
+                self.assertIsInstance(server.handle_request(request)[0], wire.Wait)
+
+            write_pressure_reading(fixture.root / "pressure")
+            _ = server.run_pass()
+            self.assertIn(first.episode, server.reservations)
+            self.assertIn(second.episode, server.waiters)
+            viewed, = server.handle_request(wire.ViewRequest())
+            explained, = server.handle_request(wire.ExplainRequest())
+            assert isinstance(viewed, wire.ViewReply)
+            assert isinstance(explained, wire.ExplainReply)
+            head = explained.explanation.head
+            assert isinstance(head, records.HeadExplanation)
+            self.assertEqual(head.waiter.pid, second.owner.pid)
+            self.assertIsInstance(head.cause, records.StartSpacingWait)
+            self.assertEqual(viewed.reading.explanation, explained.explanation)
+            self.assertEqual([step.pid for step in viewed.reading.view.waiting], [second.owner.pid])
+            self.assertEqual([row["pid"] for row in explained.explanation.ordered], [second.owner.pid])
+
+            fixture.allow_next_start()
+            _ = server.run_pass()
+            self.assertIn(second.episode, server.reservations)
+            explained, = server.handle_request(wire.ExplainRequest())
+            assert isinstance(explained, wire.ExplainReply)
+            self.assertIsInstance(explained.explanation.head, records.NoWaiter)
+
     def test_view_and_explain_reuse_the_bytes_of_the_completed_pass(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.hold_starts()
@@ -5466,10 +5540,20 @@ class ServiceTests(unittest.TestCase):
                         self.assertEqual(waiting.text, queue_view.reason_phrase(row.reason,
                             gate.queue_read_from(inputs, policy=policy).view.waiting))
                 expected = gate.queue_read_from(inputs, policy=policy)
-                self.assertEqual(fixture.server.handle_request(wire.ViewRequest()), [wire.ViewReply(expected)])
+                viewed, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(viewed, wire.ViewReply)
                 explained = fixture.server.handle_request(wire.ExplainRequest())[0]
                 assert isinstance(explained, wire.ExplainReply)
-                self.assertEqual(explained.explanation.decided_from, inputs)
+                self.assertEqual(viewed.reading.explanation, explained.explanation)
+                granted = {row.owner for row in starts}
+                if not starts:
+                    self.assertEqual(viewed, wire.ViewReply(expected))
+                else:
+                    self.assertEqual(viewed.reading.ordered, [(path, row) for path, row in expected.ordered
+                        if records.waiter_owner(row) not in granted])
+                self.assertEqual(explained.explanation.decided_from, replace(inputs,
+                    ordered=[(path, row) for path, row in inputs.ordered
+                             if records.waiter_owner(row) not in granted]))
                 self.assertEqual(explained.explanation.policy, policy)
 
     def test_queries_project_the_stored_pass_without_another_admission_walk(self) -> None:
@@ -7360,8 +7444,9 @@ class RunPlaceTests(unittest.TestCase):
             fixture.hold_starts()
             peer = fixture.request(since=first.since - 10)
             _ = fixture.server.handle_request(peer)
-            earlier = fixture.request(run=run, since=first.since - 20)
-            _ = fixture.server.handle_request(earlier)
+            # The step needs more memory than its continuation slot holds.
+            earlier = fixture.request(run=run, since=first.since - 20, need=first.profile.peak.bytes + GIB)
+            self.assertIsInstance(fixture.server.handle_request(earlier)[0], wire.Wait)
             self.assertEqual(fixture.queue_pids(), [earlier.owner.pid, peer.owner.pid])
             row, = (row for _, row in self.reading(fixture).ordered if row["pid"] == earlier.owner.pid)
             self.assertEqual(row["since"], earlier.since)

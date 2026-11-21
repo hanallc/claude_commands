@@ -6,6 +6,7 @@ import os
 from collections.abc import Callable
 from contextlib import redirect_stderr
 from dataclasses import replace
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 import subprocess
@@ -15,11 +16,16 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_records as records, head_stall
+from scripts.build_hold import build_hold
+from scripts.build_queue import admission_client, admission_records as records, head_stall
+from scripts.build_queue.admission_wire import AdmissionUnavailable
 from scripts.build_queue.queue_fixture import fixture_reservation
-from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
+from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot, write_queue_snapshot
+from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import cli, mac_idle, sample
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
+from scripts.lint import memory_admit as gate
+from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.production import staff
 
 GIB = records.GIB
 NOW = 1_800_000_000.0
@@ -51,6 +57,10 @@ def snapshot(waiters: list[records.Waiter], running: tuple[records.RunningStep, 
     return QueueSnapshot(NOW, inputs, admission_policy_fixture())
 
 
+def fixture_explanation(queue: QueueSnapshot) -> records.QueueExplanation:
+    return gate.queue_read_from(queue.inputs, queue.policy).explanation
+
+
 def compiler_service(*jobs: records.CompilerJob,
                      source: records.ScopeSource | records.NoSource = COMPILER_SCOPE_UNAVAILABLE) -> records.RunningStep:
     return records.RunningStep("", "sccache.service", "compile", "builds.slice", 0,
@@ -70,23 +80,68 @@ class FindStallTests(unittest.TestCase):
 
     def test_holder_time_starts_at_admission(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 62 * 60),))
-        stall = head_stall.find_stall(queue, NOW - 3600, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), NOW - 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertIn("held for 62 min", head_stall.builds_text(stall))
 
     def test_head_behind_an_idle_holder_with_no_start_is_a_stall(self) -> None:
-        stall = head_stall.find_stall(STALLED, NOW - 2 * 3600, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(STALLED), NOW - 2 * 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual((stall.last_start, stall.need, round(stall.waited), round(stall.quiet)),
+        self.assertEqual((stall.last_start, stall.head.waiter.need, round(stall.waited), round(stall.quiet)),
                          (NOW - 2 * 3600, 15 * GIB, 3 * 3600, 2 * 3600))
-        self.assertEqual(stall.holders, (head_stall.Holder("check", "/home/u/rust/devtools-chooserux", 706237,
-                                                         12 * GIB, GIB // 10, 3 * 3600.0),))
+        self.assertEqual(stall.holders, (head_stall.Holder((STALLED.inputs.running[0],),
+            records.RunMemory("706237-706237", 12 * GIB, records.AnonymousRunUse(GIB // 10)),
+            12 * GIB - GIB // 10, 3 * 3600.0),))
         self.assertEqual(head_stall.builds_text(stall).splitlines(), [
             "The build queue head has waited 180 min. No step started for 120 min.",
             "Head: nextest in lfo-trigger-fires-bc6b76 (pid 1618939) needs 15.0 GiB.",
+            "Admission room: 10.1 GiB for 15.0 GiB of need.",
             "Holders:",
-            "- check in devtools-chooserux (pid 706237): promise 12.0 GiB, uses 0.1 GiB, held for 180 min",
-            "The head starts only when a holder ends. Check each holder that uses much less than its promise."])
+            "- check in devtools-chooserux (pid 706237): effective need 12.0 GiB, keep-aside 11.9 GiB, "
+            + "uses 0.1 GiB, original grant 12.0 GiB, held for 180 min",
+            "Memory shortfall: 4.9 GiB."])
+
+    def test_pressure_alert_names_the_head_after_an_older_token_waiter(self) -> None:
+        token_waiter = waiter(NOW - 7200)
+        token_waiter.update(token_left_at=NOW - 7100, step="test", folder="/build/token-waiter")
+        head = waiter(NOW - 3600)
+        head.update(pid=1618940, need=4 * GIB, step="check", folder="/build/pressure-head")
+        queue = snapshot([token_waiter, head], STALLED.inputs.running)
+        inputs = replace(queue.inputs, pressure=records.MemoryPressure(3.0, condition="full"))
+
+        stall = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT)
+        assert isinstance(stall, head_stall.HeadStall)
+        report = head_stall.builds_text(stall)
+        self.assertIn("The build queue head has waited 60 min.", report)
+        self.assertIn("Head: check in pressure-head (pid 1618940) needs 4.0 GiB.", report)
+        self.assertIn("Reason: memory pressure.", report)
+        self.assertNotIn("Memory shortfall:", report)
+
+    def test_the_head_waits_for_its_own_remote_start(self) -> None:
+        head = waiter(NOW - 3600)
+        queue = snapshot([head], STALLED.inputs.running)
+        inputs = replace(queue.inputs, pending_remote_starts=frozenset({records.waiter_owner(head)}))
+
+        stall = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT)
+        assert isinstance(stall, head_stall.HeadStall)
+        report = head_stall.builds_text(stall)
+        self.assertIn("Reason: waiting for its remote start.", report)
+        self.assertNotIn("Memory shortfall:", report)
+
+    def test_a_slot_between_steps_is_listed_with_its_memory(self) -> None:
+        run = LiveBuildRun(706239, "19509000", NOW - 3600)
+        slot = records.BetweenStepsSlot(run, "finished", 5 * GIB, NOW + 10, records.HoldPredatesStepFacts())
+        for running, expected_shortfall in ((STALLED.inputs.running, "9.9 GiB"), ((), "2.0 GiB")):
+            with self.subTest(active_step=bool(running)):
+                queue = snapshot([waiter(NOW - 3600)], running)
+                host = queue.inputs.host if running else records.HostMemory(21 * GIB, 60 * GIB)
+                inputs = replace(queue.inputs, slots=(slot,), host=host)
+
+                stall = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), NOW - 3600, NOW, LIMIT)
+                assert isinstance(stall, head_stall.HeadStall)
+                report = head_stall.builds_text(stall)
+                self.assertIn("- Run pid 706239: held between steps, keep-aside 5.0 GiB", report)
+                self.assertIn(f"Memory shortfall: {expected_shortfall}.", report)
 
     def test_two_compiling_holders_count_their_own_sccache_jobs(self) -> None:
         first_scope = Path("/cgroup/builds.slice/first.scope")
@@ -131,41 +186,44 @@ class FindStallTests(unittest.TestCase):
             _ = self.enterContext(mock.patch.object(head_stall, "PROC", proc))
             _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(builds)})))
             one_unreadable = ("sccache: 1 compiler not readable; uses can be low",)
-            for name, second_holder, service, amounts, header in (
+            for name, second_holder, service, amounts, keep_asides, header in (
                 ("both jobs", second, (compiler_service(first_job, second_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "12.3 GiB"), ()),
+                 ("10.2 GiB", "12.3 GiB"), ("2.3 GiB", "1.6 GiB"), ()),
                 ("unreadable job", second, (compiler_service(first_job, unreadable_job, source=unreadable_status),),
-                 ("10.2 GiB", "unknown"), one_unreadable),
+                 ("10.2 GiB", "unknown"), ("2.3 GiB", "13.9 GiB"), one_unreadable),
                 ("two unreadable compilers in one job", second,
                  (compiler_service(first_job, unreadable_job, source=two_unreadable_statuses),),
-                 ("10.2 GiB", "unknown"), ("sccache: 2 compilers not readable; uses can be low",)),
+                 ("10.2 GiB", "unknown"), ("2.3 GiB", "13.9 GiB"), ("sccache: 2 compilers not readable; uses can be low",)),
                 ("first holder has two compilers with one unreadable environment", second, (compiler_service(first_job),),
-                 ("10.2 GiB", "0.3 GiB"), one_unreadable),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), one_unreadable),
                 ("missing job", second_tree,
                  (compiler_service(first_job, second_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "0.3 GiB"), ()),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), ()),
                 ("complete read with no job for the second holder", second,
                  (compiler_service(first_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "0.3 GiB"), ()),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), ()),
                 ("the process-tree holder owns no compiler job with an unreadable memory reading", second_tree,
                  (compiler_service(unreadable_job, source=unreadable_status),),
-                 ("0.2 GiB", "0.3 GiB"), one_unreadable),
+                 ("0.2 GiB", "0.3 GiB"), ("12.3 GiB", "13.6 GiB"), one_unreadable),
                 ("the process-tree holder can rule out a job assigned to another holder", second_tree,
                  (compiler_service(first_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "0.3 GiB"), ()),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), ()),
                 ("missing service", second, (),
-                 ("0.2 GiB", "0.3 GiB"), ("sccache: compiler scan incomplete; uses can be low",)),
+                 ("0.2 GiB", "0.3 GiB"), ("12.3 GiB", "13.6 GiB"), ("sccache: compiler scan incomplete; uses can be low",)),
             ):
                 with self.subTest(name=name):
                     queue = snapshot([waiter(NOW - 3600)], (first, second_holder, *service))
                     write_queue_snapshot(paths.admission, queue.inputs, queue.policy)
-                    stall = head_stall.current_stall(paths, NOW, LIMIT, 120)
+                    with mock.patch.object(admission_client, "explain", return_value=fixture_explanation(queue)):
+                        stall = head_stall.current_stall(paths, NOW, LIMIT, 120)
                     assert isinstance(stall, head_stall.HeadStall)
-                    self.assertEqual(head_stall.builds_text(stall).splitlines()[2:-1], [
+                    self.assertEqual(head_stall.builds_text(stall).splitlines()[3:-1], [
                         *header,
                         "Holders:",
-                        f"- nextest in first (pid 4094003): promise 12.5 GiB, uses {amounts[0]}, held for 60 min",
-                        f"- nextest in second (pid 1090772): promise 13.9 GiB, uses {amounts[1]}, held for 45 min",
+                        f"- nextest in first (pid 4094003): effective need 12.5 GiB, keep-aside {keep_asides[0]}, "
+                        + f"uses {amounts[0]}, original grant 12.5 GiB, held for 60 min",
+                        f"- nextest in second (pid 1090772): effective need 13.9 GiB, keep-aside {keep_asides[1]}, "
+                        + f"uses {amounts[1]}, original grant 13.9 GiB, held for 45 min",
                     ])
 
     def test_process_tree_holder_with_no_compiler_jobs_has_no_warning(self) -> None:
@@ -173,10 +231,11 @@ class FindStallTests(unittest.TestCase):
         source = records.ProcessSource((records.ProcessAnonymousUse(706237, use),))
         step = holder(NOW - 3600, measured=records.MeasuredMemory(use.bytes, anonymous=use, anonymous_source=source))
         queue = snapshot([waiter(NOW - 3600)], (step, compiler_service(source=COMPILER_SCOPE)))
-        stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual(head_stall.builds_text(stall).splitlines()[3],
-                         "- check in devtools-chooserux (pid 706237): promise 12.0 GiB, uses 0.1 GiB, held for 60 min")
+        self.assertEqual(head_stall.builds_text(stall).splitlines()[4],
+                         "- check in devtools-chooserux (pid 706237): effective need 12.0 GiB, keep-aside 11.9 GiB, "
+                         + "uses 0.1 GiB, original grant 12.0 GiB, held for 60 min")
 
     def test_short_waits_recent_starts_and_empty_queues_are_not_stalls(self) -> None:
         cases = {
@@ -189,19 +248,21 @@ class FindStallTests(unittest.TestCase):
         }
         for name, (queue, admitted) in cases.items():
             with self.subTest(name):
-                self.assertEqual(head_stall.find_stall(queue, admitted, NOW, LIMIT), head_stall.NoStall())
+                self.assertEqual(head_stall.find_stall(fixture_explanation(queue), admitted, NOW, LIMIT), head_stall.NoStall())
 
     def test_a_recent_zero_need_start_does_not_hide_the_stall(self) -> None:
-        gate = replace(holder(NOW - 60), step="merge-gate", promise=0)
-        stall = head_stall.find_stall(snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), gate)), 0.0, NOW, LIMIT)
+        zero_need = replace(holder(NOW - 60), step="merge-gate", promise=0)
+        queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), zero_need))
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual([row.step for row in stall.holders], ["check"])
+        self.assertEqual([step.step for row in stall.holders for step in row.steps], ["check"])
 
     def test_a_holder_without_a_reading_shows_unknown_use(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 3600, measured=records.GoneMemory()),))
-        stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertIn("promise 12.0 GiB, uses unknown", head_stall.builds_text(stall))
+        self.assertIn("effective need 12.0 GiB, keep-aside 12.0 GiB, uses unknown, original grant 12.0 GiB",
+                      head_stall.builds_text(stall))
 
     def test_unreadable_child_scope_makes_parent_use_unknown(self) -> None:
         parent = replace(holder(NOW - 3600, measured=records.MeasuredMemory(
@@ -212,16 +273,18 @@ class FindStallTests(unittest.TestCase):
             anonymous_source=records.ScopeSource(IDLE_SCOPE / "child.scope", frozenset({706238})))),
             folder="/build/child", pid=706238)
         queue = snapshot([waiter(NOW - 3600)], (parent, child, compiler_service(source=COMPILER_SCOPE)))
-        stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual(head_stall.builds_text(stall).splitlines()[3:5], [
-            "- check in parent (pid 706237): promise 12.0 GiB, uses unknown, held for 60 min",
-            "- check in child (pid 706238): promise 12.0 GiB, uses unknown, held for 60 min",
+        self.assertEqual(head_stall.builds_text(stall).splitlines()[4:6], [
+            "- check in parent (pid 706237): effective need 12.0 GiB, keep-aside 12.0 GiB, "
+            + "uses unknown, original grant 12.0 GiB, held for 60 min",
+            "- check in child (pid 706238): effective need 12.0 GiB, keep-aside 12.0 GiB, "
+            + "uses unknown, original grant 12.0 GiB, held for 60 min",
         ])
 
     def test_a_holder_without_a_start_time_shows_unknown_duration(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(0.0),))
-        stall = head_stall.find_stall(queue, NOW - 3600, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), NOW - 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertIn("held for unknown", head_stall.builds_text(stall))
 
@@ -241,16 +304,36 @@ class LastAdmissionTests(unittest.TestCase):
 
 class WatchTests(unittest.TestCase):
     paths: head_stall.StallPaths = head_stall.StallPaths(Path(), Path())
+    holders: Path = Path()
     sent: list[tuple[list[str], str]] = []
 
     @override
     def setUp(self) -> None:
-        folder = self.enterContext(tempfile.TemporaryDirectory())
-        self.paths = head_stall.StallPaths(Path(folder) / "admission", Path(folder) / "head_stall.json")
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.paths = head_stall.StallPaths(root / "admission", root / "head_stall.json")
         self.paths.admission.mkdir()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(Path(folder) / "config"))))
+        self.holders = root / "holders"
+        self.holders.mkdir()
+        for name, keys in (
+            ("lint", ("sweep_sender_timeout_seconds",)),
+            ("send", ("delivery_timeout", "kill_grace", "remote_transport_seconds", "waits_review_seconds", "caller_margin_seconds")),
+            ("postmaster", ("wait_seconds", "claim_grace_seconds")),
+            ("codex_daemon", ("timeout_seconds",)),
+        ):
+            _ = (root / f"{name}.conf").write_text("".join(f"# range: 1..\n{key}=5\n" for key in keys))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(root), "BUILD_HOLD_DIR": str(self.holders), "USER_ZONE": "America/New_York",
+        })))
+        self.enterContext(staff.supplied_snapshot(staff.StaffSnapshot(())))
         _ = self.enterContext(mock.patch.object(head_stall, "configured_limits", return_value=(LIMIT, 120.0)))
+        _ = self.enterContext(mock.patch.object(admission_client, "explain", side_effect=self.explain_fixture))
         self.sent = []
+
+    def explain_fixture(self) -> records.QueueExplanation:
+        queue = read_queue_snapshot(self.paths.admission)
+        if not isinstance(queue, QueueSnapshot):
+            raise AdmissionUnavailable("no fixture admission pass")
+        return fixture_explanation(queue)
 
     def run_send(self, result: bool) -> Callable[[list[str], str], bool]:
         def run(command: list[str], text: str) -> bool:
@@ -262,7 +345,8 @@ class WatchTests(unittest.TestCase):
         _ = (self.paths.admission / "queue_times.jsonl").write_text(
             json.dumps({"kind": "admitted", "admitted_at": at, "need": GIB}, separators=(",", ":")) + "\n")
 
-    def observe(self, queue: QueueSnapshot, now: float, *, accept: bool = True) -> head_stall.HeadStall | head_stall.NoStall:
+    def observe(self, queue: QueueSnapshot, now: float, *, accept: bool = True
+                ) -> head_stall.HeadStall | head_stall.AdmissionDecisionUnreadable | head_stall.NoStall:
         write_queue_snapshot(self.paths.admission, replace(queue.inputs, now=now), queue.policy)
         return head_stall.watch_once(self.paths, now, self.run_send(accept))
 
@@ -282,6 +366,153 @@ class WatchTests(unittest.TestCase):
 
     def sent_recipients(self) -> list[str]:
         return [command[command.index("--to") + 1] for command, _ in self.sent]
+
+    def test_alert_uses_the_hold_text_only_before_its_release_time(self) -> None:
+        now = datetime.fromisoformat("2026-11-20T10:50:00-05:00").timestamp()
+        queue = snapshot([waiter(now - 53 * 60)], (holder(now - 53 * 60),))
+        hold = self.holders / "natemerge"
+        for case, release in (("active", "11:13"), ("no hold", ""), ("overdue", "10:49")):
+            with self.subTest(case=case):
+                self.paths.state.unlink(missing_ok=True)
+                self.sent.clear()
+                hold.unlink(missing_ok=True)
+                if release:
+                    _ = hold.write_text(json.dumps({"holder": "natemerge", "for": "landing merge test",
+                        "since": "2026-11-20T09:57:00-05:00", "release_eta": f"2026-11-20T{release}:00-05:00"}))
+
+                stall = self.observe(queue, now)
+                assert isinstance(stall, head_stall.HeadStall)
+                expected = ("A build hold by natemerge is active for landing merge test. The release time is 11:13 EST."
+                            if case == "active" else head_stall.builds_text(stall))
+                self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+                self.assertEqual([text for _, text in self.sent], [expected, expected])
+                _ = self.observe(queue, now + 60)
+                self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+
+    def test_a_hold_read_error_sends_the_normal_alert(self) -> None:
+        with mock.patch.object(build_hold, "natedev_holds", side_effect=PermissionError("cannot list holders")):
+            stall = self.observe(STALLED, NOW)
+        assert isinstance(stall, head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        self.assertEqual([text for _, text in self.sent], [head_stall.builds_text(stall)] * 2)
+
+    def test_the_hold_read_fallback_uses_the_head_from_admission(self) -> None:
+        held = waiter(NOW - 7200)
+        held.update(step="nextest", folder="/build/held-ci")
+        head = waiter(NOW - 3600)
+        head.update(pid=1618940, need=12 * GIB, step="check", folder="/build/admission-head")
+        published = snapshot([head], STALLED.inputs.running)
+        observed = snapshot([held, head], STALLED.inputs.running)
+        explanation = fixture_explanation(published)
+
+        with (mock.patch.object(build_hold, "natedev_holds", side_effect=PermissionError("cannot list holders")),
+              mock.patch.object(admission_client, "explain", return_value=explanation)):
+            self.assertIsInstance(self.observe(observed, NOW), head_stall.HeadStall)
+
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        for _, report in self.sent:
+            self.assertIn("Head: check in admission-head (pid 1618940) needs 12.0 GiB.", report)
+            self.assertIn("Memory shortfall: 1.9 GiB.", report)
+            self.assertNotIn("held-ci", report)
+
+    def test_an_unavailable_admission_decision_sends_no_alert(self) -> None:
+        with mock.patch.object(admission_client, "explain", side_effect=AdmissionUnavailable("no fixture reply")):
+            _ = self.observe(STALLED, NOW)
+        self.assertEqual(self.sent, [])
+
+    def test_unreadable_decisions_log_each_skip_and_alert_after_the_limit(self) -> None:
+        self.mock_send_outcomes((0, "SENT"), (0, "SENT"))
+        diagnostics = StringIO()
+        stale = replace(fixture_explanation(STALLED), now=NOW - 121)
+        replies = iter((AdmissionUnavailable("socket permission denied"), stale,
+                        AdmissionUnavailable("socket permission denied"), AdmissionUnavailable("socket permission denied")))
+
+        def explain() -> records.QueueExplanation:
+            reply = next(replies)
+            if isinstance(reply, AdmissionUnavailable):
+                raise reply
+            return reply
+
+        with (mock.patch.object(sample, "sample") as take_sample,
+              mock.patch.object(mac_idle, "watch_once"),
+              mock.patch.object(mac_idle, "watch_paths"),
+              mock.patch.object(head_stall, "default_paths", return_value=self.paths),
+              mock.patch.object(admission_client, "explain", side_effect=explain),
+              redirect_stderr(diagnostics)):
+            for elapsed, sent in ((0, 0), (LIMIT - 1, 0), (LIMIT, 2), (LIMIT + 60, 2)):
+                now = NOW + elapsed
+                write_queue_snapshot(self.paths.admission, replace(STALLED.inputs, now=now), STALLED.policy)
+                take_sample.return_value = sample.SampleTaken(now, "natedev")
+                self.assertEqual(cli.main(["sample"]), 0)
+                self.assertEqual(len(self.sent), sent)
+
+        lines = diagnostics.getvalue().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("socket permission denied", lines[0])
+        self.assertIn("old", lines[1])
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        for _, report in self.sent:
+            self.assertIn("cannot read the admission decision", report)
+            self.assertIn("socket permission denied", report)
+
+    def test_a_fresh_queue_without_an_old_waiter_clears_the_decision_outage(self) -> None:
+        with mock.patch.object(admission_client, "explain", side_effect=AdmissionUnavailable("no fixture reply")):
+            _ = self.observe(STALLED, NOW)
+            now = NOW + LIMIT
+            fresh = snapshot([waiter(now - 60)], STALLED.inputs.running)
+            self.assertEqual(self.observe(fresh, now), head_stall.NoStall())
+            _ = self.observe(STALLED, now + 60)
+            self.assertEqual(self.sent, [])
+
+    def test_pending_decision_does_not_alert_or_extend_an_outage(self) -> None:
+        decision = fixture_explanation(STALLED)
+        head = decision.head
+        assert isinstance(head, records.HeadExplanation)
+        pending = replace(decision, now=NOW + LIMIT,
+                          head=replace(head, cause=records.ReadingUnavailable("admission decision pending")))
+        unavailable = AdmissionUnavailable("no fixture reply")
+        with mock.patch.object(admission_client, "explain", side_effect=(unavailable, pending, unavailable)):
+            _ = self.observe(STALLED, NOW)
+            self.assertEqual(self.observe(STALLED, NOW + LIMIT), head_stall.NoStall())
+            _ = self.observe(STALLED, NOW + LIMIT + 60)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(json.loads(self.paths.state.read_text())["unreadable_since"], NOW + LIMIT + 60)
+
+    def test_test_phase_reduces_the_alert_charge_while_nextest_stays_active(self) -> None:
+        memory = records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB))
+        nextest = replace(holder(NOW - 3600, measured=memory), step="nextest", folder="/build/hana-slot1")
+        queued = [waiter(NOW - 3600)]
+        queue = snapshot(queued, (nextest,))
+        inputs = replace(queue.inputs, host=records.HostMemory(20 * GIB, 60 * GIB))
+        before = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT)
+        assert isinstance(before, head_stall.HeadStall)
+        self.assertIn("effective need 12.0 GiB, keep-aside 11.0 GiB", head_stall.builds_text(before))
+        self.assertIn("Memory shortfall: 9.0 GiB.", head_stall.builds_text(before))
+
+        need = records.TestPhaseNeed(5 * GIB, 10, 8, 8, "same_width", margin=1.2)
+        phase = records.TestPhaseStarted(NOW - 10, 4 * GIB, need)
+        active = replace(nextest, measured=replace(memory, peak_history=phase))
+        after = replace(queue, inputs=replace(inputs, running=(active,)))
+        self.assertIsInstance(self.observe(after, NOW), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        for _, report in self.sent:
+            self.assertIn("Admission room: 12.0 GiB for 15.0 GiB of need.", report)
+            self.assertIn("- nextest in hana-slot1 (pid 706237): effective need 6.0 GiB, keep-aside 5.0 GiB, "
+                          + "uses 1.0 GiB, original grant 12.0 GiB, held for 60 min", report)
+            self.assertIn("Memory shortfall: 3.0 GiB.", report)
+
+    def test_a_hold_that_starts_during_a_reported_stall_sends_no_second_alert(self) -> None:
+        self.assertIsInstance(self.observe(STALLED, NOW), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+
+        _ = (self.holders / "natemerge").write_text(json.dumps({
+            "holder": "natemerge", "for": "landing merge test",
+            "since": datetime.fromtimestamp(NOW + 1, UTC).isoformat(),
+            "release_eta": datetime.fromtimestamp(NOW + 3600, UTC).isoformat(),
+        }))
+
+        self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
 
     def test_only_the_failed_recipient_retries(self) -> None:
         self.mock_send_outcomes((0, "SENT"), (3, "FAILED"), (0, "SENT"))
@@ -329,6 +560,8 @@ class WatchTests(unittest.TestCase):
             self.assertIsInstance(stall, head_stall.HeadStall)
 
         self.assertEqual([command[command.index("--to") + 1] for command, _ in self.sent], ["builds", "bob"])
+        self.assertEqual({argv[argv.index("--key") + 1] for argv, _ in self.sent},
+                         {f"head-stall-{NOW - 32 * 60}"})
 
     def test_one_alert_per_stall_and_a_new_stall_alerts_again(self) -> None:
         _ = self.observe(STALLED, NOW)
@@ -389,6 +622,17 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, "bob": last_start})
         self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
         self.assertEqual(self.sent_recipients(), ["bob"])
+
+    def test_saved_alert_for_another_head_still_covers_the_stall(self) -> None:
+        last_start = NOW - 3600 + 0.25
+        self.admit_at(last_start)
+        saved = {"builds": {"1-1": last_start, "admission-decision": NOW - 60}}
+        _ = self.paths.state.write_text(json.dumps({"alerted": saved, "at": NOW}))
+        self.assertIsInstance(self.observe(STALLED, NOW), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["bob"])
+        state = cast(dict[str, object], json.loads(self.paths.state.read_text()))
+        self.assertEqual(state["alerted"], {"builds": last_start, "bob": last_start})
+        self.assertEqual(state["outage_alerted"], {"builds": NOW - 60})
 
     def test_state_write_failures_do_not_stop_sends_and_report_once(self) -> None:
         diagnostics = StringIO()
