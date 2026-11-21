@@ -20,7 +20,9 @@ from unittest.mock import patch
 from scripts.lib import models_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id, source_environment
+from scripts.production.staff_test_support import (
+    build_fixture_sessions, fixture_runtime_id, isolated_staff_file, source_environment, unit_membership,
+)
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
@@ -351,8 +353,8 @@ class ClaudeLauncherTests(unittest.TestCase):
         environment = {**self.environment, "UNIT_RUN_DIR": str(parent),
             "PLAN_DELEGATE_BOARD_DIR": str(parent), "UNIT_RUN_ROOT": str(parent),
             "STAFF_FILE": str(paths[1]), "STAFF_ID": "parent-worker",
-            "WORKER_STAFF_ID": "parent-worker", "CODEX_THREAD_ID": "parent-thread",
-            "CLAUDE_CODE_SESSION_ID": "parent-session", "ROSTER_RUN_ROOT": str(parent),
+            "WORKER_STAFF_ID": "parent-worker", **build_fixture_sessions("parent-session"),
+            "ROSTER_RUN_ROOT": str(parent),
             "NOTIFIER_SESSIONS_DIR": str(parent), "UNIT_WORKERS_STATE": str(parent)}
         result = subprocess.run(["bash", str(SCRIPTS / "agents/test_agent_exec.sh")],
                                 env=environment, cwd=self.home, capture_output=True, text=True, check=False)

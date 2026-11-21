@@ -51,7 +51,8 @@ class GateRecordTests(unittest.TestCase):
         rows = [("a", 8, 0, 0, "full", 10), ("b", 8, 0, 0, "full", 20),
                 ("c", 8, 0, 0, "full", 30), ("d", 8, 1, 0, "full", 1000),
                 ("e", 16, 0, 0, "full", 1000), ("f", 8, 0, 1, "full", 1000),
-                ("g", 8, 0, 0, "affected", 1000), ("h", 8, 0, 0, "reused", 1000)]
+                ("g", 8, 0, 0, "affected", 1000), ("h", 8, 0, 0, "reused", 1000),
+                ("i", 8, 0, 0, "subset", 1)]
         for identity, vcpus, status, aborted, selection, seconds in rows:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)

@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents.test_support import write_machine_config
@@ -287,6 +288,12 @@ class RoleMapTests(unittest.TestCase):
         reset = (repair_at + timedelta(days=1)).isoformat()
         first = next_moves.ClaudeGroupMove("selected-before-stop", "units", 1, 0, "claude3", original_at)
         second = next_moves.ClaudeGroupMove("successor", "units", 1, 0, "claude2", original_at)
+        destination = accounts.account_dir(second.to)
+        destination.mkdir(exist_ok=True)
+        _ = agent_accounts.claude_config_file(destination).write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude2@example.invalid"},
+        }))
+        write_claude_move_credentials(destination)
         with patch.object(socket, "gethostname", return_value="natedev"), next_moves.next_moves_lock():
             next_moves.write_next_moves((first, second))
         change = role_map.RoleMapChange("units", "claude3", "auto: " + first.id, original_at.isoformat(),
