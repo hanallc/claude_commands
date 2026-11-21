@@ -1957,7 +1957,7 @@ try {
               return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
                 waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
             })()`);
-            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
@@ -1988,7 +1988,7 @@ try {
             [304, 'hana nextest', 'hana nextest', 'unregistered session', 'hana nextest'],
             [200, 'recorded local', 'recorded local', 'recorded local', 'recorded local'],
             [700002, 'recorded cloud', 'recorded cloud', 'recorded cloud', 'recorded cloud'],
-            [303, 'recorded slot · widget', 'recorded slot · widget', 'recorded slot', 'recorded slot'],
+            [303, 'recorded slot', 'recorded slot', 'recorded slot', 'recorded slot'],
           ]);
           await capture('resolved-work-names','#walk');
           comparisons.push({version:'caller-selection',...work});
@@ -2509,10 +2509,9 @@ try {
                   {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
                 waiters:[{key:'fractional-wait',name:'fractional',first_in_line:true,need:1.06,free:1.04,head_room:{rows:[
                   {label:'Queue cap',gib:5.2},{label:'− Builds',gib:3.12},
-                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}},
-                  {key:'fractional-slot',name:'slot',kind:'repository-slot',need:0,runs_on:'natedev'}]};
+                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}}]};
               window.renderReading(fractional);
-              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait','wait:fractional-slot']
+              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait']
                 .map(key=>[key,tooltipRows(key,fractional)])),
                 legend:Object.fromEntries(['builds','reserved','room'].map(key=>[key,document.querySelector('#v-cap-'+key).textContent]))};
             })()`);
@@ -2535,8 +2534,6 @@ try {
             assert.equal(swap['Swap coming back'],'1.0 GiB');
             assert.equal(swap.Target,'2.0 GiB');
             assert.equal(amounts(review.walkhead).Priority,'research, cables');
-            assert.equal(amounts(review['wait:fractional-slot'])['Waits for'],'build slot');
-            assert.ok(!review['wait:fractional-slot'].some(row=>['Needs','Free','Short by'].includes(row.label)));
             assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 123 · 2 min'));
             assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 456 · 2 min'));
             const reserveProof = await evaluate(`(() => {

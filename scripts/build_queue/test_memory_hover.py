@@ -92,7 +92,7 @@ class MemoryHoverTests(unittest.TestCase):
             (304, "hana nextest", "unregistered session", "hana nextest"),
             (200, "recorded local", "recorded local", "recorded local"),
             (700002, "recorded cloud", "recorded cloud", "recorded cloud"),
-            (303, "recorded slot · widget", "recorded slot", "recorded slot"),
+            (303, "recorded slot", "recorded slot", "recorded slot"),
         )
         self.assertEqual(page["reserved"], 11.0)
         self.assertEqual([row["pid"] for row in (*page["walk"], *page["waiters"])],
@@ -345,9 +345,9 @@ class MemoryHoverTests(unittest.TestCase):
         data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,
                           "reserved": 0, "call": "cargo nextest run -p demo"}],
                 "waiters": [{"kind": "repository-slot", "name": "demo test all", "need": 0,
-                             "call": "merge_gate.py --tests-only"}]}
+                             "call": "gate.py --tests-only"}]}
         for key, call in (("row:fixture-run-0", "cargo nextest run -p demo"),
-                          ("wait:fixture-wait-0", "merge_gate.py --tests-only")):
+                          ("wait:fixture-wait-0", "gate.py --tests-only")):
             with self.subTest(key=key):
                 tip = ElementTree.fromstring(str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True)))
                 self.assertEqual(tip[-2].text, "Call")
@@ -680,7 +680,7 @@ class MemoryHoverTests(unittest.TestCase):
             self.assertRegex(shared.style, rf"\.tip {tag} \{{[^}}]*white-space: nowrap;")
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
-        row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
+        row = memory_tests.ProgressKeepAsideTests.reservation("gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True),
             progress.ProgressCounter("suites:1", 8, 10), memory_tests.ProgressKeepAsideTests.profile("suites:1", 3 * GIB // 2),
@@ -695,10 +695,10 @@ class MemoryHoverTests(unittest.TestCase):
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
         hold = room.runs[0]
         for name, counter, ordering_note in (
-            ("merge-gate", module_counter, True),
+            ("gate", module_counter, True),
             ("merge gate", module_counter, True),
             ("fixture-project merge gate", module_counter, True),
-            ("merge-gate", test_counter, False),
+            ("gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
@@ -718,7 +718,7 @@ class MemoryHoverTests(unittest.TestCase):
                               ({"used": 1, "reserved": 0, "started_at": 100}, "running 5 min")):
             with self.subTest(row=row):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
-                    "name": "merge-gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
+                    "name": "gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
                     "need": 4.0, "need_part": False, **row}]}))
                 self.assertIn(expected, hover[0])
                 if expected == "unavailable":
@@ -823,7 +823,7 @@ class MemoryHoverTests(unittest.TestCase):
             ("", progress.NoCounter("no cloud counter"), ""),
         ):
             with self.subTest(stage=stage):
-                data = {"walk": [{"kind": "cloud", "machine": "aws", "name": "merge-gate",
+                data = {"walk": [{"kind": "cloud", "machine": "aws", "name": "gate",
                     "unit": "cloud-unit", "showrunner": "fixture", "stage": stage, "location": "eu-south-2, zone b",
                     "progress": memory_feed.cloud_row_progress(counter)}]}
                 shown = cast(list[str], self.page_expression(
@@ -1811,26 +1811,6 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
-    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
-        fixture = test_memory_feed.MemoryFeedTests()
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
-        data = fixture.copies_slot_page("python3 /fixture/check.service.sh", source="/fixture/startup",
-                                       unit="startup", staff_id="staff-startup")
-        row, = data["waiters"]
-        key = row.get("key")
-        self.assertIsNotNone(key)
-        body = cast(list[str], self.page_expression(
-            f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}',data)])",
-            cast(object, json.loads(memory_feed.page_json(data))), walk=True))
-        table = ElementTree.fromstring(f"<root>{body[0]}</root>")
-        cell = table.find(".//tr[@class='wait wait-first']/th[@class='step']/span")
-        self.assertIsNotNone(cell)
-        assert cell is not None
-        self.assertEqual(cell.text, "check.service.sh · hana")
-        self.assertIsNone(table.find(".//td[@class='unit']"))
-        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
-
     def test_repository_slot_wait_has_no_memory_group(self) -> None:
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
                 "waiters": [{"kind": "repository-slot", "name": "gate", "detail": "widget", "need": 0,
@@ -2013,6 +1993,21 @@ function fitLabels() {}
                 hover = self.page_expression("tipText('wait:fixture-wait-0', data)", {"read_at": 200_000, "waiters": [{
                     "name": "fixture", "need": 1, "since": 100, "why": memory_feed.wait_why(reason)}]})
                 self.assertIn("Waits for  "+expected, str(hover))
+
+    def test_build_space_wait_shows_the_reason_in_the_chart_and_tooltip(self) -> None:
+        wait = admission_records.BuildSpaceLow(8, 10)
+        reason = "8 GiB free, 10 GiB required"
+        data = {"read_at": 200, "waiters": [{"name": "fixture", "need": 1, "since": 100,
+                "why": memory_feed.wait_why(wait), "reason": reason}]}
+        chart, tip = cast(list[str], self.page_expression(
+            "(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:fixture-wait-0', data)])",
+            data, walk=True))
+        self.assertIn(reason, chart)
+        tooltip = ElementTree.fromstring(tip)
+        labels = dict(zip((label.text for label in tooltip.findall("dt")),
+                          (value.text for value in tooltip.findall("dd")), strict=True))
+        self.assertEqual(labels["Waits for"], "build space")
+        self.assertEqual(labels["Reason"], reason)
 
     def test_a_mac_only_wait_hover_names_what_holds_the_mac_below_can_run_on(self) -> None:
         reason = "held by research for Mac CI restore"

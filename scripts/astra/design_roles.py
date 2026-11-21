@@ -5,10 +5,13 @@ Only the pinned authority changes placements. Local lifecycle actions keep threa
 assignment evidence and pending messages when a server or acknowledgement is lost.
 """
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 from scripts.lib import unit_runs
 
@@ -34,7 +37,7 @@ from uuid import UUID, uuid4
 
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
-from scripts.direct import progress_history, recorder_state
+from scripts.direct import recorder_state
 from scripts.lib import conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, worker_admission
@@ -769,7 +772,7 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
         '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
         '--phase', phase, '--prompt', str(prompt), '--reply-file', str(reply.resolve()),
-        '--completion-actions', json.dumps(asdict(progress_history.CompletionActions(
+        '--completion-actions', json.dumps(asdict(pass_recorder.CompletionActions(
             finish_phase=phase if isinstance(design.binding, DesignUnbound) else '')))])
     refusal = result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained'
     if result.returncode:

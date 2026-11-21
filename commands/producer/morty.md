@@ -123,6 +123,8 @@ End with the open question counts on one line and the parked numbers on one line
 
 `park # until DATE/TIME` hides the item until that time. Preserve its number and incoming updates.
 Use nate's configured time zone. A date alone means its start at midnight.
+Use `the_list.py park --id L<n> --until delivered --source morty` to park until the producer sets Delivered.
+Set Delivered when the whole item is ready.
 `list parked` shows only parked items, earliest wake time first. Include the wake time.
 Parking suspends inquiries. Expiry restores visibility and status checks, not production work.
 `unpark #` restores visibility immediately.

@@ -1376,7 +1376,7 @@ function stepTooltip(key, data) {
     : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
   if (row.changes && !unavailable) rows.push(...detailRows('Work', row.about, row.about_parts));
-  else if (row.about) rows.push(field('', row.about, 'caption'));
+  else if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
   if (unavailable) return [...rows, ...stepFields, ...callFields];
   if (group) return [...rows, field('Started by', 'not the queue'),
@@ -1392,6 +1392,7 @@ function stepTooltip(key, data) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
+    if (row.why === 'build space') rows.push(field('Reason', row.reason));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
       const reading = data.waitReadings.get(row);
       const {head, earlier} = reading;
@@ -1529,7 +1530,6 @@ function publicParts(parts) {
 }
 function rowOwner(row, waiting = false) {
   if (row.caller) return row.caller;
-  if (row.kind === "repository-slot") return "";
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
@@ -2075,7 +2075,7 @@ function renderWalk(d) {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     cells(place, stepDisplayName(w), ago(w.since, d.read_at), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
-    const note = w.why === "the build in the same Cargo folder" ? w.reason : "";
+    const note = ["build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "";
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${stepLabel(w, true, note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);

@@ -296,20 +296,35 @@ class CopyGuardTests(unittest.TestCase):
     def test_original_worktree_helper_is_allowed_but_bare_worktree_add_is_refused(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
         helper = scripts / "worktree/make_worktree.sh"
-        checkout = self.root / "original checkout"
-        command = shlex.join(["bash", str(helper), str(checkout), "original-work"])
-        self.assertEqual(copy_guard.refusal(command, self.repo), "")
+        workspace = self.root / "workspace"
+        checkout = workspace / "origin/original/work"
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "build_folders.conf").write_text(
+            f"roots.workspace={workspace}\nroots.build={self.root / 'build'}\n"
+            + "# range: 0..1\nlocks.probe_wait_seconds=0.05\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+        copies_config = config / "copies.conf"
+        _ = copies_config.write_text("# range: 0.001..\ngit_timeout_seconds=5\n")
+        repository = self.root / "rust/origin"
+        repository.parent.mkdir()
+        _ = self.repo.rename(repository)
+        request = ["bash", str(helper), "origin", "original", "work"]
+        command = shlex.join(request)
+        self.assertEqual(copy_guard.refusal(command, repository), "")
         self.assertIn("copies.py run", copy_guard.refusal(
-            shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"]), self.repo))
+            shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"]), repository))
         refusal = copy_guard.hook_refusal(json.dumps({
-            "tool_name": "Bash", "cwd": str(self.repo),
+            "tool_name": "Bash", "cwd": str(repository),
             "tool_input": {"command": shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"])},
         }))
         self.assertIn("copies.py run", refusal)
-        self.assertIn("make_worktree.sh <path> <branch>", refusal)
-        result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
-                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False,
-                                env={**os.environ, "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
+        self.assertIn("worktrees.py make <repo> <unit> <short-name>", refusal)
+        result = subprocess.run(request,
+                                cwd=repository, text=True, capture_output=True, timeout=10, check=False,
+                                env={**os.environ, "HOME": str(self.root), "CONF_DIR": str(config),
+                                     "COPIES_CONFIG": str(copies_config),
+                                     "STAFF_FILE": str(self.root / "staff.json"),
+                                     "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
         self.assertEqual(result.returncode, 0, result.stderr)
         branch = subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"],
                                 text=True, capture_output=True, timeout=10, check=True).stdout.strip()

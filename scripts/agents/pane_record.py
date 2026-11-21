@@ -110,7 +110,7 @@ def resume_launch(entry: PaneLaunch) -> pane_launch.CurrentLaunch:
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
-           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> pane_launch.CurrentLaunch:
+           arguments: pane_launch.LaunchArguments, *, kind: Literal["claude", "codex"] = "claude") -> pane_launch.CurrentLaunch:
     """Retain plugin paths only in the shutdown restore record."""
     entry = pane_launch.launch(pane_id, session_id, cwd, legacy_identity.without_legacy_identity(environment), arguments, kind=kind)
     if kind == "claude":

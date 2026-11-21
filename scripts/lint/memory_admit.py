@@ -189,13 +189,13 @@ from scripts.build_queue.step_estimator import (
     OutcomeNotRecorded,
 )
 
-MERGE_GATE_TESTS = "tests"
-MERGE_GATE_TYPES = "types"
+GATE_TESTS = "tests"
+GATE_TYPES = "types"
 
 
 def merge_gate_shape(argv: Sequence[str]) -> str:
     """Separate type-check profiles from test-only profiles."""
-    return MERGE_GATE_TYPES if "--type-dirs" in argv else MERGE_GATE_TESTS
+    return GATE_TYPES if "--type-dirs" in argv else GATE_TESTS
 
 
 PROC = Path("/proc")
@@ -529,7 +529,7 @@ class HeadStartsAt:
 @dataclass(frozen=True)
 class HeadStillHeld:
     decision: AdmissionDecision
-    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing"], ...]
+    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing", "build space"], ...]
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
@@ -1928,13 +1928,13 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "merge-gate", "targeted-test", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "gate", "test-affected", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
     """Use the history identity for each step rather than its run owner."""
-    if row["step"] == "merge-gate":
-        return progress.profile_key((host, row["step"], row.get("shape", MERGE_GATE_TESTS)))
+    if row["step"] == "gate":
+        return progress.profile_key((host, row["step"], row.get("shape", GATE_TESTS)))
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
         row.get("shape", ""), row.get("test_scope", "full"), row.get("package", ""),
@@ -2024,7 +2024,9 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
                                if isinstance(slot, ContinuationSlot) and slot.owner in held_owners)
         inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
             if not isinstance(slot, ContinuationSlot) or slot.owner not in held_owners))
-    totals = AdmissionDecision("admit" if isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold) else "hold",
+    clear = (isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold)
+             and isinstance(inputs.build_space, records.NoBuildSpaceHold))
+    totals = AdmissionDecision("admit" if clear else "hold",
         kept + safety, kept, safety, used, inputs.pressure, used + kept)
     return HeadPolicy(tuple(admissions), queued_head, totals, room, frozenset(returned_claims))
 
@@ -2067,6 +2069,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
+    disk_allows_start = isinstance(inputs.build_space, records.NoBuildSpaceHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
     local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
@@ -2115,7 +2118,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         spacing = (inputs.spacing.at if isinstance(inputs.spacing, NextStartAt) and not due else
                    next_start.at if new_started and now < next_start.at else 0.0)
         wait = inputs.local_waits.get(owner)
-        ready = (local and wait is None and not remote_start_pending and fresh
+        ready = (local and disk_allows_start and wait is None and not remote_start_pending and fresh
                  and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
@@ -2209,8 +2212,17 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason: WaitReason = entry.state
         else:
-            if isinstance(entry.cargo_folder, placement.CargoFolderWait):
-                cause: HeadCause = entry.cargo_folder
+            expired = estimate_expired(row, now, policy)
+            if (not remote_start_pending and can_use_natedev(row)
+                    and isinstance(inputs.build_space, records.BuildSpaceHold)):
+                if expired:
+                    cause: HeadCause = EstimateExpired(row.get("estimated_at", now))
+                elif isinstance(decision.order_hold, HeldBehindHead):
+                    cause = queue_order_reason(decision, RecordedQueueIdentities())
+                else:
+                    cause = inputs.build_space
+            elif isinstance(entry.cargo_folder, placement.CargoFolderWait):
+                cause = entry.cargo_folder
             elif isinstance(resolved.room, ReadingUnavailable) and not within:
                 cause = resolved.room
             elif isinstance(decision.order_hold, HeldBehindHead):
@@ -2219,7 +2231,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                 if (decision.starts_at and spacing_waits.get(ahead) == decision.starts_at
                         and folder is not None and folder == inputs.cargo_folders.get(ahead)
                         and isinstance(decision.pressure, NoPressureHold)
-                        and isinstance(decision.gpu, GpuSlotFree) and not estimate_expired(row, now, policy)):
+                        and isinstance(decision.gpu, GpuSlotFree) and not expired):
                     cause = StartSpacingWait(decision.starts_at)
                 else:
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
@@ -2227,7 +2239,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                 cause = BehindHead("remote startup", row["since"], "")
             elif isinstance(local_wait, placement.EvidenceNeeded):
                 cause = ReadingUnavailable(local_wait.reason)
-            elif estimate_expired(row, now, policy):
+            elif expired:
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:
                 cause = cast(HeadCause, queue_wait_reason(decision, row["need"], available, RecordedQueueIdentities()))
@@ -2486,6 +2498,8 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         return HeadStartsAt(cause.at, ended, charge_drop, freed, growth_drop)
     if isinstance(cause, NeedsMemory):
         return HeadStillHeld(decision, ("free memory",))
+    if isinstance(cause, records.BuildSpaceHold):
+        return HeadStillHeld(decision, ("build space",))
     if isinstance(cause, GpuSlotWait):
         return HeadStillHeld(decision, ("GPU test slot",))
     if isinstance(cause, (MemoryPressure, PressureUnavailable)):
