@@ -427,24 +427,24 @@ Record the owner and the date with each answer. The answers are `delete`, `keep`
 - `scripts/style/selection_capture.py` — delete (resources, 2026-11-21).
 - `scripts/style/refill_measure.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
 - `scripts/direct/demo_refusals.sh` — delete (sdlc, 2026-11-21).
-- `scripts/production/unit_run.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/production/unit_run.py` — delete (natedev, 2026-11-21). Live code uses `scripts/lib/unit_runs` only.
 - `scripts/style/order_waste.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
 - `scripts/style/style_reader_tables.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
 - `scripts/style/style_reader_oracle.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
 - `scripts/style/style_reader_parity.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
 - `scripts/direct/phase_process.py` — keep (phases, 2026-11-21). The measure script of the sdlc-phases plan, run by hand after each step (`docs/plans/sdlc-phases.md:29`).
 - `scripts/production/roles_audit.py` — keep (sdlc, 2026-11-21). `test_roles_audit` runs its check on repository sources; `docs/as-built/roles-and-names.md`.
-- `scripts/whoami/profile_notes_pass.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/whoami/profile_notes_pass.py` — not yet (natedev, 2026-11-21). accounts may use it to re-profile the Mac notes pass; natedev answers by 18:30.
 - `scripts/whoami/worker_usage.py` — keep (sdlc, 2026-11-21). Documented Codex worker measurement in `usage-ledger.md` and `long-lived-workers.md`.
 - `scripts/usage/compaction_replay.py` — delete (sdlc, 2026-11-21). One-time study tool. Remove its `usage-ledger.md` lines in the same commit.
 - `scripts/lint/gate_folders_delete.py` — delete (resources, 2026-11-21). Also remove its name from `scripts/lib/removal_guard.py` and its tests.
-- `scripts/agents/pane_restore.py` — not answered. sdlc: natedev owns it (2026-11-21).
-- `scripts/hooks/session-end-pane-record.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/agents/pane_restore.py` — delete (natedev, 2026-11-21), with `scripts/hooks/session-end-pane-record.py`. No settings file registers the hook; no command names the tool.
+- `scripts/hooks/session-end-pane-record.py` — delete (natedev, 2026-11-21), with `scripts/agents/pane_restore.py`.
 - `scripts/mac_test/loopback_proof.py` — delete (devtools, 2026-11-21).
-- `scripts/lint/package_imports.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/lint/package_imports.py` — delete (natedev, 2026-11-21). No command, doc or lint message names it.
 - `scripts/statusline/statusline_rows.py` — delete (natest, 2026-11-21). `statusline.sh` calls `assignment.py` directly since 79a64de8e0.
 - `scripts/aws_target/terminal_table.py` — delete (aws, 2026-11-21). Main dropped its only use in 89e5ebf9b7.
-- `scripts/nix_env/heal.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/nix_env/heal.py` — delete (natedev, 2026-11-21). No command, doc or nixos module names it.
 - `scripts/test_times/coverage_overlap.py` — keep (natest, 2026-11-21). Manual coverage reviews and Phase 392 test isolation use it.
 - `scripts/message/repeats.py` — delete (postmaster, 2026-11-21). Keep `repeat_guard.py` (send.py uses it). Same commit: remove the repeats import and its tests from `test_repeat_guard.py`, and the paragraph at `docs/as-built/message-clarity.md:421`.
 - `scripts/message/install_codex_agents.py` — keep (sdlc, 2026-11-21). devtools ran it on both machines on 2026-11-21 after the macimage merge.
