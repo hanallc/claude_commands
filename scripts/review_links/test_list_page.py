@@ -5181,7 +5181,7 @@ window.fetch=async(_url,options)=>{
    return;
   }else{
   source.querySelector('.list-toggle').click();
-  source.querySelector('a[data-record-jump]').click();
+  recordDetails(source).querySelector('a[data-record-jump]').click();
   const waiting=row();
   check(linked(waiting) && chip('morty-answering').dataset.filterCount==='1',
    'The link opens the waiting item outside Working and counts it in Morty answering.');
@@ -5195,8 +5195,12 @@ window.fetch=async(_url,options)=>{
   document.dispatchEvent(new Event('visibilitychange'));
   await replaced;
   const answered=row();
-  check(linked(answered) && recordDetails(answered).querySelector('[data-question="Q1"]').textContent.includes('The gate passed.'),
-   'Refresh keeps the linked details open and shows the answer.');
+  const updates=document.querySelector('[data-show-record-updates]');
+  const hasAnswer=()=>recordDetails(answered).querySelector('[data-question="Q1"]')?.textContent.includes('The gate passed.');
+  check(linked(answered) && !updates.hidden && !hasAnswer(),
+   'Refresh keeps the linked item open and offers Show updates.');
+  updates.click();
+  check(linked(answered) && updates.hidden && hasAnswer(),'Show updates displays the answer in the linked item.');
   check(chip('working').getAttribute('aria-pressed')==='true' &&
    chip('needs-me').dataset.filterCount==='1' && chip('morty-answering').dataset.filterCount==='0' &&
    document.querySelector('[data-list-count]').textContent.startsWith('1 of 2'),
