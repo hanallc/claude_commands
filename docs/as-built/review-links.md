@@ -224,6 +224,8 @@ The phone navigation starts closed and does not change the stored desktop state.
 `?page=<id>` selects a page.
 Missing and unknown ids select the first configured entry.
 Navigation clicks update this query with `history.replaceState`.
+A plain click on a console link from a page frame selects the destination in the shell.
+The console applies the link's recorded place and keeps the source frame open.
 
 The console URL also records the place of each opened page as `at.<id>=<path, query and fragment>`.
 A reload or a shared link opens each page at its recorded place.
@@ -276,8 +278,8 @@ The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
 The phone header keeps a compact button.
 The nonmodal panel shows two action entries with machine names, copy buttons, and card links.
-The panel footer opens Review with the reserved parameters `type=for-you` and `show=open`.
-The foryou-page phase adds the For you filter and card expansion.
+The panel footer opens Review with `type=for-you` and `show=open`.
+Each card link adds its stable action key as `item` and expands that card.
 Notifier links preserve the console query entries for other pages.
 Escape closes the panel and focuses the visible For you button.
 
@@ -334,13 +336,30 @@ The console inlines the icons and makes no CDN, font, script, or stylesheet requ
 
 ### Review page
 
+The For you Type chip follows All.
+It uses the same action reader as the console notifier.
+It defaults to Open and keeps the State, Owner, and Search controls.
+Done shows completed actions. All includes withdrawn actions and their reasons.
+The card shows the command, machine, working directory, requester, reason, waiting work, and completion method.
+Copy uses the shared code block. It leaves the action open.
+Done uses the signed Review form to complete an open manual action through the action store.
+The saved action leaves Open and appears in Done and All at once.
+The same signed Done request can return the saved result again.
+The console refreshes its count after the save.
+The notifier opens the selected action in a live Review document and keeps its drafts.
+If the frame shows an error, the console reloads Review at the requested place.
+Rebuild cards show automatic completion and link to the Rebuilds details.
+Review shows source read failures in the For you view.
+Review requests For you rows with `for-you=1` on index requests.
+The server omits those rows from index responses to older tabs.
+
 `/console/review.html` replaces the Changes, Questions and Investigations navigation pages.
 The old addresses redirect to Review with the corresponding type filter.
 The redirect retains the owner, filters, sort and open item.
 Legacy `row` fields become `item` fields.
-`not-read` and `answer ready` select Open.
-Old Investigations links with `show=open` or `show=all` select All.
-`read` selects Done.
+Old Investigations links with `show=not-read`, `show=answer ready`, or `show=read` select Open.
+Old Investigations links with `show=open` select Waiting.
+Old Investigations links with `show=all` select All.
 Legacy investigation owner filters retain the exact record owner.
 The Review navigation entry uses the Lucide `inbox` icon.
 Selected-row snapshots retain their signed legacy forms.

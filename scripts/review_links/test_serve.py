@@ -42,6 +42,7 @@ from scripts.aws_target import aws_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
+from scripts.for_you.action import ActionStore
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
 from scripts.production import (
@@ -138,6 +139,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(temporary / "investigations-state"),
             "CHANGE_REVIEW_DIR": str(temporary / "change-reviews"),
             "NEXT_STATE_DIR": str(temporary / "next"),
+            "FOR_YOU_ACTIONS_DIR": str(temporary / "for-you-actions"),
+            "REBUILD_NEEDS_DIR": str(temporary / "rebuild-needs"),
             "STAFF_FILE": str(staff_file)})))
         self.outside = temporary / "outside.txt"
         _ = self.outside.write_text("outside the served root", encoding="utf-8")
@@ -1630,9 +1633,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     snapshot = cache.get()
                     origin = review_items.submission_origin(snapshot.records[saved['key']])
                     assert isinstance(origin, new_item_dialog.ReviewSubmission)
-                    self.assertNotIn(origin.reply_token.encode(), replies[0].body + snapshot.payload + snapshot.page)
+                    self.assertNotIn(origin.reply_token.encode(), replies[0].body + snapshot.index_response() + snapshot.page)
                     if kind == new_item_dialog.SubmissionKind.BUG:
-                        self.assertNotIn(EVIDENCE.title.encode(), snapshot.payload)
+                        self.assertNotIn(EVIDENCE.title.encode(), snapshot.index_response())
                         card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': saved['key']}))
                         self.assertIn(EVIDENCE.title.encode(), card.body)
                         image, = origin.images
@@ -1766,6 +1769,9 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_snapshot_endpoints_do_not_read_stores_and_use_gzip(self) -> None:
         case = self.review_fixture()
         key=case.question()
+        action = ActionStore().add(title='Restore GitHub access', command='github-warmup', machine='natedev',
+                                   cwd='/fixture', requested_by=case.fixture.unit.id, reason='The login needs your browser.',
+                                   waits='The release check', concerns='admin-console', dedupe_key='github-access')
         snapshot=review_page.build_snapshot(case.root)
         with patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                 review_items,'read',side_effect=AssertionError('A GET read a store.')), patch.object(
@@ -1776,6 +1782,14 @@ class ReviewLinksServerTests(unittest.TestCase):
             index=self.request(review_page.PAGE_PATH+'?index=1')
             self.assertEqual(index.status,200)
             self.assertEqual(json.loads(index.body)['version'],snapshot.version)
+            legacy_rows = test_review_page.unpack_index(json.dumps(json.loads(index.body)['index']))
+            self.assertIn(key, {entry['key'] for entry in legacy_rows})
+            self.assertTrue(all(entry['type'] != review_items.ReviewType.FOR_YOU for entry in legacy_rows))
+            current = self.request(review_page.PAGE_PATH+'?index=1&for-you=1')
+            self.assertEqual(current.status, 200)
+            current_rows = test_review_page.unpack_index(json.dumps(json.loads(current.body)['index']))
+            self.assertIn(action.key, {entry['key'] for entry in current_rows if entry['type'] == review_items.ReviewType.FOR_YOU})
+            self.assertEqual(legacy_rows, [entry for entry in current_rows if entry['type'] != review_items.ReviewType.FOR_YOU])
             card=self.request(review_page.PAGE_PATH+'?'+urlencode({'body':key}))
             self.assertEqual(card.status,200)
             self.assertIn(b'data-review-form',card.body)
@@ -1788,8 +1802,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(response.status,200)
                 self.assertEqual(response.getheader('Content-Encoding'),'gzip')
                 self.assertEqual(response.getheader('Vary'),'Accept-Encoding')
-                self.assertEqual(gzip.decompress(wire),snapshot.index_response())
-                self.assertLess(len(wire),len(snapshot.index_response()))
+                self.assertEqual(gzip.decompress(wire), index.body)
+                self.assertLess(len(wire), len(index.body))
             finally:
                 connection.close()
 
@@ -1855,7 +1869,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         response = connection.getresponse()
                         wire = response.read()
                         self.assertEqual(response.getheader('Content-Encoding') == 'gzip', compressed)
-                        self.assertEqual(gzip.decompress(wire) if compressed else wire, snapshot.index_response())
+                        self.assertEqual(gzip.decompress(wire) if compressed else wire, snapshot.legacy_index.body)
                     finally:
                         connection.close()
 
@@ -3030,6 +3044,37 @@ class ReviewLinksServerTests(unittest.TestCase):
         start.reset_mock()
         self.assertEqual(self.post("/disks/measure", "force=1"), (200, answer))
         start.assert_called_once_with(ANY, force=True)
+
+    def test_review_records_signed_for_you_completion_once(self) -> None:
+        case = self.review_fixture()
+        store = ActionStore()
+        action = store.add(title='Restore GitHub access', command='github-warmup', machine='natedev',
+                           cwd='/fixture', requested_by=case.fixture.unit.id, reason='The login needs your browser.',
+                           waits='The release check', concerns='admin-console', dedupe_key='github-access')
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        snapshot = cache.get()
+        self.assertIn(b'<code>github-warmup</code>', snapshot.body(action.key))
+        request = case.card_body(snapshot, action.key, 'done')
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status)):
+            status, reply = self.post(review_page.PAGE_PATH, request.replace('token=', 'token=wrong'))
+            self.assertEqual(status, 400, reply)
+            self.assertEqual(store.get(action.key), action)
+            with patch.object(atomic_file, 'sync_folder', side_effect=OSError('The action directory sync failed.')):
+                status, reply = self.post(review_page.PAGE_PATH, request)
+            self.assertEqual(status, 200, reply)
+            self.assertEqual(json.loads(reply)['state'], 'Done')
+            completed = store.get(action.key)
+            self.assertEqual(completed.status, 'done')
+            self.assertTrue(completed.completed_at)
+            self.assertEqual(completed.evidence, 'Marked Done in Review.')
+            with patch.object(ActionStore, 'mark_done', side_effect=AssertionError('Done must not write again.')):
+                status, reply = self.post(review_page.PAGE_PATH, request)
+            self.assertEqual(status, 200, reply)
+            self.assertEqual(json.loads(reply)['state'], 'Done')
+            self.assertEqual(store.get(action.key), completed)
+        self.assertNotIn(b'value="done"', cache.get().body(action.key))
 
     def test_for_you_json_reads_global_actions_without_caching_the_response(self) -> None:
         payload: console.ForYouPayload = {"available": True, "count": 0, "entries": []}

@@ -582,7 +582,7 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   form.requestSubmit(form.querySelector('[value="question"]'));await complete;
  };
  try{
-  check(!document.querySelector('[data-show-chip="Done"]'),'Review has no Done chip.');
+  check(count('Done')===0,'Done has no rows for these records.');
   for(const [id,selected] of [['C1','all'],['C2','Validating']]){
    await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
@@ -663,9 +663,9 @@ window.fetch=async(url,options={})=>{
  };
  try{
   row('C1').querySelector('.list-toggle').click();await readyReviewCard(row('C1'));
-  const counts=()=>['open','Validating','all'].map(value=>
-   Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
-  check(!document.querySelector('[data-show-chip="Done"]'),'Review has no Done chip.');
+  const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
+  const counts=()=>['open','Validating','all'].map(count);
+  check(count('Done')===0,'Done has no rows for these records.');
   const before=counts();
   const form=row('C1').querySelector('form');await save(form,'validate');
   check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2]]),
@@ -793,7 +793,8 @@ window.fetch=async(url,options={})=>{
    check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
    if(entry.owner) check(page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===entry.owner &&
     visible.every(row=>row.dataset.sourceOwner===entry.owner),'F012: the legacy link keeps its owner.');
-   if(entry.type==='investigation') check(!page.querySelector('[data-show-chip="Done"],[data-state="Done"]'),
+   if(entry.type==='investigation') check(page.querySelector('[data-show-chip="Done"] b')?.textContent==='0' &&
+    !page.querySelector('[data-state="Done"]'),
     'F012: the legacy link shows only active states.');
    if(entry.item) check(!page.querySelector('[data-key="'+entry.item+'"] [data-detail]').hidden,'F012: legacy row opens its card');
    legacy.remove();
@@ -832,12 +833,14 @@ window.fetch=async(url,options={})=>{
    await new Promise(resolve=>requestAnimationFrame(resolve));
   }
   const page=frame.contentDocument;
+  const place=new URLSearchParams(frame.contentWindow.location.hash.slice(1));
   const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
-  if(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
+  if(place.get('show')!=='open' || place.get('source-owner')!==INVESTIGATION_OWNER ||
+   page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
    page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip!==INVESTIGATION_OWNER ||
    rows.length!==1 || rows[0].dataset.key!==READY_KEY || rows[0].dataset.sourceOwner!==INVESTIGATION_OWNER ||
-   page.querySelector('[data-key="'+READ_KEY+'"],[data-show-chip="Done"],[data-state="Done"]') ||
-   count('open')!=='1' || count('all')!=='2')
+   page.querySelector('[data-key="'+READ_KEY+'"],[data-state="Done"]') ||
+   count('open')!=='1' || count('all')!=='2' || count('Done')!=='0')
    failures.push('F012: the Read alias opens Open for its owner and excludes the completed record.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});

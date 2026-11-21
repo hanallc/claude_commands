@@ -269,9 +269,9 @@ SCRIPT = r'''const filterControl={
   }
  }
 };
-function recordPlaceParams(){
- const params=new URLSearchParams(location.search);
- const fragment=new URLSearchParams(location.hash.slice(1));
+function recordPlaceParams(target=location){
+ const params=new URLSearchParams(target.search);
+ const fragment=new URLSearchParams(target.hash.slice(1));
  for(const key of new Set(fragment.keys())) params.delete(key);
  for(const [key,value] of fragment) params.append(key,value);
  return params;

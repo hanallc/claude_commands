@@ -16,6 +16,7 @@ from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
 from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
+from scripts.for_you.action import review_place
 
 PHONE_QUERY = "(max-width:680px)"
 
@@ -240,7 +241,7 @@ def for_you_payload() -> ForYouPayload:
     for row in (row for row in snapshot.rows if row.status == "open"):
         if len(entries) == 2:
             break
-        place = "/console/review.html?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
+        place = review_place(row.key)
         entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
                         "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
     return {**count, "entries": entries}
@@ -279,6 +280,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
               + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count>?</b>'
               + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
+    content = content.replace("<!-- FOR YOU LINK -->", html.escape(place_query("review", review_place()), quote=True))
     content = content.replace("<!-- SHARED STYLES -->", page_frame.BUTTON_STATES + page_frame.COPY_STYLE + FOR_YOU_STYLE)
     notifier = FOR_YOU_SCRIPT
     if any(page.identity == "accounts" and isinstance(page.destination, AvailablePage) for page in pages):
@@ -556,7 +558,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
 <p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
 <div data-for-you-entries></div>
-<footer><a data-for-you-card href="?page=review&amp;at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen">Open For you →</a></footer>
+<footer><a data-for-you-card href="<!-- FOR YOU LINK -->">Open For you →</a></footer>
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
@@ -576,7 +578,10 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const frameArea = document.querySelector('.frame-area');
   // Each opened page keeps a live frame, so a page keeps its filter, card, scroll and typed text.
   const frames = new Map();
+  const frameNavigation = new WeakMap();
   const placeKey = identity => 'at.' + identity;
+  const legacyTypes = new Map([['changes','change'],['questions','question'],['investigations','investigation']]);
+  const reviewEntry = entries.find(entry => entry.dataset.page === 'review');
   const storageKey = 'admin-console.navigation-collapsed';
   let desktopCollapsed = false;
   try { desktopCollapsed = localStorage.getItem(storageKey) === 'true'; } catch (_) {}
@@ -610,7 +615,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   function record(entry) {
     let place, state = history.state;
     try {
-      const child = frames.get(entry.dataset.page).contentWindow;
+      const frame = frames.get(entry.dataset.page);
+      if (!frameNavigation.get(frame)?.canRecord()) return;
+      const child = frame.contentWindow;
       const at = child.location;
       place = placeOf(entry, at.pathname + at.search + at.hash);
       if (entry.dataset.page === 'review') {
@@ -634,19 +641,61 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     const target = savedPlace();
     const restored = history.state?.reviewPlace;
     if (entry.dataset.page === 'review' && restored?.place === target) frame.reviewPlace = restored;
-    frame.src = target;
+    let pendingPlace, readyDocument, retry;
+    let reloading = false;
+    const recordPlace = () => record(entry);
+    function applyPlace() {
+      const doc = frame.contentDocument;
+      if (!pendingPlace || !doc || doc !== readyDocument || reloading) return;
+      const child = frame.contentWindow;
+      const place = pendingPlace;
+      pendingPlace = undefined;
+      if (typeof child.consoleNavigate === 'function' && child.location.pathname === new URL(place, location.href).pathname) {
+        child.consoleNavigate(place);
+      } else {
+        reloading = true;
+        child.history.replaceState(null, '', place);
+        child.location.reload();
+      }
+    }
+    function connectDocument() {
+      const doc = frame.contentDocument;
+      if (!doc || doc === readyDocument) return;
+      clearTimeout(retry);
+      readyDocument = doc;
+      reloading = false;
+      doc.addEventListener('click', openFrameLink);
+      frame.contentWindow.addEventListener('hashchange', recordPlace);
+      frame.contentWindow.addEventListener('keydown', actions.escape, true);
+      if (pendingPlace) applyPlace();
+      else record(entry);
+    }
+    frameNavigation.set(frame, {
+      request(place) {
+        pendingPlace = place;
+        applyPlace();
+      },
+      canRecord() {
+        const doc = frame.contentDocument;
+        return !pendingPlace && !reloading && doc === readyDocument;
+      }
+    });
+    frame.addEventListener('console-document-ready', connectDocument);
     frame.addEventListener('load', () => {
       let loaded = false;
       try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}
       if (!loaded) {
-        // A refused load, such as during a server restart, shows the browser's error page; load the page again.
-        setTimeout(() => { frame.src = savedPlace(); }, Number(shell.dataset.frameRetrySeconds) * 1000);
+        // Retry a browser error page at the latest place.
+        clearTimeout(retry);
+        retry = setTimeout(() => {
+          frame.src = pendingPlace || savedPlace();
+          pendingPlace = undefined;
+        }, Number(shell.dataset.frameRetrySeconds) * 1000);
         return;
       }
-      record(entry);
-      frame.contentWindow.addEventListener('hashchange', () => record(entry));
-      frame.contentWindow.addEventListener('keydown', actions.escape, true);
+      connectDocument();
     });
+    frame.src = target;
     frames.set(entry.dataset.page, frame);
     frameArea.prepend(frame);
     return frame;
@@ -682,16 +731,17 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       showNews();
     } catch (_) {}
   }
-  function select(identity, navigate = false) {
-    if (['changes','questions','investigations'].includes(identity) && entries.some(entry=>entry.dataset.page==='review')) {
-      const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
+  function select(identity, navigate = false, destination) {
+    const kind = legacyTypes.get(identity);
+    if (kind && reviewEntry) {
       const url=new URL(location.href);
-      const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
+      const previous=new URL((destination ?? url).searchParams.get(placeKey(identity)) || '/console/changes.html',location.origin);
       const filters=new URLSearchParams(previous.search);
       for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
       filters.set('type',kind);legacyReviewPlace(filters,kind);
       url.searchParams.set('at.review','/console/review.html#'+filters);
-      history.replaceState(null,'',url);identity='review';
+      openConsolePlace(reviewEntry, url, navigate);
+      return;
     }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];
     if (!selected) return;
@@ -722,6 +772,36 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     showNews();
     loadNews();
     if (navigate && phone.matches) collapse(true);
+  }
+  function openConsolePlace(entry, destination, navigate = true) {
+    const identity = entry.dataset.page;
+    const key = placeKey(identity);
+    const requested = destination.searchParams.get(key);
+    if (requested && entry.dataset.url) {
+      const place = placeOf(entry, requested);
+      const url = new URL(location.href);
+      url.searchParams.set(key, place);
+      history.replaceState(history.state, '', url);
+      frameNavigation.get(frames.get(identity))?.request(place);
+    }
+    select(identity, navigate);
+  }
+  function openFrameLink(event) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = event.target.closest?.('a[target="_top"][href]');
+    if (!link || link.hasAttribute('download')) return;
+    const url = new URL(link.href);
+    if (url.origin !== location.origin || url.pathname !== '/console/') return;
+    const identity = url.searchParams.get('page');
+    if (reviewEntry && legacyTypes.has(identity)) {
+      event.preventDefault();
+      select(identity, true, url);
+      return;
+    }
+    const entry = pages.find(page => page.dataset.page === identity);
+    if (!entry) return;
+    event.preventDefault();
+    openConsolePlace(entry, url);
   }
   collapse(collapsed);
   pages.forEach(entry => entry.addEventListener('click', event => {
@@ -765,10 +845,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     } catch (_) {}
   }
   const actions = createForYouNotifier(url => {
-    history.replaceState(null, '', url);
-    const place = url.searchParams.get('at.review');
-    if (frames.has('review') && place) frames.get('review').src = place;
-    select('review', true);
+    const review = pages.find(entry => entry.dataset.page === 'review');
+    if (review) openConsolePlace(review, url);
   });
   select(new URL(location.href).searchParams.get('page'));
   function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }
