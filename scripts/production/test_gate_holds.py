@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import gate
+from scripts.production import gate, showrunners
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
@@ -59,6 +59,8 @@ class MergeGateHoldTests(TemporaryHoldTest):
         _ = (process / "stat").write_bytes(Path(f"/proc/{os.getpid()}/stat").read_bytes())
         self.environment = {**self.gate.environment, **hold_environment}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
+        _ = self.enterContext(mock.patch.object(
+            showrunners, "SHOWRUNNER_STATE_DIR", Path(self.environment["SHOWRUNNER_STATE_DIR"])))
 
     def record(self, event: str) -> None:
         with (self.gate.state / "modules.jsonl").open("a") as output:
@@ -82,6 +84,9 @@ class MergeGateHoldTests(TemporaryHoldTest):
                 self.hold()
                 before_merge = self.gate.git(self.gate.checkout, "rev-parse", "HEAD")
                 before_main = self.gate.git(self.gate.main, "rev-parse", "HEAD")
+                if mode == ["--promote-only"]:
+                    tip = self.gate.git(self.gate.origin, "rev-parse", "refs/heads/integration")
+                    _ = self.gate.save_ci_receipt(tip)
 
                 def release(_seconds: float) -> None:
                     self.assertEqual(self.gate.module_events(), [])

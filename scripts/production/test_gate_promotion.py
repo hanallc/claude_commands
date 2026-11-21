@@ -17,12 +17,12 @@ from types import SimpleNamespace
 from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, gate, staff
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production import change_review, gate, promotion, showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import MergeGateFixture, wait_for_file
-from scripts.lib import land_main, waiting_rows
+from scripts.lib import land_main
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
@@ -34,10 +34,10 @@ def setUpModule() -> None:
 
 class ProductionPublicationBoundaryTests(unittest.TestCase):
     def test_production_main_publication_uses_the_promotion_operation(self) -> None:
-        integration_publishers = {"ci_points.py", "merge_checkpoint.py", "merge_gate.py", "production_lifecycle.py"}
+        integration_publishers = {"ci_points.py", "merge_checkpoint.py", "gate.py", "production_lifecycle.py"}
         legacy_publishers = {
             "merge_checkpoint.py": {"push_git"},
-            "merge_gate.py": {"merge_checkpoint"},
+            "gate.py": {"merge_checkpoint"},
             "production_lifecycle.py": {"open_production", "wrap"},
         }
         for path in sorted(Path(__file__).parent.glob("*.py")):
@@ -64,7 +64,7 @@ class ProductionPublicationBoundaryTests(unittest.TestCase):
                         primitive = (isinstance(function, ast.Name) and function.id in land_names
                                      or isinstance(function, ast.Attribute) and function.attr == "land"
                                      and isinstance(function.value, ast.Name) and function.value.id in land_modules)
-                        if primitive and path.name not in ("fast_track.py", "gate.py"):
+                        if primitive and path.name != "fast_track.py":
                             direct_calls.append(node.lineno)
                         if isinstance(function, (ast.Name, ast.Attribute)):
                             name = function.id if isinstance(function, ast.Name) else function.attr
@@ -111,6 +111,12 @@ class MergeGatePromotionTests(MergeGateFixture):
             "GIT_CONFIG_SYSTEM": os.devnull,
             "SHOWRUNNER_STATE_DIR": str(Path(self.environment["HOME"]) / ".local/state/showrunner"),
         }
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(
+            showrunners, "SHOWRUNNER_STATE_DIR", Path(self.environment["SHOWRUNNER_STATE_DIR"])))
 
     @override
     def review_list(self) -> tuple[Path, Path]:
@@ -194,23 +200,21 @@ sys.meta_path.insert(0, NoRepositoryModules())
                 self.assertEqual(index_path.read_bytes(), index)
 
     def test_mac_timeout_or_interruption_reports_that_main_was_already_promoted(self) -> None:
-        args = gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
-                                       ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
+        args = self.publish_for_promotion()
+        promote_mac = gate.promote_mac
         for failure in (subprocess.TimeoutExpired("fake-ssh", 25), GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
-            with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(gate, "wait_for_release_lock"), mock.patch.object(
-                    gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, self.base]), mock.patch.object(
-                    land_main, "land", return_value=land_main.Landed(
-                        self.base, "main", land_main.Pushed(), land_main.HookAbsent())) as landed, mock.patch.object(
-                    waiting_rows, "move_to"), mock.patch.object(
-                    gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
-                    gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
-                    gate, "live_state_refusal", return_value=""), mock.patch.object(
-                    gate, "subprocess", SimpleNamespace(run=mock.Mock(side_effect=failure),
-                                                            DEVNULL=subprocess.DEVNULL,
-                                                            SubprocessError=subprocess.SubprocessError)):
-                with self.assertRaisesRegex(GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
-                    gate.promote(args)
-            landed.assert_called_once_with(self.main, self.base)
+            with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment):
+                def fail_mac(options: gate.GateArguments, main: Path, published: promotion.PublishedMain) -> None:
+                    with mock.patch.object(gate, "subprocess", SimpleNamespace(
+                            run=mock.Mock(side_effect=failure), DEVNULL=subprocess.DEVNULL,
+                            SubprocessError=subprocess.SubprocessError)):
+                        promote_mac(options, main, published)
+
+                with mock.patch.object(gate, "promote_mac", side_effect=fail_mac):
+                    with self.assertRaisesRegex(
+                            GateRefused, f"main promoted to {self.checkpoint}; Mac fast-forward failed"):
+                        gate.promote(args)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
         args = self.publish_for_promotion()
@@ -224,6 +228,122 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
+
+    def test_promotion_refuses_missing_or_stale_ci_for_the_exact_tip(self) -> None:
+        _ = self.publish_for_promotion()
+        receipt = self.save_ci_receipt(self.checkpoint)
+        receipt.unlink()
+        for state in ("missing", "stale"):
+            with self.subTest(receipt=state):
+                if state == "stale":
+                    _ = self.save_ci_receipt(self.base)
+                result = self.run_promote_only()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"collect quiet CI on {self.checkpoint}", result.stderr)
+                self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+                self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+        _ = self.save_ci_receipt(self.checkpoint)
+        result = self.run_promote_only()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+
+    def enrolled_fixture(self, *, enrolled: bool = True) -> tuple[Path, Path, str]:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        integration = self.root / "integration"
+        _ = self.git(self.checkout, "worktree", "add", str(integration), "integration")
+        doc = self.checkout / "docs/plans/cargo-liner-production-live.md"
+        legacy = (f"- **Showrunner checkout:** `{self.checkout}`\n"
+                  + "- **Merge branch:** `integration`\n- **Log:** `production.log`\n")
+        declared = legacy.replace(str(self.checkout), str(integration)) + f"- **Merge checkout:** `{self.checkout}`\n"
+        self.write(doc, declared if enrolled else legacy)
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = recorded_showrunner("cargo-liner", doc)
+        return integration, doc, declared
+
+    def test_promotion_retries_after_enrollment_and_requires_ci_for_the_new_tip(self) -> None:
+        for enrolled in (True, False):
+            with self.subTest(enrolled_at_first_push=enrolled):
+                if not enrolled:
+                    self.restore_fixture(self.suites)
+                _ = self.publish_for_promotion()
+                integration, doc, declared = self.enrolled_fixture(enrolled=enrolled)
+                _ = self.save_ci_receipt(self.checkpoint, production="cargo-liner",
+                                         policy="cargo-liner" if enrolled else "standard")
+                options = ("--production", "cargo-liner", "--main-repo",
+                           str(self.main if enrolled else self.checkout))
+                hook = self.origin / "hooks/pre-receive"
+                self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                           + '  if [ "$ref" = refs/heads/main ]; then echo "injected push failure" >&2; exit 1; fi\n'
+                           + "done\n")
+                hook.chmod(0o755)
+                stopped = self.run_promote_only(*options)
+                self.assertIn("injected push failure", stopped.stderr)
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.checkpoint)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+                hook.unlink()
+                self.write(doc, declared)
+
+                self.write(integration / "next.txt", "next candidate\n")
+                latest = self.commit(integration, "new integration candidate")
+                _ = self.git(integration, "push", "origin", "integration")
+                held = self.run_promote_only(*options)
+                self.assertNotEqual(held.returncode, 0, held.stdout + held.stderr)
+                self.assertIn(f"collect cargo-liner CI on the integration tip before promoting {latest}", held.stderr)
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.checkpoint)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+                _ = self.save_ci_receipt(latest, production="cargo-liner", policy="cargo-liner")
+                result = self.run_promote_only(*options)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), latest)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), latest)
+                self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
+
+    def test_checkpoint_and_promote_only_refuse_a_branch_other_than_the_production_branch(self) -> None:
+        for mode in ("checkpoint", "promote-only"):
+            with self.subTest(mode=mode):
+                options = ("--merge-branch", "main")
+                result = self.run_gate(*options) if mode == "checkpoint" else self.run_promote_only(*options)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{self.quiet_production}: expected merge branch integration", result.stderr)
+                self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_legacy_production_can_publish_its_main_checkpoint_without_ci(self) -> None:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
+        result = self.run_gate("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^2"), self.checkpoint)
+
+    def test_enrolled_gate_refuses_incoming_live_files_in_both_publication_modes(self) -> None:
+        integration, doc, declared = self.enrolled_fixture()
+        relative_doc = doc.relative_to(self.checkout)
+        self.write(self.unit / relative_doc, "tracked copy\n")
+        checkpoint = self.commit(self.unit, "track a live production document")
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
+        options = ("--production", "cargo-liner")
+        result = self.run_gate(*options, checkpoint=checkpoint)
+        self.assert_refused_before_gate(result)
+        self.assertIn(str(doc), result.stderr)
+        self.assertEqual(self.git(integration, "rev-parse", "HEAD"), self.base)
+
+        _ = self.git(integration, "merge", "--ff-only", checkpoint)
+        _ = self.git(integration, "push", "origin", "integration")
+        _ = self.save_ci_receipt(checkpoint, production="cargo-liner", policy="cargo-liner")
+        result = self.run_promote_only(*options)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("incoming tree conflicts with live production files", result.stderr)
+        self.assertIn(str(doc), result.stderr)
+        self.assertEqual(doc.read_text(encoding="utf-8"), declared)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_promotion_rejects_an_unrecorded_commit_with_the_same_tree(self) -> None:
         args = self.publish_for_promotion()
