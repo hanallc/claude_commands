@@ -1096,3 +1096,20 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   2. No temporary worktree remains after pass, red, conflict and recovery tests.
   3. Each `test_merge_checkpoint*.py` module passes; basedpyright zero errors and warnings on changed files.
   4. The full gate runs at the merge.
+
+### Phase 419 — a killed page test leaves no browser behind  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** when a page test process dies without its cleanup (time limit, SIGKILL, a stopped shell), its headless Firefox and Chrome stop too. On 2026-11-21 nate found a headless Firefox from `scripts.review_links.test_list_page` alive for two days (13 processes, 0.42 GiB) after its test shell ended.
+- **Spec:**
+  1. `test_list_page.py:121-127` and `:250-253` start Chrome and Firefox with `start_new_session=True`. Cleanup (`_stop_browser`, class cleanups) runs only when the test process lives to run it, and a group kill of the test does not reach the new session.
+  2. Make each browser stop when the test process that started it dies, on every exit path, with one shared helper for all page tests that start a browser (`test_list_page.py`, `test_review_page.py`, `test_accounts_page.py`, `test_serve.py`; check each). Add no signal handler, mask or disposition in the test process (builds rule, 2026-11-15).
+  3. Keep `_stop_browser` group stops for the normal path.
+- **Files:** `scripts/review_links/test_list_page.py`; the other page test modules that start a browser; one shared test helper module in `scripts/review_links/`.
+- **Workers:** 1 writer.
+  - impl: all; one shared helper and its callers.
+- **Constraints from prior phases:** none.
+- **Acceptance gate:**
+  1. A test starts the helper's browser stand-in from a child process, SIGKILLs that child, and proves the browser process ends within 10 s.
+  2. Each changed page test module passes; basedpyright zero errors and warnings on changed files.
