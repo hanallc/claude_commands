@@ -10,7 +10,6 @@ except FileNotFoundError:
 import argparse
 import os
 import sqlite3
-import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
 from scripts.lib import build_folders
+from scripts.worktree import worktrees
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
@@ -100,7 +100,7 @@ class NoStyleProduction:
 
     @property
     def checkout(self) -> Path:
-        return self.repository.parent / self.name
+        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name, "production")
 
     @property
     def doc(self) -> Path:
@@ -402,30 +402,17 @@ def main(argv: list[str]) -> int:
             for number, step in enumerate(steps, 1):
                 print(f"{number}. {step}")
             return 0
+        if not existing and style.name not in showrunners.timer_names() and herdr_tab_open(style.name, NoEndingTab()):
+            raise Refusal(_open_session_guidance(style, "live session without an update timer"))
+        branch = (build_folders.ExistingWorktreeBranch(style.merge_branch)
+                  if worktrees.has_branch(style.repository, style.merge_branch)
+                  else build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip))
+        layout = worktrees.output_record(build_folders.repo_word(style.repository), style.name, "production")
+        _ = worktrees.create_checkout(style.checkout, style.repository, branch, layout, owner=style.name,
+                                      allow_empty=True, allow_existing=True)
         if existing:
             _attach(style)
             return 0
-        if style.name not in showrunners.timer_names() and herdr_tab_open(style.name, NoEndingTab()):
-            raise Refusal(_open_session_guidance(style, "live session without an update timer"))
-        if not (style.checkout / ".git").exists():
-            present = subprocess.run(
-                ["git", "-C", str(style.repository), "show-ref", "--verify", "--quiet", f"refs/heads/{style.merge_branch}"],
-                check=False, capture_output=True, text=True,
-            )
-            branch: build_folders.NewWorktreeBranch | build_folders.ExistingWorktreeBranch
-            if present.returncode == 1:
-                branch = build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip)
-            elif present.returncode:
-                raise Refusal(present.stderr.strip())
-            else:
-                branch = build_folders.ExistingWorktreeBranch(style.merge_branch)
-            checkout_mode = stat.S_IMODE(style.checkout.stat().st_mode) if style.checkout.exists() else None
-            if checkout_mode is not None:
-                style.checkout.rmdir()
-            _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
-                style.checkout, style.repository, branch))
-            if checkout_mode is not None:
-                style.checkout.chmod(checkout_mode)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)
@@ -454,7 +441,8 @@ def main(argv: list[str]) -> int:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
         _attach_parent(style)
         return 0
-    except (Refusal, rules.RuleValidationError, style_ledger.LedgerError, OSError, ValueError, sqlite3.Error) as error:
+    except (Refusal, worktrees.Refused, rules.RuleValidationError, style_ledger.LedgerError,
+            OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
 

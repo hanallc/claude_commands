@@ -91,6 +91,20 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
+### Build filesystem space
+
+The natedev service reads `free_floor_gib` from the `[disk]` section of `build_admission.conf` each pass.
+The service measures available space at the configured `roots.slot_cargo` path once per pass.
+If space is below the floor or the reading fails, new local steps wait in order.
+Running steps continue.
+Eligible remote steps can start on a remote target.
+The Builds page and the queue head alert show the measured GiB and the floor or the read error.
+Older clients read the disk wait as a wait behind the build space floor.
+Waiters can refresh expired estimates during the hold.
+The next pass can start local steps when a successful reading reaches the floor.
+A missing floor leaves the space check disabled.
+If a reading fails, the service logs the error.
+
 ### Placement status
 
 `PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.

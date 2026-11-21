@@ -424,6 +424,18 @@ An interrupted run stops and reaps both log readers after recording its result. 
 
 - Routing reads configured targets through `targets.py`. `verify.sh` waits on held natedev, or tries the Mac while natedev is held; it never falls back to a held target. While both are unavailable it prints `verify.sh: natedev is held by <holder> for <reason>.` and `verify.sh: waiting for the Mac (<reason>) or natedev's release.`, once and again only on change. A local run prints `verify.sh: running on natedev`. Calls carry `mac`, `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target` and `hold_wait_s`; `BUILDLOG_MAC_HOLDER` carries the busy holder, is never exported, and is cleared when a later answer is no longer busy. An interrupted retry keeps the earlier decline and holder.
 
+### Mac gate cleanup
+
+An active Mac gate uses the lifecycle script that started the run.
+Its close hook stops the attempt with the script uploaded to the Mac during preparation.
+When a later queue run finds an ended gate, it calls the installed natedev lifecycle script.
+The saved script name identifies the callback.
+The current callback invokes the installed Mac gate script to stop the attempt.
+It checks the saved checkout path even if the attempt folder is absent.
+For older inline checkouts without a journal, it checks for test processes before removal.
+Custom callbacks use their saved path.
+The queue removes its run record and receipt after the callback confirms cleanup.
+
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
 
 It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac run <sha9>" --worktree $repo --wait 600`), so the claim is the repository's; claim exit 10, 11 or 12 prints the claim's line and exits 9. When the clone already holds the commit, nothing is sent and the clone checks it out. `INT`, `TERM` and `HUP` run `stop_mac_run` (one ssh call that ends the clone's builds and test processes and removes its temp files), release, and exit 128 plus the signal.
