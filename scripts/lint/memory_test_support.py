@@ -15,7 +15,6 @@ require_checkout(Path(__file__))
 
 
 ADMISSION_CONFIG_FIXTURE = Path(__file__).with_name("fixtures") / "build_admission.conf"
-TARGETS_CONFIG_FIXTURE = ADMISSION_CONFIG_FIXTURE.with_name("build_targets.conf")
 
 
 @cache
@@ -34,8 +33,6 @@ def admission_policy_fixture() -> AdmissionPolicy:
 
 
 def _template(name: str) -> Path:
-    if name == TARGETS_CONFIG_FIXTURE.name:
-        return TARGETS_CONFIG_FIXTURE
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
@@ -136,8 +133,7 @@ def commit_config_fixture(path: Path) -> None:
 def config_environment(root: Path, *, fixture_defaults_only: bool = False) -> dict[str, str]:
     """Give subprocesses a private configuration folder."""
     folder = root
-    fixtures = {source.name: source for source in (ADMISSION_CONFIG_FIXTURE, TARGETS_CONFIG_FIXTURE)}
-    names = set(fixtures)
+    names = {ADMISSION_CONFIG_FIXTURE.name}
     if not fixture_defaults_only:
         names.update(source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"))
     for name in sorted(names):
@@ -145,7 +141,7 @@ def config_environment(root: Path, *, fixture_defaults_only: bool = False) -> di
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
             if fixture_defaults_only:
-                _ = write_config_fixture(destination, template=fixtures[name])
+                _ = write_config_fixture(destination, template=ADMISSION_CONFIG_FIXTURE)
             elif name in TEST_CONFIG_DEFAULTS:
                 _ = write_config_fixture(destination)
             else:

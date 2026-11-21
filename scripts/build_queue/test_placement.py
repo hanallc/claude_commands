@@ -53,6 +53,9 @@ class PlacementFixture(AdmissionFixture):
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         super().__init__(fixture_defaults_only=fixture_defaults_only)
         if fixture_defaults_only:
+            _ = (self.root / "build_targets.conf").write_text(
+                "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                + "kind.natedev=local\nplatform.natedev=linux\n# one of: on, off\nenabled.mac=on\n")
             _ = (self.root / "mac_test.conf").write_text("# range: 0.01..300\nprobe_timeout_s=5\n")
 
     @override
@@ -2487,7 +2490,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertIsInstance(saved.permission, placement.PermissionConsumed)
                 fixture.clock.advance(1)
                 if switch == "off":
-                    _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac=off\n")
+                    registry = fixture.root / "build_targets.conf"
+                    _ = registry.write_text(registry.read_text().replace("enabled.mac=on\n", "enabled.mac=off\n"))
 
                 self.assertEqual(fixture.connect(request).replies(), [wire.Assignment(saved.assignment)])
                 self.assertEqual(service.read_state(fixture.state_dir).assignments[key].permission, saved.permission)

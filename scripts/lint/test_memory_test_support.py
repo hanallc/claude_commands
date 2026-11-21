@@ -12,16 +12,16 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
-    def test_target_registry_uses_a_private_fixture(self) -> None:
-        tracked = Path(__file__).resolve().parents[2] / "config" / "build_targets.conf"
+    def test_fixture_defaults_read_no_checkout_configuration(self) -> None:
+        tracked = Path(__file__).resolve().parents[2] / "config"
         read_text, read_bytes = Path.read_text, Path.read_bytes
 
         def fixture_text(path: Path) -> str:
-            self.assertNotEqual(path, tracked)
+            self.assertFalse(path.is_relative_to(tracked))
             return read_text(path)
 
         def fixture_bytes(path: Path) -> bytes:
-            self.assertNotEqual(path, tracked)
+            self.assertFalse(path.is_relative_to(tracked))
             return read_bytes(path)
 
         with (tempfile.TemporaryDirectory() as directory,
@@ -29,11 +29,9 @@ class ConfigFixtureTests(unittest.TestCase):
             mock.patch.object(Path, "read_bytes", new=fixture_bytes),
         ):
             root = Path(directory)
-            private = Path(config_environment(root)["BUILD_TARGETS_CONFIG"])
-            self.assertEqual(private, root / "build_targets.conf")
-            self.assertIn("enabled.mac=on\n", private.read_text())
-            _ = write_config_fixture(private, "enabled.mac=off\n")
-            self.assertIn("enabled.mac=off\n", private.read_text())
+            environment = config_environment(root, fixture_defaults_only=True)
+            self.assertEqual(environment["BUILD_TARGETS_CONFIG"], str(root / "build_targets.conf"))
+            self.assertEqual(list(root.iterdir()), [root / "build_admission.conf"])
 
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
