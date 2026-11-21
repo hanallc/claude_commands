@@ -3,7 +3,6 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
-import re
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -842,32 +841,6 @@ class MemoryHoverTests(unittest.TestCase):
         fields = {row["label"]: row["value"] for row in rows}
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
-
-    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
-        fixture = test_memory_feed.MemoryFeedTests()
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
-        data = fixture.copies_slot_page("python3 /fixture/check.service.sh", source="/fixture/startup",
-                                       unit="startup", staff_id="staff-startup")
-        row, = data["waiters"]
-        key = row.get("key")
-        self.assertIsNotNone(key)
-        body = cast(list[str], self.page_expression(
-            f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}',data)])",
-            cast(object, json.loads(memory_feed.page_json(data))), walk=True))
-        unit = re.search(r'<tr class="wait wait-first"[^>]*>.*?<td class="unit"><span class="cell-text">([^<]*)</span></td>',
-                         body[0])
-        self.assertIsNotNone(unit)
-        assert unit is not None
-        self.assertEqual(unit[1], "startup")
-        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
-
-    def test_repository_slot_wait_has_no_memory_group(self) -> None:
-        data = {"waiters": [{"kind": "repository-slot", "name": "widget build", "need": 0,
-                            "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
-        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-0', data)", data))
-        self.assertEqual({row["label"]: row["value"] for row in rows}["Waits for"], "build slot")
-        self.assertTrue({"Needs", "Free", "Short by"}.isdisjoint(row["label"] for row in rows))
 
     def test_heading_keeps_all_structured_priority_entries(self) -> None:
         data = {"unmatched_priority_entries": [{"unit": "research", "why": "first"},

@@ -45,7 +45,7 @@ from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
-from scripts.build_queue import queue_snapshot, slot_wait
+from scripts.build_queue import queue_snapshot
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
@@ -1202,7 +1202,7 @@ class PendingCoordinatorEvidence:
 
 @dataclass(frozen=True)
 class DeferredOwnerRequest:
-    request: wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest | wire.RepositorySlotRequest
+    request: wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest
     connection: Connection
     arrived_monotonic: float
 
@@ -1272,15 +1272,6 @@ class WaitingAdmission:
     last_reply: wire.Wait | NoWaitReply = NoWaitReply()
     last_sent: float = float("-inf")
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
-
-
-@dataclass
-class WaitingRepositorySlot:
-    """The loop owns this connection until capacity or the deadline ends its wait."""
-    request: wire.RepositorySlotRequest
-    connection: Connection | NoConnection
-    reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired | NoWaitReply = NoWaitReply()
-    last_sent: float = float("-inf")
 
 
 @dataclass(frozen=True)
@@ -1476,7 +1467,6 @@ class AdmissionServer:
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
         self.pending_cloud_groups: dict[str, PendingCloudGroup] = {}
-        self.repository_slot_waiters: dict[str, WaitingRepositorySlot] = {}
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
@@ -1934,8 +1924,7 @@ class AdmissionServer:
     def _known_owner(self, owner: wire.Owner) -> bool:
         return (any(isinstance(watch, OwnerWatch) and watch.owner == owner for watch in self.watchers.values())
                 or any(place.owner == owner for place in self.places.values())
-                or any(waiter.request.owner == owner for waiter in self.waiters.values())
-                or any(waiter.request.owner == owner for waiter in self.repository_slot_waiters.values()))
+                or any(waiter.request.owner == owner for waiter in self.waiters.values()))
 
     def _confirm_omitted_owner(self, pid: int, evidence: SystemEvidence) -> OwnerStartReading:
         if self.owner_confirmation_reading is not evidence.reading_identity:
@@ -2382,7 +2371,6 @@ class AdmissionServer:
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
-        self._advance_repository_slots()
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -2493,7 +2481,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        interval = (config.waiting_pass_seconds if self.waiters or self.repository_slot_waiters or any(self._placement_waiting(request)
+        interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
         if starts or cloud_started:
@@ -2659,11 +2647,7 @@ class AdmissionServer:
         if recorded_launch:
             self.persist()
         waiting_cloud = self._cloud_waiters()
-        slot_rows = tuple(wire.RepositorySlotRow(waiting.request.owner, waiting.request.identity,
-            waiting.request.since, waiting.request.machine, waiting.reply)
-            for waiting in sorted(self.repository_slot_waiters.values(), key=lambda item: (item.request.since, item.request.owner.pid))
-            if isinstance(waiting.reply, wire.RepositorySlotWaiting))
-        if not rows and not waiting_cloud and not slot_rows:
+        if not rows and not waiting_cloud:
             return reading
         for waiting in waiting_cloud:
             request = waiting.request
@@ -2673,61 +2657,7 @@ class AdmissionServer:
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
                 progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
-            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes, repository_slots=slot_rows)
-
-    def _advance_repository_slots(self) -> None:
-        if not self.repository_slot_waiters:
-            return
-        pools: dict[tuple[str, str, str], list[WaitingRepositorySlot]] = {}
-        for waiting in tuple(self.repository_slot_waiters.values()):
-            request = waiting.request
-            if not self._live(request.owner):
-                self._remove_waiter(waiting, wire.Refused("slot waiter owner no longer exists"))
-                continue
-            pools.setdefault((request.repository, request.machine, request.root), []).append(waiting)
-        if not pools:
-            return
-        locks = read_proc_text(Path("/proc/locks"))
-        now = self.clock.now()
-        for (repository, machine, root), waiting_pool in pools.items():
-            pool = slot_wait.read_pool(repository, machine, Path(root), locks)
-            available = len(pool.held) < pool.maximum
-            for waiting in sorted(waiting_pool, key=lambda item: (item.request.since, item.request.owner.pid)):
-                request = waiting.request
-                reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired
-                if now >= request.deadline:
-                    reply = wire.RepositorySlotExpired(pool.expired_text)
-                elif available:
-                    reply = wire.RepositorySlotReady()
-                    available = False
-                else:
-                    reply = wire.RepositorySlotWaiting(repository, pool.held, pool.maximum, pool.maximum_key)
-                previous = waiting.reply
-                waiting.reply = reply
-                if not isinstance(reply, wire.RepositorySlotWaiting):
-                    self._remove_waiter(waiting, reply)
-                    continue
-                repeat_due = (isinstance(self.last_usable_configuration, records.MemoryConfig)
-                              and now - waiting.last_sent >= self.last_usable_configuration.wait_reply_seconds)
-                if isinstance(waiting.connection, Connection) and (previous != reply or repeat_due):
-                    self._send(waiting.connection, reply)
-                    waiting.last_sent = now
-
-    def _repository_slot(self, request: wire.RepositorySlotRequest,
-                         connection: Connection | NoConnection) -> list[wire.Reply]:
-        waiting = self.repository_slot_waiters.get(request.episode)
-        if waiting is None:
-            waiting = WaitingRepositorySlot(request, connection)
-            self.repository_slot_waiters[request.episode] = waiting
-        elif waiting.connection is not connection:
-            self._remove_waiter(waiting)
-            waiting.connection = connection
-            self.repository_slot_waiters[request.episode] = waiting
-        self._advance_repository_slots()
-        self._publish_replies()
-        if isinstance(waiting.reply, NoWaitReply):
-            return [wire.Refused("slot waiter owner no longer exists")]
-        return [waiting.reply]
+            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
@@ -4555,9 +4485,7 @@ done
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
-            members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
-            identity = self._named_identity(request.identity, members=members)
-            return self._repository_slot(replace(request, identity=identity), connection)
+            return [wire.Refused("Repository copy capacity no longer requires admission")]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, wire.PlacementRequest):
@@ -4808,36 +4736,29 @@ done
         if isinstance(waiting.connection, Connection):
             self._send(waiting.connection, reply)
 
-    def _remove_waiter(self, waiting: WaitingAdmission | WaitingRepositorySlot | None,
+    def _remove_waiter(self, waiting: WaitingAdmission | None,
                        reply: wire.Reply | NoWaitReply = NO_WAIT_REPLY, *,
                        claim_disposition: WaiterClaimDisposition = WaiterClaimDisposition.RELEASE) -> None:
         if waiting is None:
             return
         episode = waiting.request.episode
-        if isinstance(waiting, WaitingAdmission):
-            del self.waiters[episode]
-            if claim_disposition is WaiterClaimDisposition.RETURN and episode not in self.current_assignments:
-                self._free_claim(records.waiter_owner(waiting.row))
-            elif claim_disposition is not WaiterClaimDisposition.TRANSFER:
-                claim = waiting.continuation_claim
-                if isinstance(claim, records.ContinuationSlot) and self.slots.get(claim.slot.reservation) is claim:
-                    del self.slots[claim.slot.reservation]
-            if not isinstance(reply, NoWaitReply):
-                self._deliver(waiting, reply)
-                return
-        else:
-            del self.repository_slot_waiters[episode]
-        if isinstance(waiting.connection, Connection):
-            if isinstance(reply, NoWaitReply):
-                self._close_connection(waiting.connection)
-            else:
-                self._send(waiting.connection, reply)
+        del self.waiters[episode]
+        if claim_disposition is WaiterClaimDisposition.RETURN and episode not in self.current_assignments:
+            self._free_claim(records.waiter_owner(waiting.row))
+        elif claim_disposition is not WaiterClaimDisposition.TRANSFER:
+            claim = waiting.continuation_claim
+            if isinstance(claim, records.ContinuationSlot) and self.slots.get(claim.slot.reservation) is claim:
+                del self.slots[claim.slot.reservation]
+        if not isinstance(reply, NoWaitReply):
+            self._deliver(waiting, reply)
+        elif isinstance(waiting.connection, Connection):
+            self._close_connection(waiting.connection)
 
     def _send(self, connection: Connection, reply: wire.Reply) -> None:
         if connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
-        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.RepositorySlotWaiting))
+        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
         if connection.finished:
             self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
@@ -4899,11 +4820,6 @@ done
         self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]
 
     def _disconnect(self, connection: Connection) -> None:
-        removed = [waiting for waiting in self.repository_slot_waiters.values() if waiting.connection is connection]
-        for waiting in removed:
-            self._remove_waiter(waiting)
-        if removed:
-            self._publish_replies()
         detached = self._detach_admission(connection)
         self._close_connection(connection)
         if detached:
@@ -4987,7 +4903,7 @@ done
                     connection.request = request
                 connection.received = b""
                 if (not isinstance(self.system_reader, NoSystemReader)
-                        and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
+                        and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
                         and ((process := self.system_reader.latest.processes.get(request.owner.pid)) is None
                              or process.start != request.owner.start_time)):
                     self.deferred_requests.append(DeferredOwnerRequest(request, connection, self.clock.monotonic()))
