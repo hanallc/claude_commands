@@ -194,9 +194,15 @@ The supervisor needs a restart request; an exited child alone does not cause a r
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
 
-The staff row lock covers each member through its build wait, stop, and resume.
-The batch verifies each reference and reads the current conversation while it holds the row lock.
-If a native session gains a staff row, the batch acquires the staff row lock before it acts.
+Each move and unit attachment acquires the native session lock first.
+If the session has a staff row, the operation also acquires that row lock.
+The move holds both locks through its build wait, stop, and resume.
+If the native session changes during a build wait, the move releases the old locks.
+It acquires the new native lock before it acquires the row lock again.
+Attachment refuses while a move holds either lock.
+Retired unit recovery holds both locks in the same order before it starts `add_unit --resume`.
+The child verifies both inherited lock descriptors in native-first order.
+The batch verifies each reference and reads the current conversation while it holds the locks.
 References to the same member share one move and receive the same result.
 Each build check uses the current conversation.
 The batch reports a move to the same account as in progress.
@@ -204,23 +210,44 @@ Other busy rows remain pending while the batch moves available members.
 The pending result is final for the batch and gives the user a retry command.
 The batch omits busy members from both the self-move and build handoffs.
 Each attempt reads the member's live account while it holds the row lock.
+If the read fails, the batch leaves the request file and writes no journal request.
+For a live source, the stop must prove the same PID and start time before it records the request.
+If the request append fails, the batch refuses that member before sending a stop signal.
 The batch reads the current role map for a group move.
 A single-session move uses the explicit account.
 The batch keeps a member running when its live account matches the target.
-The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
-The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.
-The batch refuses a member if its live source read fails.
-The stop verifies the live source PID and process start time before it records the source and sends a signal.
-A refused destination leaves the members running and goes in the batch result.
-The handoff carries the group name or explicit account and the results already collected.
-The child saves and reports the carried failures even if a startup read fails.
+The batch validates the Claude destination again after build waits and before launch preparation.
+A Claude destination needs a real account directory and a matching local sign-in.
+The sign-in needs an unexpired refresh token or an unexpired access token if only that token is present.
+A refused destination leaves the members running and keeps their request files.
+The handoff carries the request ID, target, and native session references.
+Before a stop or handoff, the parent writes the new request ID and target under the session locks.
+It writes one file per native session in `latest-requests` beside the move journal.
+The key stays the same when a session gains or loses a staff row.
+The mover checks the request ID under the locks before it stops the member.
+A detached child checks that it owns the request before it reports a member outcome.
+A superseded move reports `not moved: a newer move ran`.
+Success removes the move's own file under the locks.
+Failure leaves the file for retry.
+Each explicit group request checks all members, including members that appear to be on the target.
+If the live account matches the target, the request clears the earlier file under the native lock.
+A busy lock refuses a new request and prints a fresh `batch --target` command for its account.
+`retry` can run only a saved request.
+`result` and `retry` check live accounts under the session locks.
+They remove requests for members already on their target, including after `shutdown resume --to`.
+They remove a missing session's request only when a fresh read proves absence.
+Unknown liveness keeps the request and reports the cause.
+Both commands name each file with a decode error and continue with valid files.
+Legacy reports supply display data only.
+Both commands show a fresh batch command for an off-target legacy member.
+`retry` starts a new move for each saved request that still needs a move.
+The journal writer rolls back an incomplete append before it releases the journal lock.
 The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.
 
 The batch keeps the showrunner notices and sends one phone push for the members that still need help.
-The push shows qualified names and gives a short command to retry the batch.
+The push shows qualified names and gives a short command to retry pending moves.
 If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
-The saved batch result holds every pending name and its fixed reference.
-The sender uses the same key for retries of the batch.
+The group and target identify the phone push for repeat suppression.
 `MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
 A standalone resume failure still sends its own keyed push.
 Each completed member records its outcome without waiting for other resumes.

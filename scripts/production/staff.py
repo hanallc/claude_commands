@@ -913,10 +913,34 @@ def _slot_holder_suffix(lock: IO[bytes]) -> str:
 
 
 @contextmanager
-def slot_operation(key: str, name: str) -> Generator[None]:
+def session_operation(session: str, *, native_key: str, join_recovery: bool = False) -> Generator[StaffSnapshot]:
+    """Lock the native session before its staff row, if it has one."""
+    if join_recovery:
+        if not _joined_operation(*_row_lock(native_key)):
+            raise StaffRefused("recovery did not pass the native session lock")
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is None or not _joined_operation(*_row_lock(row.id)):
+            raise StaffRefused("recovery did not pass the staff row lock")
+        yield record
+        return
+    with slot_operation(native_key, session, join=False), ExitStack() as locks:
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is not None:
+            _ = locks.enter_context(slot_operation(row.id, row.name, join=False))
+            record = initial_snapshot()
+            current = record.by_current_session(session)
+            if current is None or current.id != row.id:
+                raise StaffRefused(f"{row.name}: the session owner changed while acquiring its row")
+        yield record
+
+
+@contextmanager
+def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
-    if _joined_operation(path, variable):
+    if join and _joined_operation(path, variable):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)

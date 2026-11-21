@@ -1333,15 +1333,20 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--model", default="")
     _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--join-recovery-locks", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     staff.validate_unit_name_for_write(cast(str, args.name))
     try:
+        from scripts.accounts import moves
+
         request = launch_request(args)
-        with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)
-                                 else request.unit_id):
-            identity_record = staff.initial_snapshot()
+        session = request.session
+        with (staff.session_operation(session.session_id, native_key=moves.native_row_key(session.session_id),
+                                      join_recovery=cast(bool, args.join_recovery_locks))
+              if isinstance(session, ResumedSession) else staff.row_operation(request.unit_id)) as locked:
+            identity_record = locked if isinstance(locked, staff.StaffSnapshot) else staff.initial_snapshot()
             request = launch_request(args, record=identity_record)
             explicit_autocompact = cast(str, args.autocompact)
             if (explicit_autocompact and isinstance(request.session, ResumedSession)

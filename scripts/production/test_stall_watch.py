@@ -1453,6 +1453,7 @@ runpy.run_path(str(script), run_name='__main__')
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(accounts, "check_move_target", return_value=destination),
               mock.patch.object(stop_resume, "_record_launches"),
+              mock.patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee")),
               mock.patch.object(stop_resume, "resume", side_effect=resumed),
               mock.patch.object(stall_watch, "read_place", side_effect=resume_during_inspection)):
