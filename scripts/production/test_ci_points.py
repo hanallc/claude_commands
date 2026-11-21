@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders
+from scripts.lib.git_test_support import fixture_git_environment
 
 import fcntl
 import json
@@ -199,7 +200,8 @@ class CiPointsTests(unittest.TestCase):
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
+        self.env = {**fixture_git_environment(self.root), **copies_environment(self.root, repository="origin"),
+                    "GIT_CONFIG_SYSTEM": os.devnull, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
@@ -1006,20 +1008,55 @@ PY
                 self.assertNotIn("--ci-green", collected.stdout)
                 self.assertFalse((self.state / "ci_points.json").exists())
 
-    def test_collect_rejects_red_required_job_and_unfinished_run(self) -> None:
+    def test_collect_checks_required_jobs_on_the_production_tip(self) -> None:
+        from scripts.agents.remote import local_machine
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
         tip = self.merge(1)
         self.ci_result(tip)
         _ = self.start_point()
-        for conclusion, status, test_suite in (("failure", "completed", "failure"),
-                                               ("", "in_progress", "")):
-            with self.subTest(conclusion=conclusion, status=status):
-                self.ci_result(tip, conclusion=conclusion, status=status, test_suite=test_suite)
-                collected = self.collect_point()
-                self.assert_step(collected, "ci collect", False)
-                self.assertIn("Test Suite" if status == "completed" else "CI", collected.stdout)
-                self.assertIn(tip, collected.stdout)
-                self.assertNotIn("--ci-green", collected.stdout)
-                self.assertFalse((self.state / "ci_points.json").exists())
+        _ = self.git("switch", "main")
+        integration = self.root / "integration"
+        _ = self.git("worktree", "add", str(integration), "production")
+        document = self.checkout / "docs/plans/cargo-liner-production-live.md"
+        self.write(document, self.doc.read_text(encoding="utf-8").replace(
+            f"- **Showrunner checkout:** `{self.checkout}`",
+            f"- **Showrunner checkout:** `{integration}`\n- **Merge checkout:** `{self.checkout}`"))
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            _ = fixture_member("showrunner", name="cargo-liner", doc=staff.LiveDoc(local_machine(), document))
+        cargo_state = self.state / "cargo-liner"
+        self.write(cargo_state / "ci_run.json", json.dumps({"repo": "example/cargo-liner", "run_id": "123", "tip": tip}))
+        for production, conclusion, status, test_suite, skipped, expected in (
+            ("example", "failure", "completed", "failure", "", "Test Suite"),
+            ("example", "", "in_progress", "", "", "CI"),
+            ("cargo-liner", "success", "completed", "skipped", "Format Check", "Format Check"),
+            ("cargo-liner", "success", "completed", "skipped", "", ""),
+        ):
+            with self.subTest(production=production, conclusion=conclusion, status=status, skipped=skipped):
+                state = self.state if production == "example" else cargo_state
+                if production == "example":
+                    self.ci_result(tip, conclusion=conclusion, status=status, test_suite=test_suite)
+                else:
+                    required = ("Detect Changes", "Format Check", "Taplo Check", "Clippy", "Mend Check")
+                    conditional = ("Build Check", "Test Suite", "cargo-mend Build Check", "cargo-mend Test Suite",
+                                   "Stable Without Bootstrap", "macOS cargo-tile", "Windows Build Check")
+                    jobs = [{"name": name, "conclusion": "skipped" if name == skipped or name in conditional else "success",
+                             "status": status} for name in (*required, *conditional)]
+                    self.write(self.stub_state / "ci-result.json", json.dumps({
+                        "databaseId": 123, "headSha": tip, "status": status, "conclusion": conclusion, "jobs": jobs,
+                    }))
+                collected = self.run_ci("ci", "collect", "--state-dir", str(state), production=production)
+                self.assert_step(collected, "ci collect", not expected)
+                if expected:
+                    self.assertIn(expected, collected.stdout)
+                    self.assertIn(tip, collected.stdout)
+                    self.assertNotIn("--ci-green", collected.stdout)
+                    self.assertFalse((state / "ci_points.json").exists())
+                else:
+                    self.assertEqual(collected.stdout.splitlines()[-1], f"--ci-green {tip}")
+                    self.assertNotEqual(self.git("rev-parse", "HEAD"), tip)
+                    self.assertEqual(ci_points.ci_record(state), ci_points.CiRecord(0, tip, "cargo-liner"))
 
     def test_collected_verdict_promotes_main_only_while_tip_matches(self) -> None:
         tip = self.merge(1)
@@ -1042,40 +1079,6 @@ PY
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
         self.assertIn("ci: held", held.stdout)
-
-    def test_cargo_liner_collects_filtered_ci_at_its_integration_tip(self) -> None:
-        from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
-
-        tip = self.merge(1)
-        _ = self.git("switch", "main")
-        integration = self.root / "integration"
-        _ = self.git("worktree", "add", str(integration), "production")
-        document = self.checkout / "docs/plans/cargo-liner-production-live.md"
-        self.write(document, self.doc.read_text(encoding="utf-8").replace(
-            f"- **Showrunner checkout:** `{self.checkout}`",
-            f"- **Showrunner checkout:** `{integration}`\n- **Merge checkout:** `{self.checkout}`"))
-        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            _ = fixture_member("showrunner", name="cargo-liner", doc=staff.LiveDoc("natedev", document))
-        self.write(self.state / "ci_run.json", json.dumps({"repo": "example/cargo-liner", "run_id": "123", "tip": tip}))
-        required = ("Detect Changes", "Format Check", "Taplo Check", "Clippy", "Mend Check")
-        conditional = ("Build Check", "Test Suite", "cargo-mend Build Check", "cargo-mend Test Suite",
-                       "Stable Without Bootstrap", "macOS cargo-tile", "Windows Build Check")
-        for skipped in ("Format Check", ""):
-            with self.subTest(skipped=skipped):
-                jobs = [{"name": name, "conclusion": "skipped" if name == skipped or name in conditional else "success",
-                         "status": "completed"} for name in (*required, *conditional)]
-                self.write(self.stub_state / "ci-result.json", json.dumps({
-                    "databaseId": 123, "headSha": tip, "status": "completed", "conclusion": "success", "jobs": jobs,
-                }))
-                result = self.run_ci("ci", "collect", "--state-dir", str(self.state), production="cargo-liner")
-                self.assert_step(result, "ci collect", not skipped)
-                if skipped:
-                    self.assertIn(skipped, result.stdout)
-                    self.assertFalse((self.state / "ci_points.json").exists())
-                else:
-                    self.assertEqual(result.stdout.splitlines()[-1], f"--ci-green {tip}")
-                    self.assertNotEqual(self.git("rev-parse", "HEAD"), tip)
 
     def test_watch_first_exit_three_reports_notifies_and_logs_once(self) -> None:
         _ = (self.stub_state / "watch-three").touch()

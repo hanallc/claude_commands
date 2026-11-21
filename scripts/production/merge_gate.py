@@ -2004,6 +2004,8 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str, *, legacy:
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
+    from scripts.production.checkpoint_gate import Stop, require_cargo_liner_promotion_ci
+
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
     source = Path(args.repo).resolve() if args.enrolled else main_repo
     hold = BuildHoldWait()
@@ -2030,6 +2032,10 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             target = record.commit
         if git(source, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
+        try:
+            require_cargo_liner_promotion_ci(main_repo, args.merge_branch, target)
+        except Stop as error:
+            raise GateRefused(str(error)) from error
         if refusal := live_file_refusal(source, target):
             raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
@@ -2128,8 +2134,6 @@ def merge_checkpoint(args: GateArguments) -> int:
     hold = BuildHoldWait()
     hold.wait_until_free()
     repo = Path(str(args.repo)).resolve()
-    # Untracked files (each showrunner's LOG) never block; a merge that would
-    # overwrite one fails on its own and is aborted.
     if checked_git(repo, "status", "--porcelain", "--untracked-files=no"):
         raise GateRefused("merge checkout has uncommitted tracked changes")
     if checked_git(repo, "branch", "--show-current") != args.merge_branch:
@@ -2159,6 +2163,11 @@ def merge_checkpoint(args: GateArguments) -> int:
             _ = change_review.publication_changes(commits, production, known_producer=producer)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
+    preview = git(repo, "merge-tree", "--write-tree", "--name-only", baseline, checkpoint)
+    if preview.returncode not in (0, 1) or not preview.stdout:
+        raise GateRefused(f"cannot preview checkpoint merge: {failure_detail(preview)}")
+    if refusal := live_file_refusal(repo, preview.stdout.splitlines()[0]):
+        raise GateRefused(refusal)
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
     if isinstance(recovery, GateRecovery):
@@ -2168,12 +2177,10 @@ def merge_checkpoint(args: GateArguments) -> int:
         recovery.save()
     try:
         hold.wait_until_free()
-        result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
+        result = git(repo, "merge", "--no-overwrite-ignore", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
         if result.returncode:
             conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
-            abort = git(repo, "merge", "--abort")
-            raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
-                              + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
+            raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}")
         merged = checked_git(repo, "rev-parse", "HEAD")
         if isinstance(recovery, GateRecovery):
             recovery.rollback_head = merged
