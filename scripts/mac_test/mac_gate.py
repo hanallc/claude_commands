@@ -299,16 +299,22 @@ def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
     root = '"$HOME"/' + shlex.quote(remote)
-    runner = f'/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py" {root}/mac_gate.py'
+    python = '/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py"'
+    runner = f'{python} {root}/mac_gate.py'
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
-    if phase == 'cleanup':
+    if phase in ('cleanup', 'cleanup-ended'):
         try:
             checkout = checkout_file.read_text()
         except FileNotFoundError:
             checkout = ''
-        cleanup = checkout_cleanup_command(root, runner, checkout)
+        if phase == 'cleanup-ended':
+            from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
+
+            cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
+        else:
+            cleanup = checkout_cleanup_command(root, runner, checkout)
         result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
         outcome = result.stdout.strip()
         if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
@@ -578,7 +584,7 @@ def main() -> int:
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
     _ = writer.add_argument('natedev_record', type=Path)
-    for phase in ('prepare', 'cleanup'):
+    for phase in ('prepare', 'cleanup', 'cleanup-ended'):
         callback = commands.add_parser(phase)
         _ = callback.add_argument('argv_file', type=Path)
         _ = callback.add_argument('folder', type=Path)
@@ -595,7 +601,7 @@ def main() -> int:
     _ = commands.add_parser('stop').add_argument('folder', type=Path)
     args = parser.parse_args(namespace=Arguments())
     try:
-        if args.action in ('prepare', 'cleanup'):
+        if args.action in ('prepare', 'cleanup', 'cleanup-ended'):
             return lifecycle(args.action, args.argv_file, args.folder, args.full)
         if args.action == 'clone':
             path = clone_checkout(args.folder, args.owner, args.repository, args.session)

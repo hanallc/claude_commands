@@ -577,6 +577,41 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
             unregister.assert_called_once_with('fixture-mac', checkout)
 
+    def test_ended_lifecycle_stops_the_old_attempt_with_the_installed_gate(self) -> None:
+        home = self.root / 'Mac home'
+        folder = home / mac_gate.REMOTE_ROOT / 'mac-gate-old'
+        folder.mkdir(parents=True)
+        argv = self.root / 'argv.json'
+        checkout = self.root / 'removed checkout'
+        _ = argv.with_suffix('.json.checkout').write_text(str(checkout))
+        cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
+        _ = (folder / 'mac_gate.py').write_text("raise SystemExit('Old gate script')\n")
+        shim = home / '.claude/scripts/lib/py'
+        shim.parent.mkdir(parents=True)
+        installed = home / '.claude/scripts/mac_test/mac_gate.py'
+        installed.parent.mkdir()
+        _ = installed.touch()
+        write_stdlib_tool(shim, 'import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        run = subprocess.run
+
+        def ssh(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[:-1], ['ssh', '-n', '-o', 'BatchMode=yes', 'fixture-mac'])
+            self.assertTrue(capture_output and text and not check)
+            expanded = run(['/bin/sh', '-c', command[-1]], capture_output=True, text=True,
+                           timeout=TEST_HANG_GUARD_SECS, check=True)
+            self.assertEqual(json.loads(expanded.stdout), [str(installed), 'stop', str(folder)])
+            return subprocess.CompletedProcess(command, 0, mac_gate.stop_checkout(folder) + '\n', '')
+
+        with (mock.patch.dict(os.environ, {**copies_environment(home), 'MAC_QUEUE_HOST': 'fixture-mac'}),
+              mock.patch.object(subprocess, 'run', side_effect=ssh),
+              mock.patch.object(scratch, 'end', return_value=[]) as end,
+              mock.patch.object(copies, 'unregister_remote') as unregister):
+            self.assertEqual(mac_gate.lifecycle('cleanup-ended', argv, self.root / folder.name, '0'), 0)
+        end.assert_called_once_with('gate:mac-gate-old')
+        self.assertEqual(unregister.call_args_list, [mock.call('localhost', str(checkout)),
+                                                     mock.call('fixture-mac', str(checkout))])
+        self.assertFalse(folder.exists())
+
     def test_missing_close_script_checks_the_mac_checkout_path(self) -> None:
         folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
         argv = self.root / 'argv.json'
