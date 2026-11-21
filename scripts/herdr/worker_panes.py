@@ -1110,7 +1110,7 @@ def _claude_worker_settings(settings: models_registry.LaunchSettings,
 def kept_settings(settings: models_registry.LaunchSettings, arguments: Sequence[str]) -> models_registry.LaunchSettings:
     """Keep the saved launch settings and use the role for missing Claude flags."""
     if settings.kind == "claude":
-        saved = pane_record.parse_claude_arguments(["claude", *arguments]).values
+        saved = pane_record.parse_claude_flags(arguments).values
         return _claude_worker_settings(settings, pane_record.ClaudeResumeSettings(
             saved.get("--model", ""), saved.get("--effort", "")))
     recorded = {"--model": "", "--effort": "", "model_reasoning_effort": "", "service_tier": ""}
