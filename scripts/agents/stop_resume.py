@@ -25,10 +25,11 @@ from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from hashlib import sha256
+from functools import partial
 from threading import Event, Lock
 from time import monotonic
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, Never, Protocol, cast, final, override
+from typing import TYPE_CHECKING, Literal, Never, Protocol, cast, final, overload, override
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -750,19 +751,51 @@ class LockedMoveRow:
 
 
 @dataclass(frozen=True)
+class LiveMoveSource:
+    """The process that supplied the source account for the move."""
+
+    session: ClaudeUp
+    pid: int
+    started: str
+
+
+@dataclass(frozen=True)
+class StoppedMoveSource:
+    """The source read found no live process."""
+
+
+@dataclass(frozen=True)
 class MoveStopTarget:
     """The locked row identifies the conversation the stop may act on."""
 
     member: ResolvedMoveMember
     identity: str
-    source: str = ""
+    source: LiveMoveSource | StoppedMoveSource
+
+
+@dataclass(frozen=True)
+class MoveRequestNotRecorded:
+    """The stop has no journal request."""
+
+
+@dataclass
+class MoveStopAttempt:
+    target: MoveStopTarget
+    write_request: Callable[[], moves.RequestedMove | MoveRequestNotRecorded]
+    request: moves.RequestedMove | MoveRequestNotRecorded = field(default_factory=MoveRequestNotRecorded)
+
+    def record_request(self) -> None:
+        try:
+            self.request = self.write_request()
+        except Exception as error:
+            print(f"{self.target.identity}: move log anomaly: {error}", file=sys.stderr)
 
 
 class StopTargetAtUse:
     """The stop must resolve its own target."""
 
 
-_move_stop_target: ContextVar[MoveStopTarget | StopTargetAtUse] = ContextVar(
+_move_stop_target: ContextVar[MoveStopAttempt | StopTargetAtUse] = ContextVar(
     "move_stop_target", default=StopTargetAtUse())
 
 
@@ -1077,7 +1110,8 @@ def _stop(session: str, kind: str = "", *,
     try:
         settings = conf.read("shutdown")
         stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("KILL_GRACE_SECONDS"))
-        pinned = _move_stop_target.get()
+        attempt = _move_stop_target.get()
+        pinned = attempt.target if isinstance(attempt, MoveStopAttempt) else attempt
         target = (pinned.identity if isinstance(pinned, MoveStopTarget)
                   and isinstance(pinned.member.owner, pane_launch.StaffLaunchReference) else stop_target(session))
         if isinstance(target, (SessionNotFound, StopFailed)):
@@ -1094,6 +1128,8 @@ def _stop(session: str, kind: str = "", *,
         kind = kind or _stop_backend(identity)
         observed = herdr.read_conversation(identity, kind, **({"codex": codex} if codex is not None else {}))
         if isinstance(observed, herdr.StoppedConversation):
+            if isinstance(pinned, MoveStopTarget) and isinstance(pinned.source, LiveMoveSource):
+                return StopFailed(identity, "the move source exited before the stop")
             return NotRunning(identity)
         if isinstance(observed, herdr.UnknownConversation):
             return StopUnproved(identity, observed.reason)
@@ -1107,8 +1143,16 @@ def _stop(session: str, kind: str = "", *,
         if proved.current_identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
+        if isinstance(pinned, MoveStopTarget):
+            source = pinned.source
+            if not isinstance(source, LiveMoveSource) or (source.pid, source.started) != (live.pid, started):
+                return StopFailed(identity, "the move source process changed before the stop; no signal sent")
         if not _same_process(live.pid, started):
+            if isinstance(pinned, MoveStopTarget):
+                return StopFailed(identity, "the move source exited before the stop")
             return NotRunning(identity)
+        if isinstance(attempt, MoveStopAttempt):
+            attempt.record_request()
         if not herdr.check_native_target(live.pid, kind, proved):
             return StopFailed(identity, "process identity changed; no signal sent")
         _signal_process(live.pid, signal.SIGTERM)
@@ -1143,6 +1187,8 @@ def _stop(session: str, kind: str = "", *,
                 _ = Event().wait(operation_deadline.remaining(min(0.1, remaining)))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
+        if isinstance(_move_stop_target.get(), MoveStopAttempt) and not last_signal:
+            return StopFailed(identity, "the move source exited before the stop")
         return NotRunning(identity)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         reason = str(error)
@@ -1355,23 +1401,47 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     return live
 
 
-def _codex_running_on_account(identity: str, pane_id: str, pid: int) -> ClaudeUp | ResumeFailed:
+def _observed_account(up: ClaudeUp, pid: int, started: str | None,
+                      capture_generation: bool) -> ClaudeUp | LiveMoveSource | ResumeFailed:
+    if not capture_generation:
+        return up
+    if not started or started != sessions.process_start(pid):
+        return LiveAccountUnproved(up.session_id, "the source process changed during the account read")
+    return LiveMoveSource(up, pid, started)
+
+
+def _codex_running_on_account(identity: str, pane_id: str, pid: int,
+                              capture_generation: bool) -> ClaudeUp | LiveMoveSource | ResumeFailed:
     """Read one process that the conversation reader proves hosts this thread."""
+    started = sessions.process_start(pid) if capture_generation else None
     setting = account_reader.process_codex_home(pid)
     if isinstance(setting, account_reader.ProcessEnvironmentUnread):
         return LiveAccountUnproved(identity, setting.reason)
     home = setting.home if isinstance(setting, account_reader.ProcessCodexHome) else Path.home() / ".codex"
-    return ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING, pid=pid)
+    up = ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING, pid=pid)
+    return _observed_account(up, pid, started, capture_generation)
 
 
-def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> ClaudeUp | ResumeFailed | sessions.SessionNotLive:
+@overload
+def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", capture_generation: Literal[True]
+                       ) -> LiveMoveSource | ResumeFailed | sessions.SessionNotLive: ...
+
+
+@overload
+def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", capture_generation: Literal[False] = False
+                       ) -> ClaudeUp | ResumeFailed | sessions.SessionNotLive: ...
+
+
+def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", capture_generation: bool = False
+                       ) -> ClaudeUp | LiveMoveSource | ResumeFailed | sessions.SessionNotLive:
     """Keep a running conversation on its current account."""
     if kind == "codex":
         observed = herdr.read_conversation(identity, "codex")
         if isinstance(observed, herdr.StoppedConversation):
             return sessions.SessionNotLive()
         if isinstance(observed, herdr.UnknownConversation):
-            herdr.conversation_note(observed)
+            if not capture_generation:
+                herdr.conversation_note(observed)
             client = herdr.Herdr(herdr.shared_session())
             failure = ""
             try:
@@ -1387,31 +1457,37 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
                         failure = str(error)
                         continue
                     if isinstance(owner, pane_launch.ProvedPaneConversation) and owner.kind == "codex" and owner.identity == identity:
-                        return _codex_running_on_account(identity, candidate, owner.pid)
+                        return _codex_running_on_account(identity, candidate, owner.pid, capture_generation)
                     if pane["session_id"] == identity:
                         failure = f"pane {candidate}: cannot prove the reported Codex owner"
             except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 failure = str(error)
+            if capture_generation:
+                return ResumeFailed(identity, observed.reason)
             if failure or not observed.shared_codex:
                 return ResumeFailed(identity, failure or observed.reason)
             return sessions.SessionNotLive()
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
-        return _codex_running_on_account(identity, pane_id, observed.pids[0])
+        return _codex_running_on_account(identity, pane_id, observed.pids[0], capture_generation)
     live = sessions.session_liveness(identity)
     if isinstance(live, sessions.SessionNotLive):
         return live
     if isinstance(live, sessions.SessionLivenessUnknown):
         return ResumeFailed(identity, live.reason)
 
+    started = sessions.process_start(live.pid) if capture_generation else None
     label = "unknown account"
     try:
         setting = account_reader.process_account_directory(account_reader.process_config_dir(live.pid))
         if isinstance(setting, account_reader.ConfiguredClaudeFolder):
             label = accounts.claude_config_label(setting.path)
     except (OSError, ValueError) as error:
+        if capture_generation:
+            return LiveAccountUnproved(identity, "live process account is unreadable")
         print(f"{identity}: account anomaly: {error}", file=sys.stderr)
-    return ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING, pid=live.pid)
+    up = ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING, pid=live.pid)
+    return _observed_account(up, live.pid, started, capture_generation)
 
 
 def member_machine(member: StaffRow) -> str:
@@ -2034,8 +2110,12 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
 
 
 def _request_move(reference: str, plan: MoveStopTarget, target: str, why: str, cause: moves.MoveCause,
-                  source: str, names: LaunchNames) -> moves.RequestedMove:
-    """Record the source observed before stopping the session."""
+                  fallback_source: str, names: LaunchNames | LaunchNamesNotRead
+                  ) -> moves.RequestedMove | MoveRequestNotRecorded:
+    """Record the proved live source or the retained source for a stopped session."""
+    if isinstance(names, LaunchNamesNotRead):
+        return MoveRequestNotRecorded()
+    source = plan.source.session.account if isinstance(plan.source, LiveMoveSource) else fallback_source
     row = plan.member.staff_row(names.tab_record)
     identity = plan.identity
     label = note_file.parse_account_label(target)
@@ -2059,24 +2139,6 @@ def _request_move(reference: str, plan: MoveStopTarget, target: str, why: str, c
         "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause}
     moves.append_move(request)
     return request
-
-
-def _request_moves(plans: Mapping[str, MoveStopTarget], target: str, why: str, cause: moves.MoveCause,
-                   sources: Mapping[str, str]) -> dict[str, moves.RequestedMove]:
-    """Read launch names once and isolate each request failure."""
-    requests: dict[str, moves.RequestedMove] = {}
-    try:
-        names = LaunchNames.read()
-    except Exception as error:
-        for plan in plans.values():
-            print(f"{plan.identity}: move log anomaly: {error}", file=sys.stderr)
-        return requests
-    for session, plan in plans.items():
-        try:
-            requests[session] = _request_move(session, plan, target, why, cause, sources.get(session, ""), names)
-        except Exception as error:
-            print(f"{plan.identity}: move log anomaly: {error}", file=sys.stderr)
-    return requests
 
 
 def _record_move_outcome(request: moves.RequestedMove, result: ClaudeUp | StopFailed | SessionNotFound | ResumePending) -> None:
@@ -2410,6 +2472,17 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             _report_move_batch(batch, batch.results, target)
 
 
+def _read_move_source(identity: str, pane_id: str, kind: str) -> LiveMoveSource | StoppedMoveSource | StopFailed:
+    running = running_on_account(identity, pane_id, kind=kind, capture_generation=True)
+    if isinstance(running, ResumeFailed):
+        return StopFailed(identity, running.reason)
+    if isinstance(running, LiveMoveSource):
+        if running.session.account == "unknown account":
+            return StopFailed(identity, "live process account is unreadable")
+        return running
+    return StoppedMoveSource()
+
+
 def _prepare_move(row: LockedMoveRow, account: str, record: StaffSnapshot
                   ) -> MoveStopTarget | ClaudeUp | StopFailed:
     member = row.member
@@ -2432,20 +2505,17 @@ def _prepare_move(row: LockedMoveRow, account: str, record: StaffSnapshot
                 except ValueError:
                     pass  # The stop still requires exact native process proof.
         tab = _tab_of(member.reference)
-        running = running_on_account(identity, tab.pane_id if isinstance(tab, herdr.TabSession) else "", kind=kind)
-        if isinstance(running, LiveAccountUnproved):
-            return StopFailed(identity, running.reason)
-        if isinstance(running, ClaudeUp):
-            if running.account == "unknown account":
-                return StopFailed(identity, "live process account is unreadable")
-            if running.account == account:
-                if owner is not None and isinstance(running.pid, int):
-                    member_account.repair_home(owner, kind, running.pid)
-                return running
+        source = _read_move_source(identity, tab.pane_id if isinstance(tab, herdr.TabSession) else "", kind)
+        if isinstance(source, StopFailed):
+            return source
+        if isinstance(source, LiveMoveSource) and source.session.account == account:
+            if owner is not None:
+                member_account.repair_home(owner, kind, source.pid)
+            return source.session
         if row.marked_target != account:
             _ = row.lock.enter_context(staff.mark_row_move(row.member.row_key, account))
             row.marked_target = account
-        return MoveStopTarget(member, identity, running.account if isinstance(running, ClaudeUp) else "")
+        return MoveStopTarget(member, identity, source)
     except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         return StopFailed(identity, str(error))
 
@@ -2528,7 +2598,8 @@ def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int,
                         _record_launches([plan.member.reference for plan in ready.values()])
                         chosen = {session: plan.identity for session, plan in ready.items()}
                         chosen.update((session, session) for session in held)
-                        sources = dict(source_accounts) | {session: plan.source for session, plan in ready.items() if plan.source}
+                        sources = dict(source_accounts) | {session: plan.source.session.account for session, plan in ready.items()
+                                                          if isinstance(plan.source, LiveMoveSource)}
                         results.update(_handoff_locked_moves(chosen, locks, account, why, warn_seconds, cause, sources))
                         break
                     unwarned = {session: plan for session, plan in ready.items() if session not in warned}
@@ -2561,10 +2632,10 @@ def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int,
     return [results[aliases.get(session, session)] for session in selected]
 
 
-def _stop_move(plan: MoveStopTarget) -> StopResult:
-    token = _move_stop_target.set(plan)
+def _stop_move(attempt: MoveStopAttempt) -> StopResult:
+    token = _move_stop_target.set(attempt)
     try:
-        return _stop(plan.member.reference)
+        return _stop(attempt.target.member.reference)
     finally:
         _move_stop_target.reset(token)
 
@@ -2576,22 +2647,34 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
     from scripts.herdr import worker_panes
 
     began = monotonic()
-    sources = dict(source_accounts)
-    sources.update((session, plan.source) for session, plan in plans.items() if plan.source)
+    label = note_file.parse_account_label(target)
+    if not isinstance(label, note_file.NumberedAccountLabel) or label.tool == "claude":
+        checked = accounts.check_move_target(target, datetime.now(timezone.utc))
+        if isinstance(checked, accounts.MoveRefused):
+            for session in selected:
+                locks[session].lock.close()
+            return [StopFailed(plans[session].identity, checked.reason) for session in selected]
     _record_launches([plan.member.reference for plan in plans.values()])
+    names: LaunchNames | LaunchNamesNotRead = _UNREAD_NAMES
+    try:
+        names = LaunchNames.read()
+    except Exception as error:
+        for plan in plans.values():
+            print(f"{plan.identity}: move log anomaly: {error}", file=sys.stderr)
+    attempts: dict[str, MoveStopAttempt] = {}
+    for session, plan in plans.items():
+        attempt = MoveStopAttempt(plan, partial(_request_move, session, plan, target, why, cause,
+                                               source_accounts.get(session, ""), names))
+        if isinstance(plan.source, StoppedMoveSource):
+            attempt.record_request()
+        attempts[session] = attempt
     with ThreadPoolExecutor(max_workers=len(selected)) as pool:
-        requests = _request_moves(plans, target, why, cause, sources)
-        label = note_file.parse_account_label(target)
         failures: dict[str, StopFailed] = {}
-        if not isinstance(label, note_file.NumberedAccountLabel) or label.tool == "claude":
-            checked = accounts.check_move_target(target, datetime.now(timezone.utc))
-            if isinstance(checked, accounts.MoveRefused):
-                failures.update((session, StopFailed(plan.identity, checked.reason)) for session, plan in plans.items())
         worker_policies: dict[StaffId, worker_panes.CheckedRolePolicy] = {}
         needs_role: dict[str, MoveStopTarget] = {}
         for session, plan in plans.items():
             row = plan.member.staff_row(admitted_record)
-            if session in failures or row is None or row.kind != "worker":
+            if row is None or row.kind != "worker":
                 continue
             try:
                 if pane_record.publication_for_session(plan.identity, record=admitted_record) is None:
@@ -2614,8 +2697,12 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                         failures[session] = StopFailed(plan.identity, f"{policy.reason.value}: {policy.detail}")
                     else:
                         worker_policies[row.current_session] = policy
+        for session in failures:
+            attempt = attempts[session]
+            if isinstance(attempt.request, MoveRequestNotRecorded):
+                attempt.record_request()
         stops = [pool.submit(failures.__getitem__, session) if session in failures
-                 else pool.submit(_stop_move, plans[session]) for session in selected]
+                 else pool.submit(_stop_move, attempts[session]) for session in selected]
         stopped: list[StopResult] = []
         for session, future in zip(selected, stops):
             try:
@@ -2639,7 +2726,7 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
             if isinstance(result, (StopFailed, SessionNotFound)):
                 outcomes[index] = result
                 session = selected[index]
-                if (request := requests.get(session)) is not None:
+                if not isinstance(request := attempts[session].request, MoveRequestNotRecorded):
                     _record_move_outcome(request, result)
                 locks[session].lock.close()
         for future in as_completed(resumes):
@@ -2656,7 +2743,7 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                 outcome = ResumePending(identity, target, str(error))
             outcomes[index] = outcome
             session = selected[index]
-            if (request := requests.get(session)) is not None:
+            if not isinstance(request := attempts[session].request, MoveRequestNotRecorded):
                 _record_move_outcome(request, outcome)
             locks[session].lock.close()
     return [outcomes[index] for index in range(len(selected))]

@@ -207,7 +207,10 @@ Each attempt reads the member's live account while it holds the row lock.
 The batch reads the current role map for a group move.
 A single-session move uses the explicit account.
 The batch keeps a member running when its live account matches the target.
-The batch validates the Claude destination again after build waits and before it sends stop signals.
+The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
+The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.
+The batch refuses a member if its live source read fails.
+The stop verifies the live source PID and process start time before it records the source and sends a signal.
 A refused destination leaves the members running and goes in the batch result.
 The handoff carries the group name or explicit account and the results already collected.
 The child saves and reports the carried failures even if a startup read fails.

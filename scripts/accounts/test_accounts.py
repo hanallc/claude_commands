@@ -41,6 +41,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, set_config_credits, write_account_settings
+from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, session_state
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock, unit_runs
@@ -265,6 +266,11 @@ class RoleWriteTime(datetime):
 def provider_fixture_login(_login: str) -> bool:
     """Keep provider-account fixtures distinct from test-contamination cases."""
     return False
+
+
+def create_claude_move_account(label: str, login: str) -> None:
+    create_claude_account(label, login)
+    write_claude_move_credentials(accounts.account_dir(label))
 
 
 class McpProjectFixture(TypedDict):
@@ -1812,7 +1818,7 @@ class AccountsTests(unittest.TestCase):
             (self.main_dir / name).mkdir(exist_ok=True)
         if not (self.home / ".claude.json").exists():
             _ = (self.home / ".claude.json").write_text("{}")
-        create_claude_account(label, login)
+        create_claude_move_account(label, login)
         if default:
             _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8")
         if note_label:
@@ -2049,16 +2055,112 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("exec", "claude2", "--resume", "same-id"), (0, "", ""))
         launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "same-id"], expected)
 
-    def test_move_reports_an_unreadable_login_and_continues(self) -> None:
+    def test_move_refuses_a_target_without_a_local_login_before_stop(self) -> None:
+        from scripts.agents import inventory
+
         self.login_directory("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        with (patch.object(accounts, "account_identity", return_value=agent_accounts.UnreadableIdentity(directory, "fixture read failed")),
-              redirect_stderr(io.StringIO()) as errors):
-            result = accounts.check_move_target("claude3", datetime.now(timezone.utc))
-        self.assertIsInstance(result, accounts.MoveTargetReady)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn("anomaly:", errors.getvalue())
-        self.assertIn("fixture read failed", errors.getvalue())
+        agent_accounts.claude_config_file(directory).unlink()
+        owner = inventory.ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        with (patch.object(inventory, "listing", return_value=[owner]),
+              patch.object(stop_resume, "move_sessions", return_value=[]) as moved):
+            code, output, error = self.run_cli("move", owner.name, "claude3")
+        self.assertEqual((code, output), (1, ""))
+        command = f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude"
+        self.assertEqual(error.splitlines(), [
+            "accounts: claude3 has no sign-in on this machine; sign in first. "
+            + f"Run {command}, then /login",
+        ])
+        moved.assert_not_called()
+
+    def test_move_refuses_missing_credentials_before_stop(self) -> None:
+        from scripts.agents import inventory
+
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        (directory / ".credentials.json").unlink()
+        owner = inventory.ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(inventory, "listing", return_value=[owner]),
+              patch.object(stop_resume, "move_sessions", return_value=[]) as moved):
+            code, output, error = self.run_cli("move", owner.name, "claude3")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("claude3 has no sign-in on this machine", error)
+        self.assertNotIn("Login end date is unknown", error)
+        self.assertNotIn("@", error)
+        moved.assert_not_called()
+
+    def test_move_target_refuses_a_record_without_refresh_expiry(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "refreshToken": "fixture", "expiresAt": 4102444800000,
+        }}))
+        result = accounts.check_move_target("claude3", datetime(2026, 11, 20, tzinfo=timezone.utc))
+        self.assertIsInstance(result, accounts.MoveRefused)
+        assert isinstance(result, accounts.MoveRefused)
+        self.assertIn("claude3 has no sign-in on this machine", result.reason)
+        self.assertIn("Login end date is unknown", result.reason)
+        self.assertNotIn("@", result.reason)
+
+    def test_move_target_checks_token_expiry_before_usage(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        cutoff = int(now.timestamp() * 1000)
+        for token_key, expiry_key, expires in (("refreshToken", "refreshTokenExpiresAt", cutoff),
+                                               ("accessToken", "expiresAt", cutoff + 60_000),
+                                               ("refreshToken", "refreshTokenExpiresAt", cutoff + 60_000)):
+            with self.subTest(token_key=token_key, expires=expires):
+                _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+                    token_key: "fixture", expiry_key: expires,
+                }}))
+                with (patch.object(agent_accounts, "claude_credentials", wraps=agent_accounts.claude_credentials) as metadata,
+                      patch.object(refusals, "stored_reading", return_value=refusals.NoReading()) as usage):
+                    result = accounts.check_move_target("claude3", now)
+                metadata.assert_called_once_with(directory)
+                if expires <= cutoff:
+                    self.assertIsInstance(result, accounts.MoveRefused)
+                    assert isinstance(result, accounts.MoveRefused)
+                    self.assertIn("claude3 has no sign-in on this machine", result.reason)
+                    self.assertNotIn("unit@example.invalid", result.reason)
+                    usage.assert_not_called()
+                else:
+                    self.assertEqual(result, accounts.MoveTargetReady(accounts.NamedAccount("claude3", directory),
+                        ("no fresh usage reading for claude3 (last reading unknown)",)))
+                    usage.assert_called_once_with("claude", "unit@example.invalid", now)
+
+    def test_move_target_refuses_an_expired_access_token_without_a_refresh_token(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        cutoff = int(now.timestamp() * 1000)
+        _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture", "expiresAt": cutoff - 1, "refreshTokenExpiresAt": cutoff + 60_000,
+        }}))
+        with patch.object(refusals, "stored_reading") as usage:
+            result = accounts.check_move_target("claude3", now)
+        self.assertIsInstance(result, accounts.MoveRefused)
+        assert isinstance(result, accounts.MoveRefused)
+        self.assertIn("claude3 has no sign-in on this machine", result.reason)
+        usage.assert_not_called()
+
+    def test_move_target_refuses_future_refresh_expiry_without_tokens(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        for tokens in ({}, {"accessToken": "", "refreshToken": None}):
+            _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+                **tokens, "refreshTokenExpiresAt": int(now.timestamp() * 1000) + 60_000,
+            }}))
+            with patch.object(refusals, "stored_reading") as usage:
+                result = accounts.check_move_target("claude3", now)
+            self.assertIsInstance(result, accounts.MoveRefused)
+            assert isinstance(result, accounts.MoveRefused)
+            self.assertIn("claude3 has no sign-in on this machine", result.reason)
+            usage.assert_not_called()
 
     def test_prepared_account_named_ready_returns_only_launch_changes_without_exec(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -9025,7 +9127,7 @@ class PickerTests(unittest.TestCase):
 
     def claude(self, label: str, login: str) -> None:
         if label != "default":
-            create_claude_account(label, login)
+            create_claude_move_account(label, login)
             return
         config = self.home / ".claude.json"
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))

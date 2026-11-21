@@ -33,6 +33,7 @@ from unittest.mock import Mock, call, patch
 from urllib.parse import parse_qs
 
 from scripts.accounts import accounts, moves, role_map, worker_names
+from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 from scripts.agents import producer_transfer, restart, stop_resume, stop_results
@@ -62,6 +63,7 @@ from scripts.agents.test_pane_restore import FakeClient, fixture_launch_transcri
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 ROLE_ACCOUNT = accounts.role_account
 CHECK_MOVE_TARGET = accounts.check_move_target
+READ_CODEX_CONVERSATIONS = herdr.codex_conversations
 SAVE_PANE_RECORD = pane_record.save
 WRITE_PANE_RECORD = pane_record.write
 SEED_PANE_RECORDS = pane_record.seed
@@ -4671,15 +4673,13 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
-    def test_move_of_a_stopped_session_resumes_but_a_failed_stop_does_not(self) -> None:
+    def test_move_of_a_stopped_session_resumes_but_unreadable_liveness_refuses(self) -> None:
         self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4"))
         self.start.reset_mock()
         self.launched.clear()
         self.live.return_value = sessions.SessionLivenessUnknown("identity unreadable")
         identity = "019b3a40-4250-7000-8000-000000000102"
-        reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
-            + f"{identity} (Claude session unknown: identity unreadable)"
-        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopUnproved(identity, reason))
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopFailed(identity, "identity unreadable"))
         self.start.assert_not_called()
         self.kill.assert_not_called()
 
@@ -4699,6 +4699,8 @@ class StopResumeTests(unittest.TestCase):
         for family, source, target in (("claude", "claude3", "claude4"), ("codex", "codex2", "codex1")):
             with self.subTest(family=family):
                 moves.store_file().unlink(missing_ok=True)
+                self.kill.reset_mock()
+                self.process.side_effect = [sessions.LiveSessionProcess(456), sessions.SessionNotLive()]
                 if family == "codex":
                     _ = fixture_member("producer", name="own-codex", runtime_id=identity,
                                        backend=staff.CodexBackend(self.root / f".{source}"))
@@ -4707,20 +4709,18 @@ class StopResumeTests(unittest.TestCase):
                                  environment={"CODEX_HOME": str(self.root / f".{source}")})
                     pane_record.write("agents", entry)
                 up = stop_resume.ClaudeUp(identity, "w1:p2", target)
-                source_read = (patch.object(stop_resume, "running_on_account", return_value=
-                    stop_resume.ClaudeUp(identity, "w1:p2", source)) if family == "claude" else nullcontext())
                 def process_home(pid: int) -> account.ProcessCodexHome:
                     self.assertEqual(pid, 456)
                     return account.ProcessCodexHome(self.root / f".{target if resume.called else source}")
-                with (source_read,
-                      patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)),
-                      patch.object(stop_resume, "resume", return_value=up) as resume,
+                with (patch.object(stop_resume, "resume", return_value=up) as resume,
                       patch.object(stop_resume, "_confirm_move_start", _REAL_CONFIRM_MOVE_START),
                       patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(456)
                                    if family == "claude" else sessions.SessionNotLive()),
-                      patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", (456,))),
+                      patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation(
+                          "codex" if family == "codex" else "claude", (456,))),
+                      patch.object(herdr, "check_native_target", return_value=True),
                       patch.object(account, "process_codex_home", side_effect=process_home),
-                      patch.object(stop_resume, "_same_process", return_value=True),
+                      patch.object(stop_resume, "_check_stay", return_value=""),
                       patch.object(showrunners, "tell") as tell):
                     self.assertEqual(stop_resume.move_sessions([identity], target, why="auto: head", cause="auto",
                         source_accounts={identity: "claude1" if family == "claude" else target}), [up])
@@ -4732,6 +4732,92 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(request["tool"], family)
                 resume.assert_called_once_with(identity, why="auto: head", to=target, client=self.client)
                 tell.assert_not_called()
+
+    def test_move_refuses_a_failed_source_read_even_if_the_next_read_works(self) -> None:
+        identity = self.entry["session_id"]
+        failure = "fixture source registry unreadable"
+        self.live.side_effect = [sessions.SessionLivenessUnknown(failure), sessions.LiveSessionProcess(123)]
+        with (patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)) as stopped,
+              patch.object(stop_resume, "_resume_move", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude4")) as resumed):
+            result = stop_resume.move_sessions([identity], "claude4", why="move", source_accounts={identity: "claude1"})
+        self.assertEqual(result, [stop_resume.StopFailed(identity, failure)])
+        live = stop_resume.running_on_account(identity, "w1:p2")
+        self.assertIsInstance(live, stop_resume.ClaudeUp)
+        assert isinstance(live, stop_resume.ClaudeUp)
+        self.assertEqual(live.account, "claude3")
+        self.assertEqual(moves.read_moves(), [])
+        stopped.assert_not_called()
+        resumed.assert_not_called()
+
+    def test_move_refuses_an_unreadable_codex_daemon_without_pane_proof(self) -> None:
+        identity = self.entry["session_id"]
+        home = self.root / ".codex2"
+        _ = fixture_member("producer", name="own-codex", runtime_id=identity, backend=staff.CodexBackend(home))
+        self.client.rows.clear()
+        daemon = codex_daemon.CodexDaemon(home, home / "daemon.sock")
+        hosted = codex_daemon.DaemonRead(daemon, [codex_daemon.DaemonSession(identity, str(self.root), "idle")])
+        failure = "fixture daemon read failed"
+        unreadable = codex_daemon.DaemonRead(hosted.owner, codex_daemon.DaemonUnreadable(failure))
+        log = self.root / "move.log"
+
+        with (patch.object(codex_daemon, "read_daemons", return_value=[unreadable]) as read,
+              patch.object(herdr, "codex_conversations", side_effect=READ_CODEX_CONVERSATIONS),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_load_batch_modules"),
+              patch.object(stop_resume, "_send_move_push"),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.StopFailed(identity, "stop refused")) as stopped,
+              redirect_stderr(io.StringIO()) as errors):
+            result = stop_resume.main(["batch", "--target", "codex1", "--source-account", f"{identity}=codex2",
+                                       "--log", str(log), "--", identity])
+            self.assertEqual(result, 1)
+            self.assertTrue(read.called)
+            read.return_value = [hosted]
+            self.assertEqual(herdr.read_conversation(identity, "codex"), herdr.LiveConversation("codex", ()))
+
+        self.assertEqual(moves.read_moves(), [])
+        stopped.assert_not_called()
+        self.kill.assert_not_called()
+        self.assertEqual(errors.getvalue(), "")
+        line, = log.read_text().splitlines()
+        self.assertIn('"result": "StopFailed"', line)
+        self.assertIn(failure, line)
+
+    def test_move_cannot_stop_a_replacement_process_under_the_old_source(self) -> None:
+        identity = self.entry["session_id"]
+        for replacement_pid in (456, 123):
+            with self.subTest(replacement_pid=replacement_pid):
+                self.live.return_value = sessions.LiveSessionProcess(123)
+                self.process.side_effect = [sessions.LiveSessionProcess(replacement_pid), sessions.SessionNotLive()]
+                reads: list[str] = []
+
+                def read_account(pid: int) -> account.ConfiguredClaudeFolder:
+                    label = "claude3" if not reads else "claude2"
+                    reads.append(label)
+                    self.assertEqual(pid, 123)
+                    return account.ConfiguredClaudeFolder(self.root / f".{label}")
+
+                def replaced(_identity: str, _kind: str) -> herdr.LiveConversation:
+                    self.assertEqual(reads, ["claude3"])
+                    return herdr.LiveConversation("claude", (replacement_pid,))
+
+                with (patch.object(account, "process_config_dir", side_effect=read_account),
+                      patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+                      patch.object(stop_resume, "_record_launches"),
+                      patch.object(herdr, "read_conversation", side_effect=replaced),
+                      patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                          herdr.PaneSessionReport(identity), "replacement-generation",
+                          {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2")})),
+                      patch.object(herdr, "check_native_target", return_value=True),
+                      patch.object(stop_resume, "_resume_move", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude4")) as resume):
+                    result = stop_resume.move(identity, "claude4", why="move")
+                self.assertEqual(result, stop_resume.StopFailed(
+                    identity, "the move source process changed before the stop; no signal sent"))
+                self.kill.assert_not_called()
+                resume.assert_not_called()
+                self.assertEqual(moves.read_moves(), [])
 
     def test_move_records_and_reports_an_immediate_resume_exit(self) -> None:
         identity = self.entry["session_id"]
@@ -4757,12 +4843,19 @@ class StopResumeTests(unittest.TestCase):
                 def process_home(pid: int) -> account.ProcessCodexHome:
                     self.assertEqual(pid, 456)
                     return account.ProcessCodexHome(self.root / (f".{target}" if resumed.called else ".codex2"))
+
+                def claude_liveness(_identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+                    return (sessions.LiveSessionProcess(456) if family == "claude" and resumed.called
+                            else sessions.SessionNotLive())
+
+                def codex_liveness(_identity: str, _kind: str) -> herdr.LiveConversation | herdr.StoppedConversation:
+                    return herdr.LiveConversation("codex", (456,)) if resumed.called else herdr.StoppedConversation()
+
                 with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)),
                       patch.object(stop_resume, "resume", return_value=up) as resumed,
                       patch.object(stop_resume, "_confirm_move_start", _REAL_CONFIRM_MOVE_START),
-                      patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(456)
-                                   if family == "claude" else sessions.SessionNotLive()),
-                      patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", (456,))),
+                      patch.object(sessions, "session_liveness", side_effect=claude_liveness),
+                      patch.object(herdr, "read_conversation", side_effect=codex_liveness),
                       patch.object(account, "process_codex_home", side_effect=process_home),
                       patch.object(stop_resume, "_same_process", return_value=False) as observed,
                       patch.object(showrunners, "tell", return_value="told director") as tell):
@@ -4827,16 +4920,18 @@ class StopResumeTests(unittest.TestCase):
         self.entry["config_dir"] = str(self.root / ".claude1")
         pane_record.write("agents", self.entry)
 
-        def stop_after_request(_session: str) -> stop_resume.NotRunning:
+        def stop_after_request(_pid: int, _number: int) -> None:
             self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])
-            return stop_resume.NotRunning(identity)
 
         up = stop_resume.ClaudeUp(identity, "w1:p2", "claude4")
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        self.kill.side_effect = stop_after_request
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-              patch.object(stop_resume, "running_on_account", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude3")),
-              patch.object(stop_resume, "_stop", side_effect=stop_after_request),
+              patch.object(herdr, "check_native_target", return_value=True),
               patch.object(stop_resume, "resume", return_value=up)):
             self.assertEqual(stop_resume.move_sessions(["alpha"], "claude4", why="weekly limit", cause="auto"), [up])
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "confirmed"])
         request, confirmed = entries
@@ -4884,7 +4979,7 @@ class StopResumeTests(unittest.TestCase):
     def test_move_already_on_the_target_does_not_write_the_log(self) -> None:
         identity = self.entry["session_id"]
         up = stop_resume.ClaudeUp(identity, "w1:p2", "claude4")
-        with (patch.object(stop_resume, "running_on_account", return_value=up),
+        with (patch.object(stop_resume, "running_on_account", return_value=stop_resume.LiveMoveSource(up, 123, "generation-1")),
               patch.object(stop_resume, "_stop") as stopped):
             self.assertEqual(stop_resume.move_sessions(["alpha"], "claude4", why="rerun"), [up])
         self.assertFalse(moves.store_file().exists())
@@ -5003,6 +5098,39 @@ class StopResumeTests(unittest.TestCase):
                     self.assertIn("fixture staff read failed", failed.reason)
                     outcome, = [entry for entry in entries if entry["kind"] == "failed"]
                     self.assertEqual(outcome["reason"], failed.reason)
+
+    def test_batch_logs_a_live_worker_refused_by_the_role_check(self) -> None:
+        parent = fixture_member("showrunner", name="move-parent")
+        worker = fixture_worker("move-worker", parent.id)
+        sibling = fixture_worker("move-sibling", parent.id)
+        _ = staff.set_worker_role(sibling.id, staff.KnownWorkerRole("impl"))
+        source = stop_resume.LiveMoveSource(
+            stop_resume.ClaudeUp(worker.current_session, "worker-pane", "claude3"), 123, "generation-1")
+        up = stop_resume.ClaudeUp(sibling.current_session, "sibling-pane", "claude4")
+
+        def running(identity: str, _pane: str, **_options: object) -> stop_resume.LiveMoveSource | sessions.SessionNotLive:
+            return source if identity == worker.current_session else sessions.SessionNotLive()
+
+        with (patch.object(stop_resume, "running_on_account", side_effect=running),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(sibling.current_session)) as stop,
+              patch.object(stop_resume, "resume", return_value=up) as resume):
+            failed, moved = stop_resume.move_sessions([worker.id, sibling.id], "claude4", why="move")
+
+        self.assertIsInstance(failed, stop_resume.StopFailed)
+        assert isinstance(failed, stop_resume.StopFailed)
+        self.assertEqual(failed.session_id, worker.current_session)
+        self.assertIn(worker_panes.StartRefusal.ROLE_UNAVAILABLE.value, failed.reason)
+        self.assertEqual(moved, up)
+        stop.assert_called_once_with(sibling.id)
+        resume.assert_called_once_with(sibling.current_session, why="move", to="claude4", client=self.client)
+        subject = f"{worker.current_session}: {worker.name}"
+        trail = [entry for entry in moves.read_moves() if entry["subject"] == subject]
+        self.assertEqual([entry["kind"] for entry in trail], ["requested", "failed"])
+        request, outcome = trail
+        assert request["kind"] == "requested" and outcome["kind"] == "failed"
+        self.assertEqual(request["from"], "claude3")
+        self.assertEqual(outcome["move_id"], request["move_id"])
+        self.assertEqual(outcome["reason"], failed.reason)
 
     def test_move_log_write_errors_do_not_stop_the_move(self) -> None:
         identity = self.entry["session_id"]
@@ -5252,7 +5380,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(role_map, "_local_role_map", side_effect=read_role) as read,
               patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
-              patch.object(stop_resume, "running_on_account", return_value=up),
+              patch.object(stop_resume, "running_on_account", return_value=stop_resume.LiveMoveSource(up, 123, "generation-1")),
               patch.object(stop_resume, "_load_batch_modules"),
               patch.object(stop_resume, "_stop") as stop,
               patch.object(stop_resume, "_send_move_push") as push):
@@ -5279,7 +5407,8 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(accounts, "current_move_account", return_value="claude3"),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
-              patch.object(stop_resume, "running_on_account", return_value=replace(up, account="claude2")),
+              patch.object(stop_resume, "running_on_account", return_value=stop_resume.LiveMoveSource(
+                  replace(up, account="claude2"), 123, "generation-1")),
               patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(row.current_session)) as stop,
               patch.object(stop_resume, "_resume_move", return_value=up) as resume):
             result = stop_resume.move_sessions([row.id], "claude4", why="move",
@@ -5299,6 +5428,7 @@ class StopResumeTests(unittest.TestCase):
         _ = (destination / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "fixture@example.invalid"},
         }))
+        write_claude_move_credentials(destination)
         self.assertIsInstance(CHECK_MOVE_TARGET("claude4", datetime.now(timezone.utc), repair=False),
                               accounts.MoveTargetReady)
         log = self.root / "move.log"
@@ -5327,6 +5457,37 @@ class StopResumeTests(unittest.TestCase):
         send.assert_called_once()
         self.assertIn("claude4 has no usable account directory", log.read_text())
         self.assertEqual(moves.read_batch_result(batch_id).pending, (moves.MoveMember(row.id, row.name),))
+
+    def test_move_rechecks_target_sign_in_before_request_or_stop(self) -> None:
+        identity = self.entry["session_id"]
+        destination = self.root / ".claude4"
+        notes = self.root / "notes"
+        notes.mkdir(exist_ok=True)
+        _ = (notes / "claude4.md").write_text("---\nlogin: fixture@example.invalid\n---\n")
+        _ = (destination / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "fixture@example.invalid"},
+        }))
+        write_claude_move_credentials(destination)
+        self.assertIsInstance(CHECK_MOVE_TARGET("claude4", datetime.now(timezone.utc), repair=False),
+                              accounts.MoveTargetReady)
+
+        def lose_sign_in(_selected: list[str]) -> dict[str, tuple[str, ...]]:
+            _ = (destination / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+                "refreshTokenExpiresAt": int(datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp() * 1000),
+            }}))
+            return {}
+
+        with (patch.object(accounts, "check_move_target", wraps=CHECK_MOVE_TARGET),
+              patch.object(stop_resume, "_build_holders", side_effect=lose_sign_in),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)) as stopped,
+              patch.object(stop_resume, "_resume_move", return_value=stop_resume.ClaudeUp(identity, "pane", "claude4"))):
+            result = stop_resume.move_sessions([identity], "claude4", why="move", cause="auto")
+        failed, = result
+        self.assertIsInstance(failed, stop_resume.StopFailed)
+        assert isinstance(failed, stop_resume.StopFailed)
+        self.assertIn("claude4 has no sign-in on this machine", failed.reason)
+        stopped.assert_not_called()
+        self.assertEqual(moves.read_moves(), [])
 
     def test_a_detached_native_move_switches_to_the_staff_lock_on_admission(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed"), "showrunner", "fixture", staff.StaffRoot(),
