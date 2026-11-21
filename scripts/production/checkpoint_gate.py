@@ -294,6 +294,7 @@ class BumpGateRecord(TypedDict):
     name: str
     merge_branch: str
     checkout: str
+    # Older gates store the LOG relative to their recorded checkout.
     production_log: str
     zone: str
     unit: str

@@ -509,6 +509,16 @@ def finish_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
     return True
 
 
+def _owner_git_checkout(doc: staff.LiveDoc | staff.WrappedDoc) -> Path:
+    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+
+    try:
+        paths = resolve_production_paths(doc.path)
+    except ProductionPathsError as error:
+        raise RenameRefused(str(error)) from error
+    return paths.integration if isinstance(paths, EnrolledPaths) else doc.path.parent
+
+
 def _finish_rename_push(record: staff.StaffSnapshot, row: staff.StaffRow,
                         pending: PendingRename, checkout: Path) -> None:
     """Push only when the recorded request changes the branch name."""
@@ -520,7 +530,7 @@ def _finish_rename_push(record: staff.StaffSnapshot, row: staff.StaffRow,
             if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
                     or owner.doc.machine != remote.local_machine()):
                 raise RenameRefused("the owner's repository is unavailable")
-            checkout = owner.doc.path.parent
+            checkout = _owner_git_checkout(owner.doc)
         tip = branch_tip(checkout, pending.branch)
         if not tip:
             raise RenameRefused("the local destination branch is unavailable")
@@ -585,7 +595,7 @@ def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destin
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
-        repository = checkout_folders(owner.doc.path.parent).common_dir
+        repository = checkout_folders(_owner_git_checkout(owner.doc)).common_dir
         target = checkout_folders(destination)
         identity = target.git_dir / "locked"
         return (repository == target.common_dir and identity.parent.parent == repository / "worktrees"
@@ -605,7 +615,7 @@ def move_checkout(record: staff.StaffSnapshot, row: staff.StaffRow) -> Path:
     if (owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             and owner.doc.machine == remote.local_machine()):
         found = [Path(line.removeprefix("worktree ")).resolve()
-                 for line in git(owner.doc.path.parent, "worktree", "list", "--porcelain").splitlines()
+                 for line in git(_owner_git_checkout(owner.doc), "worktree", "list", "--porcelain").splitlines()
                  if line.startswith("worktree ")]
         matching = [path for path in found if _recoverable_folder(record, row, path)]
         if len(matching) == 1:

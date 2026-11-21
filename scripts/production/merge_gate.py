@@ -161,6 +161,7 @@ class GateArguments(argparse.Namespace):
     nightly: bool = False
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    enrolled: bool = False
 
 
 class SuiteMode(Enum):
@@ -1873,6 +1874,20 @@ def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
     return ""
 
 
+def live_file_refusal(repo: Path, target: str) -> str:
+    """Report all conflicts between the incoming tree and enrolled live files."""
+    from scripts.lib.main_sync import live_file_conflicts
+    from scripts.production.production_doc import ProductionPathsError
+
+    try:
+        conflicts = live_file_conflicts(repo, target)
+    except ProductionPathsError as error:
+        return f"cannot verify live files: {error}"
+    if conflicts:
+        return "incoming tree conflicts with live production files\n" + "\n".join(map(str, conflicts))
+    return ""
+
+
 def live_state_refusal(repo: Path, target: str) -> str:
     """Run the target tree's live state checks before its code is installed."""
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
@@ -1970,9 +1985,11 @@ def write_push_record(path: Path, record: RecordedPush) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
+def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str, *, legacy: Path | None = None) -> str:
     """Trust only this checkpoint's recorded merge, with its original parents."""
     record = read_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint))
+    if isinstance(record, NoRecordedPush) and legacy is not None:
+        record = read_push_record(push_record_path(legacy, "checkpoint", origin + ":" + checkpoint))
     if isinstance(record, NoRecordedPush):
         return origin
     head = checked_git(repo, "rev-parse", "HEAD")
@@ -1988,31 +2005,36 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
+    source = Path(args.repo).resolve() if args.enrolled else main_repo
     hold = BuildHoldWait()
     hold.wait_until_free()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
     hold.wait_until_free()
-    with main_push_lock.main_push_lock(main_repo):
-        fetch_branches(main_repo, "main", args.merge_branch)
-        head = checked_git(main_repo, "rev-parse", "HEAD")
-        origin = checked_git(main_repo, "rev-parse", "origin/main")
-        path = push_record_path(main_repo, "promotion", args.merge_branch)
-        target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
+    with main_push_lock.main_push_lock(source):
+        fetch_branches(source, "main", args.merge_branch)
+        head = checked_git(source, "rev-parse", "refs/heads/main")
+        origin = checked_git(source, "rev-parse", "origin/main")
+        path = push_record_path(source, "promotion", args.merge_branch)
+        target = checked_git(source, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
             record = read_push_record(path)
+            if isinstance(record, NoRecordedPush) and args.enrolled:
+                record = read_push_record(push_record_path(main_repo, "promotion", args.merge_branch))
             if (not isinstance(record, RecordedPush) or head != record.commit
                     or record.source_commit != record.commit
-                    or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
-                    or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
+                    or git(source, "merge-base", "--is-ancestor", origin, head).returncode
+                    or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
             target = record.commit
-        if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
+        if git(source, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
+        if refusal := live_file_refusal(source, target):
+            raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
-        if refusal := live_state_refusal(main_repo, target):
+        if refusal := live_state_refusal(source, target):
             raise GateRefused(refusal)
         write_push_record(path, RecordedPush(origin, target, target))
         try:
@@ -2020,11 +2042,11 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         except (OSError, UnicodeError) as error:
             raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
         try:
-            landed = land_main.land(main_repo, target)
+            landed = land_main.land(source, target)
         except land_main.LandError as error:
             raise GateRefused(str(error)) from error
         print(land_main.hook_report(landed.hook), flush=True)
-        promoted = checked_git(main_repo, "rev-parse", "HEAD")
+        promoted = checked_git(source, "rev-parse", "refs/heads/main")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
@@ -2116,7 +2138,8 @@ def merge_checkpoint(args: GateArguments) -> int:
     baseline = checked_git(repo, "rev-parse", "HEAD")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     origin = f"origin/{args.merge_branch}"
-    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint))
+    legacy = Path(args.main_repo) if args.enrolled else None
+    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint, legacy=legacy))
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -2178,6 +2201,8 @@ def merge_checkpoint(args: GateArguments) -> int:
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
         hold.wait_until_free()
+        if refusal := live_file_refusal(repo, checked_git(repo, "rev-parse", "HEAD")):
+            raise GateRefused(refusal)
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
@@ -2201,7 +2226,26 @@ def merge_checkpoint(args: GateArguments) -> int:
     return 0
 
 
-def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
+def gate_production(args: GateArguments) -> Path:
+    """Resolve the publication checkout from the exact staff document."""
+    from scripts.production.production_doc import EnrolledPaths, Refusal, production_field, resolve_production_paths
+
+    try:
+        document = change_review.production_doc(args.production)
+        paths = resolve_production_paths(document)
+        if isinstance(paths, EnrolledPaths):
+            merge_branch = production_field(paths.live_doc.read_text(encoding="utf-8").splitlines(), "Merge branch")
+            if args.merge_branch != merge_branch:
+                raise GateRefused(f"{paths.live_doc}: expected merge branch {merge_branch}")
+            args.repo = str(paths.integration)
+            args.main_repo = str(paths.main)
+            args.enrolled = True
+        return document
+    except (change_review.ChangeReviewError, Refusal) as error:
+        raise GateRefused(str(error)) from error
+
+
+def change_review_list(args: GateArguments, document: Path | None = None) -> tuple[Path, Path | None]:
     """The production whose merge this is, and the list its rows go to: --change-review, else its own.
 
     The production is --production, else the calling showrunner's. Rows always name their
@@ -2210,7 +2254,7 @@ def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
     if args.change_review and not args.production:
         raise GateRefused("--change-review needs --production: every row's list names its production")
     try:
-        production = change_review.production_doc(str(args.production))
+        production = document if document is not None else change_review.production_doc(str(args.production))
     except change_review.ChangeReviewError as error:
         raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
     if args.change_review:
@@ -3017,7 +3061,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tests_only:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
-        checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        document = gate_production(args) if not args.nightly else None
+        checkout = Path(args.main_repo if args.promote_only and not args.enrolled else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
                 try:
@@ -3026,7 +3071,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _sweep_nightly_slots()
             if args.promote_only:
                 promote(args)
-                production, review_list = change_review_list(args)
+                production, review_list = change_review_list(args, document)
                 if review_list is not None:
                     record_changes(checkout, review_list, production, args.merge_branch)
                 return 0

@@ -116,6 +116,50 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_checkpoint_protects_enrolled_live_files_before_publication(self) -> None:
+        for path, content, allowed in (
+            ("live/ledger", "live bytes\n", False),
+            ("live/ledger", "incoming bytes\n", False),
+            ("live", "incoming ancestor\n", False),
+            ("src/alpha.txt", "ordinary checkpoint\n", True),
+        ):
+            with self.subTest(path=path, content=content):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                _ = self.git("switch", "--detach", "main", cwd=self.promote)
+                _ = self.git("switch", "main")
+                integration = self.root / "integration"
+                _ = self.git("worktree", "add", str(integration), "production")
+                live_doc = self.checkout / "docs/plans/example-production-live.md"
+                self.write(self.checkout, str(live_doc.relative_to(self.checkout)), self.doc.read_text().replace(
+                    f"- **Showrunner checkout:** `{self.checkout}`",
+                    f"- **Showrunner checkout:** `{integration}`\n- **Merge checkout:** `{self.checkout}`").replace(
+                        "- **Log:** `production.log`", "- **Log:** `live/ledger`"))
+                self.write(self.checkout, "live/ledger", "live bytes\n")
+                with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                    owner = showrunners.owner_for("example")
+                    _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), live_doc))
+                main = self.git("rev-parse", "main")
+                original_index = self.git("write-tree")
+                original_tip = self.git("rev-parse", "production", cwd=self.origin)
+                checkpoint = self.checkpoint(path, content)
+                result = self.run_checkpoint(checkpoint)
+                self.assertEqual(result.process.returncode == 0, allowed, result.process.stdout + result.process.stderr)
+                self.assertEqual(self.git("rev-parse", "HEAD"), main)
+                self.assertEqual(self.git("write-tree"), original_index)
+                log = (self.checkout / "live/ledger").read_text()
+                if allowed:
+                    self.assertEqual(self.git("rev-parse", "HEAD^2", cwd=integration), checkpoint)
+                    self.assertIn(checkpoint, log)
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin),
+                                     self.git("rev-parse", "HEAD", cwd=integration))
+                else:
+                    self.assertIn(str(self.checkout / "live/ledger"), result.process.stdout)
+                    self.assertEqual(log, "live bytes\n")
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=integration), original_tip)
+
     def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"

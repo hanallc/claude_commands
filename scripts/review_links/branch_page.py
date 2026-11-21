@@ -185,15 +185,16 @@ def history_roots() -> tuple[Path, ...]:
                                 state / unit_runs.FORMER_HISTORY_NAME)))
 
 
-def former_units(repository: Path, scope: RepositoryScope) -> tuple[FormerUnit, ...]:
+def former_units(repository: Path, scope: RepositoryScope,
+                 live_documents: tuple[str, ...]) -> tuple[FormerUnit, ...]:
     """Read former staff rows from the production documents' retained Units tables."""
     found = git(repository, "grep", "-l", "^## Units", "refs/remotes/origin/main", "--", "docs/plans")
-    if found.returncode == 1:
-        return ()
-    found.check_returncode()
+    if found.returncode != 1:
+        found.check_returncode()
+    documents = (*(git_text(repository, "show", source) for source in found.stdout.splitlines()), *live_documents)
     units: list[FormerUnit] = []
-    for source in found.stdout.splitlines():
-        lines = git_text(repository, "show", source).splitlines()
+    for document in documents:
+        lines = document.splitlines()
         if not scope.contains(Path(production_field(lines, "Repository"))):
             continue
         in_units = False
@@ -313,15 +314,38 @@ def kept_branches() -> set[str]:
     return set(cast(list[str], value))
 
 
+def production_branches(resolver: session_staff.RowResolver, scope: RepositoryScope) -> tuple[set[str], tuple[str, ...]]:
+    """Read protected branches and enrolled unit tables from staff documents."""
+    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+
+    protected: set[str] = {"main"}
+    live_documents: list[str] = []
+    for row in resolver.record.rows:
+        if row.kind != "showrunner" or not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            continue
+        document = resolver.production_doc(row)
+        if not isinstance(document, session_staff.ProductionDoc):
+            raise ValueError(f"{row.name}: cannot read the production: {document.reason}")
+        protected.add(production_field(document.text.splitlines(), "Merge branch"))
+        if isinstance(row.doc, staff.LiveDoc) and row.doc.machine == remote.local_machine():
+            try:
+                paths = resolve_production_paths(row.doc.path)
+            except ProductionPathsError as error:
+                raise ValueError(str(error)) from error
+            if isinstance(paths, EnrolledPaths) and scope.contains(paths.integration):
+                live_documents.append(document.text)
+    return protected, tuple(live_documents)
+
+
 def list_branches(repository: Path, record: staff.StaffSnapshot,
                   roots: tuple[Path, ...]) -> BranchListing:
     """Fetch origin's graph once without changing any branch on origin."""
     _ = git_text(repository, "fetch", "--no-write-fetch-head", "-q", "origin")
     scope = RepositoryScope(repository)
     resolver = session_staff.RowResolver(record)
-    former = former_units(repository, scope)
+    protected, live_documents = production_branches(resolver, scope)
+    former = former_units(repository, scope, live_documents)
     recorded = recorded_branches(record, roots, resolver, scope, former)
-    protected = {"main"}
     active_branches: dict[str, ActiveUnitBranch] = {}
     for row in record.rows:
         # A producer's worktree is its launch folder; it holds no branch of this repository.
@@ -339,11 +363,6 @@ def list_branches(repository: Path, record: staff.StaffSnapshot,
                     active_branch = branch.name
             protected.add(active_branch)
             active_branches[row.name] = ActiveUnitBranch(active_branch)
-        if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
-            document = resolver.production_doc(row)
-            if not isinstance(document, session_staff.ProductionDoc):
-                raise ValueError(f"{row.name}: cannot read the production: {document.reason}")
-            protected.add(production_field(document.text.splitlines(), "Merge branch"))
     heads = {ref.removeprefix("refs/heads/"): tip for line in
              git_text(repository, "ls-remote", "--heads", "origin").splitlines()
              for tip, ref in [line.split()]}
@@ -495,8 +514,16 @@ def submit(page: BranchPage, body: str) -> BranchDeletion:
 
 
 def delete_selected(deletion: BranchDeletion) -> tuple[DeleteResult, ...]:
+    try:
+        resolver = session_staff.RowResolver(staff.snapshot())
+        protected, _ = production_branches(resolver, RepositoryScope(deletion.page.repository))
+    except (OSError, ValueError, Refusal, subprocess.SubprocessError, staff.StaffRefused) as error:
+        return tuple(DeleteResult(name, f"cannot verify protected branches: {error}") for name in deletion.selected)
     results: list[DeleteResult] = []
     for name in deletion.selected:
+        if name in protected:
+            results.append(DeleteResult(name, "kept: protected branch"))
+            continue
         try:
             result = git(deletion.page.repository, "push", "origin", "--delete", "--", name)
             message = "deleted" if result.returncode == 0 else failure_detail(result)
