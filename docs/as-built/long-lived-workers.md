@@ -171,7 +171,32 @@ The hook records delivery before it tries to close the pane.
 A later matching DONE updates the saved reply even after a completion action fails.
 The hook preserves the action error and notice record.
 
-`worker.dispatch_receipt` reads the transcript and detached run evidence.
+A native Stop asks the hook to read the current worker transcript.
+The hook needs a matching DONE in the transcript to complete the pass.
+The hook verifies the worker, pass, and stage under the worker lock.
+The reply evidence file saves the transcript stream, record position, and prefix digest for the verified DONE.
+Recovery keeps the greatest verified position for that pass stage.
+An older prefix or a different stream cannot replace the saved occurrence.
+A later occurrence can replace it with the same text, the same timestamp, or no timestamp.
+Completion, result delivery, pane closure, and acknowledgement use that occurrence.
+The selected occurrence covers explicit result receipts that precede it.
+The transcript timestamp can prove additional run coverage.
+Acknowledgement selects the evidence once for all pending results.
+The exact prompt and pass marker checks use separate receipt states and consume the same transcript stream.
+The parser discards each decoded record after both states read it.
+The evidence file preserves outstanding results when the transcript becomes unavailable.
+A later reply updates an unfinished completion without repeating its actions or notice.
+
+A Stop with unresolved transcript evidence saves pending verification under the worker lock.
+The pending record identifies the pass and stage.
+The next turn event or a detached-run reap can retry the transcript read.
+Reap uses `RESULT_PUSH_RETRY_SECONDS` in `detached_runs.conf` as the minimum interval between attempts.
+Reap also checks pending verification for workers that have no detached runs.
+The hook can submit a finished result while verification remains pending.
+Verification continues until completion or a pass or stage change.
+The `worker.py list` command shows `transcript verification` while the pass waits.
+Recovery requires an occurrence cursor before it accepts a saved DONE.
+The hook checks command exits separately from result delivery.
 A live detached run holds DONE.
 A finished run with no delivery record can still hold DONE.
 A matching DONE covers a run that finished before DONE.
@@ -191,6 +216,7 @@ Run events preserve the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A finished run stays out of the live run list while its completion flag is pending.
 Completion clears the pending flags for settled results of the pass.
+A covering DONE leaves an unconfirmed delivery and its alert eligibility in the run record.
 Reap retries pending completion under the run's completion lock.
 The sender submits a detached result to an idle worker pane.
 The sender confirms delivery only when the transcript contains the run ID.
@@ -200,11 +226,21 @@ A run event uses the stable staff ID to find the worker's current session.
 A session change during the hook keeps the run event pending.
 A worker puts its question in its reply and ends the turn.
 The turn hook sends that reply to the director.
+A `no DONE` notice can reach the director while verification remains pending.
+The latest transcript turn after the prompt supplies the notice text and position.
+An unavailable transcript or a missing prompt defers the notice.
+The hook records the latest notice position that it accepts and the latest position that it delivers.
+Within the same stream, the transcript must preserve the accepted prefix.
+A stream change requires a different session or transcript path and a verified prompt.
+The hook carries matching notice positions into the new stream.
+The hook starts a new notice order when the new stream has no matching notice positions.
+The callback checks the current session, path, and notice position under the worker lock before delivery.
+The notice leaves the pass active and runs no completion actions.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 A turn without DONE reports `no DONE` when no pending work explains it.
 An empty turn also reports `no DONE` after prompt acceptance if the pane is idle or the transcript records compaction.
 The hook reports an empty turn only when no pending work explains it.
-The hook sends one notice for the empty turn per pass.
+During verification, the transcript must identify the empty turn at its own position.
 A startup turn before prompt acceptance sends no notice.
 A final reply without a staff row goes to the showrunner only if the recorder confirms that thread accepted a worker prompt.
 The notice includes the worker's last reply and leaves the pass active.

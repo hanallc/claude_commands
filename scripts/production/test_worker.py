@@ -821,10 +821,16 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
-        with self.subTest(restore="a parked result uses the requested account"):
-            self.check_restore_parked_account()
+        for cause in ("saved deferral", "orphan", "unidentified at reap", "unidentified at startup"):
+            with self.subTest(parked_result=cause):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    case.check_restore_parked_account(cause)
+                finally:
+                    _ = case.doCleanups()
 
-    def check_restore_parked_account(self) -> None:
+    def check_restore_parked_account(self, cause: str) -> None:
         from scripts.whoami import agent_accounts
 
         source = Path(__file__).resolve().parents[2] / "config"
@@ -847,10 +853,16 @@ class WorkerCommandTests(unittest.TestCase):
             self.agent.complete(pane)
             self.assertEqual(self.finish(name), turn_end.TurnOutcome.WAITING_ON_RUNS)
             self.assertNotIn(pane, self.fixture.world.locations)
-        record.update(status="finished", exit_code=0, completion_pending=True,
-                      finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        record["exit_code"] = 0
+        if cause != "orphan":
+            record.update(status="finished", completion_pending=True,
+                          finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
         atomic_file.write_text_atomic(path, json.dumps(record))
-        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        if cause == "orphan":
+            self.assertEqual(record["status"], "running")
+            self.assertNotIn("delivery", record)
+        else:
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
         run_command = self.fixture.world.run
         received: list[str] = []
 
@@ -865,15 +877,45 @@ class WorkerCommandTests(unittest.TestCase):
 
         target_home = self.fixture.root / ".codex2"
         started_panes: dict[staff.StaffId, str] = {}
-        with (patch.object(self.fixture.world, "run", side_effect=accept_result),
+        launches = len(self.fixture.world.launches)
+        reap = detached_runs.reap_orphans
+        launch_policy = worker_panes.parked_launch_policy
+
+        def add_unidentified_pane() -> None:
+            sibling = self.fixture.worker("unidentified", family="codex")
+            self.fixture.world.add(sibling, "w1:p9", family="codex")
+            self.fixture.world.unknown["w1:p9"] = "process evidence is unavailable"
+
+        def add_before_reap(run: str, name: str = "") -> list[str]:
+            add_unidentified_pane()
+            return reap(run, name)
+
+        def add_before_startup(member: staff.StaffRow, passed: dict[str, object]
+                               ) -> worker_panes.LaunchPolicy | progress_history.ParkedLaunchUnavailable:
+            add_unidentified_pane()
+            return launch_policy(member, passed)
+
+        with (ExitStack() as context, patch.object(self.fixture.world, "run", side_effect=accept_result),
               patch.object(agent_accounts, "codex_account_home",
                            return_value=agent_accounts.CodexHomeHoldingLogin("codex2", target_home, "fixture"))):
-            self.assertIs(worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({row.id}),
-                                         started_panes=started_panes), worker.ExitCode.OK)
+            if cause == "unidentified at reap":
+                _ = context.enter_context(patch.object(detached_runs, "reap_orphans", new=add_before_reap))
+            if cause == "unidentified at startup":
+                _ = context.enter_context(patch.object(worker_panes, "parked_launch_policy", new=add_before_startup))
+            outcome = worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({row.id}),
+                                     started_panes=started_panes)
+        self.assertEqual(self.agent.submitted, [(pane, line)])
+        if cause.startswith("unidentified"):
+            self.assertIs(outcome, worker.ExitCode.UNCERTAIN)
+            self.assertEqual(len(self.fixture.world.launches), launches)
+            self.assertEqual(started_panes, {})
+            self.assertEqual(received, [])
+            return
+        self.assertIs(outcome, worker.ExitCode.OK)
+        self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "finished")
         self.assertEqual(received, [started_panes[row.id]])
         self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(target_home))
         self.assertEqual(self.agent.row(started_panes[row.id]).current_session, row.current_session)
-        self.assertEqual(self.agent.submitted, [(pane, line)])
 
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts
@@ -1260,6 +1302,22 @@ class WorkerCommandTests(unittest.TestCase):
                     prompt if lookup == "exact prompt" else worker.DispatchPrompt(dispatch_id), worker.DoneReply(dispatch_id))
                 expected = worker.DispatchComplete(reply) if completed else worker.DispatchSubmitted(reply)
                 self.assertEqual(receipt, worker.TranscriptReceipt(expected, frozenset()))
+
+        with self.subTest(lookup="exact with an earlier fallback timestamp overflow"):
+            row = self.opened().row
+            exact = "Read the current review."
+            reply = f"The exact review is complete.\nDONE {dispatch_id}"
+            records = [
+                {"type": "assistant", "message": {"role": "assistant", "content": f"DONE {dispatch_id}"},
+                 "timestamp": "0001-01-01T00:00:00+01:00"},
+                {"type": "user", "message": {"role": "user", "content": exact}},
+                {"type": "assistant", "message": {"role": "assistant", "content": reply},
+                 "timestamp": "2026-11-21T12:00:00Z"},
+            ]
+            atomic_file.write_text_atomic(source, "".join(json.dumps(record) + "\n" for record in records))
+            with patch.object(worker_admission, "transcript_source", return_value=source):
+                receipt = worker.dispatch_receipt(row, exact, dispatch_id, run=self.run_dir)
+            self.assertEqual(receipt, worker.DispatchComplete(reply))
 
     def test_agent_exit_after_done_still_publishes_the_reply(self) -> None:
         opened = self.opened()

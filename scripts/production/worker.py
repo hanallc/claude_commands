@@ -10,7 +10,7 @@ import argparse
 from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, redirect_stderr, suppress
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum, IntEnum
 from importlib import import_module
 from functools import cache, partial
@@ -36,7 +36,7 @@ from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, file_lock, models_registry, unit_runs
-from scripts.lib.transcripts import open_transcript
+from scripts.lib.transcripts import open_transcript, uncompressed_path
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
@@ -51,6 +51,79 @@ WorkerRole = staff.WorkerRole
 ExitCode = worker_panes.ExitCode
 
 
+class NoTranscriptTurn(Enum):
+    UNRECORDED = "no verified turn after the dispatch prompt"
+
+
+@dataclass(frozen=True)
+class TranscriptCursor:
+    """Identify a record within one transcript stream."""
+
+    stream: str
+    position: int
+    prefix: str
+
+    def at_or_after(self, boundary: TranscriptCursor) -> bool:
+        return self.stream == boundary.stream and self.position >= boundary.position
+
+    @classmethod
+    def from_json(cls, value: object) -> TranscriptCursor | NoTranscriptTurn:
+        if not isinstance(value, dict):
+            return NoTranscriptTurn.UNRECORDED
+        fields = cast(dict[str, object], value)
+        stream, position, prefix = fields.get("stream"), fields.get("position"), fields.get("prefix")
+        if (not isinstance(stream, str) or not stream or not isinstance(position, int) or isinstance(position, bool)
+                or position < 1 or not isinstance(prefix, str) or not re.fullmatch(r"[a-f0-9]{64}", prefix)):
+            return NoTranscriptTurn.UNRECORDED
+        return cls(stream, position, prefix)
+
+
+@dataclass(frozen=True)
+class TranscriptTurn:
+    """Identify the latest reply after the dispatch prompt."""
+
+    cursor: TranscriptCursor
+    reply: str
+    delivered: TranscriptCursor | NoTranscriptTurn = NoTranscriptTurn.UNRECORDED
+
+
+@dataclass(frozen=True)
+class NoticePositions:
+    """Keep the accepted and delivered positions for the current pass."""
+
+    latest: TranscriptCursor | NoTranscriptTurn = NoTranscriptTurn.UNRECORDED
+    delivered: TranscriptCursor | NoTranscriptTurn = NoTranscriptTurn.UNRECORDED
+
+    def checkpoints(self, stream: str) -> tuple[TranscriptCursor, ...]:
+        return tuple(replace(cursor, stream=stream) for cursor in (self.latest, self.delivered)
+                     if isinstance(cursor, TranscriptCursor))
+
+    def order(self, turn: TranscriptTurn, matched: frozenset[TranscriptCursor]) -> TranscriptTurn | NoTranscriptTurn:
+        stream = turn.cursor.stream
+        latest = self._confirmed(self.latest, stream, matched)
+        delivered = self._confirmed(self.delivered, stream, matched)
+        for saved in (self.latest, self.delivered):
+            if isinstance(saved, TranscriptCursor) and saved.stream == stream and saved not in matched:
+                return NoTranscriptTurn.UNRECORDED
+        for boundary in (latest, delivered):
+            if isinstance(boundary, TranscriptCursor) and not turn.cursor.at_or_after(boundary):
+                return NoTranscriptTurn.UNRECORDED
+        return replace(turn, delivered=delivered)
+
+    @staticmethod
+    def _confirmed(cursor: TranscriptCursor | NoTranscriptTurn, stream: str,
+                   matched: frozenset[TranscriptCursor]) -> TranscriptCursor | NoTranscriptTurn:
+        if isinstance(cursor, TranscriptCursor):
+            checkpoint = replace(cursor, stream=stream)
+            if checkpoint in matched:
+                return checkpoint
+        return NoTranscriptTurn.UNRECORDED
+
+
+NO_NOTICE_POSITIONS = NoticePositions()
+NO_TRANSCRIPT_CURSORS: frozenset[TranscriptCursor] = frozenset()
+
+
 @dataclass(frozen=True)
 class DispatchNotSubmitted:
     """The complete transcript contains no prompt for this dispatch."""
@@ -62,13 +135,13 @@ class DispatchSubmitted:
 
     reply: str = ""
     compacted_after_prompt: bool = False
+    turn: TranscriptTurn | NoTranscriptTurn = field(default=NoTranscriptTurn.UNRECORDED, compare=False)
 
 
 @dataclass(frozen=True)
 class DispatchComplete:
     reply: str
     anomalies: tuple[str, ...] = ()
-    restored_done: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +212,10 @@ class TranscriptReceipt:
     receipt: DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown | DispatchAwaitingReply
     received_runs: frozenset[str]
     done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
+    cursor: TranscriptCursor | NoMatchingDone = NoMatchingDone.UNRECORDED
+    results_before_done: frozenset[str] = frozenset()
+    extends_saved: bool = False
+    unreadable_pending_runs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,92 +234,191 @@ def _prompt_names_completion(text: str, completion_id: str) -> bool:
 NO_RESULT_IDS: frozenset[str] = frozenset()
 
 
+@final
+class _TranscriptReceiptState:
+    def __init__(self, line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
+                 accept_late_done: bool, late_result_ids: frozenset[str], other_pass_results: frozenset[str]) -> None:
+        self.line = line
+        self.completion = completion
+        self.accept_late_done = accept_late_done
+        self.late_result_ids = late_result_ids
+        self.other_pass_results = other_pass_results
+        self.submitted = False
+        self.responding = False
+        self.turn_has_reply = False
+        self.incomplete = False
+        self.done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
+        self.received: set[str] = set()
+        self.cursor: TranscriptCursor | NoMatchingDone = NoMatchingDone.UNRECORDED
+        self.results_before_done: frozenset[str] = frozenset()
+        self.reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply = DispatchSubmitted()
+        self.completion_id = completion.dispatch_id if isinstance(completion, DoneReply) else ""
+        self.second_stage = (worker_panes.stage_two_completion_id(line.dispatch_id)
+                             if isinstance(line, DispatchPrompt) and line.include_stage_two else "")
+
+    def user_message(self, text: str) -> None:
+        self.turn_has_reply = False
+        text = text.strip()
+        results = {part.removeprefix("Detached run: ") for part in text.splitlines()
+                   if part.startswith("Detached run: ")}
+        self.received.update(results.difference(self.other_pass_results))
+        if (self.second_stage and self.completion_id != self.second_stage
+                and _prompt_names_completion(text, self.second_stage)):
+            self.completion_id = self.second_stage
+            self.reply = DispatchSubmitted()
+            self.cursor = NoMatchingDone.UNRECORDED
+            self.results_before_done = frozenset()
+        if (text in (self.line.strip(), script_prompt(self.line).strip()) if isinstance(self.line, str) else
+                _prompt_names_completion(text, self.completion_id)):
+            self.submitted = True
+            self.responding = True
+            if isinstance(self.reply, DispatchSubmitted):
+                self.reply = DispatchSubmitted()
+        elif isinstance(self.completion, FinalReply):
+            self.responding = False
+            self.reply = DispatchSubmitted()
+        elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
+                "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
+            self.responding = False
+            if isinstance(self.reply, DispatchSubmitted):
+                self.reply = replace(self.reply, turn=NoTranscriptTurn.UNRECORDED)
+        elif self.submitted:
+            results.difference_update(self.other_pass_results)
+            if not self.responding:
+                results.intersection_update(self.late_result_ids)
+            if not results:
+                return
+            if isinstance(self.reply, DispatchAwaitingReply):
+                self.reply = replace(self.reply, runs=tuple(sorted(results.union(self.reply.runs))))
+            else:
+                matching_done = self.reply if isinstance(self.reply, DispatchComplete) else NoMatchingDone.UNRECORDED
+                self.reply = DispatchAwaitingReply(self.reply.reply, tuple(sorted(results)), matching_done)
+
+    def assistant_message(self, text: str, timestamp: object,
+                          cursor: TranscriptCursor | NoMatchingDone) -> None:
+        self.turn_has_reply = True
+        if not (self.responding or isinstance(self.line, DispatchPrompt) or self.accept_late_done and self.submitted):
+            return
+        if isinstance(self.completion, FinalReply):
+            complete = bool(text.strip())
+        else:
+            if self.second_stage and worker_admission.reply_ends_dispatch(text, self.second_stage):
+                self.completion_id = self.second_stage
+            complete = worker_admission.reply_ends_dispatch(text, self.completion_id)
+        if self.accept_late_done and not self.responding and not complete:
+            return
+        if complete and isinstance(self.line, DispatchPrompt):
+            self.submitted = True
+            self.responding = True
+        if complete:
+            self.reply = DispatchComplete(text)
+            try:
+                at = rollouts.parse_timestamp(timestamp)
+                self.done_at = at.timestamp() if at is not None else DoneTimeUnknown.UNRECORDED
+            except OverflowError:
+                self.done_at = DoneTimeUnknown.UNRECORDED
+            self.cursor = cursor
+            self.results_before_done = frozenset(self.received)
+            self.incomplete = False
+        elif isinstance(self.reply, DispatchAwaitingReply):
+            self.reply = replace(self.reply, last_reply=text)
+        elif isinstance(self.completion, FinalReply) or isinstance(self.reply, DispatchSubmitted):
+            turn = (TranscriptTurn(cursor, text) if self.responding and isinstance(cursor, TranscriptCursor)
+                    else NoTranscriptTurn.UNRECORDED)
+            self.reply = DispatchSubmitted(text, turn=turn)
+
+    def turn_ended(self, cursor: TranscriptCursor | NoMatchingDone) -> None:
+        if (not self.turn_has_reply and self.submitted and self.responding
+                and isinstance(self.reply, DispatchSubmitted) and isinstance(cursor, TranscriptCursor)):
+            self.reply = replace(self.reply, turn=TranscriptTurn(cursor, ""))
+        self.turn_has_reply = False
+
+    def compacted(self) -> None:
+        if self.submitted and self.responding and isinstance(self.reply, DispatchSubmitted):
+            self.reply = replace(self.reply, compacted_after_prompt=True)
+
+    def finish(self, failure: str, *, extends_saved: bool = False,
+               notice_positions: NoticePositions = NO_NOTICE_POSITIONS,
+               matched_cursors: frozenset[TranscriptCursor] = NO_TRANSCRIPT_CURSORS) -> TranscriptReceipt:
+        if not failure and self.incomplete:
+            failure = "worker transcript has incomplete records"
+        if failure:
+            pending = self.reply.runs if isinstance(self.reply, DispatchAwaitingReply) else ()
+            return TranscriptReceipt(DispatchEvidenceUnknown(failure), frozenset(self.received),
+                                     extends_saved=extends_saved, unreadable_pending_runs=pending)
+        reply = self.reply if self.submitted else DispatchNotSubmitted()
+        if isinstance(reply, DispatchSubmitted) and isinstance(reply.turn, TranscriptTurn):
+            reply = replace(reply, turn=notice_positions.order(reply.turn, matched_cursors))
+        return TranscriptReceipt(reply, frozenset(self.received), self.done_at, self.cursor,
+                                 self.results_before_done, extends_saved)
+
+
+def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
+                     *states: _TranscriptReceiptState, stream: str = "",
+                     previous: tuple[TranscriptCursor, ...] = (),
+                     ) -> tuple[str, frozenset[TranscriptCursor]]:
+    prefix = hashlib.sha256()
+    checkpoints = {cursor.position for cursor in previous if cursor.stream == stream}
+    matched: set[TranscriptCursor] = set()
+    try:
+        for position, entry in enumerate(entries, 1):
+            if stream:
+                data = None if isinstance(entry, worker_admission.TornTranscriptRecord) else entry
+                prefix.update(json.dumps(data, sort_keys=True).encode() + b"\n")
+                if position in checkpoints:
+                    checkpoint = TranscriptCursor(stream, position, prefix.hexdigest())
+                    if checkpoint in previous:
+                        matched.add(checkpoint)
+            if isinstance(entry, worker_admission.TornTranscriptRecord):
+                for state in states:
+                    state.incomplete = True
+                continue
+            timestamp = None
+            if isinstance(entry, dict):
+                if rollouts.is_compaction(cast(rollouts.RolloutRecordJson, cast(object, entry))):
+                    for state in states:
+                        state.compacted()
+                    continue
+                timestamp = entry.get("timestamp")
+                fields = entry
+                entry = worker_admission.transcript_entry(fields, set())
+                if not entry and stream and _transcript_turn_boundary(fields):
+                    cursor = TranscriptCursor(stream, position, prefix.hexdigest())
+                    for state in states:
+                        state.turn_ended(cursor)
+            if entry.startswith("user:\n"):
+                message = entry.removeprefix("user:\n")
+                for state in states:
+                    state.user_message(message)
+            elif entry.startswith("assistant:\n"):
+                message = entry.removeprefix("assistant:\n")
+                cursor = TranscriptCursor(stream, position, prefix.hexdigest()) if stream else NoMatchingDone.UNRECORDED
+                for state in states:
+                    state.assistant_message(message, timestamp, cursor)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return str(error) or type(error).__name__, frozenset(matched)
+    return "", frozenset(matched)
+
+
+def _transcript_turn_boundary(fields: dict[str, object]) -> bool:
+    if fields.get("type") == "system" and fields.get("subtype") == "turn_duration":
+        return True
+    if fields.get("type") == "event_msg":
+        payload = fields.get("payload")
+        return isinstance(payload, dict) and cast(dict[str, object], payload).get("type") == "task_complete"
+    return False
+
+
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
                        accept_late_done: bool = False,
                        late_result_ids: frozenset[str] = NO_RESULT_IDS,
                        other_pass_results: frozenset[str] = NO_RESULT_IDS) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
-    submitted = False
-    responding = False
-    incomplete = False
-    done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
-    received: set[str] = set()
-    reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply = DispatchSubmitted()
-    completion_id = completion.dispatch_id if isinstance(completion, DoneReply) else ""
-    second_stage = (worker_panes.stage_two_completion_id(line.dispatch_id)
-                    if isinstance(line, DispatchPrompt) and line.include_stage_two else "")
-    try:
-        for entry in entries:
-            fields = entry if isinstance(entry, dict) else {}
-            if isinstance(entry, worker_admission.TornTranscriptRecord):
-                incomplete = True
-                continue
-            if isinstance(entry, dict):
-                if rollouts.is_compaction(cast(rollouts.RolloutRecordJson, cast(object, entry))):
-                    if submitted and responding and isinstance(reply, DispatchSubmitted):
-                        reply = replace(reply, compacted_after_prompt=True)
-                    continue
-                entry = worker_admission.transcript_entry(entry, set())
-            if entry.startswith("user:\n"):
-                text = entry.removeprefix("user:\n").strip()
-                results = {part.removeprefix("Detached run: ") for part in text.splitlines()
-                           if part.startswith("Detached run: ")}
-                received.update(results)
-                if second_stage and completion_id != second_stage and _prompt_names_completion(text, second_stage):
-                    completion_id = second_stage
-                    reply = DispatchSubmitted()
-                if (text in (line.strip(), script_prompt(line).strip()) if isinstance(line, str) else
-                        _prompt_names_completion(text, completion_id)):
-                    submitted = True
-                    responding = True
-                    if isinstance(reply, DispatchSubmitted):
-                        reply = DispatchSubmitted()
-                elif isinstance(completion, FinalReply):
-                    responding = False
-                    reply = DispatchSubmitted()
-                elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
-                        "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
-                    responding = False
-                elif submitted:
-                    results.difference_update(other_pass_results)
-                    if not responding:
-                        results.intersection_update(late_result_ids)
-                    if not results:
-                        continue
-                    if isinstance(reply, DispatchAwaitingReply):
-                        reply = replace(reply, runs=tuple(sorted(results.union(reply.runs))))
-                    else:
-                        matching_done = reply if isinstance(reply, DispatchComplete) else NoMatchingDone.UNRECORDED
-                        reply = DispatchAwaitingReply(reply.reply, tuple(sorted(results)), matching_done)
-            elif (responding or isinstance(line, DispatchPrompt) or accept_late_done and submitted
-                  ) and entry.startswith("assistant:\n"):
-                text = entry.removeprefix("assistant:\n")
-                if isinstance(completion, FinalReply):
-                    complete = bool(text.strip())
-                else:
-                    if second_stage and worker_admission.reply_ends_dispatch(text, second_stage):
-                        completion_id = second_stage
-                    complete = worker_admission.reply_ends_dispatch(text, completion_id)
-                if accept_late_done and not responding and not complete:
-                    continue
-                if complete and isinstance(line, DispatchPrompt):
-                    submitted = True
-                    responding = True
-                if complete:
-                    reply = DispatchComplete(text)
-                    at = rollouts.parse_timestamp(fields.get("timestamp"))
-                    done_at = at.timestamp() if at is not None else DoneTimeUnknown.UNRECORDED
-                    incomplete = False
-                elif isinstance(reply, DispatchAwaitingReply):
-                    reply = replace(reply, last_reply=text)
-                elif isinstance(completion, FinalReply) or isinstance(reply, DispatchSubmitted):
-                    reply = DispatchSubmitted(text)
-    except (OSError, ValueError) as error:
-        return TranscriptReceipt(DispatchEvidenceUnknown(str(error)), frozenset(received))
-    if incomplete:
-        return TranscriptReceipt(DispatchEvidenceUnknown("worker transcript has incomplete records"), frozenset(received))
-    return TranscriptReceipt(reply if submitted else DispatchNotSubmitted(), frozenset(received), done_at)
+    state = _TranscriptReceiptState(line, completion, accept_late_done=accept_late_done,
+                                    late_result_ids=late_result_ids, other_pass_results=other_pass_results)
+    failure, _ = _read_transcript(entries, state)
+    return state.finish(failure)
 
 
 def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: str) -> str:
@@ -267,34 +443,48 @@ def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: s
             raise ValueError("no review was written")
 
 
-def _receipt_records(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
-                     require_transcript: bool = False) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
-    try:
-        source = worker_admission.transcript_source(row, backend)
-    except ValueError as error:
-        if not require_transcript and isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
-            return
-        raise
-    yield from worker_admission.transcript_records(source)
-
-
 class CurrentPanePass(Enum):
     CURRENT = "read the current pane pass"
 
 
+def transcript_stream(row: staff.StaffRow, source: Path) -> str:
+    return f"{row.current_session}:{uncompressed_path(source.resolve())}"
+
+
 def _dispatch_transcript(
-    records: Callable[[], Iterable[dict[str, object] | worker_admission.TornTranscriptRecord]],
-    line: str, done: DoneReply, *, stopped: bool = False, late_result_ids: frozenset[str] = NO_RESULT_IDS,
+    row: staff.StaffRow, line: str, done: DoneReply, *, require_transcript: bool,
+    previous: TranscriptCursor | NoMatchingDone = NoMatchingDone.UNRECORDED,
+    notice_positions: NoticePositions = NO_NOTICE_POSITIONS,
+    stopped: bool = False, late_result_ids: frozenset[str] = NO_RESULT_IDS,
     other_pass_results: frozenset[str] = NO_RESULT_IDS,
-) -> tuple[TranscriptReceipt, str | DispatchPrompt]:
-    prompt: str | DispatchPrompt = line
-    receipt = transcript_receipt(records(), prompt, done, accept_late_done=stopped,
-                                 late_result_ids=late_result_ids, other_pass_results=other_pass_results)
+) -> TranscriptReceipt:
+    backend = staff.backend(row)
+    if isinstance(backend, staff.BackendUnavailable):
+        return TranscriptReceipt(DispatchEvidenceUnknown("worker transcript backend is unavailable"), NO_RESULT_IDS)
+    try:
+        source = worker_admission.transcript_source(row, backend)
+        stream = transcript_stream(row, source)
+    except (OSError, ValueError) as error:
+        if not require_transcript and isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
+            return TranscriptReceipt(DispatchNotSubmitted(), NO_RESULT_IDS)
+        return TranscriptReceipt(DispatchEvidenceUnknown(str(error)), NO_RESULT_IDS)
+
+    exact = _TranscriptReceiptState(line, done, accept_late_done=stopped, late_result_ids=late_result_ids,
+                                    other_pass_results=other_pass_results)
+    fallback = _TranscriptReceiptState(DispatchPrompt(done.dispatch_id), done,
+                                       accept_late_done=stopped, late_result_ids=late_result_ids,
+                                       other_pass_results=other_pass_results)
+    checkpoints = notice_positions.checkpoints(stream)
+    if isinstance(previous, TranscriptCursor):
+        checkpoints += (previous,)
+    failure, matched = _read_transcript(worker_admission.transcript_records(source), exact, fallback,
+                                        stream=stream, previous=checkpoints)
+    receipt = exact.finish(failure, extends_saved=previous in matched,
+                           notice_positions=notice_positions, matched_cursors=matched)
     if isinstance(receipt.receipt, DispatchNotSubmitted):
-        prompt = DispatchPrompt(done.dispatch_id)
-        receipt = transcript_receipt(records(), prompt, done, accept_late_done=stopped,
-                                     late_result_ids=late_result_ids, other_pass_results=other_pass_results)
-    return receipt, prompt
+        return fallback.finish(failure, extends_saved=previous in matched,
+                               notice_positions=notice_positions, matched_cursors=matched)
+    return receipt
 
 
 def _done_covers_finish(done_at: float | DoneTimeUnknown,
@@ -318,52 +508,161 @@ def _done_covers_run(done_at: float | DoneTimeUnknown, record: detached_runs.Run
             and not record.get("self_stop"))
 
 
+@dataclass(frozen=True)
+class VerifyPassDone:
+    """Save transcript evidence while the caller holds the worker lock."""
+
+    instance: str
+    notice_positions: NoticePositions = NO_NOTICE_POSITIONS
+
+
+class ReadPassDone(Enum):
+    READ = "read without saving reply evidence"
+
+
+@dataclass(frozen=True)
+class VerifiedPassDone:
+    """Supply the verified occurrence and its run coverage."""
+
+    reply: DispatchComplete
+    cursor: TranscriptCursor
+    done_at: float | DoneTimeUnknown
+    results_before_done: frozenset[str]
+
+    def covers_run(self, record: detached_runs.RunRecord,
+                   finished_at: float | detached_runs.RunFinishedBefore | detached_runs.RunFinishTimeUnknown,
+                   ) -> detached_runs.ResultDoneCoverage | detached_runs.ResultTranscriptUnknown:
+        if record["status"] == "finished" and record["run_id"] in self.results_before_done:
+            return detached_runs.ResultDoneCoverage.COVERED
+        if finished_at is detached_runs.RunFinishTimeUnknown.UNRECORDED:
+            return detached_runs.ResultTranscriptUnknown(finished_at.value)
+        if _done_covers_run(self.done_at, record, finished_at):
+            return detached_runs.ResultDoneCoverage.COVERED
+        return detached_runs.ResultDoneCoverage.NEEDS_DELIVERY
+
+
+@dataclass(frozen=True)
+class SavedPassDone:
+    done: VerifiedPassDone
+    received_runs: frozenset[str]
+    pending_runs: frozenset[str]
+
+
+def pending_done_path(run: Path, worker_id: StaffId) -> Path:
+    return run / f".{worker_id}.pending-done.json"
+
+
+def _pass_done_path(run: Path, row: staff.StaffRow, stage: str) -> Path:
+    digest = hashlib.sha256(f"{row.id}:{stage}".encode()).hexdigest()
+    return run / f".{digest}.pass-done.json"
+
+
+def _read_pass_done(path: Path, instance: object, stage: str) -> SavedPassDone | NoMatchingDone:
+    saved = worker_lifecycle.read_json_object(path)
+    if not saved or saved.get("instance") != instance:
+        return NoMatchingDone.UNRECORDED
+    raw_cursor = saved.get("cursor")
+    if raw_cursor is None:
+        return NoMatchingDone.UNRECORDED
+    cursor = TranscriptCursor.from_json(raw_cursor)
+    if not isinstance(cursor, TranscriptCursor):
+        raise ValueError(f"{path}: invalid DONE cursor")
+    reply = saved.get("reply")
+    if not isinstance(reply, str) or not worker_admission.reply_ends_dispatch(reply, stage):
+        raise ValueError(f"{path}: invalid saved DONE reply")
+
+    def run_ids(key: str) -> frozenset[str]:
+        value = saved.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in cast(list[object], value)):
+            raise ValueError(f"{path}: invalid {key}")
+        return frozenset(cast(list[str], value))
+
+    at = saved.get("transcript_done_at")
+    done = VerifiedPassDone(DispatchComplete(reply), cursor,
+                            float(at) if isinstance(at, (int, float)) else DoneTimeUnknown.UNRECORDED,
+                            run_ids("results_before_done"))
+    return SavedPassDone(done, run_ids("received_runs"), run_ids("pending_runs"))
+
+
+def _save_pass_done(path: Path, instance: str, saved: SavedPassDone) -> None:
+    done = saved.done
+    fields = {
+        "instance": instance, "reply": done.reply.reply, "cursor": asdict(done.cursor),
+        "transcript_done_at": done.done_at if isinstance(done.done_at, float) else None,
+        "received_runs": sorted(saved.received_runs), "pending_runs": sorted(saved.pending_runs),
+        "results_before_done": sorted(done.results_before_done),
+    }
+    atomic_file.write_text_atomic(path, json.dumps(fields))
+
+
+def _select_pass_done(transcript: TranscriptReceipt, saved: SavedPassDone | NoMatchingDone,
+                      ) -> VerifiedPassDone | NoMatchingDone:
+    reply = transcript.receipt
+    matching = reply.matching_done if isinstance(reply, DispatchAwaitingReply) else reply
+    cursor = transcript.cursor
+    if isinstance(saved, SavedPassDone) and (
+            not transcript.extends_saved or not isinstance(cursor, TranscriptCursor)
+            or cursor.position <= saved.done.cursor.position):
+        return saved.done
+    if isinstance(matching, DispatchComplete) and isinstance(cursor, TranscriptCursor):
+        return VerifiedPassDone(matching, cursor, transcript.done_at, transcript.results_before_done)
+    return NoMatchingDone.UNRECORDED
+
+
+def read_result_done_evidence(
+    run: Path, row: staff.StaffRow, passed: dict[str, object],
+) -> VerifiedPassDone | detached_runs.ResultTranscriptUnknown | Literal[detached_runs.ResultDoneCoverage.NEEDS_DELIVERY]:
+    """Select DONE evidence for the current pass before checking its results."""
+    delivery = progress_history.dispatch_delivery(passed)
+    if not delivery.line or not delivery.completion_id:
+        return detached_runs.ResultDoneCoverage.NEEDS_DELIVERY
+    saved = _read_pass_done(_pass_done_path(run, row, delivery.completion_id), passed.get("instance_id"),
+                            delivery.completion_id)
+    transcript = _dispatch_transcript(row, delivery.line, DoneReply(delivery.completion_id), require_transcript=True,
+        previous=saved.done.cursor if isinstance(saved, SavedPassDone) else NoMatchingDone.UNRECORDED)
+    verified = _select_pass_done(transcript, saved)
+    if isinstance(verified, VerifiedPassDone):
+        return verified
+    if isinstance(transcript.receipt, DispatchEvidenceUnknown):
+        return detached_runs.ResultTranscriptUnknown(transcript.receipt.reason)
+    return detached_runs.ResultDoneCoverage.NEEDS_DELIVERY
+
+
 def result_done_coverage(row: staff.StaffRow, passed: dict[str, object], record: detached_runs.RunRecord,
                          ) -> detached_runs.ResultDoneCoverage | detached_runs.ResultTranscriptUnknown:
     """Check the saved prompt and DONE before delivering a run result."""
-    finished_at = detached_runs.run_finish_time(record)
-    delivery = progress_history.dispatch_delivery(passed)
     instance = passed.get("instance_id")
     linked = record.get("pane_dispatch_id")
     started = passed.get("started_at")
     belongs_to_pass = (linked == instance if linked is not None else
                        isinstance(started, (int, float)) and record["started_at"] >= started)
-    if (not delivery.line or not delivery.completion_id
-            or not isinstance(instance, str) or not instance or not belongs_to_pass):
+    if not isinstance(instance, str) or not instance or not belongs_to_pass:
         return detached_runs.ResultDoneCoverage.NEEDS_DELIVERY
-    backend = staff.backend(row)
-    if isinstance(backend, staff.BackendUnavailable):
-        return detached_runs.ResultTranscriptUnknown("worker transcript backend is unavailable")
-    transcript, _ = _dispatch_transcript(
-        lambda: _receipt_records(row, backend, require_transcript=True), delivery.line, DoneReply(delivery.completion_id))
-    if isinstance(transcript.receipt, DispatchEvidenceUnknown):
-        return detached_runs.ResultTranscriptUnknown(transcript.receipt.reason)
-    reply = transcript.receipt
-    if isinstance(reply, DispatchComplete) or (
-            isinstance(reply, DispatchAwaitingReply) and isinstance(reply.matching_done, DispatchComplete)):
-        if finished_at is detached_runs.RunFinishTimeUnknown.UNRECORDED:
-            return detached_runs.ResultTranscriptUnknown(finished_at.value)
-        if transcript.done_at is DoneTimeUnknown.UNRECORDED:
-            return detached_runs.ResultTranscriptUnknown(transcript.done_at.value)
-    return (detached_runs.ResultDoneCoverage.COVERED if _done_covers_run(transcript.done_at, record, finished_at)
-            else detached_runs.ResultDoneCoverage.NEEDS_DELIVERY)
+    verified = read_result_done_evidence(Path(record["session_dir"]), row, passed)
+    if isinstance(verified, VerifiedPassDone):
+        return verified.covers_run(record, detached_runs.run_finish_time(record))
+    return verified
 
 
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                      run: Path, require_transcript: bool = False,
                      pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt | worker_panes.PassDetachedResults = CurrentPanePass.CURRENT,
-                     require_done: bool = False,
+                     require_done: bool = False, verify: VerifyPassDone | ReadPassDone = ReadPassDone.READ,
                      ) -> DispatchReceipt:
-    """Read the shared receipt and require delivery of detached results."""
-    backend = staff.backend(row)
-    if isinstance(backend, staff.BackendUnavailable):
-        return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    def records() -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
-        return _receipt_records(row, backend, require_transcript=require_transcript)
-
+    """Check reply evidence and the command exits required by the pass."""
     directory = run / worker_lifecycle.DETACHED_RUNS_DIR
     done = DoneReply(dispatch_id)
     stopped = isinstance(pane_pass, progress_history.StoppedPassReceipt)
+    done_path = _pass_done_path(run, row, dispatch_id)
+    passed: dict[str, object] = {}
+    saved: SavedPassDone | NoMatchingDone = NoMatchingDone.UNRECORDED
+    if done_path.is_file():
+        if stopped:
+            saved = _read_pass_done(done_path, pane_pass.instance_id, dispatch_id)
+        else:
+            passed = worker_panes.worker_pass(row, run)
+            if progress_history.dispatch_delivery(passed).completion_id == dispatch_id:
+                saved = _read_pass_done(done_path, passed.get("instance_id"), dispatch_id)
     late_result_ids = other_pass_results = NO_RESULT_IDS
     if stopped:
         deliveries, other_passes = detached_runs.worker_results(directory, row, since=0,
@@ -372,13 +671,19 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         other_pass_results = frozenset(other_passes)
     else:
         deliveries = {}
-    transcript, prompt = _dispatch_transcript(records, line, done, stopped=stopped,
-        late_result_ids=late_result_ids, other_pass_results=other_pass_results)
+
+    previous = saved.done.cursor if isinstance(saved, SavedPassDone) else NoMatchingDone.UNRECORDED
+    notice_positions = verify.notice_positions if isinstance(verify, VerifyPassDone) else NO_NOTICE_POSITIONS
+    transcript = _dispatch_transcript(row, line, done, require_transcript=require_transcript, previous=previous,
+        notice_positions=notice_positions, stopped=stopped, late_result_ids=late_result_ids,
+        other_pass_results=other_pass_results)
+    verified = _select_pass_done(transcript, saved)
     reply = transcript.receipt
-    if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
-        return reply
-    if require_done and isinstance(reply, DispatchSubmitted):
-        return reply
+    if not isinstance(verified, VerifiedPassDone):
+        if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+            return reply
+        if require_done and isinstance(reply, DispatchSubmitted):
+            return reply
     live = ([] if isinstance(pane_pass, worker_panes.PassDetachedResults) and pane_pass.live_runs_checked else
             detached_runs.live_runs(directory, row.name, identity=row.id))
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
@@ -388,7 +693,8 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         if isinstance(pane_pass, worker_panes.PassDetachedResults):
             since, instance = pane_pass.started_at, pane_pass.instance_id
         else:
-            passed = worker_panes.worker_pass(row, run)
+            if not passed:
+                passed = worker_panes.worker_pass(row, run)
             started = passed.get("started_at", 0)
             since = float(started) if isinstance(started, (int, float)) else 0
             instance = passed.get("instance_id")
@@ -396,21 +702,47 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         deliveries, other_passes = detached_runs.worker_results(directory, row, since=since,
             pane_dispatch_id=instance if isinstance(instance, str) else "", include_legacy_pass=True)
         if isinstance(reply, DispatchAwaitingReply) and other_passes.intersection(reply.runs):
-            transcript = transcript_receipt(records(), prompt, done, other_pass_results=frozenset(other_passes))
-            recovered = transcript.receipt
-            if isinstance(recovered, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
-                return recovered
-            reply = (replace(recovered, restored_done=True)
-                     if isinstance(recovered, DispatchComplete) and recovered == reply.matching_done else recovered)
+            transcript = _dispatch_transcript(row, line, done, require_transcript=require_transcript, previous=previous,
+                notice_positions=notice_positions, other_pass_results=frozenset(other_passes))
+            verified = _select_pass_done(transcript, saved)
+            reply = transcript.receipt
+        other_pass_results = frozenset(other_passes)
+    read_extends_saved = not isinstance(saved, SavedPassDone) or transcript.extends_saved
+    received = transcript.received_runs if read_extends_saved else NO_RESULT_IDS
+    if isinstance(saved, SavedPassDone):
+        received |= saved.received_runs
+    if isinstance(verified, VerifiedPassDone):
+        pending_runs: set[str] = set()
+        if read_extends_saved:
+            pending_runs.update(reply.runs if isinstance(reply, DispatchAwaitingReply)
+                                else transcript.unreadable_pending_runs)
+        if isinstance(saved, SavedPassDone):
+            pending_runs.update(saved.pending_runs)
+        pending_runs.difference_update(verified.results_before_done | other_pass_results)
+        if pending_runs:
+            last_reply = (reply.last_reply if read_extends_saved and isinstance(reply, DispatchAwaitingReply)
+                          else verified.reply.reply)
+            reply = DispatchAwaitingReply(last_reply, tuple(sorted(pending_runs)), verified.reply)
+        else:
+            reply = verified.reply
+    if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+        return reply
+    covered_by_reply = {run_id for run_id, result in deliveries.items()
+                        if isinstance(verified, VerifiedPassDone)
+                        and verified.covers_run(result.run, result.finished_at) == detached_runs.ResultDoneCoverage.COVERED}
     covered = {run_id for run_id, result in deliveries.items()
-               if result.delivered_at is detached_runs.WorkerResultCovered.BY_DONE
-               or _done_covers_run(transcript.done_at, result.run, result.finished_at)}
+               if result.delivered_at is detached_runs.WorkerResultCovered.BY_DONE} | covered_by_reply
     if isinstance(reply, DispatchAwaitingReply) and isinstance(reply.matching_done, DispatchComplete):
         later = tuple(run_id for run_id in reply.runs if run_id not in covered)
-        reply = replace(reply, runs=later) if later else replace(reply.matching_done, restored_done=True)
+        reply = replace(reply, runs=later) if later else reply.matching_done
+    if isinstance(verify, VerifyPassDone) and isinstance(verified, VerifiedPassDone):
+        outstanding = frozenset(reply.runs) if isinstance(reply, DispatchAwaitingReply) else NO_RESULT_IDS
+        evidence = SavedPassDone(verified, received, outstanding)
+        if evidence != saved:
+            _save_pass_done(done_path, verify.instance, evidence)
     reap_required = {run_id for run_id, result in deliveries.items()
                      if result.delivered_at is detached_runs.WorkerResultDeferred.REAP_REQUIRED}
-    unseen = {run_id for run_id in deliveries.keys() - transcript.received_runs - covered - reap_required
+    unseen = {run_id for run_id in deliveries.keys() - received - covered - reap_required
               if deliveries[run_id].delivered_at is not detached_runs.WorkerResultDeliverySuppressed.SUCCESS_ONLY}
     live_ids = {record["run_id"] for record in live}
     pending = unseen | live_ids | reap_required
@@ -418,16 +750,19 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                    if result.requires_done_after_finish and run_id not in covered)
     if isinstance(reply, DispatchAwaitingReply):
         pending.update(reply.runs)
-    if unseen and isinstance(reply, DispatchComplete):
-        done_at = transcript.done_at
+    if unseen and isinstance(reply, DispatchComplete) and isinstance(verified, VerifiedPassDone):
+        done_at = verified.done_at
         after_done = tuple(sorted(run_id for run_id in unseen if not (
-            isinstance(done_at, float) and isinstance(delivered_at := deliveries[run_id].delivered_at, (int, float))
+            isinstance(done_at, float)
+            and isinstance(delivered_at := deliveries[run_id].delivered_at, (int, float))
             and delivered_at < done_at)))
         if after_done:
             reply = DispatchAwaitingReply(reply.reply, after_done, reply)
         elif not live and not reap_required:
-            return replace(reply, anomalies=tuple(
+            reply = replace(reply, anomalies=tuple(
                 f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
+    if isinstance(reply, DispatchComplete) and reply.anomalies:
+        return reply
     if pending:
         can_park = (not stopped and not reap_required and not isinstance(reply, DispatchAwaitingReply) and pending == live_ids
                     and isinstance(instance, str) and bool(instance)
@@ -435,18 +770,18 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                             and not record.get("self_stop") for record in live))
         return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply, can_park,
                                       reap_required=frozenset(reap_required))
-    if isinstance(reply, DispatchComplete):
+    if isinstance(reply, DispatchComplete) and isinstance(verified, VerifiedPassDone):
         finished_after_done = [
-            deliveries[run_id].run for run_id in sorted(covered)
-            if _done_covers_run(transcript.done_at, deliveries[run_id].run, deliveries[run_id].finished_at)
-            and not _done_covers_finish(transcript.done_at, deliveries[run_id].finished_at)]
+            deliveries[run_id].run for run_id in sorted(covered_by_reply)
+            if run_id not in verified.results_before_done
+            and not _done_covers_finish(verified.done_at, deliveries[run_id].finished_at)]
         if finished_after_done:
             body, _, done_line = reply.reply.rstrip().rpartition("\n")
             sections = [f"Detached run: {record['run_id']}\n"
                         + detached_runs.result_message(record, detached_runs.command_result(record))
                         for record in finished_after_done]
             text = "\n\n".join(part for part in (body.rstrip(), *sections, done_line) if part)
-            return replace(reply, reply=text, restored_done=True)
+            return replace(reply, reply=text)
     return reply
 
 
@@ -1438,6 +1773,17 @@ def _worker_dispatch_state(row: staff.StaffRow, record: staff.StaffSnapshot, det
         return worker_panes.DispatchHoldsWorker(detail)
 
 
+def _waiting_on_done(row: staff.StaffRow, detached: session_state.RunningDetachedWork,
+                     record: staff.StaffSnapshot) -> bool:
+    run = detached.launcher_runs.by_worker[row.id][0]
+    pending = worker_lifecycle.read_json_object(pending_done_path(run, row.id))
+    if not pending:
+        return False
+    passed = worker_panes.worker_pass(row, run, record=record)
+    return (pending.get("instance") == passed.get("instance_id")
+            and pending.get("stage") == progress_history.dispatch_delivery(passed).completion_id)
+
+
 def _assignment_runs(record: staff.StaffSnapshot, parent: StaffId, target: WorkerRole | WorkerName | staff.StaffRow, *,
                      additional: tuple[Path, ...] = ()) -> unit_runs.LauncherRunDirectories:
     rows = tuple(row for row in record.rows if row.kind != "worker" or (row.reports_to(parent)
@@ -2052,6 +2398,7 @@ def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
 
 
 def _restore_worker_pane(parent: StaffId, row: staff.StaffRow, hold: worker_panes.WorkerLockHold, *,
+                         selection: worker_panes.SelectedWorkerRows,
                          account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount
                                   | accounts.AccountSelection = worker_panes.ConfiguredWorkerAccount.CURRENT,
                          runs: dict[str, list[str]] | None = None,
@@ -2059,7 +2406,8 @@ def _restore_worker_pane(parent: StaffId, row: staff.StaffRow, hold: worker_pane
                          policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
                          ) -> worker_panes.WorkerStart:
     return worker_panes.start_or_resume(parent, WorkerName.parse(row.name), worker_panes.dispatch_role(row),
-                                        account=account, lock=hold, runs=runs, codex=codex, policy=policy)
+                                        account=account, lock=hold, runs=runs, codex=codex, policy=policy,
+                                        selection=selection)
 
 
 @dataclass(frozen=True)
@@ -2083,11 +2431,20 @@ _parked_restore_request: ContextVar[ParkedRestoreRequest | RestoreFromRunEvent] 
 def restore_parked_worker(row: staff.StaffRow, parent: StaffId, hold: worker_panes.WorkerLockHold) -> bool:
     """Restore the pane for a result without repeating its accepted assignment."""
     record = staff.snapshot()
-    state = worker_panes.observe_worker(parent, row, record)
+    current = record.by_id(row.id)
+    holder = record.by_id(parent)
+    if (current is None or holder is None or hold.parent != parent or not hold.owns(current)
+            or current.name != hold.name.value or current.current_session != row.current_session):
+        return False
+    herdr.refresh_restore_pane_evidence()
+    selection = worker_panes.SelectedWorkerRows(frozenset({current.id}))
+    observed = worker_panes.observe_parents([holder], record, selection=selection)
+    state = next(iter(observed[parent]), None)
     if isinstance(state, worker_panes.OpenWorker):
         return True
     if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker)):
         return False
+    row = state.row
     run = worker_panes.worker_run(row, record=record)
     policy = worker_panes.parked_launch_policy(row, worker_panes.worker_pass(row, run, record=record))
     if isinstance(policy, progress_history.ParkedLaunchUnavailable):
@@ -2096,9 +2453,10 @@ def restore_parked_worker(row: staff.StaffRow, parent: StaffId, hold: worker_pan
         return False
     request = _parked_restore_request.get()
     if not isinstance(request, ParkedRestoreRequest) or row.id not in request.workers:
-        result = _restore_worker_pane(parent, row, hold, policy=policy)
+        result = _restore_worker_pane(parent, row, hold, selection=selection, policy=policy)
     else:
-        result = _restore_worker_pane(parent, row, hold, policy=policy, account=request.account, codex=request.codex)
+        result = _restore_worker_pane(parent, row, hold, selection=selection, policy=policy,
+                                      account=request.account, codex=request.codex)
         if isinstance(result, worker_panes.OpenWorker):
             request.started_panes[row.id] = result.pane
     return startup_result(WorkerName.parse(row.name), result) == ExitCode.OK
@@ -2595,7 +2953,9 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
                 item["list_activity"] = activity or item["role"]
                 if pane != "-":
                     item["pane"] = pane
-            if parked or not as_json:
+            if _waiting_on_done(row, detached, record):
+                item["waiting_on"] = "transcript verification"
+            elif parked or not as_json:
                 item["waiting_on"] = _waiting_on(row, detached)
             listing.append(item)
     if not as_json:
@@ -2665,7 +3025,9 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
                 dispatch = progress_history.last_dispatch(state.row.id)
                 fields["list_activity"] = (dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch)
                                            and dispatch.status in ("active", "refused") else fields["role"])
-            if parked or not as_json:
+            if _waiting_on_done(state.row, detached, record):
+                fields["waiting_on"] = "transcript verification"
+            elif parked or not as_json:
                 fields["waiting_on"] = _waiting_on(state.row, detached)
             listing.append(fields)
     return listing
