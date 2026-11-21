@@ -2866,21 +2866,46 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
 
+    def select_gate_tree() -> tuple[TreeSelection, AffectedSelection | FullSuite, PassedTreeLedger]:
+        try:
+            tree, dirty = cloud.working_tree(repo)
+        except affected_modules.GraphError as error:
+            raise GateRefused(str(error)) from error
+        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+        modules = discover_test_modules(repo)
+        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+        return TreeSelection(tuple(path.relative_to(repo).as_posix() for path in paths), tree), selection, ledger
+
+    def record_no_modules(selection: AffectedSelection, ledger: PassedTreeLedger, *, reused: bool) -> GateRun:
+        if not reused:
+            ledger.record_pass(selection)
+        record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
+                        hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
+                        max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+        return GateRun((), 0.0, 0.0, selection_certified=True)
+
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        def route() -> GateRun | str:
+        def route(current: AllModules | TreeSelection) -> GateRun | str:
             return cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                               selected=selection, gate_job=gate_job)
+                               selected=current, gate_job=gate_job)
 
         def check_route_again() -> None:
             try:
-                result = route()
+                current = selection
+                if isinstance(selection, TreeSelection):
+                    current, affected, ledger = select_gate_tree()
+                    if isinstance(affected, AffectedSelection) and not affected.modules:
+                        raise CloudGateCompleted(record_no_modules(affected, ledger, reused=ledger.reuse()))
+                result = route(current)
             except (OSError, subprocess.SubprocessError) as error:
                 raise GateRefused(str(error)) from error
             if isinstance(result, GateRun):
                 raise CloudGateCompleted(result)
             print("Cloud gate uses natedev: " + result, flush=True)
 
-        outcome = route()
+        outcome = route(selection)
         if isinstance(outcome, str):
             print("Cloud gate uses natedev: " + outcome, flush=True)
             try:
@@ -2902,27 +2927,14 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     selected: AllModules | TreeSelection = ALL_MODULES
     whole_suite = full
     if not full:
-        try:
-            tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+        selected, selection, ledger = select_gate_tree()
         if ledger.reuse(report=False):
             return run_local(type_dirs)
         whole_suite = isinstance(selection, FullSuite)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
         if isinstance(selection, AffectedSelection) and not selection.modules:
             if type_dirs:
                 return run_local(type_dirs)
-            ledger.record_pass(selection)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
+            return record_no_modules(selection, ledger, reused=False)
 
     mac_module = mac_gate_process.MAC_GATE_MODULE
     try:

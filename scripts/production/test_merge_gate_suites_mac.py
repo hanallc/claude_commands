@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager, redirect_stdout, suppress
 import io
 import os
@@ -409,6 +410,28 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertTrue(callable(cast(object, run_suites.call_args.kwargs["route_again"])))
         self.assertIn("Cloud gate uses natedev: fixture cloud unavailable", self.output.getvalue())
         self.assertFalse((self.state / "mac-call.json").exists())
+
+    @gate_suites("hooks")
+    def test_cloud_retry_selects_the_tree_changed_during_the_local_wait(self) -> None:
+        original_tree, _ = cloud_gate.working_tree(self.checkout)
+        cloud_result = merge_gate.GateRun((), 1, 0)
+        added = "scripts/hooks/test_retry.py"
+
+        def wait_locally(_repo: Path, *_args: object, route_again: Callable[[], None], **_options: object) -> merge_gate.GateRun:
+            self.write(self.checkout / added, (self.checkout / HOOKS).read_text())
+            route_again()
+            self.fail("the successful retry must exit the local wait")
+
+        self.cloud_route.side_effect = ["fixture cloud unavailable", cloud_result]
+        with (mock.patch.object(merge_gate, "run_suites", side_effect=wait_locally),
+              mock.patch.dict(sys.modules, {MAC_MODULE: None})):
+            run = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+
+        updated_tree, _ = cloud_gate.working_tree(self.checkout)
+        self.assertNotEqual(original_tree, updated_tree)
+        self.assertIs(run, cloud_result)
+        self.assertEqual([call.kwargs["selected"] for call in self.cloud_route.call_args_list],
+                         [TreeSelection((HOOKS,), original_tree), TreeSelection((HOOKS, added), updated_tree)])
 
     @gate_suites("hooks")
     def test_missing_exclude_file_preserves_the_cloud_route(self) -> None:
