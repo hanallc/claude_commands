@@ -25,7 +25,7 @@ from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from hashlib import sha256
-from functools import partial
+from functools import cached_property, partial
 from threading import Event, Lock
 from time import monotonic
 from types import MappingProxyType
@@ -781,12 +781,19 @@ class MoveRequestNotRecorded:
 @dataclass
 class MoveStopAttempt:
     target: MoveStopTarget
-    write_request: Callable[[], moves.RequestedMove | MoveRequestNotRecorded]
+    build_request: Callable[[], moves.RequestedMove | MoveRequestNotRecorded]
     request: moves.RequestedMove | MoveRequestNotRecorded = field(default_factory=MoveRequestNotRecorded)
+
+    @cached_property
+    def _prepared_request(self) -> moves.RequestedMove | MoveRequestNotRecorded:
+        return self.build_request()
 
     def record_request(self) -> None:
         try:
-            self.request = self.write_request()
+            request = self._prepared_request
+            if not isinstance(request, MoveRequestNotRecorded):
+                moves.append_move(request)
+                self.request = request
         except Exception as error:
             print(f"{self.target.identity}: move log anomaly: {error}", file=sys.stderr)
 
@@ -2109,10 +2116,10 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
         capture_output=True, timeout=15, check=False)
 
 
-def _request_move(reference: str, plan: MoveStopTarget, target: str, why: str, cause: moves.MoveCause,
-                  fallback_source: str, names: LaunchNames | LaunchNamesNotRead
-                  ) -> moves.RequestedMove | MoveRequestNotRecorded:
-    """Record the proved live source or the retained source for a stopped session."""
+def _prepare_move_request(reference: str, plan: MoveStopTarget, target: str, why: str, cause: moves.MoveCause,
+                          fallback_source: str, names: LaunchNames | LaunchNamesNotRead
+                          ) -> moves.RequestedMove | MoveRequestNotRecorded:
+    """Build a request from the proved live source or the retained source."""
     if isinstance(names, LaunchNamesNotRead):
         return MoveRequestNotRecorded()
     source = plan.source.session.account if isinstance(plan.source, LiveMoveSource) else fallback_source
@@ -2134,11 +2141,9 @@ def _request_move(reference: str, plan: MoveStopTarget, target: str, why: str, c
             previous = label.label if isinstance(label, note_file.NumberedAccountLabel) else moves.HomeAccountUnresolved(home)
         else:
             print(f"anomaly: {identity}: session home is unknown; retain the normal source account", file=sys.stderr)
-    request: moves.RequestedMove = {"kind": "requested", "at": datetime.now(timezone.utc).isoformat(),
+    return {"kind": "requested", "at": datetime.now(timezone.utc).isoformat(),
         "move_id": uuid4().hex, "tool": tool, "subject": f"{identity}: {row.name}" if row is not None else reference,
         "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause}
-    moves.append_move(request)
-    return request
 
 
 def _record_move_outcome(request: moves.RequestedMove, result: ClaudeUp | StopFailed | SessionNotFound | ResumePending) -> None:
@@ -2663,7 +2668,7 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
             print(f"{plan.identity}: move log anomaly: {error}", file=sys.stderr)
     attempts: dict[str, MoveStopAttempt] = {}
     for session, plan in plans.items():
-        attempt = MoveStopAttempt(plan, partial(_request_move, session, plan, target, why, cause,
+        attempt = MoveStopAttempt(plan, partial(_prepare_move_request, session, plan, target, why, cause,
                                                source_accounts.get(session, ""), names))
         if isinstance(plan.source, StoppedMoveSource):
             attempt.record_request()

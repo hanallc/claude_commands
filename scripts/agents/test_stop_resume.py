@@ -5099,38 +5099,81 @@ class StopResumeTests(unittest.TestCase):
                     outcome, = [entry for entry in entries if entry["kind"] == "failed"]
                     self.assertEqual(outcome["reason"], failed.reason)
 
-    def test_batch_logs_a_live_worker_refused_by_the_role_check(self) -> None:
+    def test_batch_logs_a_worker_refused_by_the_role_check(self) -> None:
         parent = fixture_member("showrunner", name="move-parent")
         worker = fixture_worker("move-worker", parent.id)
         sibling = fixture_worker("move-sibling", parent.id)
         _ = staff.set_worker_role(sibling.id, staff.KnownWorkerRole("impl"))
+        _ = staff.set_home(worker.id, staff.SessionHome(self.root / ".claude3"))
         source = stop_resume.LiveMoveSource(
             stop_resume.ClaudeUp(worker.current_session, "worker-pane", "claude3"), 123, "generation-1")
+        sibling_source = stop_resume.LiveMoveSource(
+            stop_resume.ClaudeUp(sibling.current_session, "sibling-pane", "claude3"), 124, "generation-2")
         up = stop_resume.ClaudeUp(sibling.current_session, "sibling-pane", "claude4")
 
-        def running(identity: str, _pane: str, **_options: object) -> stop_resume.LiveMoveSource | sessions.SessionNotLive:
-            return source if identity == worker.current_session else sessions.SessionNotLive()
+        write = os.write
+        read_journal = worker_names.migrate_locked_journal
+        for live, fail_read in ((True, False), (False, False), (False, True)):
+            with self.subTest(live=live, fail_read=fail_read):
+                moves.store_file().unlink(missing_ok=True)
+                first_id = ""
+                newline_failed = False
+                read_failed = False
 
-        with (patch.object(stop_resume, "running_on_account", side_effect=running),
-              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(sibling.current_session)) as stop,
-              patch.object(stop_resume, "resume", return_value=up) as resume):
-            failed, moved = stop_resume.move_sessions([worker.id, sibling.id], "claude4", why="move")
+                def write_request(descriptor: int, data: bytes) -> int:
+                    nonlocal first_id, newline_failed
+                    if first_id and not newline_failed and data == b"\n":
+                        newline_failed = True
+                        raise OSError("write failed after the request JSON")
+                    if (not live and not newline_failed and b'"kind": "requested"' in data
+                            and worker.current_session.encode() in data):
+                        first_id = str(cast(dict[str, object], json.loads(data))["move_id"])
+                        return write(descriptor, data[:-1])
+                    return write(descriptor, data)
 
-        self.assertIsInstance(failed, stop_resume.StopFailed)
-        assert isinstance(failed, stop_resume.StopFailed)
-        self.assertEqual(failed.session_id, worker.current_session)
-        self.assertIn(worker_panes.StartRefusal.ROLE_UNAVAILABLE.value, failed.reason)
-        self.assertEqual(moved, up)
-        stop.assert_called_once_with(sibling.id)
-        resume.assert_called_once_with(sibling.current_session, why="move", to="claude4", client=self.client)
-        subject = f"{worker.current_session}: {worker.name}"
-        trail = [entry for entry in moves.read_moves() if entry["subject"] == subject]
-        self.assertEqual([entry["kind"] for entry in trail], ["requested", "failed"])
-        request, outcome = trail
-        assert request["kind"] == "requested" and outcome["kind"] == "failed"
-        self.assertEqual(request["from"], "claude3")
-        self.assertEqual(outcome["move_id"], request["move_id"])
-        self.assertEqual(outcome["reason"], failed.reason)
+                def read_requests(source: io.TextIOWrapper, path: Path) -> list[str]:
+                    nonlocal read_failed
+                    if fail_read and newline_failed and not read_failed:
+                        read_failed = True
+                        raise OSError("read failed after the request JSON")
+                    return read_journal(source, path)
+
+                def running(identity: str, _pane: str, **_options: object) -> stop_resume.LiveMoveSource | sessions.SessionNotLive:
+                    if live and identity == worker.current_session:
+                        return source
+                    if fail_read and identity == sibling.current_session:
+                        return sibling_source
+                    return sessions.SessionNotLive()
+
+                with (patch.object(os, "write", write_request),
+                      patch.object(worker_names, "migrate_locked_journal", read_requests),
+                      patch.object(stop_resume, "running_on_account", running),
+                      patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(sibling.current_session)) as stop,
+                      patch.object(stop_resume, "resume", return_value=up) as resume):
+                    failed, moved = stop_resume.move_sessions([worker.id, sibling.id], "claude4", why="move")
+
+                self.assertEqual(newline_failed, not live)
+                self.assertEqual(read_failed, fail_read)
+                self.assertIsInstance(failed, stop_resume.StopFailed)
+                assert isinstance(failed, stop_resume.StopFailed)
+                self.assertEqual(failed.session_id, worker.current_session)
+                self.assertIn(worker_panes.StartRefusal.ROLE_UNAVAILABLE.value, failed.reason)
+                self.assertEqual(moved, up)
+                stop.assert_called_once_with(sibling.id)
+                resume.assert_called_once_with(sibling.current_session, why="move", to="claude4", client=self.client)
+                subject = f"{worker.current_session}: {worker.name}"
+                trail = [entry for entry in moves.read_moves() if entry["subject"] == subject]
+                self.assertEqual([entry["kind"] for entry in trail], ["requested"] if fail_read else ["requested", "failed"])
+                request = trail[0]
+                assert request["kind"] == "requested"
+                self.assertEqual(request["from"], "claude3")
+                if not live:
+                    self.assertEqual(request["move_id"], first_id)
+                if not fail_read:
+                    outcome = trail[1]
+                    assert outcome["kind"] == "failed"
+                    self.assertEqual(outcome["move_id"], request["move_id"])
+                    self.assertEqual(outcome["reason"], failed.reason)
 
     def test_move_log_write_errors_do_not_stop_the_move(self) -> None:
         identity = self.entry["session_id"]
