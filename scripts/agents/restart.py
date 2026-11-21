@@ -463,7 +463,9 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
         return _saved_launch(entry, identity, name)
     for directory in sessions.config_dirs():
         if transcript_paths(directory / "projects", f"*/{identity}.jsonl"):
-            return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
+            turn = pane_record.claude_turn_settings(identity, directory)
+            arguments = ["--resume", identity, "--name", name, *pane_record.claude_resume_settings(turn).arguments()]
+            return "claude", named_account_environment(directory), arguments
     for directory in codex_transcript_homes():
         if transcript_paths(directory / "sessions", f"**/rollout-*{identity}.jsonl"):
             return "codex", {"CODEX_HOME": str(directory)}, ["resume", identity]

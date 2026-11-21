@@ -16,6 +16,8 @@ from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_protocol as wire, admission_service as service
+from scripts.build_queue.memory_feed import FeedStaff
+from scripts.agents.remote import local_machine
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
@@ -24,6 +26,8 @@ from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_pressure_reading
+from scripts.production import staff
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 
 
 DOC_COMMAND = ("bash", str(VERIFY), "doc")
@@ -55,12 +59,6 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         finally:
             _ = subprocess.run(["bash", str(helper), "release", *token], env=self.environment,
                                check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-
-    @contextmanager
-    def occupy_doc_slot(self) -> Generator[None]:
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_copy(
-                self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc"):
-            yield
 
     def test_doc_holds_no_checkout_while_waiting_for_the_cargo_token(self) -> None:
         with self.hold_cargo_token():
@@ -104,6 +102,64 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
         self.assertEqual(len(self.pass_records()), 1)
 
+    def test_doc_admission_wait_names_the_unit_without_a_session(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "doc-staff.json", self.environment))
+        showrunner = fixture_member("showrunner", name="builds")
+        unit = fixture_member("unit", name="doc-proof", parent=showrunner.id,
+                              worktree=staff.PresentWorktree(local_machine(), self.repo))
+        _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        _ = self.environment.pop("CODEX_THREAD_ID", None)
+        self.assert_doc_wait_identity(showrunner, unit, session="")
+
+    def test_doc_admission_wait_names_the_unit_from_an_unregistered_clone(self) -> None:
+        registered = self.root / "registered" / self.repo.name
+        registered.parent.mkdir()
+        _ = self.repo.rename(registered)
+        _ = subprocess.run(["git", "clone", "-q", "--", str(registered), str(self.repo)],
+                           env=self.environment, check=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = self.enterContext(isolated_staff_file(self.root / "doc-staff.json", self.environment))
+        showrunner = fixture_member("showrunner", name="builds")
+        unit = fixture_member("unit", name="doc-proof", parent=showrunner.id,
+                              worktree=staff.PresentWorktree(local_machine(), registered),
+                              runtime_id=staff.caller_identity())
+        self.environment.update(build_fixture_sessions(unit.current_session))
+        self.assert_doc_wait_identity(showrunner, unit, session=unit.current_session)
+
+    def assert_doc_wait_identity(self, showrunner: staff.StaffRow, unit: staff.StaffRow, *, session: str) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        waiting = Event()
+        requests: list[wire.PlacementRequest] = []
+        handle_request = admission.server.handle_request
+
+        def observe_request(request: wire.Request, connection: service.Connection | service.NoConnection
+                            = service.NO_CONNECTION) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                requests.append(request)
+            return handle_request(request, connection)
+
+        def observe_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait):
+                waiting.set()
+            return reply
+
+        admission.hold_starts()
+        with (mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait),
+              mock.patch.object(admission.server, "handle_request", side_effect=observe_request)):
+            process, log, _ = self.start_doc()
+            try:
+                self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
+                with admission.loop_turn():
+                    request = requests[0]
+                feed = FeedStaff(staff.StaffSnapshot((showrunner, unit)))
+                identity = request.identity
+                self.assertEqual(identity.session_id, session)
+                self.assertEqual(identity.folder, str(self.repo))
+                labels = feed.labels_for(identity.session_id, request.owner.host, Path(identity.folder))
+                assert labels is not None
+                self.assertEqual(labels.unit, unit.name)
+            finally:
+                write_pressure_reading(self.root / "pressure")
+        self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
     def test_remote_doc_refuses_a_tree_staged_during_checkout_preparation(self) -> None:
         self.enable_held_mac_doc()
         wrapper = self.root / "checkout-interpreter"
@@ -214,7 +270,8 @@ else:
         self.assertFalse(call["notes_present"])
         checkout = Path(call["cwd"])
         self.assertTrue(checkout.is_relative_to(self.root / "build"))
-        key = treekey.tree_key(str(checkout))
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            key = treekey.tree_key(str(checkout))
         assert key is not None
         self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key))
         rows = (cast(dict[str, object], json.loads(line))
@@ -289,7 +346,7 @@ else:
 
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         original = self.repo
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_copy(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_copy(
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
             self.repo: Path = slot.path
             self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)
