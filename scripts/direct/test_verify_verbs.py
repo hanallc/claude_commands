@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import subprocess
+from typing import override
 import unittest
 
 from scripts.build_queue import admission_records
@@ -14,6 +15,11 @@ from scripts.direct.verify_lint_scope_test_support import VERIFY
 
 
 class VerifyVerbTests(VerifyLintCacheFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment["BUILDLOG_SYNC"] = "1"
+
     def test_help_forms_print_the_same_short_usage_with_short_lines(self) -> None:
         missing = self.invoke_verify(cwd=self.root)
         self.assertEqual(missing.returncode, 2)
@@ -157,7 +163,7 @@ class VerifyWorkspaceFormTests(FinalPassFixture):
         return [row for row in rows if row.get("kind") == "call" and row.get("tool") == "verify.sh"]
 
     def test_check_without_package_preserves_features_and_records_workspace(self) -> None:
-        self.environment["BUILDLOG_OFF"] = "0"
+        self.environment.update(BUILDLOG_OFF="0", BUILDLOG_SYNC="1")
         result = self.verify("check", "--features", "foo")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check --workspace --lib --bins --features foo,extra", self.calls_made())
@@ -176,7 +182,7 @@ class VerifyWorkspaceFormTests(FinalPassFixture):
         self.assertNotIn("-E", calls[0])
 
     def test_named_final_records_its_package_without_a_saved_pass(self) -> None:
-        self.environment["BUILDLOG_OFF"] = "0"
+        self.environment.update(BUILDLOG_OFF="0", BUILDLOG_SYNC="1")
         result = self.verify("final", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check --workspace --all-targets --features extra", self.calls_made())

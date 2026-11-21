@@ -202,8 +202,12 @@ sys.stdin.read(1)
                 os.close(descriptor)
             with merge_gate.gate_recovery(self.unit):
                 self.assertEqual(self.jobserver_tokens(), b"Q")
-            self.assertFalse(folder.exists())
-            self.assertFalse(recovery.path.exists())
+            self.assertTrue(folder.is_dir())
+            saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
+            self.assertEqual(saved["folders"], [str(folder)])
+            self.assertEqual(saved["tokens"], [])
+            self.assertEqual(saved["groups"], {})
+            self.assertIs(saved["finished"], True)
 
     def test_recovery_drops_a_non_fifo_token_without_writing(self) -> None:
         pool = self.root / "token-pool"
@@ -459,9 +463,11 @@ merge_gate.start_gate_job = stop_after_start
                 pass
 
     def test_termination_signals_leave_resources_for_the_next_gate_to_recover(self) -> None:
+        active_runs = self.state / "runner/active-runs"
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             with self.subTest(sig=sig):
                 child = 0
+                previous_records = set(active_runs.glob("*/*.json"))
                 (self.state / "module-held").unlink(missing_ok=True)
                 self.write(self.state / "hold-module", "hold")
                 self.write(self.state / "leak-child", "leak")
@@ -500,9 +506,10 @@ merge_gate.run_gate_suites = whole_gate
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, -sig, output + errors)
                     self.assert_process_stopped(child)
-                    records = list((self.state / "runner/active-runs").glob("*/*.json"))
+                    records = set(active_runs.glob("*/*.json")) - previous_records
                     self.assertEqual(len(records), 1)
-                    record = cast(dict[str, object], json.loads(records[0].read_text()))
+                    record_path, = records
+                    record = cast(dict[str, object], json.loads(record_path.read_text()))
                     self.assertEqual(record["pid"], process.pid)
                     folders = [Path(folder) for folder in cast(list[str], record["folders"])]
                     self.assertTrue(folders)
@@ -514,9 +521,13 @@ merge_gate.run_gate_suites = whole_gate
                     self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
                     self.assert_process_stopped(child)
                     self.assert_process_stopped(leftover)
-                    self.assertTrue(all(not folder.exists() for folder in folders))
-                    self.assertEqual(list((self.state / "runner/active-runs").glob("*/*.json")), [])
-                    self.assertEqual(list(parent.iterdir()), [])
+                    self.assertTrue(all(folder.is_dir() for folder in folders))
+                    self.assertEqual(set(active_runs.glob("*/*.json")), previous_records | {record_path})
+                    saved = cast(dict[str, object], json.loads(record_path.read_text()))
+                    self.assertEqual(saved["folders"], record["folders"])
+                    self.assertEqual(saved["groups"], {})
+                    self.assertEqual(saved["tokens"], [])
+                    self.assertIs(saved["finished"], True)
                     self.assertEqual(self.jobserver_tokens(), b"Q")
                     self.assert_not_pushed()
                 finally:

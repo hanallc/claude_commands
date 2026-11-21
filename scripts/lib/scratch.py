@@ -3058,15 +3058,9 @@ def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: 
 
 def delete_sweep_tree(path: str) -> None:
     """Remove a source owned by the legacy folder audit."""
-    if os.path.islink(path) or not os.path.isdir(path):
-        os.unlink(path)
-        return
-    try:
-        shutil.rmtree(path)
-    except PermissionError:
-        for _, _, _, descriptor in os.fwalk(path, follow_symlinks=False):
-            os.fchmod(descriptor, 0o700)
-        shutil.rmtree(path)
+    folder = Path(path)
+    kind = RemovalKind.TREE if not folder.is_symlink() and folder.is_dir() else RemovalKind.FILE
+    delete_entry(folder, kind)
 
 
 @dataclass(frozen=True)

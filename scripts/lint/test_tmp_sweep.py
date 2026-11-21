@@ -584,7 +584,7 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(live.parent.exists())
         self.assertTrue((self.tmp / "copies").is_dir())
 
-    def test_empty_copy_pair_stays_with_a_hold_or_unreadable_hold_file(self) -> None:
+    def test_review_keeps_empty_copy_pairs(self) -> None:
         copies = self.tmp / "copies"
         pair = copies / "held"
         pair.mkdir(parents=True)
@@ -593,18 +593,20 @@ class CopyTests(TmpSweepCase):
         self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(copies)}))
         _ = scratch.hold(pair, "phase:demo/1", "The task needs this folder.")
 
-        result = self.sweep()
+        _ = self.sweep()
 
         self.assertTrue(pair.is_dir())
-        self.assertFalse(unheld.exists())
-        self.assertIn(str(pair), result.kept[scratch.HELD_FOLDER_REASON])
+        self.assertTrue(unheld.is_dir())
+        self.assertNotIn(pair, self.plan.rows)
         self.assertTrue(scratch.release(pair))
         hold_file = write(scratch.holds_file(), '{"partial":')
 
         result = self.sweep()
 
         self.assertTrue(pair.is_dir())
-        self.assertIn(str(pair), result.kept[f"cannot read scratch hold file {hold_file}"])
+        self.assertNotIn(pair, self.plan.rows)
+        self.assertEqual(result.deleted, [])
+        self.assertEqual(hold_file.read_text(), '{"partial":')
 
     def test_dry_run_does_not_add_a_busy_mark_to_an_unregistered_copy(self) -> None:
         path = self.copy("unknown")
@@ -810,7 +812,10 @@ class IdleTests(TmpSweepCase):
               mock.patch.object(sweep, "saved_cargo_output_roots", return_value=sweep.CargoOutputIndex((roots,))),
               mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([]))):
             folder_audit.clean_checkout_cargo_output(checkout)
-        self.assertFalse(build.exists())
+        self.assertEqual((build / "output").read_text(), "build data")
+        [plan] = list((Path.home() / removal_guard.LIST_DIRECTORY).glob("*.jsonl"))
+        [line] = plan.read_text().splitlines()
+        self.assertEqual(removal_guard.ListedEntry.parse(line).path, build)
         self.assertEqual((hidden / "note").read_text(), "source data")
         self.assertEqual((destination / "note").read_text(), "source data")
 

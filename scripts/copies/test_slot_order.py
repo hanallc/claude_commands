@@ -712,7 +712,8 @@ placement_once
         leave = self.root / "leave"
         _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
         self.queue.hold_starts()
-        with mock.patch.dict(os.environ, {**environment, "LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
+        with mock.patch.dict(os.environ, {**environment, "BUILDLOG_SYNC": "1",
+                                         "LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
             process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "check", "sample"),
                 "--apply-uncommitted", str(tools.root))
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
@@ -735,6 +736,9 @@ placement_once
     def test_next_allocation_removes_a_stopped_verify_waiters_source_copy(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
+        environment.update(BUILDLOG_SYNC="1", COPY_SLOT_TEST_ROOT=str(self.root))
+        marker = f"COPY_SLOT_TEST_ROOT={self.root}"
+        self.addCleanup(reap, marker)
         self.queue.hold_starts()
         with mock.patch.dict(os.environ, environment):
             process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "check", "sample"))
@@ -747,6 +751,7 @@ placement_once
         lease = cast(dict[str, object], json.loads(leftover.with_name(leftover.name + ".lease.json").read_text()))
         self.assertEqual(lease["pid"], process.pid)
         process.kill()
+        _ = reap(marker)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(build_folders.build_folder_state(leftover), "free")
         with build_folders.tool_folder("copies-source", parent=leftover.parent) as replacement:

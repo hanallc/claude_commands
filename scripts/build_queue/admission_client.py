@@ -1163,7 +1163,12 @@ class RefreshedWrite:
     request: AdmissionRequest
 
 
-def _wait_for_admission_reply(sockets: AcquisitionSockets, request: AdmissionRequest,
+@dataclass
+class AcquisitionRequests:
+    current: AdmissionRequest
+
+
+def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: AdmissionRequest,
                               on_wait: Callable[[wire.Wait], None],
                               refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
                               attempt: Callable[[], None], retry: AcquisitionRetry, checker: CheckerRetry,
@@ -1171,6 +1176,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, request: AdmissionReq
                               ) -> tuple[AdmissionRequest, AdmissionCompletion]:
     from scripts.build_queue import admission_records as records
 
+    requests = AcquisitionRequests(initial_request)
     interval = configuration.reconnect_seconds
     silence = configuration.silence_seconds
     retry.start_leave_schedule(configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig) else interval)
@@ -1200,7 +1206,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, request: AdmissionReq
             restarted = True
 
     if (expired := retry.expired()) is not None:
-        return request, expired
+        return requests.current, expired
     if not isinstance(attempt, AdmissionHoldCheck):
         attempt()
 
@@ -1223,6 +1229,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, request: AdmissionReq
         return None
 
     while True:
+        request = requests.current
         checker_due = False
         if sockets.terminal() is None:
             sockets.drain(request)
@@ -1231,7 +1238,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, request: AdmissionReq
             if not stream.outgoing:
                 assert refreshing is not None
                 answered_expiry = refreshing.estimated_at
-                request = refreshed_write.request
+                requests.current = request = refreshed_write.request
                 refreshing = None
                 refreshed_write = None
                 checker.clear()

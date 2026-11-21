@@ -28,11 +28,11 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lib import proc_text
+from scripts.lib import proc_text, removal_guard
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import build_folders, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
 from scripts.lib.cleanup_process_test_support import private_cleanup_processes
-from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.lint import sweep, tmp_sweep
 
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -196,7 +196,9 @@ class ScratchTests(unittest.TestCase):
         cache = self.base / "outside-cache"
         roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", cache)
         calls: list[str] = []
-        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...], *,
+                  source: removal_guard.Identity | None = None) -> None:
+            self.assertEqual(source, removal_guard.identity(path.lstat()))
             self.assertEqual(path, checkout)
             self.assertEqual(saved[0].roots, roots)
             self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
@@ -713,7 +715,9 @@ class ScratchTests(unittest.TestCase):
                 roots = cargo_output.CargoOutputRoots(path, path / "target", self.base / "outside-output")
                 saved = scratch.SavedCargoOutput(roots, (), (), time.time())
 
-                def change_refs(repo: Path, _saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+                def change_refs(repo: Path, _saved: tuple[scratch.SavedCargoOutput, ...], *,
+                                source: removal_guard.Identity | None = None) -> None:
+                    self.assertEqual(source, removal_guard.identity(repo.lstat()))
                     query.assert_called_once()
                     if change == "private":
                         self.git(repo, "checkout", "--detach", "-q")
@@ -1540,7 +1544,9 @@ for descriptor in descriptors:
                             reference.symlink_to("refs/heads/loose")
                         return saved
 
-                    def change_metadata(_path: Path, _saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+                    def change_metadata(path: Path, _saved: tuple[scratch.SavedCargoOutput, ...], *,
+                                        source: removal_guard.Identity | None = None) -> None:
+                        self.assertEqual(source, removal_guard.identity(path.lstat()))
                         if has_outputs:
                             index.unlink()
                             index.mkdir()

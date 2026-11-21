@@ -1223,7 +1223,7 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             request = fixture.request()
             transport = self.use_transport(fixture,
-                Exchange(reply_bytes(wire.RouteAgain()), reply_bytes(wire.RouteGranted())),
+                Exchange(reply_bytes(wire.RouteAgain()), after_send={2: (reply_bytes(wire.RouteGranted()),)}),
                 Exchange(reply_bytes(GRANTED)))
 
             def check_aws() -> None:

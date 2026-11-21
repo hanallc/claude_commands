@@ -1473,9 +1473,11 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         result.keep(entry.path, "its phases parent changed")
         return False
     try:
+        scratch.CoordinatedRemoval.check_tree(path)
         with scratch.coordinate_removals(dry_run=True, scratch_settings=scratch_settings) as removal:
             removal.check(path)
     except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
+        print(f"tmp sweep: keep {entry.path}: {error}")
         result.keep(entry.path, str(error))
         return False
     with scratch.judgment_lock(path) as idle:
@@ -1545,6 +1547,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
                 if not idle:
                     result.keep(entry.path, IN_USE)
                     continue
+                scratch.CoordinatedRemoval.check_tree(path)
                 if isinstance(plan, removal_guard.RemovalList):
                     maker = (removal_guard.review_evidence(path)
                              if isinstance(entry.maker, removal_guard.UnknownMaker) else entry.maker)
@@ -1934,7 +1937,7 @@ def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: S
                         result.keep(path, "the nextest log changed during the process scan")
                         continue
                     removal.check(scratch.AnchoredRemoval(folder, name))
-                    if isinstance(plan, removal_guard.RemovalList):
+                    if not dry_run and isinstance(plan, removal_guard.RemovalList):
                         _ = plan.add_manual(removal_guard.Tool.NEXTEST, Path(path), root,
                                             info.st_blocks * 512, "expired Mac nextest log")
             except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
