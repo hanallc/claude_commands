@@ -447,7 +447,6 @@ class Tool(Enum):
     BUILD = "sweep"
     DOC = "sweep:rustdoc"
     CARGO = "scratch:cargo"
-    GATE = "gate_folders_delete"
 
 
 LIST_DIRECTORY = Path(".local/state/removal-lists")

@@ -354,7 +354,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/style/coverage_report.py` | read | snapshot |
 | `scripts/style/crate_run.py` | read | local_snapshot, owner_of; worktree_names names the unit of a crate run |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
-| `scripts/style/selection_capture.py` | read | record_path copies staff.json into a capture |
 | `scripts/style/style_config.py` | read | StaffRow, StaffSnapshot.find, StaffSnapshot.parent_of, LiveDoc, WrappedDoc |
 | `scripts/style/style_ledger.py` | read | snapshot |
 | `scripts/style/style_plan.py` | read | snapshot |
