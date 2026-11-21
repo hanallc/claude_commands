@@ -2542,7 +2542,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, Refusal, RenameRefused, herdr_types.HerdrFailure) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0
