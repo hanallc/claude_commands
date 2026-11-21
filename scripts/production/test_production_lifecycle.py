@@ -917,7 +917,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.merge_tip()
         destination = self.promotion_checkout("installed")
         hook = destination / ".claude/config/post_push.sh"
-        self.write(hook, 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
+        self.write(hook, 'test "$(git rev-parse HEAD)" = "$LANDED_SHA" || exit 0\n'
+                   + 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
         self.production_doc("running", promote=f"`{destination}`")
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "declare promotion")
@@ -950,6 +951,22 @@ class LifecycleTests(LifecycleFixture):
                        "--production", "example", "--no-ci"]
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
+
+        with self.subTest(installed="newer integration commit"):
+            earlier = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "Requested promotion")
+            later = self.git("commit-tree", "HEAD^{tree}", "-p", earlier, "-m", "Newer integration commit")
+            _ = self.git("push", "origin", f"{later}:refs/heads/production")
+            _ = self.git("fetch", "origin", "production", cwd=destination)
+            _ = self.git("merge", "--ff-only", later, cwd=destination)
+            promotion = production_doc.PromoteTo((destination,), production_doc.NoMac())
+            with mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(io.StringIO()) as output:
+                merge_checkpoint.promote_targets(promotion, "production", earlier, source=self.checkout,
+                                                 label="fixture checkpoint", local_only=True)
+            self.assertIn(f"{destination} already at {later}", output.getvalue())
+            self.assertIn("post-push hook: done", output.getvalue())
+            self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], later)
+            self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
+            self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
 
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()

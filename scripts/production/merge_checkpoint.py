@@ -1119,6 +1119,39 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
     return tip
 
 
+def run_installed_main_hook(checkout: Path, head: str) -> land_main.HookAbsent | land_main.HookDone | land_main.HookSkipped | land_main.HookFailed:
+    """Run the post-push hook for the newer commit already installed in main."""
+    checkout = checkout.resolve()
+    default = git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD")
+    if default.returncode == 0 and default.stdout.strip() != "refs/remotes/origin/main":
+        return land_main.HookSkipped()
+    hook = checkout / ".claude/config/post_push.sh"
+    if not hook.is_file():
+        return land_main.HookAbsent()
+    rerun = f"cd {shlex.quote(str(checkout))} && LANDED_SHA={head} LANDED_BRANCH=main bash {shlex.quote(str(hook))}"
+    common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.returncode:
+        return land_main.HookFailed(1, rerun)
+    record = Path(common.stdout.strip()) / "post-push-completed"
+    try:
+        if record.read_text(encoding="utf-8").strip() == head:
+            return land_main.HookSkipped()
+    except OSError:
+        pass
+    try:
+        installed = git(checkout, "rev-parse", "HEAD")
+        if installed.returncode or installed.stdout.strip() != head:
+            return land_main.HookFailed(1, rerun)
+        result = subprocess.run(["bash", str(hook)], cwd=checkout, check=False,
+                                env={**os.environ, "LANDED_SHA": head, "LANDED_BRANCH": "main"})
+        if result.returncode:
+            return land_main.HookFailed(result.returncode, rerun)
+        write_text_atomic(record, head + "\n")
+    except OSError:
+        return land_main.HookFailed(1, rerun)
+    return land_main.HookDone()
+
+
 def promote_local_checkout(checkout: Path, merge_branch: str, tip: str | VerifiedIntegrationTip,
                            *, integration: Path | None = None) -> (
         PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed):
@@ -1162,13 +1195,20 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str | Verifie
         if isinstance(target, VerifiedIntegrationTip):
             target.require_current(merge_branch, source)
         if foreign:
-            return PromotionNotPushed(tip, at_tip)
-        try:
-            landed = land_main.land(source, tip)
-        except land_main.LandError as error:
-            raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
-        checkpoint_gate.report("post-push", "warning" if isinstance(landed.hook, land_main.HookFailed) else "ok",
-                               land_main.hook_report(landed.hook))
+            return PromotionNotPushed(head, head == current)
+        if head == tip:
+            try:
+                hook = land_main.land(checkout, tip).hook
+            except land_main.LandError as error:
+                raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
+        else:
+            if git(source, "merge-base", "--is-ancestor", tip, "refs/remotes/origin/main").returncode:
+                _ = good(git(source, "push", "origin", f"{tip}:refs/heads/main"), "promote")
+            hook = run_installed_main_hook(checkout, head)
+        checkpoint_gate.report("post-push", "warning" if isinstance(hook, land_main.HookFailed) else "ok",
+                               land_main.hook_report(hook))
+        if head != tip:
+            return PromotionAlreadyAtTip(head)
         if at_tip:
             return PromotionOriginPushed(tip) if unpushed else PromotionAlreadyAtTip(tip)
         return PromotionAdvanced(tip)
@@ -1242,7 +1282,7 @@ def promote_targets(promotion: production_doc.NoPromotion | production_doc.Promo
             result = promote_local_checkout(checkout, branch, tip)
         already_at = isinstance(result, (PromotionAlreadyAtTip, PromotionOriginPushed)) or (
             isinstance(result, PromotionNotPushed) and result.already_at_tip)
-        detail = f"{checkout} {'already at' if already_at else 'main at'} {tip}"
+        detail = f"{checkout} {'already at' if already_at else 'main at'} {result.tip}"
         if isinstance(result, PromotionNotPushed):
             detail += "; main holds commits not on origin/" + branch + " and was not pushed"
         checkpoint_gate.report("promote", "ok", detail)

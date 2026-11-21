@@ -805,11 +805,11 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
                 if isinstance(result, PromotionNotPushed):
                     raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
                 if isinstance(result, PromotionAlreadyAtTip):
-                    detail = f"{destination}: already at {tip}"
+                    detail = f"{destination}: already at {result.tip}"
                 elif isinstance(result, PromotionOriginPushed):
-                    detail = f"{destination}: pushed {tip}"
+                    detail = f"{destination}: pushed {result.tip}"
                 else:
-                    detail = f"{destination}: advanced to {tip}"
+                    detail = f"{destination}: advanced to {result.tip}"
                 report("promote", "ok", detail)
     if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
