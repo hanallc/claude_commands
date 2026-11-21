@@ -1906,7 +1906,7 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 **Workers:** 1 writer, 1 reviewer.
 
 ### Phase 108 — Config names are lower case  · status: pending
-**Depends on:** builds 355 on main (about 18:35 EST 2026-11-21)
+**Depends on:** builds 355 on main (about 18:35 EST 2026-11-21) to start; builds' Mac rows (45f part 1, 45r, 45s part 2, split gate 46c, about 20:30 EST) on main and merged in before the full test
 
 #### Work Order
 
