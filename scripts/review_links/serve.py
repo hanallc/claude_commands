@@ -45,6 +45,7 @@ from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
+from scripts.whoami import usage_store
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
@@ -185,57 +186,152 @@ class PageCaptures:
             return capture.saved
 
 
+@dataclass(frozen=True)
+class UsageStoreRevision:
+    device: int
+    inode: int
+    modified_ns: int
+    size: int
+
+
+class MissingUsageStore(Enum):
+    ABSENT = "usage store absent"
+
+
+class UsageStoreRevisionUnavailable(OSError):
+    """The server cannot check for a change in the usage store."""
+
+
+def _usage_store_revision() -> UsageStoreRevision | MissingUsageStore:
+    try:
+        info = usage_store.store_file().stat()
+    except FileNotFoundError:
+        return MissingUsageStore.ABSENT
+    except OSError as error:
+        raise UsageStoreRevisionUnavailable("Cannot check the usage store file.") from error
+    return UsageStoreRevision(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+@dataclass(frozen=True)
+class AccountsRenderAttempt:
+    revision: UsageStoreRevision | MissingUsageStore
+    response: Future[bytes]
+    following_response: Future[bytes] = field(default_factory=Future[bytes])
+
+
+class NoAccountsRender(Enum):
+    YET = "no render started"
+
+
 @dataclass
 class AccountsPageCache:
     """Keep the last good page and allow one render at a time."""
 
     page: bytes = b""
+    rendered_at: float = 0.0
+    page_revision: UsageStoreRevision | MissingUsageStore = MissingUsageStore.ABSENT
     render_failed: bool = False
     recent_times: deque[float] = field(default_factory=lambda: deque(maxlen=10))
     rendering: bool = False
-    first_render: Future[bytes] = field(default_factory=Future[bytes])
+    render_attempt: AccountsRenderAttempt | NoAccountsRender = NoAccountsRender.YET
     condition: threading.Condition = field(default_factory=threading.Condition)
 
     def get(self) -> bytes:
-        render_first = False
+        try:
+            refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
+        except (OSError, ValueError) as error:
+            with self.condition:
+                return self._read_error(error, "The Accounts refresh setting could not be read.")
+        try:
+            return self._get_for_period(refresh_seconds)
+        except UsageStoreRevisionUnavailable as error:
+            with self.condition:
+                return self._read_error(error, "The Accounts usage store could not be checked.")
+
+    def _get_for_period(self, refresh_seconds: float) -> bytes:
         with self.condition:
-            if self.page:
-                if not self.rendering:
-                    self.rendering = True
-                    try:
-                        threading.Thread(target=self.replace, daemon=True).start()
-                    except RuntimeError:
-                        self.rendering = False
-                        raise
+            revision = _usage_store_revision()
+            previous = self.render_attempt
+            current = (bool(self.page) and self.page_revision == revision
+                       and time.monotonic() - self.rendered_at <= refresh_seconds)
+            if current:
+                if self.rendering:
+                    return self._response()
+                background = self._begin_render(revision)
+                try:
+                    threading.Thread(target=self._render, args=(background,), daemon=True).start()
+                except RuntimeError:
+                    self.rendering = False
+                    self.render_attempt = previous
+                    raise
                 return self._response()
-            if not self.rendering:
-                self.first_render = Future[bytes]()
-                self.rendering = True
-                render_first = True
-            attempt = self.first_render
-        if render_first:
-            try:
-                page = self.replace()
-            except BaseException as error:
-                attempt.set_exception(error)
-                raise
-            attempt.set_result(page)
+            attempt = (previous if self.rendering and isinstance(previous, AccountsRenderAttempt)
+                       else self._begin_render(revision))
+
+        if attempt is not previous:
+            return self._render(attempt)
+        if attempt.revision == revision:
+            page = attempt.response.result()
+            if revision == _usage_store_revision():
+                return page
+        return self._render_after(attempt)
+
+    def _render_after(self, previous: AccountsRenderAttempt) -> bytes:
+        with self.condition:
+            _ = self.condition.wait_for(lambda: not self.rendering or self.render_attempt is not previous)
+            attempt = (self._begin_render(_usage_store_revision()) if self.render_attempt is previous
+                       else NoAccountsRender.YET)
+        if isinstance(attempt, AccountsRenderAttempt):
+            return self._render(attempt)
+        return previous.following_response.result()
+
+    def _begin_render(self, revision: UsageStoreRevision | MissingUsageStore) -> AccountsRenderAttempt:
+        previous = self.render_attempt
+        # Give requests that waited for the previous attempt this render's response.
+        response = previous.following_response if isinstance(previous, AccountsRenderAttempt) else Future[bytes]()
+        attempt = AccountsRenderAttempt(revision, response)
+        self.render_attempt = attempt
+        self.rendering = True
+        return attempt
+
+    def _render(self, attempt: AccountsRenderAttempt) -> bytes:
+        try:
+            page = self._replace(attempt.revision)
+        except BaseException as error:
+            attempt.response.set_exception(error)
+            raise
+        else:
+            attempt.response.set_result(page)
             return page
-        return attempt.result()
+        finally:
+            with self.condition:
+                self.rendering = False
+                self.condition.notify_all()
 
     def _response(self) -> bytes:
         if self.render_failed:
-            return self.page.replace(b'data-page-facts',
-                                     b'data-page-facts data-read-error="The Accounts render failed."', 1)
+            return self._page_with_error("The Accounts render failed.")
         return self.page
 
-    def replace(self) -> bytes:
+    def _page_with_error(self, message: str) -> bytes:
+        mark = f'data-page-facts data-read-error="{html.escape(message, quote=True)}"'
+        return self.page.replace(b'data-page-facts', mark.encode(), 1)
+
+    def _read_error(self, error: OSError | ValueError, message: str) -> bytes:
+        if not self.page:
+            raise error
+        print(f"review-links accounts: {error}", file=sys.stderr)
+        return self._page_with_error(message)
+
+    def _replace(self, revision: UsageStoreRevision | MissingUsageStore) -> bytes:
         try:
             rendered = accounts_page.render_with_facts()
             with self.condition:
                 self.render_failed = False
                 self.recent_times.append(rendered.seconds)
                 self.page = rendered.with_recent_times(tuple(self.recent_times))
+                self.rendered_at = time.monotonic()
+                self.page_revision = revision
                 return self.page
         except (OSError, ValueError) as error:
             with self.condition:
@@ -244,10 +340,6 @@ class AccountsPageCache:
                 self.render_failed = True
                 print(f"review-links accounts: {error}", file=sys.stderr)
                 return self._response()
-        finally:
-            with self.condition:
-                self.rendering = False
-                self.condition.notify_all()
 
 
 class TailscaleAddressLost(RuntimeError):

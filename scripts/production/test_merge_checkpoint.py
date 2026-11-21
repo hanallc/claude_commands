@@ -31,6 +31,7 @@ from scripts.production import showrunners
 from scripts.production import production_doc
 
 from scripts.lib import main_publish, scratch
+from scripts.lib.git_test_support import fixture_git_environment
 
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, configure_test_environment,
@@ -41,15 +42,19 @@ MAC_RECOVERY = ("{ [ ! -f scripts/lib/waiting_rows.py ] || "
 
 
 def setUpModule() -> None:
+    state = Path(tempfile.mkdtemp(prefix="checkpoint-zone-fixture-")).resolve()
+    unittest.addModuleCleanup(shutil.rmtree, state)
+    environment = fixture_git_environment(state)
+    for key in ("BASH_ENV", "STAFF_CONFIG"):
+        _ = environment.pop(key, None)
+    environment["ZONE_STATE"] = str(state)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     configure_test_environment()
-    state = tempfile.TemporaryDirectory()
-    unittest.addModuleCleanup(state.cleanup)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
 
 
 class CheckpointTestFolderTests(unittest.TestCase):
     def test_package_step_uses_the_manifest_name_and_package_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
             checkout = Path(temporary)
             package = checkout / "scripts/aws_target/proof_crate"
             package.mkdir(parents=True)
@@ -63,7 +68,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[0].folder, package)
 
     def test_example_step_uses_the_manifest_name_and_checkout_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
             checkout = Path(temporary)
             package = checkout / "crates/proof_crate"
             package.mkdir(parents=True)
@@ -79,7 +84,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
     def test_package_commands_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
-                with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory() as temporary:
+                with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
                     checkout = Path(temporary)
                     relative = ("crates/proof_crate/examples/demo.rs" if workspace
                                 else "scripts/aws_target/proof_crate/src/lib.rs")
@@ -266,7 +271,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             for outcome in ("green", "red", "conflict", "resume", "moving-green", "moving-red"):
@@ -935,7 +940,7 @@ raise SystemExit(1)
         result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "failed", "ancestry: failed")
         self.assertIn("send alpha: the showrunner will inspect the failed command", result.process.stdout)
-    def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
+    def test_a_code_checkpoint_keeps_its_phases_scratch_folders(self) -> None:
         plan = self.root / "scratch-plan.md"
         _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
         with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
@@ -943,8 +948,9 @@ raise SystemExit(1)
             later = scratch.new("phase:alpha/3")
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha/2: ", result.process.stdout)
-        self.assertFalse(any(path.exists() for path in done))
+        for path in done:
+            self.assertIn(f"kept for a manual removal list: {path} (scratch, task phase:alpha/2 ended)", result.process.stderr)
+            self.assertTrue(path.is_dir())
         self.assertTrue(later.is_dir())
 
     def test_a_code_checkpoint_reports_retained_scratch_folders(self) -> None:
@@ -956,8 +962,7 @@ raise SystemExit(1)
         _ = (folder / "work").write_text("keep this work")
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn(f"kept {folder}:", result.process.stdout)
-        self.assertIn("uncommitted changes", result.process.stdout)
+        self.assertIn(f"kept for a manual removal list: {folder} (scratch, task phase:alpha/2 ended)", result.process.stderr)
         self.assertEqual((folder / "work").read_text(), "keep this work")
     def test_real_merge_tests_run_only_the_two_commands_before_commentary(self) -> None:
         self.production_doc(merge_tests_line=REAL_MERGE_TESTS)
@@ -1155,7 +1160,7 @@ class MacPromotionPathTests(unittest.TestCase):
                  ("pulled with zone", 0, "rc=0\n", "Zone changed", main_publish.MacPulled),
                  ("offline with zone", 255, "", "Zone changed", main_publish.MacPullPending))
         for label, code, output, text, expected in cases:
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as folder:
                 state = Path(folder)
                 ssh = state / "ssh"
                 _ = ssh.write_text(f"#!{sys.executable}\nimport sys\n"
@@ -1196,7 +1201,7 @@ class MacPromotionPathTests(unittest.TestCase):
         from scripts.lib import zone
 
         for text in ("", "Zone changed"):
-            with self.subTest(custom_checkout=True, text=text), tempfile.TemporaryDirectory() as folder:
+            with self.subTest(custom_checkout=True, text=text), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as folder:
                 state = Path(folder)
                 ssh = state / "ssh"
                 _ = ssh.write_text(f"#!{sys.executable}\n" + '''import json

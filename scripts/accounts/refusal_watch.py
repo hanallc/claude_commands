@@ -44,6 +44,7 @@ from scripts.whoami.quota_alert import (RefusedAt, _refusal_window, blocked_next
                          TargetLoginRenewalFailed as TargetLoginRenewalFailed,
                          TargetAtOrBelowThreshold as TargetAtOrBelowThreshold,
                          TargetUnresolvedRefusal as TargetUnresolvedRefusal,
+                         TargetPreparationRefused,
                          TargetAccountUnavailable as TargetAccountUnavailable)
 
 if TYPE_CHECKING:
@@ -1170,10 +1171,15 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
         if current_account == label:
             return candidate
         try:
-            target_login = accounts.claude_login(accounts.claude_account_dir(label))
+            destination = accounts.NamedAccount(label, accounts.claude_account_dir(label))
         except accounts.AccountsError as error:
             blocked.append((candidate, TargetAccountUnavailable(str(error).splitlines()[0])))
             continue
+        sign_in = accounts.move_target_sign_in(destination, now)
+        if isinstance(sign_in, accounts.MoveRefused):
+            blocked.append((candidate, TargetPreparationRefused(sign_in.reason)))
+            continue
+        target_login = sign_in.login
         target = refusals.stored_reading_with_age("claude", target_login, now, stale_after)
         last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
                      and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
@@ -1327,20 +1333,28 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                 lines.append(_record_blocked_head(state, blocked_rule, reason, now, dry_run,
                                                   other_targets=chosen.reasons[1:]))
             continue
-        rule = chosen
-        if selection.account == rule.to:
-            if isinstance(_remove_head_if_selected(rule, lines, dry_run=dry_run), AutoMoveTargetSelected):
+        if selection.account == chosen.to:
+            if isinstance(_remove_head_if_selected(chosen, lines, dry_run=dry_run), AutoMoveTargetSelected):
                 _ = holds.pop(rule.entry_id, None)
                 _ = notices.pop(rule.entry_id, None)
             continue
-        _ = notices.pop(rule.entry_id, None)
         why = f"auto: {rule.entry_id}"
-        lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {selection.account} to {rule.to}")
-        moved.add(rule.group)
         if dry_run:
+            lines.append(f"{rule.group}: {why}; would move from {selection.account} to {chosen.to}")
+            moved.add(rule.group)
             continue
         members = _action_group_members()
+        destination = accounts.NamedAccount(chosen.to, accounts.account_dir(chosen.to))
+        checked_at = datetime.now(timezone.utc)
+        sign_in = accounts.move_target_sign_in(destination, checked_at)
+        if isinstance(sign_in, accounts.MoveRefused):
+            lines.append(_record_blocked_head(state, rule, TargetPreparationRefused(sign_in.reason), checked_at, dry_run))
+            continue
+        rule = chosen
         transition = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
+        _ = notices.pop(rule.entry_id, None)
+        lines.append(f"{rule.group}: {why}; move from {selection.account} to {rule.to}")
+        moved.add(rule.group)
         _ = holds.pop(rule.entry_id, None)
         # Remove the entry after the role writer records the selection.
         _remove_auto_move_entries(frozenset({rule.entry_id}))
