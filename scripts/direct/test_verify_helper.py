@@ -181,38 +181,75 @@ VERIFY_START_DIR=$1; PY=$2
 verify_helper --start
 export FIXTURE_SPACE='one two' FIXTURE_EQUALS='one=two=three'
 export FIXTURE_NEWLINES=$'one\ntwo\n' FIXTURE_EMPTY=''
+export complete='caller complete' exported='caller exported' input='caller input' entry='caller entry'
 export FIXTURE_UNSET
 declare -ax FIXTURE_ARRAY=(one two)
 declare -Ax FIXTURE_MAPPING=([one]=two)
+fixture_function() { :; }
+export -f fixture_function
 env -0 > "$4/environment"
 env() { return 91; }
 verify_helper "$3"
 compgen() { return 1; }
-verify_helper "$3" > "$4/fallback-environment"
+verify_helper_environment='caller array name' verify_helper "$3" > "$4/env-without-compgen"
 unset -f compgen
+(unset VERIFY_HELPER_INPUT input entry; verify_helper "$3") > "$4/fallback-environment"
 FIXTURE_EXECUTION=next verify_helper "$3" > "$4/next-environment"
 '''
         result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
                                  str(self.program), str(self.root)],
-                                 env=verify_test_environment(), capture_output=True, text=True,
+                                 env={**verify_test_environment(), "inherited-key": "caller"}, capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = dict(entry.split("=", 1) for entry in
                         (self.root / "environment").read_text().split("\0") if entry)
+        self.assertIn("BASH_FUNC_fixture_function%%", expected)
+        self.assertEqual(expected["inherited-key"], "caller")
         actual = cast(dict[str, str], json.loads(result.stdout))
         # Bash sets this entry to each external command's path.
         _ = expected.pop("_", None)
-        _ = actual.pop("_", None)
-        self.assertEqual(actual, expected)
+        helper_expected = {name: value for name, value in expected.items()
+                           if name not in ("BASH_FUNC_fixture_function%%", "inherited-key")}
+        self.assertEqual(actual, helper_expected)
+        without_compgen = cast(dict[str, str], json.loads((self.root / "env-without-compgen").read_text()))
+        self.assertEqual(without_compgen, {**helper_expected, "verify_helper_environment": "caller array name"})
         fallback = cast(dict[str, str], json.loads((self.root / "fallback-environment").read_text()))
         self.assertEqual(fallback.pop("FIXTURE_EXECUTION"), "local")
         _ = fallback.pop("_", None)
-        self.assertEqual(fallback, expected)
+        self.assertEqual(fallback, {name: value for name, value in expected.items() if name not in ("input", "entry")})
         following = cast(dict[str, str], json.loads((self.root / "next-environment").read_text()))
         self.assertEqual(following.pop("FIXTURE_EXECUTION"), "next")
-        _ = following.pop("_", None)
-        self.assertEqual(following, expected)
-        self.assertEqual(self.program.with_suffix(".py.calls").read_text(), "helper\nlocal\nnext\n")
+        self.assertEqual(following, helper_expected)
+        self.assertEqual(self.program.with_suffix(".py.calls").read_text(), "helper\nhelper\nlocal\nnext\n")
+
+    def test_failed_or_truncated_environment_leaves_the_helper_ready(self) -> None:
+        env = self.root / "env"
+        _ = env.write_text("#!/bin/sh\nprintf 'VALUE=wrong\\000partial'\nexit \"$FIXTURE_STREAM_EXIT\"\n")
+        env.chmod(0o755)
+        script = shell_functions(DIRECT / "verify.sh", "verify_helper") + r'''
+set -e
+VERIFY_START_DIR=$1; PY=$2
+verify_helper --start
+compgen() { return 1; }
+verify_helper "$3" pid
+for status in 1 0; do
+    PATH="$4:$PATH" VALUE=caller FIXTURE_STREAM_EXIT="$status" verify_helper --stdin "$3" "$status" <<< 'fixture input'
+done
+verify_helper "$3" pid
+'''
+        result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
+                                 str(self.program), str(self.root)], env=verify_test_environment(),
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before, failed, truncated, after = result.stdout.splitlines()
+        self.assertEqual(before, after)
+        for status, reply in (("1", failed), ("0", truncated)):
+            with self.subTest(status=status):
+                decoded = cast(dict[str, object], json.loads(reply))
+                self.assertNotEqual(decoded["pid"], int(before))
+                self.assertEqual(decoded["value"], "caller")
+                self.assertEqual(decoded["stdin"], "fixture input\n")
+                self.assertEqual(decoded["args"], [status])
 
     def test_shell_recovers_after_helper_death_and_keeps_shell_fixtures(self) -> None:
         shell = self.root / "shell-fixture"
