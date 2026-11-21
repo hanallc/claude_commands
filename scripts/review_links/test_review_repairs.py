@@ -350,12 +350,17 @@ class ReviewRepairsTests(unittest.TestCase):
                         later = saved.item.times.later
                         result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)
                                       else later.timestamp()*1000)
-                    delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
-                    change_page.deliver(delivery, case.status)
-                    self.send_response(200)
-                    self.send_header('Content-Type','application/json')
-                    self.end_headers()
-                    _ = self.wfile.write(json.dumps(result).encode())
+                    try:
+                        content = json.dumps(result).encode()
+                        self.send_response(200)
+                        self.send_header('Content-Type','application/json')
+                        self.send_header('Content-Length', str(len(content)))
+                        self.end_headers()
+                        _ = self.wfile.write(content)
+                        self.wfile.flush()
+                    finally:
+                        delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
+                        change_page.deliver(delivery, case.status)
                     return
                 results.append(cast(list[str],json.loads(body)))
                 complete.set()
