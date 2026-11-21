@@ -1,9 +1,9 @@
 """Shell stand-ins keep argument records without starting Python per command."""
 
+from dataclasses import dataclass
 import shlex
 from pathlib import Path
 import subprocess
-from typing import Literal
 
 from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -72,11 +72,67 @@ def write_shell(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-def configure_nextest_trim(shim: Path, trim: int | Literal["run"]) -> None:
-    """Keep the log writer active for each trim outcome."""
+WORKSPACE_SWEEP_SETTINGS = """\
+# range: 0..
+recent_minutes=60
+# range: 0..
+sweep_budget_gib=24
+sweep_budget_gib.hana=96
+# range: 0..
+sweep_doc_index_mib=250
+# whole: 1..
+sweep_max_tree_depth=3
+# whole: 1..
+sweep_floor_search_depth=8
+sweep_floor_skip=.git node_modules
+# whole: 1..
+sweep_discovery_workers=4
+# whole: 1..
+sweep_dep_info_head_bytes=4096
+# whole: 1..
+sweep_proc_locks_reads=3
+# range: 0..
+sweep_holder_lookback_seconds=180
+# range: 0..
+sweep_delete_stamp_grace_seconds=2
+# range: 0..
+sweep_phone_floor_gib=0
+# range: 0..
+sweep_phone_rearm_gib=5
+# range: 0..
+sweep_phone_rearm_minutes=60
+# range: 0..
+sweep_alert_interval_seconds=3600
+# whole: 1..
+sweep_message_limit=1024
+# range: 3..5
+sweep_alert_folder_count=3
+# range: 0..
+sweep_crossing_repeat_minutes=525600
+# whole: 1..
+sweep_push_text_limit=500
+# range: 0..
+sweep_sender_timeout_seconds=30
+"""
+
+
+@dataclass(frozen=True)
+class WorkspaceSweepFixture:
+    proc: Path
+
+    def python_prefix(self) -> str:
+        """Use the fixture process table in the child sweep."""
+        return ('from functools import partial; from scripts.lint import sweep; '
+                + f'sweep.sweep_workspace = partial(sweep.sweep_workspace, proc={str(self.proc)!r}); ')
+
+
+def configure_nextest_trim(shim: Path, trim: int | WorkspaceSweepFixture) -> None:
+    """Keep the log writer active while the fixture controls the trim."""
     original = Path(__file__).resolve().with_name("nextest_log.py")
     interpreter, _, body = fixture_shim_source().partition("\n")
-    trim_command = f"exit {trim}" if isinstance(trim, int) else ":"
+    trim_command = (f"exit {trim}" if isinstance(trim, int) else
+                    '[ "$#" -eq 4 ] && [ "$1" = -B ] && [ "$2" = -c ] || exit 99\n'
+                    + f'set -- "$1" "$2" {shlex.quote(trim.python_prefix())}"$3" "$4"')
     source = (interpreter + '\nif [ "${2##*/}" = nextest_log.py ]; then\n'
               + f'    shift 2\n    set -- -B {shlex.quote(str(original))} "$@"\n'
               + f'else\n    {trim_command}\nfi\n' + body)

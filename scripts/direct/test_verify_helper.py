@@ -12,6 +12,7 @@ import tempfile
 from typing import BinaryIO, cast, override
 import unittest
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.agents.detached_runs import RunRecord
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -55,6 +56,7 @@ if __name__ == "__main__":
 
     def start_helper(self) -> subprocess.Popen[bytes]:
         process = subprocess.Popen([sys.executable, str(DIRECT / "verify_helper.py")],
+                                   env=verify_test_environment(),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.stop_helper, process)
         return process
@@ -65,8 +67,7 @@ if __name__ == "__main__":
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def encode(self, value: str, text: str, *arguments: str, directory: Path | None = None) -> bytes:
-        environment = {**os.environ, "VALUE": value}
-        _ = environment.pop("LEAK", None)
+        environment = {**verify_test_environment(), "VALUE": value}
         fields = [str(self.program), str(directory or self.root), str(len(arguments)), *arguments,
                   *(f"{name}={value}" for name, value in environment.items()), "", text, ""]
         return b"\0".join(os.fsencode(value) for value in fields) + b"\0"
@@ -192,7 +193,8 @@ unset -f compgen
 FIXTURE_EXECUTION=next verify_helper "$3" > "$4/next-environment"
 '''
         result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
-                                 str(self.program), str(self.root)], capture_output=True, text=True,
+                                 str(self.program), str(self.root)],
+                                 env=verify_test_environment(), capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = dict(entry.split("=", 1) for entry in
@@ -267,7 +269,8 @@ fi
 '''
                 result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), str(runner),
                                          mode, str(self.program), str(shell), str(TEST_HANG_GUARD_SECS),
-                                         str(os.getpid()), str(record)], capture_output=True,
+                                         str(os.getpid()), str(record)],
+                                         env=verify_test_environment(), capture_output=True,
                                         text=True, timeout=TEST_HANG_GUARD_SECS)
                 if mode == "death":
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -318,7 +321,7 @@ verify_helper --start
 verify_helper "$3" pid
 '''
         caller = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
-                                 str(self.program)], capture_output=True, text=True,
+                                 str(self.program)], env=verify_test_environment(), capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(caller.returncode, 0, caller.stderr)
         self.assertGreater(int(caller.stdout), 0)

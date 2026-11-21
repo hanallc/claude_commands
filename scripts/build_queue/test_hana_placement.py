@@ -33,7 +33,7 @@ from scripts.aws_target.controller_lock import control_lock
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import atomic_file, conf, process_start
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
@@ -599,14 +599,8 @@ class HanaQueueTests(unittest.TestCase):
             candidate = request.constraints.candidates[0]
             request = replace(request, constraints=replace(request.constraints, candidates=(replace(candidate,
                 destination=replace(candidate.destination, provider='ssh', target=target.name)),)))
-            locked, finish, reading = threading.Event(), threading.Event(), threading.Event()
+            reading = threading.Event()
             execution_bound = controller.execution_bound
-
-            def hold_controller_lock() -> None:
-                with control_lock(controller.directory):
-                    locked.set()
-                    if not finish.wait(TEST_HANG_GUARD_SECS):
-                        raise AssertionError('The fixture did not release the controller lock')
 
             def read_bound(execution: str) -> bool:
                 reading.set()
@@ -614,32 +608,30 @@ class HanaQueueTests(unittest.TestCase):
 
             with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
                     mock.patch.object(hana_placement, 'controller_for', return_value=controller),
-                    mock.patch.object(controller, 'execution_bound', side_effect=read_bound),
-                    ThreadPoolExecutor(max_workers=2) as workers):
+                    mock.patch.object(controller, 'execution_bound', side_effect=read_bound)):
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 grant = only_admitted(fixture.connect(fixture.request()).replies())
-                lock_owner = workers.submit(hold_controller_lock)
+
+                def release_reservation() -> list[wire.Reply]:
+                    return fixture.connect(
+                        wire.ReleaseRequest('release-with-controller-lock', grant.reservation, 0)).replies()
+
                 try:
-                    self.assertTrue(locked.wait(1))
-                    fixture.proc.kill(wire.Owner(assignment.owner.pid, assignment.owner.start_time))
-                    queue_pass = workers.submit(fixture.run_pass)
-                    _ = queue_pass.result(timeout=1)
-                    self.assertTrue(reading.wait(1))
-                    began = time.monotonic()
-                    reply = fixture.connect(wire.ReleaseRequest('release-with-controller-lock', grant.reservation, 0)).replies()
-                    self.assertEqual(reply, [wire.Ok()])
-                    self.assertLess(time.monotonic() - began, 1)
-                    self.assertFalse(lock_owner.done())
-                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
-                    self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                    with ThreadPoolExecutor(max_workers=1) as workers, control_lock(controller.directory):
+                        fixture.proc.kill(wire.Owner(assignment.owner.pid, assignment.owner.start_time))
+                        queue_pass = LauncherHangGuard('Queue pass while the controller lock is held')
+                        _ = queue_pass.result(workers.submit(fixture.run_pass))
+                        queue_pass.event(reading)
+                        release = LauncherHangGuard('Release reply while the controller lock is held')
+                        self.assertEqual(release.result(workers.submit(release_reservation)), [wire.Ok()])
+                        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                        self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                 finally:
-                    finish.set()
-                _ = lock_owner.result(timeout=TEST_HANG_GUARD_SECS)
-                worker = fixture.server.host_targets[('ssh', target.name)]
-                worker.close()
-                worker.thread.join(timeout=1)
-                self.assertFalse(worker.thread.is_alive())
+                    worker = fixture.server.host_targets.get(('ssh', target.name))
+                    if worker is not None:
+                        worker.close()
+                        LauncherHangGuard('Hana evidence worker cleanup').join(worker.thread)
 
     def test_cancel_before_permission_use_settles_and_frees_capacity_with_a_live_coordinator(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):

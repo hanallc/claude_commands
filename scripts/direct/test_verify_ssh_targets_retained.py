@@ -13,6 +13,7 @@ import tempfile
 from typing import Literal
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -211,7 +212,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         self.release_memory_after_hook()
         diagnostic_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with mock.patch.object(self, "verify_diagnostic_root", return_value=diagnostic_root), \
-             subprocess.Popen(["printf", "partial\n"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+             subprocess.Popen(["printf", "partial\n"], env=verify_test_environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
              mock.patch.object(self, "start_verify", return_value=process), \
              self.assertRaisesRegex(self.failureException, "verify exited"):
             _ = self.verify("test", "sample", "--no-cache")
@@ -326,6 +327,75 @@ if output_size:
         self.assertEqual(claim_state.claim_identity(remaining.record), claim_state.claim_identity(old.record))
         self.assertTrue(claim_exclusion_path(self.runner_state, "linux", claim_state.claim_identity(old.record)).is_file())
         self.assertFalse(any(isinstance(request, wire.ClaimFailure) for request in self.queue_requests()))
+
+    def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
+        self.configure("natedev,linux,spare")
+        claims = self.retain_slots()
+        _ = self.hold_memory()
+        pressure = Path(self.environment["BUILDLOG_MEMORY_PRESSURE"])
+        _ = pressure.write_text("some avg10=100 avg60=0 avg300=0 total=0\n"
+                                + "full avg10=100 avg60=0 avg300=0 total=0\n")
+        before_attempt = r'''
+steps_path = root / "memory-steps.json"
+steps = json.loads(steps_path.read_text()) if steps_path.exists() else []
+if request.target == "linux":
+    assert steps == [], steps
+    steps.append("linux_attempt")
+else:
+    assert request.target == "spare", request.target
+    assert steps == ["linux_attempt", "linux_cleanup_failed"], steps
+    prior = json.loads((root / "ssh-events.jsonl").read_text().splitlines()[-1])
+    assert prior["target"] == "linux" and "cleanup" in prior["actions"], prior
+    assert prior["holder"] == "LostRunLeftovers", prior
+    steps.append("spare_retry")
+steps_path.write_text(json.dumps(steps))
+'''
+        after_attempt = r'''
+if request.target == "linux":
+    assert isinstance(result, offload.BusyMacDecline), result
+    assert isinstance(result.holder, offload.LostRunLeftovers), result
+    assert "cleanup" in actions and "run" not in actions, actions
+    steps.append("linux_cleanup_failed")
+else:
+    assert isinstance(result, offload.PassedOnTarget), result
+    steps.append("spare_completed")
+    Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
+    Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text(
+        "some avg10=0 avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n")
+steps_path.write_text(json.dumps(steps))
+'''
+        self.write_executable(self.runner, support.SSH_RUNNER.replace(
+            "started = time.monotonic()", before_attempt + "\nstarted = time.monotonic()").replace(
+            '\noutcome = root / ', after_attempt + '\noutcome = root / '))
+        with self.spare_after_linux_refusal():
+            result = self.verify("test", "sample", "--no-cache", extra={
+                "TEST_SSH_MODES": '{"linux":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, second = self.ssh_events()
+        self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
+        self.assertEqual(first["result_type"], "BusyMacDecline")
+        self.assertEqual(first["holder"], "LostRunLeftovers")
+        self.assertIn("cleanup", first["actions"])
+        self.assertNotIn("run", first["actions"])
+        self.assertNotIn("release", first["actions"])
+        self.assertTrue(all(path.exists() for path in claims))
+        self.assertEqual(first["queued_at"], second["queued_at"])
+        self.assertFalse((self.target_state("linux") / "unreachable_until").exists())
+        self.assertEqual(json.loads((self.runner_state / "memory-steps.json").read_text()),
+                         ["linux_attempt", "linux_cleanup_failed", "spare_retry", "spare_completed"])
+        refusal, = [request for request in self.queue_requests() if isinstance(request, wire.ExecutionReport)
+                    and request.assignment.destination.target == "linux"]
+        self.assertEqual(refusal.outcome, placement.PrelaunchRefused("busy", placement.PrelaunchEnded()))
+        self.assertIsInstance(refusal.path, placement.DispatchPathPending)
+        self.assertIsInstance(refusal.claim, placement.ProviderClaimReference)
+        assert isinstance(refusal.claim, placement.ProviderClaimReference)
+        self.assertEqual(refusal.claim.claim_id, first["adopted_claim_ids"][0])
+        self.assertNotEqual(refusal.claim.episode, refusal.assignment.episode)
+        saved = self.admission.server.assignments[execution_identity.attempt_key(
+            refusal.assignment.episode, refusal.assignment.attempt)]
+        self.assertEqual(saved.provider, refusal.claim)
+        self.assertIsInstance(saved.state, placement.ClosedAssignment)
+        self.assertTrue(saved.release_pending())
 
     def test_retained_slots_stay_owned_when_cleanup_finds_leftovers(self) -> None:
         self.check_retained_takeover("retained-leftovers")

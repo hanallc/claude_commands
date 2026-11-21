@@ -250,8 +250,9 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         from scripts.buildlog import record, store
 
         self.configure("natedev,linux")
-        with mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "linux",
-                                         "BUILDLOG_PINNED_TARGET": "linux"}), \
+        with self.admission.loop_turn(), \
+             mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "linux",
+                                         "BUILDLOG_PINNED_TARGET": "linux"}, clear=True), \
              mock.patch.object(store, "host_name", return_value="linux-build"), \
              mock.patch.object(os, "getcwd", return_value=str(self.root)):
             record.step(["0", "100", "101", "0", "", "", "cargo", "nextest", "run"])
@@ -424,7 +425,7 @@ raise SystemExit(75)
             if isinstance(request, wire.PlacementRequest) and any(
                     isinstance(reply, wire.DispatchStatus) for reply in replies):
                 reply_path, = (self.root / "tmp").glob("verify*/placement-reply")
-                reply_path.with_name("placement-1.json.wait").mkdir()
+                reply_path.with_name(f"placement-{request.episode}.json.wait").mkdir()
             return replies
 
         for arguments, cleanup_error in (
@@ -440,7 +441,7 @@ raise SystemExit(75)
                 self.assertEqual([line for line in output.splitlines() if line.startswith("verify.sh: target hana-gpu refused:")],
                                  [f"verify.sh: target hana-gpu refused: {hana.GPU_SELECTION_REQUIRED}"], output)
                 if cleanup_error:
-                    self.assertRegex(result.stderr, r"(?m)^\[Errno 21\] Is a directory: .*placement-1\.json\.wait'")
+                    self.assertRegex(result.stderr, r"(?m)^\[Errno 21\] Is a directory: .*placement-.+-step-1\.json\.wait'")
                 self.assertEqual(self.local_runs(), [])
 
     def test_pinned_gpu_prints_the_service_error_once(self) -> None:

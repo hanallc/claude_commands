@@ -336,7 +336,8 @@ class MemberLifecycle(Protocol):
     def stop(self, session: str, *, deadline: float,
              codex: herdr.CodexConversations | None = None) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot, *,
-                          codex: herdr.CodexConversations | None = None) -> list[str]: ...
+                          codex: herdr.CodexConversations | None = None,
+                          keep_running: frozenset[staff.StaffId] = ...) -> list[str]: ...
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -463,7 +464,9 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
         return _saved_launch(entry, identity, name)
     for directory in sessions.config_dirs():
         if transcript_paths(directory / "projects", f"*/{identity}.jsonl"):
-            return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
+            turn = pane_record.claude_turn_settings(identity, directory)
+            arguments = ["--resume", identity, "--name", name, *pane_record.claude_resume_settings(turn).arguments()]
+            return "claude", named_account_environment(directory), arguments
     for directory in codex_transcript_homes():
         if transcript_paths(directory / "sessions", f"**/rollout-*{identity}.jsonl"):
             return "codex", {"CODEX_HOME": str(directory)}, ["resume", identity]
@@ -1187,10 +1190,54 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve())
         print(f"restart continues outside this session; log: {log}")
         return 0
-    selected_sessions = {str(row.current_session) for row in selected} if stop_all else set[str]()
+    from scripts.herdr.worker_panes import (
+        CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
+    )
+
+    worker_policies: dict[staff.StaffId, CheckedRolePolicy] = {}
+    refused_workers: set[staff.StaffId] = set()
+
+    def omit_refused_workers(refused: set[staff.StaffId]) -> None:
+        for identity in refused:
+            _ = holders.pop(identity, None)
+        for holder in holders:
+            members_by_holder[holder] = [member for member in members_by_holder[holder] if staff.StaffId(member) not in refused]
+            saved_by_holder[holder] = [member for member in saved_by_holder[holder] if staff.StaffId(member) not in refused]
+
+    if stop_all and after_stop is AfterStop.RESTART:
+        for row in selected:
+            if row.kind != "worker":
+                continue
+            policy = checked_role_policy(dispatch_role(row))
+            if isinstance(policy, StartRefused):
+                _anomaly(row, f"{policy.reason.value}: {policy.detail}")
+                refused_workers.add(row.id)
+            else:
+                worker_policies[row.id] = policy
+        omit_refused_workers(refused_workers)
+
     pre_stop_codex = observed.codex
+    keep_running = (frozenset(row.id for row in record.rows if row.kind == "worker" and row.id not in worker_policies)
+                    if stop_all and after_stop is AfterStop.RESTART else frozenset[staff.StaffId]())
     unconfirmed: set[staff.StaffId] = set()
     unconfirmed_workers: set[staff.StaffId] = set()
+    role_changes_by_holder: dict[staff.StaffId, set[staff.StaffId]] = {}
+
+    def refuse_changed_worker_roles(members: list[str]) -> set[staff.StaffId]:
+        checked = {identity: worker_policies[identity] for member in members
+                   if (identity := staff.StaffId(member)) in worker_policies}
+        changed: set[staff.StaffId] = set()
+        if checked:
+            current_record = staff.initial_snapshot()
+            for identity, policy in checked.items():
+                row = current_record.by_id(identity)
+                if row is None or row.kind != "worker" or row.role != staff.KnownWorkerRole(policy.role):
+                    changed.add(identity)
+                    role = row.role.value if row is not None and isinstance(row.role, staff.KnownWorkerRole) else "unavailable"
+                    _anomaly(row or record.rows_by_id[identity],
+                             f"worker role changed from {policy.role} to {role}; worker kept running")
+        return changed
+
     def stop_holder(holder: staff.StaffRow, previous: Event, recorded: Event) -> tuple[bool, tuple[staff.StaffId, ...]]:
         _ = previous.wait()
         try:
@@ -1199,11 +1246,18 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 for member in members_by_holder[holder.id]:
                     if member != str(holder.id):
                         _ = locks.enter_context(staff.row_operation(member))
-                shutdown_record.update(started=[], pending=saved_by_holder[holder.id])
+                changed = refuse_changed_worker_roles(members_by_holder[holder.id])
+                if changed:
+                    role_changes_by_holder[holder.id] = changed
+                if holder.id in changed:
+                    return True, ()
+                shutdown_record.update(started=[], pending=[member for member in saved_by_holder[holder.id]
+                                        if staff.StaffId(member) not in changed])
                 recorded.set()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
-                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex)
+                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex,
+                                                              keep_running=keep_running.union(changed))
                     if unresolved and holder.id in observed.pane_owners:
                         workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
                                         if child.id in selected_ids)
@@ -1237,9 +1291,15 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     _anomaly(holder, error)
     if after_stop == AfterStop.KEEP_STOPPED:
         return 0
-    blocked_workers: set[staff.StaffId] = set()
+    changed = {identity for identities in role_changes_by_holder.values() for identity in identities}
+    if changed:
+        omit_refused_workers(changed)
+        refused_workers.update(changed)
+    selected_sessions = ({str(row.current_session) for row in selected if row.id not in refused_workers}
+                         if stop_all else set[str]())
+    blocked_workers = refused_workers.copy()
     for child in record.rows:
-        if child.id not in unconfirmed_workers:
+        if child.id not in unconfirmed_workers or child.id in refused_workers:
             continue
         try:
             fresh = _after_unconfirmed_stop(child, pre_stop_codex)
@@ -1265,10 +1325,12 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             pane_evidence.close()
             _ = pane_evidence.enter_context(herdr.pane_evidence_run())
     resume_checks = DirectorResumeChecks()
+    resume_policies = {record.rows_by_id[identity].current_session: policy
+                       for identity, policy in worker_policies.items() if identity not in blocked_workers}
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition:
-        with ExitStack() as locks:
+        with ExitStack() as locks, use_checked_resume_policies(resume_policies):
             _ = locks.enter_context(staff.row_operation(str(holder.id)))
             for member in members_by_holder[holder.id]:
                 if member != str(holder.id):

@@ -353,6 +353,37 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertTrue(reply.read_text().startswith(self.fixture.agent.final))
         self.assertEqual(len(self.fixture.agent.submitted), 1)
 
+    def test_astra_launch_refusals_do_not_start_a_pane(self) -> None:
+        parent = self.fixture.fixture.parent
+        member = fixture_worker("TEST-reviewer", parent.id)
+        world = self.fixture.fixture.world
+        launches = world.launches.copy()
+        before = staff.snapshot().rows
+        durable = ["--target", "durable-design-role", "--policy", "astra-reviewer", "--parent", parent.id]
+        with self.subTest(refusal="missing name"):
+            result = invoke_cli(assign, assign.main, ["--role", "review", *durable], os.environ.copy(), ROOT)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("durable-design-role requires --to or --new-worker", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        for locked in (parent, member):
+            run = self.fixture.fixture.root / f"busy-astra-{locked.name}"
+            base = ["--role", "review", "--new-worker", member.name, "--session-dir", str(run)]
+            one_shot = ["--operation", "astra-review", "--cwd", str(self.fixture.fixture.root),
+                        "--prompt", str(self.fixture.prompt), "--reply-file", str(run / "astra-review.md")]
+            with patch.object(sys, "argv", ["holder", "first part\nlast part"]), staff.row_operation(locked.id):
+                env = staff.child_environment(os.environ)
+                for target, options in (("durable", durable), ("one-shot", one_shot)):
+                    with self.subTest(locked=locked.name, target=target):
+                        result = invoke_cli(assign, assign.main, [*base, *options], env, ROOT)
+                        self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
+                        lines = result.stderr.splitlines()
+                        self.assertEqual(len(lines), 1, lines)
+                        self.assertIn(f"{locked.name}: another operation holds this row", lines[0])
+                        self.assertIn("first part last part", lines[0])
+        self.assertEqual(world.launches, launches)
+        self.assertEqual(staff.snapshot().rows, before)
+        self.assertEqual(self.fixture.agent.submitted, [])
+
     def test_completed_astra_review_rerun_repeats_its_notice_without_typing(self) -> None:
         for changed_session in (False, True):
             with self.subTest(changed_session=changed_session):
@@ -1081,7 +1112,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.turn_starts, 1)
         prompt = (self.session_dir / f"phases/7/{name}_prompt.txt").read_text()
         self.assertIn(self.prompt.read_text().strip(), prompt)
-        for text in ("detached_runs.py start", "Simple, Fast and Beautiful", "poll"):
+        for text in ("detached_runs.py start", "--kind python-tests before --", "Simple, Fast and Beautiful", "poll"):
             self.assertIn(text, prompt)
         manifest = self.session_dir / "phases/7/dispatch_1_paths.json"
         self.assertEqual(read_object(manifest), {"worker": name, "round": 1,

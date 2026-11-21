@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
+from scripts.direct import verify_mac_offload_test_support
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
@@ -952,6 +953,23 @@ class BusyHolderTests(unittest.TestCase):
             self.assertNotIn("holder=", path.read_text())
 
 
+@final
+class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
+    def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
+        _ = self.routing_fixture()
+        holder = "last recorded mirror session reader (mirror process check)"
+        self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
+        process = self.start_routing()
+
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        result = self.finish_verify(process)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.count(f"verify.sh: Mac holder: {holder}.\n"), 1)
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(self.local_runs(), [])
+
+
 class OffloadCommandTests(OffloadCommandFixture):
     def test_remote_build_target_directory_reaches_the_result_file(self) -> None:
         self.write_portable_workspace()
@@ -1320,6 +1338,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         result = self.command(runner_options=("--target", "mac"), direct_placement=True)
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "last recorded mirror session grep")
         self.assertNotIn("without a final status", result.stdout)
         self.assertTrue(path.exists())
         self.assertFalse(self.claim_file.exists())
@@ -1358,10 +1377,26 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("dispatch_start_settled=", settlement["args"][-1])
         self.assert_exact_fence_settlement(probe, settlement)
 
-        _ = stub.write_text(source.replace("rsync: destination denied", "copies: /mirror/hana: busy; held by session reader"))
-        result = self.command(runner_options=("--target", "mac"))
-        self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertTrue((self.state_directory / "mirror-busy-hana.until").exists())
+        self.assertNotIn("holder", self.wire_result())
+        self.assertFalse((self.state_directory / "mirror-busy-hana.until").exists())
+
+        self.fixture["rsync_status"] = 12
+        self.sync_fixture()
+        backoff = self.state_directory / "mirror-busy-hana.until"
+        for check in ("mirror lease", "mirror process check"):
+            with self.subTest(check=check):
+                _ = stub.write_text(source.replace(
+                    "rsync: destination denied", f"copies: /mirror/hana: busy; held by session reader ({check})",
+                ).replace("code 23", "code 12"))
+                before = len(self.events_for("rsync"))
+                result = self.command(runner_options=("--target", "mac"))
+                self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+                self.assert_wire("declined", "busy")
+                self.assertEqual(self.wire_result().get("holder"), f"last recorded mirror session reader ({check})")
+                self.assertEqual(len(self.events_for("rsync")), before + 1)
+                self.assertGreater(float(backoff.read_text()), time.time())
+                self.assertFalse(self.claim_file.exists())
+                backoff.unlink()
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

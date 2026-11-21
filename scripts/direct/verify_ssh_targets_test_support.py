@@ -160,7 +160,9 @@ remote_status = 0
 launch_error = (offload.OffloadInterrupted(SIGTERM) if mode == "start-launch-interrupted" else
                 OSError("SSH could not start") if mode in ("start-launch-failed", "start-journal-unremovable") else None)
 check_start_fence = launch_error is not None or mode in (
-    "start-fence-confirmed", "start-fence-unconfirmed", "start-fence-interrupted", "start-release-unconfirmed")
+    "probe-fence-with-leftovers", "start-fence-confirmed", "start-fence-unconfirmed",
+    "start-fence-interrupted", "start-release-unconfirmed")
+probe_has_leftovers = mode in ("probe-leftovers", "probe-fence-with-leftovers")
 
 def run_start_fence(command):
     settled = real_run(["bash", "-c", command], capture_output=True,
@@ -212,9 +214,10 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
         actions.append("reachability")
         return offload.CommandOutput(0, "", "")
     actions.append("probe")
-    if mode == "probe-leftovers":
+    if mode != "probe-leftovers":
+        prepare_probe_fence(arguments[-1])
+    if probe_has_leftovers:
         return offload.CommandOutput(255, "", "host unavailable")
-    prepare_probe_fence(arguments[-1])
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
@@ -284,7 +287,7 @@ def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
-        count = 2 if mode in ("probe-leftovers", "retained-leftovers", "run-cleanup-unconfirmed") else 0
+        count = 2 if probe_has_leftovers or mode in ("retained-leftovers", "run-cleanup-unconfirmed") else 0
         fence = ""
         identity = controller.claim_identity
         reference = controller.fence
