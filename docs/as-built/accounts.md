@@ -751,3 +751,47 @@ Account and role changes preserve these boundaries:
 7. Mark an alert delivered only after successful delivery.
 8. Clear only alerts that precede the observation of a live session.
 9. Preserve shared settings and concurrent edits during local-key filtering.
+
+## Mac fallback token
+
+The Mac notes timer publishes `Mac fallback token.md` in the shared account notes.
+The Accounts page shows the token table below Models.
+The table shows the file date, estimated expiry, last good use, and alert state in the user's zone.
+The `mac_token.account` key in `config/showrunners.conf` sets the Claude account for display and renewal.
+A blank or invalid label shows as Unknown.
+The relay and timer use no account probe.
+The note stores the token file's modification time and the times of relay results.
+The timer records a fresh observation at most once an hour for the same file.
+The page marks data stale when the observation is more than one day old, missing, or in the future.
+Replacing the file starts a new record.
+The page estimates expiry as 365 days after the modification time.
+Copying the file or changing its timestamp can change this estimate.
+
+The relay puts the decoded value in its Claude child environment.
+The selected account folder remains in `CLAUDE_CONFIG_DIR`.
+The relay removes inherited credential, provider, endpoint, proxy, and TLS overrides.
+It tells Claude Code to ignore provider and endpoint overrides from settings files.
+Settings stored in the account folder can still select another credential, such as a gateway sign-in or an `apiKeyHelper`.
+The relay records the login result separately from the message delivery result.
+See https://code.claude.com/docs/en/authentication#authentication-precedence and https://code.claude.com/docs/en/network-config.
+
+
+Run `mac-token-renew` in a Mac terminal to renew the token.
+The zsh alias runs this command.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/whoami/mac_fallback_token.py renew
+```
+
+1. Approve browser access while signed in to the configured account.
+2. Copy the token that `setup-token` shows.
+3. Paste the token at the hidden prompt.
+4. Press Enter.
+
+The command runs `setup-token` for the configured account.
+It passes the pasted token to GPG through standard input.
+GPG encrypts the token for `gh token` in a private temporary file.
+The command replaces `~/.config/claude/oauth-token.gpg` with one rename.
+The command clears the terminal and scrollback after the hidden prompt.
+It clears the clipboard even if encryption fails or the prompt is interrupted.
+It publishes the new file date and prints the account and estimated expiry in the user's zone.
