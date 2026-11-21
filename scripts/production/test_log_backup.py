@@ -14,8 +14,9 @@ import unittest
 from unittest.mock import patch
 
 from scripts.agents import remote
+from scripts.copies import copies
 from scripts.lib.git_test_support import fixture_git_environment
-from scripts.production import log_backup, staff, tidy_wrapped
+from scripts.production import log_backup, record_store, staff, tidy_wrapped
 from scripts.production.production_doc import production_backup_checkout, production_backup_root
 from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY, LEGACY_COPIES
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -41,10 +42,10 @@ class LogBackupTests(unittest.TestCase):
                         self.assertFalse(production_backup_root().exists())
 
     def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
-        with TemporaryDirectory() as folder:
+        with (TemporaryDirectory() as folder,
+              patch.dict(os.environ, {**fixture_git_environment(Path(folder)),
+                         "GIT_CONFIG_SYSTEM": os.devnull}, clear=True)):
             root = Path(folder)
-            _ = self.enterContext(patch.dict(os.environ, {**fixture_git_environment(root),
-                "GIT_CONFIG_SYSTEM": os.devnull}, clear=True))
             state = root / "staff-state"
             checkout = root / "worktree"
             checkout.mkdir()
@@ -105,8 +106,8 @@ class LogBackupTests(unittest.TestCase):
                         wrapped_owner = replace(owner, doc=staff.WrappedDoc(remote.local_machine(), document))
                         identities = QuestionStaff.for_record(staff.StaffSnapshot((wrapped_owner,)))
                         with (patch.object(tidy_wrapped, "STATE_DIR", state),
-                              patch.object(tidy_wrapped.copies, "remove_trees"),
-                              patch.object(tidy_wrapped.record_store, "staff_store_folders", return_value=())):
+                              patch.object(copies, "remove_trees"),
+                              patch.object(record_store, "staff_store_folders", return_value=())):
                             _ = tidy_wrapped.tidy(owner.name, identities=identities)
                         self.assertFalse(legacy.exists())
                         self.assertEqual((backup_root / owner.id / LEGACY_COPIES / late.name).read_bytes(),
