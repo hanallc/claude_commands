@@ -15,21 +15,29 @@ import subprocess
 import select
 from types import SimpleNamespace
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from collections.abc import Generator
 from unittest import mock
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, merge_gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.production.test_merge_gate_promotion import green_ci_after_merge
 
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @override
+    def setUp(self) -> None:
+        environment = {**fixture_git_environment(self.fixture_root.parent), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        super().setUp()
+
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
         # The queue admission wait comes before the time limit starts.
@@ -601,7 +609,8 @@ class ChildImports(unittest.TestCase):
     def test_explicit_fetch_updates_refs_without_matching_remote_configuration(self) -> None:
         _ = self.git(self.checkout, "config", "--unset-all", "remote.origin.fetch")
         _ = self.git(self.checkout, "update-ref", "refs/remotes/origin/unit-phase", self.base)
-        result = self.run_gate("--promote")
+        with green_ci_after_merge(self):
+            result = self.run_gate("--promote")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "origin/unit-phase"), self.checkpoint)
 

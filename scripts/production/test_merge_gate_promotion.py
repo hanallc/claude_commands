@@ -35,7 +35,7 @@ def setUpModule() -> None:
 
 def save_fixture_verdict(fixture: MergeGateFixture, owner: staff.StaffRow, tip: str,
                          policy: PromotionCiPolicy = "standard") -> None:
-    folder = Path(fixture.environment["SHOWRUNNER_STATE_DIR"]) / owner.id / "session/waiting_state"
+    folder = Path(fixture.environment["HOME"]) / ".local/state/showrunner" / owner.id / "session/waiting_state"
     fixture.write(folder / "ci_points.json", json.dumps({"count": 1, "tip": tip, "policy": policy}))
 
 
@@ -51,7 +51,9 @@ def green_ci_after_merge(fixture: MergeGateFixture) -> Generator[None]:
         doc = change_review.production_doc(args.production, record=record)
         tip = fixture.git(fixture.origin, "rev-parse", f"refs/heads/{args.merge_branch}")
         save_fixture_verdict(fixture, doc_owner(doc, record), tip)
-        promote(args)
+        state_dir = Path(fixture.environment["HOME"]) / ".local/state/showrunner"
+        with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state_dir):
+            promote(args)
 
     with mock.patch.object(merge_gate, "promote", side_effect=promote_with_verdict):
         yield
