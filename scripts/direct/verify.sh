@@ -597,6 +597,7 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
+# shellcheck disable=SC2329 # The EXIT trap calls this function.
 finish_verify_verb_list() {
     local status=$1 child=${!:-}
     # Use the interrupted status when Bash reports no signal status to EXIT.
