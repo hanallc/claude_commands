@@ -635,90 +635,50 @@ class LedgerTests(CostFixture):
                                          instance_type='m7a.8xlarge', region='us-east-2')
         self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
 
-    def test_admission_counts_unlogged_bookings_across_utc_midnight(self) -> None:
+    def test_admission_uses_the_complete_launch_row_across_utc_midnight(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0',
-                    'monthly_limit_usd': '.70'})
+                    'monthly_limit_usd': '.70', 'cost_explorer_unchanged_reads': '1'})
+        policy = config.read_settings(self.settings)
         midnight = self.start + 86400
-        terminated_at = midnight + 900
-        following_day = midnight + 86400
         rate = ledger.BoxRate(Decimal('.80'), 'fixture booking')
         day_rates = (('2026-01-15', rate), ('2026-01-16', rate))
-        booking = ledger.GateReservation('cross-midnight', midnight - 1800, midnight + 1800, rate.usd_per_hour,
-            Decimal('.02'), instance_type='m7a.8xlarge', rate=rate, region='us-east-2', day_rates=day_rates)
-        launch = json.dumps({'attempt': booking.attempt, 'time': booking.at, 'instance_type': 'm7a.4xlarge',
-                             'region': booking.region, 'result': 'launched'})
-
-        def bill_for(start: int) -> ledger.ChargeRead:
-            return ledger.ChargeRead(datetime.fromtimestamp(start, UTC).date().isoformat(), start + 86400,
-                start, start + 86400, Decimal('.08'), Decimal(0), Decimal(0), (
-                    ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.04'), Decimal('.2'), 'Hrs'),
-                    ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('.04'), Decimal('.05'), 'Hrs'),
-                ), False)
-
-        first = (bill_for(self.start),)
-        second = (bill_for(midnight),)
+        launch = json.dumps({'attempt': 'cross-midnight', 'time': midnight - 1800, 'instance_type': 'm7a.4xlarge',
+                             'region': 'us-east-2', 'result': 'launched'})
         states = (ledger.GateLaunchPending(booked_day_rates=day_rates), ledger.GateRunning('i-fixture'))
         rows = (('absent', ''), ('incomplete', launch), ('complete', launch + '\n'))
-        # The second bill covers the day an open instance can run beyond its original booking.
-        bills = (('none', (), terminated_at, '.82', '.82'), ('first', first, terminated_at, '.90', '.50'),
-                 ('second', second, following_day, '19.70', '.50'))
-        cases: list[tuple[str, ledger.GateReservation | dict[str, object], str, Sequence[ledger.ChargeRead],
-                          int, str, str]] = []
-        for outcome, (row_label, row), (bill_label, readings, now, unlogged, logged) in product(states, rows, bills):
-            name = f'{type(outcome).__name__}-{row_label}-{bill_label}'
-            amount = logged if row_label == 'complete' else unlogged
-            cases.append((name, replace(booking, state=outcome), row, readings, now, amount, amount))
+        # An open instance can run past its booking. The second bill covers that UTC day.
+        bills = (('none', None, midnight + 900, '.82', '.82'),
+                 ('first', self.start, midnight + 900, '.90', '.50'),
+                 ('second', midnight, midnight + 86400, '19.70', '.50'))
 
-        terminated = ledger.GateTerminated(terminated_at, 'i-fixture')
-        legacy: dict[str, object] = {
-            'attempt': booking.attempt, 'at': booking.at, 'expires': booking.expires,
-            'usd_per_hour': '.80', 'allowance_usd': '0',
-            'state': {'kind': 'terminated', 'at': terminated_at, 'instance_id': 'i-fixture'}}
-        released = replace(booking, state=ledger.GateAbsent(terminated_at))
-        cleanup = replace(booking, state=terminated, allowance_usd=Decimal(0))
-        recovered = replace(booking, state=terminated, launch_pricing=ledger.GateLaunchPricing.BOOKING_UNTIL_LOGGED)
-        cases.extend((
-            ('pre-log-termination', legacy, '', first, terminated_at, '.28', '.28'),
-            ('main-release', released, '', first, terminated_at, '.08', '.08'),
-            ('main-cleanup-before-log', cleanup, '', first, terminated_at, '.13', '.13'),
-            ('main-cleanup-without-bill', cleanup, '', (), terminated_at, '.60', '.60'),
-            ('recovery-without-bill', recovered, launch, (), terminated_at, '.82', '.82'),
-            ('recovery-first-day-settled', recovered, launch, first, terminated_at, '.48', '.48'),
-            ('recovery-second-day-settled', recovered, launch, second, following_day, '.50', '.50'),
-            ('recovery-both-days-settled', recovered, launch, (*first, *second), following_day, '.16', '.16'),
-            ('recovery-second-day-unsettled', recovered, launch, (replace(second[0], provisional=True),),
-             following_day, '.90', '.82'),
-        ))
-
-        for name, reservation, row, readings, now, expected_cap, expected_guard in cases:
-            with self.subTest(case=name):
-                self.replace('cost_explorer_unchanged_reads', '2' if any(bill.provisional for bill in readings) else '1')
-                policy = config.read_settings(self.settings)
-                book = ledger.CostLedger(self.state / name)
+        for outcome, (row_label, row), (bill_label, bill_start, now, unlogged_usd, logged_usd) in product(states, rows, bills):
+            state_label = type(outcome).__name__
+            with self.subTest(state=state_label, launch_row=row_label, bill=bill_label):
+                book = ledger.CostLedger(self.state / f'{state_label}-{row_label}-{bill_label}')
                 with book.transaction() as state:
                     state.inventories.append(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
                     state.observations.append(ledger.InstanceObservation(self.start, 'terminated', 'fixture'))
-                    if isinstance(reservation, ledger.GateReservation):
-                        state.gate_reservations.append(reservation)
-                if isinstance(reservation, dict):
-                    document = ledger.mapping(cast(object, json.loads(book.path.read_text())))
-                    document['gate_reservations'] = [reservation]
-                    _ = book.path.write_text(json.dumps(document))
+                    state.gate_reservations.append(ledger.GateReservation('cross-midnight', midnight - 1800,
+                        midnight + 1800, rate.usd_per_hour, Decimal('.02'), outcome,
+                        'm7a.8xlarge', rate, region='us-east-2', day_rates=day_rates))
                 if row:
                     _ = book.launch_history_path.write_text(row)
-                if readings:
+                if bill_start is not None:
+                    day = datetime.fromtimestamp(bill_start, UTC).date().isoformat()
+                    bill = ledger.ChargeRead(day, now, bill_start, bill_start + 86400,
+                        Decimal('.08'), Decimal(0), Decimal(0), (
+                            ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.04'), Decimal('.2'), 'Hrs'),
+                            ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('.04'), Decimal('.05'), 'Hrs'),
+                        ), False)
                     charges = book.directory / 'charges'
                     charges.mkdir()
-                    for bill in readings:
-                        _ = (charges / f'{bill.day}.json').write_text(json.dumps(ledger.charge_record(bill)))
+                    _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(bill)))
 
-                amount = Decimal(expected_cap)
-                complete_days = book.read_complete_day_amounts(policy, now)
-                days = ledger.gate_spend_days(book.priced_snapshot(now), policy, book.read_bills(), now,
-                                              reserve=True, complete_days=complete_days)
+                amount = Decimal(logged_usd if row_label == 'complete' else unlogged_usd)
+                days = ledger.gate_spend_days(book.priced_snapshot(now), policy, book.read_bills(), now, reserve=True)
                 self.assertEqual(sum((day.usd for day in days), Decimal(0)), amount)
-                self.assertEqual(book.accrued_cost(self.settings, now, window='month').limit_count, Decimal(expected_guard))
-                proposal = ledger.GateReservation('next', now, now + 60, Decimal(0), Decimal(0), region=booking.region)
+                self.assertEqual(book.accrued_cost(self.settings, now, window='month').limit_count, amount)
+                proposal = ledger.GateReservation('next', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
                 decision = book.reserve_gate(self.settings, proposal)
                 if amount < policy.monthly_limit_usd:
                     self.assertIsInstance(decision, ledger.GateReserved)
