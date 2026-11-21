@@ -64,6 +64,11 @@ def _has_diagnostic(log: str) -> bool:
     return False
 
 
+def has_kill_diagnostic(output: str) -> bool:
+    """Check whether the output reports SIGKILL."""
+    return re.search(r"SIGKILL|signal: 9", output) is not None
+
+
 def was_memory_kill(log: str, started: str, ended: str) -> bool:
     """Preserve signal retries. Require crate and time evidence for silent exits."""
     try:
@@ -73,7 +78,7 @@ def was_memory_kill(log: str, started: str, ended: str) -> bool:
     if not (math.isfinite(start) and math.isfinite(end) and 0 < start <= end):
         return False
     log = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", log)
-    if re.search(r"SIGKILL|SIGTERM|signal: (9|15)", log):
+    if has_kill_diagnostic(log) or re.search(r"SIGTERM|signal: 15", log):
         # Preserve the signal rule for test binaries, linkers, and build scripts.
         # Any earlyoom or kernel kill in the attempt window is sufficient.
         if re.search(r"sending SIG(TERM|KILL) to process",
@@ -113,6 +118,9 @@ def was_memory_kill(log: str, started: str, ended: str) -> bool:
 
 
 def main(arguments: list[str]) -> int:
+    report_diagnostic = len(arguments) == 4 and arguments[-1] == "--report-kill-diagnostic"
+    if report_diagnostic:
+        arguments = arguments[:-1]
     if len(arguments) != 3:
         return 1
     started, ended, log_path = arguments
@@ -120,6 +128,8 @@ def main(arguments: list[str]) -> int:
         log = Path(log_path).read_text(errors="replace")
     except OSError:
         return 1
+    if report_diagnostic:
+        print(int(has_kill_diagnostic(log)))
     return 0 if was_memory_kill(log, started, ended) else 1
 
 

@@ -87,7 +87,7 @@ verb = words[words.index("--verb") + 1] if "--verb" in words else "nextest"
 needs_repair = ((verb == "clippy" and os.environ.get("TEST_REQUIRE_CLIPPY_FIX") == "1")
                 or (verb == "mend-check" and os.environ.get("TEST_REQUIRE_MEND_FIX") == "1"))
 if needs_repair and not (Path(os.environ["PACKAGE_ROOT"]) / "local-repair").exists():
-    result.write_text("mac=failed\nseconds=0\n")
+    result.write_text("mac=failed\nseconds=0\nkill_diagnostic=0\n")
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCompleted(101)
         fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())

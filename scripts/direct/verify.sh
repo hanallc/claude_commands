@@ -832,9 +832,10 @@ STEP_TARGET_TABLE=""
 HOLD_LINT=0
 
 # Status 101 permits repairs for lint findings and compile errors.
-# A kill or a lint hold prevents repairs.
+# A kill, unknown kill evidence, or a lint hold prevents repairs.
 first_judgment_permits_repair() {
-    [[ "$HOLD_LINT" == 0 && "$1" == 101 && "${RUN_LAST_ATTEMPT_KILLED:-0}" == 0 ]] && ! grep -qE "process didn.t exit successfully:.*signal:" "$2"
+    [[ "$HOLD_LINT" == 0 && "$1" == 101 && "${RUN_LAST_ATTEMPT_KILL_EVIDENCE:-not_killed}" == not_killed ]] \
+        && ! grep -qE "process didn.t exit successfully:.*signal:" "$2"
 }
 
 publish_step_state() {
@@ -869,12 +870,15 @@ remove_step_record() {
 # One classifier preserves signal retries and checks the failed crate for silent exits.
 memory_kill_in_journal() {
     local started=$1 ended=$2 log=$3
-    "$PY" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log"
+    "$PY" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log" --report-kill-diagnostic
 }
 
 step_was_killed_for_memory() {
-    local log=$1 started=$2 ended=$3
-    memory_kill_in_journal "$started" "$ended" "$log"
+    local log=$1 started=$2 ended=$3 diagnostic status=0
+    diagnostic="$(memory_kill_in_journal "$started" "$ended" "$log")" || status=$?
+    # A kill diagnostic prevents a verdict even when the journal cannot confirm an OOM.
+    if [[ "$diagnostic" == 1 ]]; then RUN_LAST_ATTEMPT_KILL_EVIDENCE=killed; fi
+    return "$status"
 }
 
 step_writes_tree() {
@@ -981,7 +985,7 @@ run_step() {
         fi
         (( admission == 0 )) || return "$admission"
     fi
-    RUN_LAST_ATTEMPT_KILLED=0
+    RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     if buildlog_step_compiles "$@"; then
         if [[ "${CMD:-}" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
@@ -1088,7 +1092,7 @@ run_step() {
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
-            RUN_LAST_ATTEMPT_KILLED=0
+            RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
             rm -f "$step_log"
             return 0
         fi
@@ -1128,15 +1132,12 @@ run_step() {
             return "$status"
         fi
         ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
-        RUN_LAST_ATTEMPT_KILLED=0
-        if grep -qaE 'SIGKILL|signal: 9' "$step_log"; then
-            RUN_LAST_ATTEMPT_KILLED=1
-        fi
+        RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
         if ! step_was_killed_for_memory "$step_log" "$started" "$ended"; then
             rm -f "$step_log"
             return "$status"
         fi
-        RUN_LAST_ATTEMPT_KILLED=1
+        RUN_LAST_ATTEMPT_KILL_EVIDENCE=killed
         if [[ -n "${MEM_KILL_FILE:-}" ]]; then
             printf x >> "$MEM_KILL_FILE"
         fi
@@ -1335,7 +1336,15 @@ workspace_taplo() (
     fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
-    if [[ "$status" != 0 && "${1:-}" == --check ]]; then
+    if (( status == 101 )); then
+        if [[ "$(uname)" == Darwin ]]; then
+            echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+            return 3
+        fi
+        echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+        return 2
+    fi
+    if (( status != 0 )) && [[ "${1:-}" == --check ]]; then
         echo 'verify.sh: TOML check failed; files can be invalid or not properly formatted.' >&2
     fi
     return "$status"
@@ -1984,6 +1993,7 @@ if [[ "$CMD" == test ]]; then
 fi
 RUN_LOG=""
 RUN_LOG_PIDS=()
+MEND_LOG=""
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -2369,7 +2379,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal HUP 129' HUP
     REMOTE_BUILD_TARGET_DIR=""
     local runner_status result_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 name
+    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 result_kill_evidence=unknown name
     MAC_FIX_RESULT=""
     local runner_root=${STEP_REMOTE_REPO_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}
     local runner_args=(run --repo-root "$runner_root"
@@ -2495,6 +2505,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             IFS= read -r result_fetch || true
             IFS= read -r MAC_FIX_RESULT || true
             IFS= read -r REMOTE_BUILD_TARGET_DIR || true
+            IFS= read -r result_kill_evidence || true
         } <<< "$result_text"
     else
         result_status=$?
@@ -2553,6 +2564,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             return
             ;;
         failed|prelaunch_failed)
+            if [[ "$selected_is_mac" == 1 ]]; then
+                RUN_LAST_ATTEMPT_KILL_EVIDENCE=${result_kill_evidence:-unknown}
+            else
+                RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
+            fi
             close_mac_log
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
@@ -3201,6 +3217,7 @@ settle_placed_scope() {
 placement_once() {
     local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local reply line roots route="" status=0 monitor=0 refresh_source=${1:-0} prerequisite=none target="${PINNED_TARGET:-}"
+    local lint_refusal_returns_to_queue=0
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "$target" && "${STEP_FORCE_MAC:-0}" != 0 ]]; then target=mac; fi
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
@@ -3292,7 +3309,14 @@ placement_once() {
         IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
         return 0
     fi
-    [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
+    # An internal Mac pin can return lint to the local repair path.
+    if [[ "${LINT_MAC_FIX:-0}" == 1 ||
+            ( "${STEP_FORCE_MAC:-0}" == 1 && "${MAC_VERB:-}" == mend-check && "${MAC_ONLY:-0}" == 0 ) ]]; then
+        lint_refusal_returns_to_queue=1
+    fi
+    if [[ -n "${PINNED_TARGET:-}" || "$lint_refusal_returns_to_queue" == 1 ]]; then
+        placement_args+=(--pinned-refusals)
+    fi
     # A builtin wait lets the parent handle signals during a service outage.
     local placement_previous_job_pid=${!:-}
     PLACEMENT_CLIENT_ACTIVE=1
@@ -3315,7 +3339,7 @@ placement_once() {
                 if [[ -n "${PINNED_TARGET:-}" ]]; then
                     pinned_target_refuse "${line#*$'\t'}"
                 fi
-                if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
+                if [[ "$lint_refusal_returns_to_queue" == 1 ]]; then
                     LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=${line#*$'\t'}
                     status=$LINT_LEFT_QUEUE_STATUS
                     continue
@@ -3839,17 +3863,22 @@ record_mac_pass() {
     RUN_LOG=""
 }
 
-# A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
-# placement that failed before its step started. A fix pass that still changes
-# the tree at the limit can leave more fixes for the next call.
-# An incomplete fix pass can also leave fixes for the next call.
+# With an argument, classify one check by its status.
+# Without an argument, also check whether the run completed its judgment.
 lint_failure_is_the_tree() {
+    local status=${1:-$EXIT_STATUS}
+    # Usage errors, sandbox failures, lost tokens, and signals give no verdict.
+    (( status != 2 && status != 3 && status != 125 && status < 128 )) || return 1
+    [[ "$status" != "${TREE_CHANGED_STATUS:-}" ]] || return 1
+    [[ "${RUN_LAST_ATTEMPT_KILL_EVIDENCE:-not_killed}" == not_killed ]] || return 1
+    (( $# == 0 )) || return 0
     [[ "$CMD" == lint ]] || return 1
     (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
-    (( LINT_FIX_INCOMPLETE == 0 )) || return 1
-    (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
-    (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
+    (( LINT_FIX_INCOMPLETE == 0 ))
+}
+
+lint_require_verdict() {
+    lint_failure_is_the_tree "$1" || exit "$1"
 }
 
 # Logs the finished run and records a pass or a lint failure. Runs once:
@@ -4128,6 +4157,7 @@ verify_cleanup() {
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
     lint_copy_drop
+    [[ -z "${MEND_LOG:-}" ]] || rm -f -- "$MEND_LOG"
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
     fi
@@ -4300,6 +4330,7 @@ run_lint_judgment() {
         rm -f "$CLIPPY_LOG"
         unset CLIPPY_LOG
         finish_tree_watch
+        if (( clippy_status != 0 )); then lint_require_verdict "$clippy_status"; fi
         if (( clippy_repair )); then
             # Read at use so a changed policy applies to this repair round.
             clippy_fix_limit="$(_lint_config_raw clippy_fix_pass_limit)"
@@ -4310,8 +4341,9 @@ run_lint_judgment() {
             lint_copy_begin
             clippy_tree_before="$(lint_fix_tree_key)"
             for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
-                lint_rewrite invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+                lint_rewrite invoke_clippy_fix --workspace --all-targets --all-features --keep-going \
+                    || lint_require_verdict "$?"
+                lint_rewrite fmt_cargo "${FMT_SCOPE[@]}" || exit "$?"
                 clippy_tree_after="$(lint_fix_tree_key)"
                 if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                     break
@@ -4335,20 +4367,26 @@ run_lint_judgment() {
     fi
 }
 
-# The Mac runs mend --fix and then clippy on its copy in one run. offload.py
-# writes the changed files into the worktree only when the worktree still has
-# the tree key that the copy sent. Any other answer leaves the tree as it was,
-# and the caller repairs it on natedev.
+# The Mac fixes and judges its copy. Judge the live tree after local rustfmt.
 run_mac_lint_fix() {
     local STEP_FORCE_MAC=1 LINT_MAC_FIX=1 fix_status=0
     MAC_FIX_RESULT=""
     echo 'verify.sh: mend found findings on the Mac; running the fix pass there.'
     invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" || fix_status=$?
+    # A queue transfer returns to local repair.
+    if (( fix_status != 0 && fix_status != LINT_LEFT_QUEUE_STATUS )); then
+        lint_require_verdict "$fix_status"
+    fi
     if [[ "$MAC_FIX_RESULT" == withheld ]]; then
         # A fix that no reservation holds is withheld on natedev too.
         LINT_FIX_INCOMPLETE=1
         echo 'verify.sh: the Mac fix pass fixed a path that no reservation holds; see above.' >&2
         exit 1
+    fi
+    if [[ "$MAC_FIX_RESULT" == partial ]]; then
+        LINT_FIX_INCOMPLETE=1
+        echo 'verify.sh: another reservation holds part of the Mac fix. The live tree needs a new lint judgment.'
+        return 1
     fi
     if (( fix_status != 0 )) || [[ "$STEP_RAN_ON_MAC" != 1 \
             || ( "$MAC_FIX_RESULT" != applied && "$MAC_FIX_RESULT" != none ) ]]; then
@@ -4356,14 +4394,18 @@ run_mac_lint_fix() {
         echo 'verify.sh: the Mac fix pass did not finish; natedev repairs the tree.'
         return 1
     fi
-    # Format the returned files with natedev's rustfmt, then judge this tree.
+    LINT_MAC_FIX=0
     lint_copy_begin
-    lint_rewrite fmt_cargo --all
+    lint_rewrite fmt_cargo --all || exit "$?"
     lint_copy_return || exit 1
-    if [[ -n "${RUN_LOG}" ]]; then
-        set_verdict_keys
-    fi
-    echo 'verify.sh: the Mac fix pass passed; the worktree has its files.'
+    start_tree_watch
+    local judgment_watch="$TREE_WATCH_PID"
+    run_lint_checks after-fix
+    finish_tree_watch
+    # The verdict keys must cover all checks of the formatted tree.
+    if [[ -z "$judgment_watch" ]]; then VERDICT_KEY="" VERDICT_TREE_KEY=""; fi
+    (( lint_status == 0 )) || exit "$lint_status"
+    echo 'verify.sh: the returned worktree passed lint after formatting.'
 }
 
 run_lint_held_sequence() {
@@ -4371,8 +4413,8 @@ run_lint_held_sequence() {
     LINT_HELD_CLIPPY_FAILED=0
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
-    lint_rewrite fmt_cargo --all
-    workspace_taplo
+    lint_rewrite fmt_cargo --all || exit "$?"
+    workspace_taplo || exit "$?"
     lint_copy_return || exit 1
     workspace_taplo --check || exit "$?"
     lint_status=0
@@ -4380,14 +4422,16 @@ run_lint_held_sequence() {
         local mend_status=0
         LAST_TARGET_OUTCOME=""
         invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}" || mend_status=$?
-        if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 && "$mend_status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
+        if [[ "$mend_status" == "$LINT_LEFT_QUEUE_STATUS" &&
+                ( "${LINT_MEMORY_JUDGMENT:-0}" == 1 || "$LAST_TARGET_OUTCOME" == declined ) ]]; then
             LINT_MEMORY_JUDGMENT=0
             lint_status=1
             return 0
         fi
         LINT_MEMORY_JUDGMENT=0
         if (( mend_status != 0 )); then
-            # A finding the Mac reported gets its fix pass there; clippy judges the fixed copy.
+            lint_require_verdict "$mend_status"
+            # A Mac finding can start a fix pass and a new judgment.
             if [[ "$LAST_TARGET_OUTCOME" == failed ]] && run_mac_lint_fix; then
                 return 0
             fi
@@ -4396,13 +4440,63 @@ run_lint_held_sequence() {
     fi
     if lint_config_enabled clippy; then
         start_tree_watch
-        if ! invoke_clippy --workspace --all-targets --all-features; then
+        if invoke_clippy --workspace --all-targets --all-features; then
+            :
+        else
+            lint_require_verdict "$?"
             if (( lint_status == 0 )); then LINT_HELD_CLIPPY_FAILED=1; fi
             lint_status=1
         fi
         finish_tree_watch
     fi
     return 0
+}
+
+run_lint_checks() {
+    # Run all checks even when an earlier check reports findings.
+    lint_status=0
+    if lint_config_enabled mend; then
+        echo 'style-lint: mend start'
+        if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
+            echo 'style-lint: mend passed'
+        else
+            lint_require_verdict "$?"
+            lint_status=1
+        fi
+    else
+        lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
+    fi
+    if lint_config_enabled fmt; then
+        echo 'style-lint: rustfmt start'
+        if fmt_cargo --all --check; then
+            echo 'style-lint: rustfmt passed'
+        else
+            lint_require_verdict "$?"
+            lint_status=1
+        fi
+    else
+        lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
+    fi
+    load_metadata
+    if workspace_taplo --check; then
+        :
+    else
+        lint_require_verdict "$?"
+        lint_status=1
+    fi
+    if lint_config_enabled clippy; then
+        echo 'style-lint: clippy start'
+        if [[ "${1:-}" != after-fix ]]; then start_tree_watch; fi
+        if invoke_clippy --workspace --all-targets --all-features; then
+            echo 'style-lint: clippy passed'
+        else
+            lint_require_verdict "$?"
+            lint_status=1
+        fi
+        if [[ "${1:-}" != after-fix ]]; then finish_tree_watch; fi
+    else
+        lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
+    fi
 }
 
 run_lint_sequence() {
@@ -4413,44 +4507,7 @@ run_lint_sequence() {
     if (( CHECK_LINT )); then
         # Give placement and Taplo the same workspace metadata.
         load_metadata
-        # Judge all three tools even when an earlier one reports findings.
-        # Report mode never enters the rewrite paths of the package gate.
-        lint_status=0
-        if lint_config_enabled mend; then
-            echo 'style-lint: mend start'
-            if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
-                echo 'style-lint: mend passed'
-            else
-                lint_status=1
-            fi
-        else
-            lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
-        fi
-        if lint_config_enabled fmt; then
-            echo 'style-lint: rustfmt start'
-            if fmt_cargo --all --check; then
-                echo 'style-lint: rustfmt passed'
-            else
-                lint_status=1
-            fi
-        else
-            lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
-        fi
-        if ! workspace_taplo --check; then
-            lint_status=1
-        fi
-        if lint_config_enabled clippy; then
-            echo 'style-lint: clippy start'
-            start_tree_watch
-            if invoke_clippy --workspace --all-targets --all-features; then
-                echo 'style-lint: clippy passed'
-            else
-                lint_status=1
-            fi
-            finish_tree_watch
-        else
-            lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
-        fi
+        run_lint_checks
         exit "$lint_status"
     fi
     # Cargo stages are gated by lint.conf; the Taplo check always runs.
@@ -4493,10 +4550,7 @@ run_lint_sequence() {
                 lint_copy_begin
                 continue
             fi
-            if (( mend_status == 137 || mend_status == 125 )); then
-                rm -f "$MEND_LOG"
-                exit "$mend_status"
-            fi
+            lint_require_verdict "$mend_status"
             if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                 echo "verify.sh: cargo mend --fix rolled its rewrites back; stop and keep the tree for inspection" >&2
             else
@@ -4534,7 +4588,7 @@ run_lint_sequence() {
         echo 'style-lint: rustfmt start'
     fi
     lint_copy_begin
-    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}" || exit "$?"
     lint_copy_return || exit 1
     if [[ -z "$PKG" ]] && lint_config_enabled fmt; then
         echo 'style-lint: rustfmt passed'
@@ -4545,20 +4599,7 @@ run_lint_sequence() {
     fi
     # Taplo checks the repository with its top-level config, as CI does.
     load_metadata
-    if workspace_taplo --check; then
-        :
-    else
-        taplo_status=$?
-        if (( taplo_status == 101 )); then
-            if [[ "$(uname)" == Darwin ]]; then
-                echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
-                exit 3
-            fi
-            echo "verify.sh: taplo panicked; this is a tooling failure." >&2
-            exit 2
-        fi
-        exit "$taplo_status"
-    fi
+    workspace_taplo --check || exit "$?"
     run_lint_judgment
 }
 

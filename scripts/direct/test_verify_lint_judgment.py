@@ -1,4 +1,4 @@
-"""Judge first; repair Cargo 101 unless a kill or lint hold prevents it."""
+"""Check when the first lint judgment permits repairs."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.direct.runner_result import KillEvidence
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.lint.memory_test_support import write_config_fixture
@@ -30,15 +31,15 @@ LINT_FINDING = CLIPPY_DENY_WARNINGS
 
 class FirstJudgmentRepairTests(unittest.TestCase):
     def repair_decision(
-        self, status: int, diagnostic: str, *, hold_lint: int = 0, killed: int = 0,
+        self, status: int, diagnostic: str, *, hold_lint: int = 0, kill_evidence: KillEvidence = KillEvidence.NOT_KILLED,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "clippy.log"
             _ = log.write_text(diagnostic, encoding="utf-8")
             script = "set -eu\n" + shell_functions(VERIFY, "first_judgment_permits_repair")
-            script += '\nHOLD_LINT=$3\nRUN_LAST_ATTEMPT_KILLED=$4\nfirst_judgment_permits_repair "$1" "$2"\n'
+            script += '\nHOLD_LINT=$3\nRUN_LAST_ATTEMPT_KILL_EVIDENCE=$4\nfirst_judgment_permits_repair "$1" "$2"\n'
             return subprocess.run(
-                ["bash", "-c", script, "judgment", str(status), str(log), str(hold_lint), str(killed)],
+                ["bash", "-c", script, "judgment", str(status), str(log), str(hold_lint), kill_evidence.value],
                 env=verify_test_environment(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             )
 
@@ -60,9 +61,11 @@ class FirstJudgmentRepairTests(unittest.TestCase):
         result = self.repair_decision(101, LINT_FINDING, hold_lint=1)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
-    def test_killed_attempt_prevents_repair(self) -> None:
-        result = self.repair_decision(101, LINT_FINDING, killed=1)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+    def test_killed_or_unknown_attempt_prevents_repair(self) -> None:
+        for evidence in (KillEvidence.KILLED, KillEvidence.UNKNOWN):
+            with self.subTest(evidence=evidence):
+                result = self.repair_decision(101, LINT_FINDING, kill_evidence=evidence)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_signal_report_prevents_repair(self) -> None:
         result = self.repair_decision(
@@ -120,7 +123,8 @@ class VerifyLintJudgmentFixture(VerifyLintCacheFixture):
 
 class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
     def invoke_lint_functions(
-        self, *, killed: int = 0, held_clippy_failure: bool = False, memory_judgment: bool = False,
+        self, *, kill_evidence: KillEvidence = KillEvidence.NOT_KILLED,
+        held_clippy_failure: bool = False, memory_judgment: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run the lint sequence with real tools and private state."""
         self.events.unlink(missing_ok=True)
@@ -129,6 +133,7 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
             "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
             "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch",
             "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
+            "lint_failure_is_the_tree", "lint_require_verdict",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
         functions += verify_cancellation_functions(VERIFY, "cancel_tree_run")
@@ -149,7 +154,7 @@ run() {
     else
         "$@" || status=$?
     fi
-    RUN_LAST_ATTEMPT_KILLED=$TEST_RUNNER_KILLED_FLAG
+    RUN_LAST_ATTEMPT_KILL_EVIDENCE=$TEST_RUNNER_KILL_EVIDENCE
     return "$status"
 }
 CMD=lint
@@ -159,7 +164,7 @@ HOLD_LINT=0
 CHECK_LINT=0
 METADATA_READY=0
 CLIPPY_FIX_JOBS=8
-RUN_LAST_ATTEMPT_KILLED=0
+RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
 CLIPPY_FIX_LIMIT_REACHED=0
 FEATURE_FLAGS=()
 RUN_LOG=""
@@ -206,7 +211,7 @@ invoke_clippy() { printf 'clippy\n' >> "$PACKAGE_ROOT/held-calls"; return 101; }
         script += "\nrun_lint_sequence\n"
         return subprocess.run(
             ["bash", "-c", script], cwd=self.root,
-            env={**self.environment, "PY": sys.executable, "TEST_RUNNER_KILLED_FLAG": str(killed)},
+            env={**self.environment, "PY": sys.executable, "TEST_RUNNER_KILL_EVIDENCE": kill_evidence.value},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
@@ -262,7 +267,7 @@ Caused by:
 
     def test_killed_attempt_flag_without_signal_text_never_repairs(self) -> None:
         self.environment["TEST_CLIPPY_FIRST_STATUS"] = "101"
-        result = self.invoke_lint_functions(killed=1)
+        result = self.invoke_lint_functions(kill_evidence=KillEvidence.KILLED)
         self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
         self.assertEqual(len(self.calls("clippy")), 1)
         self.assertNotIn("--fix", self.calls("clippy")[0])

@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 import sys
 from typing import Literal, cast, get_args
 
 
 ResultWord = Literal["passed", "failed", "lost", "declined", "prelaunch_failed", "hana_command_admission_refused"]
+
+
+class KillEvidence(StrEnum):
+    KILLED = "killed"
+    NOT_KILLED = "not_killed"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -20,6 +27,7 @@ class UsableRunnerResult:
     fetch: str = "failed"
     fix: str = ""
     build_target_directory: str = ""
+    kill_evidence: KillEvidence = KillEvidence.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -46,7 +54,7 @@ def read_result(path: Path, status: int, selected_is_mac: bool) -> UsableRunnerR
             continue
         if name == "mac" or name == "outcome" and not selected_is_mac:
             words.append(value)
-        elif name in {"reason", "seconds", "holder", "fetch", "fix", "build_target_directory"}:
+        elif name in {"reason", "seconds", "holder", "fetch", "fix", "build_target_directory", "kill_diagnostic"}:
             fields[name] = value
     if len(words) != 1 or words[0] not in get_args(ResultWord):
         return UnusableRunnerResult()
@@ -57,9 +65,17 @@ def read_result(path: Path, status: int, selected_is_mac: bool) -> UsableRunnerR
         return UnusableRunnerResult()
     if word == "hana_command_admission_refused" and (selected_is_mac or status != 75 or not fields.get("reason")):
         return UnusableRunnerResult()
+    kill_evidence = KillEvidence.UNKNOWN
+    if selected_is_mac and word == "failed":
+        diagnostic = fields.get("kill_diagnostic")
+        if diagnostic == "1":
+            kill_evidence = KillEvidence.KILLED
+        elif diagnostic == "0":
+            kill_evidence = KillEvidence.NOT_KILLED
     return UsableRunnerResult(word, fields.get("reason", ""), fields.get("seconds", ""),
                               fields.get("holder", ""), fields.get("fetch", "failed"),
-                              fields.get("fix", ""), fields.get("build_target_directory", ""))
+                              fields.get("fix", ""), fields.get("build_target_directory", ""),
+                              kill_evidence=kill_evidence)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(result, UnusableRunnerResult):
         return 1
     for field in (result.word, result.reason, result.seconds, result.holder, result.fetch,
-                  result.fix, result.build_target_directory):
+                  result.fix, result.build_target_directory, result.kill_evidence):
         print(field)
     return 0
 

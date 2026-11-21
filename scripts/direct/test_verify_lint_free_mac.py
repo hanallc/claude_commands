@@ -10,6 +10,7 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB, write_fixture_cargo_mend
+from scripts.direct.verify_mac_offload_test_support import RUNNER_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -51,9 +52,9 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.addCleanup(self.stop_verify, process)
         return process
 
-    def finish_lint(self, process: subprocess.Popen[str]) -> str:
+    def finish_lint(self, process: subprocess.Popen[str], *, status: int = 0) -> str:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(process.returncode, status, output + errors)
         return output + errors
 
     def release_memory(self) -> None:
@@ -111,20 +112,99 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         local = [row["args"] for row in self.cargo_events()]
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
 
-    def test_mac_fix_pass_repairs_the_copy_without_natedev(self) -> None:
+    def repair_lint_on_mac(self, *, status: int = 0, clippy_runs: bool = True) -> str:
+        self.write_executable(self.runner, RUNNER_STUB.replace(
+            "if verb_answer.exists():",
+            'if verb_answer.exists() and (attempt == 1 or verb_answer.name != "runner-answer-mend-check"):',
+        ))
         self.set_verb_answer("mend-check", "failed", 1)
         self.set_verb_answer("mend-fix", "passed", 0, "applied")
-        process = self.queued_lint()
+        output = self.finish_lint(self.queued_lint(), status=status)
+        expected = ["mend-check", "mend-fix", "mend-check"]
+        if clippy_runs:
+            expected.append("clippy")
+        self.assertEqual(self.mac_verbs(), expected)
+        return output
+
+    def assert_lint_runs_again(self) -> None:
+        self.assertTrue((self.board / "verify_cache").is_dir())
+        self.assertEqual(self.saved_results(), [])
+        self.clear_observations()
+        for answer in self.runner_state.glob("runner-answer-*"):
+            answer.unlink()
+        self.release_memory()
+        process = self.start_verify("lint", "sample")
+        self.addCleanup(self.stop_verify, process)
         output = self.finish_lint(process)
-        self.assertIn("the Mac fix pass passed; the worktree has its files", output)
-        # mend-fix runs clippy on the fixed copy, so no held clippy follows it.
-        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix"])
+        self.assertTrue(self.local_mend(), output)
+
+    def test_mac_fix_pass_repairs_the_copy_without_natedev(self) -> None:
+        output = self.repair_lint_on_mac()
+        self.assertIn("the returned worktree passed lint after formatting", output)
         fix_words = self.runner_events()[1]["args"]
         self.assertIn("--workspace", fix_words)
         self.assertNotIn("--fail-on-warn", fix_words)
         self.assertEqual(self.local_mend(), [])
         local = [row["args"] for row in self.cargo_events()]
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
+
+    def test_final_taplo_panic_does_not_cache_a_lint_failure(self) -> None:
+        self.write_executable(self.bin_directory / "taplo", TAPLO_STUB.replace(
+            'status = int(os.environ["TEST_TAPLO_STATUS"])',
+            '''status = int(os.environ["TEST_TAPLO_STATUS"])
+if "--check" in sys.argv and (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-events.jsonl").exists():
+    status = 101''',
+        ))
+        output = self.repair_lint_on_mac(status=2, clippy_runs=False)
+        self.assertIn("taplo panicked", output)
+        self.assert_lint_runs_again()
+
+    def test_final_mac_clippy_sandbox_failure_does_not_cache_a_lint_failure(self) -> None:
+        self.set_verb_answer("clippy", "failed", 3)
+        _ = self.repair_lint_on_mac(status=3)
+        self.assert_lint_runs_again()
+
+    def test_final_mac_clippy_kill_preserves_status_without_a_verdict(self) -> None:
+        self.environment["TEST_RUNNER_KILLED_VERB"] = "clippy"
+        self.set_verb_answer("clippy", "failed", 101)
+        _ = self.repair_lint_on_mac(status=101)
+        self.assert_lint_runs_again()
+
+    def test_final_mac_clippy_without_kill_evidence_preserves_status_without_a_verdict(self) -> None:
+        self.environment["TEST_RUNNER_OMIT_KILL_DIAGNOSTIC_VERB"] = "clippy"
+        self.set_verb_answer("clippy", "failed", 101)
+        _ = self.repair_lint_on_mac(status=101)
+        self.assert_lint_runs_again()
+
+    def test_final_mac_clippy_finding_returns_failure_without_caching(self) -> None:
+        self.set_verb_answer("clippy", "failed", 101)
+        _ = self.repair_lint_on_mac(status=1)
+        self.assert_lint_runs_again()
+
+    def test_held_clippy_sandbox_failure_preserves_its_status(self) -> None:
+        self.set_verb_answer("clippy", "failed", 3)
+        _ = self.finish_lint(self.queued_lint(), status=3)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "clippy"])
+        self.assertEqual(self.local_mend(), [])
+        self.assert_lint_runs_again()
+
+    def test_mac_mend_fix_tooling_failure_preserves_its_status(self) -> None:
+        self.set_verb_answer("mend-check", "failed", 1)
+        self.set_verb_answer("mend-fix", "failed", 3)
+        _ = self.finish_lint(self.queued_lint(), status=3)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix"])
+        self.assertEqual(self.local_mend(), [])
+        self.assert_lint_runs_again()
+
+    def test_held_taplo_format_panic_is_a_tooling_failure(self) -> None:
+        self.environment["TEST_TAPLO_STATUS"] = "101"
+        output = self.finish_lint(self.queued_lint(), status=2)
+        self.assertIn("taplo panicked", output)
+        self.assertNotIn("TOML check failed", output)
+        self.assertEqual(self.mac_verbs(), [])
+        self.assertEqual(self.local_mend(), [])
+        self.environment["TEST_TAPLO_STATUS"] = "0"
+        self.assert_lint_runs_again()
 
     def test_refused_mac_fix_repairs_on_natedev(self) -> None:
         self.set_verb_answer("mend-check", "failed", 1)

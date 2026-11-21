@@ -120,6 +120,10 @@ if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")] and (
 ):
     with Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").open("a", encoding="utf-8") as source:
         source.write("// changed during " + arguments[0] + "\n")
+if arguments[:1] == ["mend"] and "TEST_MEND_STATUS" in os.environ:
+    if "TEST_MEND_DIAGNOSTIC" in os.environ:
+        print(os.environ["TEST_MEND_DIAGNOSTIC"], file=sys.stderr)
+    raise SystemExit(int(os.environ["TEST_MEND_STATUS"]))
 if arguments[:1] == ["clippy"]:
     source = Path(os.environ["PACKAGE_ROOT"], os.environ.get("TEST_FIX_FILE", "src/lib.rs"))
     if "--fix" in arguments:

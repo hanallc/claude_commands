@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.direct import verify_mac_offload_test_support
+from scripts.direct.runner_result import KillEvidence, UsableRunnerResult, read_result
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
@@ -967,6 +968,21 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
 
 
 class OffloadCommandTests(OffloadCommandFixture):
+    def test_failed_mac_lint_reports_whether_the_output_contains_kill_evidence(self) -> None:
+        self.write_portable_workspace()
+        self.fixture["run_status_line"] = "mac_exit=101"
+        for diagnostic, killed in (
+            ("process didn't exit successfully: signal: 9 (SIGKILL)", 1),
+            ("error: unused import", 0),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.fixture["run_lines"] = [{"stream": "stderr", "text": diagnostic}]
+                self.sync_fixture()
+                result = self.command("--workspace", verb="clippy")
+                self.assertEqual(result.returncode, 101, result.stdout)
+                self.assertIn(diagnostic, result.stdout)
+                self.assertIn(f"kill_diagnostic={killed}\n", self.result_path.read_text())
+
     def test_remote_build_target_directory_reaches_the_result_file(self) -> None:
         self.write_portable_workspace()
         stub = self.bin_directory / "command-stub"
@@ -1514,7 +1530,14 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertEqual(status, 4, output)
                     self.assertIn("fix the finding in the local worktree", output)
                     self.assertNotIn("only a test", output)
-                    self.assert_wire("failed", "")
+                    if eligibility.verb_kind(verb) == "lint":
+                        decoded = read_result(self.result_path, status, selected_is_mac=True)
+                        self.assertIsInstance(decoded, UsableRunnerResult)
+                        assert isinstance(decoded, UsableRunnerResult)
+                        self.assertEqual((decoded.word, decoded.reason, decoded.kill_evidence),
+                                         ("failed", "", KillEvidence.NOT_KILLED))
+                    else:
+                        self.assert_wire("failed", "")
 
     def test_non_test_verbs_never_apply_nextest_skip_words_or_start_a_copy(self) -> None:
         self.write_portable_workspace()

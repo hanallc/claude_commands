@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.lib import berth_board
+from scripts.lib import berth_board, test_hang_guard
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
-from scripts.lib import test_hang_guard
 
 HOST = "fixture-host"
 REPOSITORY = eligibility.KnownRepository("claude")
@@ -172,6 +172,7 @@ class ReturnFixTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in self.worktree.glob(".*mac-fix-*")), [])
         calls = (self.root / "rsync-calls").read_text()
         self.assertIn("--files-from", calls)
+        self.assertEqual(calls.count("--dry-run"), 1)
 
     def test_changed_worktree_refuses_the_patch(self) -> None:
         sent = offload.read_tree_key(self.worktree)
@@ -197,12 +198,165 @@ class ReturnFixTests(unittest.TestCase):
         sent = offload.read_tree_key(self.worktree)
         self.fix_the_mirror()
         result = self.return_fix(sent)
-        self.assertEqual(result, fix_return.FixApplied(("a.rs",), (), (
+        self.assertEqual(result, fix_return.FixPartial(("a.rs",), (), (
             fix_return.Withheld("c.rs", "other-2 (theirs)"), fix_return.Withheld("b.rs", ""))))
         self.assertEqual(fix_return.fix_word(result), "withheld")
         self.assertEqual((self.worktree / "a.rs").read_text(), "pub(crate) fn a() {}\n")
         self.assertFalse((self.worktree / "c.rs").exists())
         self.assertEqual((self.worktree / "b.rs").read_text(), "fn b() {}\n")
+
+    def test_a_save_at_the_commit_boundary_survives_the_return(self) -> None:
+        sent = offload.read_tree_key(self.worktree)
+        self.fix_the_mirror()
+        edited = self.worktree / "a.rs"
+        editor_save = self.root / "editor-save"
+        _ = editor_save.write_text("fn a() { local_edit }\n")
+        replace = os.replace
+
+        def save_during_replace(source: Path, destination: Path) -> None:
+            if (source == edited or destination == edited) and editor_save.exists():
+                replace(editor_save, edited)
+            replace(source, destination)
+
+        with patch.object(os, "replace", save_during_replace):
+            result = self.return_fix(sent)
+
+        self.assertEqual(edited.read_text(), "fn a() { local_edit }\n")
+        self.assertIsInstance(result, fix_return.FixRefused)
+        self.assertTrue(fix_return.git_folder_path(self.worktree, fix_return.RECORD_NAME).exists())
+        self.assertEqual([path.read_text() for path in self.worktree.glob(".*mac-fix-*/original")],
+                         ["fn a() { local_edit }\n"])
+        self.assertIn("pub(crate) fn a() {}\n",
+                      [path.read_text() for path in self.worktree.glob(".*mac-fix-*/fixed")])
+
+    def test_a_new_file_at_publication_survives_an_addition(self) -> None:
+        sent = offload.read_tree_key(self.worktree)
+        _ = (self.mirror / "c.rs").write_text("fn c() {}\n")
+        added = self.worktree / "c.rs"
+        link = os.link
+        replace = os.replace
+
+        def create_local_file(destination: Path) -> None:
+            if destination == added and not added.exists():
+                _ = added.write_text("fn c() { local_edit }\n")
+
+        def add_during_link(source: Path, destination: Path) -> None:
+            create_local_file(destination)
+            link(source, destination)
+
+        def add_during_replace(source: Path, destination: Path) -> None:
+            create_local_file(destination)
+            replace(source, destination)
+
+        with (patch.object(os, "link", add_during_link),
+              patch.object(os, "replace", add_during_replace)):
+            result = self.return_fix(sent)
+
+        self.assertEqual(added.read_text(), "fn c() { local_edit }\n")
+        self.assertIsInstance(result, fix_return.FixRefused)
+        self.assertEqual([path.read_text() for path in self.worktree.glob(".*mac-fix-*/fixed")],
+                         ["fn c() {}\n"])
+
+    def test_partial_mac_return_keeps_the_foreign_file_and_records_no_pass(self) -> None:
+        self.board = berth_board.Board((
+            reservation("own-1", self.worktree, "mine", "file:a.rs"),
+            reservation("other-2", self.root / "other", "theirs", "file:b.rs"),
+        ))
+        sent = offload.read_tree_key(self.worktree)
+        for name in ("a", "b"):
+            _ = (self.mirror / f"{name}.rs").write_text(f"pub(crate) fn {name}() {{}}\n")
+        result = self.return_fix(sent)
+
+        self.assertEqual((self.worktree / "a.rs").read_text(), "pub(crate) fn a() {}\n")
+        self.assertEqual((self.worktree / "b.rs").read_text(), "fn b() {}\n")
+        verdict = self.mac_lint_fix(result)
+        self.assertEqual(list(self.root.glob("*.pass")), [])
+        self.assertEqual(verdict.returncode, 1, verdict.stdout + verdict.stderr)
+        self.assertIn("incomplete=1", verdict.stdout)
+        self.assertEqual(fix_return.fix_word(result), "partial")
+
+    def mac_lint_fix(self, result: fix_return.FixResult,
+                     judgment: Literal["pass", "fail", "edit"] = "pass") -> subprocess.CompletedProcess[str]:
+        script = r"""
+reply=$1
+judgment=$2
+CACHE_DIR=$3
+RUN_LOG="$CACHE_DIR/run.log"
+TREE_WATCH_PID=""
+LINT_FIX_INCOMPLETE=0
+CMD=lint
+VERIFY_PACKAGE=""
+COMMAND_ARGS=()
+EXIT_STATUS=0
+LINT_LOADED_CODE_KEY=fixture
+lint_code_key() { echo fixture; }
+user_clock() { echo fixture; }
+tree_key() { cat a.rs; }
+start_tree_watch() { set_verdict_keys; TREE_WATCH_PID=fixture; }
+finish_tree_watch() {
+    if [[ "$judgment" == edit ]]; then printf 'edited\n' > a.rs; fi
+}
+invoke_mend() {
+    if (( LINT_MAC_FIX )); then
+        STEP_RAN_ON_MAC=1
+        MAC_FIX_RESULT=$reply
+    else
+        cat a.rs > "$CACHE_DIR/judged"
+        [[ "$1 $2" == "--workspace --fail-on-warn" && "$judgment" != fail ]]
+    fi
+}
+lint_copy_begin() { :; }
+lint_rewrite() { "$@"; }
+lint_copy_return() { :; }
+lint_config_enabled() { return 0; }
+fmt_cargo() {
+    if [[ "$2" == --check ]]; then
+        [[ "$(cat a.rs)" == formatted ]]
+    else
+        printf 'formatted\n' > a.rs
+    fi
+}
+workspace_taplo() { [[ "$*" == --check ]]; }
+invoke_clippy() { [[ "$LINT_MAC_FIX" == 0 ]]; }
+load_metadata() { :; }
+"""
+        script += shell_functions(
+            VERIFY, "run_mac_lint_fix", "run_lint_checks", "lint_failure_is_the_tree", "lint_require_verdict",
+            "set_verdict_keys", "cache_record",
+        )
+        script += r"""
+: > "$RUN_LOG"
+run_mac_lint_fix
+status=$?
+printf 'incomplete=%s\n' "$LINT_FIX_INCOMPLETE"
+if (( status == 0 )); then cache_record pass 0 || true; fi
+exit "$status"
+"""
+        return subprocess.run(
+            ["bash", "-c", script, "verify", fix_return.fix_word(result), judgment, str(self.root)],
+            cwd=self.worktree, capture_output=True, text=True, check=False,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+
+    def test_mac_fix_records_only_a_passing_judgment_of_the_formatted_tree(self) -> None:
+        cases: tuple[tuple[Literal["fail", "edit", "pass"], int, bool], ...] = (
+            ("fail", 1, False), ("edit", 0, False), ("pass", 0, True),
+        )
+        for judgment, status, cached in cases:
+            with self.subTest(judgment=judgment):
+                verdict = self.mac_lint_fix(fix_return.FixApplied(("a.rs",), ()), judgment=judgment)
+                self.assertEqual(verdict.returncode, status, verdict.stdout + verdict.stderr)
+                self.assertEqual((self.root / "judged").read_text(), "formatted\n")
+                self.assertEqual((self.root / "formatted.pass").exists(), cached)
+                self.assertFalse((self.root / "edited.pass").exists())
+
+    def test_an_empty_listing_still_requires_the_sent_key(self) -> None:
+        sent = offload.read_tree_key(self.worktree)
+        for tree in (self.worktree, self.mirror):
+            _ = (tree / "a.rs").write_text("fn a() { identical_edit }\n")
+        result = self.return_fix(sent)
+        self.assertIsInstance(result, fix_return.FixRefused)
+        self.assertNotIn("--files-from", (self.root / "rsync-calls").read_text())
 
     def test_unchanged_mirror_writes_nothing(self) -> None:
         result = self.return_fix(offload.read_tree_key(self.worktree))
@@ -219,25 +373,31 @@ import os, sys
 from pathlib import Path
 from scripts.mac_test import fix_return
 worktree, staging, stop_at = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-stage, replace = fix_return.stage_file, os.replace
+stage, replace, link = fix_return.stage_file, os.replace, os.link
 staged: list[Path] = []
-renamed: list[str] = []
 
 def stage_then_stop(source, temporary, destination):
-    staged.append(source)
-    if stop_at == "staging" and len(staged) == 2:
-        os._exit(137)
+    if Path(temporary).name != "received":
+        staged.append(source)
+        if stop_at == "staging" and len(staged) == 2:
+            os._exit(137)
     stage(source, temporary, destination)
 
 def rename_then_stop(source, destination):
+    if stop_at == "displaced" and Path(source) == worktree / "a.rs":
+        Path(source).write_text("editor save before displacement\n")
+        replace(source, destination)
+        os._exit(137)
     replace(source, destination)
-    if fix_return.TEMPORARY_MARK in str(source):
-        renamed.append(str(destination))
-        if stop_at == "renames" and len(renamed) == 1:
-            os._exit(137)
+
+def link_then_stop(source, destination, **kwargs):
+    link(source, destination, **kwargs)
+    if stop_at == "renames" and Path(source).name == "fixed":
+        os._exit(137)
 
 fix_return.stage_file = stage_then_stop
 fix_return.os.replace = rename_then_stop
+fix_return.os.link = link_then_stop
 changes = fix_return.MirrorChanges(("a.rs", "src/b.rs", "c.rs"), ("gone.rs",))
 unconfigured = fix_return.berth_board.Board((), configured=False)
 print(fix_return.apply_fix(worktree, staging, changes, lambda: True, lambda _: unconfigured))
@@ -248,11 +408,6 @@ VERIFY_START = r'''
 VERIFY_START_DIR=$1
 verify_helper() { "$VERIFY_PYTHON" "$@"; }
 '''
-
-
-def verify_start_function() -> str:
-    body = VERIFY.read_text().split("\nfinish_mac_fix() {", 1)[1].split("\n}\n", 1)[0]
-    return "finish_mac_fix() {" + body + "\n}\nfinish_mac_fix\n"
 
 
 class RollForwardTests(unittest.TestCase):
@@ -289,14 +444,14 @@ class RollForwardTests(unittest.TestCase):
         )
         self.assertEqual(stopped.returncode, 137, stopped.stdout + stopped.stderr)
 
-    def next_verify_start(self) -> str:
+    def next_verify_start(self, status: int = 0) -> str:
         started = subprocess.run(
-            ["bash", "-c", VERIFY_START + verify_start_function(), "verify", str(VERIFY.parent)],
+            ["bash", "-c", VERIFY_START + shell_functions(VERIFY, "finish_mac_fix") + "finish_mac_fix\n", "verify", str(VERIFY.parent)],
             cwd=self.worktree / "src", capture_output=True, text=True, check=False,
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**git_environment(), "VERIFY_PYTHON": sys.executable},
         )
-        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        return started.stdout
+        self.assertEqual(started.returncode, status, started.stdout + started.stderr)
+        return started.stdout + started.stderr
 
     def files(self) -> dict[str, str]:
         return {str(path.relative_to(self.worktree)): path.read_text()
@@ -308,7 +463,8 @@ class RollForwardTests(unittest.TestCase):
     def test_stop_while_staging_leaves_the_worktree_unchanged(self) -> None:
         self.stop_return("staging")
         self.assertEqual(fix_return.read_record(self.record())["state"], "staging")
-        self.assertEqual(len([name for name in self.files() if fix_return.TEMPORARY_MARK in name]), 1)
+        stages = [path for path in self.worktree.glob(".*mac-fix-*") if path.is_dir()]
+        self.assertEqual(len(stages), 1)
         output = self.next_verify_start()
         self.assertIn("the worktree is unchanged", output)
         self.assertEqual(self.files(), {"a.rs": "old a.rs\n", "c.rs": "old c.rs\n",
@@ -324,6 +480,68 @@ class RollForwardTests(unittest.TestCase):
         self.assertIn("finished a stopped Mac fix: 3 file(s) written, 1 removed", output)
         self.assertEqual(self.files(), {"a.rs": "fixed a.rs\n", "c.rs": "fixed c.rs\n", "src/b.rs": "fixed src/b.rs\n"})
         self.assertFalse(self.record().exists())
+
+    def test_recovery_keeps_a_save_made_after_the_stop(self) -> None:
+        self.stop_return("renames")
+        _ = (self.worktree / "a.rs").write_text("editor save after publication\n")
+        _ = (self.worktree / "src/b.rs").write_text("new editor save\n")
+        output = self.next_verify_start(status=2)
+        self.assertIn("a.rs", output)
+        self.assertTrue(self.record().exists())
+        self.assertEqual(self.files()["src/b.rs"], "new editor save\n")
+        self.assertEqual(self.files()["gone.rs"], "removed by the fix\n")
+        self.assertEqual(self.files()["a.rs"], "editor save after publication\n")
+        self.assertIn("fixed src/b.rs\n", self.files().values())
+        self.assertIn("fixed a.rs\n", self.files().values())
+
+    def test_recovery_restores_a_changed_displacement_when_the_live_path_is_empty(self) -> None:
+        self.stop_return("displaced")
+        edited = self.worktree / "a.rs"
+        self.assertFalse(edited.exists())
+        _ = edited.write_text("editor save after the stop\n")
+        self.assertIn("a.rs changed", self.next_verify_start(status=2))
+        self.assertEqual(edited.read_text(), "editor save after the stop\n")
+
+        edited.unlink()
+        self.assertIn("a.rs changed", self.next_verify_start(status=2))
+        self.assertEqual(edited.read_text(), "editor save before displacement\n")
+        self.assertEqual((self.worktree / "src/b.rs").read_text(), "old src/b.rs\n")
+        self.assertTrue(self.record().exists())
+        (displaced,) = self.worktree.glob(".*mac-fix-*/original")
+        self.assertEqual(displaced.with_name("received").read_text(), "fixed a.rs\n")
+
+    def test_cleanup_keeps_a_save_to_the_open_displaced_file(self) -> None:
+        edit = "editor save after the commit check\n"
+        changes = fix_return.MirrorChanges(("a.rs",), ())
+        write_record = fix_return.write_record
+        with (self.worktree / "a.rs").open("r+") as editor:
+            def save_at_cleanup(path: Path, record: fix_return.FixRecord) -> None:
+                write_record(path, record)
+                if record["state"] == "cleanup":
+                    _ = editor.write(edit)
+                    _ = editor.truncate()
+                    editor.flush()
+
+            with patch.object(fix_return, "write_record", save_at_cleanup):
+                result = fix_return.apply_fix(self.worktree, self.staging, changes, lambda: True, unconfigured)
+
+        self.assertIsInstance(result, fix_return.FixRefused)
+        self.assertEqual((self.worktree / "a.rs").read_text(), "fixed a.rs\n")
+        self.assertEqual(fix_return.read_record(self.record())["state"], "cleanup")
+        self.assertIn("a.rs changed", self.next_verify_start(status=2))
+        self.assertEqual([saved.read_text() for saved in self.worktree.glob(".*mac-fix-*/original")], [edit])
+
+    def test_recovery_keeps_a_legacy_commit_without_file_versions(self) -> None:
+        staged = self.worktree / ".a.rs.mac-fix-legacy"
+        _ = staged.write_text("fixed a.rs\n")
+        _ = self.record().write_text(json.dumps({
+            "state": "commit", "renames": [[staged.name, "a.rs"]], "removals": ["gone.rs"],
+        }))
+        self.assertIn("no expected file versions", self.next_verify_start(status=2))
+        self.assertTrue(self.record().exists())
+        self.assertEqual(staged.read_text(), "fixed a.rs\n")
+        self.assertEqual(self.files()["a.rs"], "old a.rs\n")
+        self.assertIn("gone.rs", self.files())
 
     def test_whole_return_leaves_no_record(self) -> None:
         changes = fix_return.MirrorChanges(("a.rs", "src/b.rs", "c.rs"), ("gone.rs",))
@@ -424,7 +642,7 @@ class HoldFilterTests(unittest.TestCase):
         self.assertEqual(fix_return.hold_filter(self.ROOT, self.CHANGES, UNCONFIGURED), (self.CHANGES, ()))
 
     def test_withheld_lines_name_the_holder_and_the_check(self) -> None:
-        result = fix_return.FixApplied(("src/held.rs",), (), (
+        result = fix_return.FixPartial(("src/held.rs",), (), (
             fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),
             fix_return.Withheld("src/free.rs", ""), fix_return.Withheld("src/also.rs", "")))
         self.assertEqual(fix_return.withheld_lines(result), [
@@ -432,13 +650,13 @@ class HoldFilterTests(unittest.TestCase):
             "not written: no reservation holds src/free.rs, src/also.rs; "
             + "run `cargo-berth check src/free.rs src/also.rs`, then run lint again",
         ])
-        self.assertFalse(fix_return.fix_passed(result))
+        self.assertFalse(fix_return.local_return_succeeded(result))
         self.assertEqual(fix_return.fix_word(result), "withheld")
 
-    def test_foreign_only_withheld_passes(self) -> None:
-        result = fix_return.FixApplied((), (), (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
-        self.assertTrue(fix_return.fix_passed(result))
-        self.assertEqual(fix_return.fix_word(result), "applied")
+    def test_foreign_only_withheld_reports_a_partial_return(self) -> None:
+        result = fix_return.FixPartial((), (), (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
+        self.assertTrue(fix_return.local_return_succeeded(result))
+        self.assertEqual(fix_return.fix_word(result), "partial")
 
 
 class LocalCopyTests(unittest.TestCase):
@@ -499,9 +717,9 @@ class LocalCopyTests(unittest.TestCase):
         _ = (made.tree / "ws/src/new.rs").write_text("fn new() {}\n")
         _ = (made.tree / "out.log").write_text("log\n")
         result = fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read)
-        self.assertEqual(result, fix_return.FixApplied(("ws/src/held.rs", "ws/src/new.rs"), ("ws/src/gone.rs",), (
+        self.assertEqual(result, fix_return.FixPartial(("ws/src/held.rs", "ws/src/new.rs"), ("ws/src/gone.rs",), (
             fix_return.Withheld("ws/src/foreign.rs", "other-2 (theirs)"), fix_return.Withheld("ws/src/free.rs", ""))))
-        self.assertFalse(fix_return.fix_passed(result))
+        self.assertFalse(fix_return.local_return_succeeded(result))
         self.assertEqual(self.text("ws/src/held.rs"), "pub(crate) fn held() {}\n")
         self.assertEqual(self.text("ws/src/new.rs"), "fn new() {}\n")
         self.assertFalse((self.worktree / "ws/src/gone.rs").exists())
@@ -514,9 +732,9 @@ class LocalCopyTests(unittest.TestCase):
         made = self.copy()
         _ = (made.tree / "ws/src/foreign.rs").write_text("pub(crate) fn foreign() {}\n")
         result = fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read)
-        self.assertEqual(result, fix_return.FixApplied((), (), (
+        self.assertEqual(result, fix_return.FixPartial((), (), (
             fix_return.Withheld("ws/src/foreign.rs", "other-2 (theirs)"),)))
-        self.assertTrue(fix_return.fix_passed(result))
+        self.assertTrue(fix_return.local_return_succeeded(result))
         self.assertEqual(self.text("ws/src/foreign.rs"), "fn foreign() {}\n")
 
     def test_unchanged_copy_is_none(self) -> None:
