@@ -1113,3 +1113,20 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Acceptance gate:**
   1. A test starts the helper's browser stand-in from a child process, SIGKILLs that child, and proves the browser process ends within 10 s.
   2. Each changed page test module passes; basedpyright zero errors and warnings on changed files.
+
+### Phase 420 — the drain never counts a test fixture as a waiting gate  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** a hold drain stops only real waiting gates. On 2026-11-21 at 18:25 the gate rename deploy failed at step 4: it read a `verify.sh` test fixture (`/dev/shm/tr-*/.../verify.sh test sample`, inside `unshare --pid` under `module_run.py`) as a waiting gate, and the fixture did not exit in 120 s. builds approved this fix at 18:28.
+- **Spec:**
+  1. `hold_enforcer.is_waiting_gate` (`scripts/build_hold/hold_enforcer.py:715-732`) counts every process whose script is named `verify.sh`.
+  2. Skip a process whose pid namespace (`/proc/<pid>/ns/pid`) differs from the enforcer's own. Test fixtures run under `unshare --pid`; real gates never do. Read the namespace with the other audit fields in `build_hold.read_audit_processes`, so classification stays a pure function of the audit record.
+  3. An unreadable namespace keeps today's rule (count the process), so a real gate is never missed.
+- **Files:** `scripts/build_hold/hold_enforcer.py`; `scripts/build_hold/build_hold.py` (audit record); `scripts/build_hold/test_hold_enforcer.py`.
+- **Workers:** 1 writer.
+  - impl: all.
+- **Constraints from prior phases:** none.
+- **Acceptance gate:**
+  1. A table row: a `verify.sh` process in another pid namespace is not a waiting gate; the same process in the enforcer's namespace is; an unreadable namespace is.
+  2. `test_hold_enforcer` and the `build_hold` tests pass; basedpyright zero errors and warnings on changed files.
