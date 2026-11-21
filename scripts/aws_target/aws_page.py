@@ -25,7 +25,7 @@ from scripts.aws_target import cloud_gate, config as aws_config, console_help, l
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
-from scripts.review_links import console_theme, page_frame, review_link
+from scripts.review_links import console_theme, page_frame, record_table, review_link
 
 PAGE_NAME = 'aws_prices.html'
 # The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
@@ -648,6 +648,7 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
+    source = record_table.with_empty_result(source)
     # A '</' in a cell must not end the script element.
     data['render_seconds'] = time.perf_counter() - started
     page = (page_frame.template(source, 'AWS', 'aws')

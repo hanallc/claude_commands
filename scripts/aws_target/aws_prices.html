@@ -57,6 +57,10 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #price-table .region-quota { width: 1%; color: var(--ink); font-weight: 600;
   background: color-mix(in srgb, var(--accent) 12%, var(--card)); }
 #price-table .spot-status { margin-left: 6px; color: var(--ink-3); }
+#price-table .scroll:has([data-empty-result]) { container-type: inline-size; }
+#price-table .empty-result-content {
+  position: sticky; inset-inline-start: 16px; max-width: calc(100cqw - 32px);
+}
 .legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
 .swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 .swatch.scale { background: linear-gradient(to right, var(--scale-low), var(--scale-mid), var(--scale-high));
@@ -211,10 +215,6 @@ function banIcon() {
 
 function remembered(key) {
   try { return localStorage.getItem(key); } catch (error) { return null; }
-}
-
-function remember(key, value) {
-  try { localStorage.setItem(key, value); } catch (error) { /* The choice is kept only for this view. */ }
 }
 
 // Select the columns and rows for the chosen regions.
@@ -525,8 +525,36 @@ function drawPrices() {
   }
   note.textContent = [...causes].join(" ");
   note.hidden = !note.textContent;
-  const content = rows.length ? pricesAndQuotas(quota, tables.spot, sources, rows, requests)
-    : element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note");
+  let content = pricesAndQuotas(quota, tables.spot, sources, rows, requests);
+  if (!rows.length) {
+    const labels = [];
+    if (shown.size !== data.regions.length) {
+      const geography = [...document.querySelectorAll("#geographies button:not(.all)[aria-pressed='true']")]
+        .map(chip => chip.textContent);
+      const regions = data.regions.filter(region => shown.has(region) && !geography.includes(geographyOf(region)));
+      if (geography.length) labels.push("Geography: " + geography.join(", "));
+      if (regions.length || !shown.size) labels.push("Regions: " + (regions.join(", ") || "none"));
+    }
+    const selectedMeasures = SHOW.filter(([key]) => measures.has(key));
+    if (selectedMeasures.length !== SHOW.length) {
+      labels.push("Show: " + (selectedMeasures.map(([, label]) => label).join(", ") || "none"));
+    }
+    if (types === "gpu") labels.push("Types: GPU");
+    const hasRunCosts = quota.headers.length > 2 && sources.some(source => source.table === tables.cost);
+    if (hasRunCosts && scopeCosts() !== data.runs[0]) labels.push("Runs: " + scopeCosts().label);
+    const filtered = updateEmptyResult(content.firstElementChild, {
+      empty: quota.rows.length > 0 || data.quotas[0].rows.length > 0, labels,
+      resetFilters: () => {
+        for (const [key] of SHOW) measures.add(key);
+        types = "standard";
+        scope = null;
+        showRegions(new Set(data.regions));
+        keepInUrl();
+        document.querySelector("#geographies button").focus({preventScroll: true});
+      },
+    });
+    if (!filtered) content = element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note");
+  }
   holder.replaceChildren(content);
   content.scrollLeft = scrollLeft;
   document.getElementById("gpu-gate-note").hidden = group === 0 || sources.length > 0 || !measures.has("cost");
@@ -700,7 +728,10 @@ function showRegions(next) {
   shown = next;
   markRegions();
   draw();
-  remember(REGIONS_KEY, JSON.stringify([...shown]));
+  try {
+    if (shown.size === data.regions.length) localStorage.removeItem(REGIONS_KEY);
+    else localStorage.setItem(REGIONS_KEY, JSON.stringify([...shown]));
+  } catch (error) { /* Keep the choice for this view only. */ }
 }
 function configureRegionFilter() {
   const geographies = [...new Set(data.regions.map(geographyOf))];
