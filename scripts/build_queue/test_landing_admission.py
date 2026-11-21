@@ -19,6 +19,7 @@ from scripts.build_queue.test_placement import (PlacementFixture, adopt_assignme
 from scripts.buildlog import repository
 from scripts.lib import build_folders
 from scripts.lib.process_start import Started
+from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lint import memory_admit as gate
 from scripts.production import land_queue, land_runs
 
@@ -135,6 +136,44 @@ class LandingAdmissionTests(unittest.TestCase):
             self.assertIsInstance(wait, wire.Wait)
             assert isinstance(wait, wire.Wait)
             self.assertEqual(wait.reason, records.WaitsForLandingTest())
+
+    def test_a_refreshed_test_waits_for_the_landing_when_its_origin_becomes_readable(self) -> None:
+        with AdmissionFixture(skip_idle_spacing=True) as fixture, patch.object(client, "CLOCK", fixture.clock):
+            clone = local_test_clone(fixture.root)
+            source = fixture.root / "source"
+            unavailable = source.rename(fixture.root / "source-away")
+            queue_land()
+            owner = fixture.request(step="test", need=GIB)
+            refresh_seconds = records.read_memory_config().policy.timing.estimate_refresh_seconds
+
+            def request() -> wire.AdmitRequest:
+                return client.step_request(["cargo", "test"], str(clone), owner.owner, owner.since, "", owner.episode)
+
+            first = request()
+            self.assertEqual(first.identity.landing_repository, wire.LandingRepositoryNotRecorded())
+            fixture.clock.advance(refresh_seconds + 1)
+            waited_for_landing = False
+
+            def wait(reply: wire.Wait) -> None:
+                nonlocal waited_for_landing
+                reason = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
+                if isinstance(reason, records.WaitsForLandingTest):
+                    self.assertTrue(source.is_dir())
+                    self.assertEqual(fixture.caller_reservations(), {})
+                    if not waited_for_landing:
+                        self.assertEqual(land_queue.take_next(os.getpid()), "builds first")
+                        land_runs.close_claim(os.getpid())
+                        waited_for_landing = True
+                elif isinstance(reason, records.EstimateExpired):
+                    self.assertFalse(source.exists())
+                    _ = unavailable.rename(source)
+
+            with LauncherHangGuard("Landing estimate refresh").protect(), fixture.serving():
+                result = client.admit(first, wait, request)
+            self.assertTrue(source.is_dir(), f"the client did not request a refreshed estimate: {result!r}")
+            self.assertTrue(waited_for_landing, "the refreshed request bypassed landing protection")
+            assert isinstance(result, wire.Admitted), result
+            fixture.release(result)
 
     def test_a_local_clone_keeps_its_history_key_for_an_unrelated_test(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:

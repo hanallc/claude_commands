@@ -349,13 +349,15 @@ def _refreshed(first: wire.AdmitRequest | wire.LaunchRequest,
         updated = refresh()
     finally:
         _ESTIMATE_CONNECTION.reset(token)
-    # A refresh changes estimates only, never the step's identity or place.
+    # Keep the original queue place and refresh the landing key with the estimate.
     if isinstance(first, wire.AdmitRequest) and isinstance(updated, wire.AdmitRequest):
+        identity = replace(first.identity, landing_repository=updated.identity.landing_repository)
         if isinstance(first.place, wire.CloudPlace):
-            return first
-        return replace(first, profile=updated.profile, fresh_test=updated.fresh_test)
+            return replace(first, identity=identity)
+        return replace(first, identity=identity, profile=updated.profile, fresh_test=updated.fresh_test)
     if isinstance(first, wire.LaunchRequest) and isinstance(updated, wire.LaunchRequest):
-        return replace(first, profile=updated.profile)
+        identity = replace(first.identity, landing_repository=updated.identity.landing_repository)
+        return replace(first, identity=identity, profile=updated.profile)
     raise CheckerFailure("refresh changed request kind")
 
 
@@ -1535,7 +1537,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                     cause = cause.cause
                 if isinstance(cause, records.EstimateExpired):
                     local = cast(wire.AdmitRequest, _refreshed(local, refresh_local))
-                    request = replace(request, profile=local.profile,
+                    request = replace(request, identity=local.identity, profile=local.profile,
                         local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                             local.test_width, local.fresh_test, local.token_back_at))
                     continue
