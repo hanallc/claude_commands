@@ -109,7 +109,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
-from scripts.lib import build_folders, conf, copy_record, git_files, removal_guard, scratch, session_folder, unit_runs
+from scripts.lib import build_folders, conf, copy_record, git_files, proc_text, removal_guard, scratch, session_folder, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.testing_folders import RUN_FOLDER_ENV
 from scripts.lib.python_startup.sitecustomize import dataclass_code_root, dataclass_code_usable  # noqa: E402
@@ -1278,15 +1278,17 @@ class ClosedPhaseEntry(RemovableEntry):
     """The phase is closed under a director or session worktree guard."""
 
 
-def _review_holds(settings: conf.ConfigRead | UseConfiguredValue, *, now: float | None = None) -> scratch.HeldScratchFolders:
+def _review_holds(settings: conf.ConfigRead | UseConfiguredValue, *, now: float | None = None,
+                  mounts: Sequence[proc_text.Mount] | None = None) -> scratch.HeldScratchFolders:
     """Check direct holds for review even when mount aliases are unknown."""
     refuse_live_test_roots((scratch.holds_file(scratch_settings=settings),))
     return scratch.HeldScratchFolders.from_holds(scratch.read_holds(scratch_settings=settings),
-                                                now=now, require_mounts=False)
+                                                now=now, mounts=mounts, require_mounts=False)
 
 
-def _review_has_hold(path: Path, settings: conf.ConfigRead | UseConfiguredValue) -> bool:
-    holds = _review_holds(settings)
+def _review_has_hold(path: Path, settings: conf.ConfigRead | UseConfiguredValue, *,
+                     mounts: Sequence[proc_text.Mount] | None = None) -> bool:
+    holds = _review_holds(settings, mounts=mounts)
     return bool(holds.held) and any(holds.protects(candidate) for candidate in scratch.resolved_removal_paths((path,)))
 
 
@@ -1609,6 +1611,10 @@ def prune_dataclass_code(root: str, now: float, days: int, result: Sweep, *,
         scratch_settings = conf.read("scratch")
     if not dataclass_code_usable(root, os.getuid()):
         return 0
+    mounts = proc_text.read_mounts() if sys.platform == "linux" else None
+    reason = "expired dataclass code"
+    if mounts == ():
+        reason += " (cannot read the mount table)"
     count = 0
     for tag in listing(root):
         if not tag.is_dir(follow_symlinks=False) or not re.fullmatch(r"cpython-[0-9]+[a-z]*", tag.name):
@@ -1619,12 +1625,13 @@ def prune_dataclass_code(root: str, now: float, days: int, result: Sweep, *,
                 if not stat.S_ISREG(info.st_mode) or info.st_mtime >= now - days * 86400:
                     continue
                 path = Path(entry.path)
-                with scratch.coordinate_removals(dry_run=True, scratch_settings=scratch_settings) as removal:
-                    removal.check(path)
-                    scratch.require_no_folder_operations((path,), scratch_settings=scratch_settings)
+                if _review_has_hold(path, scratch_settings, mounts=mounts):
+                    result.keep(entry.path, scratch.HELD_FOLDER_REASON)
+                    continue
+                scratch.require_no_folder_operations((path,), scratch_settings=scratch_settings)
                 if isinstance(plan, removal_guard.RemovalList):
                     _ = plan.add_manual(removal_guard.Tool.DATACLASS, Path(entry.path), Path(root),
-                                        info.st_blocks * 512, "expired dataclass code")
+                                        info.st_blocks * 512, reason)
                 count += 1
             except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
                 result.keep(entry.path, str(error))

@@ -723,7 +723,12 @@ class HeldScratchFolders:
         if not self.locations:
             return False
         location = FilesystemLocation.at(path, self.mounts)
-        return any(held.overlaps(location) for held in self.locations)
+        if any(held.overlaps(location) for held in self.locations):
+            return True
+        # At each mount point, use the last mount from the table.
+        nested = {mount.point: mount for mount in reversed(self.mounts) if mount.point.is_relative_to(path)}
+        return any(held.overlaps(FilesystemLocation(mount.device, mount.root))
+                   for mount in nested.values() for held in self.locations)
 
     def protects(self, path: Path) -> bool:
         if not self.held:

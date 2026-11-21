@@ -451,14 +451,15 @@ class CopyTests(TmpSweepCase):
                       f"1 0 {number} / / rw - ext4 fixture rw\n"
                       + f"2 1 {number} {outside} {mounted} rw - ext4 fixture rw\n")
         _ = scratch.hold(outside, "phase:demo/1", "Keep the bound folder.")
-        entry = tmp_sweep.RemovableEntry(str(source), str(self.tmp), self.now, 0)
-        result = tmp_sweep.Sweep()
-        reason = f"tree contains a mount point at {mounted}"
-        with (mock.patch.object(proc_text, "read_mounts", return_value=proc_text.read_mounts(table)),
-              redirect_stdout(io.StringIO()) as log):
-            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
-        self.assertEqual(log.getvalue().splitlines(), [f"tmp sweep: keep {source}: {reason}"])
-        self.assertEqual(result.kept, {reason: [str(source)]})
+        self.now += 8 * DAY
+        with mock.patch.object(proc_text, "read_mounts", return_value=proc_text.read_mounts(table)):
+            result = self.sweep()
+            self.assertNotIn(source, self.plan.rows)
+            self.assertIn(str(source), result.kept[scratch.HELD_FOLDER_REASON])
+            self.assertTrue(scratch.release(outside))
+            _ = self.sweep()
+        self.assertIn(f"tree contains a mount point at {mounted}", self.plan.rows[source].reason)
+        self.assertEqual(self.plan.rows[source].fingerprint, "")
         self.assertEqual(result.failed, [])
         self.assertEqual(payload.read_text(), "held data")
         self.assertEqual(sibling.read_text(), "other data")
@@ -1162,6 +1163,31 @@ class NextestLogRetentionTests(TmpSweepCase):
         self.assertTrue(cached.is_file())
         self.assertTrue(log.is_file())
         self.assertEqual(result.kept, {scratch.HELD_FOLDER_REASON: [str(log)]})
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mountinfo")
+    def test_review_lists_expired_cache_entries_when_the_mount_table_is_unreadable(self) -> None:
+        cache = self.tmp.parent / "cache"
+        cache.mkdir(mode=0o700)
+        expired = write(cache / "cpython-0" / "old", "unheld")
+        held = write(cache / "cpython-1" / "old", "held")
+        _ = scratch.hold(held.parent, "phase:demo/1", "Keep this cache folder.")
+        old = self.now - 20 * DAY
+        for path in (expired, held):
+            os.utime(path, (old, old))
+        plan = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
+        result = tmp_sweep.Sweep()
+
+        with mock.patch.object(proc_text, "read_mounts", return_value=()):
+            count = tmp_sweep.prune_dataclass_code(str(cache), self.now, 14, result, plan=plan)
+
+        self.assertEqual(set(plan.rows), {expired})
+        self.assertEqual(count, 1)
+        self.assertIn("cannot read the mount table", plan.rows[expired].reason)
+        self.assertEqual(plan.rows[expired].fingerprint, "")
+        self.assertEqual(result.kept, {scratch.HELD_FOLDER_REASON: [str(held)]})
+        self.assertEqual(result.failed, [])
+        self.assertEqual(expired.read_text(), "unheld")
+        self.assertEqual(held.read_text(), "held")
 
 
 class RemovalGuardTests(TmpSweepCase):
