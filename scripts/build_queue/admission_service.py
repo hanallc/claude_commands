@@ -3062,8 +3062,7 @@ class AdmissionServer:
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
-        if kind in placement.MAC_RUN_KINDS and isinstance(target, target_config.SshTarget) and target.platform == "macos":
-            # A Mac run has no repository step policy. The busy check and the claims below still apply.
+        if build_targets.mac_run_bypasses_repository_policy(target, kind):
             eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
