@@ -906,3 +906,36 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Constraints from prior phases:** Phase 409 made `ModuleTimeLimit`, `read_rerun_module_time_limits` and the two keys `rerun.module_time_factor` and `rerun.module_time_floor_seconds`. Phase 355 renames `merge_gate.py` to `gate.py`. Phase 406 is held and also adds request fields; merge-tree against `natest-affected406` before the hash.
 
 **Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; one blind review; the reader hash goes to builds before the writer hash.
+
+### Phase 411 — a merge batch runs the tests its rows affect before the full run  · status: todo
+**Depends on:** Phase 409
+
+#### Work Order
+
+**Goal:** a merge batch finds a red row in minutes. On 2026-11-20 four red rows (44dz, 178, 45e, 45g) each cost about 1 h of full run. Order from builds (proposal of bob, with the support of natemerge).
+
+**Spec:**
+1. Design note first (read only): the step list in `scripts/production/checkpoint_gate.py`, the batch flow in `scripts/production/merge_checkpoint.py`, and the affected-module map (`select_affected` and `select_targeted_modules` in `scripts/production/merge_gate.py`, `scan_roots` in `config/merge_gate.conf`). The note states where the new step goes, how a red row leaves, and each gap of the map.
+2. Before the full test step of a batch, a new step runs the test modules that the rows of the batch affect. It uses the existing map; it copies no selection code.
+3. A row that is red in this step leaves the batch through the existing red-row path. The full test step then runs once on the tree that passed.
+4. The map gives the tests for doc rows and staff rows. On 2026-11-20 it missed `test_staff_accessors` for a staff row. A row with no mapped test adds no module; the full step still covers it.
+5. The new step is a filter, not a proof. The full step stays the only step that lets a batch merge. Nothing weakens it.
+6. Modules in the new step use the Phase 409 module limits for named runs.
+7. Tests: table rows in the existing checkpoint tests. Rows: a red row leaves before the full step and the full step runs once; a batch with all rows green runs the new step and then the full step; a batch with no affected module skips the new step; a staff row and a doc row select their tests.
+
+**Files:**
+- `scripts/production/checkpoint_gate.py` — the step list and the new step
+- `scripts/production/merge_checkpoint.py` — the batch flow
+- `scripts/production/merge_gate.py` — the map, only where it has a gap
+- `config/merge_gate.conf` — map rows, only where the map has a gap
+- `scripts/production/test_merge_checkpoint_rerun.py` — table rows; the other checkpoint test modules as the design note names them
+
+**Workers:** 2 writers after the design note. The split is the step and the map.
+- `impl` — `checkpoint_gate.py`, `merge_checkpoint.py` and their tests. hub: `checkpoint_gate.py`.
+- `test` opens as impl — the map gaps in `merge_gate.py`, `config/merge_gate.conf` and their tests.
+
+**State:** none new, unless the design note shows that the batch record must name the new step.
+
+**Constraints from prior phases:** Phase 409 changed `only_tests` and the module limits; the base is main after 409. Phase 355 renames `merge_gate.py` to `gate.py`; merge-tree against the 355 tip before the hash. Phase 406 (held) sends an affected selection to the AWS gate; this phase does not depend on it and changes no AWS request. natest changes no process doc. Tests read no tunable config value.
+
+**Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; one blind review; 20 repeated runs of each changed test module after natemerge's go; the gate route that builds names for the merge passes.
