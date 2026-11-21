@@ -11,7 +11,7 @@ They show stopped, closed, unknown and incomplete states.
 `refusal_watch.py` owns `QUOTA_REFUSAL`.
 
 The assignment launcher uses native worker panes.
-Detached commands use `detached_runs.py` and the `detached_runs/` record folder.
+Detached commands use `detached_runs.py` and keep run records and locks in the session's `detached_runs/` folder.
 Completed run folders keep their roster files.
 `progress_history.py` and `usage/agents_log.py` keep their historical reads.
 
@@ -717,6 +717,9 @@ To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <comma
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
 `detached_runs.py stop` and a build hold stop send TERM to the command group.
+Pass the path to the existing `.json` record beside the run log.
+Record commands refuse other paths before they create a lock.
+Each record lock requires a valid record in its recorded session folder before creation.
 Each checks the supervisor and the command leader identity before it signals the group.
 Each stages the stop reason before it sends TERM.
 The supervisor stays alive to record the exit status and deliver the result.

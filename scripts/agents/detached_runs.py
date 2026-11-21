@@ -243,14 +243,66 @@ def _run_owner(record: RunRecord, membership: staff.StaffSnapshot) -> staff.Staf
 
 
 def _runs_dir(session_dir: str) -> Path:
-    return Path(session_dir) / DETACHED_RUNS_DIR
+    return _resolve_runs_dir(Path(session_dir) / DETACHED_RUNS_DIR)
+
+
+def _resolve_runs_dir(path: Path) -> Path:
+    runs = path.resolve()
+    if runs.name != DETACHED_RUNS_DIR:
+        raise SystemExit(f"detached_runs: expected a {DETACHED_RUNS_DIR} folder: {str(runs)!r}")
+    return runs
+
+
+def _require_record_file(path: Path) -> None:
+    if (path.parent.resolve().name != DETACHED_RUNS_DIR or path.suffix != ".json"
+            or path.is_symlink() or not path.is_file()):
+        raise SystemExit(f"detached_runs: {str(path)!r} is not a run record in a {DETACHED_RUNS_DIR} folder")
+
+
+@contextlib.contextmanager
+def _record_files_locked(runs: Path) -> Generator[None]:
+    """Serialize sidecar creation with record removal."""
+    descriptor = os.open(runs, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _open_run_lock(path: Path, lock_path: Path) -> IO[str]:
+    """Open a sidecar and validate the record before creating it."""
+    _require_record_file(path)
+    try:
+        return open(lock_path, "r", opener=_open_sidecar)
+    except FileNotFoundError:
+        with _record_files_locked(path.parent):
+            _ = _read_record(path)
+            return open(lock_path, "a", opener=_open_sidecar)
+
+
+@contextlib.contextmanager
+def _run_lock(path: Path, lock_path: Path) -> Generator[None]:
+    with _open_run_lock(path, lock_path) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _open_sidecar(path: str, flags: int) -> int:
+    return os.open(path, flags | os.O_NOFOLLOW, 0o666)
+
+
+@contextlib.contextmanager
+def _admission_lock(runs: Path) -> Generator[None]:
+    with open(runs / ".start.lock", "a", opener=_open_sidecar) as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        yield
 
 
 @contextlib.contextmanager
 def record_lock(path: Path) -> Generator[None]:
     """Serialize supervisor updates and drain stop reasons for one record."""
-    with path.with_suffix(".record.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _run_lock(path, path.with_suffix(".record.lock")):
         yield
 
 
@@ -332,11 +384,14 @@ def _read_stop_fields(path: Path, run_id: object) -> StopFields:
 
 
 def _read_record(path: Path) -> RunRecord:
+    _require_record_file(path)
     raw = worker_lifecycle.read_json_object(path)
     if not _is_run_record(raw):
         raise SystemExit(f"detached_runs: {path} is not a run record")
     if path.name != f"{raw['run_id']}.json":
         raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
+    if path.parent.resolve() != _runs_dir(raw["session_dir"]):
+        raise SystemExit(f"detached_runs: {path} does not belong to the recorded session folder")
     confirmed = _read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw["run_id"])
     return {**raw, **confirmed} if confirmed else raw
 
@@ -359,8 +414,9 @@ def stop_with_reason(
     signal_group: Callable[[int, int], None], stop_pass: bool = False, self_stop: bool = False,
 ) -> bool:
     """Publish the stop reason after signaling the verified group."""
-    with record_lock(path):
+    with contextlib.ExitStack() as locks:
         try:
+            locks.enter_context(record_lock(path))
             record = _read_record(path)
         except SystemExit:
             return False
@@ -575,18 +631,18 @@ class OrphanReapResult:
 
     def queue_completion(self, path: Path, record: RunRecord) -> None:
         """Create the claim file while the caller holds the admission lock."""
-        path.with_suffix(".completion.lock").touch(exist_ok=True)
+        try:
+            _open_run_lock(path, path.with_suffix(".completion.lock")).close()
+        except (OSError, SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+            print(" ".join(str(error).splitlines()), file=sys.stderr)
+            return
         self.pending_completions.append((path, record))
 
     def complete(self) -> None:
         for path, _ in self.pending_completions:
-            # Pruning can remove the claim file after collection. Do not create it here.
             try:
-                claim = path.with_suffix(".completion.lock").open("r")
-            except FileNotFoundError:
-                continue
-            try:
-                with claim:
+                # Pruning can remove the claim file after collection. Do not create it here.
+                with open(path.with_suffix(".completion.lock"), "r", opener=_open_sidecar) as claim:
                     try:
                         fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
@@ -597,7 +653,9 @@ class OrphanReapResult:
                         pending = _replay_completion(path, current) == CompletionReplay.RETRY
                 if pending:
                     _alert_failed_push(path, check_receipt=True)
-            except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+            except FileNotFoundError:
+                continue
+            except (OSError, SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
                 print(" ".join(str(error).splitlines()), file=sys.stderr)
 
 
@@ -610,8 +668,7 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     runs = _runs_dir(session_dir)
     if not runs.is_dir():
         return []
-    with (runs / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
+    with _admission_lock(runs):
         result = _reap_orphans_locked(runs, worker)
     result.complete()
     return result.run_ids
@@ -677,8 +734,7 @@ class CompletionReplay(StrEnum):
 
 def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
     """Publish the finished run and claim its pending completion."""
-    with path.with_suffix(".completion.lock").open("a") as claim:
-        fcntl.flock(claim, fcntl.LOCK_EX)
+    with _run_lock(path, path.with_suffix(".completion.lock")):
         current = _read_record(path)
         if current["status"] == "finished":
             if current.get("completion_pending") is True:
@@ -728,8 +784,7 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str:
     @contextlib.contextmanager
     def guard_ended() -> Generator[worker_panes.CloseAllowed | worker_panes.Kept]:
         # The caller holds the worker lock before it takes admission and the recorder lock.
-        with (runs / ".start.lock").open("a") as admission:
-            fcntl.flock(admission, fcntl.LOCK_EX)
+        with _admission_lock(runs):
             if not _stopped_group_has_ended(record):
                 yield worker_panes.Kept("the command group has no confirmed end")
                 return
@@ -795,8 +850,8 @@ def prune_finished(runs: Path) -> list[str]:
     """Delete the folder's finished runs that no reader needs; the user keeps no old run files."""
     if not runs.is_dir():
         return []
-    with (runs / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
+    runs = _resolve_runs_dir(runs)
+    with _admission_lock(runs):
         return _prune_finished_locked(runs)
 
 
@@ -849,8 +904,9 @@ def _prune_finished_locked(runs: Path) -> list[str]:
             if (current.get("run_id") != run_id or current.get("status") != "finished"
                     or current.get("completion_pending") or _worker_result_pending(str(current.get("delivery", "")))):
                 continue
-            for name in _RUN_FILES:
-                (runs / name.format(run_id)).unlink(missing_ok=True)
+            with _record_files_locked(runs):
+                for name in _RUN_FILES:
+                    (runs / name.format(run_id)).unlink(missing_ok=True)
         removed.append(run_id)
     return removed
 
@@ -1192,14 +1248,13 @@ def command_start(args: argparse.Namespace) -> int:
     kind = cast(DetachedRunKind, args.kind)
     done_file = str(getattr(args, "done_message_file", "") or "")
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
-    runs = _runs_dir(session_dir).resolve()
+    runs = _runs_dir(session_dir)
     runs.mkdir(parents=True, exist_ok=True)
     cwd = os.getcwd()
     tree_key = treekey.tree_key(cwd) or ""
     reaped = OrphanReapResult()
     try:
-        with (runs / ".start.lock").open("a") as admission:
-            fcntl.flock(admission, fcntl.LOCK_EX)
+        with _admission_lock(runs):
             reaped = _reap_orphans_locked(runs)
             if twin := live_twin(runs, name, command, tree_key):
                 started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
@@ -1246,8 +1301,7 @@ def command_start(args: argparse.Namespace) -> int:
                     record["pane_dispatch_id"] = {"unavailable": dispatch.reason}
             else:
                 record["pane_dispatch_id"] = {"unavailable": "the worker staff row is unavailable"}
-            with record_lock(record_path):
-                write_text_atomic(record_path, json.dumps(record, indent=2, sort_keys=True))
+            write_text_atomic(record_path, json.dumps(record, indent=2, sort_keys=True))
             with log_path.open("ab") as log:
                 supervisor = subprocess.Popen(
                     [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
@@ -1370,8 +1424,7 @@ def result_text(record: RunRecord, result: CommandResult) -> str:
 
 @contextlib.contextmanager
 def _delivery_lock(path: Path) -> Generator[None]:
-    with path.with_name(f".{path.stem}.delivery.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _run_lock(path, path.with_name(f".{path.stem}.delivery.lock")):
         yield
 
 
@@ -1667,7 +1720,7 @@ def _retry_failed_push(path: Path) -> None:
 
 
 def command_deliver(args: argparse.Namespace) -> int:
-    record_path = Path(str(getattr(args, "record", ""))).resolve()
+    record_path = cast(Path, args.record)
     record = _read_record(record_path)
     if record.get("stop_pass_requested") and record["status"] != "finished":
         if "exit_code" not in record:
@@ -1817,9 +1870,8 @@ def _completion_sources(root: Path) -> Generator[None]:
 
 
 def command_supervise(args: argparse.Namespace) -> int:
-    record_path = Path(str(getattr(args, "record", "")))
-    with (record_path.parent / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
+    record_path = cast(Path, args.record)
+    with _admission_lock(record_path.parent):
         record = _read_record(record_path)
         if record["pid"] == 0:
             record["pid"] = os.getpid()
@@ -1896,7 +1948,7 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
 
     The gate watcher runs this when the supervisor pipe closes without "done".
     """
-    path = Path(str(getattr(args, "record", "")))
+    path = cast(Path, args.record)
     # Leave the command group, so its TERM spares this watcher.
     os.setsid()
     command = command_group(path)
@@ -1934,7 +1986,7 @@ def _wait_for_leader(command: CommandGroup) -> None:
 
 def command_record_exit(args: argparse.Namespace) -> int:
     """Save the command status before its orphan record is completed."""
-    path = Path(str(getattr(args, "record", "")))
+    path = cast(Path, args.record)
     caller = int(getattr(args, "pid", 0)) or os.getppid()
     with record_lock(path):
         record = _read_record(path)
@@ -1949,7 +2001,7 @@ def command_record_exit(args: argparse.Namespace) -> int:
 
 
 def command_stop(args: argparse.Namespace) -> int:
-    path = Path(str(getattr(args, "record", ""))).resolve()
+    path = cast(Path, args.record)
     if stop_command(path, str(getattr(args, "reason", ""))):
         print(f"stopped {path.stem}: its result comes from the supervisor")
         return 0
@@ -2003,6 +2055,14 @@ def main(argv: list[str] | None = None) -> int:
     _ = reap.add_argument("--worker", default="")
     reap.set_defaults(handler=command_reap)
     args = parser.parse_args(argv)
+    if hasattr(args, "record"):
+        try:
+            path = Path(cast(str, args.record)).resolve()
+            _ = _read_record(path)
+        except (OSError, RuntimeError, SystemExit, ValueError) as error:
+            print(" ".join(str(error).splitlines()), file=sys.stderr)
+            return 1
+        args.record = path
     handler = cast("Callable[[argparse.Namespace], int]", getattr(args, "handler"))
     return handler(args)
 

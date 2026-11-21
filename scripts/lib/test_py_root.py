@@ -59,23 +59,27 @@ with mock.patch.object(merge_gate, 'run_gate_suites', side_effect=selected_suite
     finally:
         audit()
 '''
-COPY_DETACHED_RUN = '''import argparse, os, sys
+COPY_DETACHED_RUN = '''import json, os, sys
 from pathlib import Path
 from unittest import mock
 from scripts.agents import detached_runs
 
 root = Path(os.environ['EXPECTED_CHECKOUT'])
-record_path = root / 'detached.json'
-record = dict(status='running', pid=os.getpid(), session_dir=str(root), worker='fixture-test',
-              staff_id='fixture-staff', log=str(root / 'detached.log'),
+record_dir = root / detached_runs.DETACHED_RUNS_DIR
+record_dir.mkdir()
+record_path = record_dir / 'detached.json'
+record = dict(run_id=record_path.stem, status='running', pid=os.getpid(), started_at=1.0,
+              session_dir=str(root), director_dir=str(root), worker='fixture-test',
+              staff_id='fixture-staff', label='Copy imports', log=str(record_path.with_suffix('.log')),
+              done_message_file='',
               command=[sys.executable, *sys.argv[1:]])
+record_path.write_text(json.dumps(record))
 # Simulate a supervisor that inherited the root from an older launcher.
 os.environ['PYTHONPATH'] = str(Path(__file__).parent)
-with (mock.patch.object(detached_runs, '_read_record', side_effect=lambda path: record.copy()),
-      mock.patch.object(detached_runs, '_write_record', side_effect=lambda path, value: record.update(value) or value),
-      mock.patch.object(detached_runs, '_finish_record'),
+with (mock.patch.object(detached_runs, '_finish_record'),
       mock.patch.object(detached_runs, 'deliver_in_fresh_process', return_value=0)):
     status = detached_runs.main(['supervise', str(record_path)])
+record = json.loads(record_path.read_text())
 print(Path(record['log']).read_text())
 assert status == 0 and record['exit_code'] == 0, record
 '''

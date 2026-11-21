@@ -748,16 +748,14 @@ class HoldEnforcerTests(unittest.TestCase):
                         shutil.rmtree(self.proc / str(pid))
 
     def test_drain_records_stop_and_owner_before_signalling_and_cancels_a_changed_identity(self) -> None:
-        record = self.root / "detached-run.json"
-        _ = self.process(100, "python3", start=10_000,
-                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        run_record = self.root / detached_runs.DETACHED_RUNS_DIR / "detached-run.json"
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
         for outcome in ("shared holders", "shared releases", "shared run record",
                         "record failure", "identity change", "no command group", "stopped"):
             with self.subTest(outcome=outcome):
                 record = (self.root / ".local/state/build-hold-enforcer/run.json"
-                          if outcome == "shared run record" else self.root / "detached-run.json")
+                          if outcome == "shared run record" else run_record)
                 record.parent.mkdir(parents=True, exist_ok=True)
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", str(record)))
@@ -934,7 +932,8 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(self.rows(), [])
 
     def test_drain_checks_detached_supervisor_before_group_stop_and_records_reason(self) -> None:
-        record = self.root / "detached-run.json"
+        record = self.root / detached_runs.DETACHED_RUNS_DIR / "detached-run.json"
+        record.parent.mkdir()
         _ = self.process(100, "python3", start=10_000,
                          argv=("python3", "detached_runs.py", "supervise", str(record)))
         _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
@@ -947,7 +946,7 @@ class HoldEnforcerTests(unittest.TestCase):
         read_supervisor_args = hold_enforcer.supervisor_args
         for argument, current, prefix, changes in ((str(record), False, ("python3",), False),
                                                    (str(record), True, ("python3",), False),
-                                                   (record.name, True, ("python3",), False),
+                                                   (str(record.relative_to(self.root)), True, ("python3",), False),
                                                    (str(record), False, ("python3", "unrelated.py"), False),
                                                    (str(record), True, ("python3",), True)):
             with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix,

@@ -703,6 +703,33 @@ class DetachedRunsTests(unittest.TestCase):
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertFalse(saved.get("completion_pending"))
 
+        for stage in ("collection", "completion"):
+            with self.subTest(symlinked_claim=stage):
+                damaged = self.finished_run(f"bad-{stage}", pid=DEAD_PID, completion_pending=True)
+                later = self.finished_run(f"later-{stage}", pid=DEAD_PID, completion_pending=True)
+                claim = damaged.with_suffix(".completion.lock")
+                target = self.root / f"claim-target-{stage}"
+                _ = target.write_text("Keep this file.")
+                original = damaged.read_bytes()
+                with (patch.object(detached_runs, "_complete_worker_dispatch") as complete,
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    if stage == "collection":
+                        claim.symlink_to(target)
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                    else:
+                        collected, = self.collect_completions(1)
+                        claim.unlink()
+                        claim.symlink_to(target)
+                        collected.complete()
+                complete.assert_called_once()
+                self.assertEqual(complete.call_args.args[0]["run_id"], later.stem)
+                self.assertFalse(worker_lifecycle.read_json_object(later)["completion_pending"])
+                self.assertIn(str(claim), errors.getvalue())
+                self.assertEqual(damaged.read_bytes(), original)
+                self.assertEqual(target.read_text(), "Keep this file.")
+                claim.unlink()
+                damaged.unlink()
+
     def test_prune_keeps_only_the_finished_runs_that_a_reader_needs(self) -> None:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         opened = time.time()
@@ -1548,6 +1575,18 @@ sys.exit(status)
                     self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), "fixture stop")
 
     def test_updates_do_not_write_missing_or_invalid_records(self) -> None:
+        record = self.record(["true"])
+        outside = self.session / record.name
+        _ = outside.write_bytes(record.read_bytes())
+        for argument in (record.stem, outside.name, "detached_runs/missing.json"):
+            with self.subTest(update="stop outside a run record", argument=argument):
+                with contextlib.chdir(self.session), contextlib.redirect_stderr(io.StringIO()) as error:
+                    before = sorted(self.session.rglob("*"))
+                    self.assertEqual(detached_runs.main(["stop", "--reason", "fixture stop", argument]), 1)
+                self.assertEqual(sorted(self.session.rglob("*")), before)
+                message, = error.getvalue().splitlines()
+                self.assertIn("is not a run record in a detached_runs folder", message)
+
         with self.subTest(update="stop after prune"):
             path = self.finished_run("pruned-before-stop")
             self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
@@ -1566,6 +1605,21 @@ sys.exit(status)
             write.assert_not_called()
             send.assert_not_called()
             self.assertEqual(path.read_text(), partial)
+            self.assertFalse(path.with_suffix(".record.lock").exists())
+
+        with self.subTest(update="stop on a record copied from another session"):
+            original = self.record(["true"]).read_bytes()
+            copied = self.root / "another-session" / detached_runs.DETACHED_RUNS_DIR / record.name
+            copied.parent.mkdir(parents=True)
+            _ = copied.write_bytes(original)
+            verify_group = MagicMock(side_effect=AssertionError("the copied record reached group verification"))
+            send_group = MagicMock()
+            self.assertFalse(detached_runs.stop_with_reason(
+                copied, "fixture stop", verify_group=verify_group, signal_group=send_group))
+            verify_group.assert_not_called()
+            send_group.assert_not_called()
+            self.assertEqual(list(copied.parent.iterdir()), [copied])
+            self.assertEqual(copied.read_bytes(), original)
 
         with self.subTest(update="stop on a record named for another run"):
             path = self.record(["true"])
