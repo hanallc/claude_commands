@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
+from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
@@ -1012,6 +1013,40 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
 
 
 class OffloadCommandTests(OffloadCommandFixture):
+    def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
+        assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
+        retained = self.write_kept_claim()
+        _ = self.claim_file.write_text(json.dumps({**retained, "worktree": "."}))
+        reservation = self.root / "reservation"
+        identity = self.root / "reservation.identity"
+        waiter = str(os.getpid())
+        result = invoke_cli(build_targets, build_targets.main, [
+            "reserve", *assignment, "--repo-root", str(self.repository), "--package", "hana",
+            "--kind", "test", "--pid", waiter, "--reservation-file", str(reservation),
+            "--claim-identity-file", str(identity),
+        ], self.environment, self.root,
+            environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+        self.assertEqual(result.returncode, 13, result.stdout + result.stderr)
+        target, settings = reservation.read_text().rstrip("\n").split("\t")
+        claim_id, episode, attempt, session = identity.read_text().rstrip("\n").split("\t")
+
+        result = self.command(subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
+            *assignment, "--target", target, "--claim-owner-pid", waiter, "--claim-id", claim_id,
+            "--episode", episode, "--attempt", attempt, "--claim-session", session,
+        ))
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertTrue(result.stdout.endswith(f"mac_test: not running on the {target} (busy)\n"), result.stdout)
+        self.assert_wire("declined", "busy")
+        self.assertFalse(self.claim_file.exists())
+        cleanup, = self.leftover_events()
+        self.assertEqual(self.events(), [cleanup])
+        adopted = cleanup.get("claim")
+        self.assertIsNotNone(adopted)
+        assert adopted is not None
+        self.assertNotEqual(adopted["pid"], int(waiter))
+        self.assertEqual(adopted["claim_id"], retained["claim_id"])
+        self.assertEqual(adopted["worktree"], ".")
+
     def test_wait_claim_decline_prints_the_child_status_and_failed_check(self) -> None:
         result = self.command(runner_options=(
             "--claim-owner-pid", str(os.getpid()), "--claim-id", "missing-claim",

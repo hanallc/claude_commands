@@ -1981,8 +1981,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
         (WaitClaimCheck.OWNER_START, lambda claim:
             process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
-        (WaitClaimCheck.WORKTREE, lambda claim: (claim.record.get("cleanup_pending") is True
-            and Path(claim.record["worktree"]).is_absolute())
+        (WaitClaimCheck.WORKTREE, lambda claim: claim.record.get("cleanup_pending") is True
             or recorded_worktree_matches(claim.record["worktree"], worktree)),
     )
     for check, matches in checks:
@@ -2011,13 +2010,16 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         record = {**claim.record, "remote_host": args.remote}
     record["pid"] = args.pid
     record["proc_start"] = start.start
-    record["worktree"] = str(claim_worktree_path(record["worktree"]))
+    cleanup_only = record.get("cleanup_pending") is True
+    if not cleanup_only:
+        record["worktree"] = str(claim_worktree_path(record["worktree"]))
     write_json(claim.path, record)
     print_claim_identity(args, record)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
-        remember_slot(paths, claim.scope, record)
+        if not cleanup_only:
+            remember_slot(paths, claim.scope, record)
         print(f"slot: {claim.scope.slot}")
-    if record.get("cleanup_pending"):
+    if cleanup_only:
         print(f"leftovers: {record['remote_host']}")
         return ClaimFinished(13)
     print("claimed")
