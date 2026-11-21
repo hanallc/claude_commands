@@ -484,7 +484,7 @@ run_step_attempt() {
         BUILDLOG_MEM_WAIT_S=$memory_wait
     fi
     if [[ "${VALIDATION_OPERATION:-}" == fmt && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
-        if ! require_rustfmt; then
+        if ! fmt_cargo --check-nightly-version; then
             buildlog_finish_memory 2 "$sampler_pid"
             return 2
         fi
@@ -866,19 +866,20 @@ run_nextest() {
 # Formatting with stable could accept output that nightly rejects, so it is an
 # error here.
 fmt_cargo() {
-    if ! lint_config_enabled fmt; then
-        lint_config_skip_notice fmt "cargo +nightly fmt $*"
-        return 0
+    local check_only=0
+    if [[ "${1:-}" == --check-nightly-version ]]; then
+        check_only=1
     fi
-    if [[ "${LINT_QUEUE_PLACEMENT:-0}" == 1 && "${VALIDATION_OPERATION:-}" == fmt ]]; then
-        run cargo +nightly fmt "$@"
-        return
+    if [[ "$check_only" != 1 ]]; then
+        if ! lint_config_enabled fmt; then
+            lint_config_skip_notice fmt "cargo +nightly fmt $*"
+            return 0
+        fi
+        if [[ "${LINT_QUEUE_PLACEMENT:-0}" == 1 && "${VALIDATION_OPERATION:-}" == fmt ]]; then
+            run cargo +nightly fmt "$@"
+            return
+        fi
     fi
-    require_rustfmt || return $?
-    run cargo +nightly fmt "$@"
-}
-
-require_rustfmt() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
@@ -892,6 +893,7 @@ require_rustfmt() {
         echo "cargo +nightly fmt is required" >&2
         return 2
     fi
+    [[ "$check_only" == 1 ]] || run cargo +nightly fmt "$@"
 }
 
 # Clippy with warnings denied. Callers pass full cargo scope args (--workspace

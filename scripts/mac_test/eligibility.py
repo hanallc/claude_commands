@@ -446,6 +446,9 @@ def verb_kind(verb: MacVerb) -> str:
 
 def recorded_step_kind(step: str) -> str:
     """Map a recorded step to its command kind; a recorded mend is the mend-check verb."""
+    if step == "fmt":
+        # Validation supplies its routing kind with the placement request.
+        return step
     return verb_kind(cast(MacVerb, "mend-check" if step == "mend" else step))
 
 

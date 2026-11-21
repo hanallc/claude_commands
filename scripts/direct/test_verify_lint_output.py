@@ -12,6 +12,7 @@ import unittest
 from scripts.direct.verify_lint_scope_test_support import SCRIPTS, VERIFY
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint import test_invoke_scope
 
 
 @final
@@ -61,6 +62,32 @@ sweep_after_step() { :; }
                     script += f'\nexport PATH="$PWD/bin:$PATH"\nif run_once bash -c "exit {status}"; then result=0; else result=$?; fi\nexit "$result"\n'
                     result = self.shell(script, root)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_inherited_probe_flag_does_not_skip_formatting(self) -> None:
+        script = r"""
+LINT_QUEUE_PLACEMENT=0
+VERIFY_LINT_RUSTFMT_VERSION_FILE=""
+lint_config_enabled() { return 0; }
+cargo() {
+    if [[ "$*" == '+nightly fmt --version' ]]; then
+        printf 'probe\n' >> probes
+        return 0
+    fi
+    printf '%s\n' "$*"
+    return 47
+}
+run() { "$@"; }
+"""
+        for command in ("fmt_cargo --all", "validation_cargo_step fmt"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = test_invoke_scope.BuildAdmissionTests.run_invoke(
+                    root, script + "\n" + command, [], cwd=root,
+                    environment={"LINT_RUSTFMT_CHECK_ONLY": "1"},
+                )
+                self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "+nightly fmt --all\n")
+                self.assertEqual((root / "probes").read_text(encoding="utf-8"), "probe\n")
 
     def test_clippy_fix_preserves_extra_lints_and_run_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

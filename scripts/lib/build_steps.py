@@ -102,7 +102,7 @@ def command_program(argv: Sequence[str]) -> str:
 
 SCRIPT_SUFFIXES = frozenset({".awk", ".bash", ".fish", ".js", ".lua", ".mjs", ".pl", ".ps1", ".py", ".rb",
                              ".sh", ".ts", ".zsh"})
-VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test"})
+VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test", "validation"})
 RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
     "targeted-test", "merge-gate", "integrate", "test-all", "test-modules",
     "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote"}

@@ -15,6 +15,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import cast
 from unittest.mock import patch
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -78,7 +79,7 @@ def sampler_command() -> str:
 
 def configured_scope_command(root: Path, config: Path, *,
                              reader: Path = LINT_CONFIG_READER) -> str:
-    result = BuildAdmissionTests(methodName="runTest").run_invoke(
+    result = BuildAdmissionTests.run_invoke(
         root, 'printf "%s" "$BUILDLOG_SCOPE_SH"', [], environment={
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
@@ -661,14 +662,15 @@ sweep_after_step() { :; }
             self.assertEqual(arguments[arguments.index("--jobs") + 1], "8")
             self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
 
+    @staticmethod
     def run_invoke(
-        self, root: Path, shell: str, arguments: list[str], *,
+        root: Path, shell: str, arguments: list[str], *,
         environment: dict[str, str] | None = None, cwd: Path | None = None,
         terminal: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
                    "admission-test", str(INVOKE), *arguments]
-        isolated = {**os.environ,
+        isolated = {**verify_test_environment(),
                  "HOME": str(root), "TMPDIR": str(root),
                  "BUILDLOG_DIR": str(root / "buildlog"),
                  "BUILD_HOLD_DIR": str(root / "holders"),
@@ -705,6 +707,12 @@ sweep_after_step() { :; }
                                                b"".join(chunks).decode(), result.stderr)
         finally:
             os.close(reader)
+
+    def test_run_invoke_ignores_the_parent_source_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LINT_INVOKE_SOURCED": "1"}):
+            result = self.run_invoke(Path(directory), "buildlog_exec printf 'loaded\\n'", [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "loaded\n")
 
     def test_terminal_and_tee_runs_capture_scope_after_command_before_release(self) -> None:
         shell = r'''
