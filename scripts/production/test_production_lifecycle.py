@@ -17,8 +17,10 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
 import unittest
 from pathlib import Path
 from typing import cast, final, override
@@ -26,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import fake_unit_host
-from scripts.production import production_lifecycle
+from scripts.production import merge_checkpoint, production_lifecycle
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
 from scripts.agents import stop_resume
@@ -34,7 +36,7 @@ from scripts.production import showrunner_tree
 from scripts.production.fake_unit_host import HostedUnit
 
 
-from scripts.production import log_backup, production_doc, staff, unit_config, update_registration
+from scripts.production import log_backup, production_admission, production_doc, staff, unit_config, update_registration
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import (
     BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
@@ -46,6 +48,7 @@ from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.lib.atomic_file import prepared_replacement
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.main_push_lock_test_support import publish_after_contender
@@ -152,6 +155,8 @@ class LifecycleTests(LifecycleFixture):
         _ = staff.set_doc(target.id, staff.LiveDoc(remote.local_machine(), live_doc))
         live = read_production(target.id)
         self.assertEqual((live.checkout, live.log), (integration, self.log))
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.require_admission(live)
         with live.log.open("ab") as output:
             _ = output.write(b"Entry after the move\n")
         assert isinstance(target.doc, staff.LiveDoc)
@@ -161,6 +166,8 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(worktrees.read_record(made_path), made)
         restored = read_production(target.id)
         self.assertEqual((restored.doc, restored.log), (self.doc, self.log))
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.require_admission(restored)
         self.assertEqual((restored.log.read_bytes(), restored.log.stat().st_ino),
                          (original_log + b"Entry after the move\n", inode))
         self.assertEqual((self.git("rev-parse", "main"), (common / "index").read_bytes()), (tip, index))
@@ -251,6 +258,8 @@ class LifecycleTests(LifecycleFixture):
         super().setUp()
         self.env["GATE_TEST_HOST"] = remote.local_machine()
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
+        with mock.patch.dict(os.environ, self.env):
+            _ = production_admission.capture_rollout_inventory([self.owner_id()])
 
     @override
     def reports_to(self, child: str, parent: str) -> Path:
@@ -630,6 +639,7 @@ class LifecycleTests(LifecycleFixture):
             session_staff.UnreadablePaneList("agents", "pane list denied"),))
         output = io.StringIO()
         with (mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+              mock.patch.dict(os.environ, self.env),
               contextlib.redirect_stdout(output)):
             production_lifecycle.load(production, [], True, None)
         self.assertIn("alpha: unknown", output.getvalue())
@@ -664,46 +674,95 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("production.log", (self.checkout / common_dir / "info/exclude").read_text())
 
     def test_open_needs_no_session_name(self) -> None:
-        for form in ("legacy", "enrolled"):
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "fixture"
+        _ = shutil.copytree(self.root, snapshot)
+        staff_bytes = self.staff.staff_file.read_bytes()
+
+        def assert_registration_refused(name: str, checkout: Path) -> None:
+            with mock.patch.object(agents_log, "append") as usage:
+                denied = invoke_cli(update_registration, update_registration.main,
+                    ["register", "--production", name], self.env, checkout, production_state=True)
+                self.assert_step(denied, "failed")
+                self.assertIn(GUARD_READY_FILE, denied.stdout)
+                usage.assert_not_called()
+
+        for form in ("unlisted legacy", "legacy", "enrolled"):
             with self.subTest(form=form):
-                if form == "enrolled":
-                    self.production_doc("planned")
-                    live, integration = self.enroll_document()
-                    _ = self.git("checkout", "HEAD", "--", str(self.doc))
-                else:
-                    live, integration = self.doc, self.checkout
-                before = live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)
-                with mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("new fixture")):
-                    for action in ("load", "open"):
-                        result = self.run_lifecycle(action)
+                if form != "unlisted legacy":
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root)
+                    _ = self.staff.staff_file.write_bytes(staff_bytes)
+                if form == "unlisted legacy":
+                    new_doc = self.doc.with_name("new-production.md")
+                    self.write(new_doc, "\n".join(line for line in self.doc.read_text().splitlines()
+                                                  if not line.startswith("> **Status:")) + "\n")
+                    newcomer = fixture_member("showrunner", name="new", doc=staff.LiveDoc(remote.local_machine(), new_doc))
+                    _ = self.git("add", str(new_doc))
+                    _ = self.git("commit", "-m", "Add a legacy document without a status")
+                    assert_registration_refused(newcomer.name, self.checkout)
+                    timer = self.state / "notifier" / f"showrunner-{newcomer.id}"
+                    self.assertFalse(timer.exists())
+                    self.write(timer / "conf", f"TARGET=session:{newcomer.id}\n")
+                    self.write(new_doc, "> **Status: PRODUCTION — planned.**\n\n" + new_doc.read_text())
+                    _ = self.git("add", str(new_doc))
+                    _ = self.git("commit", "-m", "Add planned status to the unlisted production")
+                    before = new_doc.read_bytes(), self.git("rev-parse", "HEAD"), self.calls()
+                    assert_registration_refused(newcomer.name, self.checkout)
+                    for arguments in (("load",), ("load", "--resume"), ("open",)):
+                        result = self.run_lifecycle(arguments[0], *arguments[1:], "--production", newcomer.name)
                         self.assert_step(result, "failed")
                         self.assertIn(GUARD_READY_FILE, result.stdout)
+                    self.assertEqual((new_doc.read_bytes(), self.git("rev-parse", "HEAD"), self.calls()), before)
+                    self.assertFalse((self.state / "showrunner/admission" / f"{newcomer.id}.json").exists())
+                    continue
+                if form == "legacy":
+                    timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
+                    saved = timer.rename(timer.with_name("saved-fixture-timer"))
+                    result = self.run_lifecycle("open")
+                    _ = saved.rename(timer)
+                    self.assert_step(result, "ok")
+                    self.assertIn("doc: ok — running", result.stdout)
+                    continue
+                receipt = self.state / "showrunner/admission" / f"{self.owner_id()}.json"
+                receipt.unlink()
+                live, integration = self.enroll_document()
+                before = live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)
+                timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
+                saved_timer = timer.rename(timer.with_name("saved-fixture-timer"))
+                calls = self.calls()
+                assert_registration_refused("example", integration)
+                self.assertFalse(timer.exists())
+                self.assertEqual(self.calls(), calls)
+                for action in ("load", "open"):
+                    result = self.run_lifecycle(action)
+                    self.assert_step(result, "failed")
+                    self.assertIn(GUARD_READY_FILE, result.stdout)
+                _ = saved_timer.rename(timer)
                 self.assertEqual((live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)), before)
-                if form == "enrolled":
-                    write_guard_proof(self.root, self.state / "showrunner", self.checkout)
-                    for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
-                        self.write(folder / ".unit.toml", f'plan = "docs/plans/{name}.md"\nresponsibilities = []\n')
-                    _ = self.git("rm", "docs/plans/alpha.md", cwd=integration)
-                    _ = self.git("commit", "-m", "Prepare an untracked unit plan", cwd=integration)
-                    self.write(integration / "docs/plans/alpha.md", "# Alpha plan\n")
-                    main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
-                    with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
-                        result = self.run_lifecycle("open")
-                    self.assertEqual(self.git("ls-files", "--", str(live), str(self.log)), "")
-                    self.assertEqual(self.git("symbolic-ref", "HEAD"), main[0])
-                    self.assertEqual(self.git("rev-parse", "HEAD"), main[1])
-                    self.assertEqual(self.git("ls-files", "--stage"), main[2])
-                    self.assertEqual(self.git("show", "--format=", "--name-only", "HEAD", cwd=integration),
-                                     "docs/plans/alpha.md")
-                    with mock.patch.object(agents_log, "append"):
-                        registered = invoke_cli(update_registration, update_registration.main,
-                            ["register", "--production", "example"], self.env, integration, production_state=True)
-                    self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
-                    self.assertIn("registered", registered.stdout)
-                else:
+                write_guard_proof(self.root, self.state / "showrunner", self.checkout)
+                for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
+                    self.write(folder / ".unit.toml", f'plan = "docs/plans/{name}.md"\nresponsibilities = []\n')
+                _ = self.git("rm", "docs/plans/alpha.md", cwd=integration)
+                _ = self.git("commit", "-m", "Prepare an untracked unit plan", cwd=integration)
+                self.write(integration / "docs/plans/alpha.md", "# Alpha plan\n")
+                main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
+                with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
                     result = self.run_lifecycle("open")
                 self.assert_step(result, "ok")
                 self.assertIn("doc: ok — running", result.stdout)
+                self.assertEqual(self.git("ls-files", "--", str(live), str(self.log)), "")
+                self.assertEqual(self.git("symbolic-ref", "HEAD"), main[0])
+                self.assertEqual(self.git("rev-parse", "HEAD"), main[1])
+                self.assertEqual(self.git("ls-files", "--stage"), main[2])
+                self.assertEqual(self.git("show", "--format=", "--name-only", "HEAD", cwd=integration),
+                                 "docs/plans/alpha.md")
+                self.assertIn('"basis": "guard and document"', receipt.read_text())
+                (self.state / "showrunner" / GUARD_READY_FILE).unlink()
+                with mock.patch.object(agents_log, "append"):
+                    registered = invoke_cli(update_registration, update_registration.main,
+                        ["register", "--production", "example"], self.env, integration, production_state=True)
+                self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+                self.assertIn("registered", registered.stdout)
 
     def test_open_skips_missing_plan_then_commits_it_on_rerun(self) -> None:
         _ = self.git("rm", "--cached", "docs/plans/alpha.md")
@@ -858,7 +917,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.merge_tip()
         destination = self.promotion_checkout("installed")
         hook = destination / ".claude/config/post_push.sh"
-        self.write(hook, 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
+        self.write(hook, 'test "$(git rev-parse HEAD)" = "$LANDED_SHA" || exit 0\n'
+                   + 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
         self.production_doc("running", promote=f"`{destination}`")
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "declare promotion")
@@ -891,6 +951,22 @@ class LifecycleTests(LifecycleFixture):
                        "--production", "example", "--no-ci"]
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
+
+        with self.subTest(installed="newer integration commit"):
+            earlier = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "Requested promotion")
+            later = self.git("commit-tree", "HEAD^{tree}", "-p", earlier, "-m", "Newer integration commit")
+            _ = self.git("push", "origin", f"{later}:refs/heads/production")
+            _ = self.git("fetch", "origin", "production", cwd=destination)
+            _ = self.git("merge", "--ff-only", later, cwd=destination)
+            promotion = production_doc.PromoteTo((destination,), production_doc.NoMac())
+            with mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(io.StringIO()) as output:
+                merge_checkpoint.promote_targets(promotion, "production", earlier, source=self.checkout,
+                                                 label="fixture checkpoint", local_only=True)
+            self.assertIn(f"{destination} already at {later}", output.getvalue())
+            self.assertIn("post-push hook: done", output.getvalue())
+            self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], later)
+            self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
+            self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
 
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()
@@ -1227,7 +1303,8 @@ class LifecycleTests(LifecycleFixture):
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             staff_bytes = self.staff.staff_file.read_bytes()
-            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled"):
+            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled",
+                           "document edit at replace", "integration ref moves at promotion"):
                 with self.subTest(landed=landed):
                     shutil.rmtree(self.root)
                     _ = shutil.copytree(snapshot, self.root)
@@ -1244,11 +1321,28 @@ class LifecycleTests(LifecycleFixture):
                         _ = self.git("cherry-pick", "--no-commit", alpha)
                         _ = self.git("commit", "-m", "Copy alpha patch")
                     _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
-                    if landed == "enrolled":
+                    if landed in ("enrolled", "document edit at replace"):
                         _ = self.git("push", "origin", "production")
                         live, integration = self.enroll_document()
                         runner = staff.by_id(self.owner_id())
                         assert runner is not None
+                        if landed == "document edit at replace":
+                            edited = live.read_bytes() + b"\r\nOwner edit before replace.\r\n"
+
+                            @contextlib.contextmanager
+                            def edit_before_replace(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+                                with prepared_replacement(path, content, mode=mode) as temporary:
+                                    if path == live:
+                                        _ = path.write_bytes(edited)
+                                    yield temporary
+
+                            with mock.patch.object(production_lifecycle, "prepared_replacement", side_effect=edit_before_replace):
+                                result = self.run_lifecycle("wrap", "--no-ci")
+                            self.assert_step(result, "held")
+                            self.assertIn("document changed during wrap", result.stdout)
+                            self.assertEqual(live.read_bytes(), edited)
+                            self.assertEqual(staff.by_id(runner.id), runner)
+                            continue
                         staging = self.root / "merge-staging"
                         _ = self.git("worktree", "add", "-b", "merge-staging", str(staging), "production")
                         _ = self.git("push", "origin", "merge-staging")
@@ -1313,11 +1407,36 @@ class LifecycleTests(LifecycleFixture):
                         self.assertFalse(self.alpha.exists())
                         self.assertFalse(self.beta.exists())
                         continue
-                    if landed == "separate-promotion":
+                    if landed in ("separate-promotion", "integration ref moves at promotion"):
                         destination = self.promotion_checkout("installed")
                         self.production_doc("running", promote=f"`{destination}`")
                         _ = self.git("add", str(self.doc))
                         _ = self.git("commit", "-m", "Declare promotion")
+                        if landed == "integration ref moves at promotion":
+                            verified = self.git("rev-parse", "HEAD")
+                            later = self.git("commit-tree", "HEAD^{tree}", "-p", verified, "-m", "Later integration tip")
+                            _ = self.git("fetch", str(self.checkout), later, cwd=destination)
+                            _ = self.git("merge", "--ff-only", later, cwd=destination)
+                            main = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+                            original_git = merge_checkpoint.git
+
+                            def move_integration_after_check(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                                if checkout == destination and args == (
+                                        "fetch", "origin", "+refs/heads/production:refs/remotes/origin/production"):
+                                    _ = self.git("update-ref", "refs/heads/production", later, verified)
+                                    _ = self.git("push", "origin", "production")
+                                return original_git(checkout, *args)
+
+                            with mock.patch.object(merge_checkpoint, "git", side_effect=move_integration_after_check):
+                                result = self.run_lifecycle("wrap", "--ci-green", verified, "--smoke-passed", verified)
+                            self.assert_step(result, "held")
+                            self.assertIn("integration tip changed", result.stdout)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=destination), later)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), later)
+                            self.assertTrue(self.alpha.exists())
+                            self.assertTrue(self.beta.exists())
+                            continue
                     _ = self.git("push", "origin", "production")
                     result = self.run_lifecycle("wrap", "--no-ci")
                     self.assert_step(result, "ok")

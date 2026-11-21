@@ -4,7 +4,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -621,10 +623,24 @@ class DemoteShowrunnerTests(StaffTestCase):
         fields: dict[str, object] = {}
         parent_text = self.doc.read_text()
         child_text = self.child_doc.read_text()
-        for count, scenario in enumerate(("legacy", "saved completion", "enrolled"), start=1):
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "fixture"
+        _ = shutil.copytree(self.root, snapshot, symlinks=True)
+
+        def stop_enrolled_child(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> bool:
+            self.assertTrue(self.stop_child(name, marked, claude))
+            _ = self.git("-C", str(self.child_tree), "switch", "temporary-branch")
+            return True
+
+        for scenario in ("legacy", "saved completion", "enrolled"):
             with self.subTest(scenario=scenario):
+                if scenario != "legacy":
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root, symlinks=True)
+                    self.events.clear()
+                    self.account.reset_mock()
                 saved_completion = scenario == "saved completion"
                 if scenario == "enrolled":
+                    _ = self.git("-C", str(self.child_tree), "switch", self.child_branch)
                     integration = self.root / "parent-integration"
                     _ = self.git("worktree", "add", "-qb", "parent-integration", str(integration), "main")
                     parent_live = self.checkout / "parent-production-live.md"
@@ -640,9 +656,8 @@ class DemoteShowrunnerTests(StaffTestCase):
                         _ = output.write("\n/*-production-live.md\n/log.md\n/child.log\n")
                     _ = staff.set_doc(self.parent.id, staff.LiveDoc(remote.local_machine(), parent_live))
                     self.doc, self.child_doc = parent_live, child_live
-                if scenario != "legacy":
-                    _ = staff.change_director(self.child.id, staff.ShowrunnerRole(self.child_name, self.parent.id,
-                                                                                 staff.LiveDoc(remote.local_machine(), self.child_doc)))
+                    _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.child_doc))
+                    self.stop.side_effect = stop_enrolled_child
                 if saved_completion:
                     demote.save(self.journal(), fields, demote.Step.PLACED)
                 main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
@@ -653,9 +668,8 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(code, 0, errors)
                 checked.assert_called_once()
                 fields = cast(dict[str, object], save.call_args.args[1])
-                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"] * count)
-                self.assertEqual(self.account.call_count, count)
-                self.account.assert_called_with("unit", resume=True)
+                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
+                self.account.assert_called_once_with("unit", resume=True)
                 self.assertEqual(staff.by_id(self.worker.id), self.worker)
                 document = self.doc.read_text()
                 self.assertIn(f"| {self.child_name} |  | {self.child_tree} | {self.child_branch} | {self.plan_relative} |", document)
@@ -674,7 +688,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(self.git("status", "--porcelain"), "")
                 self.assertFalse(self.journal().exists())
                 self.assertEqual(self.run_command()[0], 2)
-                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"] * count)
+                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
 
     def test_placed_or_cleaned_journal_resumes_an_unchanged_unit_without_another_launch(self) -> None:
         with mock.patch.object(demote, "save", wraps=demote.save) as save:
