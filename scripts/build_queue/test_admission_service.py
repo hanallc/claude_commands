@@ -67,6 +67,37 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def test_gate_placement_prefers_natedev_when_it_can_start(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, shared_mac_run_request,
+        )
+        from scripts.production.gate_routes import SuiteMode
+
+        for mode, local_busy, expected in (
+            (SuiteMode.MERGE_GATE, False, "natedev"),
+            (SuiteMode.MERGE_GATE, True, "mac"),
+            (SuiteMode.TARGETED_TEST, False, "mac"),
+        ):
+            with self.subTest(mode=mode.value, local_busy=local_busy), PlacementFixture() as fixture:
+                if local_busy:
+                    _ = fixture.occupy_host()
+                    fixture.free(0)
+                request = shared_mac_run_request(fixture, placement_request(fixture))
+                assert isinstance(request.profile, records.ProgramProfile)
+                assert isinstance(request.local, wire.LocalAdmissionContext)
+                command = (mode.value,)
+                request = replace(request, profile=replace(request.profile, program=mode.value),
+                    identity=replace(request.identity, step=mode.value),
+                    local=replace(request.local, argv=command),
+                    constraints=replace(request.constraints, command=command))
+                _ = publish_candidate(fixture, request)
+
+                reply, = fixture.connect(request).replies()
+                assert isinstance(reply, (wire.LocalPlacementGranted, wire.Assignment)), reply
+                self.assertEqual(reply.assignment.destination.target, expected)
+                self.assertEqual(set(fixture.caller_reservations()),
+                                 {request.episode} if expected == "natedev" else set())
+
     def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
 
@@ -1783,6 +1814,45 @@ class ReplyPublicationTests(unittest.TestCase):
                     release.set()
                     reader.close()
 
+    def test_service_shutdown_leaves_the_live_reader_descriptor_open(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(query_timeout_seconds=0.125)
+            server = fixture.server
+            initial = server.system_evidence
+            config = records.read_memory_config()
+            assert isinstance(initial, service.SystemEvidence)
+            plan = service.SystemReadingPlan(config, (), (), False)
+            entered, release = threading.Event(), threading.Event()
+
+            def stalled_read(*_arguments: object) -> service.SystemEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("The test did not release the reader")
+                return initial
+
+            with mock.patch.object(service, "read_system", side_effect=stalled_read):
+                reader = service.OperatingSystemReader(plan, initial, fixture.readings,
+                    fixture.proc, fixture.clock, server.reading_events)
+                server.system_reader = reader
+                reader.request_read()
+                closer = threading.Thread(target=server.close)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    closer.start()
+                    closer.join(1)
+                    self.assertFalse(closer.is_alive(), "The service waited for the stalled reader")
+                    self.assertTrue(reader.thread.is_alive())
+                    self.assertNotEqual(reader.wake, server.reading_events)
+                    _ = os.fstat(reader.wake)
+                finally:
+                    release.set()
+                    reader.thread.join(test_hang_guard.TEST_HANG_GUARD_SECS)
+                    if closer.ident is not None:
+                        closer.join(test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertFalse(reader.thread.is_alive())
+                with self.assertRaises(OSError):
+                    _ = os.fstat(reader.wake)
+
     def test_mine_keeps_the_full_reading_and_reuses_view_bytes(self) -> None:
         with AdmissionFixture() as fixture:
             first = fixture.request()
@@ -3409,6 +3479,7 @@ class PlacementRestartTests(unittest.TestCase):
 
     def test_restart_preserves_old_waiters_and_both_placement_permission_states(self) -> None:
         from scripts.build_queue import placement
+        from scripts.mac_test.claim_state import RepositoryScope
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
         )
@@ -3432,8 +3503,13 @@ class PlacementRestartTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.Wait)
                 pending = placement_request(fixture, since=fixture.clock.now() - 25)
                 consumed = placement_request(fixture, since=fixture.clock.now() - 10)
+                other_scope = RepositoryScope("other-repo")
+                destination = replace(consumed.constraints.candidates[0].destination, scope=other_scope)
+                consumed = replace(consumed, constraints=replace(consumed.constraints,
+                    candidates=(placement.PlacementCandidate(destination),)))
                 _ = publish_candidate(fixture, pending)
                 pending_assignment = assignment_for(fixture, pending)
+                _ = publish_candidate(fixture, consumed)
                 consumed_assignment = assignment_for(fixture, consumed)
                 claim = adopt_assignment(fixture, consumed, consumed_assignment)
                 consume = consume_permission("first-consumption", consumed_assignment, claim)

@@ -745,17 +745,17 @@ class OffloadSettingsTests(unittest.TestCase):
                                  ("leftovers=4\nrc=0\n", offload.LeftoversRemain(4))):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
-                with mock.patch.object(subprocess, "run", return_value=response) as run:
+                with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", return_value=response) as run:
                     self.assertEqual(offload.check_leftovers(config.connection, "kept-host", HANA), expected)
                 arguments = cast(list[str], run.call_args.args[0])
                 self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config.connection), "kept-host"])
-                self.assertEqual(run.call_args.kwargs["timeout"], 10)
+                self.assertEqual(run.call_args.args[1], 10)
                 self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', arguments[-1])
                 self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", arguments[-1])
         for answer in ("leftovers=0\n", "rc=0\n", "leftovers=-1\nrc=0\n", "leftovers=bad\nrc=0\n"):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
-                with mock.patch.object(subprocess, "run", return_value=response):
+                with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", return_value=response):
                     result = offload.check_leftovers(config.connection, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
@@ -766,14 +766,14 @@ class OffloadSettingsTests(unittest.TestCase):
         for error, expected in ((subprocess.TimeoutExpired("ssh", 10), "timed out after 10"),
                                 (FileNotFoundError("ssh missing"), "could not start")):
             with self.subTest(error=type(error).__name__):
-                with mock.patch.object(subprocess, "run", side_effect=error):
+                with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", side_effect=error):
                     result = offload.check_leftovers(config.connection, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn(expected, result.reason)
                     self.assertIn("10", result.reason)
         response = subprocess.CompletedProcess(["ssh"], 255, "", "connection\n refused\tby host")
-        with mock.patch.object(subprocess, "run", return_value=response):
+        with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", return_value=response):
             result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertIsInstance(result, offload.LeftoverCheckFailed)
         if isinstance(result, offload.LeftoverCheckFailed):
@@ -784,9 +784,9 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
         _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", template="mac_test")
         config = eligibility.read_config(self.settings)
-        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
+        with mock.patch("scripts.mac_test.claim_state.capture_cleanup_command", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
             result = offload.check_leftovers(config.connection, "kept-host", HANA)
-        self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
+        self.assertEqual(run.call_args.args[1], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
         self.settings.unlink()
         _ = write_config_fixture(self.settings, "leftover_timeout_s=10\n")

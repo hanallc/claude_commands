@@ -8,9 +8,10 @@ except FileNotFoundError:
 from collections import deque
 from collections.abc import Generator, Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import suppress, contextmanager
 from contextvars import ContextVar
 import errno
+import fcntl
 import heapq
 import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -29,6 +30,8 @@ import uuid
 from types import MappingProxyType
 from typing import Callable, Protocol, cast, override
 
+from scripts.agents.worker_lifecycle import operation_deadline
+from scripts.lib.operation_deadline import remaining
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
@@ -37,6 +40,9 @@ from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.proc_text import read_proc_text
 from scripts.build_queue import admission_code
+from scripts.build_queue.admission_client import (
+    LocalGateResult, LocalGateResultPending, LocalGateRunFiles, OtherReservationSidecar, local_result_report, read_assignment,
+)
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import placement
@@ -53,6 +59,7 @@ from scripts.build_hold import override_guard
 from scripts.production import staff
 
 from scripts.buildlog import store
+from scripts.mac_test import mac_queue_run
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
@@ -594,6 +601,8 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
     _ = record
     if isinstance(lifetime, gate.EndedStep):
         return records.GoneMemory()
+    if isinstance(lifetime, gate.GateGroupsUnsettled):
+        return records.PromisedMemory(row["need"])
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
             return gate.process_memory(lifetime, proc)
@@ -783,7 +792,7 @@ class OperatingSystemReader:
         self.readings: Readings = readings
         self.proc: Proc = proc
         self.clock: Clock = clock
-        self.wake: int = wake
+        self.wake: int = os.dup(wake)
         self.lock: threading.Lock = threading.Lock()
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
@@ -813,6 +822,12 @@ class OperatingSystemReader:
             raise failure
 
     def _read(self) -> None:
+        try:
+            self._read_until_stopped()
+        finally:
+            os.close(self.wake)
+
+    def _read_until_stopped(self) -> None:
         while not self.stopped.is_set():
             with self.lock:
                 plan = self.plan
@@ -831,12 +846,14 @@ class OperatingSystemReader:
             else:
                 with self.lock:
                     self.reading = reading
-            os.eventfd_write(self.wake, 1)
+            if not self.stopped.is_set():
+                os.eventfd_write(self.wake, 1)
 
     def close(self) -> None:
         self.stopped.set()
         self.requested.set()
-        self.thread.join()
+        with suppress(TimeoutError), operation_deadline(timeout=self.plan.config.query_timeout_seconds):
+            self.thread.join(remaining())
 
 
 @dataclass(frozen=True)
@@ -1401,6 +1418,7 @@ class AdmissionServer:
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
+        self.mac_recovery_work: dict[Path, threading.Thread] = {}
         self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
@@ -2799,11 +2817,22 @@ class AdmissionServer:
 
     def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting) -> None:
         record = self.reservations[episode]
+        files = LocalGateRunFiles.for_sidecar(Path(record.sidecar))
+        if isinstance(files, LocalGateRunFiles) and isinstance(ending, (OwnerExited, NotEnding)):
+            lifetime = self._lifetime(record)
+            if not isinstance(lifetime, gate.EndedStep):
+                self._watch_scope(lifetime, episode)
+                return
+            saved = self.assignments.get(self.current_assignments.get(episode, ""))
+            if saved is not None:
+                result = self._local_gate_result(saved, files, record.reservation_id)
+                if isinstance(result, LocalGateResult):
+                    ending = ReleaseStatus("local-gate-result:" + record.reservation_id, result.status)
         record = replace(record, ending=ending)
         self.reservations[episode] = record
         self.persist()
         row = reservation_row(record)
-        if isinstance(ending, (OwnerExited, NotEnding)):
+        if isinstance(files, OtherReservationSidecar) and isinstance(ending, (OwnerExited, NotEnding)):
             lifetime = self._lifetime(record)
             if isinstance(lifetime, gate.PopulatedStepScope):
                 self._watch_scope(lifetime, episode)
@@ -3079,18 +3108,20 @@ class AdmissionServer:
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
-        # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
-        # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
-                and target.platform == "macos"
-                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
-            eligibility = placement.TemporaryExclusion("busy")
+                and target.platform == "macos"):
+            availability = mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                                            session=key.session, configuration=configuration)
+            if availability in ("busy", "blocked", "backoff", "off"):
+                eligibility = placement.TemporaryExclusion(availability)
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
-        with claim_state.locked(paths.lock):
-            held = claim_state.read_claims(paths)
+        try:
+            with claim_state.locked(paths.lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB):
+                held = claim_state.read_claims(paths)
+        except BlockingIOError:
+            return placement.HostEvidenceUnavailable(key, self.clock.now(), "the claim state lock is held")
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)
@@ -3109,17 +3140,17 @@ class AdmissionServer:
                 continue
             reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
                 record["claim_id"], record["episode"], record["attempt"])
-            session_id = record["submitting_session"]
-            session = OwningSession(session_id) if session_id else NoOwningSession()
             if record.get("cleanup_pending", False):
                 cleanup.append(placement.RetainedCleanupClaim(reference, "provider cleanup remains unresolved"))
                 executions.append((reference, execution_identity.ExecutionEvidenceUnavailable("provider cleanup remains unresolved", self.clock.now())))
                 continue
-            adopted.append(placement.AdoptedProviderClaim(reference,
-                placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
-                session, record["remote_host"], record.get("instance_generation", "")))
-            executions.append((reference, self._observe_provider_execution(request, destination, reference,
-                record["remote_host"], record.get("instance_generation", ""), configuration)))
+            claim_evidence = placement.AdoptedProviderClaim.from_remote_record(reference, self.host, record)
+            adopted.append(claim_evidence)
+            execution = (execution_identity.ExecutionEvidenceUnavailable("Mac offload is disabled", self.clock.now())
+                if destination.provider == "mac" and eligibility == placement.TemporaryExclusion("off")
+                else self._observe_provider_execution(
+                    request, destination, reference, claim_evidence.host, claim_evidence.generation, configuration))
+            executions.append((reference, execution))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
@@ -3175,6 +3206,9 @@ done
                  and not self._placement_owner_live(owners[episode])}
         if not ended:
             return
+        ended.difference_update(saved.assignment.episode for saved in self.assignments.values()
+                                if saved.assignment.episode in ended and saved.assignment.destination.provider == "mac"
+                                and mac_queue_run.registered_mac_run_exists(saved.assignment))
         self.assignments = {key: saved for key, saved in self.assignments.items()
                             if saved.assignment.episode not in ended}
         for episode in ended:
@@ -3226,7 +3260,8 @@ done
         assignment = saved.assignment
         if (not isinstance(saved.state, placement.CurrentAssignment)
                 or self.current_assignments.get(assignment.episode) != execution_identity.attempt_key(assignment.episode, assignment.attempt)
-                or assignment.episode not in self.placement_requests):
+                or assignment.episode not in self.placement_requests
+                or assignment.destination.provider == "mac" and mac_queue_run.registered_mac_run_exists(assignment)):
             return False
         if self._claim_holder_ended(saved):
             return True
@@ -3333,6 +3368,16 @@ done
                     return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read_dispatch))
             except (OSError, ValueError):
                 return True
+        if saved.assignment.destination.provider == "mac":
+            if mac_queue_run.registered_mac_run_exists(saved.assignment):
+                return True
+            submitted = self.placement_requests.get(saved.assignment.episode)
+            if submitted is not None and self._shared_mac_run(submitted):
+                with conf.report_key_changes():
+                    try:
+                        return not isinstance(offload.read_assigned_mac_claim(saved.assignment), offload.MacClaimSettled)
+                    except (OSError, ValueError):
+                        return True
         if not isinstance(provider, placement.ProviderClaimReference):
             return False
         identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
@@ -3368,12 +3413,27 @@ done
         state = self._assignment_state(saved) if check_lifetime else saved.state
         return wire.DispatchStatus(saved.assignment, state, saved.permission, reason, saved.retry)
 
+    @staticmethod
+    def _shared_mac_run(request: wire.PlacementRequest) -> bool:
+        return (isinstance(request.profile, records.ProgramProfile)
+                and request.constraints.command_kind == "run" and not request.constraints.package
+                and {candidate.destination.provider for candidate in request.constraints.candidates} == {"local", "mac"})
+
+    def _ends_placement_episode(self, request: wire.PlacementRequest, saved: records.SavedPlacementAssignment) -> bool:
+        if saved.assignment.episode != request.episode or not isinstance(saved.state, placement.ClosedAssignment):
+            return False
+        if saved.state.reason in ("completed", "cancelled"):
+            return True
+        report = saved.terminal_report
+        return (saved.assignment.destination.provider == "mac" and self._shared_mac_run(request)
+                and not (isinstance(report, placement.TerminalAttemptReport)
+                         and isinstance(report.outcome, placement.PrelaunchRefused)
+                         and isinstance(report.path, placement.DispatchPathSettled)))
+
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
         if not self._placement_owner_live(request.owner) or request.episode in self.current_assignments:
             return False
-        return not any(saved.assignment.episode == request.episode
-            and isinstance(saved.state, placement.ClosedAssignment)
-            and saved.state.reason in ("completed", "cancelled") for saved in self.assignments.values())
+        return not any(self._ends_placement_episode(request, saved) for saved in self.assignments.values())
 
     def _placement_admission(self, request: wire.PlacementRequest) -> wire.AdmitRequest | wire.LaunchRequest:
         identity = request.identity
@@ -3417,6 +3477,8 @@ done
             return placement.RetryAt(0)
         saved = previous[-1]
         retry = saved.retry
+        if destination.provider == "mac" and self._shared_mac_run(request):
+            return retry
         if (isinstance(retry, placement.DoNotRetry) and retry.reason in placement.SETTINGS_REFUSAL_REASONS
                 and saved.state == placement.ClosedAssignment(retry.reason)):
             generation = (saved.refusal_settings if isinstance(saved.refusal_settings, records.RefusalSettings)
@@ -3692,8 +3754,7 @@ done
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
-        terminal = [saved for saved in self.assignments.values() if saved.assignment.episode == request.episode
-                    and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]
+        terminal = [saved for saved in self.assignments.values() if self._ends_placement_episode(request, saved)]
         if terminal:
             return self._placement_status(terminal[-1].assignment)
         candidates = self.placement_eligibility.get(request.episode, ())
@@ -3805,7 +3866,14 @@ done
         pending_remote_starts = set(inputs.pending_remote_starts)
         cargo_folders = dict(inputs.cargo_folders)
         held: list[PlacementHold] = []
-        taken: list[placement.PlacementDestination] = []
+        # Keep the scope until the runner adopts its claim or the attempt ends.
+        taken = [saved.assignment.destination
+            for key in self.current_assignments.values()
+            if (saved := self.assignments.get(key)) is not None
+            and saved.assignment.destination.provider == "mac"
+            and isinstance(saved.state, placement.CurrentAssignment)
+            and isinstance(saved.permission, placement.PermissionAvailable)
+            and self._placement_owner_live(saved.assignment.owner)]
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         for _, row in ordered:
@@ -3817,7 +3885,10 @@ done
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
-            for candidate in self.placement_eligibility.get(request.episode, ()):
+            candidates = self.placement_eligibility.get(request.episode, ())
+            if request.profile.step == "merge-gate" and self._shared_mac_run(request):
+                candidates = tuple(sorted(candidates, key=lambda candidate: candidate.destination.provider != "local"))
+            for candidate in candidates:
                 destination = candidate.destination
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
                     continue
@@ -3989,6 +4060,23 @@ done
                 return self._placement_status(assignment, adopted.reason)
             if adopted.reference != reference:
                 return self._placement_status(assignment, "the exact claim is not adopted")
+        elif destination.provider == "mac" and self._shared_mac_run(submitted):
+            from scripts.mac_test import mac_test, offload
+
+            try:
+                target = records.effective_target(destination.target, self._placement_settings(submitted, destination))
+                if not isinstance(target, target_config.SshTarget) or target.platform != "macos":
+                    return self._placement_status(assignment, "the Mac target is no longer configured")
+                paths = mac_test.state_paths(destination.target)
+                availability = mac_test.free_now(paths, target.settings, Path(submitted.constraints.repository),
+                                                 session=submitted.constraints.session)
+                if availability in ("blocked", "backoff", "off"):
+                    return self._placement_status(assignment, availability)
+                if (availability == "state" or reference != placement.assigned_claim_reference(assignment)
+                        or not isinstance(offload.confirm_assigned_mac_adoption(assignment, request.holder), offload.MacClaimAdopted)):
+                    return self._placement_status(assignment, "the exact claim is not adopted")
+            except (OSError, ValueError) as error:
+                return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
         else:
             evidence = self._request_host_evidence(submitted, destination)
             if not isinstance(evidence, placement.FreshHostEvidence):
@@ -3998,9 +4086,9 @@ done
                 return self._placement_status(assignment, f"adoption evidence is {state}: {evidence.reason}")
             if destination.target == 'hana-gpu' and not isinstance(evidence.eligibility, placement.AllowedHost):
                 return self._placement_status(assignment, 'The Hana GPU step is no longer eligible')
-            if not any(claim.reference == reference and claim.holder == request.holder
-                       and claim.session == assignment.session and claim.host == destination.host
-                       and claim.generation == evidence.generation for claim in evidence.claims):
+            holder = request.holder
+            if not any(claim.matches(assignment, reference, holder) and claim.generation == evidence.generation
+                       for claim in evidence.claims):
                 return self._placement_status(assignment, "the exact claim is not adopted")
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
@@ -4065,9 +4153,118 @@ done
         self._close_placement(replace(saved, terminal_report=settled), state_reason, placement.DoNotRetry(reason))
         return True
 
+    def _recover_mac_gates(self) -> None:
+        """Use saved plans to restore cleanup after a service restart."""
+        self.mac_recovery_work = {path: worker for path, worker in self.mac_recovery_work.items()
+                                  if worker.is_alive()}
+        for manual in mac_queue_run.read_ended_manual_mac_runs():
+            self._start_mac_recovery(manual)
+        for saved in tuple(self.assignments.values()):
+            assignment = saved.assignment
+            if assignment.destination.provider != "mac":
+                continue
+            try:
+                run = mac_queue_run.read_registered_mac_run(assignment)
+                if isinstance(run, mac_queue_run.NoRegisteredMacRun) or mac_queue_run.registered_mac_runner_live(run):
+                    continue
+                service_settled = isinstance(saved.state, placement.ClosedAssignment)
+                if run.saved["settlement"] is mac_queue_run.GateSettlement.RELEASE_CONFIRMED and not service_settled:
+                    report = mac_queue_run.saved_completion(run.saved, assignment)
+                    if isinstance(report, wire.ExecutionReport):
+                        _ = self._handle_placement(report)
+                        service_settled = isinstance(self.assignments[
+                            execution_identity.attempt_key(assignment.episode, assignment.attempt)].state,
+                            placement.ClosedAssignment)
+                    if not service_settled:
+                        continue
+                self._start_mac_recovery(run, service_settled=service_settled)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(f"memory admission: cannot read Mac recovery: {error}", file=sys.stderr)
+
+    def _start_mac_recovery(self, run: mac_queue_run.RegisteredMacRun | mac_queue_run.ManualMacRun,
+                            *, service_settled: bool = False) -> None:
+        path = run.paths.journal
+        if path in self.mac_recovery_work:
+            return
+        worker = threading.Thread(target=self._recover_mac_gate_files, args=(run, service_settled),
+                                  name="mac-gate-recovery", daemon=True)
+        worker.start()
+        self.mac_recovery_work[path] = worker
+
+    @staticmethod
+    def _recover_mac_gate_files(run: mac_queue_run.RegisteredMacRun | mac_queue_run.ManualMacRun,
+                                service_settled: bool) -> None:
+        from scripts.mac_test.mac_gate import queue_cancel_seconds
+
+        try:
+            target = run.assignment.destination.target if isinstance(run, mac_queue_run.RegisteredMacRun) else "mac"
+            with operation_deadline(timeout=queue_cancel_seconds(target)):
+                if isinstance(run, mac_queue_run.RegisteredMacRun):
+                    mac_queue_run.recover_registered_mac_run(run, service_settled=service_settled)
+                else:
+                    mac_queue_run.recover_manual_mac_run(run, dict(os.environ))
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            print(f"memory admission: Mac gate cleanup remains unresolved: {error}", file=sys.stderr)
+
+
+    def _local_gate_files(self, episode: str) -> LocalGateRunFiles | OtherReservationSidecar:
+        request = self.placement_requests.get(episode)
+        if request is not None and isinstance(request.local, wire.LocalAdmissionContext):
+            return LocalGateRunFiles.for_sidecar(Path(request.local.sidecar))
+        return OtherReservationSidecar()
+
+    def _local_gate_result(self, saved: records.SavedPlacementAssignment, files: LocalGateRunFiles,
+                           reservation: str) -> LocalGateResult | LocalGateResultPending:
+        try:
+            grant = read_assignment(files.assignment)
+            if (isinstance(grant, wire.LocalPlacementGranted) and grant.assignment == saved.assignment
+                    and grant.grant.reservation == reservation):
+                return files.read_result()
+        except FileNotFoundError:
+            pass
+        return LocalGateResultPending()
+
+    def _recover_local_gate(self, saved: records.SavedPlacementAssignment) -> bool:
+        """Replay a dead gate's saved status after the reservation ends."""
+        assignment = saved.assignment
+        files = self._local_gate_files(assignment.episode)
+        if not isinstance(files, LocalGateRunFiles):
+            return False
+        current = self.current_assignments.get(assignment.episode)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        if self._placement_owner_live(assignment.owner) or current is not None and current != key:
+            return True
+        if assignment.episode in self.reservations:
+            record = self.reservations[assignment.episode]
+            if not self._end_if_finished(assignment.episode, record):
+                return True
+        if not isinstance(saved.state, placement.ClosedAssignment):
+            entry = self.ledger.get(assignment.episode)
+            if entry is not None and isinstance(entry.reply, wire.Admitted):
+                result = self._local_gate_result(saved, files, entry.reply.reservation)
+                if isinstance(result, LocalGateResult):
+                    _ = self._handle_placement(local_result_report(assignment, result.status))
+                    if self.current_assignments.get(assignment.episode) is not None:
+                        return True
+            if self.current_assignments.get(assignment.episode) is not None:
+                self._close_placement(saved, "local reservation has ended",
+                                      placement.DoNotRetry("coordinator ended"))
+        files.remove()
+        return True
+
     def _settle_attempt_reports(self, keys: PlacementEvidenceKeys) -> None:
+        self._recover_mac_gates()
         for key, saved in tuple(self.assignments.items()):
             assignment = saved.assignment
+            if assignment.destination.provider == "local":
+                try:
+                    if self._recover_local_gate(saved):
+                        continue
+                except (OSError, ValueError) as error:
+                    print(f"memory admission: local gate cleanup remains unresolved: {error}", file=sys.stderr)
+                    continue
+            if assignment.destination.provider == "mac" and mac_queue_run.registered_mac_run_exists(assignment):
+                continue
             if self.current_assignments.get(assignment.episode) != key:
                 continue
             report = saved.terminal_report
@@ -4108,6 +4305,16 @@ done
                             and terminal.outcome == recovered.outcome):
                         self._close_for_report(updated, terminal)
                 continue
+            if (assignment.destination.provider == "mac" and self._shared_mac_run(submitted)
+                    and isinstance(report, placement.NoTerminalReport) and self._ended_claim_holder(saved)):
+                try:
+                    completion = mac_queue_run.journaled_mac_completion(assignment)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    print(f"memory admission: cannot read Mac completion: {error}", file=sys.stderr)
+                    continue
+                if isinstance(completion, wire.ExecutionReport):
+                    _ = self._handle_placement(completion)
+                    continue
             if not self._claim_holder_ended(saved):
                 _ = self._request_host_evidence(submitted, assignment.destination, keys)
                 if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
@@ -4120,7 +4327,11 @@ done
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
-        if isinstance(outcome, placement.AttemptCompleted):
+        submitted = self.placement_requests.get(saved.assignment.episode)
+        if (isinstance(outcome, placement.PrelaunchRefused) and saved.assignment.destination.provider == "mac"
+                and submitted is not None and self._shared_mac_run(submitted)):
+            self._close_placement(saved, outcome.reason, placement.DoNotRetry(outcome.reason))
+        elif isinstance(outcome, placement.AttemptCompleted):
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
             self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
@@ -4158,7 +4369,10 @@ done
                         with retry_cleanup(Path(reservation.path)):
                             self._end(request.episode, OwnerExited())
                     report = saved.terminal_report
-                    if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
+                    if (saved.assignment.destination.provider == "mac"
+                            and mac_queue_run.registered_mac_run_exists(saved.assignment)):
+                        pass
+                    elif (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
                             and isinstance(report.path, placement.DispatchPathPending))):
                         key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
                         self.assignments[key] = replace(saved, terminal_report=placement.TerminalAttemptReport(
@@ -4226,6 +4440,38 @@ done
         saved = self.assignments.get(key)
         if saved is None or saved.assignment != assignment:
             return [self._placement_status(assignment, check_lifetime=False)]
+        submitted = self.placement_requests.get(assignment.episode)
+        registered_mac_settlement = False
+        if assignment.destination.provider == "mac" and submitted is not None and self._shared_mac_run(submitted):
+            if self.current_assignments.get(assignment.episode) != key:
+                return [self._placement_status(assignment, check_lifetime=False)]
+            if isinstance(request, wire.ClaimFailure):
+                return [self._placement_status(assignment, "the Mac run requires an exact settlement report",
+                                               check_lifetime=False)]
+            if (isinstance(request.outcome, placement.PrelaunchRefused)
+                    and not isinstance(saved.permission, placement.PermissionAvailable)):
+                return [self._placement_status(assignment, "the Mac launch was already authorized",
+                                               check_lifetime=False)]
+            if isinstance(request.path, placement.DispatchPathSettled):
+                from scripts.mac_test import offload
+
+                try:
+                    registered = mac_queue_run.read_registered_mac_run(assignment)
+                    if isinstance(registered, mac_queue_run.RegisteredMacRun):
+                        journal_report = mac_queue_run.saved_completion(registered.saved, assignment)
+                        if (registered.saved["settlement"] is not mac_queue_run.GateSettlement.RELEASE_CONFIRMED
+                                or not isinstance(journal_report, wire.ExecutionReport)
+                                or journal_report != replace(request, code_version=journal_report.code_version)
+                                or isinstance(saved.holder, placement.ClaimHolderIdentity) and saved.holder != registered.holder):
+                            return [self._placement_status(assignment, "the Mac gate journal has not settled",
+                                                           check_lifetime=False)]
+                        registered_mac_settlement = True
+                    if (request.claim != placement.assigned_claim_reference(assignment)
+                            or not isinstance(offload.read_assigned_mac_claim(assignment), offload.MacClaimSettled)):
+                        return [self._placement_status(assignment, "the exact Mac claim has not settled",
+                                                       check_lifetime=False)]
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    return [self._placement_status(assignment, str(error), check_lifetime=False)]
         if isinstance(request, wire.ClaimFailure):
             if (self.current_assignments.get(assignment.episode) == key
                     and isinstance(saved.permission, placement.PermissionAvailable)
@@ -4258,8 +4504,8 @@ done
                 or isinstance(saved.permission, placement.PermissionAvailable)
                 and (isinstance(request.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
                     or isinstance(request.outcome, placement.AttemptCancelled)
-                    and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
-                    and saved.terminal_report.outcome == request.outcome)
+                    and (registered_mac_settlement or isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+                         and saved.terminal_report.outcome == request.outcome))
                 and isinstance(request.claim, placement.ProviderClaimReference)
                 and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
                 and request.claim.provider == assignment.destination.provider
@@ -4382,6 +4628,12 @@ done
             return [wire.Refused(refusal)]
         if isinstance(request, status_wire.PlacementStatusRequest):
             saved = self._saved_assignment(request.episode, request.attempt)
+            if (isinstance(saved, records.SavedPlacementAssignment) and saved.assignment.destination.provider == "mac"
+                    and mac_queue_run.registered_mac_run_exists(saved.assignment)):
+                try:
+                    _ = mac_queue_run.read_registered_mac_run(saved.assignment)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    return [wire.Refused(f"the admission service cannot read the Mac gate journal: {error}")]
             status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]

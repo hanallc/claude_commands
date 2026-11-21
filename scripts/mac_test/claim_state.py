@@ -1,22 +1,205 @@
-"""Read claim records and lock the target coordination state."""
+"""Read claim records and manage the processes that hold claims."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 import fcntl
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
+from scripts.agents.worker_lifecycle import acquire_flock, operation_deadline
+from scripts.lib import conf, process_group
+from scripts.lib.operation_deadline import remaining
+from scripts.lib.process_start import Gone, Zombie, proc_table_start
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
+    from scripts.build_queue.placement import PlacementAssignment
     from scripts.buildlog.transfer_bytes import TransferBytes
+
+
+CREATION_LEASE_FD = "MAC_GATE_CREATION_LEASE_FD"
+QUEUE_RUNS = ".local/state/mac-queue/runs"
+
+
+def gate_requests_directory() -> Path:
+    return Path.home() / '.local/state/mac-queue/requests'
+
+
+def queue_runs_directory() -> Path:
+    return Path.home() / QUEUE_RUNS
+
+
+@dataclass(frozen=True)
+class AssignedGatePaths:
+    journal: Path
+    directory: Path
+    lock: Path
+    preparation_lock: Path
+    request_root: Path
+
+    @property
+    def request(self) -> Path:
+        return self.request_root / self.request_root.name
+
+
+def assigned_gate_paths(assignment: PlacementAssignment | str) -> AssignedGatePaths:
+    attempt = assignment if isinstance(assignment, str) else assignment.attempt
+    if not attempt.isascii() or not attempt.isalnum():
+        raise ValueError("the Mac attempt identifier is invalid")
+    runs = queue_runs_directory()
+    return AssignedGatePaths(runs / f"{attempt}.json", runs / attempt, runs / f"{attempt}.lock",
+                             runs / f"{attempt}.prepare", gate_requests_directory() / f"mac-gate-{attempt}")
+
+
+def checkout_cleanup_seconds() -> float:
+    grace = conf.read('mac_gate').number('terminate_grace_seconds')
+    return conf.read("build_admission").number("program_stop_seconds") + 2 * grace
+
+
+def queue_cancel_seconds(target: str) -> float:
+    from scripts.mac_test import eligibility
+
+    connection = eligibility.read_connection_settings(eligibility.configured_ssh_target(target).settings)
+    grace = conf.read('mac_gate').number('terminate_grace_seconds')
+    return checkout_cleanup_seconds() + connection.leftover_timeout_s + 4 * grace
+
+
+class QueueProcessUnsettled(ValueError):
+    """The cleanup deadline ended before the process exited."""
+
+
+def wait_for_exit(process: subprocess.Popen[str] | subprocess.Popen[bytes], deadline: float) -> int:
+    with operation_deadline(deadline=deadline):
+        return process.wait(timeout=remaining())
+
+
+def owned_groups_alive(group: int, *, session: bool) -> set[int]:
+    """Read live groups on the natedev queue, excluding reaped or zombie processes."""
+    if not session:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return set()
+        if sys.platform == "darwin":
+            return {group}
+    proc = Path("/proc")
+    groups: set[int] = set()
+    for entry in proc.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        with suppress(ProcessLookupError):
+            active = os.getpgid(pid)
+            belongs = os.getsid(pid) == group if session else active == group
+            if belongs and not isinstance(proc_table_start(pid, proc), (Gone, Zombie)):
+                groups.add(active)
+    return groups
+
+
+def stop_owned_groups(group: int, *, session: bool) -> None:
+    while groups := owned_groups_alive(group, session=session):
+        budget = remaining()
+        for active in groups:
+            with suppress(ProcessLookupError):
+                process_group.send_process_group(active, signal.SIGKILL)
+        time.sleep(min(budget / 2, 0.05))
+
+
+def kill_and_wait(process: subprocess.Popen[str] | subprocess.Popen[bytes], deadline: float, *,
+                  owns_group: bool = False, confirm_group: bool = False, owns_session: bool = False) -> None:
+    try:
+        with operation_deadline(deadline=deadline):
+            with suppress(ProcessLookupError):
+                if owns_group:
+                    process_group.send_process_group(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            _ = process.wait(timeout=remaining())
+            if confirm_group or owns_session:
+                stop_owned_groups(process.pid, session=owns_session)
+    except (subprocess.TimeoutExpired, TimeoutError) as error:
+        raise QueueProcessUnsettled('The Mac queue process did not exit by the cleanup deadline') from error
+
+
+def terminate_and_wait(process: subprocess.Popen[str] | subprocess.Popen[bytes], *,
+                       deadline: float = 0, grace: float = 0, owns_group: bool = False) -> None:
+    if not owns_group and process.poll() is not None:
+        return
+    if not grace:
+        grace = conf.read("mac_gate").number("terminate_grace_seconds")
+    with operation_deadline(deadline=deadline or float('inf'), timeout=2 * grace) as end:
+        if process.poll() is None:
+            with suppress(ProcessLookupError):
+                if owns_group:
+                    process_group.send_process_group(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            try:
+                now = time.monotonic()
+                _ = wait_for_exit(process, min(now + grace, (now + end) / 2))
+            except (subprocess.TimeoutExpired, TimeoutError):
+                pass
+        if process.poll() is None or owns_group:
+            kill_and_wait(process, end, owns_group=owns_group, confirm_group=owns_group)
+
+
+def collect_command_output(process: subprocess.Popen[str], deadline: float, *,
+                           owns_group: bool, input_text: str | None = None,
+                           owns_session: bool = False) -> tuple[str, str]:
+    """Leave part of the deadline for termination and reaping."""
+    try:
+        try:
+            with operation_deadline(deadline=deadline):
+                reap_budget = remaining() / 4
+                with operation_deadline(deadline=deadline - reap_budget):
+                    if input_text is None:
+                        output = process.communicate(timeout=remaining())
+                    else:
+                        output = process.communicate(input_text, timeout=remaining())
+                if owns_session:
+                    stop_owned_groups(process.pid, session=sys.platform == "linux")
+                return output
+        except BaseException:
+            kill_and_wait(process, deadline, owns_group=owns_group, confirm_group=owns_group,
+                          owns_session=owns_session and sys.platform == "linux")
+            raise
+    finally:
+        close_process_pipes(process)
+
+
+def capture_cleanup_command(command: list[str], budget: float, *,
+                            pass_fds: tuple[int, ...] = (), cwd: Path | None = None,
+                            input_text: str | None = None,
+                            supervise_session: bool = False) -> subprocess.CompletedProcess[str]:
+    with operation_deadline(timeout=budget) as deadline:
+        _ = remaining()
+        # The callback owns its group. Its children must stay in that group.
+        own_group = supervise_session or CREATION_LEASE_FD not in os.environ
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=own_group, cwd=cwd, pass_fds=pass_fds)
+        output, errors = collect_command_output(process, deadline, owns_group=own_group, input_text=input_text,
+                                                owns_session=supervise_session)
+        assert process.returncode is not None
+        return subprocess.CompletedProcess(command, process.returncode, output, errors)
+
+
+def close_process_pipes(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
 
 
 SubmittingSession = OwningSession | NoOwningSession
@@ -323,14 +506,22 @@ def state_paths(target: str = "") -> StatePaths:
 
 
 @contextmanager
-def locked(path: Path) -> Generator[None, None, None]:
+def state_lock_descriptor(path: Path, *, mode: int = fcntl.LOCK_EX) -> Generator[int]:
+    """Keep the lock until the last copy of its descriptor closes."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with record_after_unlock(), path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    with path.open("a+", encoding="utf-8") as lock_file:
+        descriptor = lock_file.fileno()
+        acquire_flock(descriptor, mode=mode)
+        yield descriptor
+
+
+@contextmanager
+def locked(path: Path, *, mode: int = fcntl.LOCK_EX) -> Generator[None, None, None]:
+    with record_after_unlock(), state_lock_descriptor(path, mode=mode) as descriptor:
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def read_json_object(path: Path) -> dict[str, object] | None:

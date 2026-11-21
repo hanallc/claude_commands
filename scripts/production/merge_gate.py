@@ -38,7 +38,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -65,7 +65,10 @@ import tempfile
 import time
 from typing import Literal, TextIO, cast
 
+from scripts.agents.worker_lifecycle import operation_deadline
 from scripts.lib import process_group
+from scripts.lib.operation_deadline import remaining
+from scripts.mac_test.claim_state import kill_and_wait, stop_owned_groups
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
@@ -76,7 +79,8 @@ from scripts.production.gate_modules import GateRefused, discover_test_modules, 
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules, CloudGateRoute,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
-    MacGateExcludeFileMissing, ModuleCoverage, SelectedModules as SelectedModules,
+    MacGateExcludeFileMissing, MacGatePrelaunchRefused, MacGateUnresolved, ModuleCoverage,
+    SelectedModules as SelectedModules,
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production import mac_gate_process
@@ -91,12 +95,13 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records  # noqa: E402
+from scripts.build_queue import admission_protocol as wire, admission_records, first_step  # noqa: E402
 from scripts.build_queue import progress_profile
-from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_client import AdmissionHoldCheck, LocalGateRunFiles  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
+    QueuePlace, QueuePlaceRefused, gate_placement_sidecar, placed_program, queue_place,
+    suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -414,12 +419,27 @@ def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
         print("Memory stop message could not be sent: " + " ".join(str(error).split()), flush=True)
 
 
+@dataclass(frozen=True)
+class RequestGateReservation:
+    """The local runner must request a memory reservation."""
+
+
+REQUEST_GATE_RESERVATION = RequestGateReservation()
+ACTIVE_PLACED_GATE: ContextVar[QueuePlace | RequestGateReservation] = ContextVar(
+    "active_placed_gate", default=REQUEST_GATE_RESERVATION)
+
+
+
 @contextmanager
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
                      type_dirs: Sequence[str] = (),
-                     mode: SuiteMode = SuiteMode.MERGE_GATE) -> Generator[QueuePlace]:
+                     mode: SuiteMode = SuiteMode.MERGE_GATE,
+                     admitted: QueuePlace | RequestGateReservation = REQUEST_GATE_RESERVATION) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
+    if isinstance(admitted, QueuePlace):
+        yield admitted
+        return
     try:
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
         with queue_place(program, repo,
@@ -480,27 +500,44 @@ def fetch_branches(repo: Path, *branches: str) -> None:
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
     with ExitStack() as cleanup:
         recovery = ACTIVE_GATE_RECOVERY.get()
+        placed = ACTIVE_PLACED_GATE.get()
         process: subprocess.Popen[str] | None = None
+        settled = False
+        confirming_exit = False
         try:
             with cancellation.defer_cleanup_signals():
-                process = cleanup.enter_context(subprocess.Popen(
+                process = subprocess.Popen(
                     arguments, cwd=repo, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
+                    text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
+                if isinstance(placed, QueuePlace):
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None:
+                            _ = cleanup.enter_context(stream)
+                else:
+                    _ = cleanup.enter_context(process)
                 if isinstance(recovery, GateRecovery):
                     recovery.add_group(process.pid)
             output, errors = process.communicate()
+            if isinstance(placed, QueuePlace):
+                confirming_exit = True
+                with operation_deadline(timeout=placed.configuration.program_stop_seconds):
+                    stop_owned_groups(process.pid, session=False)
+            settled = True
             return subprocess.CompletedProcess(arguments, cast(int, process.returncode), output, errors)
         except BaseException:
-            if process is not None:
-                try:
-                    process_group.send_process_group(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                _ = process.wait()
+            if process is not None and not confirming_exit:
+                if isinstance(placed, QueuePlace):
+                    with operation_deadline(timeout=placed.configuration.program_stop_seconds) as deadline:
+                        kill_and_wait(process, deadline, owns_group=True, confirm_group=True)
+                else:
+                    with suppress(ProcessLookupError):
+                        process_group.send_process_group(process.pid, signal.SIGKILL)
+                    _ = process.wait()
+                settled = True
             raise
         finally:
-            if isinstance(recovery, GateRecovery) and process is not None and process.returncode is not None:
+            if isinstance(recovery, GateRecovery) and process is not None and settled:
                 recovery.remove_group(process.pid)
 
 
@@ -734,6 +771,12 @@ class GateRecovery:
         self.path.unlink()
 
 
+def record_placed_gate_journal(place: QueuePlace, recovery: GateRecovery) -> None:
+    files = LocalGateRunFiles.for_sidecar(place.sidecar)
+    if isinstance(files, LocalGateRunFiles) and not files.group_journal.exists():
+        write_text_atomic(files.group_journal, str(recovery.path))
+
+
 @dataclass(frozen=True)
 class NoGateRecovery:
     """No gate owns resources in this calling context."""
@@ -944,37 +987,63 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
             job.cpu_seconds = usage.ru_utime + usage.ru_stime
 
 
-def kill_job_group(job: RunningGateJob) -> None:
-    # Also run this after the leader exits: a successful module may have leaked
-    # children. SIGKILL prevents a child that ignores TERM from surviving cleanup.
-    try:
-        process_group.send_process_group(job.process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    reap_gate_job(job, block=True)
+def signal_gate_job(job: RunningGateJob, number: signal.Signals) -> None:
+    with suppress(ProcessLookupError):
+        process_group.send_process_group(job.process.pid, number)
+
+
+def confirm_placed_job_exit(job: RunningGateJob, sample_seconds: float) -> None:
+    while job.process.returncode is None:
+        reap_gate_job(job)
+        if job.process.returncode is None:
+            time.sleep(remaining(sample_seconds))
+    stop_owned_groups(job.process.pid, session=False)
+
+
+def remove_gate_job_record(job: RunningGateJob) -> None:
     recovery = ACTIVE_GATE_RECOVERY.get()
     if isinstance(recovery, GateRecovery):
         recovery.remove_group(job.process.pid)
 
 
+def kill_job_group(job: RunningGateJob) -> None:
+    # A successful module can leave children after its leader exits.
+    signal_gate_job(job, signal.SIGKILL)
+    placed = ACTIVE_PLACED_GATE.get()
+    if isinstance(placed, QueuePlace):
+        with operation_deadline(timeout=placed.configuration.program_stop_seconds):
+            confirm_placed_job_exit(job, placed.configuration.program_sample_seconds)
+    else:
+        reap_gate_job(job, block=True)
+    remove_gate_job_record(job)
+
+
 def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
     """Stop all groups with one deadline, then reap their leaders."""
-    config = admission_records.read_memory_config()
-    deadline = time.monotonic() + config.program_stop_seconds
-    for job in jobs:
-        try:
-            process_group.send_process_group(job.process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    while True:
+    if not jobs:
+        return
+    placed = ACTIVE_PLACED_GATE.get()
+    config = placed.configuration if isinstance(placed, QueuePlace) else admission_records.read_memory_config()
+    with operation_deadline(timeout=config.program_stop_seconds) as deadline:
+        term_limit = (time.monotonic() + deadline) / 2 if isinstance(placed, QueuePlace) else deadline
         for job in jobs:
-            reap_gate_job(job)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or all(job.process.returncode is not None for job in jobs):
-            break
-        time.sleep(min(config.program_sample_seconds, remaining))
-    for job in jobs:
-        kill_job_group(job)
+            signal_gate_job(job, signal.SIGTERM)
+        while True:
+            for job in jobs:
+                reap_gate_job(job)
+            left = term_limit - time.monotonic()
+            if left <= 0 or all(job.process.returncode is not None for job in jobs):
+                break
+            time.sleep(min(config.program_sample_seconds, left))
+        if isinstance(placed, QueuePlace):
+            for job in jobs:
+                signal_gate_job(job, signal.SIGKILL)
+            for job in jobs:
+                confirm_placed_job_exit(job, config.program_sample_seconds)
+                remove_gate_job_record(job)
+        else:
+            for job in jobs:
+                kill_job_group(job)
 
 
 def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
@@ -1373,7 +1442,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                mode: SuiteMode = SuiteMode.MERGE_GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
-               time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
+               time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT,
+               admitted: QueuePlace | RequestGateReservation = REQUEST_GATE_RESERVATION) -> GateRun:
     shared = isinstance(machine, SharedMachine)
     if shared:
         recover_gate_runs(repo)
@@ -1518,7 +1588,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
+          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode, admitted=admitted)
+           if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
@@ -2803,122 +2874,135 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.MERGE_GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
-    """Route merge gates through AWS. Split targeted tests between natedev and the Mac."""
-    def run_local(types: Sequence[str]) -> GateRun:
-        return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
-
+    """Use AWS first for merge gates, then place eligible tests on the Mac or natedev."""
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
 
-    def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
-        return run_suites(repo, types, module_time_limit_s, source=source, full=full,
-                          mode=mode, selected=SelectedModules(paths))
+    def run_local(types: Sequence[str], modules: AllModules | SelectedModules = ALL_MODULES,
+                  admitted: QueuePlace | RequestGateReservation = REQUEST_GATE_RESERVATION) -> GateRun:
+        return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode,
+                          selected=modules, admitted=admitted)
 
-    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
+    def run_cloud(selection: AllModules | TreeSelection) -> GateRun | str:
         outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                               selected=selection, gate_job=gate_job)
-        if isinstance(outcome, str):
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
-        if not type_dirs or outcome.time_limit_report:
+        if isinstance(outcome, str) or not type_dirs or outcome.time_limit_report:
             return outcome
-        local = run_local_subset((), type_dirs)
+        local = run_local(type_dirs, SelectedModules(()))
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
+
+    def without_mac() -> GateRun:
+        if mode is SuiteMode.TARGETED_TEST:
+            cloud_result = run_cloud(selected)
+            if isinstance(cloud_result, GateRun):
+                return cloud_result
+            print("Cloud gate uses natedev: " + cloud_result, flush=True)
+        return run_local(type_dirs)
 
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     if mode is SuiteMode.MERGE_GATE:
-        return run_cloud(ALL_MODULES)
+        cloud_result = run_cloud(ALL_MODULES)
+        if isinstance(cloud_result, GateRun):
+            return cloud_result
+        print("Cloud gate declined: " + cloud_result, flush=True)
 
     selected: AllModules | TreeSelection = ALL_MODULES
-    whole_suite = full
-    if not full:
-        try:
+    whole_suite = full or mode is SuiteMode.MERGE_GATE
+    try:
+        if mode is SuiteMode.TARGETED_TEST and not full:
             tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        if ledger.reuse(report=False):
-            return run_local(type_dirs)
-        whole_suite = isinstance(selection, FullSuite)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
-        if isinstance(selection, AffectedSelection) and not selection.modules:
-            if type_dirs:
+            tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                           else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+            modules = discover_test_modules(repo)
+            selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+            if ledger.reuse(report=False):
                 return run_local(type_dirs)
-            ledger.record_pass(selection)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
+            whole_suite = isinstance(selection, FullSuite)
+            paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+            selected = TreeSelection(tuple(path.relative_to(repo).as_posix() for path in paths), tree)
+            if isinstance(selection, AffectedSelection) and not selection.modules:
+                if type_dirs:
+                    return run_local(type_dirs)
+                ledger.record_pass(selection)
+                record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
+                                hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
+                                max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+                return GateRun((), 0.0, 0.0, selection_certified=True)
 
-    mac_module = mac_gate_process.MAC_GATE_MODULE
-    try:
-        mac = mac_gate_process.load_mac_gate_route(mac_module)
-    except ModuleNotFoundError as error:
-        if error.name != mac_module:
-            raise
-        return run_cloud(selected)
-    try:
+        mac_module = mac_gate_process.MAC_GATE_MODULE
+        try:
+            mac = mac_gate_process.load_mac_gate_route(mac_module)
+        except ModuleNotFoundError as error:
+            if error.name != mac_module:
+                raise
+            return without_mac()
         exclusions = mac.read_modules(repo)
         if isinstance(exclusions, MacGateExcludeFileMissing):
-            return run_cloud(selected)
-        excluded = set(exclusions.paths)
+            return without_mac()
+
         if isinstance(selected, AllModules):
-            tree, _dirty = cloud.working_tree(repo)
+            tree, dirty = cloud.working_tree(repo)
             modules = discover_test_modules(repo)
-            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), tree)
-        else:
-            assignment = selected
-        mac_paths = tuple(path for path in assignment.paths if path not in excluded)
-        linux_paths = tuple(path for path in assignment.paths if path in excluded)
+            suite_names = sorted({suite for suite, _ in modules})
+            if not full and not dirty and isinstance(full_required(), NoFullRunRequired):
+                clean = CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD"))
+                if PassedTreeLedger(repo, source, clean, suite_names).reuse(report=False):
+                    return run_local(type_dirs)
+            selected = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), tree)
+        excluded = set(exclusions.paths)
+        mac_paths = tuple(path for path in selected.paths if path not in excluded)
+        linux_paths = tuple(path for path in selected.paths if path in excluded)
+        local_modules = ALL_MODULES if whole_suite else SelectedModules(selected.paths)
+        tested_tree_key = selected.tree
+
+        def check_tree() -> None:
+            if cloud.working_tree(repo)[0] != tested_tree_key:
+                raise GateRefused("The checkout changed during the gate")
+
         if mac_paths:
-            with mac_gate_process.start_mac_gate(
-                    mac_module, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                    selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
-                if linux_paths or type_dirs:
-                    linux = run_local_subset(linux_paths, type_dirs)
-                else:
-                    linux = GateRun((), 0.0, 0.0, selection_certified=True)
-                outcome = mac_result.result()
+            with gate_placement_sidecar() as sidecar:
+                config = admission_records.read_memory_config()
+                request = first_step.gate_placement_request(repo.resolve(), tested_tree_key, mode.value,
+                                                            type_dirs, sidecar, config, gate_job)
+                grant = first_step.placement_grant(request)
+                if isinstance(grant, wire.Assignment):
+                    mac_result = mac.run_assigned(repo, assignment=grant.assignment, mode=mode, full=full,
+                                                  module_time_limit_s=module_time_limit_s,
+                                                  selected=TreeSelection(mac_paths, tested_tree_key))
+                    if isinstance(mac_result, MacGateUnresolved):
+                        raise GateRefused("Mac gate result unavailable: " + mac_result.reason)
+                    if isinstance(mac_result, MacGatePrelaunchRefused):
+                        print("Mac gate uses natedev: " + mac_result.reason, flush=True)
+                        grant = first_step.placement_grant(request)
+                        if isinstance(grant, wire.Assignment):
+                            raise GateRefused("The queue assigned the Mac after a settled refusal")
+                    else:
+                        check_tree()
+                        run = mac_result.run
+                        if linux_paths or type_dirs:
+                            local = run_local(type_dirs, SelectedModules(linux_paths))
+                            run = combine_gate_runs(run, local, seconds=run.seconds + local.seconds)
+                        check_tree()
+                        return replace(run, coverage=ModuleCoverage.COMPLETE if whole_suite else ModuleCoverage.SUBSET)
+                with placed_program(grant, sidecar, config) as place:
+                    token = ACTIVE_PLACED_GATE.set(place)
+                    try:
+                        with gate_recovery(repo) as recovery:
+                            record_placed_gate_journal(place, recovery)
+                            check_tree()
+                            run = run_local(type_dirs, local_modules, place)
+                            check_tree()
+                            place.status = int(not run.passed)
+                            return run
+                    finally:
+                        ACTIVE_PLACED_GATE.reset(token)
 
-            if isinstance(outcome, mac_gate_process.MacGateMiss):
-                print("Mac gate uses natedev: " + outcome.reason, flush=True)
-                outcome = GateRun((), outcome.seconds, 0.0, coverage=ModuleCoverage.SUBSET)
-
-            def module_path(job: GateJobResult) -> str:
-                return f"scripts/{job.suite}/{job.module}"
-
-            requested_paths = set(mac_paths)
-            passed_jobs = tuple(job for job in outcome.jobs
-                                if job.kind is GateJobKind.TEST_MODULE and job.returncode == 0
-                                and not job.killed_for and not job.tripwire_tripped and module_path(job) in requested_paths)
-            passed_paths = {module_path(job) for job in passed_jobs}
-            mac_pass = replace(outcome, jobs=passed_jobs, time_limit_report="",
-                               executions=outcome.executions or outcome.jobs)
-            run = combine_gate_runs(linux, mac_pass, seconds=max(linux.seconds, mac_pass.seconds))
-            missing = tuple(path for path in mac_paths if path not in passed_paths)
-            if missing:
-                print(f"Mac gate uses natedev for {len(missing)} modules without a pass", flush=True)
-                complete_local_run = whole_suite and not linux_paths and not passed_paths
-                if complete_local_run:
-                    local = run_local(())
-                else:
-                    local = run_local_subset(missing, ())
-                run = combine_gate_runs(run, local, seconds=run.seconds + local.seconds)
-                if complete_local_run:
-                    run = replace(run, tests_reused=local.tests_reused, coverage=local.coverage)
-        elif whole_suite:
-            run = run_local(type_dirs)
-        else:
-            run = run_local_subset(linux_paths, type_dirs)
-        if cloud.working_tree(repo)[0] != assignment.tree:
-            raise GateRefused("The checkout changed during the split gate")
+        run = run_local(type_dirs, local_modules)
+        check_tree()
         return run
-    except affected_modules.GraphError as error:
+    except (affected_modules.GraphError, first_step.FirstStepRefused, QueuePlaceRefused,
+            wire.AdmissionUnavailable, conf.Unusable) as error:
         raise GateRefused(str(error)) from error
 
 

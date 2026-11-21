@@ -5,7 +5,7 @@ build_targets asks this module first. A refused step never imports offload.py.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import time
@@ -110,6 +110,10 @@ class OffloadConfig:
     values: dict[str, str]
     source: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
     settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+
+    def for_host(self, host: str) -> OffloadConfig:
+        """Use the selected host with the same SSH timeouts."""
+        return replace(self, connection=replace(self.connection, host=host))
 
     @property
     def host(self) -> str:
