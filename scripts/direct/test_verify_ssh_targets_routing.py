@@ -424,7 +424,7 @@ raise SystemExit(75)
             if isinstance(request, wire.PlacementRequest) and any(
                     isinstance(reply, wire.DispatchStatus) for reply in replies):
                 reply_path, = (self.root / "tmp").glob("verify*/placement-reply")
-                reply_path.with_name("placement-1.json.wait").mkdir()
+                reply_path.with_name(f"placement-{request.episode}.json.wait").mkdir()
             return replies
 
         for arguments, cleanup_error in (
@@ -440,7 +440,7 @@ raise SystemExit(75)
                 self.assertEqual([line for line in output.splitlines() if line.startswith("verify.sh: target hana-gpu refused:")],
                                  [f"verify.sh: target hana-gpu refused: {hana.GPU_SELECTION_REQUIRED}"], output)
                 if cleanup_error:
-                    self.assertRegex(result.stderr, r"(?m)^\[Errno 21\] Is a directory: .*placement-1\.json\.wait'")
+                    self.assertRegex(result.stderr, r"(?m)^\[Errno 21\] Is a directory: .*placement-.+-step-1\.json\.wait'")
                 self.assertEqual(self.local_runs(), [])
 
     def test_pinned_gpu_prints_the_service_error_once(self) -> None:

@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # Source this file from the statusLine command with statusline set to this folder.
 # Read the account, colors, zone, and quota labels with shell builtins.
-# assignment.py reads the assignment and counts, then replaces itself with jq.
+# assignment.py reads the action count and renders the status line.
 
 if [ -n "${CONF_READ_LOG:-}" ]; then
   # shellcheck source=/dev/null

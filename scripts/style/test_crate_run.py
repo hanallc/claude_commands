@@ -146,7 +146,6 @@ def _configuration(root: Path) -> dict[str, str]:
         f"remote_registry={root / 'remote-mirrors'}",
         "git_timeout_seconds=10",
         "guard_timeout_seconds=10",
-        "wait_seconds=0.01",
         "owner.style=style",
         "owner.verify=verify",
         "",

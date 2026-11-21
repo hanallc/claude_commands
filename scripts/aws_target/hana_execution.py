@@ -695,6 +695,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
         guest_ended = False
         refusal = admission_refusal
         fence_needed = False
+        fence_observation: hana_protocol.HanaExecutionObservation | None = None
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
             if (isinstance(objects, SavedTerminalProofOnly) and (_journal_request(row) != request
@@ -750,6 +751,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             observation = _await_fence_acknowledgement(request, objects, fence_window)
             if isinstance(observation, HanaSettlementPending):
                 return pending(observation.reason)
+            fence_observation = observation
             evidence = observation.evidence
             reported_refusal = hana_protocol.command_admission_refusal(observation)
             if isinstance(reported_refusal, execution_identity.HanaCommandAdmissionRefused):
@@ -758,6 +760,13 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             row = _read_journal(directory, execution)
             if row['phase'] == 'settled':
                 return _settled_dispatch(row)
+            if fence_observation is not None and fence_observation.timing:
+                saved_observation = _checked_observation(row, request)
+                if isinstance(saved_observation, hana_protocol.HanaExecutionObservation):
+                    timing: hana_protocol.HanaCommandTiming = {**saved_observation.timing, **fence_observation.timing}
+                    fence_observation = replace(fence_observation, timing=timing)
+                row['observation'] = hana_result.object_fields(cast(object,
+                    json.loads(hana_protocol.encode_observation(fence_observation))))
             if 'outcome' not in row:
                 if isinstance(command, HanaSettled) and isinstance(command.outcome, placement.AttemptCompleted):
                     outcome: dict[str, object] = {'kind': 'completed', 'status': command.outcome.status}

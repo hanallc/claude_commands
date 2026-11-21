@@ -3907,6 +3907,10 @@ class TargetCatastropheTests(StaffTestCase):
         cast(Mock, self.client.pane_activity).return_value = herdr.PaneRunning(("claude",))
         cast(Mock, self.client.native_session).return_value = self.row.current_session
         cast(Mock, self.client.run).return_value = ""
+        visible_screen = herdr.Herdr._visible_screen  # pyright: ignore[reportPrivateUsage]
+        def read_visible_screen(pane: str) -> str:
+            return visible_screen(cast(herdr.Herdr, self.client), pane)
+        self.client.configure_mock(**{"_visible_screen.side_effect": read_visible_screen})
         cast(Mock, self.client.result).return_value = {"process_info": {
             "shell_pid": 998042, "foreground_process_group_id": 998043,
             "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}}
@@ -4082,6 +4086,65 @@ class HerdrTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "record failed"):
                 client.prompt("w1:p1", "/resume", target="fixture-submission")
         submit.assert_not_called()
+
+    def test_idle_command_checks_the_destination_before_the_final_composer_read(self) -> None:
+        client = self.herdr
+        pane, terminal, session = "w1:p1", "terminal-1", "fixture-submission"
+        text = "/model gpt-6.2-sol --reasoning=high"
+        for draft in ("", "typed text", " "):
+            screen = f"Earlier output\n  › {draft}\n\n  gpt-6.1-sol medium"
+            responses = [screen, screen, ""]
+            with (self.subTest(draft=draft),
+                  patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence")}),
+                  patch.object(client, "readiness",
+                               return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+                  patch.object(client, "native_session", return_value=session) as native,
+                  patch.object(client, "command_terminal", return_value=terminal) as destination,
+                  patch.object(client, "run", side_effect=responses) as run):
+                transport = Mock()
+                transport.attach_mock(native, "conversation")
+                transport.attach_mock(destination, "terminal")
+                transport.attach_mock(run, "run")
+                reads = [
+                    call("pane", "read", pane, "--source", "recent-unwrapped", "--lines", "60", deadline=math.inf),
+                    call("pane", "read", pane, "--source", "visible", "--format", "ansi"),
+                ]
+                if draft:
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, "^has unsent text$"):
+                        _ = client.idle_command(pane, terminal, text, target=session, codex=True)
+                    self.assertEqual(run.call_args_list, reads)
+                else:
+                    self.assertEqual(client.idle_command(pane, terminal, text, target=session, codex=True),
+                                     ("Earlier output",))
+                    self.assertEqual(run.call_args_list, [*reads, call("agent", "prompt", pane, text)])
+                self.assertEqual([step[0] for step in transport.mock_calls],
+                                 ["run", "conversation", "terminal", "run"] + ([] if draft else ["run"]))
+
+    def test_idle_command_refuses_a_conversation_that_changes_during_the_history_read(self) -> None:
+        client = self.herdr
+        pane, terminal, session = "w1:p1", "terminal-1", "fixture-submission"
+        text = "/model gpt-6.2-sol --reasoning=high"
+        conversation = session
+
+        def read_history(pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
+            nonlocal conversation
+            del pane, lines, joined, ansi, deadline
+            conversation = "replacement"
+            return "Earlier output\n  › \n\n  gpt-6.1-sol medium"
+
+        def read_conversation(_pane: str, _kind: str, _timeout: float) -> str:
+            return conversation
+
+        with (patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence")}),
+              patch.object(client, "readiness",
+                           return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+              patch.object(client, "native_session", side_effect=read_conversation),
+              patch.object(client, "command_terminal", return_value=terminal),
+              patch.object(client, "read", side_effect=read_history),
+              patch.object(client, "run") as run):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "the conversation changed"):
+                _ = client.idle_command(pane, terminal, text, target=session, codex=True)
+        run.assert_not_called()
 
     def test_timed_out_prose_keeps_its_source_in_the_delayed_hook(self) -> None:
         from scripts.hooks import conversation_pause

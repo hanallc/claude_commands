@@ -150,7 +150,7 @@ def unguarded_group_signals(scripts: Path) -> list[str]:
                     lines.add(number)
         if relative == Path("lib/process_group.py"):
             allowed = next((node for node in ast.walk(ast.parse(source))
-                            if isinstance(node, ast.FunctionDef) and node.name == "send_process_group"), None)
+                            if isinstance(node, ast.FunctionDef) and node.name == "_send_checked_group"), None)
             if allowed is not None:
                 send_line = next((node.lineno for node in ast.walk(allowed)
                                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -188,6 +188,16 @@ class ProcessGroupTests(PrivateGroupFixture):
         with patch.object(os, "killpg") as send:
             process_group.send_process_group(child.pid, signal.SIGTERM)
             send.assert_called_once_with(child.pid, signal.SIGTERM)
+
+    def test_only_the_group_leader_can_terminate_its_own_group(self) -> None:
+        pid = os.getpid()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid + 1):
+            with self.assertRaises(ValueError):
+                process_group.terminate_owned_process_group()
+            send.assert_not_called()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid):
+            process_group.terminate_owned_process_group()
+            send.assert_called_once_with(pid, signal.SIGTERM)
 
     def test_cli_refuses_invalid_ids_without_sending_a_signal(self) -> None:
         invalid: tuple[object, ...] = (MagicMock(), True, False, 0, 1, -2, os.getpgrp())

@@ -8,16 +8,20 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Sequence
+import sys
 from typing import cast
 
 from scripts.production import merge_gate
+from scripts.lib.build_steps import gate_job_for_command
 from scripts.lib.testing_folders import test_run_folder
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     merge_gate.add_suite_arguments(parser)
-    args = cast(merge_gate.GateArguments, parser.parse_args(argv))
+    args = cast(merge_gate.GateArguments, parser.parse_args(arguments))
+    args.gate_job = gate_job_for_command(["targeted_test.py", *arguments])
     with test_run_folder():
         return merge_gate.run_tests_only(args, merge_gate.SuiteMode.TARGETED_TEST)
 

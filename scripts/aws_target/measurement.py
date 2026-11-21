@@ -7,6 +7,7 @@ from datetime import date
 from decimal import Decimal
 import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger import ChargeRead as ChargeRead, read_charge as read_charge, charge_record as charge_record
@@ -115,17 +116,23 @@ class DailyUsage:
     usd: Decimal
 
 
+def accounting_day_bounds(day: date, now: int, zone: ZoneInfo) -> tuple[int, int]:
+    """Return accounting day bounds up to the report time."""
+    start, end = ledger.period_bounds(day, zone)
+    return start, min(now, end)
+
+
 def daily_usage(settings_path: Path, directory: Path, day: str, now: int, *,
                 inputs: MeasurementInputs | None = None) -> DailyUsage | MeasurementUnavailable:
     try:
         source = read_inputs(settings_path, directory) if inputs is None else inputs
         if isinstance(source.settings, MeasurementUnavailable):
             return source.settings
-        start, end = ledger.period_bounds(date.fromisoformat(day), source.settings.accounting_zone)
-        end = min(now, end)
+        accounting_day = date.fromisoformat(day)
+        start, end = accounting_day_bounds(accounting_day, now, source.settings.accounting_zone)
         if end < start:
             return MeasurementUnavailable('report day is in the future')
-        costs = ledger.costs_from_evidence(source.state, source.settings, end, window=date.fromisoformat(day))
+        costs = ledger.costs_from_evidence(source.state, source.settings, end, window=accounting_day)
         uptime = sum(row.confirmed_uptime_s for row in costs.intervals)
         usd = ledger.period_cost(costs.intervals, start, end)
         book = ledger.CostLedger(directory)

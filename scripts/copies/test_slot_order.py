@@ -45,7 +45,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
-from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, waiting
 from scripts.production.production_doc import Production
@@ -318,18 +318,23 @@ printf '%s\n' "$PLACEMENT_OWNER_PID" "$PLACEMENT_SINCE" "$PLACEMENT_EPISODE" "$P
 [[ -z "${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}${BUILDLOG_FIRST_STEP_ROUTE:-}${BUILDLOG_FIRST_STEP_SINCE:-}" ]]
 placement_once
 '''
-        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=self.source,
-            env={**os.environ, "HOLD_WAIT_DIR": str(self.root), "TEST_PLACEMENT_ARGUMENTS": str(arguments_file)},
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.splitlines(),
-            ["4242", "123.25", "parent-episode", str(self.root / "parent-assignment.json")])
-        arguments = arguments_file.read_text().split("\0")
-        self.assertEqual(arguments.count("place-step"), 1)
-        self.assertEqual(arguments[arguments.index("--pid") + 1], "4242")
-        self.assertEqual(arguments[arguments.index("--since") + 1], "123.25")
-        self.assertEqual(arguments[arguments.index("--episode") + 1], "parent-episode")
-        self.assertEqual(arguments[arguments.index("--assignment-file") + 1], str(self.root / "parent-assignment.json"))
+        for slot_source in ("", str(self.source)):
+            with self.subTest(slot_source=slot_source):
+                arguments_file.unlink(missing_ok=True)
+                environment = {**os.environ, "HOLD_WAIT_DIR": str(self.root),
+                               "TEST_PLACEMENT_ARGUMENTS": str(arguments_file), "VERIFY_SLOT_SOURCE": slot_source}
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=self.source,
+                    env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                    ["4242", "123.25", "parent-episode", str(self.root / "parent-assignment.json")])
+                arguments = arguments_file.read_text().split("\0")
+                self.assertEqual(arguments.count("place-step"), 1)
+                self.assertEqual(arguments[arguments.index("--pid") + 1], "4242")
+                self.assertEqual(arguments[arguments.index("--since") + 1], "123.25")
+                self.assertEqual(arguments[arguments.index("--episode") + 1], "parent-episode")
+                self.assertEqual(arguments[arguments.index("--assignment-file") + 1], str(self.root / "parent-assignment.json"))
+                self.assertEqual("--run" in arguments, not slot_source)
 
     def test_waiting_and_stopped_runs_leave_no_slot_or_lease(self) -> None:
         self.queue.hold_starts()
@@ -388,9 +393,11 @@ placement_once
             self.assertEqual(preparation.owner.pid, process.pid)
             self.assertGreater(preparation.need, 0)
             self.queue.free(0)
-        self.waiting.clear()
-        _ = os.write(proceed_fd, b"x")
-        first = self.next_step(process)
+        # Keep the held slot alive across the handoff, independent of scheduling.
+        with mock.patch.object(self.queue.clock, "advance", return_value=None):
+            self.waiting.clear()
+            _ = os.write(proceed_fd, b"x")
+            first = self.next_step(process)
         self.assertEqual(first["phase"], 0)
         self.assertFalse(self.waiting.is_set(), "the first command step entered the memory queue again")
         self.assertTrue(first["run"].startswith(f"{process.pid}:"), first)
@@ -409,8 +416,9 @@ placement_once
         self.waiting.clear()
         with self.queue.loop_turn():
             self.queue.free(0)
-        self.finish_step(process)
-        second = self.next_step(process)
+        with mock.patch.object(self.queue.clock, "advance", return_value=None):
+            self.finish_step(process)
+            second = self.next_step(process)
         self.assertEqual((second["phase"], second["cwd"], second["run"]), (1, first["cwd"], first["run"]))
         self.assertFalse(self.waiting.is_set(), "the next step entered the memory queue again")
         self.assertEqual(build_folders.build_folder_state(tree), "held")
@@ -480,9 +488,17 @@ placement_once
             self.assertEqual(Path(started["cwd"]), self.slot_root / "origin-slot1")
             self.finish(process)
 
+    def drain_full_folder_callers(self) -> None:
+        self.queue.free(60 * 1024**3)
+        # Close the gate's stdin before waiting for the step that needs its folder.
+        for process in self.processes:
+            if process.returncode is None:
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
     def test_full_folder_returns_memory_until_the_gate_releases_it(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
+        self.addCleanup(self.drain_full_folder_callers)
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
             f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max=1\nslots.wait_seconds=120\n")
         environment.update(fake_memory_readings(self.queue.root, available_kib=60 * 1024**2))
@@ -494,15 +510,18 @@ placement_once
         _ = gate.write_text(GATE_COMMAND.replace("for phase in range(2):",
             f"Path({str(held)!r}).touch()\nsys.stdin.buffer.read(1)\nfor phase in range(1):"))
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
-        with mock.patch.dict(os.environ, environment):
+        board = self.root / "step-board"
+        with locked_environment({**os.environ, **environment}, self.queue.loop_access):
             gate_process = self.start((sys.executable, str(gate), "--tests-only"))
             wait_until(held.exists, held.parent, processes=(gate_process,))
-            step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
+            with locked_environment({**os.environ, "UNIT_RUN_DIR": str(board)}, self.queue.loop_access):
+                step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
             self.assertTrue(self.slot_waiting.wait(TEST_HANG_GUARD_SECS), "the step did not wait for its folder")
             with self.queue.loop_turn():
                 slot, = self.queue.server.repository_slot_waiters.values()
                 episode = slot.request.episode
                 self.assertNotIn(episode, self.queue.caller_reservations())
+                self.assertFalse((board / "locks/cargo.d").exists())
             request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
             member = Path(request.constraints.repository) / "src/lib.rs"
             admitted_content = member.read_bytes()
@@ -701,7 +720,7 @@ placement_once
         environment.update(memory, UNIT_DETACHED_RUN="1", BUILDLOG_RUN="", TEST_RUNNER_MAC="passed",
                            TEST_RUNNER_STATUS="0", TEST_RUNNER_BUSY_UNTIL=str(mac_ready),
                            COPY_SLOT_TEST_ROOT=str(self.root))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(locked_environment({**os.environ, **environment}, self.queue.loop_access))
         self.addCleanup(reap, f"COPY_SLOT_TEST_ROOT={self.root}")
 
         def read_host(key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -729,18 +748,18 @@ placement_once
         hold_waiters: set[str] = set()
         mac_waiters: set[str] = set()
         slot_requests: dict[str, int] = {}
-        live_slot_waiter_count = 0
+        slot_request_count = 0
         handle = self.queue.server.handle_request
         reply_filter = self.queue.server.reply_filter
 
         def observe(request: wire.Request, connection: admission_service.Connection | admission_service.NoConnection
                     = admission_service.NO_CONNECTION) -> list[wire.Reply]:
-            nonlocal live_slot_waiter_count
+            nonlocal slot_request_count
             replies = handle(request, connection)
             if isinstance(request, wire.RepositorySlotRequest):
                 with condition:
                     slot_requests[request.episode] = slot_requests.get(request.episode, 0) + 1
-                    live_slot_waiter_count = len(self.queue.server.repository_slot_waiters)
+                    slot_request_count += 1
                     condition.notify_all()
             return replies
 
@@ -768,6 +787,8 @@ placement_once
         def start_verify(variant: str = "") -> subprocess.Popen[str]:
             caller = len(self.processes)
             board = boards[caller] = self.root / f"board-{caller}"
+            temporary = self.root / f"caller-{caller}-tmp"
+            temporary.mkdir()
             local = ("test", "sample", "--local", "fixture", "--no-cache")
             command = ("bash", verify, *local)
             if variant == "env":
@@ -777,8 +798,8 @@ placement_once
                 local_command = 'bash "$VERIFY_SCRIPT" ' + shlex.join(local)
                 command = ("bash", "-c", remote + " && " + local_command)
             options = ("--publish", "report.txt") if caller == 0 else ()
-            with mock.patch.dict(os.environ, {"COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
-                                            "VERIFY_SCRIPT": verify}):
+            with locked_environment({**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
+                                     "VERIFY_SCRIPT": verify, "TMPDIR": str(temporary)}, self.queue.loop_access):
                 return self.start(command, *options)
 
         def held_folders() -> set[Path]:
@@ -836,19 +857,36 @@ placement_once
             self.assertEqual(set(running), held_folders())
             print(f"Running: {len(running)} of {maximum} held.", flush=True)
 
-            with condition:
-                self.assertTrue(condition.wait_for(lambda: live_slot_waiter_count == 2, timeout=60),
-                                f"Expected two live slot waiters, saw {live_slot_waiter_count}.")
-            with self.queue.loop_turn():
-                waiters = list(self.queue.server.repository_slot_waiters.values())
-                self.assertEqual(len(waiters), 2)
-                reservations = self.queue.caller_reservations()
-                active = {self.processes.index(process) for process in (step[1] for step in running.values())}
-                self.assertEqual(len(reservations), maximum)
-                for waiter in waiters:
-                    self.assertNotIn(waiter.request.episode, reservations)
-                for number in set(boards) - active:
-                    self.assertFalse((boards[number] / "locks/cargo.d").exists())
+            deadline = time.monotonic() + 60
+            while True:
+                with condition:
+                    observed_count = slot_request_count
+                with self.queue.loop_turn():
+                    waiters = list(self.queue.server.repository_slot_waiters.values())
+                    if len(waiters) >= 2:
+                        self.assertEqual(len(waiters), 2)
+                        reservations = self.queue.caller_reservations()
+                        active = {self.processes.index(process) for process in (step[1] for step in running.values())}
+                        self.assertEqual(len(reservations), maximum)
+                        for waiter in waiters:
+                            self.assertNotIn(waiter.request.episode, reservations)
+                        for number in set(boards) - active:
+                            self.assertFalse((boards[number] / "locks/cargo.d").exists())
+                        break
+                with condition:
+                    changed = condition.wait_for(lambda: slot_request_count != observed_count,
+                                                 timeout=deadline - time.monotonic())
+                    if not changed:
+                        statuses = [process.poll() for process in self.processes]
+                        errors: dict[int, str] = {}
+                        for number, process in enumerate(self.processes):
+                            if statuses[number] is None or process.stderr is None:
+                                continue
+                            descriptor = process.stderr.fileno()
+                            if select.select([descriptor], [], [], 0)[0]:
+                                errors[number] = os.read(descriptor, 8192).decode(errors="replace")
+                        self.fail(f"Expected two live slot waiters, saw {len(waiters)}. "
+                                  + f"Slot requests: {slot_requests}. Caller statuses: {statuses}. Errors: {errors}.")
             print("Capacity: two waiters hold no memory, token or folder.", flush=True)
 
             def finish_caller(process: subprocess.Popen[str]) -> None:
