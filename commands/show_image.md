@@ -27,7 +27,7 @@ Check the light mode and phone width yourself when the change needs them.
    - Use `--change` for a change review row, such as `sdlc/C12`. Use `--phase` for phase work.
    - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
    - It copies the images, so you can delete the source files after it prints `registered`.
-4. Give the user the `Image link:` that the command prints for each image or pair.
+4. Give the user the `Image link:` that the command prints for each image or pair. Write it as the full URL in plain text, never as a Markdown link or a wikilink.
    It opens the Images page at that image.
    In a notice to a showrunner, give the same links and the image ids.
 

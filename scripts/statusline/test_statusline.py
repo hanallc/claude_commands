@@ -658,7 +658,7 @@ class AdhocItemsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config"
             config.mkdir()
-            _ = write_config_fixture(config / "send.conf", "review_hold_idle_minutes=30")
+            _ = write_config_fixture(config / "send.conf", "review_hold=on\nreview_hold_idle_minutes=30")
             env = {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "America/New_York",
                    "CLAUDE_CODE_SESSION_ID": "review-session"}
             first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
@@ -684,7 +684,7 @@ class AdhocItemsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config"
             config.mkdir()
-            _ = write_config_fixture(config / "send.conf", "review_hold_idle_minutes=30")
+            _ = write_config_fixture(config / "send.conf", "review_hold=on\nreview_hold_idle_minutes=30")
             with patch.dict(os.environ, {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "UTC"}):
                 repo = Path(adhoc_items.__file__).parents[2]
                 settings = cast(dict[str, object], json.loads((repo / "settings.json").read_text()))

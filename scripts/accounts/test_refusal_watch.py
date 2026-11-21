@@ -39,7 +39,7 @@ from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
-from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
+from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.agents.test_support import write_machine_config
@@ -91,6 +91,7 @@ REAL_SESSION_MOVES = stop_resume.move_sessions
 
 
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
+FIXTURE_REFRESH_EXPIRY = datetime(2100, 1, 1, tzinfo=timezone.utc)
 SOURCE_LOGIN = "source@example.invalid"
 TARGET_LOGIN = "target@example.invalid"
 def stored_group_labels(path: Path) -> dict[str, str]:
@@ -153,6 +154,7 @@ class RefusalWatchTests(unittest.TestCase):
         for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
             _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
+            self.write_refresh_expiry(label)
             _ = (self.home / "notes" / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
         _ = (self.home / "notes/claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
         _ = self.enterContext(isolated_parents())
@@ -368,6 +370,9 @@ class RefusalWatchTests(unittest.TestCase):
     def expired_login(self, login: str = "main@example.invalid") -> None:
         usage_store.save([agent_accounts.Report("Claude", email=login,
             usage_read_outcome=agent_accounts.UsageReadOutcome.STALE_TOKEN)], NOW)
+
+    def write_refresh_expiry(self, label: str, at: datetime = FIXTURE_REFRESH_EXPIRY) -> None:
+        write_claude_move_credentials(accounts.account_dir(label), expires_at=at)
 
     def test_expired_target_renews_before_the_queue_lock_and_moves_in_the_same_pass(self) -> None:
         path = self.groups()
@@ -1043,10 +1048,95 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(holds[head.id].at, WatchTime.at)
         self.assertEqual(self.moves.calls, [])
 
+    def test_due_head_without_local_sign_in_stays_queued_and_reports_once(self) -> None:
+        path = self.groups()
+        head = self.low_rule()
+        self.next_entries(head)
+        login_file = agent_accounts.claude_config_file(accounts.account_dir(head.to))
+        login_file.unlink()
+
+        for _pass in range(2):
+            lines = refusal_watch.run_auto_moves(NOW)
+            self.assertTrue(any(f"{head.to} has no sign-in on this machine" in line for line in lines), lines)
+            self.assertEqual(next_moves.read_next_moves(), (head,))
+            self.assertEqual(stored_group_labels(path)["units"], "claude1")
+            self.assertEqual(self.moves.calls, [])
+        self.assertEqual(len(self.head_deliveries), 1)
+        job, = self.head_deliveries[0]
+        self.assertEqual(job.recipient, "fixture-showrunner")
+        self.assertIn(f"{head.to} has no sign-in on this machine", job.text)
+        self.assertNotIn("@", job.text)
+
+    def test_second_group_stays_queued_when_its_sign_in_expires_during_the_pass(self) -> None:
+        path = self.groups(showrunners="claude1")
+        _ = self.owner("unit", host="unit")
+        _ = self.owner("runner", host="herdr")
+        first = self.low_rule()
+        second = self.low_rule("showrunners-low", group="showrunners", target="claude3")
+        self.next_entries(first, second)
+        self.reading(TARGET_LOGIN, 80)
+        self.write_refresh_expiry(second.to, NOW + timedelta(seconds=1))
+
+        def move_member(call: MoveCall) -> None:
+            self.moved(call)
+            if call.target == first.to:
+                WatchTime.at = NOW + timedelta(seconds=2)
+
+        self.moves.moved = move_member
+        for at in (NOW, NOW + timedelta(seconds=2)):
+            lines = refusal_watch.run_auto_moves(at)
+            self.assertEqual(next_moves.read_next_moves(), (second,))
+            self.assertEqual(stored_group_labels(path), {"units": first.to, "showrunners": "claude1"})
+            self.assertEqual([call.target for call in self.moves.calls], [first.to])
+            self.assertTrue(any(f"{second.to} has no sign-in on this machine" in line for line in lines), lines)
+        self.assertEqual(len(self.head_deliveries), 1)
+        job, = self.head_deliveries[0]
+        self.assertEqual(job.recipient, "fixture-showrunner")
+        self.assertIn(f"{second.to} has no sign-in on this machine", job.text)
+
+    def test_due_head_with_a_linked_account_directory_stays_queued(self) -> None:
+        path = self.groups()
+        head = self.low_rule(target="claude3")
+        self.next_entries(head)
+        self.reading(TARGET_LOGIN, 80)
+        directory = accounts.account_dir(head.to)
+        original = directory.rename(self.home / "former-account")
+        directory.symlink_to(original, target_is_directory=True)
+
+        lines = refusal_watch.run_auto_moves(NOW)
+
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertEqual(self.moves.calls, [])
+        self.assertTrue(any(f"{head.to} has no usable account directory" in line for line in lines))
+
+    def test_due_head_stays_queued_if_its_account_directory_becomes_a_link(self) -> None:
+        path = self.groups()
+        head = self.low_rule(target="claude3")
+        self.next_entries(head)
+        self.reading(TARGET_LOGIN, 80)
+        directory = accounts.account_dir(head.to)
+        read_members = refusal_watch._action_group_members  # pyright: ignore[reportPrivateUsage]
+
+        def replace_directory() -> dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]]:
+            original = directory.rename(self.home / "former-account")
+            directory.symlink_to(original, target_is_directory=True)
+            return read_members()
+
+        with patch.object(refusal_watch, "_action_group_members", side_effect=replace_directory) as members:
+            lines = refusal_watch.run_auto_moves(NOW)
+
+        members.assert_called_once_with()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertEqual(self.moves.calls, [])
+        self.assertTrue(any(f"{head.to} has no usable account directory" in line for line in lines))
+
     def test_stale_due_head_blocks_the_fresh_second_entry_and_reports_once_per_reason(self) -> None:
         self.assertEqual(accounts.setup("claude4"), [])
         _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "four@example.invalid"}}))
+        self.write_refresh_expiry("claude4")
         _ = (self.home / "notes" / note_name("claude4")).write_text("---\nlogin: four@example.invalid\n---\n")
         path = self.groups(showrunners="claude1")
         first = next_moves.ClaudeGroupMove("stale-head", "showrunners", 1, 40, "claude4", NOW)
@@ -2151,6 +2241,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(accounts.setup("claude4"), [])
         _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "four@example.invalid"}}))
+        self.write_refresh_expiry("claude4")
         _ = (self.home / "notes" / note_name("claude4")).write_text("---\nlogin: four@example.invalid\n---\n")
         path = self.groups()
         self.next_entries(self.hold_rule("first", target="claude4", minutes=5), self.hold_rule("second", minutes=5))

@@ -44,3 +44,7 @@ authorized assignment. Clear them only after that turn's acceptance is known;
 retain them on uncertainty. Use the adoption destination after a transfer fence,
 including when the old run no longer exists.
 </HeldRoleMessages>
+
+## links in session output
+- Write each link as the full URL in plain text, for example http://100.103.14.30:8765/3be7ed/mock.html.
+- Never write a Markdown link or a wikilink. The user's terminal cannot open them.

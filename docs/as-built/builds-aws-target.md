@@ -1131,11 +1131,20 @@ A launch row without a region ran in the home region, `region` in `aws_target.co
 The next line names the cheapest merge gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
-The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
-A cell shows `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`.
-The cell lists any Hana reservation after the recorded box hours and marks a gap above the limit with `over`.
-A type and region without a bill read shows `not billed`. Only types with hours have a row.
-An unreadable cost ledger shows a note in place of the billed hours.
+The last card asks “Did AWS bill more machine hours than we used?”
+It uses `run_cost.hours_checks` over the days with a bill in the configured window.
+When a higher bill exceeds the limit, the answer sums the displayed differences for those rows and gives their count.
+If only lower bills exceed the limit, the answer sums the displayed differences for those rows and gives their count.
+If all comparisons pass, the answer gives the total billed hours and the total recorded hours.
+If the answer is “No” and the displayed billed total is higher, a second sentence explains the limit and the Hana allowance.
+The visible table includes only higher bills that exceed the limit.
+The closed “All rows” control opens a table for every type and region with hours in the selected regions.
+The tables show billed hours, recorded hours and the signed difference to one decimal place.
+The difference subtracts the full values before rounding.
+If a marked difference or its sum rounds to zero, it shows as “less than 0.1 hours.”
+The Hana reserved column shows the hours set aside for Hana where the check uses them.
+If the bill for a row is due, the billed hours and the difference show a dash in “All rows.”
+The shared region filter includes all regions with an hours check.
 
 The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
@@ -1155,6 +1164,8 @@ The user approved the combined table on 2026-11-18.
 2. The first two columns show the region and its quota in vCPUs.
    The quota is Standard quota or G and VT quota for the selected types.
    The quota has a blue-gray tint and stays visible when all Show chips are off.
+   The next three columns show the requested vCPUs, request state, and request age.
+   A region without a request shows a dash in those columns.
 3. Each type header includes its vCPU count.
    When multiple values show, each type groups the Spot (USD/h), Gate (USD), or Fit (boxes) columns.
    Fit divides the region quota by the type's vCPU count and rounds down.
