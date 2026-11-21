@@ -665,7 +665,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** the `module_cost.py` sum of the 37 modules is at the Phase 401 target or less, labeled with its host, or the report gives a floor result with its cause; 20 repeated runs of each changed module and of each importer of the support file pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review; the gate route that builds names passes. After the phase is merged to main, the director writes the AWS sum in the next file when AWS has a full gate in the last 2 days.
 
-### Phase 403 — sibling tests that share one costly start fold into one test  · status: todo
+### Phase 403 — sibling tests that share one costly start fold into one test  · status: done (no change)
+
+**As built:** no code change (main 9f3459ec1b, 2026-11-21). A source read of the four groups found no read-only shared start, so Spec step 3 stops each fold. Gate cleanup: each signal case needs a fresh failed-gate process. Lint cache: each tool case changes its version and reads new cache results. SSH refusal: each case is a separate verify call that writes claim and attempt records. Unit status: each scenario uses its own registry or pane sequence, and the status command writes decisions to the fixture. No measurement ran. A later fold needs a group whose rows only read one costly start.
 **Depends on:** none
 
 #### Work Order
