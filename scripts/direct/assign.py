@@ -165,6 +165,8 @@ def parse_arguments() -> Arguments:
         parser.error("consultation-pane requires --new-worker")
     if args.target == "durable-design-role" and not args.parent:
         parser.error("durable-design-role requires --parent and an Astra policy")
+    if args.target == "durable-design-role" and not (args.to or args.new_worker):
+        parser.error("durable-design-role requires --to or --new-worker")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
     if args.operation == AssignmentOperation.ASTRA_REVIEW and not args.new_worker:
@@ -693,7 +695,13 @@ def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy, *
     """Start the named target with the supplied policy."""
     if isinstance(target, worker_panes.ConsultationPane):
         return side_pane.open(target.label, policy, question=target.question, cwd=target.cwd, delivery=target.delivery)
-    return staff_worker.launch(target, policy, lock=lock)
+    try:
+        started = staff_worker.launch(target, policy, lock=lock)
+    except staff.StaffRefused as error:
+        started = worker_panes.AdmissionRefused(str(error))
+    if isinstance(started, worker_panes.AdmissionRefused):
+        return worker_panes.AdmissionRefused(" ".join(started.reason.splitlines()))
+    return started
 
 
 def execute_consultation(args: Arguments, cwd: Path) -> int:

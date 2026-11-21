@@ -9,13 +9,16 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import Enum, auto
-from typing import Literal, TypeVar, cast
+from typing import Literal, TypeVar, assert_never, cast
 
 from scripts.buildlog import index
 from scripts.buildlog import holds
 from scripts.buildlog import record
 from scripts.buildlog import store
-from scripts.mac_test.offload import KnownMacJob, LostRunLeftovers, MacHolder, UnreadableMacHolder
+from scripts.mac_test.offload import (
+    KnownMacJob, LostRunLeftovers, MacHolder, MirrorBusyCheck, RecordedMirrorSession, UnreadableMacHolder,
+    holder_from_value, holder_value,
+)
 from scripts.buildlog.mac_outcome import (
     COUNTED_AGAINST_SHARE, NOT_USABLE_REASONS, CacheReuse, LocalReasonNotRecorded,
     LocalRunRequested, MacRunCompleted, MacRunLost, MacRunMatchedNoTest,
@@ -56,21 +59,21 @@ RecordedBusyHolder = MacHolder | MacHolderNotRecorded
 def recorded_busy_holder(value: object) -> RecordedBusyHolder:
     if not isinstance(value, str) or not value:
         return MacHolderNotRecorded.VALUE
-    if value == "leftovers":
-        return LostRunLeftovers()
-    if value == "unreadable":
-        return UnreadableMacHolder()
-    return KnownMacJob(value)
+    return holder_from_value(value)
 
 
 def holder_text(holder: RecordedBusyHolder) -> str:
-    if isinstance(holder, KnownMacJob):
-        return holder.what
-    if isinstance(holder, LostRunLeftovers):
-        return "lost-run leftovers"
-    if isinstance(holder, UnreadableMacHolder):
-        return "holder unreadable"
-    return holder.value
+    match holder:
+        case UnreadableMacHolder(mirror_check=MirrorBusyCheck.UNREPORTED):
+            return "holder unreadable"
+        case KnownMacJob() | RecordedMirrorSession() | UnreadableMacHolder():
+            return holder_value(holder)
+        case LostRunLeftovers():
+            return "lost-run leftovers"
+        case MacHolderNotRecorded.VALUE:
+            return holder.value
+        case _:
+            assert_never(holder)
 
 
 @dataclass(frozen=True)

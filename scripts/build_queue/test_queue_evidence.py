@@ -5,8 +5,18 @@ import unittest
 from scripts.build_queue import admission_records as records, queue_evidence
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.message.unit_labels import UnitLabels
 
 GIB = records.GIB
+
+
+class StepLabelsTests(unittest.TestCase):
+    def test_an_unknown_staff_name_keeps_the_recorded_caller(self) -> None:
+        step = records.WaitingStep(123, "fixture", "saved caller", "nextest", "/private/widget",
+                                   0, GIB, records.ReadyForAdmission(), unit="unit")
+        labels = {"fixture": UnitLabels("unregistered session", "showrunner", "unit")}
+        label = queue_evidence.step_labels(step, labels)
+        self.assertEqual((label.session, label.showrunner, label.unit), ("saved caller", "showrunner", "unit"))
 
 
 class RoomTextTests(unittest.TestCase):
