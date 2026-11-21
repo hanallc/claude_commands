@@ -23,7 +23,7 @@ from scripts.mac_test.offload_test_commands import (
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
-from scripts.lib import conf, test_hang_guard
+from scripts.lib import conf, removal_guard, test_hang_guard
 
 
 MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
@@ -313,6 +313,18 @@ exit "$CLEANUP_TEST_STATUS"
         self.assertRegex(lines[2], r"^mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=(yes|no|unknown)$")
         return lines[:2] + lines[3:]
 
+    def assert_budget_review(self, target: Path, *, listed: bool) -> str:
+        report = (self.root / "trim-report").read_text()
+        plans = [Path(line.removeprefix("removal list: ")) for line in report.splitlines()
+                 if line.startswith("removal list: ")]
+        self.assertEqual(len(plans), int(listed), report)
+        if listed:
+            [plan] = plans
+            self.assertEqual(plan.parent, self.home_directory / removal_guard.LIST_DIRECTORY)
+            rows = [removal_guard.ListedEntry.parse(line) for line in plan.read_text().splitlines()]
+            self.assertEqual([(row.path, row.fingerprint) for row in rows], [(target, "")])
+        return report
+
     def test_unusable_log_directory_refuses_setup_before_lint(self) -> None:
         _ = install_nextest_log_writer(self.home_directory)
         path = self.home_directory / nextest_log.DIRECTORY
@@ -509,7 +521,7 @@ exit 1
 
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
-                for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
+                for default_kib, repository_kib, listed in ((96, 0, True), (256, 96, True), (96, 256, False)):
                     with self.subTest(shell=shell, status=status, default_kib=default_kib,
                                       repository_kib=repository_kib):
                         shutil.rmtree(target)
@@ -531,10 +543,11 @@ exit 1
                         self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
                         self.assertEqual(self.cleanup_lines(answer),
                                          ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
-                        self.assertEqual(old.exists(), not trim)
+                        _ = self.assert_budget_review(target, listed=listed)
+                        self.assertEqual(len(old.read_bytes()), 64 * 1024)
                         self.assertEqual(len(new.read_bytes()), 64 * 1024)
-                        remaining = sum(path.stat().st_blocks * 512 for path in target.rglob("*") if path.is_file())
-                        self.assertLessEqual(remaining, (repository_kib or default_kib) * 1024)
+                        over_budget = "yes" if listed else "no"
+                        self.assertRegex(answer.stdout, rf"mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget={over_budget}")
 
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for trim_fails in (False, True):
@@ -576,8 +589,8 @@ exit 1
                 answer = self.run_remote(["/bin/sh"], 0, free_floor_gib=50, budget_gib=str(32 / 1024 ** 2), trim="run")
             self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
             self.assertEqual(self.cleanup_lines(answer), ["nextest finished", "mac_exit=0", "mac_cleanup=kept"])
-            self.assertFalse(old.exists())
-            report = (self.root / "trim-report").read_text()
+            self.assertEqual(len(old.read_bytes()), 64 * 1024)
+            report = self.assert_budget_review(target, listed=True)
             self.assertIn("last used 2020-02-03 04:05 to 2020-02-03 04:05", report)
             self.assertNotIn("user_zone", (self.root / "trim-config-reads").read_text().splitlines())
 

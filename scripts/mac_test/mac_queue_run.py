@@ -423,6 +423,7 @@ def caller_watch(caller: int) -> Generator[None]:
     pid = os.getpid()
     if os.getpgrp() != pid:
         raise ValueError("the Mac queue must own its process group")
+    queue_thread = threading.get_ident()
     reader, writer = os.pipe()
     closing = threading.Event()
     failed = threading.Event()
@@ -452,8 +453,8 @@ def caller_watch(caller: int) -> Generator[None]:
                     if status != CALLER_EXITED:
                         print(f"mac queue: caller watch ended unexpectedly ({status})", file=sys.stderr, flush=True)
                         failed.set()
-                    # Let the queue reap prepare and obtain the remote cleanup result.
-                    os.kill(pid, signal.SIGINT)
+                    # Wake the queue thread if it is blocked reading SSH output.
+                    signal.pthread_kill(queue_thread, signal.SIGINT)
 
                 supervisor = threading.Thread(target=monitor, daemon=True)
                 supervisor.start()
