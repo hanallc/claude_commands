@@ -42,10 +42,14 @@ from scripts.production.merge_checkpoint import (
 )
 from scripts.production import production_doc
 from scripts.production.production_names import (
-    CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, MOVE_RECORD,
+    CARGO_LINER_PRODUCTION, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, MOVE_RECORD,
     MOVE_VERSION, NOTES_DIRECTORY,
 )
-from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
+from scripts.production.update_registration import (
+    QuestionStaff, RegistrationFailure, judgment_state, require_planned_admission, status_line,
+    require_guard_ready as require_guard_ready,
+    require_new_document as require_new_document,
+)
 
 from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
 from scripts.lib.process_failure import failure_detail
@@ -479,11 +483,6 @@ def stage_notes(production: Production, lines: list[str], record: staff.StaffSna
     print(f"Staged {len(copies)} notes in {staged}.")
 
 
-def status_line(lines: list[str]) -> re.Match[str] | None:
-    return next((re.search(r"^> \*\*Status: PRODUCTION — (planned|running|wrapped)\.\*\*", line)
-                 for line in lines if line.startswith("> **Status:")), None)
-
-
 def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | ProductionWrapped:
     match = status_line(lines)
     if match is None:
@@ -579,32 +578,6 @@ def move_session_state(production_name: str, scratch: Path) -> None:
     copied = showrunners.copy_session_state(identity, scratch)
     report("state-dir", "ok", f"{showrunners.session_state_dir(identity)}"
            + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
-
-
-def require_guard_ready() -> None:
-    """Require the installed guard proof before a production starts."""
-    if production_doc.read_guard_ready() is None:
-        raise Refusal(f"new production creation requires a valid {GUARD_READY_FILE}")
-
-
-def require_new_document(document: production_doc.ProductionDocument) -> None:
-    require_guard_ready()
-    if not staff.declares_merge_checkout(document.doc.read_text(encoding="utf-8").splitlines()):
-        raise Refusal(f"{document.doc}: new productions require {MERGE_CHECKOUT_FIELD}")
-    main = session_staff.production_session_directory(document.doc, document.checkout)
-    for path in (document.doc, document.log):
-        try:
-            require_untracked_ignored(main, path.relative_to(main).as_posix())
-        except (ExcludeRefused, ValueError) as error:
-            raise Refusal(str(error)) from error
-
-
-def require_planned_admission(production: Production, lines: list[str]) -> None:
-    status = status_line(lines)
-    if status is not None and status[1] == "planned" and (
-            staff.declares_merge_checkout(lines)
-            or isinstance(showrunners.timer_for(production.owner, staff.snapshot()), showrunners.NoTimer)):
-        require_new_document(production)
 
 
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
