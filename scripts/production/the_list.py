@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib import conf, file_lock
+from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
-from scripts.production import change_review, delivery_state, record_store, staff
+from scripts.production import delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
 
 
@@ -368,18 +368,6 @@ class LinkedChangeDelivered:
 @dataclass(frozen=True)
 class UnparkedForDelivery(Unparked):
     reason: ItemDelivered | LinkedChangeDelivered
-
-
-@dataclass(frozen=True)
-class DeliveryParkEvent:
-    """Identify a park even when another park has the same time."""
-
-    index: int
-    change: ItemChange
-
-
-class NoDeliveryPark(StrEnum):
-    ABSENT = ""
 
 
 @dataclass(frozen=True)
@@ -924,6 +912,7 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": "Reopened"}
     if isinstance(content, UnparkedForDelivery):
         if isinstance(content.reason, LinkedChangeDelivered):
+            # Preserve old entries when saving the item.
             return {"action": "Unparked", "delivered_change": content.reason.key}
         return {"action": "Unparked", "delivered_item": True}
     if isinstance(content, Unparked):
@@ -1520,18 +1509,6 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
     return _change(keeper, identity, edit, event, source, page_action=notice).item
 
 
-def delivery_park_event(item: ListItem) -> DeliveryParkEvent | NoDeliveryPark:
-    if item.parked_until is ParkUntilDelivered.DELIVERED and item.state not in (ItemState.CLOSED, ItemState.DONE):
-        for index in range(len(item.log) - 1, -1, -1):
-            change = item.log[index]
-            event = change.what
-            if isinstance(event, FieldChange) and event.action == "Parked":
-                if event.fields.get("parked_until") is ParkUntilDelivered.DELIVERED:
-                    return DeliveryParkEvent(index, change)
-                break
-    return NoDeliveryPark.ABSENT
-
-
 def unread_delivery(item: ListItem) -> bool:
     if item.state != ItemState.DELIVERED or not isinstance(item.unread_since, datetime):
         return False
@@ -1542,32 +1519,6 @@ def unread_delivery(item: ListItem) -> bool:
         if isinstance(event, UnparkedForDelivery):
             return True
     return False
-
-
-class DeliveryParkRelease(StrEnum):
-    RELEASED = "released"
-    KEPT = "kept"
-
-
-def unpark_for_delivered_change(keeper: staff.StaffId, identity: str, park: DeliveryParkEvent, key: str,
-                                *, review_root: Path, review_list: Path,
-                                change_ready: Callable[[], bool]) -> DeliveryParkRelease:
-    """Try the List lock before the Review locks, as List Ask does."""
-    store = _store(keeper)
-    with file_lock.exclusive(store.lock_path(), wait=False) as listing:
-        if listing is file_lock.LockResult.BUSY:
-            return DeliveryParkRelease.KEPT
-        item = load(keeper, identity)
-        if delivery_park_event(item) != park or key not in item.reviews:
-            return DeliveryParkRelease.KEPT
-        with change_review.try_review_write(review_list, review_root) as review:
-            if review is file_lock.LockResult.BUSY or not change_ready():
-                return DeliveryParkRelease.KEPT
-            moment = now()
-            event = ItemChange(moment, UnparkedForDelivery(LinkedChangeDelivered(key)), "the List")
-            _save(store, replace(item, parked_until=NoTimestamp.UNSET, state=ItemState.DELIVERED,
-                                 updated=moment, unread_since=moment, log=(*item.log, event)))
-    return DeliveryParkRelease.RELEASED
 
 
 def unpark(keeper: staff.StaffId, identity: str, *, source: str,

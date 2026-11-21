@@ -3042,6 +3042,92 @@ window.fetch=async(url,options)=>{
                 self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_question_chip_counts_match_rows_while_a_saved_followup_awaits_refresh(self) -> None:
+        answered = self.question()
+        remaining = self.question('What should the header say?')
+        other_source = fixture_member('unit', name='other-source', parent=self.fixture.unit.parent)
+        _ = self.fixture.file_user_question('What should the footer say?', asker=other_source)
+        other_owner = fixture_member('showrunner', name='other-owner')
+        other_question = self.fixture.file_user_question('Which label should the button use?', asker=other_source)
+        records = [replace(item, owner=other_owner.id) if item.key == other_question else item
+                   for item in review_items.read(self.root)]
+        with patch.object(review_items, 'read', return_value=records):
+            markup = browser_markup(self.root)
+        place = '#' + urlencode({'show': 'all', 'type': 'question', 'owner': answered.split('/')[1],
+                                  'source-owner': self.fixture.unit.id})
+        setup = '<script>history.replaceState(null, "", '+json.dumps(place)+');</script>'
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const content=document.querySelector('[data-review]'),fetchPage=window.fetch;
+ const answered=ANSWERED,remaining=REMAINING;
+ const rows=()=>[...content.querySelectorAll('[data-list-item]:not([hidden])')];
+ const ownerChip=id=>content.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]');
+ const checkCounts=expected=>{
+  const shown=rows().length;
+  check(shown===expected,'Expected '+expected+' visible Questions, got '+shown+'.');
+  for(const kind of ['type','show','owner']){
+   const chip=content.querySelector('[data-'+kind+'-chip][aria-pressed="true"]');
+   check(chip?.querySelector('b')?.textContent===String(shown),
+    'The selected '+kind+' chip counts the visible Questions.');
+  }
+ };
+ let releaseRefresh;
+ const refreshResponse=new Promise(resolve=>{releaseRefresh=resolve;});
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST' && options.body.get('row')===answered && options.body.get('outcome')==='question')
+   return Promise.resolve(Response.json({answer:'question sent',state:'Waiting',type:'question',later:0}));
+  const params=new URL(url,location.href).searchParams;
+  if(params.has('version') && !params.has('body')) return refreshResponse;
+  return fetchPage(url,options);
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='720px';
+  check(content.dataset.show==='all' &&
+   content.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
+   'Review starts with Show All and the Question type.');
+  const row=rows().find(item=>item.dataset.key===answered);
+  const owner=ownerChip(row.dataset.owner);
+  check(owner.getAttribute('aria-pressed')==='true' && owner.querySelector('b').textContent==='2',
+   'The selected Owner chip excludes the Question from the other source.');
+  checkCounts(2);
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(!form.dataset.sending){observer.disconnect();resolve();}
+   });
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.elements.feedback.value='Can the compact layout show all controls?';
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  if(!form.dataset.sending) throw new Error('The Question follow-up did not start.');
+  await saved;
+  check(form.querySelector('[data-send-status]').textContent==='Saved: question sent',
+   'The Question follow-up saves before the next index arrives.');
+  check(rows()[0]?.dataset.key===remaining,'The other Question stays visible.');
+  checkCounts(1);
+  check(content.querySelector('[data-show-chip="Waiting"] b').textContent==='0',
+   'The Waiting chip excludes the saved Question until the index arrives.');
+  const other=ownerChip(OTHER_OWNER),all=ownerChip('');
+  const otherCount=Number(other.querySelector('b').textContent),allCount=Number(all.querySelector('b').textContent);
+  check(otherCount===1 && allCount===3,'The other Owner and All counts include Questions from the other source.');
+  other.click();
+  check(other.getAttribute('aria-pressed')==='true' && !new URLSearchParams(location.hash.slice(1)).has('source-owner'),
+   'Selecting another Owner clears the source filter.');
+  check(rows().length===otherCount && rows()[0]?.dataset.key===OTHER_QUESTION,
+   'The other Owner count equals the number of Questions after the click.');
+  all.click();
+  check(rows().length===allCount,'The All count equals the number of Questions after the click.');
+ }catch(error){failures.push(String(error));}
+ finally{releaseRefresh(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));}
+ await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace('ANSWERED', json.dumps(answered)).replace('REMAINING', json.dumps(remaining)).replace(
+            'OTHER_OWNER', json.dumps(other_owner.id)).replace('OTHER_QUESTION', json.dumps(other_question))
+        page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
         _ = self.decisions()
         _ = self.question()
