@@ -542,32 +542,65 @@ def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["git", *arguments], 1, "", str(error))
 
 
+def _configuration_checkout(source: Path, checkout_text: str) -> tuple[Path, str] | NoCommittedConfiguration:
+    checkout = Path(checkout_text)
+    if not checkout.is_absolute():
+        return NoCommittedConfiguration()
+    try:
+        checkout = checkout.resolve()
+        relative = source.resolve().relative_to(checkout).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return NoCommittedConfiguration()
+    return checkout, relative
+
+
+def _full_commit_id(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", value) is not None
+
+
 def committed_configuration_revision(source: Path) -> CommittedConfigurationRevision | NoCommittedConfiguration:
     """Identify the commit and file that can supply saved settings."""
     root = _git(source.parent, "rev-parse", "--show-toplevel", "HEAD")
     if root.returncode:
         return NoCommittedConfiguration()
-    checkout_text, commit = root.stdout.splitlines()
-    checkout = Path(checkout_text).resolve()
-    try:
-        relative = source.resolve().relative_to(checkout).as_posix()
-    except ValueError:
+    lines = root.stdout.splitlines()
+    if len(lines) != 2 or not _full_commit_id(lines[1]):
         return NoCommittedConfiguration()
-    return CommittedConfigurationRevision(checkout, relative, commit)
+    location = _configuration_checkout(source, lines[0])
+    if isinstance(location, NoCommittedConfiguration):
+        return location
+    checkout, relative = location
+    return CommittedConfigurationRevision(checkout, relative, lines[1])
 
 
-def _files_at_revision(revision: CommittedConfigurationRevision | NoCommittedConfiguration) -> Iterator[str]:
-    if isinstance(revision, NoCommittedConfiguration):
+def _configuration_history(checkout: Path, relative: str, *revision: str) -> Iterator[str]:
+    history = _git(checkout, "log", "--format=%H", *revision, "--", relative)
+    if history.returncode:
         return
-    history = _git(revision.checkout, "log", "--format=%H", revision.commit, "--", revision.path)
-    for commit in history.stdout.splitlines() if history.returncode == 0 else ():
-        saved = _git(revision.checkout, "show", f"{commit}:{revision.path}")
+    for commit in history.stdout.splitlines():
+        if not _full_commit_id(commit):
+            continue
+        saved = _git(checkout, "show", f"{commit}:{relative}")
         if saved.returncode == 0:
             yield saved.stdout
 
 
+def _files_at_revision(revision: CommittedConfigurationRevision | NoCommittedConfiguration) -> Iterator[str]:
+    if isinstance(revision, CommittedConfigurationRevision):
+        yield from _configuration_history(revision.checkout, revision.path, revision.commit)
+
+
 def _committed_files(source: Path) -> Iterator[str]:
-    yield from _files_at_revision(committed_configuration_revision(source))
+    root = _git(source.parent, "rev-parse", "--show-toplevel")
+    if root.returncode:
+        return
+    lines = root.stdout.splitlines()
+    if len(lines) != 1:
+        return
+    location = _configuration_checkout(source, lines[0])
+    if not isinstance(location, NoCommittedConfiguration):
+        checkout, relative = location
+        yield from _configuration_history(checkout, relative)
 
 
 def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:

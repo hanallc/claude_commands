@@ -725,7 +725,8 @@ def publish_configured() -> int:
     from scripts.build_targets.target_config import ssh_target_state_directory
 
     try:
-        _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder())
+        _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder(),
+                    settings_path=aws_config.account_settings_path())
     except PagePublicationDeferred as error:
         print(f'aws_page: {error}', file=sys.stderr)
         return 1

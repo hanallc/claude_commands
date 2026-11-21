@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from zipfile import ZipFile, Path as ZipPath
+from scripts.aws_target.ledger_test_support import install_cost_settings
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
@@ -1875,8 +1876,11 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_mac_copies_section_counts_outcomes_and_estimates_the_saving(self) -> None:
+        settings = self.root.parent / 'installed' / 'aws_target.conf'
+        install_cost_settings(settings)
         self.write_copy_day()
-        text = self.render()
+        with mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(settings)}):
+            text = self.render()
         lines = text.splitlines()
         mac = self.section_lines(text, "### Mac")
         self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### AWS")
