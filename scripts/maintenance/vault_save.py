@@ -443,7 +443,7 @@ def commit_first_save(vault: Path, manifest: Path, manifest_hash: str) -> None:
 
 
 class Arguments(argparse.Namespace):
-    vault: Path = Path()
+    vault: Path | None = None
     command: str = ""
     action: str = ""
     manifest_hash: str = ""
@@ -451,14 +451,14 @@ class Arguments(argparse.Namespace):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--vault", type=Path, default=Path.home() / "rust/hanadocs")
+    _ = parser.add_argument("--vault", type=Path)
     modes = parser.add_subparsers(dest="command")
     first_save = modes.add_parser("first-save")
     actions = first_save.add_subparsers(dest="action", required=True)
     _ = actions.add_parser("scan")
     _ = actions.add_parser("commit").add_argument("manifest_hash")
     args = parser.parse_args(argv, namespace=Arguments())
-    vault = args.vault.resolve()
+    vault = (args.vault if args.vault is not None else Path.home() / "rust/hanadocs").resolve()
     try:
         root = Path(checked(vault, "rev-parse", "--show-toplevel").strip()).resolve()
         if vault != root:

@@ -8,7 +8,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
@@ -53,9 +53,9 @@ class VaultSaveTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
-        self.vault = root / "vault"
+        self.vault = root / "rust" / "hanadocs"
         self.origin = root / "origin"
-        self.vault.mkdir()
+        self.vault.mkdir(parents=True)
         self.origin.mkdir()
         config = root / "agent_notes.toml"
         _ = config.write_text(job_config_fixture())
@@ -100,6 +100,21 @@ class VaultSaveTests(unittest.TestCase):
             code, output, errors = self.command("first-save", "scan")
         self.assertEqual(code, 0, errors)
         return output.splitlines()[-1].removeprefix("Manifest hash ")
+
+    def test_vault_save_defaults_to_the_home_vault_from_another_repo(self) -> None:
+        home = self.vault.parent.parent
+        other = home / "other"
+        other.mkdir()
+        _ = self.git("init", "-q", "-b", "main", repo=other)
+        _ = self.git("commit", "--allow-empty", "-m", "Other fixture base", repo=other)
+        _ = (other / "other.md").write_text("Keep this note untracked.\n")
+        self.write("note.md", "Save this note.\n")
+
+        with chdir(other), patch.object(Path, "home", return_value=home), redirect_stdout(io.StringIO()):
+            self.assertEqual(vault_save.main([]), 0)
+
+        self.assertEqual(self.git("show", "HEAD:note.md"), "Save this note.")
+        self.assertEqual(self.git("status", "--short", repo=other), "?? other.md")
 
     def test_vault_save_selects_text_at_every_depth(self) -> None:
         names = {"new/nested/note [x].MD", "new/nested/note\rline.txt", "new/nested/note\nline.txt",
