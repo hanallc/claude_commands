@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from scripts.agents.test_support import write_machine_config
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 from scripts.agents import remote
 from scripts.herdr import herdr_types
@@ -230,8 +230,8 @@ class WorkerResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
-        atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     case.fixture.root / "conf/shutdown.conf")
         opened = case.opened()
         _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -3046,8 +3046,8 @@ class StopResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
-        atomic_file.write_text_atomic(case.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     case.root / "conf/shutdown.conf")
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
                           current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))

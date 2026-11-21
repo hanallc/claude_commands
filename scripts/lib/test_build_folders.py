@@ -21,7 +21,7 @@ from unittest import mock
 from contextlib import contextmanager, nullcontext
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import FixtureConfigValues, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 
@@ -1709,20 +1709,16 @@ assert not loaded, loaded
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
         copied = self.root / "copied-config"
-        _ = config_environment(copied)
+        _ = config_environment(copied, values=FixtureConfigValues.EXACT)
         config = copied / "build_folders.conf"
         config.unlink()
-        environment = config_environment(config.parent)
+        environment = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
         for source in sources.glob("*.conf"):
             private = config.parent / source.name
-            if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
-            else:
-                self.assertEqual(private.read_bytes(), source.read_bytes())
+            self.assertEqual(private.read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -1732,7 +1728,7 @@ assert not loaded, loaded
             self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
-        _ = config_environment(config.parent)
+        _ = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
 
     def test_repository_key_keeps_the_fixed_path_name(self) -> None:

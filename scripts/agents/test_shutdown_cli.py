@@ -42,7 +42,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.agents.test_support import write_machine_config
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
@@ -659,7 +659,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.addCleanup(self.staff.doCleanups)
         self.restore_repository()
         _ = self.limits()
-        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(CHECKOUT / "config/shutdown.conf", self.root / "shutdown.conf")
         environment = copies_environment(self.root)
         _ = shutil.copy2(Path(environment["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
         self.enterContext(mock.patch.dict(os.environ, environment))
@@ -1555,7 +1555,7 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         self.addCleanup(self.staff.doCleanups)
         self.restore_repository()
         for name in ("shutdown", "production", "direct"):
-            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
+            _ = copy_config_file_fixture(CHECKOUT / f"config/{name}.conf", self.root / f"{name}.conf")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "pane-launches"))
         self.configs = [self.root / "claude1", self.root / "claude2"]

@@ -11,6 +11,7 @@ from typing import cast
 import unittest
 from unittest import mock
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -48,7 +49,7 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
         gpu = 'g6.2xlarge'
         config = self.root / 'cloud_gate.conf'
-        _ = config.write_bytes((Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf').read_bytes())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf', config)
         for key, value in (
             ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', standard[0]),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),

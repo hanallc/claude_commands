@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign, progress_history
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
@@ -55,7 +56,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             "SCRATCH_VISIBLE_ROOT": str(self.session_dir.parent / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.session_dir.parent / "scratch-holds.json"),
         })))
-        _ = shutil.copy2(ROOT / "config/scratch.conf", Path(os.environ["CONF_DIR"]) / "scratch.conf")
+        _ = copy_config_file_fixture(ROOT / "config/scratch.conf", Path(os.environ["CONF_DIR"]) / "scratch.conf")
         for key in ("CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "PLAN_DELEGATE_RUN_DIR"):
             _ = os.environ.pop(key, None)
         _ = staff.set_run(self.native.fixture.parent.id, staff.OpenRun(self.session_dir))

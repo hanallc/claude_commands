@@ -12,6 +12,7 @@ import sys
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib import conf
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.style import refill_measure, selection_capture, style_config, style_ledger, style_reader
@@ -171,8 +172,8 @@ class SelectionCaptureTests(StylePlanFixture):
             for path in conf.directory().glob("*.conf"):
                 _ = shutil.copy2(path, config / path.name)
             staff_config = config / "staff.conf"
-            original_config = (Path(__file__).resolve().parents[2] / "config/staff.conf").read_text()
-            _ = staff_config.write_text(original_config)
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/staff.conf", staff_config)
+            original_config = staff_config.read_text()
             with patch.dict(os.environ, {"CONF_DIR": str(config), "STAFF_CONFIG": str(staff_config)}):
                 captured = self.root / "staff-capture"
                 _ = selection_capture.capture(self.repo, self.database, "names", captured)

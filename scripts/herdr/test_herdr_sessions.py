@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr_types
 
@@ -776,8 +777,8 @@ class StandaloneLaunchTests(unittest.TestCase):
         _ = self.enterContext(fake_unit_host.private_process_registry())
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         configuration = self.enterContext(scratch_accounts_config())
-        _ = (configuration / "script_prompts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/script_prompts.conf",
+                                     configuration / "script_prompts.conf")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": ""}))
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],

@@ -2199,7 +2199,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             settings, request, destination = self.target_settings_fixture(fixture)
             host = socket.gethostname().split(".", 1)[0]
             good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
-            _ = settings.write_text(good.replace("floor_sweep_timeout_s=180", "floor_sweep_timeout_s=broken"))
+            broken = "\n".join("floor_sweep_timeout_s=broken" if line.startswith("floor_sweep_timeout_s=") else line
+                               for line in good.splitlines()) + "\n"
+            _ = settings.write_text(broken)
             repository = eligibility.KnownRepository("hana")
             with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
                   mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),

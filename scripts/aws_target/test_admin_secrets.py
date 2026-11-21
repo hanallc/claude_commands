@@ -15,6 +15,7 @@ import unittest
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.aws_target import admin_secrets, box, deploy
 from scripts.lib import conf
 
@@ -44,7 +45,8 @@ class AdminSecretTests(unittest.TestCase):
         self.credentials = self.root / 'credentials'
         _ = self.credentials.write_text('[build-scaler]\naws_access_key_id=scaler-id\naws_secret_access_key=scaler-secret\n')
         self.credentials.chmod(0o600)
-        source = (Path(__file__).resolve().parents[2] / 'config/aws_target.conf').read_text()
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / 'config/aws_target.conf', self.settings)
+        source = self.settings.read_text()
         replacements = {'admin_secret_file': str(self.path), 'deployment_price_file': str(self.root / 'price'),
                         'deployment_profile': 'build-admin'}
         _ = self.settings.write_text('\n'.join(key + '=' + replacements[key] if '=' in line and

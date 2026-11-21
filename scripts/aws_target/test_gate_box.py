@@ -16,6 +16,7 @@ from typing import Self, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.aws_target import aws_trial, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -128,7 +129,7 @@ subprocess.run = fail_log_put
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in ('cloud_gate.conf', 'test_times.conf'):
-            _ = (root / name).write_bytes((ROOT / 'config' / name).read_bytes())
+            _ = copy_config_file_fixture(ROOT / 'config' / name, root / name)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
 
     def test_trial_and_route_share_one_guest(self) -> None:

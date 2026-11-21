@@ -10,6 +10,7 @@ from typing import cast, override
 import unittest
 from unittest.mock import patch
 
+from scripts.lib import conf_reads
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,7 +52,7 @@ class NixFixture(unittest.TestCase):
         _ = copy_config_fixture(ROOT / "config", configuration)
         _ = write_config_fixture(configuration / "nix_env.conf",
                                  "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")
-        self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
+        self.env = {**conf_reads.shift_child_environment(), "CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),
                     "HERDR_BIN": "/nonexistent/herdr",

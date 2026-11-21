@@ -55,7 +55,7 @@ from scripts.message import sessions  # noqa: E402
 from scripts.herdr import herdr, worker_panes  # noqa: E402
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable, Iterator
+    from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
@@ -644,12 +644,13 @@ def prompt_alert_seconds() -> float:
     return tunables.read("production").number("PROMPT_ALERT_SECONDS")
 
 
-def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
+def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> Mapping[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
     defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
     path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
     fields: dict[str, str] = {}
+    shifts: dict[str, conf_reads.ShiftedConfigKey] = {}
     for source in paths:
         try:
             content = conf_reads.read_text(source)
@@ -657,11 +658,16 @@ def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) 
             if status_defaults and source != defaults:
                 continue
             raise
+        origins = conf_reads.shift_origins(source, content)
         for line in content.splitlines():
             if line.strip() and not line.lstrip().startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 fields[key] = value
-    return fields
+                if (origin := origins.get(key)) is not None:
+                    shifts[key] = origin
+                elif shifts:
+                    _ = shifts.pop(key, None)
+    return conf_reads.ShiftTracedValues(fields, shifts) if shifts else fields
 
 
 def name_spans(text: str, name: str) -> list[tuple[int, int]]:
@@ -736,7 +742,7 @@ class SenderConfiguration(NamedTuple):
     exit_code: int
 
 
-def sender_limits(fields: dict[str, str]) -> SenderLimits:
+def sender_limits(fields: Mapping[str, str]) -> SenderLimits:
     values: list[float] = []
     for key in ("sender_batch_seconds", "sender_cleanup_seconds"):
         try:

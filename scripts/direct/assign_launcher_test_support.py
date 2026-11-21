@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.direct import assign, phase_table
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lib.git_test_support import commit_repository
@@ -125,8 +126,8 @@ class AssignLauncherFixture(unittest.TestCase):
         _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf",
                                  "patterns.legacy-stable={purpose}\n")
         config = Path(os.environ["CONF_DIR"]) / "direct.conf"
-        _ = config.write_text((ROOT / "config/direct.conf").read_text())
-        _ = config.with_name("shutdown.conf").write_text((ROOT / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(ROOT / "config/direct.conf", config)
+        _ = copy_config_file_fixture(ROOT / "config/shutdown.conf", config.with_name("shutdown.conf"))
         self.addCleanup(self.native.doCleanups)
         _ = self.enterContext(assignment_helpers())
         self.home = Path.home()

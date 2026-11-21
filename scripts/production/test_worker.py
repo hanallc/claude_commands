@@ -21,6 +21,7 @@ from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import call, patch
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents import pane_record
 from scripts.herdr import herdr_types, pane_launch
@@ -335,10 +336,10 @@ class WorkerCommandTests(unittest.TestCase):
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
-        atomic_file.write_text_atomic(config.with_name("send.conf"),
-                                      (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
-        atomic_file.write_text_atomic(config.with_name("scratch.conf"),
-                                      (Path(__file__).resolve().parents[2] / "config/scratch.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/send.conf",
+                                     config.with_name("send.conf"))
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/scratch.conf",
+                                     config.with_name("scratch.conf"))
         root = self.fixture.root
         (root / "worker-tmp").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

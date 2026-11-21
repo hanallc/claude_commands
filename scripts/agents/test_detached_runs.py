@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 
 import contextlib
 import fcntl
@@ -111,8 +111,8 @@ class DetachedRunsTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         for name in ("detached_runs", "send", "postmaster", "codex_daemon", "direct"):
-            _ = (config / f"{name}.conf").write_text(
-                (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{name}.conf",
+                                         config / f"{name}.conf")
         self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
@@ -2102,8 +2102,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.pending_transcripts = []
         config = self.fixture.root / "conf"
         for name in ("detached_runs", "send", "postmaster", "codex_daemon"):
-            write_text_atomic(config / f"{name}.conf",
-                              (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{name}.conf",
+                                         config / f"{name}.conf")
         for name, keys in (("send", {"delivery_timeout", "kill_grace", "remote_transport_seconds",
                                      "waits_review_seconds", "caller_margin_seconds"}),
                            ("postmaster", {"wait_seconds", "claim_grace_seconds", "poll_seconds"}),

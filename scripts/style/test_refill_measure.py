@@ -10,6 +10,7 @@ import subprocess
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.style import git_process, refill_measure, style_config, style_ledger
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
@@ -62,9 +63,13 @@ class RefillMeasureTests(StylePlanFixture):
             original = tuple(source.iterdump())
         config_folder = self.root / "measure-config"
         config_folder.mkdir()
-        current = Path(os.environ.get("CONF_DIR", str(Path(__file__).resolve().parents[2] / "config")))
+        template = Path(__file__).resolve().parents[2] / "config"
+        current = Path(os.environ.get("CONF_DIR", str(template))).resolve()
         for path in current.glob("*.conf"):
-            _ = shutil.copy2(path, config_folder / path.name)
+            if current == template:
+                _ = copy_config_file_fixture(path, config_folder / path.name)
+            else:
+                _ = shutil.copy2(path, config_folder / path.name)
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config_folder)}))
         config = config_folder / "style_reader.conf"
         original_switch = config.read_text()

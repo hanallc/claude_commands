@@ -9,6 +9,7 @@ import shutil
 import shlex
 import sys
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, inherited_paths
 
 
@@ -44,7 +45,10 @@ def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
         destination = checkout / relative
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            copy_with_bytecode(SOURCE / relative, destination)
+            if relative.parts[0] == "config" and relative.suffix == ".conf":
+                _ = copy_config_file_fixture(SOURCE / relative, destination)
+            else:
+                copy_with_bytecode(SOURCE / relative, destination)
 
 
 def copy_startup(checkout: Path) -> None:

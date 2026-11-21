@@ -90,6 +90,9 @@ _lint_config_raw_into() {
         _lint_value="${_lint_line#*=}"
         _lint_value="${_lint_value#"${_lint_value%%[![:space:]]*}"}"
         _lint_value="${_lint_value%"${_lint_value##*[![:space:]]}"}"
+        if [[ -n "${CONF_SHIFT_READ_LOG:-}" ]]; then
+            conf_record_shift "$LINT_CONFIG_FILE" "$_lint_key" "$_lint_value"
+        fi
         printf -v "$_lint_output" '%s' "$_lint_value"
         printf -v "$_lint_presence_output" '%s' present
         return 0

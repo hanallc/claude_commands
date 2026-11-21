@@ -1,6 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.agents import remote
 
 import contextlib
@@ -414,7 +415,7 @@ class FooterCountsTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         source = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-        _ = (config / "change_review.conf").write_text(source.read_text())
+        _ = copy_config_file_fixture(source, config / "change_review.conf")
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         listing = self.root / "change-review - top.md"
