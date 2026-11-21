@@ -1474,17 +1474,25 @@ After the file is gone, `notify_release` checks each recorded recipient before i
 The notice says to start builds and BRP launches now; the memory gate orders them.
 No answer is needed.
 Claude session keys use `socket_for`, which returns `RecipientLive | RecipientGone | RecipientLookupFailed`.
-Lookup exit 1 means gone; other lookup failures retry three times with one second between tries.
+Lookup exit 1 means the session is gone. Other lookup failures retry up to three times, one second apart.
+Release reads one staff snapshot per cycle with notices to send.
 Release sends Codex notices through `send.py --skip-closed --to codex:<thread> --text <notice>`.
-The sender checks both machines for a route.
+The sender checks both machines for a route when it has no usable local route.
+With `--skip-closed`, a complete search with no match returns `ABSENT` with exit 8.
+An unknown Codex thread identity prevents the sender from confirming absence.
+After automatic forwarding, the sender accepts a peer's `ABSENT` result only if its local search also proved absence.
 When the roster shows only closed or stopped worker panes, send returns `CLOSED` with exit 7.
 Release records `WorkerClosed`. The next assignment resumes the worker.
+Release records a confirmed missing session as `RecipientGone`.
+If the staff row is also absent, release removes the recipient from the cycle's recipient list.
+Release recovery uses each session's first saved outcome to decide whether to restore a removed recipient.
 Both routes use the same notice text.
 Send exit 0 gives `Delivered`. Exit 1 gives `QueuedUnconfirmed`. Other failures give `DeliveryFailed`.
 A failed Codex send prints the sender's error detail on stderr.
 The cycle saves the outcome after the sender returns.
 A stopped send stays pending and can repeat the notice on retry.
-`Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries.
+`Not reached, tell them yourself: <session name> (<reason>)` names failed and unconfirmed deliveries.
+It also names a recipient whose staff row remains after its session is gone.
 `cycle_status_lines` prints delivery outcomes.
 Release waits for no answer, build or memory allocation.
 
