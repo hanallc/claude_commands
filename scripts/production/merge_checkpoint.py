@@ -28,12 +28,14 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
+from scripts.production.gate_modules import GateRefused
 from scripts.worktree import worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -864,13 +866,29 @@ def undo_failed_push(production: ProductionDocument, old_origin: str, before_mer
     _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
 
 
-def merge_main(production: ProductionDocument) -> None:
+def merge_main(production: ProductionDocument) -> PinnedMain:
     """Integrate main before the checkpoint selects and runs its tests."""
     checkout = production.checkout
     _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "push")
-    main = git(checkout, "rev-parse", "refs/remotes/origin/main")
-    if main.returncode == 0:
-        merge_main_commit(production, main.stdout.strip())
+    main = good(git(checkout, "rev-parse", "refs/remotes/origin/main"), "push")
+    merge_main_commit(production, main)
+    return PinnedMain(main)
+
+
+class PinnedMain(NamedTuple):
+    commit: str
+
+
+class FullTestsOnly(NamedTuple):
+    pass
+
+
+FULL_TESTS_ONLY = FullTestsOnly()
+
+
+class PreparedCheckpoint(NamedTuple):
+    paths: tuple[str, ...]
+    main: PinnedMain
 
 
 class MainConflict(checkpoint_gate.Stop):
@@ -913,12 +931,16 @@ def push_rollback(production: ProductionDocument, before_merge_tip: str) -> Gene
 
 def prepare_checkpoint(production: ProductionDocument, merge_head: str, *, published_tip: str = "") -> tuple[str, ...]:
     """Integrate main and select all paths that need checkpoint tests."""
+    return prepare_checkpoint_tree(production, merge_head, published_tip).paths
+
+
+def prepare_checkpoint_tree(production: ProductionDocument, merge_head: str, published_tip: str) -> PreparedCheckpoint:
     checkout = production.checkout
     before_merge_tip = good(git(checkout, "rev-parse", f"{merge_head}^1"), "test")
     with push_rollback(production, before_merge_tip):
-        merge_main(production)
+        main = merge_main(production)
     output = good(git(checkout, "diff", "--name-only", published_tip or before_merge_tip, "HEAD"), "test")
-    return tuple(output.splitlines())
+    return PreparedCheckpoint(tuple(output.splitlines()), main)
 
 
 def push_git(production: ProductionDocument, may_undo: bool) -> str:
@@ -1650,18 +1672,49 @@ def reset_batch(production: ProductionDocument, start_tip: str, *, merge_in_prog
         undo_unpushed_merge(production, head, start_tip)
 
 
-def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem, ...], start_tip: str,
-                     red: checkpoint_gate.RedCheckpointTests, paths: tuple[str, ...], log: Path) -> MergedBatchItem:
-    """Find the first candidate whose merge makes the unresolved commands red."""
+class PrefixVerdict(Enum):
+    GREEN = auto()
+    RED = auto()
+    INCONCLUSIVE = auto()
+
+
+class UnconfirmedBoundary(NamedTuple):
+    pass
+
+
+def bisect_red_batch(candidates: tuple[MergedBatchItem, ...],
+                     probe: Callable[[MergedBatchItem], PrefixVerdict]) -> MergedBatchItem | UnconfirmedBoundary:
+    """Find the first red prefix or stop when a probe cannot decide."""
+    low, high = 0, len(candidates) - 1
+    while low < high:
+        middle = (low + high) // 2
+        item = candidates[middle]
+        verdict = probe(item)
+        checkpoint_gate.report("bisect", verdict.name.lower(),
+                               f"{item.request.unit.name} phase {item.request.phase} at {item.merge_head}")
+        if verdict is PrefixVerdict.INCONCLUSIVE:
+            return UnconfirmedBoundary()
+        if verdict is PrefixVerdict.RED:
+            high = middle
+        else:
+            low = middle + 1
+    return candidates[low]
+
+
+def checkout_prefix(production: ProductionDocument, head: str, main: str) -> None:
+    _ = good(git(production.checkout, "reset", "--keep", head), "bisect")
+    merge_main_commit(production, main)
+
+
+def locate_full_test_red(reference: MergeRequest, candidates: tuple[MergedBatchItem, ...], start_tip: str,
+                         red: checkpoint_gate.RedCheckpointTests, paths: tuple[str, ...], log: Path) -> MergedBatchItem:
+    checkout = reference.production.checkout
     try:
         try:
-            main_commit = good(git(reference.production.checkout, "rev-parse", "origin/main"), "bisect")
-            low, high = 0, len(candidates) - 1
-            while low < high:
-                middle = (low + high) // 2
-                item = candidates[middle]
-                _ = good(git(reference.production.checkout, "reset", "--keep", item.merge_head), "bisect")
-                merge_main_commit(reference.production, main_commit)
+            main = good(git(checkout, "rev-parse", "origin/main"), "bisect")
+
+            def probe(prefix: MergedBatchItem) -> PrefixVerdict:
+                checkout_prefix(reference.production, prefix.merge_head, main)
                 selected = checkpoint_gate.test_steps(reference.production, paths, reference.merge_tests)
                 commands = {(tuple(step.command), step.folder) for step in selected}
                 red_steps = tuple(checkpoint_gate.narrowed(item) for item in red.red
@@ -1670,16 +1723,14 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
                     _ = checkpoint_gate.run_test_steps(reference.parent_production, red_steps, reference.flakes,
                                                         reference.flaky_tests, log, raise_start_errors=True)
                 except checkpoint_gate.RedCheckpointTests:
-                    probe_result = "red"
-                    high = middle
-                else:
-                    probe_result = "green"
-                    low = middle + 1
-                checkpoint_gate.report("bisect", probe_result,
-                                       f"{item.request.unit.name} phase {item.request.phase} at {item.merge_head}")
-            return candidates[low]
+                    return PrefixVerdict.RED
+                return PrefixVerdict.GREEN
+
+            found = bisect_red_batch(candidates, probe)
+            assert isinstance(found, MergedBatchItem)
+            return found
         finally:
-            _ = good(git(reference.production.checkout, "reset", "--keep", start_tip), "bisect")
+            _ = good(git(checkout, "reset", "--keep", start_tip), "bisect")
     except MainConflict:
         raise
     except checkpoint_gate.Stop as error:
@@ -1687,6 +1738,145 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
     except (OSError, ValueError) as error:
         raise BatchItemStop(tuple(item.position for item in candidates), checkpoint_gate.Stop(
             "run", "failed", str(error), "the showrunner will inspect the failed command")) from error
+
+
+def batch_row_paths(checkout: Path, items: tuple[MergedBatchItem, ...]) -> tuple[str, ...]:
+    paths: set[str] = set()
+    for item in items:
+        head = item.merge_head
+        diff = subprocess.run(["git", "-C", str(checkout), "diff", "--name-only", "-z", "--no-renames",
+                               f"{head}^1", head, "--"], capture_output=True, check=True)
+        paths.update(os.fsdecode(path) for path in diff.stdout.split(b"\0") if path)
+    return tuple(sorted(paths))
+
+
+def require_filter_head(checkout: Path, expected_head: str, log: Path) -> None:
+    if git(checkout, "rev-parse", "HEAD").stdout.strip() != expected_head:
+        step = checkpoint_gate.AFFECTED_TESTS
+        raise checkpoint_gate.Stop("test", "cancelled", f"{step} cancelled because HEAD moved; log {log}",
+                                   f"resubmit this checkpoint after your edits are done; test log: {log}")
+
+
+def filter_tree(checkout: Path, expected_head: str, log: Path) -> (
+    merge_gate.CleanTestTree | checkpoint_gate.FilterInconclusive
+):
+    require_filter_head(checkout, expected_head, log)
+    try:
+        tree = merge_gate.clean_test_tree(checkout)
+    except (GateRefused, OSError) as error:
+        return checkpoint_gate.FilterInconclusive(str(error))
+    if isinstance(tree, merge_gate.UnrecordableTestTree):
+        return checkpoint_gate.FilterInconclusive(tree.reason)
+    if tree.commit != expected_head:
+        require_filter_head(checkout, expected_head, log)
+        return checkpoint_gate.FilterInconclusive("HEAD changed during inspection")
+    return tree
+
+
+def confirm_affected_red(production: ProductionDocument, items: tuple[MergedBatchItem, ...],
+                         start_tip: str, test_tip: str, main: PinnedMain, names: frozenset[str],
+                         log: Path) -> None:
+    checkout = production.checkout
+    expected_head = test_tip
+    results: dict[tuple[str, str], PrefixVerdict] = {}
+    confirmed: dict[int, set[str]] = {}
+    try:
+        def probe(head: str, name: str) -> PrefixVerdict:
+            nonlocal expected_head
+            require_filter_head(checkout, expected_head, log)
+            if expected_head != head:
+                try:
+                    _ = good(git(checkout, "reset", "--keep", head), "bisect")
+                    expected_head = head
+                    merge_main_commit(production, main.commit)
+                except checkpoint_gate.Stop as error:
+                    checkpoint_gate.log_filter(log, "inconclusive", 1, error.detail)
+                    return PrefixVerdict.INCONCLUSIVE
+                expected_head = good(git(checkout, "rev-parse", "HEAD"), "bisect")
+            tree = filter_tree(checkout, expected_head, log)
+            if isinstance(tree, checkpoint_gate.FilterInconclusive):
+                checkpoint_gate.log_filter(log, "inconclusive", 1, tree.reason)
+                return PrefixVerdict.INCONCLUSIVE
+            key = (tree.tree, name)
+            if key not in results:
+                result = checkpoint_gate.run_affected_tests(checkout, (name,))
+                after = filter_tree(checkout, expected_head, log)
+                if isinstance(after, checkpoint_gate.FilterInconclusive):
+                    result = after
+                if isinstance(result, checkpoint_gate.FilterInconclusive):
+                    checkpoint_gate.log_filter(log, "inconclusive", 1, result.reason)
+                    results[key] = PrefixVerdict.INCONCLUSIVE
+                else:
+                    results[key] = PrefixVerdict.RED if name in result.red else PrefixVerdict.GREEN
+            return results[key]
+
+        for name in sorted(names):
+            if probe(test_tip, name) is not PrefixVerdict.RED:
+                checkpoint_gate.log_filter(log, "inconclusive", 1, f"{name} did not fail again")
+                continue
+            if probe(start_tip, name) is not PrefixVerdict.GREEN:
+                checkpoint_gate.log_filter(log, "inconclusive", 1, f"{name} did not pass on the base")
+                continue
+            found = bisect_red_batch(items, lambda item: probe(item.merge_head, name))
+            if isinstance(found, UnconfirmedBoundary):
+                continue
+            previous = items[found.position - 1].merge_head if found.position else start_tip
+            if (probe(found.merge_head, name) is PrefixVerdict.RED
+                    and probe(previous, name) is PrefixVerdict.GREEN):
+                confirmed.setdefault(found.position, set()).add(name)
+            else:
+                checkpoint_gate.log_filter(log, "inconclusive", 1, f"no verified red boundary for {name}")
+    finally:
+        require_filter_head(checkout, expected_head, log)
+        if expected_head != test_tip:
+            restore = git(checkout, "reset", "--keep", test_tip)
+            if restore.returncode:
+                raise checkpoint_gate.Stop("test", "cancelled", failure_detail(restore),
+                                           f"restore the batch tree before retrying; test log: {log}")
+    if confirmed:
+        position = min(confirmed)
+        step = checkpoint_gate.CheckpointTestStep(checkpoint_gate.AFFECTED_TESTS, [], checkout)
+        stop = checkpoint_gate.unit_red((checkpoint_gate.RedStep(step, frozenset(confirmed[position])),), log)
+        raise BatchItemStop((position,), stop)
+
+
+def filter_batch(production: ProductionDocument, items: tuple[MergedBatchItem, ...], start_tip: str,
+                 test_tip: str, main: PinnedMain, log: Path) -> None:
+    checkout = production.checkout
+    tree = filter_tree(checkout, test_tip, log)
+    if isinstance(tree, checkpoint_gate.FilterInconclusive):
+        checkpoint_gate.log_filter(log, "skipped", 0, tree.reason)
+        return
+    try:
+        paths = batch_row_paths(checkout, items)
+        selection = merge_gate.map_batch_modules(checkout, start_tip, paths)
+    except (GateRefused, OSError, subprocess.SubprocessError) as error:
+        require_filter_head(checkout, test_tip, log)
+        checkpoint_gate.log_filter(log, "skipped", 0, f"map unavailable: {error}")
+        return
+    require_filter_head(checkout, test_tip, log)
+    if isinstance(selection, merge_gate.BatchMapUnavailable):
+        checkpoint_gate.log_filter(log, "skipped", 0, selection.reason)
+        return
+    if isinstance(selection, merge_gate.FullInventory):
+        checkpoint_gate.log_filter(log, "skipped", selection.count, "the map selected the full inventory")
+        return
+    names = selection.names
+    if not names:
+        checkpoint_gate.log_filter(log, "skipped", 0, "the map selected no modules")
+        return
+    checkpoint_gate.log_filter(log, "start", len(names), "run the selected modules")
+    result = checkpoint_gate.run_affected_tests(checkout, names)
+    after = filter_tree(checkout, test_tip, log)
+    if isinstance(after, checkpoint_gate.FilterInconclusive):
+        result = after
+    if isinstance(result, checkpoint_gate.FilterInconclusive):
+        checkpoint_gate.log_filter(log, "inconclusive", len(names), result.reason)
+    elif result.red:
+        checkpoint_gate.log_filter(log, "red", len(names), ", ".join(sorted(result.red)))
+        confirm_affected_red(production, items, start_tip, test_tip, main, result.red, log)
+    else:
+        checkpoint_gate.log_filter(log, "green", len(names), "all selected modules passed")
 
 
 def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: Path,
@@ -1715,10 +1905,12 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
     non_code_paths = {path for item in items if not isinstance(item.request.kind, CodeCheckpoint) for path in item.paths}
     tests_green = "no tests"
 
-    def retest(paths: tuple[str, ...], test_tip: str) -> None:
+    def retest(paths: tuple[str, ...], test_tip: str, *, filter_main: PinnedMain | FullTestsOnly = FULL_TESTS_ONLY) -> None:
         nonlocal tests_green
         test_paths.update(set(paths) - non_code_paths)
         if not code_items and not test_paths:
+            if isinstance(filter_main, PinnedMain):
+                checkpoint_gate.log_filter(log, "skipped", 0, "the batch has no checkpoint tests")
             tests_green = tests(shared, (), first.merge_head)
             return
         selections = [(item, checkpoint_gate.test_steps(item.request.production, item.paths, item.request.merge_tests))
@@ -1729,6 +1921,11 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                 for item in code_items:
                     _ = waits.enter_context(merge_gate_wait(item.request.unit.worktree, item.request.phase,
                                                             item.request.unit.name, item.request.commit))
+                if isinstance(filter_main, PinnedMain):
+                    if any(checkpoint_gate.runs_merge_gate(command) for command in reference.merge_tests):
+                        filter_batch(reference.production, tuple(items), start_tip, test_tip, filter_main, log)
+                    else:
+                        checkpoint_gate.log_filter(log, "skipped", 0, "the batch has no merge gate command")
                 tests_green = run_checkpoint_tests(reference.production, tuple(sorted(test_paths)), reference.merge_tests,
                                                    reference.flakes, reference.flaky_tests, log, test_tip, start_tip,
                                                    base_tip=start_tip, ledger=reference.parent_production)
@@ -1738,7 +1935,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                              if any((tuple(step.command), step.folder) in red_commands for step in steps))
             candidates = affected or tuple(code_items) or tuple(items)
             if len(candidates) > 1:
-                candidates = (bisect_red_batch(reference, candidates, start_tip, error, tuple(sorted(test_paths)), log),)
+                candidates = (locate_full_test_red(reference, candidates, start_tip, error, tuple(sorted(test_paths)), log),)
             raise BatchItemStop(tuple(item.position for item in candidates), error) from error
 
     publication_started = False
@@ -1748,9 +1945,9 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
         _ = good(git(shared.production.checkout, "fetch", "origin",
                      f"+refs/heads/{shared.production.merge_branch}:{remote}"), "test")
         published_tip = good(git(shared.production.checkout, "rev-parse", remote), "test")
-        paths = prepare_checkpoint(shared.production, first.merge_head, published_tip=published_tip)
+        prepared = prepare_checkpoint_tree(shared.production, first.merge_head, published_tip)
         test_tip = good(git(shared.production.checkout, "rev-parse", "HEAD"), "test")
-        retest(paths, test_tip)
+        retest(prepared.paths, test_tip, filter_main=prepared.main)
         try:
             try:
                 with tested_main_push(shared.production, test_tip, retest, start_tip):

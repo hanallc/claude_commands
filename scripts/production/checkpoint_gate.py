@@ -16,11 +16,14 @@ from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.copies import copies
+from scripts.lib import conf, scratch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
-from scripts.production import staff
+from scripts.production import merge_gate, staff
+from scripts.production.gate_modules import GateRefused
 from scripts.production.production_doc import ProductionDocument
+from scripts.test_times.gate_record import NoModuleTimes, TimingNotApplicable
 
 TREE_CHANGED_STATUS = 77
 
@@ -61,6 +64,52 @@ class RedCheckpointTests(Stop):
     def __init__(self, detail: str, message: str, red: tuple[RedStep, ...]) -> None:
         super().__init__("red", "failed", detail, message)
         self.red: tuple[RedStep, ...] = red
+
+
+AFFECTED_TESTS = "affected tests"
+
+
+class FilterResults(NamedTuple):
+    red: frozenset[str]
+
+
+class FilterInconclusive(NamedTuple):
+    reason: str
+
+
+def log_filter(log: Path, state: str, count: int, detail: str) -> None:
+    message = f"{count} selected; {detail}"
+    with log.open("a", encoding="utf-8") as output:
+        _ = output.write(f"{AFFECTED_TESTS}: {state} — {message}\n")
+    report(AFFECTED_TESTS, state, message)
+
+
+def run_affected_tests(repo: Path, names: Sequence[str]) -> FilterResults | FilterInconclusive:
+    """Use only complete test results as evidence for row removal."""
+    try:
+        run = merge_gate.run_filter_modules(repo, names)
+    except (GateRefused, copies.CopyError, conf.Unusable, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
+        return FilterInconclusive(str(error))
+    if run.time_limit_report:
+        return FilterInconclusive("the run time limit expired")
+    reported = tuple(f"{job.suite}/{job.module}" for job in run.jobs)
+    if len(reported) != len(names) or set(reported) != set(names) or run.tests_reused:
+        return FilterInconclusive("the runner did not report a fresh result for each selected module")
+    for job in (*run.jobs, *run.executions):
+        if job.kind is not merge_gate.GateJobKind.TEST_MODULE:
+            return FilterInconclusive("the runner reported a non-test job")
+        if job.killed_for or job.memory_stopped or job.tripwire_tripped or job.returncode < 0:
+            return FilterInconclusive(f"{job.suite}/{job.module} stopped before a valid result")
+    red: set[str] = set()
+    for name, job in zip(reported, run.jobs, strict=True):
+        times = job.times
+        failed = (not isinstance(times, (NoModuleTimes, TimingNotApplicable))
+                  and any(test["status"] in ("fail", "error", "unexpected_success") for test in times["tests"]))
+        if job.returncode == 1 and failed:
+            red.add(name)
+        elif job.returncode or failed:
+            return FilterInconclusive(f"{name} has no test result that agrees with its exit status")
+    return FilterResults(frozenset(red))
 
 
 class CargoPackage(NamedTuple):

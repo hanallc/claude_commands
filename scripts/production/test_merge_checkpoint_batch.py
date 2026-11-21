@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 import shlex
 import shutil
@@ -11,13 +12,17 @@ import unittest
 from typing import final
 from unittest.mock import patch
 
-from scripts.production import merge_checkpoint, staff
+from scripts.production import merge_checkpoint, merge_gate, staff
+from scripts.production.gate_modules import GateRefused
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment,
 )
+
+
+from scripts.test_times.gate_record import ModuleTimes
 
 
 def setUpModule() -> None:
@@ -65,6 +70,99 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                          list(zip(merges, checkpoints)))
         self.assertEqual(len(self.events("style_sync.py")), 1)
         return merges
+
+    def test_affected_tests_run_before_the_full_list(self) -> None:
+        module = "production/test_batch_fixture.py"
+        renamed = "src/alpha-renamed\nfile.txt"
+        cases = (
+            ("confirmed red", ("batch", "batch", "base", "alpha", "alpha"), "red", "1 selected"),
+            ("all green", ("batch",), "green", "1 selected"),
+            ("empty map", (), "skipped", "0 selected; the map selected no modules"),
+            ("unavailable map", (), "skipped", "0 selected; fixture map unavailable"),
+            ("full inventory", (), "skipped", "2 selected; the map selected the full inventory"),
+            ("base red", ("batch", "batch", "base"), "inconclusive", "did not pass on the base"),
+            ("killed module", ("batch",), "inconclusive", "stopped before a valid result"),
+            ("missing prefix", ("batch", "batch", "base", "alpha"), "inconclusive", "module absent"),
+            ("repeat green", ("batch", "batch"), "inconclusive", "did not fail again"),
+        )
+        for case, expected_runs, state, detail in cases:
+            with self.subTest(case=case):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.production_doc(merge_tests_line="- **Merge tests:** `merge_gate.py`")
+                self.executable(self.bin / "merge_gate.py", STUB)
+                start = self.git("rev-parse", "HEAD")
+                _ = self.git("mv", "src/alpha.txt", renamed, cwd=self.unit)
+                first = self.checkpoint("src/alpha-marker.txt", "alpha change\n")
+                second = self.beta_checkpoint("src/beta.txt", "beta change\n")
+                main = self.push_main_change("docs/main-only.md", "main change\n")
+                map_paths: list[tuple[str, ...]] = []
+                runs: list[str] = []
+
+                def map_modules(repo: Path, start_tip: str, paths: Sequence[str]) -> (
+                    merge_gate.MappedBatchModules | merge_gate.BatchMapUnavailable | merge_gate.FullInventory
+                ):
+                    self.assertEqual(repo, self.checkout)
+                    self.assertEqual(start_tip, start)
+                    self.assertTrue((repo / "docs/main-only.md").exists())
+                    map_paths.append(tuple(paths))
+                    if case == "empty map":
+                        return merge_gate.MappedBatchModules(())
+                    if case == "unavailable map":
+                        return merge_gate.BatchMapUnavailable("fixture map unavailable")
+                    if case == "full inventory":
+                        return merge_gate.FullInventory(2)
+                    return merge_gate.MappedBatchModules((module,))
+
+                def run_modules(repo: Path, names: Sequence[str]) -> merge_gate.GateRun:
+                    self.assertEqual(tuple(names), (module,))
+                    self.assertEqual(self.events("merge_gate.py"), [])
+                    self.assertTrue((repo / "docs/main-only.md").exists())
+                    if (repo / "src/beta.txt").read_text() == "beta change\n":
+                        tree = "batch"
+                    elif (repo / "src/alpha-marker.txt").exists():
+                        tree = "alpha"
+                    else:
+                        tree = "base"
+                    runs.append(tree)
+                    if case == "missing prefix" and tree == "alpha":
+                        raise GateRefused("module absent")
+                    if case == "killed module":
+                        job = merge_gate.GateJobResult("production", "test_batch_fixture.py", -15, 0, "",
+                                                       killed_for="test limit")
+                        return merge_gate.GateRun((job,), 0, 0)
+                    red = ((tree == "batch" and case in ("confirmed red", "base red", "missing prefix"))
+                           or (tree == "base" and case == "base red")
+                           or (case == "repeat green" and len(runs) == 1))
+                    times: ModuleTimes = {
+                        "wall_s": 0, "cpu_s": 0, "tests_s": 0, "tests_run": 1,
+                        "failures": int(red), "errors": 0, "skipped": 0,
+                        "tests": [{"test": "test_fixture", "s": 0, "status": "fail" if red else "pass"}],
+                    }
+                    job = merge_gate.GateJobResult("production", "test_batch_fixture.py", int(red), 0, "",
+                                                   times=times)
+                    return merge_gate.GateRun((job,), 0, 0)
+
+                with (patch.object(merge_gate, "map_batch_modules", side_effect=map_modules),
+                      patch.object(merge_gate, "run_filter_modules", side_effect=run_modules)):
+                    result = self.land_batch([self.batch_line("alpha", "2", first),
+                                              self.batch_line("beta", "2", second)])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(tuple(runs), expected_runs)
+                first_paths = tuple(sorted(("src/alpha.txt", "src/alpha-marker.txt", renamed)))
+                all_paths = tuple(sorted((*first_paths, "src/beta.txt")))
+                removed_beta = case == "confirmed red"
+                self.assertEqual(map_paths, [all_paths, first_paths] if removed_beta else [all_paths])
+                self.assertEqual(self.events("merge_gate.py"), [[]])
+                log = self.state / f"merge_{first[:7]}_test.log"
+                lines = log.read_text().splitlines()
+                self.assertTrue(any(line.startswith(f"affected tests: {state} —") and detail in line
+                                    for line in lines), lines)
+                self.assertEqual([row["source_checkpoint"] for row in self.receipts()],
+                                 [first, main] if removed_beta else [first, second, main])
+                if removed_beta:
+                    self.assertIn(f"send beta: repair affected tests ({module})", result.stdout)
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
         for outcome in ("shared list", "push failure", "separate lists", "second list fails",

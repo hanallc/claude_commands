@@ -17,12 +17,13 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.production import merge_checkpoint
+from scripts.production import merge_checkpoint, merge_gate
 from scripts.production import change_review
 from scripts.production import staff, unit_lookup
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 from scripts.production.production_doc import ProductionDocument
+from scripts.test_times.gate_record import ModuleTimes
 
 
 class Killed(BaseException):
@@ -84,6 +85,38 @@ class CheckpointRerunTests(MergeCheckpointFixture):
                 self.assertEqual(red_step.names, names)
                 self.assertEqual(checkpoint_gate.narrowed(red_step).command,
                                  [*command, *(word for name in sorted(names) for word in ("--module", name))])
+
+    def test_affected_repeat_requires_a_finished_test_result(self) -> None:
+        module = "production/test_fixture.py"
+        red_times: ModuleTimes = {
+            "wall_s": 0, "cpu_s": 0, "tests_s": 0, "tests_run": 1, "failures": 1, "errors": 0, "skipped": 0,
+            "tests": [{"test": "test_fixture", "s": 0, "status": "fail"}],
+        }
+        red = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "", times=red_times)
+        green = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "")
+        refused = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "runner refused")
+        tripwire = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "", times=red_times,
+                                           tripwire_tripped=True)
+        conflict = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "", times=red_times)
+        killed = merge_gate.GateJobResult("production", "test_fixture.py", -15, 0, "", killed_for="test limit")
+        cases = (
+            ("test failure", merge_gate.GateRun((red,), 0, 0), checkpoint_gate.FilterResults(frozenset({module}))),
+            ("green", merge_gate.GateRun((green,), 0, 0), checkpoint_gate.FilterResults(frozenset())),
+            ("missing", merge_gate.GateRun((), 0, 0),
+             checkpoint_gate.FilterInconclusive("the runner did not report a fresh result for each selected module")),
+            ("refused", merge_gate.GateRun((refused,), 0, 0),
+             checkpoint_gate.FilterInconclusive(f"{module} has no test result that agrees with its exit status")),
+            ("tripwire", merge_gate.GateRun((tripwire,), 0, 0),
+             checkpoint_gate.FilterInconclusive(f"{module} stopped before a valid result")),
+            ("conflict", merge_gate.GateRun((conflict,), 0, 0),
+             checkpoint_gate.FilterInconclusive(f"{module} has no test result that agrees with its exit status")),
+            ("killed first attempt", merge_gate.GateRun((red,), 0, 0, executions=(killed, red)),
+             checkpoint_gate.FilterInconclusive(f"{module} stopped before a valid result")),
+        )
+        for case, run, expected in cases:
+            with self.subTest(case=case), patch.object(merge_gate, "run_filter_modules", return_value=run) as run_modules:
+                self.assertEqual(checkpoint_gate.run_affected_tests(self.checkout, (module,)), expected)
+                run_modules.assert_called_once_with(self.checkout, (module,))
 
     def save_case(self) -> Path:
         snapshot = self.root.with_name("rerun-seed")
