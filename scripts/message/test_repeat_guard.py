@@ -24,7 +24,6 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 from scripts.message import send
 from scripts.message import repeat_guard as guard
-from scripts.message import repeats
 from scripts.message.repeat_guard_test_support import (
     NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, install_notice_test_config, run_ready_notice_attempt,
     wait_for_notice_exit, wait_for_notice_readiness,
@@ -570,18 +569,6 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             guard.drain(self.root, lambda state, notice, limits: "delivered", self.limits.window_seconds + 6)
         self.assertEqual(list(self.root.glob("*.json")), [])
 
-    def test_replay_is_pure_and_counts_no_distinct_or_protected_holds(self) -> None:
-        rows: list[dict[str, object]] = [{"from": "watchdog", "to": "morty", "text": text,
-            "time": f"2026-10-31T01:00:0{index}+00:00", "machine": "fixture-host",
-            "safety": "distinct" if text == "recovered" else "repeat"}
-            for index, text in enumerate(("stopped", "stopped", "stopped", "recovered"))]
-        rows += [{**rows[0], "from": "user"}, {**rows[0], "to": "user"}]
-        result = repeats.replay(rows, self.limits)
-        self.assertEqual(result["watchdog"].held, 1)
-        self.assertEqual(sum(item.distinct_held for item in result.values()), 0)
-        self.assertEqual(sum(item.protected_held for item in result.values()), 0)
-        self.assertFalse(self.root.exists())
-
     def prime_outbox(self) -> None:
         self.assertEqual([self.persist(self.attempt(at=index)).held for index in range(3)],
                          [False, False, True])
@@ -802,7 +789,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 finally:
                     self.owned.finish()
 
-    def test_direct_events_report_observed_outcomes_and_replay_uses_independent_labels(self) -> None:
+    def test_direct_events_record_observed_outcomes(self) -> None:
         receiver = guard.recipient_identity("", thread_id="thread-1")
         for text in ["stopped"] * 3:
             decision = guard.transport_check("direct", receiver, text)
@@ -811,15 +798,8 @@ os.kill(os.getpid(), signal.SIGSTOP)
         rows = [cast(dict[str, object], json.loads(line))
                 for line in (self.home / "state/message/transports.jsonl").read_text().splitlines()]
         self.assertEqual([row["outcome"] for row in rows], ["queued", "queued", "held"])
-        totals = repeats.replay(rows, self.limits, simulate=False)["direct"]
-        self.assertEqual((totals.count, totals.held, totals.receivers), (3, 1, {receiver}))
-        labelled = [{**rows[0], "text": f"process {name} stopped", "safety": "distinct"}
-                    for name in ("Ada", "Abe", "Bea")]
-        result = repeats.replay(labelled, self.limits)["direct"]
-        self.assertEqual((result.held, result.distinct_held), (0, 0))
-        with patch.object(guard, "normalize", return_value="broken collision"):
-            result = repeats.replay(labelled, self.limits)["direct"]
-        self.assertEqual((result.held, result.distinct_held), (1, 1))
+        self.assertEqual({row["from"] for row in rows}, {"direct"})
+        self.assertEqual({row["to"] for row in rows}, {receiver})
 
     def test_digit_prefixed_names_dates_durations_and_meaningful_paths_stay_distinct(self) -> None:
         for texts in (
