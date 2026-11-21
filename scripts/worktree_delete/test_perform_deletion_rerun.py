@@ -10,10 +10,72 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import cast, override
+
+from scripts.agents import remote
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.test_production_doc import enrolled_document
 
 
 class DeletionRerunTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(isolated_staff_file(root / "staff.json", {}))
+
+    def test_protected_integration_stops_validation_and_both_deletion_routes(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = fixture_git_environment(root)
+        repo, origin, tree = root / "repo", root / "origin.git", root / "integration"
+        _ = subprocess.run(["git", "init", "-qb", "main", str(repo)], env=environment, check=True)
+        _ = subprocess.run(["git", "init", "-q", "--bare", str(origin)], env=environment, check=True)
+        _ = commit_repository(repo, "Fixture", allow_empty=True, env=environment)
+
+        def git(checkout: Path, *arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(checkout), *arguments], env=environment,
+                                  check=True, capture_output=True, text=True).stdout
+
+        _ = git(repo, "remote", "add", "origin", str(origin))
+        _ = git(repo, "worktree", "add", "-qb", "integration", str(tree))
+        _ = git(repo, "push", "-q", "origin", "main", "integration")
+        doc = repo / "fixture-production-live.md"
+        enrolled_document(doc, repo, tree, "integration")
+        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
+
+        source = Path(__file__).resolve().parent
+        scripts = root / "scripts/worktree_delete"
+        scripts.mkdir(parents=True)
+        for name in ("record_confirmation.sh", "worktree_delete_validation.sh", "perform_deletion.sh"):
+            _ = shutil.copyfile(source / name, scripts / name)
+        nonce_dir = root / "confirmations"
+        _ = (scripts / "confirm_gate.sh").write_text((source / "confirm_gate.sh").read_text().replace(
+            'WT_CONFIRM_DIR="/tmp/claude/worktree_delete"', f"WT_CONFIRM_DIR={shlex.quote(str(nonce_dir))}"))
+        for name in ("lib", "worktree"):
+            (scripts.parent / name).symlink_to(source.parent / name, target_is_directory=True)
+
+        def attempt(script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(["bash", str(scripts / script), str(tree), *arguments], cwd=repo, env=environment,
+                                  capture_output=True, text=True, check=False)
+
+        pattern = ("for-each-ref", "--format=%(refname) %(objectname)")
+        refs = git(repo, *pattern), git(origin, *pattern)
+        validation = attempt("worktree_delete_validation.sh")
+        self.assertEqual(validation.returncode, 1, validation.stderr)
+        self.assertIn("protected production", validation.stdout)
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                if confirmed:
+                    result = attempt("record_confirmation.sh", "integration")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                result = attempt("perform_deletion.sh", "integration")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("protected production", result.stderr)
+                self.assertTrue(tree.is_dir())
+                self.assertEqual((git(repo, *pattern), git(origin, *pattern)), refs)
+                self.assertEqual(len(list(nonce_dir.glob("*"))), int(confirmed))
+
     def test_confirmed_removal_releases_the_pair_when_the_lock_is_free(self) -> None:
         scripts = Path(__file__).resolve().parent
         for held in (False, True):

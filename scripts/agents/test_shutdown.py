@@ -7,23 +7,110 @@ import json
 import math
 import os
 import signal
+import subprocess
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest.mock import call, patch
 
-from scripts.agents import pane_record, shutdown, stop_resume, test_stop_resume
+from scripts.agents import pane_record, remote, shutdown, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf, git_exclude
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.message import sessions
-from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production import production_doc, staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.production.test_production_doc import enrolled_document
 
 
 NATIVE_PROCESS = herdr.native_process
+
+
+class EnrolledProductionShutdownTests(StaffTestCase):
+    repository: Path = Path()
+    integration: Path = Path()
+    document: Path = Path()
+    owner_id: staff.StaffId = staff.StaffId("")
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.repository = self.root / "main"
+        self.integration = self.root / "integration"
+        self.environment = fixture_git_environment(self.root)
+        _ = subprocess.run(["git", "init", "-qb", "main", str(self.repository)], env=self.environment, check=True)
+        _ = commit_repository(self.repository, "Fixture", allow_empty=True, env=self.environment)
+        _ = self.git("worktree", "add", "-qb", "integration", str(self.integration))
+        self.document = self.repository / "docs/plans/fixture-production-live.md"
+        enrolled_document(self.document, self.repository, self.integration, "integration", log="docs/plans/fixture-log.md")
+        owner = fixture_member(
+            "showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), self.document))
+        self.owner_id = owner.id
+
+    @property
+    def owner(self) -> staff.StaffRow:
+        owner = staff.by_id(self.owner_id)
+        assert owner is not None
+        return owner
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repository), *arguments], env=self.environment, check=True,
+                              text=True, capture_output=True).stdout
+
+    def test_retirement_preserves_integration_and_removes_an_ordinary_staging_worktree(self) -> None:
+        origin = self.root / "origin.git"
+        _ = subprocess.run(["git", "init", "-q", "--bare", str(origin)], env=self.environment, check=True)
+        _ = self.git("remote", "add", "origin", str(origin))
+        staging = self.root / "staging"
+        _ = self.git("worktree", "add", "-qb", "staging", str(staging))
+        _ = self.git("push", "-q", "origin", "main", "integration", "staging")
+        unit = fixture_member("unit", name="fixture-merges", parent=self.owner.id,
+                              worktree=staff.PresentWorktree(remote.local_machine(), staging))
+        production = production_doc.read_production(self.owner)
+        settings_path = self.root / "production.conf"
+        _ = settings_path.write_text("# range: 0.01..\nRETIRE_COMMAND_TIMEOUT_SECONDS=5\n")
+        settings = conf.read(settings_path)
+        for target, branch, kept in ((self.integration, "integration", True), (staging, "staging", False)):
+            with self.subTest(branch=branch):
+                result = shutdown.retirement_remove(shutdown.RetiringUnit(production, unit.name, target, branch, unit),
+                                                    settings=settings)
+                if kept:
+                    self.assertIn("protected production", result[0])
+                else:
+                    self.assertEqual(result, [])
+                self.assertEqual(target.exists(), kept)
+                self.assertEqual(bool(self.git("branch", "--list", branch)), kept)
+                self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), kept)
+        self.assertTrue(self.integration.is_dir())
+        self.assertTrue(self.git("branch", "--list", "integration"))
+        self.assertTrue(self.git("ls-remote", "--heads", "origin", "integration"))
+
+    def test_live_rename_resumes_an_interrupted_branch_rename_without_changing_main(self) -> None:
+        # Keep the index present so the comparison includes its original bytes.
+        _ = self.git("read-tree", "HEAD")
+        index = self.repository / ".git/index"
+        head, before = self.git("rev-parse", "HEAD"), index.read_bytes()
+        destination = self.document.with_name("renamed-production-live.md")
+        request = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch="renamed-integration")
+        move = request.move
+        assert isinstance(move, shutdown.LiveDocBranchMove)
+        self.assertTrue(shutdown.rename_move_doc(request, move))
+        _ = self.git("-C", str(self.integration), "branch", "-m", move.branch)
+        retry = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch=move.branch)
+        assert isinstance(retry.move, shutdown.LiveDocBranchMove)
+        self.assertTrue(shutdown.rename_move_branch(retry.move))
+        row = staff.by_id(self.owner.id)
+        assert row is not None and isinstance(row.doc, staff.LiveDoc)
+        self.assertEqual(row.doc.path, destination)
+        self.assertFalse(self.document.exists())
+        git_exclude.require_untracked_ignored(self.repository, destination.relative_to(self.repository).as_posix())
+        self.assertEqual(production_doc.read_production(row).merge_branch, move.branch)
+        self.assertEqual((self.git("branch", "--show-current"), self.git("rev-parse", "HEAD"), index.read_bytes()),
+                         ("main\n", head, before))
 
 
 class ProducerCommandsTests(unittest.TestCase):

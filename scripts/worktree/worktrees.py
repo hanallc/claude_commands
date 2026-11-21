@@ -12,14 +12,15 @@ import os
 import subprocess
 import sys
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib import build_folders, scratch
-from scripts.production import session_staff, staff
+from scripts.production import production_doc, session_staff, staff
 from scripts.agents import remote
 
 
@@ -110,6 +111,10 @@ def record_file(path: Path) -> Path:
 
 def read_record(path: Path) -> WorktreeRecord:
     fields = cast(dict[str, object], json.loads(path.read_text()))
+    return _worktree_record(fields)
+
+
+def _worktree_record(fields: dict[str, object]) -> WorktreeRecord:
     return WorktreeRecord(
         version=cast(int, fields["version"]), path=cast(str, fields["path"]),
         branch=cast(str, fields["branch"]), repo=cast(str, fields["repo"]),
@@ -120,9 +125,45 @@ def read_record(path: Path) -> WorktreeRecord:
 def write_record(record: WorktreeRecord) -> None:
     path = record_file(Path(record.path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    _ = temporary.write_text(json.dumps(asdict(record), indent=2) + "\n")
-    _ = temporary.replace(path)
+    write_text_atomic(path, json.dumps(asdict(record), indent=2) + "\n")
+
+
+def retarget_cargo_liner_records(repository: Path, integration_branch: str, receipt: Path,
+                                *, reverse: bool = False) -> int:
+    """Save the original records before retargeting them. Reverse only those edits."""
+    main = main_checkout(repository)
+    if integration_branch == "main":
+        raise Refused(1, "the cargo-liner integration branch must differ from main")
+    _ = git(main, "check-ref-format", f"refs/heads/{integration_branch}")
+    if not reverse and not receipt.exists():
+        originals: list[WorktreeRecord] = []
+        for path in sorted(state_folder().glob("*.json")):
+            record = read_record(path)
+            if Path(record.repo).resolve() == main and record.merge_branch == "main":
+                originals.append(record)
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        _ = create_text_atomic(receipt, json.dumps({
+            "version": 1, "repository": str(main), "integration_branch": integration_branch,
+            "records": [asdict(record) for record in originals],
+        }, indent=2) + "\n")
+    saved = cast(dict[str, object], json.loads(receipt.read_text()))
+    if saved["version"] != 1 or saved["repository"] != str(main) or saved["integration_branch"] != integration_branch:
+        raise Refused(1, f"{receipt}: does not describe this cargo-liner move")
+    original_records = tuple(_worktree_record(fields) for fields in cast(list[dict[str, object]], saved["records"]))
+    if any(Path(record.repo).resolve() != main or record.merge_branch != "main" for record in original_records):
+        raise Refused(1, f"{receipt}: contains a record outside the cargo-liner main target")
+    changed = 0
+    for original in original_records:
+        updated = replace(original, merge_branch=integration_branch)
+        before, after = (updated, original) if reverse else (original, updated)
+        try:
+            current = read_record(record_file(Path(original.path)))
+        except FileNotFoundError:
+            continue
+        if current == before:
+            write_record(after)
+            changed += 1
+    return changed
 
 
 def staff_record() -> staff.StaffSnapshot:
@@ -271,16 +312,20 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
 
 
 def cleanup(path: Path) -> CleanupReady | Kept:
+    head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if head.returncode not in (0, 1):
+        raise Refused(1, head.stderr.strip())
+    branch = head.stdout.strip()
+    try:
+        production_doc.require_removable_checkout(path, path, branch)
+    except production_doc.ProductionPathsError as error:
+        return Kept(path, str(error))
     _ = git(path, "fetch", "--no-prune", "origin")
     dirty = git(path, "status", "--porcelain").stdout
     if dirty:
         return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
-    head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if head.returncode == 1:
         return Kept(path, "HEAD is detached")
-    if head.returncode:
-        raise Refused(1, head.stderr.strip())
-    branch = head.stdout.strip()
     repo = main_checkout(path)
     local = local_branch_tip(repo, branch)
     if isinstance(local, LocalBranchAbsent):
@@ -323,6 +368,10 @@ def release_worktree_pair(path: Path) -> None:
 
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
+    try:
+        production_doc.require_removable_checkout(path, repo, record.branch)
+    except production_doc.ProductionPathsError as error:
+        return Kept(path, str(error))
     resolver = session_staff.RowResolver(snapshot)
     member = resolver.member_by_folder(remote.local_machine(), path)
     if isinstance(member, session_staff.MemberFound):
@@ -473,9 +522,36 @@ def main() -> int:
     check_cleanup = commands.add_parser("cleanup")
     _ = check_cleanup.add_argument("path")
     _ = check_cleanup.add_argument("--checked-tips", action="store_true")
+    protection = commands.add_parser("protect-deletion")
+    _ = protection.add_argument("path")
+    _ = protection.add_argument("branch")
+    _ = protection.add_argument("repository")
     release = commands.add_parser("release-pair")
     _ = release.add_argument("path")
+    retarget = commands.add_parser("cargo-liner-target")
+    _ = retarget.add_argument("repository")
+    _ = retarget.add_argument("integration_branch")
+    _ = retarget.add_argument("receipt")
+    _ = retarget.add_argument("--reverse", action="store_true")
     arguments = parser.parse_args()
+    if cast(str, arguments.command) == "cargo-liner-target":
+        try:
+            count = retarget_cargo_liner_records(
+                Path(cast(str, arguments.repository)).expanduser(), cast(str, arguments.integration_branch),
+                Path(cast(str, arguments.receipt)).expanduser(), reverse=cast(bool, arguments.reverse))
+        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(f"updated {count} cargo-liner worktree records")
+        return 0
+    if cast(str, arguments.command) == "protect-deletion":
+        try:
+            production_doc.require_removable_checkout(
+                Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), cast(str, arguments.branch))
+        except production_doc.ProductionPathsError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if cast(str, arguments.command) == "release-pair":
         release_worktree_pair(Path(cast(str, arguments.path)).absolute())
         return 0

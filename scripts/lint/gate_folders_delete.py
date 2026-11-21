@@ -21,6 +21,7 @@ import sys
 
 from scripts.lib import git_files, git_rescue, scratch
 from scripts.lint.sweep import gib
+from scripts.production.production_doc import ProductionPathsError, protected_checkouts
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,12 @@ def prune_sources(sources: set[Path]) -> tuple[PruneFailure, ...]:
 
 def remove_gate(path: Path, dry_run: bool) -> FolderDecision:
     try:
+        canonical = path.resolve()
+        for checkout in sorted(protected_checkouts(), key=lambda item: item.path):
+            if checkout.path.is_relative_to(canonical):
+                return KeptFilesystemError(path, f"contains protected production checkout {checkout.path}")
+            if canonical.is_relative_to(checkout.path):
+                return KeptFilesystemError(path, f"inside protected production checkout {checkout.path}")
         with scratch.judgment_lock(path) if dry_run else scratch.removal_lock(path) as idle:
             if not idle:
                 return KeptBusy(path)
@@ -183,7 +190,7 @@ def remove_gate(path: Path, dry_run: bool) -> FolderDecision:
             if failures:
                 return DeletedWithPruneFailures(path, contents.size, failures)
             return Deleted(path, contents.size)
-    except OSError as error:
+    except (OSError, ProductionPathsError) as error:
         return KeptFilesystemError(path, str(error))
 
 

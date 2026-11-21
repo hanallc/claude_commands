@@ -21,6 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=confirm_gate.sh
 source "$SCRIPT_DIR/confirm_gate.sh"
 
+"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
+    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$PWD"
+
 HAS_CONFIRMATION=false
 CHECKED_LOCAL_TIP=""
 CHECKED_ORIGIN_TIP=""

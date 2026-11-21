@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
 from scripts.production import session_staff, staff
-from scripts.production.production_doc import cell_value
+from scripts.production.production_doc import (
+    MERGE_CHECKOUT_FIELD, FieldPresent, Refusal, cell_value, optional_field, read_new_production,
+)
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
@@ -46,7 +48,7 @@ def production_owners(production_docs: Path, record: staff.StaffSnapshot) -> Ite
     """Yield the showrunners with documents in the production folder."""
     return (owner for owner in record.find(kind="showrunner")
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
-            and owner.doc.path.parent == production_docs)
+            and owner.doc.path.parent.resolve() == production_docs.resolve())
 
 
 def production_paths(owner: staff.StaffRow, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
@@ -58,6 +60,15 @@ def production_paths(owner: staff.StaffRow, *, resolver: session_staff.RowResolv
         return ()
     headers = tuple(Path(value).expanduser() for line in lines if line.startswith("- **Repository:** ")
                     if (value := cell_value(line.removeprefix("- **Repository:** "))))
+    enrolled = isinstance(optional_field(lines, MERGE_CHECKOUT_FIELD), FieldPresent)
+    if enrolled:
+        try:
+            document = read_new_production(path, owner.name)
+            assert isinstance(document.merge_checkout, Path)
+            headers = (document.merge_checkout,)
+        except Refusal as error:
+            print(f"outcomes: {path}: {error}", file=sys.stderr)
+            return ()
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         rows = resolver.record.find(kind="unit", parent=owner.id)
@@ -84,7 +95,7 @@ def production_paths(owner: staff.StaffRow, *, resolver: session_staff.RowResolv
                 found_main = found_main or main != folder
         if folder not in paths:
             paths.append(folder)
-    if not found_main:
+    if enrolled or not found_main:
         paths = [*(header for header in headers if header not in paths), *paths]
     return tuple(paths)
 
