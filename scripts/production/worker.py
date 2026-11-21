@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import stat
 import time
 from pathlib import Path
 import subprocess
@@ -31,7 +32,7 @@ from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
-from scripts.lib import atomic_file, conf, detached, models_registry, unit_runs
+from scripts.lib import conf, detached, models_registry, unit_runs
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
@@ -486,15 +487,69 @@ def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCo
     return ExitCode.UNCERTAIN
 
 
-def save_reply(path: Path, reply: str) -> None:
-    text = reply.rstrip() + "\n"
+@dataclass(frozen=True)
+class SavedReply:
+    content: bytes
+    mode: int
+
+
+class ReplyMissing(Enum):
+    ABSENT = "no reply file exists"
+
+
+def _read_saved_reply(parent: int, path: Path) -> SavedReply | ReplyMissing:
     try:
-        if path.read_text(encoding="utf-8") == text:
-            return
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     except FileNotFoundError:
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_file.write_text_atomic(path, text)
+        return ReplyMissing.ABSENT
+    with os.fdopen(descriptor, "rb") as source:
+        mode = os.fstat(source.fileno()).st_mode
+        if not stat.S_ISREG(mode):
+            raise OSError(f"{path}: expected a regular reply file")
+        return SavedReply(source.read(), stat.S_IMODE(mode))
+
+
+def save_reply(path: Path, reply: str) -> None:
+    path = path.absolute()
+    if ".." in path.parts:
+        raise OSError(f"{path}: expected a reply path without parent references")
+    content = (reply.rstrip() + "\n").encode()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as directories:
+        parent = os.open(path.anchor, flags)
+        _ = directories.callback(os.close, parent)
+        for folder in path.parts[1:-1]:
+            try:
+                child = os.open(folder, flags, dir_fd=parent)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(folder, dir_fd=parent)
+                child = os.open(folder, flags, dir_fd=parent)
+            parent = child
+            _ = directories.callback(os.close, parent)
+        existing = _read_saved_reply(parent, path)
+        if isinstance(existing, SavedReply) and existing.content == content:
+            return
+        temporary = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                if isinstance(existing, SavedReply):
+                    os.fchmod(output.fileno(), existing.mode)
+                _ = output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            if isinstance(existing, ReplyMissing):
+                os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                os.unlink(temporary, dir_fd=parent)
+            else:
+                if _read_saved_reply(parent, path) != existing:
+                    raise OSError(f"{path}: reply changed before publication")
+                os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=parent)
 
 
 @dataclass(frozen=True)
@@ -693,18 +748,21 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              new_pass_instance_id: uuid.UUID | None = None,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
-    prompt = prompt.resolve()
     record = staff.snapshot()
     owner = record.by_id(parent)
+    enrolled = False
     if owner is not None:
         destination = reply if isinstance(reply, Path) else prompt.with_name(prompt.stem + "_reply.txt")
         artifacts = (prompt, destination, *(path for path in (early_ready,) if isinstance(path, Path)),
                      *_review_artifacts(completion_actions))
         try:
-            _ = _require_review_order(owner, role, session_dir, *artifacts)
+            enrolled = isinstance(_require_review_order(owner, role, session_dir, *artifacts), EnrolledPaths)
         except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
             print(error, file=sys.stderr)
             return ExitCode.REFUSED
+    prompt = prompt.absolute() if enrolled else prompt.resolve()
+    if enrolled and isinstance(reply, Path):
+        reply = reply.absolute()
     with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock

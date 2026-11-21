@@ -88,8 +88,12 @@ def review_run_refusal(owner: staff.StaffRow, run: Path, paths: EnrolledPaths, *
         return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
     if any(root.is_relative_to(tree) or tree.is_relative_to(root) for tree in (paths.main, paths.integration)):
         return AdmissionRefused("the showrunner run directory overlaps a checkout")
-    if any(not artifact.resolve().is_relative_to(root) for artifact in artifacts):
-        return AdmissionRefused("showrunner review orders and replies must stay in the run directory")
+    for artifact in artifacts:
+        path = artifact.absolute()
+        if ".." in path.parts or not path.is_relative_to(root):
+            return AdmissionRefused("showrunner review orders and replies must stay in the run directory")
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+            return AdmissionRefused(f"{path}: showrunner review paths cannot contain symbolic links")
     return None
 
 

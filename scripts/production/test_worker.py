@@ -1700,12 +1700,14 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_dispatch_rerun_after_done_restores_the_reply_once(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        write = atomic_file.write_text_atomic
+        save = worker.save_reply
+
         def interrupted(path: Path, text: str) -> None:
             if path == self.reply:
                 raise OSError("interrupted before reply publication")
-            write(path, text)
-        with patch.object(atomic_file, "write_text_atomic", side_effect=interrupted):
+            save(path, text)
+
+        with patch.object(worker, "save_reply", side_effect=interrupted):
             with self.assertRaisesRegex(OSError, "before reply"):
                 _ = self.finish()
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
@@ -3370,13 +3372,32 @@ class WorkerCommandTests(unittest.TestCase):
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}),
               patch.object(worker_panes, "resolve_production_paths", return_value=paths),
               patch.object(worker_panes, "launch_policy", side_effect=launch_policy)):
+            def assign_review(role: staff.WorkerRole, reply: Path) -> tuple[int, str, str]:
+                return self.command("assign", role, str(self.prompt), "--to", role,
+                    "--session-dir", str(self.run_dir), "--slot", role, "--phase", "8", "--kind", "review",
+                    "--reply", str(reply), "--launcher-command", json.dumps(["assign.sh", "--role", role]))
+
+            for role, location in zip(families, (main, integration), strict=True):
+                with self.subTest(reply_link_in=location.name):
+                    link = location / "verdict.md"
+                    link.symlink_to(self.run_dir / "unwritten.md")
+                    code, output, errors = assign_review(role, link)
+                    self.assertEqual((code, output), (int(worker.ExitCode.REFUSED), ""), errors)
+                    self.assertEqual(self.agent.submitted, [])
+                    self.assertTrue(link.is_symlink())
+
             for role in families:
                 with self.subTest(role=role):
                     reply = self.run_dir / f"{role}-verdict.md"
-                    code, output, errors = self.command("assign", role, str(self.prompt), "--to", role,
-                        "--session-dir", str(self.run_dir), "--slot", role, "--phase", "8", "--kind", "review",
-                        "--reply", str(reply), "--launcher-command", json.dumps(["assign.sh", "--role", role]))
+                    code, output, errors = assign_review(role, reply)
                     self.assertEqual((code, output), (0, "submitted\n"), errors)
+
+            with self.subTest(reply_parent="symbolic link after admission"):
+                verdicts = self.run_dir / "verdicts"
+                verdicts.symlink_to(main, target_is_directory=True)
+                with self.assertRaises(OSError):
+                    worker.save_reply(verdicts / source.name, "Do not replace this file.")
+                self.assertEqual(source.read_text(), "Confirm the selected panel.")
             self.assertEqual(len(self.agent.submitted), 2)
             self.assertEqual(self.agent.notices, [])
             for (pane, line), (role, family) in zip(self.agent.submitted, families.items(), strict=True):
