@@ -1989,6 +1989,11 @@ tableView.bind();bindListControls();tableView.apply(true);
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+document.addEventListener('review-item-saved',event=>{
+ if(typeof event.detail?.list_key!=='string' || !event.detail.list_key) return;
+ listSaveVersion++;
+ refreshAfterListSave(true);
+});
 document.addEventListener('review-item-created',event=>{
  if(typeof event.detail?.list_key!=='string') return;
  createdItem=event.detail.list_key;

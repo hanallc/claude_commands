@@ -733,6 +733,82 @@ window.fetch=async (path,options={})=>{
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
                     "status": status, "body": body})))
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_new_item_retry_refreshes_without_revealing_the_saved_row(self) -> None:
+        root = self.root / "reviews"
+        for number in range(1, 25):
+            _ = self.add(f"List item {number}", number=number)
+        initial = page_frame.with_owner(list_page.render(root, include_counts=False), "list", MORTY,
+                                        staff.StaffSnapshot((MORTY,)), new_item_dialog.render).decode()
+        item = self.add("The first Send")
+        fresh = list_page.render(root, include_counts=False).decode()
+        setup = r"""<script>
+const savedKey=__KEY__,owner=__OWNER__,fresh=__FRESH__,sends=[];
+let pendingCapture=false;
+window.setInterval=()=>0;
+window.fetch=async (path,options={})=>{
+ if(path===location.pathname) return new Response(fresh);
+ if(new URL(path,location.href).search==='?page=list')
+  return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
+ const payload=JSON.parse(options.body);
+ if(payload.page_capture){
+  pendingCapture=true;
+  return new Promise(()=>{});
+ }
+ sends.push(payload);
+ if(sends.length===1) throw new TypeError('The response was lost.');
+ return Response.json({id:'Q1',key:'fixture-review-key',list_key:savedKey});
+};
+</script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
+            "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=(target,test)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(test()){observer.disconnect();resolve();}});
+  observer.observe(target,{subtree:true,childList:true,attributes:true});
+  if(test()){observer.disconnect();resolve();}
+ });
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+ try{
+  const launcher=document.querySelector('[data-owner-new]');
+  const dialog=document.querySelector('#review-new-item');
+  const words=dialog.querySelector('textarea'),send=dialog.querySelector('[type="submit"]');
+  const type=value=>{
+   words.value=value;
+   words.dispatchEvent(new Event('input',{bubbles:true}));
+  };
+  scrollTo({top:480,behavior:'instant'});
+  await frame();
+  launcher.click();
+  await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
+  type('The first Send');
+  check(pendingCapture && !send.disabled,'Send is available while the screenshot is pending.');
+  send.click();
+  await until(dialog,()=>!dialog.querySelector('.new-item-error').hidden && !send.disabled);
+  type('The words for a new Send');
+  const address=location.href,top=scrollY;
+  check(top>0,'The List has scrolled before the retry.');
+  send.click();
+  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(savedKey)+'"]');
+  await until(document.body,()=>row() && !row().hidden);
+  await frame();
+  check(sends.length===2 && JSON.stringify(sends[0])===JSON.stringify(sends[1]),
+        'Send retries the original draft and capture key.');
+  check(location.href===address && scrollY===top,'The refresh keeps the List address and scroll position.');
+  check(dialog.open && words.value==='The words for a new Send' && document.activeElement===send,
+        'The dialog keeps the edited words and focus.');
+  dialog.querySelector('[data-close]').click();
+  await frame();
+  check(!dialog.open && location.href===address && scrollY===top,
+        'Close keeps the List address and scroll position.');
+ }catch(error){failures.push(String(error));}
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+})();
+</script>"""
+        self.browser_actions(initial, setup, probe, window_size=(1440, 900))
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_list_owner_button_fits_at_320_pixels(self) -> None:
         owner = replace(MORTY, name="cargo-liner")

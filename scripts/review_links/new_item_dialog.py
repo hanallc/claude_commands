@@ -9,7 +9,7 @@ import re
 import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Literal, cast
 
 from scripts.production import staff
@@ -23,6 +23,8 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PAGE_DATA_BYTES = 64 * 1024
 MAX_PAGE_ROWS = 48
+MAX_PAGE_SECTIONS = 16
+MAX_PAGE_SECTION_ROWS = 128
 MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
@@ -147,15 +149,38 @@ class BuildStepEvidence:
 
 
 @dataclass(frozen=True)
+class PageDataSection:
+    """Keep the column labels with the page values."""
+
+    label: str
+    columns: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class PageDataEvidence:
-    """Keep the visible data when the server cannot take a screenshot."""
+    """Keep the page data available when a screenshot fails."""
 
     title: str
     rows: tuple[tuple[str, ...], ...]
+    sections: tuple[PageDataSection, ...] = ()
     kind: Literal["page-data"] = field(default="page-data", init=False)
+
+    def page_data(self) -> dict[str, object]:
+        fields: dict[str, object] = {"title": self.title, "rows": self.rows}
+        if self.sections:
+            fields["sections"] = tuple(asdict(section) for section in self.sections)
+        return fields
 
 
 type Evidence = NoEvidence | BuildStepEvidence | PageDataEvidence
+
+
+def evidence_fields(evidence: Evidence) -> dict[str, object]:
+    """Preserve the fields used by existing request digests."""
+    if isinstance(evidence, PageDataEvidence):
+        return {**evidence.page_data(), "kind": evidence.kind}
+    return cast(dict[str, object], asdict(evidence))
 
 
 @dataclass(frozen=True)
@@ -166,6 +191,28 @@ class PageCaptureRequest:
     width: int
     height: int
     dark: bool
+
+
+class UnavailableCapture(Enum):
+    UNAVAILABLE = "capture unavailable"
+
+
+@dataclass(frozen=True)
+class DeferredCaptureIntent:
+    capture_key: str
+    submitted_draft_id: str
+    request: PageCaptureRequest | UnavailableCapture
+
+
+class NoDeferredCapture(Enum):
+    ABSENT = "no deferred capture"
+
+
+type SubmissionCaptureIntent = DeferredCaptureIntent | NoDeferredCapture
+
+
+class NoBoundCaptureTarget(Enum):
+    UNBOUND = "no saved item"
 
 
 @dataclass(frozen=True)
@@ -268,6 +315,7 @@ class ReviewSubmission:
     page: str = ""
     page_state: BugPageState | None = None
     page_state_data: PageDataEvidence | None = None
+    capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
 
     @property
     def bug_page_data(self) -> PageDataEvidence | None:
@@ -395,6 +443,11 @@ def _tip_entry(value: object) -> TipEntry:
             raise SubmissionError("Select a valid tooltip entry type.")
 
 
+def _page_cells(value: object) -> tuple[str, ...]:
+    return tuple(_text(cell, "Page value", 240, allow_empty=True)
+                 for cell in _entries(value, "Page cells", 16))
+
+
 def read_evidence(value: object) -> Evidence:
     """Decode the structured evidence supplied by the dialog."""
     data = _mapping(value, "Evidence")
@@ -402,10 +455,18 @@ def read_evidence(value: object) -> Evidence:
         case "none":
             return NoEvidence()
         case "page-data":
-            rows = tuple(tuple(_text(cell, "Page value", 240, allow_empty=True)
-                               for cell in _entries(row, "Page row", 16))
-                         for row in _entries(data.get("rows"), "Page rows", MAX_PAGE_ROWS))
-            return PageDataEvidence(_text(data.get("title"), "Page title", 240), rows)
+            rows = tuple(_page_cells(row) for row in _entries(data.get("rows"), "Page rows", MAX_PAGE_ROWS))
+            sections = tuple(
+                PageDataSection(_text(section.get("label"), "Page section", 240), _page_cells(section.get("columns")),
+                                tuple(_page_cells(row) for row in _entries(
+                                    section.get("rows"), "Section rows", MAX_PAGE_SECTION_ROWS)))
+                for value in _entries(data.get("sections", ()), "Page sections", MAX_PAGE_SECTIONS)
+                for section in (_mapping(value, "Page section"),))
+            evidence = PageDataEvidence(_text(data.get("title"), "Page title", 240), rows, sections)
+            if sections and len(json.dumps(
+                    evidence_fields(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PAGE_DATA_BYTES:
+                raise SubmissionError("The page data exceeds its size limit.")
+            return evidence
         case "build-step":
             captured_at = _text(data.get("captured_at"), "Capture time", 80)
             _ = _time(captured_at)
@@ -433,25 +494,45 @@ def read_evidence(value: object) -> Evidence:
             raise SubmissionError("Select a valid evidence type.")
 
 
+PAGE_CAPTURE_KEY = re.compile(r"(?:[0-9a-f]{32}|r[26]-[0-9a-f]{64})")
+
+
 def read_capture_key(value: object) -> str:
-    """Check a key issued for one dialog session."""
-    key = _text(value, "Capture key", 32)
-    if not re.fullmatch(r"[0-9a-f]{32}", key):
+    """Check a legacy key or a key that starts with its draft ID."""
+    key = _text(value, "Capture key", 67)
+    if not PAGE_CAPTURE_KEY.fullmatch(key):
         raise SubmissionError("Invalid capture key.")
     return key
 
 
-def read_page_capture(value: object) -> PageCaptureRequest:
-    """Check a viewport before starting Firefox."""
-    data = _mapping(value, "Page capture")
+def capture_key_matches_draft(key: str, draft: str) -> bool:
+    """Check that the key starts with the ID of its draft."""
+    return len(key) == 67 and key[:35] == draft and PAGE_CAPTURE_KEY.fullmatch(key) is not None
+
+
+def read_capture_viewport(value: object) -> PageViewport:
+    """Check the viewport dimensions for a screenshot."""
+    data = _mapping(value, "Capture viewport")
     width, height, dark = data.get("width"), data.get("height"), data.get("dark")
     if (type(width) is not int or not 240 <= width <= 4096
             or type(height) is not int or not 200 <= height <= 2160 or not isinstance(dark, bool)):
         raise SubmissionError("The page size is outside the screenshot limits.")
+    return PageViewport(width, height, dark)
+
+
+def _capture_place(data: dict[str, object]) -> str:
     place = _text(data.get("place"), "Page address", 2048)
     if not place.startswith("/") or place.startswith("//") or re.search(r"[\\\x00-\x20\x7f]", place):
         raise SubmissionError("Use a console page address.")
-    return PageCaptureRequest(place, width, height, dark)
+    return place
+
+
+def read_page_capture(value: object) -> PageCaptureRequest:
+    """Check the page address and viewport before starting Firefox."""
+    data = _mapping(value, "Page capture")
+    viewport = read_capture_viewport(data)
+    place = _capture_place(data)
+    return PageCaptureRequest(place, viewport.width, viewport.height, viewport.dark)
 
 
 def _page_integer(value: object, label: str, minimum: int) -> int:
@@ -526,8 +607,8 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
             not page or kind != SubmissionKind.BUG or
             not (isinstance(evidence, PageDataEvidence) or isinstance(evidence, NoEvidence) and page_state.title)):
         raise SubmissionError("Send page state from a console Bug dialog.")
-    if page_state is not None and len(
-            json.dumps(asdict(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PAGE_DATA_BYTES:
+    if page_state is not None and len(json.dumps(
+            evidence_fields(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PAGE_DATA_BYTES:
         raise SubmissionError("The Bug page data exceeds its size limit.")
     images = tuple(
         PastedImage(_text(image.get("media_type"), "Image type", 32),
@@ -535,7 +616,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         for entry in _entries(data.get("images"), "Images", MAX_IMAGES)
         for image in (_mapping(entry, "Image"),))
     return NewItemRequest(
-        _text(data.get("request_id"), "Request ID", MAX_REQUEST_ID_LENGTH), kind,
+        read_request_id(data.get("request_id")), kind,
         staff.StaffId(_text(data.get("recipient_id"), "Recipient ID", 128)),
         _text(data.get("words"), "Your words", MAX_WORDS_LENGTH),
         evidence, images, page, page_state, page_recipient)
@@ -555,11 +636,32 @@ def read_image_reference(value: object) -> ImageReference:
 def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     """Write the submission fields inside the native record."""
     fields = cast(dict[str, object], asdict(details))
+    fields["evidence"] = evidence_fields(details.evidence)
     if details.page_state is None:
         _ = fields.pop("page_state")
     if details.page_state_data is None:
         _ = fields.pop("page_state_data")
+    else:
+        fields["page_state_data"] = evidence_fields(details.page_state_data)
+    if isinstance(details.capture_intent, DeferredCaptureIntent):
+        intent = details.capture_intent
+        fields["capture_intent"] = {
+            "capture_key": intent.capture_key, "submitted_draft_id": intent.submitted_draft_id,
+            **({"request": asdict(intent.request)} if isinstance(intent.request, PageCaptureRequest) else {}),
+        }
+    else:
+        _ = fields.pop("capture_intent")
     return fields
+
+
+def _read_capture_intent(value: object) -> DeferredCaptureIntent:
+    row = _mapping(value, "Capture intent")
+    key = read_capture_key(row.get("capture_key"))
+    draft = read_request_id(row.get("submitted_draft_id"))
+    if not capture_key_matches_draft(key, draft):
+        raise SubmissionError("The screenshot belongs to another draft.")
+    request = read_page_capture(row["request"]) if "request" in row else UnavailableCapture.UNAVAILABLE
+    return DeferredCaptureIntent(key, draft, request)
 
 
 def read_submission(value: object) -> ReviewSubmission:
@@ -574,7 +676,8 @@ def read_submission(value: object) -> ReviewSubmission:
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
         read_evidence(row.get("evidence")), tuple(read_image_reference(image) for image in images),
-        _text(row.get("reply_token"), "Reply token", 43), page, read_bug_page_state(row.get("page_state")), data)
+        _text(row.get("reply_token"), "Reply token", 43), page, read_bug_page_state(row.get("page_state")), data,
+        _read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT)
 
 
 def decode_submission(value: str) -> SubmissionOrigin:
@@ -623,7 +726,8 @@ def render() -> str:
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
-                         "pageRows": MAX_PAGE_ROWS,
+                         "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
+                         "sectionRows": MAX_PAGE_SECTION_ROWS,
                          "pageUrlLength": MAX_PAGE_URL_LENGTH})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
@@ -636,7 +740,7 @@ def render() -> str:
     <h4 id="sent-details-title">Sent with your words</h4>
     <div data-bug-page-state hidden>
      <dl class="page-state"></dl>
-     <p data-visible-text>Visible text from this page (up to {MAX_PAGE_ROWS} rows)</p>
+     <p data-visible-text>Page data and visible text</p>
     </div>
     <label class="new-item-page-capture">
      <input type="checkbox" name="include_page" checked><span>Include a screenshot</span>
@@ -646,10 +750,10 @@ def render() -> str:
       <img alt="Screenshot of this page">
       <span>Open full size ↗</span>
      </a>
-     <div data-taking role="status"><span class="capture-spinner" aria-hidden="true"></span>Taking a screenshot</div>
+     <div data-taking role="status"><span class="capture-spinner" aria-hidden="true"></span>Taking a screenshot. You can send now. The screenshot joins the saved item when ready.</div>
     </div>
-    <p data-capture-expired role="status" hidden>The screenshot expired. A new one is being taken. Send again when it shows.</p>
-    <p data-fallback role="status" hidden>Screenshot unavailable. Visible text from this page goes instead (up to {MAX_PAGE_ROWS} rows).</p>
+    <p data-capture-expired role="status" hidden>The screenshot expired.</p>
+    <p data-fallback role="status" hidden>Screenshot unavailable. Page data and visible text go instead.</p>
     <div class="new-item-previews" data-previews hidden></div>
    </section>
 '''
@@ -685,6 +789,8 @@ PAGE_STATE_STYLE = '''
 
 
 STYLE = '''
+/* Keep the page at the same scroll position when a save adds a row. */
+:root:has(#review-new-item[open]) { overflow-anchor: none; }
 #review-new-item button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
 #review-new-item button:disabled { opacity: .55; cursor: default; }
 #review-new-item button:focus-visible, #review-new-item textarea:focus-visible,
@@ -811,7 +917,7 @@ SCRIPT = r'''(() => {
  let draftId, keepDraft = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
- let captureSession, pageContext, savedItem;
+ let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -826,8 +932,8 @@ SCRIPT = r'''(() => {
  }
 
  function updateSend() {
-  send.disabled = !!savedItem || sending || (!slot.hidden && !taking.hidden) || !token || !recipientChips.querySelector('input:checked') ||
-                  !words.value.trim() || words.value.length > words.maxLength;
+  send.disabled = !!savedItem || sending || !token || (!pendingItem &&
+    (!recipientChips.querySelector('input:checked') || !words.value.trim() || words.value.length > words.maxLength));
  }
 
  function showRecipients() {
@@ -858,6 +964,7 @@ SCRIPT = r'''(() => {
 
  function editDraft(event) {
   if (sending) return;
+  if (pendingItem) pendingEdited = true;
   if (event?.target.name === 'kind') {
    showRecipients();
    showBugPage();
@@ -867,7 +974,7 @@ SCRIPT = r'''(() => {
    storeListDraft();
    recipientStatus.hidden = true;
   }
-  if (event?.target === includePage) startCapture();
+  if (event?.target === includePage && !pendingItem) startCapture();
   showSentDetails();
   setError('');
   updateSend();
@@ -933,6 +1040,7 @@ SCRIPT = r'''(() => {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
+   failure.definiteRefusal = response.status >= 400 && response.status < 500;
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
@@ -944,8 +1052,8 @@ SCRIPT = r'''(() => {
   return data;
  }
 
- async function loadOptions(signal) {
-  const path = endpoint + '?' + new URLSearchParams({page: ownerPage});
+ async function loadOptions(signal, page = ownerPage) {
+  const path = page ? endpoint + '?' + new URLSearchParams({page}) : endpoint;
   const response = await fetch(path, {cache: 'no-store', signal});
   const data = await responseData(response, 'Could not load recipients.');
   if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
@@ -982,18 +1090,75 @@ SCRIPT = r'''(() => {
   const main = document.querySelector('main') || document.body;
   const text = element => clip(element.innerText || '');
   const title = clip(main.querySelector('h1')?.textContent || document.title || ownerPage);
-  const data = {kind: 'page-data', title, rows: []};
+  const data = {kind: 'page-data', title, rows: [], sections: []};
   const encoder = new TextEncoder();
-  let bytes = encoder.encode(JSON.stringify(data)).length;
+  const size = value => encoder.encode(JSON.stringify(value)).length;
+  let bytes = size(data);
+  function append(entries, entry) {
+   const added = size(entry) + Number(entries.length > 0);
+   if (bytes + added > limits.pageDataBytes) return false;
+   entries.push(entry);
+   bytes += added;
+   return true;
+  }
+  function addSection(label, columns, rows) {
+   if (!columns.some(Boolean) || data.sections.length >= limits.pageSections) return;
+   const section = {label: label || title, columns, rows: []};
+   const before = bytes;
+   if (!append(data.sections, section)) return;
+   for (const values of rows) {
+    const row = values.slice(0, 16).map(value => clip(value));
+    if (!row.some(Boolean)) continue;
+    if (!append(section.rows, row) || section.rows.length === limits.sectionRows) break;
+   }
+   if (!section.rows.length) {
+    data.sections.pop();
+    bytes = before;
+   }
+  }
+  if (ownerPage === 'builds') {
+   const memory = function* () {
+    for (const row of main.querySelectorAll('.legend .row[data-tip]')) {
+     if (visible(row)) yield [text(row.querySelector('.name') || row), text(row.querySelector('.v') || row)];
+    }
+   };
+   addSection('Build memory', ['Name', 'Value'], memory());
+  }
+  for (const element of main.querySelectorAll('table,dl')) {
+   if (!visible(element)) continue;
+   const heading = element.closest('section,article,details')?.querySelector('h2,h3,summary');
+   const label = clip(element.caption?.innerText || element.getAttribute('aria-label') || heading?.innerText || '');
+   if (element.pageData) {
+    const {columns, rows} = element.pageData();
+    addSection(label, columns, rows);
+   } else if (element.matches('table')) {
+    const header = element.tHead?.rows[0] || element.rows[0];
+    if (!header) continue;
+    const columns = [...header.cells].slice(0, 16).map(cell => cell.tagName === 'TH' && visible(cell) ? text(cell) : '');
+    const rows = function* () {
+     for (const row of element.rows) {
+      if (row === header || row.closest('thead') || row.matches('[data-detail]') || !visible(row)) continue;
+      yield columns.map((column, at) => column && row.cells[at] ? text(row.cells[at]) : '');
+     }
+    };
+    addSection(label, columns, rows());
+   } else {
+    const rows = function* () {
+     for (const term of element.querySelectorAll('dt')) {
+      const value = term.nextElementSibling;
+      if (visible(term) && value?.matches('dd') && visible(value)) yield [text(term), text(value)];
+     }
+    };
+    addSection(label, ['Name', 'Value'], rows());
+   }
+  }
   for (const element of main.querySelectorAll('h2,h3,p,dl,tr')) {
    if (!visible(element)) continue;
    const cells = element.matches('tr,dl') ? [...element.children].slice(0, 16).map(text) : [text(element)];
    if (!cells.some(Boolean)) continue;
-   bytes += encoder.encode(JSON.stringify(cells)).length + (data.rows.length ? 1 : 0);
-   if (bytes > limits.pageDataBytes) break;
-   data.rows.push(cells);
-   if (data.rows.length === limits.pageRows) break;
+   if (!append(data.rows, cells) || data.rows.length === limits.pageRows) break;
   }
+  if (!data.sections.length) delete data.sections;
   return data;
  }
 
@@ -1086,24 +1251,48 @@ SCRIPT = r'''(() => {
  function startCapture(renewed = false) {
   if ((savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
-  const session = {token, renewed, controller: new AbortController()};
+  const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
+  const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,
+                   controller: new AbortController()};
   captureSession = session;
   showSentDetails();
-  session.key = post({token, page_capture: {place, ...viewport}})
+  session.key = post({token, page_capture: capture.request, capture_key: capture.key})
    .then(result => result.capture_key || '', () => '');
   void session.key.then(async key => {
-   if (!key || captureSession !== session) return null;
-   const response = await fetch(endpoint + '?' + new URLSearchParams({capture_key: key}),
-    {cache: 'no-store', headers: {'X-Review-Token': session.token}, signal: session.controller.signal});
-   if (!response.ok) return null;
-   const blob = await response.blob();
-   return captureSession === session ? {key, size: blob.size, blob, url: URL.createObjectURL(blob)} : null;
+   if (!key) return null;
+   const path = endpoint + '?' + new URLSearchParams({capture_key: key});
+   const getPreview = () => fetch(path, {cache: 'no-store',
+    headers: {'X-Review-Token': session.token}, signal: session.controller.signal});
+   let refreshToken = true;
+   while (!session.controller.signal.aborted) {
+    const response = await getPreview().catch(() => null);
+    if ((!response || response.status === 403) && refreshToken) {
+     const fresh = await loadOptions(session.controller.signal, session.page);
+     if (!fresh.token) return null;
+     session.token = fresh.token;
+     if (captureSession === session) setOptions(fresh);
+     refreshToken = false;
+    } else if (response?.status === 202) {
+     await new Promise(resolve => setTimeout(resolve, 250));
+    } else {
+     return response?.ok ? {key, blob: await response.blob()} : null;
+    }
+   }
+   return null;
   }).catch(() => null).then(image => {
-   if (captureSession !== session) return null;
-   session.image = image;
+   if (captureSession !== session) return;
+   session.image = image ? {key: image.key, size: image.blob.size, url: URL.createObjectURL(image.blob)} : null;
    showSentDetails();
-   return image;
   });
+ }
+
+ function randomNonce() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                    byte => byte.toString(16).padStart(2, '0')).join('');
+ }
+
+ function ensureDraftId() {
+  return draftId ||= 'r6-' + randomNonce();
  }
 
  async function renewCapture() {
@@ -1123,7 +1312,7 @@ SCRIPT = r'''(() => {
   session.controller.abort();
   clearCapturePreview(session);
   showSentDetails();
-  if (!used) {
+  if (!used && !session.sent) {
    void session.key.then(key => key && post({token: session.token, discard_capture: key}, true)).catch(() => {});
   }
  }
@@ -1155,7 +1344,8 @@ SCRIPT = r'''(() => {
  }
 
  function finishDraft() {
-  draftId = undefined;
+  draftId = deferredCapture = pendingItem = undefined;
+  pendingEdited = false;
   if (ownerPage === 'list') {
    try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
@@ -1177,9 +1367,9 @@ SCRIPT = r'''(() => {
   discardCapture();
   opening.abort();
   dialog.close();
-  keepDraft = !sent && !result && Boolean(words.value || images.length);
+  keepDraft = !sent && !result && Boolean(pendingItem || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list') draftId = undefined;
+   if (ownerPage !== 'list' || !storedListDraft()) finishDraft();
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -1203,6 +1393,7 @@ SCRIPT = r'''(() => {
 
  async function open(trigger, page) {
   if (dialog.open || sending) return;
+  if (pendingItem) page = pendingItem.page;
   ownerPage = page;
   pageContext = collectPageContext();
   launcher = trigger;
@@ -1257,30 +1448,42 @@ SCRIPT = r'''(() => {
  for (const control of dialog.querySelectorAll('[data-cancel], [data-done]')) {
   control.addEventListener('click', () => close());
  }
+ async function submissionPayload() {
+  if (pendingItem) return pendingItem;
+  const type = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
+  if (!recipient) throw new Error('Select a recipient.');
+  const kind = type === 'feedback' ? 'investigation' : type;
+  const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
+                   page: ownerPage, page_recipient: 'selected'};
+  storeListDraft();
+  let key = '';
+  if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
+  if (!deferredCapture && !slot.hidden && !shot.hidden) {
+   key = captureSession?.image?.key;
+   if (!key) throw new Error('The screenshot is unavailable.');
+  }
+  const bug = isPageBug();
+  const data = bug || deferredCapture || !fallback.hidden ? pageContext.data : {kind: 'none'};
+  const state = bug && pageContext.state;
+  const files = await Promise.all(images.map(image => pastedData(image.file)));
+  if (deferredCapture && captureSession?.capture === deferredCapture) captureSession.sent = true;
+  const item = {...payload, evidence: data, images: files,
+                ...(deferredCapture && {capture_key: deferredCapture.key, defer_capture: deferredCapture.request}),
+                ...(key && {capture_key: key}), ...(state && {page_state: state})};
+  if (deferredCapture) pendingItem = item;
+  return item;
+ }
+
  form.addEventListener('submit', async event => {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
-  let saved, captureKey = '';
+  let saved, usedPreview = false;
   setError('');
   setSending(true);
   try {
-   const type = form.elements.kind.value, selected = recipientChips.querySelector('input:checked');
-   const kind = type === 'feedback' ? 'investigation' : type;
-   if (!selected) throw new Error('Select a recipient.');
-   if (!draftId) {
-    draftId = 'r6-' + Array.from(crypto.getRandomValues(new Uint8Array(16)),
-                                byte => byte.toString(16).padStart(2, '0')).join('');
-   }
-   storeListDraft();
-   const screenshot = slot.hidden || shot.hidden ? null : captureSession?.image;
-   captureKey = screenshot?.key || '';
-   const bug = isPageBug();
-   const evidence = bug || !fallback.hidden ? pageContext.data : {kind: 'none'};
-   const files = await Promise.all(images.map(image => pastedData(image.file)));
-   const item = {request_id: draftId, kind, recipient_id: selected.value, words: words.value,
-                 page: ownerPage, page_recipient: 'selected', evidence, images: files,
-                 ...(captureKey && {capture_key: captureKey}), ...(bug && {page_state: pageContext.state})};
+   const item = await submissionPayload();
+   usedPreview = Boolean(item.capture_key && !item.defer_capture);
    const sendItem = () => post({...item, token});
    let result;
    try {
@@ -1289,7 +1492,7 @@ SCRIPT = r'''(() => {
     if (onList || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
-    if (selectedRecipient !== selected.value) return;
+    if (!pendingItem && selectedRecipient !== item.recipient_id) return;
     result = await sendItem();
    }
    if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
@@ -1297,18 +1500,22 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
+   if (failure?.definiteRefusal && !failure.staleToken) {
+    pendingItem = deferredCapture = undefined;
+    pendingEdited = false;
+   }
    if (failure?.filedId) {
+    discardCapture();
     finishDraft();
     setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
-    discardCapture();
     void renewCapture();
    } else {
     setError(failure?.message || 'Could not send this item.');
     if (failure?.screenshotExpired && includePage.checked) {
      discardCapture(!onList);
      void renewCapture();
-    } else if (onList && failure?.staleToken) {
-     discardCapture();
+    } else if (onList && (failure?.staleToken || failure instanceof TypeError)) {
+     if (!pendingItem) discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {
@@ -1322,9 +1529,16 @@ SCRIPT = r'''(() => {
    setSending(false);
   }
   if (saved) {
+   const keepEdits = pendingEdited;
+   discardCapture(usedPreview);
    finishDraft();
-   discardCapture(Boolean(captureKey));
-   if (onList) {
+   if (keepEdits) {
+    setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
+    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+    startCapture();
+    updateSend();
+    send.focus();
+   } else if (onList) {
     close({sent: true});
     dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
    } else {

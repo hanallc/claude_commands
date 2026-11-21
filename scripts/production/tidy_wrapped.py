@@ -123,17 +123,19 @@ class ReviewRecordMove:
         if isinstance(hint, review_submissions.UnreadableRequestFile):
             raise hint.error
         original = self.source
+        browser_token_digest = ""
         if isinstance(hint, review_submissions.NativeSubmissionDestination):
             if (hint.address != address or hint.id != self.identity
                     or hint.payload_hash != self.submission.request_digest):
                 raise TidyRefused(f"{self.identity}: the Review receipt disagrees with {self.source}")
             original = hint.original_path
+            browser_token_digest = hint.browser_token_digest
         elif (isinstance(hint, review_submissions.PendingFiling)
               and hint.payload_hash != self.submission.request_digest):
             raise TidyRefused(f"{self.identity}: the pending Review request disagrees with {self.source}")
         destination = review_submissions.NativeSubmissionDestination(
             self.identity, self.kind, recipient, request_id, self.submission.request_digest,
-            self.target, original, self.owner)
+            self.target, original, self.owner, browser_token_digest=browser_token_digest)
         folder = review_submissions.image_folder(self.submission).parent
         receipt, pending = folder / "receipt.json", folder / "pending.json"
         with (self.publish_record(numbers),

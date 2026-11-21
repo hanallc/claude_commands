@@ -314,7 +314,7 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
     elif isinstance(evidence, new_item_dialog.PageDataEvidence):
         page_data = evidence
     if page_data is not None:
-        data = json.dumps({'title': page_data.title, 'rows': page_data.rows}, ensure_ascii=False, indent=2)
+        data = json.dumps(page_data.page_data(), ensure_ascii=False, indent=2)
         body += '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
     if images:
         links: list[str] = []
@@ -642,6 +642,9 @@ class ReviewSnapshotCache:
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
         capture_requested: bool = False,
         refusal: new_item_dialog.SubmissionError | None = None,
+        capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
+        capture_target: new_item_dialog.ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
+        = new_item_dialog.NoBoundCaptureTarget.UNBOUND,
     ) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
         _ = self.get()
@@ -651,7 +654,8 @@ class ReviewSnapshotCache:
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
                 saved = review_submissions.submit(request, members=members, screenshot=screenshot,
-                                                  capture_requested=capture_requested, refusal=refusal)
+                                                  capture_requested=capture_requested, refusal=refusal,
+                                                  capture_intent=capture_intent, capture_target=capture_target)
             if not remote_staff:
                 members = staff.snapshot()
             path = saved.path
@@ -679,6 +683,15 @@ class ReviewSnapshotCache:
                 self._publish_submission_evidence(saved.request_id)
                 return True
             return False
+
+    def attach_deferred_page_screenshot(self, target: new_item_dialog.ScopedSubmissionKey,
+                                        image: new_item_dialog.PageScreenshot) -> review_submissions.ScreenshotAttachment:
+        """Attach a deferred screenshot and publish the updated Review card."""
+        with self._save_lock:
+            attached = review_submissions.attach_submission_screenshot(target, image)
+            if attached is not review_submissions.ScreenshotAttachment.UNAVAILABLE:
+                self._publish_submission_evidence(target.request_id)
+            return attached
 
     def publish_submission_evidence(self, request_id: str) -> None:
         """Publish evidence added to an existing submission."""
@@ -1753,8 +1766,18 @@ const view=createRecordTable({content:()=>content,
  shows:showValues,
  visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
- applied:(_items,filters)=>{
+ applied:(items,filters)=>{
   const {type,show,owner,query,keys,now}=filters;
+  content.querySelector('table').pageData=()=>({
+   columns:['Id','Type','Owner','Source','Item','State','Filed'],
+   rows:(function*(){
+    for(const {dataset:entry} of items){
+     if(!isListed(entry,filters)) continue;
+     yield [entry.id,entry.type,entry.ownerName,entry.sourceName,entry.title,entry.state,
+      new Date(entry.filed*1000).toISOString()];
+    }
+   })()
+  });
   content.dataset.show=show;loadBodies();
   const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys,now}));
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{

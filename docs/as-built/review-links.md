@@ -582,35 +582,51 @@ The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
 The page owner dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
-The dialog shows **Taking a screenshot** until the preview is available.
+The dialog keeps **Send** available while it takes the screenshot.
+Send uses page data if the preview is still pending.
+Send saves the capture intent with the native item and links the List draft to it.
+The capture key belongs to the browser draft, even when The List saves a different request ID.
+The server recreates a missing capture lookup from the native item after a restart.
+The item retains its page data if the screenshot is unavailable.
+An invalid capture object, address, or viewport makes the screenshot unavailable.
+An address for a different page also makes the screenshot unavailable.
+Send rejects an invalid capture key or a key that belongs to another draft or item.
+The server attaches the screenshot when the capture finishes, even if you leave the page.
+A saved capture remains available after the preview expires.
+The server retries a failed attachment and keeps one screenshot on the item.
+After a lost response for a pending capture, Send retries the original payload, draft ID and capture key.
+The dialog keeps any edits for a new Send.
+Review and the List refresh the saved row and keep the current address, scroll position, and focus while the dialog holds edits.
 Select the preview to open the image at full size.
 Send saves the item with the evidence shown in the dialog.
 If the native write fails, the server discards the staged evidence.
 The server holds the preview for the retry.
 If Cancel discards the preview during filing, the server releases it when filing ends.
 The draft stays available for edits after a failed Send.
-Send publishes the saved item and delivers its message before it confirms success.
+Send publishes the saved item before it confirms success.
+For a List or legacy page draft, Send delivers the message after the response.
 A retry with the same request ID resumes publication and delivery of the saved item.
 If the content matches, the retry returns the saved item.
-If the content changed, the dialog shows the saved item ID and keeps the edits.
+If the content changed or the screenshot cannot be verified, the dialog shows the saved item ID and keeps the edits.
 The next Send uses a new request ID.
 When Back restores an open dialog, the dialog takes a new screenshot if the box is checked.
 Changing the type keeps the same capture.
+The server keeps the capture key and preview in its private store until they expire or the dialog discards them.
+After a restart, the dialog can request an unfinished preview with the same key and a fresh token.
 If the preview expires, the dialog keeps the draft and shows the placeholder while it takes a new screenshot.
 If the first Send fails because the preview expires, the checkbox stays available.
-Select **Send** again when the new screenshot appears.
+Select **Send** again to use the new screenshot or page data.
 Send requests a reload if a legacy request for a checked Bug lacks both a capture key and a filed match.
 A retry can recover the filed item after a restart.
-The server confirms a screenshot retry only when a held capture proves the PNG matches.
-If the server cannot confirm a match, the dialog shows the filed item ID and keeps the edits.
+For a synchronous screenshot, the server uses the capture digest to verify a retry.
 It replaces the old screenshot when the checkbox is selected.
-The next Send uses a new request ID.
 Clear **Include a screenshot** to omit the image.
-A Bug always includes up to 48 rows of visible text from when the dialog opened.
-The Bug card shows these rows under **Page data**, including when the screenshot is unavailable.
-It also includes the page title, address, filters, and render time.
-The dialog shows Error lines and Script errors when the page has those errors.
-For other types, Send includes visible text when the block shows the fallback notice.
+A Bug includes structured page sections and up to 48 rows of visible text from when the dialog opens.
+Other types include the same page data when Send requests a pending screenshot or the screenshot is unavailable.
+The Review card shows this evidence under **Page data**.
+A Bug also includes the page title, address, filters, and render time.
+The dialog shows Error lines and Script errors when the page has errors.
+Review reuses gzip bytes for an unchanged page shell with its current owner control.
 A Bug with a screenshot also includes the viewport.
 The dialog shows the saved item ID after Send on Review and the other pages outside The List.
 Select **Done** to close the confirmation.
@@ -937,7 +953,7 @@ The user can edit the draft before a retry.
 Each draft ID can file one Review item.
 A retry of a filed draft returns the original item ID and restores a missing List row.
 A retry can use a new screenshot if the first screenshot expires before filing.
-After the server confirms the save, The List closes the dialog, refreshes, and opens the new row.
+After a Send that closes the dialog, The List refreshes and opens the saved row.
 If a row save is in progress, the List refreshes when that save ends.
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
