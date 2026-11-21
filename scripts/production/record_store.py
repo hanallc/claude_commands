@@ -25,7 +25,9 @@ from scripts.lib import git_files
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
 from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
-from scripts.production.production_doc import Refusal, legacy_document_path, production_backup_checkout, production_field
+from scripts.production.production_doc import (
+    BACKUP_DOCUMENT_DIRECTORY, Refusal, legacy_document_path, production_backup_checkout, production_field,
+)
 
 
 class RecordText(NamedTuple):
@@ -307,8 +309,7 @@ def _backup_issue_folders(owner: staff.StaffId, doc: Path, sources: list[Path] |
     if not backup.is_dir():
         return ()
     try:
-        checkout = git_files.locate(doc.parent)
-        relative = doc.resolve().relative_to(checkout.toplevel)
+        relative = Path(BACKUP_DOCUMENT_DIRECTORY) / doc.name
         if sources is not None:
             _ = _history_inputs(backup, backup / relative, sources)
         return _read_folder_log(backup, relative.as_posix(), doc) or ()
@@ -356,7 +357,7 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
             if include_history:
                 try:
                     roots.extend(historical_issue_folders(document, sources=sources))
-                    if owner:
+                    if owner and legacy_document_path(document) != document:
                         roots.extend(_backup_issue_folders(owner, document, sources))
                 except (OSError, UnicodeError):
                     if strict and require_document:

@@ -23,6 +23,8 @@ MERGE_CHECKOUT_FIELD = "Merge checkout"
 LIVE_DOCUMENT_SUFFIX = "-live.md"
 NOTES_DIRECTORY = ".showrunner-notes"
 GUARD_READY_FILE = "guard-ready.json"
+BACKUP_DOCUMENT_DIRECTORY = "document"
+GUARD_REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 def production_backup_root() -> Path:
@@ -267,10 +269,15 @@ def _repository_live_paths(checkout: git_files.Checkout) -> dict[Path, Path]:
         assert isinstance(row.doc, staff.LiveDoc)
         doc = row.doc.path.resolve()
         try:
-            if git_files.locate(doc.parent).common_dir != checkout.common_dir:
+            existing = next(parent for parent in doc.parents if parent.is_dir())
+            if git_files.locate(existing).common_dir != checkout.common_dir:
                 continue
             lines = doc.read_text(encoding="utf-8").splitlines()
-        except (FileNotFoundError, git_files.NotACheckout):
+        except FileNotFoundError:
+            if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
+                raise
+            continue
+        except git_files.NotACheckout:
             continue
         declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
         if isinstance(declared, FieldPresent):
@@ -357,6 +364,8 @@ def require_removable_checkout(path: Path, repository: Path, branch: str) -> Non
         for checkout in protected:
             if checkout.path.is_relative_to(candidate):
                 raise ProductionPathsError(f"{candidate}: contains protected production checkout {checkout.path}")
+            if candidate.is_relative_to(checkout.path):
+                raise ProductionPathsError(f"{candidate}: inside protected production checkout {checkout.path}")
     except (OSError, RuntimeError, ValueError) as error:
         raise ProductionPathsError(f"{path}: cannot check production protection: {error}") from error
 
@@ -486,9 +495,9 @@ def read_guard_ready() -> GuardReady | None:
                != {(event, tool) for event in events for tool in ("Bash", "apply_patch")}
                for home in {entry.codex_home for entry in codex}):
             return None
-        code = Path(__file__).resolve().parents[2]
         ancestor = subprocess.run(
-            ["git", "--no-replace-objects", "-C", str(code), "merge-base", "--is-ancestor", revision, "refs/heads/main"],
+            ["git", "--no-replace-objects", "-C", str(GUARD_REPOSITORY),
+             "merge-base", "--is-ancestor", revision, "refs/heads/main"],
             capture_output=True, check=False,
         )
         if ancestor.returncode:
