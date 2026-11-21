@@ -425,13 +425,13 @@ Phase 404 found 30 candidates on main at `9f3459ec1b`. Builds routes the questio
 Record the owner and the date with each answer. The answers are `delete`, `keep`, and `not yet`.
 
 - `scripts/style/selection_capture.py` — delete (resources, 2026-11-21).
-- `scripts/style/refill_measure.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/refill_measure.py` — delete (cargo-liner, 2026-11-21), with `selection_capture.py`.
 - `scripts/direct/demo_refusals.sh` — delete (sdlc, 2026-11-21).
 - `scripts/production/unit_run.py` — delete (natedev, 2026-11-21). Live code uses `scripts/lib/unit_runs` only.
-- `scripts/style/order_waste.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
-- `scripts/style/style_reader_tables.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
-- `scripts/style/style_reader_oracle.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
-- `scripts/style/style_reader_parity.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/order_waste.py` — delete (cargo-liner, 2026-11-21). Same commit: remove its pilot paragraph and manual command from `docs/style_production.md` (lines 152 and 221).
+- `scripts/style/style_reader_tables.py` — keep (cargo-liner, 2026-11-21). It generates `crates/cargo-style/src/unicode_tables.rs` in the cargo-liner repository.
+- `scripts/style/style_reader_oracle.py` — keep (cargo-liner, 2026-11-21). cargo-liner `crates/cargo-style/tests/differential.rs` runs it.
+- `scripts/style/style_reader_parity.py` — keep (cargo-liner, 2026-11-21). cargo-liner `crates/cargo-style/tests/refill_parity.rs` runs it.
 - `scripts/direct/phase_process.py` — keep (phases, 2026-11-21). The measure script of the sdlc-phases plan, run by hand after each step (`docs/plans/sdlc-phases.md:29`).
 - `scripts/production/roles_audit.py` — keep (sdlc, 2026-11-21). `test_roles_audit` runs its check on repository sources; `docs/as-built/roles-and-names.md`.
 - `scripts/whoami/profile_notes_pass.py` — not yet (natedev, 2026-11-21). accounts may use it to re-profile the Mac notes pass; natedev answers by 18:30.
@@ -450,9 +450,9 @@ Record the owner and the date with each answer. The answers are `delete`, `keep`
 - `scripts/message/install_codex_agents.py` — keep (sdlc, 2026-11-21). devtools ran it on both machines on 2026-11-21 after the macimage merge.
 - `scripts/buildlog/width_trial.py` — delete (report, 2026-11-21). Same commit: update the two `invoke.sh` comments (lines 605-607, 663-665) and remove `width_trial` from `docs/as-built/nextest-width-and-lint-scope.md` (lines 86, 91, 138-140, 173). The trial mode of `nextest_width_arm` in `invoke.sh` then has no reader: remove it in the same commit (natest ruling).
 - `scripts/model_study/` — delete (sdlc, 2026-11-21). The study is done. Update `director-model-study-results.md` and `config/README.md:683` in the same commit.
-- `scripts/style/crate_run.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
-- `scripts/style/bulk_run.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
-- `scripts/style/bulk_constants.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
-- `scripts/style/bulk_rename.py` except `cargo_output` and its dependencies — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/crate_run.py` — not yet (cargo-liner, 2026-11-21). The style unit checks for live paths; cargo-liner answers by 19:30 EST.
+- `scripts/style/bulk_run.py` — not yet (cargo-liner, 2026-11-21). The style unit checks for live paths; cargo-liner answers by 19:30 EST.
+- `scripts/style/bulk_constants.py` — not yet (cargo-liner, 2026-11-21). The style unit checks for live paths; cargo-liner answers by 19:30 EST.
+- `scripts/style/bulk_rename.py` except `cargo_output` and its dependencies — not yet (cargo-liner, 2026-11-21). The style unit checks for live paths; cargo-liner answers by 19:30 EST.
 
 Natest decision, 2026-11-21: keep `test_times/coverage_overlap.py`. It supports manual coverage reviews. Phase 184 recorded 941 tests with unknown coverage. Phase 392 names the collector as an entry point for test isolation.
