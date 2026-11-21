@@ -28,7 +28,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
@@ -38,7 +38,7 @@ from scripts.lib import process_group
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
 from scripts.agents import remote
-from scripts.whoami import note_file
+from scripts.whoami import mac_fallback_token, note_file
 
 from scripts.lib import conf, models_registry  # noqa: E402
 
@@ -440,10 +440,30 @@ class PreviousClaudeExpiryDelivery(TypedDict):
     delivered_at: str
 
 
+class MacTokenDeliveryAttempt(TypedDict):
+    attempted_at: str
+    delivered: bool
+
+
+class MacTokenAlertAttempt(MacTokenDeliveryAttempt):
+    event: str
+
+
+class PreviousMacTokenLoginClaim(TypedDict):
+    made: str
+    failure: str
+
+
+class MacTokenLoginClaim(PreviousMacTokenLoginClaim, MacTokenDeliveryAttempt):
+    pass
+
+
 class State(TypedDict):
     # Account label ("codex1") -> its open episode.
     episodes: dict[str, Episode]
     claude_expiry: NotRequired[dict[str, ClaudeExpiryAttempt]]
+    mac_token_alerts: NotRequired[dict[str, MacTokenAlertAttempt]]
+    mac_token_login_claim: NotRequired[MacTokenLoginClaim]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     fallback: CodexQuotaFallback
@@ -470,6 +490,8 @@ class StoredFallback(TypedDict):
 class StoredState(TypedDict):
     episodes: dict[str, Episode]
     claude_expiry: NotRequired[dict[str, ClaudeExpiryAttempt | PreviousClaudeExpiryDelivery]]
+    mac_token_alerts: NotRequired[dict[str, MacTokenAlertAttempt]]
+    mac_token_login_claim: NotRequired[MacTokenLoginClaim | PreviousMacTokenLoginClaim]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     switch: NotRequired[StoredFallback]
@@ -535,6 +557,10 @@ def _stored_fallback(fallback: AccountCodexQuotaFallback | UnknownOwnerCodexQuot
 
 def _stored_state(state: State) -> StoredState:
     saved = StoredState(episodes=state["episodes"])
+    if mac_attempts := state.get("mac_token_alerts"):
+        saved["mac_token_alerts"] = mac_attempts
+    if "mac_token_login_claim" in state:
+        saved["mac_token_login_claim"] = state["mac_token_login_claim"]
     if expiry_attempts := state.get("claude_expiry"):
         saved["claude_expiry"] = {label: attempt for label, attempt in expiry_attempts.items()}
     if "no_worker_mode" in state:
@@ -782,6 +808,14 @@ def state_file() -> Generator[State]:
         try:
             saved = cast(StoredState, json.loads(STATE.read_text(encoding="utf-8")))
             state = State(episodes={note_file.canonical_label(label): episode for label, episode in saved.get("episodes", {}).items()}, fallback=_read_fallback(saved.get("switch")))
+            if "mac_token_alerts" in saved:
+                state["mac_token_alerts"] = saved["mac_token_alerts"]
+            if "mac_token_login_claim" in saved:
+                claim = saved["mac_token_login_claim"]
+                state["mac_token_login_claim"] = (
+                    claim if "attempted_at" in claim and "delivered" in claim else
+                    MacTokenLoginClaim(made=claim["made"], failure=claim["failure"],
+                                       attempted_at=claim["failure"], delivered=False))
             if "claude_expiry" in saved:
                 state["claude_expiry"] = {
                     note_file.canonical_label(label): ClaudeExpiryAttempt(
@@ -1744,13 +1778,16 @@ def tell_user(push: RenderedPush) -> PushDelivery:
     from scripts.notify.push_texts import user_send_argv
 
     expiry = push.id == "quota.claude_expiry"
+    needs_confirmation = expiry or push.id in mac_fallback_token.ALERT_IDS
     user_send_timeout = review.user_send_seconds()
     command = user_send_argv(push, timeout=user_send_timeout)
     try:
         done = subprocess.run(command, capture_output=True, text=True,
                               timeout=send_budget.user_seconds(user_send_timeout),
                               check=False)
-    except (subprocess.TimeoutExpired, OSError) as error:
+    except subprocess.TimeoutExpired as error:
+        return PushUnconfirmed(str(error)) if needs_confirmation else PushFailed(str(error))
+    except OSError as error:
         return PushUnconfirmed(str(error)) if expiry else PushFailed(str(error))
     outcome = send_result.send_outcome(done.returncode, done.stdout)
     why = " ".join(failure_detail(done).split())
@@ -1761,16 +1798,16 @@ def tell_user(push: RenderedPush) -> PushDelivery:
             case "refused" | "held":
                 return PushFailed(why)
             case "skipped" | "replaced":
-                return PushFailed(why) if expiry else PushSent()
+                return PushFailed(why) if needs_confirmation else PushSent()
             case "kept":
-                if not expiry:
+                if not needs_confirmation:
                     return PushSent()
             case "retry":
                 if not expiry:
                     return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
             case "queued" | "failed" | "pending" | "closed" | "absent":
                 pass
-    return PushUnconfirmed(why) if expiry else PushFailed(why)
+    return PushUnconfirmed(why) if needs_confirmation else PushFailed(why)
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
@@ -2272,6 +2309,94 @@ def _send_claude_expiry(note: AgentNote, readings: list[run_out.Reading],
     return [f"quota Claude expiry {label} -> user: {_push_outcome(delivery)}"]
 
 
+def _mac_token_retry_due(attempt: MacTokenDeliveryAttempt, now: datetime) -> bool:
+    last = reset_time(attempt["attempted_at"])
+    return not attempt["delivered"] and (not isinstance(last, note_file.KnownReset) or now >= last.value + timedelta(days=1))
+
+
+def _deliver_mac_token_attempt(push: RenderedPush, attempt: MacTokenDeliveryAttempt, *,
+                               expiry_slot: str | None = None) -> list[str]:
+    delivery = tell_user(push)
+    if not isinstance(delivery, PushUnconfirmed):
+        with state_file() as state:
+            alerts = state.get("mac_token_alerts", {})
+            current = state.get("mac_token_login_claim") if expiry_slot is None else alerts.get(expiry_slot)
+            if current is not None and current == attempt:
+                if isinstance(delivery, PushSent):
+                    current["delivered"] = True
+                elif expiry_slot is None:
+                    _ = state.pop("mac_token_login_claim", None)
+                else:
+                    del alerts[expiry_slot]
+    return [f"{push.id} -> user: {_push_outcome(delivery)}"]
+
+
+def _send_mac_token_expiry(push: RenderedPush, slot: str, event: str, now: datetime) -> list[str]:
+    with state_file() as state:
+        alerts = state.setdefault("mac_token_alerts", {})
+        previous = alerts.get(slot)
+        if previous is not None and previous["event"] == event and not _mac_token_retry_due(previous, now):
+            return []
+        attempt = MacTokenAlertAttempt(event=event, attempted_at=now.isoformat(), delivered=False)
+        alerts[slot] = attempt
+    return _deliver_mac_token_attempt(push, attempt, expiry_slot=slot)
+
+
+def _send_mac_token_login(now: datetime, zone: tzinfo) -> list[str]:
+    from scripts.notify.push_texts import render
+
+    with state_file() as state:
+        token = mac_fallback_token.read()
+        if not isinstance(token, mac_fallback_token.MacFallbackToken) or not token.recently_checked(now):
+            return []
+        failure = token.active_login_failure(now)
+        if not isinstance(failure, datetime):
+            return []
+        previous = state.get("mac_token_login_claim")
+        if previous is not None:
+            claimed_made = reset_time(previous["made"])
+            if isinstance(claimed_made, note_file.KnownReset) and claimed_made.value > token.made:
+                return []
+            if isinstance(claimed_made, note_file.KnownReset) and claimed_made.value == token.made:
+                claimed_failure = reset_time(previous["failure"])
+                if isinstance(claimed_failure, note_file.KnownReset):
+                    if failure < claimed_failure.value:
+                        return []
+                    good = token.last_good_use
+                    if not isinstance(good, datetime) or good <= claimed_failure.value:
+                        if not _mac_token_retry_due(previous, now):
+                            return []
+                        failure = claimed_failure.value
+        claim = MacTokenLoginClaim(made=token.made.isoformat(), failure=failure.isoformat(),
+                                  attempted_at=now.isoformat(), delivered=False)
+        state["mac_token_login_claim"] = claim
+    time = failure.astimezone(zone).strftime(WEEKLY_EMPTY_FORMAT)
+    return _deliver_mac_token_attempt(render("quota.mac_token_login", time=time), claim)
+
+
+def mac_token_alerts(now: datetime) -> list[str]:
+    from scripts.notify.push_texts import render
+
+    if not _claude_quota_sender() or silence.active():
+        return []
+    token = mac_fallback_token.read()
+    if not isinstance(token, mac_fallback_token.MacFallbackToken) or not token.recently_checked(now):
+        return []
+    log: list[str] = []
+    zone = user_zone()
+    if isinstance(token.active_login_failure(now), datetime):
+        log += _send_mac_token_login(now, zone)
+    try:
+        leads = mac_fallback_token.expiry_days(conf.read(CONFIG))
+    except (OSError, ValueError):
+        return [*log, "quota-alert: Mac token expiry days unavailable"]
+    lead = token.expiry_lead(now, zone, leads)
+    if lead is not None:
+        push = render("quota.mac_token_expiry", date=token.expires.astimezone(zone).date().isoformat())
+        log += _send_mac_token_expiry(push, f"{push.id}/{lead}", token.made.isoformat(), now)
+    return log
+
+
 def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: ClaudeAccountsInUse,
                               codex_readings: CodexAlertPassReadings) -> list[str]:
     stamp = now.isoformat(timespec="seconds")
@@ -2331,6 +2456,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                 log.append(f"quota push {push.name} -> user: {outcome}")
     for future in expiry_futures:
         log.extend(future.result())
+    log.extend(mac_token_alerts(now))
     return log
 
 
