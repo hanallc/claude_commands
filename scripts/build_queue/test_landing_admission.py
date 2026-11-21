@@ -9,6 +9,7 @@ import io
 import os
 from pathlib import Path
 import subprocess
+from typing import override
 import unittest
 from unittest.mock import Mock, patch
 
@@ -54,6 +55,11 @@ def local_test_clone(root: Path, source_name: str = "source", upstream: str = RE
 
 
 class LandingAdmissionTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        memo: dict[Path, wire.LandingRepositoryKey] = {}
+        _ = self.enterContext(patch.object(client, "_LANDING_REPOSITORY_KEYS", memo, create=True))
+
     def assert_landing_wait(self, fixture: AdmissionFixture, request: wire.AdmitRequest,
                             check: Callable[[], None] = lambda: None) -> None:
         def wait(reply: wire.Wait) -> None:
@@ -150,6 +156,40 @@ class LandingAdmissionTests(unittest.TestCase):
             request = client.step_request(["cargo", "test"], str(clone), owner.owner,
                                           owner.since, "", owner.episode)
             self.assert_landing_wait(fixture, request)
+
+    def test_separate_placement_calls_keep_the_landing_wait_after_the_origin_disappears(self) -> None:
+        with PlacementFixture() as fixture:
+            clone = local_test_clone(fixture.root)
+            request = placement_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            request = replace(request, local=replace(request.local, cwd=str(clone)))
+            _ = publish_candidate(fixture, request)
+            queue_land()
+
+            with (LauncherHangGuard("Separate landing placement calls").protect(),
+                  patch.object(client, "CLOCK", fixture.clock), fixture.serving()):
+                first = client.request_placement(request)
+                assert isinstance(first, wire.PlacementWait) and isinstance(first.wait, wire.Wait), first
+                self.assertEqual(first.wait.reason, records.WaitsForLandingTest())
+
+                _ = (fixture.root / "source").rename(fixture.root / "source-away")
+                second = client.request_placement(request)
+                assert isinstance(second, wire.PlacementWait) and isinstance(second.wait, wire.Wait), second
+                self.assertEqual(second.wait.reason, records.WaitsForLandingTest())
+                self.assertEqual((second.episode, second.since), (first.episode, first.since))
+
+    def test_origin_headers_with_trailing_comments_resolve(self) -> None:
+        for comment in ("#", ";"):
+            with self.subTest(comment=comment), AdmissionFixture() as fixture:
+                git("init", "-q", str(fixture.root))
+                config = fixture.root / ".git/config"
+                with config.open("a", encoding="utf-8") as settings:
+                    _ = settings.write(f'  [remote "origin"]\t{comment} Source repository\n\turl = {REPOSITORY.key}\n')
+                queue_land()
+                owner = fixture.request(step="test", need=GIB)
+                request = client.step_request(["cargo", "test"], str(fixture.root), owner.owner,
+                                              owner.since, "", owner.episode)
+                self.assert_landing_wait(fixture, request)
 
     def test_first_step_resends_a_placement_with_the_new_landing_key(self) -> None:
         with AdmissionFixture() as fixture:

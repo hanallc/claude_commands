@@ -17,8 +17,9 @@ import json
 import math
 import os
 from pathlib import Path
-import socket
+import re
 import shlex
+import socket
 import subprocess
 import sys
 from typing import TYPE_CHECKING, Callable, Protocol, cast
@@ -379,7 +380,6 @@ class AcquisitionRetry:
     leave_interval: float = float("inf")
     unreachable_deadline: float = float("inf")
     estimate_refresh_pending: bool = False
-    landing_keys: dict[tuple[str, wire.Owner | placement.SubmittingOwner], wire.LandingRepositoryKey] = field(default_factory=dict)
 
     def start_leave_schedule(self, interval: float) -> None:
         self.leave_interval = interval
@@ -1197,12 +1197,15 @@ def verify_call() -> records.VerifyStep:
     return records.NotVerifyCall()
 
 
+_LANDING_REPOSITORY_KEYS: dict[Path, wire.LandingRepositoryKey] = {}
+
+
 def _landing_origin(common: Path) -> str:
     in_origin = False
     for line in (common / "config").read_text(encoding="utf-8").splitlines():
         text = line.strip()
         if text.startswith("["):
-            in_origin = text == '[remote "origin"]'
+            in_origin = re.fullmatch(r'\[(?i:remote)[ \t]+"origin"\][ \t]*(?:[#;].*)?', text) is not None
         elif in_origin:
             name, separator, value = text.partition("=")
             if separator and name.strip().lower() == "url":
@@ -1211,7 +1214,10 @@ def _landing_origin(common: Path) -> str:
 
 
 def _landing_repository_key(directory: str) -> wire.LandingRepository:
-    """Follow local origins to a repository with a remote URL."""
+    """Follow local origins to a repository with a remote URL.
+
+    Git config includes and URL rewrites are unsupported.
+    """
     from scripts.buildlog import repository
     from scripts.lib import git_files
 
@@ -1246,8 +1252,6 @@ def _send_request(connection: socket.socket, request: wire.Request) -> None:
     if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.PlacementRequest, wire.ServiceEstimateRequest)):
         from scripts.build_queue import landing_test_gate
 
-        retry = _ACQUISITION_RETRY.get()
-        episode_owner = request.episode, request.owner
         if isinstance(request, wire.ServiceEstimateRequest):
             from scripts.buildlog import parse
 
@@ -1256,9 +1260,7 @@ def _send_request(connection: socket.socket, request: wire.Request) -> None:
         else:
             step = request.profile.step
             key = request.identity.landing_repository
-        if isinstance(key, wire.LandingRepositoryNotRecorded) and retry is not None:
-            key = retry.landing_keys.get(episode_owner, key)
-        if isinstance(key, wire.LandingRepositoryNotRecorded) and step in landing_test_gate.TEST_STEPS:
+        if step in landing_test_gate.TEST_STEPS:
             from scripts.buildlog import step_context
 
             if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest)):
@@ -1267,16 +1269,19 @@ def _send_request(connection: socket.socket, request: wire.Request) -> None:
                 directory = (step_context.git_directory(list(request.local.argv), request.local.cwd)
                              if isinstance(request.local, wire.LocalAdmissionContext) else request.constraints.repository)
             else:
+                retry = _ACQUISITION_RETRY.get()
                 if retry is not None and retry.launch_directory:
                     directory = retry.launch_directory
                 else:
                     folder = request.identity.folder
                     directory = step_context.git_directory([], folder if Path(folder).is_absolute() else os.getcwd())
-            if Path(directory).is_absolute():
-                key = _landing_repository_key(directory)
+            path = Path(directory)
+            if path.is_absolute():
+                if isinstance(key, wire.LandingRepositoryNotRecorded):
+                    key = _LANDING_REPOSITORY_KEYS.get(path) or _landing_repository_key(directory)
+                if isinstance(key, wire.LandingRepositoryKey):
+                    _ = _LANDING_REPOSITORY_KEYS.setdefault(path, key)
         if isinstance(key, wire.LandingRepositoryKey):
-            if retry is not None:
-                retry.landing_keys[episode_owner] = key
             if isinstance(request, wire.ServiceEstimateRequest):
                 request = replace(request, landing_repository=key)
             else:
