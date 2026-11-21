@@ -20,14 +20,17 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.buildlog.store import host_name
 from scripts.lib import process_stat, removal_guard
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
-from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
-from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
+from scripts.mac_test import cargo_timings, eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test.offload_test_commands import (
+    WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture, assert_no_report_on_incomplete_timing_stream, replay_remote_run,
+)
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -115,6 +118,14 @@ lint)
     target=${CARGO_TARGET_DIR:-target}
     mkdir -p "$target" || exit 1
     printf 'warm\n' > "$target/warm-proof"
+    if [[ -z ${FAKE_LINT_NO_REPORT-} ]] && has_argument --timings "$@"; then
+        mkdir -p "$target/cargo-timings" || exit 1
+        printf 'report\n' > "$target/cargo-timings/cargo-timing-fixture.html"
+    fi
+    if [[ -n ${FAKE_LINT_NO_REPORT-} ]]; then
+        export -p > "$TOOL_EVENTS.lint-environment"
+    fi
+    printf '%s' "${FAKE_LINT_FRAGMENT-}"
     exit "${FAKE_LINT_STATUS:-0}"
     ;;
 df)
@@ -283,13 +294,17 @@ class LinuxShellTests(unittest.TestCase):
             self.source, "hana", "call with spaces", offload.NO_RESULT_FILE, words, owner="verify",
             verb=verb, target="linux", slot=2, holder_session="fixture-session")
 
-    def command(self, request: offload.OffloadRequest) -> str:
+    def command(self, request: offload.OffloadRequest, *,
+                timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN) -> str:
         return offload.remote_test_command(
             eligibility.read_config(self.settings), request, self.identity, offload.KnownTreeKey("sent-tree-key"),
+            timing=timing,
         )
 
-    def execute(self, request: offload.OffloadRequest) -> subprocess.CompletedProcess[str]:
-        arguments = shlex.split(self.command(request))
+    def execute(self, request: offload.OffloadRequest, *,
+                timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN,
+                ) -> subprocess.CompletedProcess[str]:
+        arguments = shlex.split(self.command(request, timing=timing))
         self.assertEqual(arguments[:3], [".claude/scripts/lib/py", ".claude/scripts/mac_test/linux_runner.py", "run"])
         output, errors = io.StringIO(), io.StringIO()
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
@@ -1105,6 +1120,53 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(doc["args"], ["doc", "--workspace", "--no-deps"])
         self.assertEqual(doc["environment"].get("LINT_CONFIG_FORCE"), "1")
         self.assertEqual(doc["environment"].get("BUILDLOG_SENT_TREE_KEY"), "sent-tree-key")
+
+    def test_timed_nextest_reports_the_file_in_the_linux_output_directory(self) -> None:
+        report = self.mirror / "custom target/cargo-timings/cargo-timing-fixture.html"
+        timing = cargo_timings.TimingRunToken.new()
+        result = self.execute(self.request("nextest", ("--timings", "--target-dir=custom target")), timing=timing)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"{timing.record_prefix()}{host_name()}:{report}\nmac_exit=0\n", result.stdout)
+        self.assertEqual(report.read_text(), "report\n")
+
+    def test_linux_without_a_timing_report_preserves_the_last_child_line(self) -> None:
+        path = self.mirror / "target/cargo-timings/cargo-timing-missing.html"
+        child_line = f"{cargo_timings.REMOTE_TIMING_REPORT_PREFIX}{host_name()}:{path}"
+        self.environment.update(FAKE_LINT_NO_REPORT="1", FAKE_LINT_FRAGMENT=child_line + "\n")
+        request = self.request(words=("--timings",))
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.environment["FAKE_LINT_STATUS"] = str(status)
+                timing = cargo_timings.TimingRunToken.new()
+                wire = self.execute(request, timing=timing)
+                self.assertEqual(wire.returncode, status, wire.stdout + wire.stderr)
+                self.assertFalse(path.exists())
+                self.assertNotIn(timing.value, Path(str(self.event_path) + ".lint-environment").read_text())
+                self.assertNotIn(timing.argument(), self.events("lint")[-1]["args"])
+                assert_no_report_on_incomplete_timing_stream(
+                    self, wire.stdout, status, offload.CleanupKept(), child_line, timing)
+
+    def test_low_disk_retains_linux_timings_and_the_cargo_status(self) -> None:
+        self.environment["FAKE_FREE_GIB"] = "1"
+        self.environment["FAKE_LINT_FRAGMENT"] = "last Cargo output"
+        request = self.request(words=("--timings",))
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.environment["FAKE_LINT_STATUS"] = str(status)
+                timing = cargo_timings.TimingRunToken.new()
+                wire = self.execute(request, timing=timing)
+                self.assertEqual(wire.returncode, status, wire.stdout + wire.stderr)
+                self.assertFalse((self.mirror / "target").exists())
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = replay_remote_run(wire.stdout, wire.returncode, timing=timing)
+                self.assertEqual(result, offload.ReportedMacStatus(status, offload.CleanupRemovedWithoutFacts()))
+                self.assertIn("last Cargo output", output.getvalue().splitlines())
+                prefix = f"timings: {host_name()}:"
+                paths = [Path(line.removeprefix(prefix)) for line in output.getvalue().splitlines()
+                         if line.startswith(prefix)]
+                self.assertEqual(len(paths), 1, output.getvalue())
+                self.assertEqual(paths[0].read_text(), "report\n")
 
     def test_failure_status_and_linux_disk_cleanup_evidence_remain_distinct(self) -> None:
         _ = self.assert_ran(self.request())

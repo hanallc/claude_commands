@@ -121,7 +121,7 @@ from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.mac_test import eligibility, offload, mac_test, claim_state
+from scripts.mac_test import cargo_timings, eligibility, offload, mac_test, claim_state
 from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
@@ -205,7 +205,7 @@ def copy_source(*arguments):
                                   else offload.UNAVAILABLE_TREE_KEY)
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
-def stream(arguments):
+def stream(arguments, **options):
     global remote_output, remote_status
     actions.append("run")
     if mode in ("run-refusal", "after-probe"):
@@ -221,6 +221,14 @@ def stream(arguments):
     else:
         status = 75 if mode == "completed-decline" else 42 if mode == "failed" else 4 if mode == "no-tests" else 0
         wire = "mac_exit=" + str(status) + "\nmac_cleanup=0\n"
+        if "--timings" in request.nextest_words:
+            timing = options["timing"]
+            assert isinstance(timing, cargo_timings.TimingRunToken)
+            assert timing.argument() in arguments[-1]
+            path = os.environ["TEST_SSH_TIMING_REPORT"]
+            wire = timing.record_prefix() + "linux-build:" + path + "\n" + wire
+            if missing := os.environ.get("TEST_SSH_MISSING_TIMING_REPORT"):
+                wire = "Timing report saved to " + missing + "\n" + wire
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)
@@ -238,10 +246,14 @@ def stream(arguments):
         def poll(self):
             return status
 
-    with mock.patch.object(subprocess, "Popen", return_value=Remote()):
-        return offload.ProcessController.stream_mac_run(controller, arguments)
+    def open_run(words, *args, **options):
+        return Remote() if words == arguments else real_popen(words, *args, **options)
+
+    with mock.patch.object(subprocess, "Popen", side_effect=open_run):
+        return offload.ProcessController.stream_mac_run(controller, arguments, **options)
 
 real_run = subprocess.run
+real_popen = subprocess.Popen
 def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")

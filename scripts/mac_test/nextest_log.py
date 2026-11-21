@@ -23,6 +23,7 @@ if __name__ == "__main__":
 
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.mac_test import cargo_timings
 
 DIRECTORY = ".local/state/mac-test/logs"
 LOG_NAME = re.compile(r"nextest\.[a-z0-9_]{8}", re.IGNORECASE)
@@ -65,12 +66,16 @@ def output_limits(settings: conf.ConfigRead | conf.UseConfiguredValue) -> Nextes
     return NextestOutputLimits(tail, summary)
 
 
-def capture_function(limits: NextestOutputLimits) -> str:
+def capture_function(
+    limits: NextestOutputLimits,
+    timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN,
+) -> str:
     """Define the remote shell function that executes the log writer."""
+    timing_argument = f" {timing.argument()}" if isinstance(timing, cargo_timings.TimingRunToken) else ""
     return (
         'run_nextest_logged() { '
         '"$HOME/.claude/scripts/lib/py" -B "$HOME/.claude/scripts/mac_test/nextest_log.py" '
-        f'run {limits.tail_bytes} {limits.summary_bytes} "$@"; }}'
+        f'run {limits.tail_bytes} {limits.summary_bytes}{timing_argument} "$@"; }}'
     )
 
 
@@ -134,7 +139,8 @@ def replay_log(log: BinaryIO, path: Path, status: int, limits: NextestOutputLimi
             _ = output.write(summary + b"\n")
 
 
-def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: BinaryIO) -> int | None:
+def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: BinaryIO,
+               timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun) -> int | None:
     """Hold the log lock through dispatch and replay."""
     from scripts.copies import copies
 
@@ -150,6 +156,9 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
             try:
                 log = files.enter_context(os.fdopen(descriptor, "w+b", closefd=False))
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
+                before = cargo_timings.NoTimingReport()
+                if isinstance(timing, cargo_timings.TimingRunToken):
+                    before = cargo_timings.snapshot_for_command(cargo_timings.cargo_arguments("nextest", command[2:]))
                 status = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
                                         pass_fds=copies.inherited_mirror_descriptors(), check=False).returncode
             except (OSError, ValueError):
@@ -159,9 +168,13 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
             print(f"mac_test: cannot start nextest with a log: {error}", file=sys.stderr)
             return None
         try:
-            if status:
-                os.utime(log.fileno(), None)
-            replay_log(log, path, status, limits, output)
+            try:
+                if status:
+                    os.utime(log.fileno(), None)
+                replay_log(log, path, status, limits, output)
+            finally:
+                if isinstance(timing, cargo_timings.TimingRunToken):
+                    _ = output.write(cargo_timings.mac_report_line(timing, before).encode("utf-8", errors="replace"))
             if status == 0:
                 path.unlink()
         except OSError as error:
@@ -172,7 +185,8 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
 def main(arguments: list[str]) -> int:
     if arguments[:1] == ["run"] and len(arguments) >= 4:
         limits = NextestOutputLimits(int(arguments[1]), int(arguments[2]))
-        status = run_logged(arguments[3:], limits, sys.stdout.buffer)
+        timing, command = cargo_timings.take_timing_argument(arguments[3:])
+        status = run_logged(command, limits, sys.stdout.buffer, timing)
         if status is None:
             return 1
         print(f"mac_exit={status}", flush=True)

@@ -550,13 +550,14 @@ def gpu_step(transport: HanaGpuNextestTransport, repository: str, package: str, 
 
 
 def gpu_command_matches(command: tuple[str, ...], package: str, test: str) -> bool:
-    """Accept the verify.sh command with an optional explicit nextest profile."""
+    """Accept the exact Verify selection with its profile and timing options."""
     if command[:3] != ('cargo', 'nextest', 'run'):
         return False
     arguments = command[3:]
     if arguments[:1] == ('--profile',) and len(arguments) >= 2 and re.fullmatch(r'[A-Za-z0-9_-]+', arguments[1]):
         arguments = arguments[2:]
-    return arguments == ('--no-fail-fast', '--workspace', '--test', test, '-E', 'package(' + package + ')')
+    selection = ('--no-fail-fast', '--workspace', '--test', test, '-E', 'package(' + package + ')')
+    return arguments in (selection, (*selection, '--timings'))
 
 
 def gpu_claim_pending(target: str, claim_id: str) -> bool:
@@ -695,7 +696,7 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
             if isinstance(current, claim_state.NoRun) or current != record:
                 raise ValueError('The assigned Hana GPU claim changed')
 
-    result: gpu_size_trial.HanaGpuNextestResult | HanaStepRefused
+    result: gpu_size_trial.HanaGpuNextestResult | HanaStepRefused | gpu_size_trial.HanaGpuNoTestsWithTimingCopy
     claimed = False
     source_changed = False
     try:
@@ -726,6 +727,8 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
             raise ValueError('The queue did not authorize the Hana GPU step')
         result = gpu_size_trial.run_nextest(repo, commit, gpu_size_trial.HanaGpuNextestRequest(command[3:], sizes),
             launch=gpu_size_trial.AssignedHanaGpuLaunch(claim_id, before_service))
+    except gpu_size_trial.HanaGpuNoTestsWithTimingCopy as error:
+        result = error
     except (OSError, ValueError, KeyError, wire.AdmissionUnavailable, subprocess.SubprocessError, copies.CopyError,
             GateRefused) as error:
         source_changed |= isinstance(error, copies.PreparationError) and str(error).startswith('SourceChanged:')
@@ -747,8 +750,10 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
             pass
     dispatch = (placement.DispatchPathSettled() if settled else
                 placement.DispatchPathPending('The Hana GPU claim release remains pending'))
-    if isinstance(result, HanaStepRefused):
+    if isinstance(result, (HanaStepRefused, gpu_size_trial.HanaGpuNoTestsWithTimingCopy)):
         print('Hana GPU infrastructure failure: ' + result.reason, file=sys.stderr)
+        if isinstance(result, gpu_size_trial.HanaGpuNoTestsWithTimingCopy):
+            print(result.timing_copy.location(), flush=True)
         evidence: execution_identity.ExecutionEvidence
         outcome: placement.AttemptOutcome
         detail = ' '.join(result.reason.splitlines()) or 'The Hana GPU step was refused'
@@ -773,6 +778,8 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
     else:
         print(result.stdout, end='', flush=True)
         print(result.stderr, end='', file=sys.stderr, flush=True)
+        if command[-1] == '--timings' and isinstance(result, gpu_size_trial.HanaGpuNextestResultWithTimingCopy):
+            print(result.timing_copy.location(), flush=True)
         word = 'passed' if result.exit_code == 0 else 'failed'
         write_text_atomic(result_file, f'outcome={word}\nseconds={time.monotonic() - started:.3f}\n')
         report = wire.ExecutionReport(admission_client.request_id(), assignment, reference,

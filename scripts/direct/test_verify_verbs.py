@@ -35,7 +35,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         ])
         self.assertEqual([line.split()[0] for line in flags.splitlines()], [
             "--test", "--name", "--check", "--saved", "--tree",
-            "--filter", "--run-ignored", "--features", "--no-cache", "--attached",
+            "--filter", "--run-ignored", "--features", "--timings", "--no-cache", "--attached",
             "--target", "--mac", "--local", "--session-dir",
         ])
 
@@ -50,6 +50,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
                 self.assertEqual(result.stderr, "")
                 self.assertTrue(result.stdout.startswith(f"Usage: verify {command}"), result.stdout)
                 self.assertNotIn("Commands:", result.stdout)
+                self.assertEqual("--timings" in result.stdout, command in ("build", "test"))
                 self.assertGreater(len(result.stdout.splitlines()), 3)
                 for line in result.stdout.splitlines():
                     self.assertLess(len(line), 80, line)
@@ -60,6 +61,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
             (("lint", "--workspace"), "verify lint [<package>] [--check]"),
             (("example", "sample", "demo"), "verify example [<package>] [--name <name>]"),
             (("test", "sample", "smoke"), "verify test [<package>] [--test <name>]"),
+            (("check", "--timings"), "verify check [<package>]"),
             (("final", "--tree", "HEAD"), "verify final [<package>] [--saved] [--tree <tree>]"),
         ):
             with self.subTest(arguments=arguments):

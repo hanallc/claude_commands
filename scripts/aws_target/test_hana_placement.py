@@ -673,10 +673,16 @@ class HanaGpuPlacementTests(CostFixture):
         candidate = self.candidate()
         self.assertEqual(candidate.eligibility, placement.AllowedHost())
         self.assertEqual(candidate.destination, self.assignment.destination)
+        self.assertEqual(self.candidate(command=(*self.command, '--timings')), candidate)
         routed = build_targets.fixed_placement_constraints(
             self.root, self.package, 'test', self.command, self.assignment.session, self.assignment.source_key)
         self.assertEqual([item.destination.target for item in routed.candidates], ['natedev'])
-        for command in (self.command[:-3] + ('another_test', *self.command[-2:]), (*self.command, '--run-ignored', 'only')):
+        for command in (
+                self.command[:-3] + ('another_test', *self.command[-2:]),
+                (*self.command, '--run-ignored', 'only'),
+                (*self.command, '--timings', '--timings'),
+                (*self.command[:3], '--timings', *self.command[3:]),
+                (*self.command, '--timings=html')):
             self.assertEqual(self.candidate(command=command).eligibility,
                              placement.FixedExclusion(adapter.GPU_SELECTION_REQUIRED))
 
@@ -689,7 +695,7 @@ class HanaGpuPlacementTests(CostFixture):
         self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
 
     def run_fake_gpu(self, code: int | str, *, confirm_cleanup: bool = True, refuse_start: bool = False,
-                     report_unavailable: bool = False, refuse_release: bool = False
+                     report_unavailable: bool = False, refuse_release: bool = False, timings: bool = False
                      ) -> tuple[int, str, str, wire.ExecutionReport]:
         from contextlib import redirect_stdout
         from scripts.aws_target import gpu_size_trial
@@ -706,6 +712,7 @@ class HanaGpuPlacementTests(CostFixture):
         real_run = gpu_size_trial.run_nextest
         real_unlink = Path.unlink
         claim_path = mac_test.claim_path(claim_state.state_paths('hana-gpu'), self.assignment.destination.scope)
+        command = (*self.command, '--timings') if timings else self.command
 
         def unlink(path: Path, missing_ok: bool = False) -> None:
             if refuse_release and path == claim_path:
@@ -715,7 +722,7 @@ class HanaGpuPlacementTests(CostFixture):
         def run(repo: Path, commit: str, request: gpu_size_trial.HanaGpuNextestRequest, *,
                 launch: gpu_size_trial.AssignedHanaGpuLaunch) -> gpu_size_trial.HanaGpuNextestResult:
             self.assertEqual((repo, commit, request.arguments, launch.trial),
-                             (self.root, 'captured', self.command[3:], claim_id))
+                             (self.root, 'captured', command[3:], claim_id))
             if refuse_start:
                 def refuse(_folder: Path, _directory: Path, _settings: Path,
                            _execute: Callable[[Sequence[str]], int], *, assigned: bool) -> int:
@@ -735,6 +742,15 @@ class HanaGpuPlacementTests(CostFixture):
                 receipt = gpu_size_trial.cleanup_receipt(self.trials / claim_id)
                 receipt.parent.mkdir(parents=True)
                 _ = receipt.write_text(json.dumps({'trial': claim_id}))
+            if timings:
+                report = self.root / 'cargo-timing.html'
+                _ = report.write_text('Cargo report')
+                timing_copy = gpu_size_trial.HanaGpuTimingCopy('fixture-guest', str(report))
+                if code == 4:
+                    raise gpu_size_trial.HanaGpuNoTestsWithTimingCopy(timing_copy)
+                assert isinstance(code, int)
+                return gpu_size_trial.HanaGpuNextestResultWithTimingCopy(
+                    'cloud-attempt', commit, 'tree', code, 'output\n', 'diagnostics\n', timing_copy)
             if isinstance(code, str):
                 raise ValueError(code)
             return gpu_size_trial.HanaGpuNextestResult('cloud-attempt', commit, 'tree', code, 'output\n', 'diagnostics\n')
@@ -761,7 +777,7 @@ class HanaGpuPlacementTests(CostFixture):
                 mock.patch.object(admission_client, 'report_execution', new=report),
                 mock.patch.object(Path, 'unlink', new=unlink),
                 redirect_stdout(stdout), redirect_stderr(stderr)):
-            status = adapter.run_gpu_assignment(self.assignment, self.root, self.package, self.command, result)
+            status = adapter.run_gpu_assignment(self.assignment, self.root, self.package, command, result)
         self.assertIn('outcome=', result.read_text())
         self.assertEqual(adapter.gpu_claim_pending('hana-gpu', claim_id), refuse_release or not confirm_cleanup)
         self.assertEqual(len(reports), 1)
@@ -770,10 +786,14 @@ class HanaGpuPlacementTests(CostFixture):
     def test_returns_the_pass_or_fail_status_and_output(self) -> None:
         from scripts.aws_target import gpu_size_trial
 
-        for code in (0, 100):
-            with self.subTest(code=code):
-                status, stdout, stderr, report = self.run_fake_gpu(code)
-                self.assertEqual((status, stdout, stderr), (code, 'output\n', 'diagnostics\n'))
+        for code, timings in ((0, False), (100, False), (0, True), (100, True)):
+            with self.subTest(code=code, timings=timings):
+                status, stdout, stderr, report = self.run_fake_gpu(code, timings=timings)
+                expected_output, expected_diagnostics = 'output\n', 'diagnostics\n'
+                if timings:
+                    path = self.root / 'cargo-timing.html'
+                    expected_output += f'timings: {store.host_name()}:{path} (copy of guest report from fixture-guest)\n'
+                self.assertEqual((status, stdout, stderr), (code, expected_output, expected_diagnostics))
                 self.assertEqual(report.outcome, placement.AttemptCompleted(code))
                 self.assertEqual(report.path, placement.DispatchPathSettled())
                 with mock.patch.object(gpu_size_trial, 'trial_root', return_value=self.trials):
@@ -787,6 +807,15 @@ class HanaGpuPlacementTests(CostFixture):
         self.assertEqual((status, stdout), (125, ''))
         self.assertIn('Spot capacity unavailable', stderr)
         self.assertEqual(report.outcome, placement.AttemptDeclined('Spot capacity unavailable'))
+        self.assertEqual(report.path, placement.DispatchPathSettled())
+
+    def test_reports_the_timing_copy_after_nextest_refuses_an_empty_selection(self) -> None:
+        status, stdout, stderr, report = self.run_fake_gpu(4, timings=True)
+        path = self.root / 'cargo-timing.html'
+        self.assertEqual(status, 125)
+        self.assertEqual(stdout, f'timings: {store.host_name()}:{path} (copy of guest report from fixture-guest)\n')
+        self.assertIn('Cargo nextest selected no tests', stderr)
+        self.assertEqual(report.outcome, placement.AttemptDeclined('Cargo nextest selected no tests'))
         self.assertEqual(report.path, placement.DispatchPathSettled())
 
     def test_retains_capacity_when_cleanup_has_no_confirmation(self) -> None:

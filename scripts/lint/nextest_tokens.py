@@ -89,13 +89,17 @@ class SizedTestRun:
         selection = self.rest[:self.rest.index("--")] if "--" in self.rest else self.rest
         return [*self.head, "--no-run", *build_selection(selection)]
 
+    def after_compile_options(self) -> list[str]:
+        boundary = self.rest.index("--") if "--" in self.rest else len(self.rest)
+        return [*(word for word in self.rest[:boundary] if word != "--timings"), *self.rest[boundary:]]
+
     def list_selected(self) -> list[str]:
         # The filter-matched count bounds rerun tests before the launcher applies the width limit.
-        selection = build_selection(self.rest, for_list=True)
+        selection = build_selection(self.after_compile_options(), for_list=True)
         return [*self.head[:2], "list", "--message-format", "json", *selection]
 
     def with_threads(self, threads: int) -> list[str]:
-        return [*self.head, "--test-threads", str(threads), *self.rest]
+        return [*self.head, "--test-threads", str(threads), *self.after_compile_options()]
 
 
 @dataclass(frozen=True)

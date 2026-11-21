@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import final
 
+from scripts.buildlog import store
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP, BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
@@ -21,6 +22,32 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
+    def test_test_reports_timings_after_local_success_or_failure(self) -> None:
+        path = self.root / "custom output/cargo-timings/cargo-timing-fixture.html"
+        path.parent.mkdir(parents=True)
+        arguments = ("test", "sample", "--filter", "alpha", "--local", "uses Linux APIs")
+        result = self.verify(*arguments)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ordinary, = self.local_runs()
+        self.assertEqual(ordinary["args"][4:], [
+            "--no-fail-fast", "--workspace", "--lib", "-E", "package(sample) & test(alpha)",
+        ])
+        self.assertNotIn("timings:", result.stdout)
+        self.assertNotIn("--timings", self.last_call()["command"])
+        for status in (0, 101):
+            with self.subTest(status=status):
+                self.clear_observations()
+                path.unlink(missing_ok=True)
+                result = self.verify(*arguments, "--timings", extra={
+                    "CARGO_TARGET_DIR": str(path.parent.parent),
+                    "TEST_LOCAL_STATUS": str(status), "TEST_LOCAL_TIMING_REPORT": str(path),
+                })
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                timed, = self.local_runs()
+                self.assertEqual(timed["args"][4:], ordinary["args"][4:] + ["--timings"])
+                self.assertEqual(result.stdout.splitlines().count(f"timings: {store.host_name()}:{path}"), 1)
+                self.assertIn("--timings", self.last_call()["command"])
+
     def test_decline_runs_same_nextest_words_locally_after_runner(self) -> None:
         # NextestArgumentTests checks the nextest words of each argument shape. These complete runs keep
         # a filter run with a package and an ignored-only run with no package and no filter.
@@ -139,6 +166,21 @@ raise SystemExit(offload.write_result(result, destination))
 
 @final
 class NextestArgumentTests(unittest.TestCase):
+    def test_timed_and_untimed_calls_have_distinct_waiter_keys(self) -> None:
+        script = shell_functions(VERIFY, "parse_command_arguments", "hash_stream", "token_waiters_key") + r'''
+CMD=build
+parse_command_arguments sample
+token_waiters_key
+parse_command_arguments sample --timings
+token_waiters_key
+'''
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(["bash", "-e", "-c", script], env=verify_test_environment(), cwd=root,
+                                    text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ordinary, timed = result.stdout.splitlines()
+        self.assertNotEqual(ordinary, timed)
+
     @staticmethod
     def compose_script(root: Path, *extra: str) -> str:
         """Return the verify.sh functions that compose nextest words, with fixture metadata for one package."""
@@ -200,13 +242,14 @@ done
     def test_only_plain_package_runs_allow_no_tests_on_both_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            script = self.compose_script(root) + r'''
-for selection in plain filter target; do
+            script = self.compose_script(root, "parse_command_arguments") + r'''
+for selection in plain filter target timed-target; do
     FEATURE_FLAGS=() TEST_SELECTION=() NEXTEST_ARGS=()
     case "$selection" in
-        plain) ARGS=(sample) ;;
-        filter) ARGS=(sample --filter alpha) ;;
-        target) ARGS=(sample --test integration_suite) ;;
+        plain) parse_command_arguments sample ;;
+        filter) parse_command_arguments sample --filter alpha ;;
+        target) parse_command_arguments sample --test integration_suite ;;
+        timed-target) parse_command_arguments --timings sample --test integration_suite ;;
     esac
     compose_nextest_args
     printf '%s\0' "${NEXTEST_ARGS[@]}"
@@ -216,13 +259,15 @@ done
             result = subprocess.run(["bash", "-e", "-c", script], env=verify_test_environment(), cwd=root,
                                     text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        cases = (((), True), (("--filter", "alpha"), False), (("--test", "integration_suite"), False))
+        cases = (((), True), (("--filter", "alpha"), False), (("--test", "integration_suite"), False),
+                 (("--timings", "--test", "integration_suite"), False))
         answers = result.stdout.split("\0\0")[:-1]
         self.assertEqual(len(answers), len(cases))
         for (arguments, allow_empty), answer in zip(cases, answers, strict=True):
             with self.subTest(arguments=arguments):
                 nextest_arguments = answer.split("\0")
                 self.assertEqual("--no-tests=warn" in nextest_arguments, allow_empty)
+                self.assertEqual(nextest_arguments.count("--timings"), int("--timings" in arguments))
 
         parser = shell_functions(VERIFY, "parse_command_arguments") + '\nCMD=$1; shift; parse_command_arguments "$@"\n'
         refusals = (

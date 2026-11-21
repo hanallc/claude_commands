@@ -23,6 +23,7 @@
 #   --filter <name>      test: select names; repeat to select more names
 #   --run-ignored only   test: run only ignored tests, with optional filters
 #   --features <list>    check, test, doc, build: enable Cargo features
+#   --timings            build, test: write an HTML report for compilation
 #   --no-cache           test, lint: ignore saved results
 #   --attached           build: stay in the foreground; never detach
 #   --target <name>      pin movable steps to one configured target
@@ -46,7 +47,7 @@
 # End help.
 #
 # Help test:
-# Usage: verify test [<package>] [--test <name>] [flags]
+# Usage: verify test [<package>] [--test <name>] [--timings] [flags]
 #
 # Run package tests with nextest. No package selects the workspace.
 # Try eligible targets in config/build_targets.conf order.
@@ -60,6 +61,7 @@
 # --run-ignored only selects ignored tests; with no package, all packages.
 # Do not combine an integration test target with --filter.
 # --features <list> enables features for the package.
+# --timings runs the tests and reports the host and Cargo timing report path.
 # Also add workspace.metadata.dev.features.
 # Cargo builds the package's test targets and workspace libraries as needed.
 # A full package run refuses examples that contain tests or set test = true.
@@ -139,13 +141,14 @@
 #
 # Help build:
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
-#                     [--release] [--features <list>] [--attached]
+#                     [--release] [--features <list>] [--timings] [--attached]
 #
 # Build binaries on an eligible target. --target or --mac pins the step.
 # --local pins the step to natedev.
 # --bin selects one binary. --example selects one example.
 # Enable the example's required features when building an example.
 # --release selects the release profile.
+# --timings reports the host and Cargo timing report path.
 # Names without a slash in --features belong to the named package.
 # Without a package, pass feature names unchanged.
 # For a debug build, also add workspace.metadata.dev.features.
@@ -377,6 +380,7 @@ parse_command_arguments() {
     local ignored_only=0 integration_target=0
     VERIFY_PACKAGE=""
     COMMAND_ARGS=()
+    VERIFY_TIMINGS=()
     SAVED_FINAL=0
     SAVED_TREE=""
     EXAMPLE_NAME=""
@@ -402,6 +406,9 @@ parse_command_arguments() {
                 fi
                 ignored_only=1
                 COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
+            --timings)
+                [[ "$CMD" == build || "$CMD" == test ]] || { command_help "$CMD" >&2; exit 2; }
+                VERIFY_TIMINGS=(--timings); shift ;;
             --features|--filter|--bin|--example|--target|--env|--fetch|--mac|--local)
                 [[ $# -ge 2 ]] || { command_help "$CMD" >&2; exit 2; }
                 COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
@@ -1364,6 +1371,7 @@ take_build_args() {
     if [[ -n "$features" ]]; then
         BUILD_ARGS+=(--features "$(qualify_features "$PKG" "$features")")
     fi
+    BUILD_ARGS+=("${VERIFY_TIMINGS[@]+"${VERIFY_TIMINGS[@]}"}")
 }
 
 # One `binary: <path>` line per binary the build made, for the caller to launch.
@@ -1426,37 +1434,29 @@ compose_nextest_args() {
             FILTER="($FILTER)"
         fi
         TEST_FILTER="${PKG:+package($PKG) & }$FILTER"
-    elif [[ -n "$TARGET" ]]; then
+    else
+        TEST_FILTER="${PKG:+package($PKG)}"
+    fi
+    if [[ -n "$TARGET" ]]; then
         # Integration test target names are unique across the workspace,
         # so --test builds just that binary, under the workspace's
         # feature resolution.
         NEXTEST_ARGS=(--no-fail-fast --workspace --test "$TARGET")
-        if [[ -n "$PKG" ]]; then NEXTEST_ARGS+=(-E "package($PKG)"); fi
-        NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
-        return
     else
-        TEST_FILTER="${PKG:+package($PKG)}"
+        # Select only the test targets that the package uses.
+        take_test_targets
+        NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}")
     fi
-    # Build only the targets this package's tests live in
-    # (verify_metadata.py): --lib, which cannot be narrowed to one member
-    # under --workspace and is left out for a package without a lib,
-    # and the package's own bins and test-enabled targets. --bins
-    # --tests linked every member's test executables, 78 in hana, to
-    # run one package's; this links 4 (2026-10-04). The integration
-    # tests stay in so a phase runs the package's integration tests
-    # alongside its unit tests. The lint half's clippy checks all
-    # workspace targets with all features.
-    take_test_targets
-    NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}")
     if [[ -n "$TEST_FILTER" ]]; then NEXTEST_ARGS+=(-E "$TEST_FILTER"); fi
     NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
     if [[ "$ignored_only" == 1 ]]; then
         NEXTEST_ARGS+=(--run-ignored only)
     fi
     # Filters and ignored-test selections must match tests.
-    if [[ ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 ]]; then
+    if [[ -z "$TARGET" && ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 ]]; then
         NEXTEST_ARGS+=(--no-tests=warn)
     fi
+    NEXTEST_ARGS+=("${VERIFY_TIMINGS[@]+"${VERIFY_TIMINGS[@]}"}")
 }
 
 # A stop during a Mac fix return leaves a record in the git folder (fix_return.py).
@@ -1885,6 +1885,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
 if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
+if [[ "${VERIFY_TIMINGS[0]:-}" == --timings ]]; then CACHE_DIR=""; fi
 if [[ "$CMD" == test ]]; then
     for VERIFY_ENV_ENTRY in ${VERIFY_TEST_ENVIRONMENT[@]+"${VERIFY_TEST_ENVIRONMENT[@]}"}; do
         MAC_ENV_NAMES+=("${VERIFY_ENV_ENTRY%%=*}")
@@ -2197,6 +2198,7 @@ note_event() {
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
         verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${VERIFY_PACKAGE:+"$VERIFY_PACKAGE"} ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} \
+        ${VERIFY_TIMINGS[@]+"${VERIFY_TIMINGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
 
@@ -3705,6 +3707,7 @@ token_waiters_key() {
     if [[ "$CMD" == lint && ${#key_args[@]} -gt 0 && "${key_args[0]}" != --* ]]; then
         key_args=("${key_args[@]:1}")
     fi
+    key_args+=("${VERIFY_TIMINGS[@]+"${VERIFY_TIMINGS[@]}"}")
     local hash
     hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | hash_stream)"
     printf '%s\n' "${hash:0:16}"
@@ -4083,6 +4086,13 @@ stop_token_renewer() {
 }
 
 buildlog_exec() {
+    if [[ "${VERIFY_TIMINGS[0]:-}" == --timings && "${BUILDLOG_TARGET_FOLDER:-}" == /* ]]; then
+        # Keep the prebuild prefix outside the timing check and inside the copy lease.
+        local -a timing_observer=("$PY" "$BUILD_HELPER_ROOT/mac_test/cargo_timings.py"
+            "$BUILDLOG_TARGET_FOLDER")
+        local prefix=${#LINT_PREBUILD_PREFIX[@]}
+        set -- "${@:1:prefix}" "${timing_observer[@]}" "${@:prefix+1}"
+    fi
     if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]] && buildlog_step_compiles "$@"; then
         set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
             --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" -- "$@"
@@ -4193,7 +4203,7 @@ refresh_test_build_inputs() {
             < "$HOLD_WAIT_DIR/test-build-inputs"
     fi
     # A hold can also arrive during memory admission, after buildlog_begin.
-    if [[ -n "${BUILDLOG_START:-}" ]]; then
+    if [[ -n "${BUILDLOG_START:-}${BUILDLOG_TARGET_FOLDER:-}" ]]; then
         buildlog_read_context ${BUILDLOG_STEP_ARGV[@]+"${BUILDLOG_STEP_ARGV[@]}"}
     fi
     TEST_BUILD_INPUTS_READY=1

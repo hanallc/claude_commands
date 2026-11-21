@@ -200,6 +200,21 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         result = self.verify("build", "sample", "--target", "linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("binary: linux:/remote/cargo output/debug/sample-cli", result.stdout)
+        self.assertNotIn("timings:", result.stdout)
+        path = self.root / "remote cargo output/cargo-timings/cargo-timing-fixture.html"
+        missing = path.with_name("cargo-timing-missing.html")
+        for mode, status in (("passed", 0), ("failed", 42)):
+            with self.subTest(mode=mode):
+                result = self.verify("build", "sample", "--timings", "--target", "linux", extra={
+                    "TEST_SSH_TIMING_REPORT": str(path), "TEST_SSH_MISSING_TIMING_REPORT": str(missing),
+                    "TEST_SSH_MODES": json.dumps({"linux": mode}),
+                })
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines().count(f"timings: linux-build:{path}"), 1)
+                self.assertNotIn(f"timings: linux-build:{missing}", result.stdout)
+        expected = ["--workspace", "--bin", "sample-cli"]
+        self.assertEqual([words[words.index("--") + 1:] for words in self.received_arguments()],
+                         [expected, expected + ["--timings"], expected + ["--timings"]])
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
 

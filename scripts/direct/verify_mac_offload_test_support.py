@@ -390,6 +390,10 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
     wait_for_file(root / "cargo-release")
     if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
         print("     Starting 1 test", flush=True)
+if arguments[:2] == ["nextest", "run"] and "--timings" in arguments:
+    report = Path(os.environ["TEST_LOCAL_TIMING_REPORT"])
+    report.write_text("Cargo report")
+    print(f"      Timing report saved to {report}", file=sys.stderr)
 if arguments[:2] == ["nextest", "run"]:
     raise SystemExit(int(os.environ.get("TEST_LOCAL_STATUS", "0")))
 raise SystemExit(0)
@@ -432,7 +436,7 @@ locale_was_set=${LC_ALL+x}
 LC_ALL=C
 for argument in "$@" "$token_holder" "$coordinator"; do
     case "$argument" in
-        *[!\ -~]*)
+        --timings|*[!\ -~]*)
             if [ "$locale_was_set" = x ]; then LC_ALL=$original_locale; else unset LC_ALL; fi
             python_reply "$@"
             ;;

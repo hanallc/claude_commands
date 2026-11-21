@@ -1,10 +1,14 @@
 """Shell stand-ins keep argument records without starting Python per command."""
 
 from dataclasses import dataclass
+from contextlib import redirect_stdout
+import io
 import shlex
 from pathlib import Path
+import unittest
 
 from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
+from scripts.mac_test import cargo_timings, offload
 
 
 JSON_SHELL = r'''
@@ -42,6 +46,51 @@ def write_shell(path: Path, source: str) -> None:
     """Bash builtins handle JSON escaping and timed FIFO reads on Linux and macOS."""
     _ = path.write_text("#!/bin/bash\n" + JSON_SHELL + source)
     path.chmod(0o755)
+
+
+def replay_remote_run(
+    output: str, status: int, *,
+    timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN,
+) -> offload.RemoteRunStatus:
+    return offload.ProcessController().stream_mac_run([
+        "/bin/sh", "-c", 'printf "%s" "$1"; exit "$2"', "protocol", output, str(status),
+    ], timing=timing)
+
+
+def assert_no_report_on_incomplete_timing_stream(
+    case: unittest.TestCase, wire: str, status: int, cleanup: offload.CleanupOutcome, child_line: str,
+    timing: cargo_timings.TimingRunToken,
+) -> None:
+    record = cargo_timings.remote_report_line(timing, cargo_timings.NoTimingReport()).strip()
+    lines = wire.splitlines()
+    case.assertEqual(lines.count(record), 1)
+    index = lines.index(record)
+    case.assertEqual(lines[index + 1], f"mac_exit={status}")
+    child = "\n".join(lines[:index]).rstrip("\n") + "\n"
+    completion = "\n".join(lines[index + 1:]) + "\n"
+    malformed = timing.record_prefix() + "invalid"
+    other_run = cargo_timings.TimingRunToken.new().record_prefix() + child_line.removeprefix(
+        cargo_timings.REMOTE_TIMING_REPORT_PREFIX)
+    cases = (
+        ("complete", wire, status, child_line),
+        ("copied", child + child_line + "\n" + completion, 255, child_line),
+        ("other run", child + other_run + "\n" + completion, status, other_run),
+        ("truncated", child + record + "\nmac_exit=", 255, "mac_exit="),
+        ("missing", child + completion, status, child_line),
+        ("malformed", child + malformed + "\n" + completion, status, malformed),
+    )
+    for name, stream, ssh_status, visible_line in cases:
+        with case.subTest(stream=name):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = replay_remote_run(stream, ssh_status, timing=timing)
+            if name == "truncated":
+                case.assertIsInstance(result, offload.MissingMacStatus)
+            else:
+                case.assertEqual(result, offload.ReportedMacStatus(status, cleanup))
+            case.assertNotIn(cargo_timings.TIMING_REPORT_PREFIX, output.getvalue())
+            case.assertIn(visible_line, output.getvalue().splitlines())
+            case.assertNotIn(record, output.getvalue().splitlines())
 
 
 WORKSPACE_SWEEP_SETTINGS = """\
@@ -100,14 +149,15 @@ class WorkspaceSweepFixture:
 
 def configure_nextest_trim(shim: Path, trim: int | WorkspaceSweepFixture) -> None:
     """Keep the log writer active while the fixture controls the trim."""
-    original = Path(__file__).resolve().with_name("nextest_log.py")
+    directory = Path(__file__).resolve().parent
     interpreter, _, body = fixture_shim_source().partition("\n")
     trim_command = (f"exit {trim}" if isinstance(trim, int) else
                     '[ "$#" -eq 4 ] && [ "$1" = -B ] && [ "$2" = -c ] || exit 99\n'
                     + f'set -- "$1" "$2" {shlex.quote(trim.python_prefix())}"$3" "$4"')
-    source = (interpreter + '\nif [ "${2##*/}" = nextest_log.py ]; then\n'
-              + f'    shift 2\n    set -- -B {shlex.quote(str(original))} "$@"\n'
-              + f'else\n    {trim_command}\nfi\n' + body)
+    source = (interpreter + '\ncase ${2##*/} in\n    nextest_log.py|cargo_timings.py)\n'
+              + f'        script={shlex.quote(str(directory))}/"${{2##*/}}"\n'
+              + '        shift 2\n        set -- -B "$script" "$@"\n        ;;\n'
+              + f'    *)\n        {trim_command}\n        ;;\nesac\n' + body)
     _ = shim.write_text(source)
     shim.chmod(0o755)
 

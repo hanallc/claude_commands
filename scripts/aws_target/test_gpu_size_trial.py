@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from typing import BinaryIO, cast, final, override
 import unittest
@@ -30,6 +31,7 @@ from scripts.aws_target.ledger_test_support import (
 )
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
+from scripts.buildlog.store import host_name
 from scripts.lib import conf
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -227,6 +229,12 @@ if name == 'vulkaninfo':
     print('deviceType = ' + os.environ['FIXTURE_VULKAN'])
 elif name == 'curl':
     assert '-T' in args
+    with (Path.cwd() / 'uploads').open('a') as uploads:
+        print(Path(args[-1]).name, file=uploads)
+    if Path(args[-1]).name == 'cargo-timing.html':
+        assert 0 < int(args[args.index('--max-time') + 1]) <= int(os.environ['FIXTURE_COPY_WINDOW'])
+        if os.environ['FIXTURE_TIMING_COPY'] == 'failed':
+            sys.exit(23)
     shutil.copyfile(args[args.index('-T') + 1], args[-1])
 elif name == 'cargo':
     if args == ['nextest', '--version']:
@@ -241,7 +249,13 @@ elif name == 'cargo':
         assert os.environ['CARGO_NET_OFFLINE'] == 'true'
         print('fixture stdout')
         print('fixture stderr', file=sys.stderr)
-        sys.exit(100)
+        status = int(os.environ['FIXTURE_NEXTEST_STATUS'])
+        if '--timings' in args:
+            report = target / 'cargo-timings/cargo-timing-fixture.html'
+            report.parent.mkdir()
+            report.write_text('Cargo report')
+            print(f'Timing report saved to {report}', file=sys.stderr)
+        sys.exit(status)
 """
         for name in ('cargo', 'vulkaninfo', 'curl'):
             executable = tools / name
@@ -252,16 +266,30 @@ elif name == 'cargo':
             "root = Path('/var/lib/gpu-size-trial')", 'root = Path(' + repr(str(folder)) + ')', 1))
         environment = {**os.environ, 'PATH': str(tools) + os.pathsep + os.environ.get('PATH', ''),
                        'GPU_TRIAL_CARGO': str(tools / 'cargo')}
-        for version, device, failure in (
-                ('0.9.142', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', 'does not match the Hana CI pin'),
-                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_CPU', 'hardware Vulkan adapter'),
-                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', '')):
-            with self.subTest(version=version, device=device):
+        report = self.root / 'cargo-timing.html'
+        links = trial.read_json(folder / 'links.json')
+        trial.write_json(folder / 'links.json', {**links, 'timing_report': str(report)})
+        for version, device, failure, timings, status, copy in (
+                ('0.9.142', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', 'does not match the Hana CI pin', False, 100, ''),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_CPU', 'hardware Vulkan adapter', False, 100, ''),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', '', False, 100, ''),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', '', True, 4, 'kept'),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', '', True, 100, 'failed'),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', '', True, 4, 'late')):
+            with self.subTest(version=version, device=device, timings=timings, status=status, copy=copy):
+                copy_window = 25 if copy != 'late' else 0
+                report.unlink(missing_ok=True)
+                (folder / 'uploads').unlink(missing_ok=True)
+                _ = (folder / 'stop-at').write_text(str(int(time.time()) + copy_window))
+                requested = [*arguments, '--timings'] if timings else arguments
+                manifest['hana_nextest'] = {'arguments': requested, 'instance_types': ['g6.2xlarge']}
                 manifest['nextest'] = 'cargo-nextest ' + version
                 trial.write_json(folder / 'manifest.json', manifest)
                 result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True,
                     timeout=TEST_HANG_GUARD_SECS,
                                         env={**environment, 'FIXTURE_VULKAN': device,
+                                             'FIXTURE_COPY_WINDOW': str(copy_window), 'FIXTURE_TIMING_COPY': copy,
+                                             'FIXTURE_NEXTEST_STATUS': str(status),
                                              'FIXTURE_NEXTEST_VERSION': manifest['nextest']})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 document = trial.read_json(finished)
@@ -271,14 +299,32 @@ elif name == 'cargo':
                     self.assertFalse((folder / 'cargo-invocations').exists())
                     shutil.rmtree(folder / 'source')
                     continue
-                actual = trial.nextest_result(document, 'fixture-attempt', manifest)
-                self.assertEqual((actual.exit_code, actual.stdout, actual.stderr),
-                                 (100, 'fixture stdout\n', 'fixture stderr\n'))
+                nextest = trial.mapping(document['nextest']) if document['status'] == 'complete' else {}
+                self.assertEqual(document['status'], 'complete', document.get('reason'))
+                self.assertEqual(nextest['exit_code'], status)
+                self.assertEqual(nextest['stdout'], 'fixture stdout\n')
+                self.assertIn('fixture stderr\n', str(nextest['stderr']))
+                if copy in ('kept', 'failed'):
+                    self.assertEqual(nextest['timing_host'], host_name())
+                    self.assertEqual((folder / 'uploads').read_text().splitlines(), [finished.name, report.name])
+                else:
+                    self.assertNotIn('timing_host', nextest)
+                    self.assertEqual((folder / 'uploads').read_text().splitlines(), [finished.name])
+                if copy == 'kept':
+                    self.assertEqual(report.read_text(), 'Cargo report')
+                else:
+                    self.assertFalse(report.exists())
+                if copy in ('late', 'failed'):
+                    self.assertIn('The Hana GPU timing report copy was not kept', result.stderr)
                 call, = (folder / 'cargo-invocations').read_text().splitlines()
                 self.assertEqual(cast(object, json.loads(call)),
                                  ['nextest', 'run', '--locked', '--offline', '--target-dir', str(folder / 'target'),
                                   '--no-tests', 'fail', '--color', 'never', '--message-format', 'libtest-json',
-                                  '--message-format-version', '0.1', *arguments])
+                                  '--message-format-version', '0.1', *requested])
+                (folder / 'cargo-invocations').unlink()
+                (folder / 'uploads').unlink()
+                shutil.rmtree(folder / 'target')
+                shutil.rmtree(folder / 'source')
 
     def test_hana_preparation_refuses_a_toolchain_that_differs_from_the_source_pin(self) -> None:
         folder = trial.trial_root() / 'trial'
@@ -1145,6 +1191,12 @@ class FakeGpuAws:
         self.launch_errors: dict[tuple[str, str], str] = {}
         self.launch_attempt_limit = ''
         self.lose_nextest_result = False
+        self.nextest_report = b''
+        self.nextest_report_delay = 0
+        self.nextest_report_window = trial.GPU_TIMING_COPY_MAX_SECONDS
+        self.timing_call_seconds: dict[str, float] = {}
+        self.timing_calls: list[tuple[str, float, float]] = []
+        self.timing_availability: dict[str, float] = {}
         self.bad_nextest_identity = False
         self.on_launch: Callable[[str], None] = lambda _attempt: None
         self.events: list[str] = []
@@ -1165,10 +1217,17 @@ class FakeGpuAws:
     def results(self, attempt: str, size: str) -> None:
         if 'hana_nextest' in self.manifest:
             if not self.lose_nextest_result:
-                self.objects[f'artifacts/gpu-size-trial/{attempt}/finished.json'] = json.dumps({
-                    'status': 'complete', 'nextest': {'attempt': attempt, 'exit_code': self.nextest_exit,
-                        'commit': 'wrong' if self.bad_nextest_identity else self.manifest['commit'],
-                        'tree': self.manifest['tree'], 'stdout': self.nextest_stdout, 'stderr': self.nextest_stderr}}).encode()
+                prefix = f'artifacts/gpu-size-trial/{attempt}/'
+                result = {'attempt': attempt, 'exit_code': self.nextest_exit,
+                          'commit': 'wrong' if self.bad_nextest_identity else self.manifest['commit'],
+                          'tree': self.manifest['tree'], 'stdout': self.nextest_stdout, 'stderr': self.nextest_stderr}
+                if self.nextest_report:
+                    result['timing_host'] = 'fixture-guest'
+                    result['timing_copy_until'] = int(self.now) + self.nextest_report_window
+                    key = prefix + 'cargo-timing.html'
+                    self.objects[key] = self.nextest_report
+                    self.timing_availability[key] = self.now + self.nextest_report_delay
+                self.objects[prefix + 'finished.json'] = json.dumps({'status': 'complete', 'nextest': result}).encode()
             return
         for number in (1, 2):
             payloads = {'machine.json': {'commit': self.manifest['commit'],
@@ -1189,11 +1248,17 @@ class FakeGpuAws:
 
     def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        del capture_output, text, timeout, check
+        del capture_output, text, check
         if arguments[0] != 'aws':
             raise AssertionError('Unexpected external command: ' + str(arguments))
         offset = arguments.index('--region')
         region, service, operation = arguments[offset + 1:offset + 4]
+        if any(word.endswith('/cargo-timing.html') for word in arguments):
+            self.timing_calls.append((operation, self.clock(), timeout))
+            elapsed = self.timing_call_seconds.get(operation, 0)
+            self.now += min(elapsed, timeout)
+            if elapsed > timeout:
+                raise subprocess.TimeoutExpired(arguments, timeout)
         self.events.append(operation)
         reply: dict[str, object]
         if operation == 'get-service-quota':
@@ -1225,7 +1290,8 @@ class FakeGpuAws:
             if self.result_list_error:
                 return subprocess.CompletedProcess(arguments, 1, '',
                     f'An error occurred ({self.result_list_error}) when calling the ListObjectsV2 operation: fixture')
-            reply = {'Contents': [{'Key': key} for key in sorted(self.objects) if key.startswith(prefix)][:1]}
+            reply = {'Contents': [{'Key': key} for key in sorted(self.objects)
+                                  if key.startswith(prefix) and self.clock() >= self.timing_availability.get(key, 0)][:1]}
         elif operation == 'get-object':
             if self.fail_result:
                 self.fail_result = False
@@ -1260,9 +1326,9 @@ class FakeGpuAws:
             self.events[-1] += ':' + size
             instance = 'i-fixture-' + str(len(self.launches))
             self.instances[instance] = 'running'
+            self.now += 60
             self.results(str(launch['ClientToken']), size)
             reply = {'Instances': [{'InstanceId': instance}]}
-            self.now += 60
         elif operation == 'terminate-instances':
             for instance in arguments[arguments.index('--instance-ids') + 1:arguments.index('--output')]:
                 if not self.unconfirmed:
@@ -1360,7 +1426,8 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertEqual(self.fake.events, ['cp'])
         self.assertIn('large-payload', self.fake.objects)
 
-    def nextest_cli(self, types: tuple[str, ...], arguments: tuple[str, ...]) -> tuple[int, str, str]:
+    def nextest_cli(self, types: tuple[str, ...], arguments: tuple[str, ...], *,
+                    restart_after_result: bool = False) -> tuple[int, str, str]:
         self.fake.manifest['tree'] = 'b' * 40
         self.fake.manifest['hana_nextest'] = {'arguments': arguments, 'instance_types': types}
         self.fake.manifest['sha256'] = {name: checksum for name, checksum in
@@ -1378,8 +1445,23 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             trial.write_json(folder / 'manifest.json', self.fake.manifest)
 
         def service(folder: Path, _directory: Path, _settings: Path, _execute: Callable[[Sequence[str]], int]) -> int:
+            worker = self.worker
+            if restart_after_result:
+                collect = worker.collect_nextest
+
+                def interrupt_after_collection(box: Path, request: dict[str, object], online: dict[str, object],
+                                               poll_seconds: int) -> None:
+                    collect(box, request, online, poll_seconds)
+                    raise OSError('The fixture stops after result collection')
+
+                # Leave the instance booked as a stopped service would.
+                with (mock.patch.object(worker, 'collect_nextest', side_effect=interrupt_after_collection),
+                      mock.patch.object(worker, 'cleanup', return_value=True),
+                      self.assertRaisesRegex(OSError, 'The fixture stops after result collection')):
+                    worker.execute(folder, self.deployment)
+                worker = trial.GpuTrialWorker(worker.gates)
             try:
-                self.worker.execute(folder, self.deployment)
+                worker.execute(folder, self.deployment)
             except (ValueError, OSError, AwsUnavailable):
                 return 1
             finally:
@@ -1429,6 +1511,99 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         settled, = self.book.read_snapshot().gate_reservations
         self.assertIsInstance(settled.state, ledger.GateTerminated)
         self.assertFalse(any(key.endswith('hana-tests.tar.zst') for key in self.fake.objects))
+
+    def test_hana_nextest_retains_the_guest_timing_report_before_termination(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.nextest_report = b'<html>Cargo report</html>'
+        self.fake.nextest_report_delay = cloud_gate.settings().whole('gpu_size_trial_result_poll_s')
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants', '--timings'))
+        self.assertEqual(code, 0, errors)
+        launch, = self.fake.launches
+        trial_id = str(self.fake.manifest['trial'])
+        box = trial.gpu_box(trial.trial_root() / trial_id, trial_id, size, str(launch['ClientToken']))
+        self.assertTrue((box / 'cargo-timing.html').is_file(), self.fake.events)
+        self.assertEqual((box / 'cargo-timing.html').read_bytes(), self.fake.nextest_report)
+        result = trial.mapping(cast(object, json.loads(output)))
+        self.assertEqual(result['timing_copy'], {'guest': 'fixture-guest', 'path': str(box / 'cargo-timing.html')})
+        self.assertLess(self.fake.events.index('get-object:cargo-timing.html'),
+                        self.fake.events.index('terminate-instances'))
+        self.assertGreater(self.fake.events.count('list-objects-v2:cargo-timing.html'), 1)
+
+    def test_hana_nextest_keeps_the_result_when_the_report_copy_is_late(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.nextest_report = b'<html>Cargo report</html>'
+        self.fake.nextest_report_delay = trial.GPU_TIMING_COPY_MAX_SECONDS + 1
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants', '--timings'))
+        self.assertEqual(code, 0, errors)
+        result = trial.mapping(cast(object, json.loads(output)))
+        self.assertEqual(result['exit_code'], 0)
+        self.assertNotIn('timing_copy', result)
+        self.assertIn('The Hana GPU timing report copy was not kept', errors)
+        self.assertIn('terminate-instances', self.fake.events)
+
+    def test_hana_nextest_timing_calls_stop_at_the_copy_deadline(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.nextest_report = b'Cargo report'
+        cases: tuple[tuple[str, int, dict[str, float], list[tuple[str, int, int]]], ...] = (
+            ('expired at entry', 0, {}, []),
+            ('LIST reaches expiry', 3, {'list-objects-v2': 3}, [('list-objects-v2', 0, 3)]),
+            ('GET succeeds at expiry', 3, {'list-objects-v2': 1, 'get-object': 2},
+             [('list-objects-v2', 0, 3), ('get-object', 1, 2)]),
+            ('GET times out', 3, {'list-objects-v2': 1, 'get-object': 3},
+             [('list-objects-v2', 0, 3), ('get-object', 1, 2)]),
+        )
+        for name, window, call_seconds, calls in cases:
+            for restart in (False, True):
+                for status in (0, 100):
+                    with self.subTest(case=name, restart=restart, status=status):
+                        self.fake.nextest_report_window = window
+                        self.fake.timing_call_seconds = call_seconds
+                        self.fake.nextest_exit = status
+                        self.assert_hana_nextest_copy_expires(size, restart, calls)
+
+    def assert_hana_nextest_copy_expires(self, size: str, restart: bool, calls: list[tuple[str, int, int]]) -> None:
+        self.fake.timing_calls.clear()
+        first_event = len(self.fake.events)
+        first_launch = len(self.fake.launches)
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants', '--timings'),
+                                               restart_after_result=restart)
+        status = self.fake.nextest_exit
+        self.assertEqual(code, status, errors)
+        self.assertEqual(len(self.fake.launches), first_launch + 1)
+        attempt = str(self.fake.launches[first_launch]['ClientToken'])
+        trial_id = str(self.fake.manifest['trial'])
+        box = trial.gpu_box(trial.trial_root() / trial_id, trial_id, size, attempt)
+        result = trial.mapping(cast(object, json.loads(output)))
+        self.assertEqual(result, {'attempt': attempt, 'commit': self.fake.manifest['commit'],
+                                  'tree': self.fake.manifest['tree'], 'exit_code': status,
+                                  'stdout': self.fake.nextest_stdout, 'stderr': self.fake.nextest_stderr})
+        saved = trial.mapping(trial.read_json(box / 'finished.json')['nextest'])
+        start = ledger.instant(saved, 'timing_copy_until') - self.fake.nextest_report_window
+        self.assertEqual(self.fake.timing_calls, [(op, start + offset, timeout) for op, offset, timeout in calls])
+        report = box / trial.GPU_TIMING_REPORT
+        self.assertFalse(report.exists())
+        self.assertFalse(report.with_suffix('.partial').exists())
+        self.assertIn('The Hana GPU timing report copy was not kept', errors)
+        self.assertIn('terminate-instances', self.fake.events[first_event:])
+        settled, = [row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt]
+        self.assertIsInstance(settled.state, ledger.GateTerminated)
+
+    def test_hana_nextest_status_four_keeps_the_copied_report_and_refusal(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.nextest_exit = 4
+        self.fake.nextest_report = b'<html>Cargo report</html>'
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants', '--timings'))
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+        self.assertEqual(output, '')
+        launch, = self.fake.launches
+        trial_id = str(self.fake.manifest['trial'])
+        box = trial.gpu_box(trial.trial_root() / trial_id, trial_id, size, str(launch['ClientToken']))
+        self.assertIn('Hana GPU infrastructure failure: Cargo nextest selected no tests', errors)
+        self.assertIn(f'timings: {host_name()}:{box / "cargo-timing.html"} (copy of guest report from fixture-guest)', errors)
 
     def test_hana_nextest_uses_only_types_from_the_saved_gate_deployment(self) -> None:
         types = ('g4dn.2xlarge', 'g6.2xlarge')

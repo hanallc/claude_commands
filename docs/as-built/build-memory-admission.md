@@ -1736,7 +1736,7 @@ It also records `outside_build_cache_totals` and `previous_measured_at`.
 
 ### `verify.sh` example guard
 
-`verify.sh build [<pkg>] [--bin <name> | --example <name>] [--release] [--features <list>]` builds the selected binaries or example.
+`verify.sh build [<pkg>] [--bin <name> | --example <name>] [--release] [--features <list>] [--timings]` builds the selected binaries or example.
 `BUILD_TARGETS_PY` reads the package's binaries, or every member's binaries when no package is given.
 A named example supplies its required features.
 `take_build_args` refuses a missing target or a package without a binary with exit 2.
@@ -1744,10 +1744,30 @@ The Cargo build keeps `--workspace` and the workspace's feature set.
 A named package owns feature names without a slash; without a package, feature names pass unchanged.
 The build uses the build hold, cargo token, memory admission, and a call record with verb `build`.
 `print_built_binaries` prints `binary: <target_directory>/<debug|release>/[examples/]<name>` for each target.
-The build saves no pass record and does not use Mac offload.
+The build saves no pass record.
 Use this command for smoke and shot helpers.
 
-A gate run is `test [<pkg>]` without `--filter` or `--test`; `--features` is allowed.
+A gate run is `test [<pkg>]` without `--filter` or `--test`. It accepts `--features` and `--timings`.
+`--timings` passes the flag to the Cargo command that compiles.
+When the jobserver separates compilation from test runs, only the compilation command receives the flag.
+Verify prints `timings: <host>:<path>` when Cargo writes an HTML report, including on compilation or test failure.
+The execution host lists reports before and after the command in the selected target folder.
+Verify reports the path if Cargo creates one new stamped file.
+The Mac saves the report outside the target folder if cleanup can remove it.
+Verify gives each timed SSH runner a new token through a runner argument.
+The runner consumes the argument before it starts Cargo.
+The runner sends one timing record with the token before the Cargo status.
+The record contains the confirmed path or states that no report is available.
+The Mac starts cleanup after it sends the Cargo status.
+The controller displays the timing path only if the record matches the token and the controller accepts the final status.
+For `--target hana-gpu`, the guest sends the Cargo result before it uploads the report.
+Verify retains the report in the GPU result folder if the optional upload and download finish before the deadline.
+Each controller transfer uses the time left before the deadline, up to the normal AWS call limit.
+A result that arrives near guest shutdown can leave no time for the report copy.
+The optional copy does not extend the guest lifetime.
+The output names the retained file and identifies the guest that wrote it.
+If the copy fails or arrives late, Verify reports that no copy was kept and preserves the Cargo result.
+Timed tests bypass the saved result cache.
 A test without a package uses the workspace figure for memory admission and estimates.
 Gate runs and `final` read `cargo metadata --no-deps --format-version 1` once into `GATE_METADATA`.
 They run `UNTESTED_EXAMPLES_PY` before the cache lookup and any build.

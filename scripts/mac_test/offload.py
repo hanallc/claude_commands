@@ -68,7 +68,7 @@ from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
-from scripts.mac_test import eligibility, nextest_log
+from scripts.mac_test import cargo_timings, eligibility, nextest_log
 from scripts.mac_test.eligibility import (
     MacVerb,
     NonBusyMacDeclineReason,
@@ -1095,7 +1095,9 @@ class ProcessController:
             self.copy_failure_detail = f"copy: {arguments[0]}: {error}"
         return result
 
-    def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
+    def stream_mac_run(self, arguments: Sequence[str], *,
+                       timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN,
+                       ) -> RemoteRunStatus:
         self.pending = PendingStartOperation()
         try:
             process = subprocess.Popen(
@@ -1118,6 +1120,9 @@ class ProcessController:
         status: RemoteRunStatus = MISSING_MAC_STATUS
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
+        no_report = cargo_timings.NoTimingReport()
+        pending_report: cargo_timings.ConfirmedTimingReport | cargo_timings.NoTimingReport = no_report
+        status_report: cargo_timings.ConfirmedTimingReport | cargo_timings.NoTimingReport = no_report
         mismatch = ""
         mirror_refusal: MirrorBusyRefusal | NoMirrorBusyRefusal = NoMirrorBusyRefusal()
         build_target_directory = ""
@@ -1133,6 +1138,9 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
+                if status_match is None:
+                    pending_report = no_report
                 identity = self.claim_identity
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
@@ -1160,7 +1168,6 @@ class ProcessController:
                     held_status_line = ""
                     cleanup = CleanupUnconfirmed()
                     continue
-                status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
                 if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
                     if held_status_line:
                         print(held_status_line, end="", flush=True)
@@ -1170,6 +1177,8 @@ class ProcessController:
                         status_digits = status_match.group(1).lstrip("0") or "0"
                         mac_status = int(status_digits) if len(status_digits) <= 3 else 256
                         status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    status_report = pending_report
+                    pending_report = no_report
                     if isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
                         self.pending = AcknowledgedStartOperation()
                         held_status_line = line
@@ -1189,6 +1198,12 @@ class ProcessController:
                     held_status_line = ""
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
+                if (isinstance(timing, cargo_timings.TimingRunToken)
+                        and marker.startswith(cargo_timings.REMOTE_TIMING_REPORT_PREFIX)):
+                    record = cargo_timings.parse_remote_report(timing, marker)
+                    if not isinstance(record, cargo_timings.UnrecognizedTimingRecord):
+                        pending_report = record
+                        continue
                 print(line, end="", flush=True)
             finished_output = True
             exit_status = process.wait()
@@ -1210,6 +1225,8 @@ class ProcessController:
         if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
+            if isinstance(status_report, cargo_timings.ConfirmedTimingReport):
+                print(cargo_timings.format_timing_report(status_report), flush=True)
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
         if isinstance(status, MacNextestSetupFailed):
             return MacNextestSetupFailed(cleanup)
@@ -2062,6 +2079,8 @@ def remote_test_command(
     request: OffloadRequest,
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
+    *,
+    timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN,
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
@@ -2073,7 +2092,7 @@ def remote_test_command(
             {**runner_values(config, request.target), "step_kind": request.kind or eligibility.verb_kind(request.verb)},
             repository.policy_name, request.verb, words, request.call_id,
             sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
-            repository.key, request.environment, clear_environment,
+            repository.key, request.environment, clear_environment, timing=timing,
         )
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -2109,13 +2128,17 @@ def remote_test_command(
     report_status = "; echo mac_exit=$?"
     if request.verb == "nextest":
         limits = nextest_log.output_limits(config.settings)
-        capture = nextest_log.capture_function(limits) + " && "
+        capture = nextest_log.capture_function(limits, timing) + " && "
         # The writer reports the child status. A failed launch takes the setup path.
         report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
-    runner = "run_nextest_logged " if capture else ""
+    runner = "run_nextest_logged " if capture else cargo_timings.mac_build_prefix(timing)
+    timing_environment = ""
+    if isinstance(timing, cargo_timings.TimingRunToken):
+        cleanup_target = "''" if custom_target else f'"$HOME"/{target}'
+        timing_environment = f"VERIFY_MAC_TIMING_CLEANUP_TARGET={cleanup_target} "
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}{timing_environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
@@ -2630,8 +2653,10 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        timing = (cargo_timings.TimingRunToken.new() if cargo_timings.timings_requested(
+            request.verb, request.nextest_words) else cargo_timings.UNTIMED_RUN)
         try:
-            step_command = remote_test_command(config, request, repository, copied.tree_key)
+            step_command = remote_test_command(config, request, repository, copied.tree_key, timing=timing)
         except ValueError as error:
             evidence.execution = execution_identity.ExecutionNotStarted()
             return DeclinedMacRun("state", elapsed_seconds(started), str(error))
@@ -2683,12 +2708,11 @@ def claimed_run(
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
-        remote_status = controller.stream_mac_run(
-            [
-                *ssh_prefix(config),
-                command,
-            ]
-        )
+        arguments = [*ssh_prefix(config), command]
+        if isinstance(timing, cargo_timings.TimingRunToken):
+            remote_status = controller.stream_mac_run(arguments, timing=timing)
+        else:
+            remote_status = controller.stream_mac_run(arguments)
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
