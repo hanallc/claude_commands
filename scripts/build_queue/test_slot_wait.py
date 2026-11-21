@@ -1,10 +1,15 @@
-"""Reject requests for retired repository capacity waits."""
+"""Check queue names and refusal of retired capacity requests."""
 from __future__ import annotations
 
 import unittest
 
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture
+
+
+class QueueRowNameTests(unittest.TestCase):
+    def test_an_unknown_repository_uses_the_folder_name(self) -> None:
+        self.assertEqual(slot_wait.QueueRowName.repository("unregistered session", "/private/widget"), "widget build")
 
 
 class RepositorySlotWaitTests(unittest.TestCase):

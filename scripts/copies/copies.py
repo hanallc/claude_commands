@@ -1684,6 +1684,9 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join(failures))
 
 
+REMOTE_MIRROR_PROBE_TIMEOUT_S = 5
+
+
 class RemoteRemoval(Enum):
     KEEP = "keep"
     DEFERRED = "deferred"
@@ -1699,6 +1702,7 @@ class RemoteMirror:
     path: str
     session: str
     removal: RemoteRemoval = RemoteRemoval.KEEP
+    task: str = ""
 
 
 @dataclass(frozen=True)
@@ -1818,12 +1822,15 @@ def register_remote(mirror: RemoteMirror) -> None:
     _ = checked_owner(mirror.owner)
     _ = repository_scope(mirror.repository)
     remote_registry().mkdir(parents=True, exist_ok=True)
+    fields: dict[str, object] = {
+        "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
+        "host": mirror.host, "path": mirror.path, "session": mirror.session,
+        "holder_pid": os.getpid(), "last_use": time.time(),
+    }
+    if mirror.task:
+        fields["task"] = mirror.task
     with file_lock.exclusive(remote_registry() / "records.lock"):
-        write_text_atomic(remote_record_path(mirror), json.dumps({
-            "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
-            "host": mirror.host, "path": mirror.path, "session": mirror.session,
-            "holder_pid": os.getpid(), "last_use": time.time(),
-        }) + "\n")
+        write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
     remove_deferred_mirrors(mirror.host)
 
 
@@ -1859,19 +1866,26 @@ def unregister_remote(host: str, path: str) -> None:
         (remote_registry() / (key + ".json")).unlink(missing_ok=True)
 
 
+def decode_remote_mirror(record: str) -> RemoteMirror:
+    raw = cast(object, json.loads(record))
+    if not isinstance(raw, dict):
+        raise ValueError("expected a remote mirror record")
+    fields = cast(dict[str, object], raw)
+    values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError("invalid remote mirror record")
+    task = fields.get("task", "")
+    if not isinstance(task, str):
+        raise ValueError("invalid remote mirror task")
+    unit, repo, host, remote, session = cast(list[str], values)
+    return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                        RemoteRemoval(fields.get("removal", "keep")), task=task)
+
+
 def read_remote_mirror(path: Path) -> RemoteMirror:
     """Decode one registry record without scanning other records."""
     try:
-        raw = cast(object, json.loads(path.read_text()))
-        if not isinstance(raw, dict):
-            raise ValueError("expected a remote mirror record")
-        fields = cast(dict[str, object], raw)
-        values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
-        if not all(isinstance(value, str) for value in values):
-            raise ValueError("invalid remote mirror record")
-        unit, repo, host, remote, session = cast(list[str], values)
-        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
-                            RemoteRemoval(fields.get("removal", "keep")))
+        return decode_remote_mirror(path.read_text())
     except (OSError, ValueError) as error:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
@@ -1903,6 +1917,99 @@ def remote_lease(mirror: RemoteMirror) -> Generator[None]:
             session = read_remote_mirror(record).session if record.exists() else mirror.session
             raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
+
+
+def path_missing_command(path: str) -> str:
+    """Build a remote check that succeeds only when lstat reports a missing path."""
+    program = "\n".join((
+        "import os, sys",
+        "try:",
+        "    os.lstat(sys.argv[1])",
+        "except FileNotFoundError:",
+        "    sys.exit(0)",
+        "sys.exit(1)",
+    ))
+    return '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join([program, path])
+
+
+@dataclass(frozen=True)
+class IdleRemoteMirror:
+    """The record of a mirror that was idle before the probe."""
+
+    mirror: RemoteMirror
+    record_path: Path
+    record: str
+
+
+def idle_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> list[IdleRemoteMirror]:
+    candidates: list[IdleRemoteMirror] = []
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            record = path.read_text()
+            mirror = decode_remote_mirror(record)
+            if (mirror.host != host or mirror.removal is not RemoteRemoval.KEEP
+                    or path != remote_record_path(mirror) or not select(mirror)):
+                continue
+            with remote_lease(mirror):
+                if path.read_text() == record:
+                    candidates.append(IdleRemoteMirror(mirror, path, record))
+        except (CopyError, OSError, ValueError):
+            continue
+    return candidates
+
+
+def probe_remote_mirrors(host: str, candidates: Sequence[IdleRemoteMirror]) -> list[IdleRemoteMirror]:
+    """Use one remote command to check the paths on this host."""
+    program = "\n".join((
+        "import os, sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        "from scripts.lib import scratch",
+        "from scripts.mac_test import floor_claims",
+        "def missing(path):",
+        "    try:",
+        "        os.lstat(path)",
+        "    except FileNotFoundError:",
+        "        return True",
+        "    return False",
+        "for path in sys.argv[1:]:",
+        "    tree = floor_claims.mirror_local_path(path)",
+        "    paths = (tree, floor_claims.removal_authority_path(tree),",
+        "             scratch.removal_mark(tree), scratch.cargo_removal_mark(tree))",
+        "    print('absent' if all(missing(item) for item in paths) else 'present')",
+    ))
+    command = '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join(
+        [program, *(candidate.mirror.path for candidate in candidates)])
+    answer = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", "--", host, command],
+                            capture_output=True, text=True, timeout=REMOTE_MIRROR_PROBE_TIMEOUT_S)
+    if answer.returncode:
+        raise CopyError(failure_detail(answer))
+    states = answer.stdout.splitlines()
+    if len(states) != len(candidates) or any(state not in ("present", "absent") for state in states):
+        raise CopyError("the host did not confirm the state of every path")
+    return [candidate for candidate, state in zip(candidates, states, strict=True) if state == "absent"]
+
+
+def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> None:
+    """Unregister a selected, unchanged mirror only after the host confirms its removal."""
+    try:
+        candidates = idle_remote_mirrors(host, select)
+        if not candidates:
+            return
+        missing = probe_remote_mirrors(host, candidates)
+    except (CopyError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+        detail = ("the probe timed out" if isinstance(error, subprocess.TimeoutExpired)
+                  else " ".join(str(error).split()))
+        print(f"anomaly: remote mirror check on {host}: {detail}", file=sys.stderr)
+        return
+    for candidate in missing:
+        path = candidate.record_path
+        try:
+            with remote_lease(candidate.mirror), file_lock.exclusive(path.parent / "records.lock"):
+                if path.read_text() == candidate.record:
+                    path.unlink()
+        except (CopyError, OSError, UnicodeError):
+            continue
 
 
 def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:

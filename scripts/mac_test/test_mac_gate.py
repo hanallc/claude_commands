@@ -1,6 +1,7 @@
 """Exercise the Mac gate route and the module list with private fixtures."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
@@ -425,16 +426,29 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             sends.append(command)
             return subprocess.CompletedProcess(command, 0)
 
+        registered: list[copies.RemoteMirror] = []
+        reconciled_hosts: list[str] = []
+
+        def reconcile(host: str, select: Callable[[copies.RemoteMirror], bool]) -> None:
+            self.assertEqual(len(registered), 1)
+            self.assertIs(select, mac_gate.is_mac_gate_checkout)
+            reconciled_hosts.append(host)
+
         lease = self.root / 'lease'
         with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac', 'CODEX_THREAD_ID': folder.name}),
               mock.patch.object(copies, 'source_owner', return_value='fixture-owner'),
               mock.patch.object(copies, 'repository_name', return_value='fixture-project'),
               mock.patch.object(copies, 'remote_lease_path', return_value=lease),
-              mock.patch.object(copies, 'register_remote') as register,
+              mock.patch.object(copies, 'register_remote', registered.append),
+              mock.patch.object(copies, 'reconcile_remote_mirrors', reconcile),
               mock.patch.object(subprocess, 'check_output', side_effect=reply),
               mock.patch.object(subprocess, 'run', side_effect=send)):
             self.assertEqual(mac_gate.lifecycle('prepare', argv_file, folder, '1'), 0)
-        register.assert_called_once()
+        self.assertEqual(reconciled_hosts, ['fixture-mac'])
+        self.assertEqual(registered, [
+            copies.RemoteMirror('fixture-owner', copies.SelectedRepository('fixture-project'),
+                                'fixture-mac', str(clone), folder.name, task='gate:' + folder.name),
+        ])
         self.assertEqual(argv_file.with_suffix('.json.checkout').read_text(), str(clone))
         self.assertEqual(argv_file.with_suffix('.json.lease').read_text(), str(lease))
         self.assertIn(str(folder / 'request.json'), sends[1])
@@ -529,18 +543,21 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         removed = self.root / 'removed'
         kept = self.root / 'kept'
         kept.mkdir()
+        cloud_gate.save(folder / 'checkout.json', {'path': str(removed)})
         result = LegacyTaskCleanup(removed, scratch.KeptFolder(kept, 'fixture hold'))
         with (mock.patch.dict(os.environ, copies_environment(self.root)),
-              mock.patch.object(scratch, 'end', return_value=result),
+              mock.patch.object(scratch, 'end', return_value=result) as end,
               mock.patch.object(copies, 'unregister_remote') as unregister,
               redirect_stderr(StringIO()) as notices):
-            self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.RETAINED)
+            for _ in range(2):
+                self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.RETAINED)
+        end.assert_called_once_with(mac_gate.checkout_task(folder))
         unregister.assert_called_once_with('localhost', str(removed))
         self.assertEqual(notices.getvalue().splitlines(), [
             scratch.retained_task_folder_notice(kept, 'fixture hold'),
         ])
         self.assertTrue(kept.is_dir())
-        self.assertTrue((folder / 'task-ended.json').is_file())
+        self.assertEqual(cloud_gate.read(folder / 'task-ended.json'), {str(kept): 'fixture hold'})
 
     def test_lifecycle_unregisters_only_after_remote_removal(self) -> None:
         folder = self.root / 'mac-gate-fixture'
@@ -559,6 +576,44 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             self.assertEqual(errors.getvalue().splitlines(), [notice])
             self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
             unregister.assert_called_once_with('fixture-mac', checkout)
+
+    def test_missing_close_script_checks_the_mac_checkout_path(self) -> None:
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        argv = self.root / 'argv.json'
+        receipt = argv.with_suffix('.json.checkout')
+        checkout = self.root / "Mac's gate checkout"
+        shim = self.root / '.claude/scripts/lib/py'
+        shim.parent.mkdir(parents=True)
+        shim.symlink_to(sys.executable)
+        run = subprocess.run
+
+        def ssh(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[0], 'ssh')
+            self.assertTrue(capture_output and text and not check)
+            return run(['/bin/sh', '-c', command[-1]], capture_output=True, text=True,
+                       timeout=TEST_HANG_GUARD_SECS)
+
+        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac', 'HOME': str(self.root)}),
+              mock.patch.object(subprocess, 'run', side_effect=ssh),
+              mock.patch.object(copies, 'unregister_remote') as unregister):
+            checkout.mkdir()
+            for case in ('no receipt', 'folder', 'dangling symlink', 'gone'):
+                with self.subTest(case=case):
+                    folder.mkdir(parents=True)
+                    if case == 'folder':
+                        _ = receipt.write_text(str(checkout))
+                    elif case == 'dangling symlink':
+                        checkout.rmdir()
+                        checkout.symlink_to(self.root / 'missing')
+                    elif case == 'gone':
+                        checkout.unlink()
+                    self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
+                    self.assertFalse(folder.exists())
+                    if case == 'gone':
+                        unregister.assert_called_once_with('fixture-mac', str(checkout))
+                    else:
+                        unregister.assert_not_called()
+            self.assertFalse(checkout.is_symlink())
 
     def install_held_module(self) -> None:
         shim = self.repo / 'scripts/lib/py'
