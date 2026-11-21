@@ -1419,7 +1419,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("owner held: move pending", result.stderr)
         stop.assert_not_called()
         send.assert_not_called()
-        self.assertIn(moves.batch_move_command("held", "claude3"), result.stderr)
+        self.assertIn(moves.batch_move_command("held", moves.FollowGroupAccount("units")), result.stderr)
         self.assertFalse(moves.latest_request_path("held").exists())
 
     def test_group_move_uses_the_staff_id_when_a_row_becomes_busy_after_observation(self) -> None:
@@ -1453,7 +1453,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(result.outcomes, (moves.MoveWaitingForRow(row.id, "another operation holds this row"),))
         self.assertIn(f"{row.name}: move pending", result.stderr)
         send.assert_not_called()
-        self.assertIn(moves.batch_move_command("new-conversation", "claude3"), result.stderr)
+        self.assertIn(moves.batch_move_command("new-conversation", moves.FollowGroupAccount("units")), result.stderr)
         self.assertFalse(moves.latest_request_path(row.current_session).exists())
 
     def test_changed_registered_process_identity_confirms_completion_fresh(self) -> None:

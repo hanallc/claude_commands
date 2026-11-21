@@ -231,7 +231,9 @@ Success removes the move's own file under the locks.
 Failure leaves the file for retry.
 Each explicit group request checks all members, including members that appear to be on the target.
 If the live account matches the target, the request clears the earlier file under the native lock.
-A busy lock refuses a new request and prints a fresh `batch --target` command for its account.
+A busy lock refuses a new request and prints a fresh `batch --target` command for an explicit target.
+For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
+The batch creates the default `move.log` directory and its parents before it opens the log.
 `retry` can run only a saved request.
 `result` and `retry` check live accounts under the session locks.
 They remove requests for members already on their target, including after `shutdown resume --to`.

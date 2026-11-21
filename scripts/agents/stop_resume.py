@@ -2303,7 +2303,7 @@ def _owns_detached_request(identity: str, request_id: str) -> bool:
 
 def _move_lock_command(batch: MoveBatch, identity: str, target: str) -> str:
     if isinstance(batch.origin, NewMoveRequest):
-        destination = batch.intent if not target and isinstance(batch.intent, moves.FollowGroupAccount) else target
+        destination = batch.intent if isinstance(batch.intent, moves.FollowGroupAccount) else target
         return moves.batch_move_command(identity, destination)
     return moves.RETRY_COMMAND
 
@@ -3020,7 +3020,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--request-id", default="", help=argparse.SUPPRESS)
     _ = batch.add_argument("--group", choices=accounts.CLAUDE_GROUPS, help=argparse.SUPPRESS)
     _ = batch.add_argument("--staff-member", action="append", default=[], help=argparse.SUPPRESS)
-    _ = batch.add_argument("--log", type=Path, default=shutdown_state_root() / "move.log")
+    _ = batch.add_argument("--log", type=Path)
     _ = batch.add_argument("--preload-restarted", action="store_true", help=argparse.SUPPRESS)
     _ = batch.add_argument("sessions", nargs="+")
     retry = commands.add_parser("retry")
@@ -3039,8 +3039,8 @@ def main(argv: list[str] | None = None) -> int:
         return _pending_move_command(cast(str, args.command), cast(str, args.id))
     # Even a directly invoked batch must not hand itself off a second time.
     _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-    log = cast(Path, args.log)
     if cast(str, args.command) == "stay":
+        log = cast(Path, args.log)
         with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
             cause = _check_stay(cast(str, args.session), cast(str, args.pane), cast(str, args.account),
                                 cast(int, args.pid), cast(str, args.generation), cast(str, args.requester), cast(str, args.why))
@@ -3057,6 +3057,10 @@ def main(argv: list[str] | None = None) -> int:
     request = (DetachedMoveRequest(request_id, frozenset(cast(list[str], args.staff_member)))
                if request_id else _NEW_MOVE_REQUEST)
     try:
+        log = cast(Path | None, args.log)
+        if log is None:
+            log = shutdown_state_root() / "move.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
             try:
                 _load_batch_modules()

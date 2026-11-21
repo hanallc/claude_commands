@@ -6083,6 +6083,60 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("another operation holds this row", line)
         self.assertIn(f"batch --target claude3 -- {identity}", line)
         self.assertNotIn(moves.RETRY_COMMAND, line)
+
+    def test_busy_group_command_moves_to_the_current_group_account(self) -> None:
+        identity = self.entry["session_id"]
+        key = moves.native_row_key(identity)
+        log = self.root / "group-move.log"
+        selected = role_map.RoleMap(role_map.StoredGroupSelections(showrunners="claude3"), "codex1")
+
+        def read_role() -> role_map.RoleMap:
+            self.assertIsInstance(staff.row_activity(key), staff.RowBusy)
+            return selected
+
+        def resume_member(session: str, target: str, *_args: object) -> stop_resume.ClaudeUp:
+            return stop_resume.ClaudeUp(session, "own-pane", target)
+
+        with (patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_load_batch_modules"),
+              patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning) as stop,
+              patch.object(stop_resume, "_resume_move", side_effect=resume_member) as resume):
+            with staff.session_operation(identity, native_key=key):
+                waiting, = stop_resume.move_sessions([identity], "claude4", why="move",
+                    intent=moves.FollowGroupAccount("showrunners"))
+            assert isinstance(waiting, moves.MoveWaitingForRow)
+            stop.assert_not_called()
+            command = shlex.split(waiting.command)[2:]
+            with (patch.object(role_map, "is_role_map_host", return_value=True),
+                  patch.object(role_map, "_local_role_map", side_effect=read_role) as read):
+                self.assertEqual(stop_resume.main([command[0], "--log", str(log), *command[1:]]), 0)
+        self.assertEqual(resume.call_args.args[1], "claude3")
+        self.assertEqual(command[1:3], ["--group", "showrunners"])
+        self.assertNotIn("--target", command)
+        read.assert_called_once()
+
+    def test_busy_batch_command_creates_the_default_move_log_directory(self) -> None:
+        identity = self.entry["session_id"]
+        state = self.root / "missing" / "shutdown"
+        moved = stop_resume.ClaudeUp(identity, "own-pane", "claude4")
+        with (patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(state)}),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_load_batch_modules"),
+              patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning) as stop,
+              patch.object(stop_resume, "_resume_move", return_value=moved)):
+            with staff.session_operation(identity, native_key=moves.native_row_key(identity)):
+                waiting, = stop_resume.move_sessions([identity], "claude4", why="move")
+            assert isinstance(waiting, moves.MoveWaitingForRow)
+            stop.assert_not_called()
+            self.assertFalse(state.parent.exists())
+            command = shlex.split(waiting.command)[2:]
+            self.assertNotIn("--log", command)
+            self.assertEqual(stop_resume.main(command), 0)
+        stop.assert_called_once()
+        self.assertIn('"result": "ClaudeUp"', (state / "move.log").read_text())
+
     def test_same_target_move_reports_in_progress_without_stopping_its_member(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed"), "showrunner", "renamed", staff.StaffRoot(),
                              current_session=staff.StaffId("current"))

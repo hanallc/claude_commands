@@ -279,7 +279,8 @@ The file holds the request ID and the account or group.
 The move checks each selected member under the native lock.
 This check includes group members that appear to be on the target.
 A member on the target clears its pending file.
-A busy lock refuses a new request and prints a fresh `batch --target` command for its account.
+A busy lock refuses a new request and prints a fresh `batch --target` command for an explicit target.
+For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
 `retry` can run only a saved request.
 The detached child checks its request ID before it reports a member outcome.
 The mover checks the request ID under the locks before stopping the member.
