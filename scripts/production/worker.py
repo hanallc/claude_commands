@@ -747,16 +747,31 @@ class CheckAssignmentAvailability:
     status_file: str = ""
 
     @classmethod
-    def for_worker(cls, record: staff.StaffSnapshot, hold: worker_panes.WorkerLockHold, run: Path
+    def for_worker(cls, record: staff.StaffSnapshot, row: staff.StaffRow, run: Path
                    ) -> CheckAssignmentAvailability:
-        return cls(_assignment_runs(record, hold.parent, hold.name, additional=(run,)))
+        parent = record.parent_of(row)
+        runs = (_assignment_runs(record, parent.id, row, additional=(run,)) if parent is not None
+                else unit_runs.LauncherRunDirectories({}, {}))
+        return cls(runs)
 
-    def check(self, row: staff.StaffRow, record: staff.StaffSnapshot, hold: worker_panes.WorkerLockHold, *,
+    def check(self, row: staff.StaffRow, hold: worker_panes.WorkerLockHold, *,
               retry: RetryingAssignment | AssignmentCheckStage,
               ) -> worker_panes.CloseAllowed | worker_panes.DispatchHoldsWorker:
-        detached = _worker_detached_work(record, self.runs, (row.id,))
-        with progress_history.dispatch_reads(record, self.runs.by_worker[row.id]):
-            return _assignment_hold(row, record, detached, hold, status_file=self.status_file, retry=retry)
+        current_record = staff.snapshot()
+        current = current_record.by_id(row.id)
+        paths = self.runs.by_worker.get(row.id)
+        if (current is None or not hold.owns(current) or current.current_session != row.current_session or not paths):
+            return worker_panes.DispatchHoldsWorker("the worker changed before dispatch")
+        if isinstance(retry, RetryingAssignment):
+            passed = worker_panes.worker_pass(current, retry.run, record=current_record)
+            delivery = progress_history.dispatch_delivery(passed)
+            if (passed.get("instance_id") != retry.instance or passed.get("status") not in ("active", "refused")
+                    or delivery.completion_id != retry.delivery.completion_id or delivery.line != retry.delivery.line
+                    or delivery.reply_file != retry.delivery.reply_file):
+                return worker_panes.DispatchHoldsWorker("the pass or delivery changed before dispatch")
+        detached = _worker_detached_work(current_record, self.runs, (current.id,))
+        with progress_history.dispatch_reads(current_record, paths):
+            return _assignment_hold(current, current_record, detached, hold, status_file=self.status_file, retry=retry)
 
 
 class AvailabilityAtUse(Enum):
@@ -781,6 +796,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
     prompt = prompt.resolve()
     with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
+        expected = (worker_admission.find_worker(staff.snapshot(), parent, name.value)
+                    if isinstance(lock, worker_panes.WorkerLockAtUse) else None)
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
@@ -796,6 +813,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         completion_notices = _completion_notices()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
+        if ((row is None and hold.bound) or (row is not None and not hold.owns(row))
+                or (expected is not None and (row is None or row.id != expected.id
+                                             or row.current_session != expected.current_session))):
+            print(f"{name.value}: the worker changed before dispatch", file=sys.stderr)
+            return ExitCode.BUSY
         recovered = CompletionRecovery.NO_PENDING_NOTICE
         if row is not None and (owner := record.parent_of(row)) is not None:
             recorded = progress_history.recorded_dispatch_run(row.id)
@@ -829,7 +851,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                                   lock: worker_panes.WorkerLockHold) -> bool:
             if isinstance(matched, progress_history.MatchedDispatch):
                 return False
-            state = check.check(target, record, lock, retry=AssignmentCheckStage.DELIVERY)
+            state = check.check(target, lock, retry=AssignmentCheckStage.DELIVERY)
             if isinstance(state, worker_panes.DispatchHoldsWorker):
                 print(f"workers unavailable: {target.name}: {state.blocker}", file=sys.stderr)
                 return True
@@ -837,14 +859,16 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
 
         if row is not None and not isinstance(matched, progress_history.MatchedDispatch):
             if isinstance(availability, AvailabilityAtUse):
-                availability = CheckAssignmentAvailability.for_worker(record, hold, session_dir)
+                availability = CheckAssignmentAvailability.for_worker(record, row, session_dir)
             if refuse_new_assignment(row, availability, hold):
                 return ExitCode.BUSY
-        if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
-                and row is not None):
+        if isinstance(matched, progress_history.MatchedDispatch) and row is not None:
             passed = worker_panes.worker_pass(row, session_dir)
             delivery = progress_history.dispatch_delivery(passed)
             same_pass = passed.get("instance_id") == matched.instance_id
+            if not same_pass:
+                print(f"{row.name}: the selected pass belongs to another worker", file=sys.stderr)
+                return ExitCode.BUSY
             retired = recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None
             if _compaction_retry_pending(session_dir, selection):
                 return _pending_compaction_result(session_dir, selection)
@@ -868,7 +892,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
             arm_launch_cleanup(cleanup, before, current_start)
         else:
-            if not started.row.reports_to(parent) or started.row.name != name.value or not hold.owns(started.row):
+            if not started.row.reports_to(parent) or not hold.owns(started.row):
                 print("dispatch startup does not belong to this worker", file=sys.stderr)
                 return ExitCode.REFUSED
             current_start = started
@@ -885,9 +909,14 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 return ExitCode.BUSY
         if row is None or row.id != started.row.id or isinstance(availability, AvailabilityAtUse):
             record = staff.snapshot()
-            availability = CheckAssignmentAvailability.for_worker(record, hold, session_dir)
+            availability = CheckAssignmentAvailability.for_worker(record, started.row, session_dir)
             if refuse_new_assignment(started.row, availability, hold):
                 return ExitCode.BUSY
+        current = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        if (current is None or current.id != started.row.id or not hold.owns(current)
+                or current.current_session != started.row.current_session):
+            print(f"{started.row.name}: the worker changed before pass creation", file=sys.stderr)
+            return ExitCode.BUSY
 
         def submitted() -> None:
             _ = cleanup.pop_all()
@@ -895,7 +924,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
 
         try:
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
-                worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
+                worker_name=current.name, worker_id=current.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
                 new_pass_instance_id=new_pass_instance_id, selection=selection)
         except progress_history.DispatchPromptRefused as refused:
@@ -909,7 +938,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not saved.line:
             dispatch_id = dispatch_id or instance
             line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. " + _done_instruction(dispatch_id)
-            handoff = worker_admission.dispatch_record(session_dir, name.value)
+            handoff = worker_admission.dispatch_record(session_dir, current.name)
             if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
                 extract = worker_admission.handoff_path(session_dir, started.row)
                 if extract.is_file():
@@ -926,12 +955,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             deferred = True
             print(f"{started.row.name}: {COMPACTION_STARTED_TEXT}")
 
-        before_input = partial(availability.check, record=record, hold=hold,
-                               retry=RetryingAssignment(session_dir.resolve(), instance))
+        before_input = partial(availability.check, hold=hold,
+                               retry=RetryingAssignment(session_dir.resolve(), instance, saved))
         try:
             result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
-                                   run=session_dir, instance_id=instance, on_submission=submitted, defer_compaction=defer_compaction,
-                                   before_input=before_input)
+                                   run=session_dir, instance_id=instance, on_submission=submitted,
+                                   defer_compaction=defer_compaction, before_input=before_input)
         except CompactionStartupUncertain as error:
             # The helper can still deliver the prompt after this launcher returns.
             submitted()
@@ -1126,15 +1155,14 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
         finally:
             os.close(started_fd)
     with ExitStack() as notices, ExitStack() as completion_lock:
-        if isinstance(lock, CompactionLockAtUse):
-            _ = completion_lock.enter_context(file_lock.exclusive(_compaction_lock(run, completion_id)))
-        else:
+        if isinstance(lock, file_lock.ExclusiveLock):
             _ = completion_lock.callback(lock.close)
             os.set_inheritable(lock.descriptor, False)
-        return _finish_dispatch(parent, identity, run, instance, completion_id, notices)
+        return _finish_dispatch(parent, identity, run, instance, completion_id, lock, completion_lock, notices)
 
 
 def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str, completion_id: str,
+                     lock: file_lock.ExclusiveLock | CompactionLockAtUse, completion_lock: ExitStack,
                      notices: ExitStack) -> int:
     path = run / f"compact-{instance}_dispatch_error.txt"
     diagnostics = io.StringIO()
@@ -1145,35 +1173,76 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
         nonlocal submission_unproved
         submission_unproved = True
 
-    try:
-        with suppress(OSError, ValueError):
-            _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
-        with redirect_stderr(diagnostics):
-            record = staff.snapshot()
-            row = record.by_id(identity)
-            if row is None:
-                raise ValueError(f"{identity}: worker staff row is unavailable")
-            name = WorkerName.parse(row.name)
-            with worker_panes.worker_lock(parent, name, blocking=True) as hold:
-                if isinstance(hold, worker_panes.Kept):
-                    raise ValueError(hold.blocker)
-                passed = worker_panes.worker_pass(row, run)
-                if passed.get("instance_id") != instance or passed.get("status") != "active":
-                    return ExitCode.OK
-                delivery = progress_history.dispatch_delivery(passed)
-                if delivery.completion_id != completion_id:
-                    return ExitCode.OK
-                if delivery.reply_file:
-                    reply = Path(delivery.reply_file)
-                    path = reply.with_name(reply.stem + "_dispatch_error" + reply.suffix)
-                record = staff.snapshot()
-                current = worker_panes.observe_worker(parent, row, record)
-                if not isinstance(current, worker_panes.OpenWorker):
-                    raise herdr_types.HerdrFailure(f"{row.name}: worker state is unavailable; no prompt sent")
+    def current_pass() -> dict[str, object]:
+        no_pass: dict[str, object] = {}
+        return next((item for item in _pass_records(worker_panes.run_state(run))
+                     if item.get("instance_id") == instance and item.get("worker_id") == identity
+                     and item.get("status") == "active"
+                     and progress_history.dispatch_delivery(item).completion_id == completion_id), no_pass)
 
-                availability = CheckAssignmentAvailability.for_worker(record, hold, run)
-                before_input = partial(availability.check, record=record, hold=hold,
-                                       retry=RetryingAssignment(run.resolve(), instance))
+    def busy(passed: dict[str, object], detail: str) -> ExitCode:
+        if not passed or progress_history.dispatch_submission_confirmed(run, instance, completion_id):
+            return ExitCode.OK
+        print(detail, file=sys.stderr)
+        _ = notices.callback(_dispatch_failure_step, identity, "notice",
+            partial(_dispatch_notice, parent, identity, run, instance, passed, "busy", detail))
+        return ExitCode.BUSY
+
+    confirmation_error: Exception | SystemExit | None = None
+    try:
+        if progress_history.dispatch_submission_confirmed(run, instance, completion_id):
+            return ExitCode.OK
+    except (Exception, SystemExit) as error:
+        confirmation_error = error
+
+    if isinstance(lock, CompactionLockAtUse):
+        try:
+            acquired = completion_lock.enter_context(
+                file_lock.exclusive(_compaction_lock(run, completion_id), wait=False))
+        except (Exception, SystemExit) as error:
+            print(f"{identity}: cannot acquire the compaction lock: {error}", file=sys.stderr)
+            return ExitCode.UNCERTAIN
+        if acquired is not file_lock.LockResult.ACQUIRED:
+            print(f"{identity}: the compaction lock is busy", file=sys.stderr)
+            return ExitCode.BUSY
+
+    try:
+        if confirmation_error is not None:
+            raise confirmation_error
+        if isinstance(lock, CompactionLockAtUse):
+            if progress_history.dispatch_submission_confirmed(run, instance, completion_id):
+                return ExitCode.OK
+        expected = staff.snapshot().by_id(identity)
+        if expected is None or expected.kind != "worker" or not expected.reports_to(parent):
+            return busy(current_pass(), f"{identity}: the worker is unavailable for this unit")
+        name = WorkerName.parse(expected.name)
+        with worker_panes.worker_lock(parent, name, blocking=True) as hold:
+            if progress_history.dispatch_submission_confirmed(run, instance, completion_id):
+                return ExitCode.OK
+            passed = current_pass()
+            if not passed:
+                return ExitCode.OK
+            if isinstance(hold, worker_panes.Kept):
+                return busy(passed, hold.blocker)
+            record = staff.snapshot()
+            row = worker_admission.find_worker(record, parent, name.value)
+            if (row is None or row.id != identity or not hold.owns(row)
+                    or row.current_session != expected.current_session):
+                return busy(passed, f"{expected.name}: the worker changed before dispatch")
+            if worker_panes.worker_pass(row, run, record=record).get("instance_id") != instance:
+                return busy(passed, f"{row.name}: the dispatch pass is unavailable for this worker")
+            delivery = progress_history.dispatch_delivery(passed)
+            if delivery.reply_file:
+                reply = Path(delivery.reply_file)
+                path = reply.with_name(reply.stem + "_dispatch_error" + reply.suffix)
+            current = worker_panes.observe_worker(parent, row, record)
+            if not isinstance(current, worker_panes.OpenWorker):
+                return busy(passed, f"{row.name}: worker state is unavailable; no prompt sent")
+
+            with redirect_stderr(diagnostics):
+                availability = CheckAssignmentAvailability.for_worker(record, row, run)
+                before_input = partial(availability.check, hold=hold,
+                                       retry=RetryingAssignment(run.resolve(), instance, delivery))
                 result = dispatch_turn(parent, current, _client(), delivery.line, completion_id, run=run,
                                        instance_id=instance, before_input=before_input,
                                        on_submission=prompt_input_possible)
@@ -1183,10 +1252,7 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
                     return result
         detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
         if result is ExitCode.BUSY:
-            print(detail, file=sys.stderr)
-            _ = notices.callback(_dispatch_failure_step, identity, "notice",
-                partial(_dispatch_notice, parent, identity, run, instance, passed, "busy", detail))
-            return result
+            return busy(passed, detail)
         submission_unproved = submission_unproved or result is ExitCode.UNCERTAIN
     except recorder_state.OldRecorderState as error:
         print(str(error), file=sys.stderr)
@@ -1214,31 +1280,31 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
                           import_module("scripts.herdr.turn_end").run_finished)
             _ = notify(row.id)
 
-    row = staff.snapshot().by_id(identity)
-    with worker_panes.worker_id_lock(identity, blocking=True):
-        if row is not None:
-            passed = worker_panes.worker_pass(row, run)
-        else:
-            no_pass: dict[str, object] = {}
-            passed = next((item for item in _pass_records(worker_panes.run_state(run))
-                           if item.get("instance_id") == instance and item.get("worker_id") == identity), no_pass)
-        if passed.get("instance_id") != instance or passed.get("status") != "active":
-            return result
-        if progress_history.dispatch_submission_confirmed(run, instance, completion_id):
-            return ExitCode.OK
-        if progress_history.dispatch_delivery(passed).completion_id != completion_id:
-            return ExitCode.OK
-        print(detail, file=sys.stderr)
-        if not submission_unproved:
+    try:
+        with worker_panes.worker_id_lock(identity, blocking=True):
+            if progress_history.dispatch_submission_confirmed(run, instance, completion_id):
+                return ExitCode.OK
+            passed = current_pass()
+            if not passed:
+                return ExitCode.OK
+            row = staff.snapshot().by_id(identity)
+            if (row is None or row.kind != "worker" or not row.reports_to(parent)
+                    or worker_panes.worker_pass(row, run).get("instance_id") != instance):
+                return busy(passed, f"{identity}: the worker is unavailable for this unit")
+            print(detail, file=sys.stderr)
+            if submission_unproved:
+                _ = notices.callback(_dispatch_failure_step, identity, "notice",
+                                     partial(_dispatch_notice, parent, identity, run, instance, passed,
+                                             "uncertain", detail))
+                return result
             _ = _dispatch_failure_step(identity, "pass end", end_pass)
             completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
                 run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
             reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
-    if submission_unproved:
-        _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
-            parent, identity, run, instance, passed, "uncertain", detail))
-    else:
-        _ = _dispatch_failure_step(identity, "notice", notice)
+            _ = notices.callback(_dispatch_failure_step, identity, "notice", notice)
+    except (Exception, SystemExit) as error:
+        print(f"{identity}: cannot recover dispatch {instance}: {error}", file=sys.stderr)
+        return ExitCode.UNCERTAIN
     return result
 
 
@@ -1270,10 +1336,11 @@ def _worker_dispatch_state(row: staff.StaffRow, record: staff.StaffSnapshot, det
         return worker_panes.DispatchHoldsWorker(detail)
 
 
-def _assignment_runs(record: staff.StaffSnapshot, parent: StaffId, target: WorkerRole | WorkerName, *,
+def _assignment_runs(record: staff.StaffSnapshot, parent: StaffId, target: WorkerRole | WorkerName | staff.StaffRow, *,
                      additional: tuple[Path, ...] = ()) -> unit_runs.LauncherRunDirectories:
     rows = tuple(row for row in record.rows if row.kind != "worker" or (row.reports_to(parent)
-                 and (row.name == target.value if isinstance(target, WorkerName) else _role_number(row.name, target))))
+                 and (row.id == target.id if isinstance(target, staff.StaffRow)
+                      else row.name == target.value if isinstance(target, WorkerName) else _role_number(row.name, target))))
     runs = worker_panes.worker_run_directories(replace(record, rows=rows))
     return unit_runs.LauncherRunDirectories({identity: tuple(dict.fromkeys((*paths, *additional)))
         for identity, paths in runs.by_worker.items()}, runs.by_session)
@@ -1288,6 +1355,7 @@ class AssignmentCheckStage(Enum):
 class RetryingAssignment:
     run: Path
     instance: str
+    delivery: progress_history.DispatchDelivery
 
 
 def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached: session_state.RunningDetachedWork,
@@ -1295,17 +1363,44 @@ def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached:
                      *, status_file: str = "",
                      retry: RetryingAssignment | AssignmentCheckStage = AssignmentCheckStage.DELIVERY,
                      ) -> worker_panes.DispatchHoldsWorker | worker_panes.CloseAllowed:
-    """Check for work other than the exact pass being retried."""
+    """Check for work that blocks a new assignment or the exact retry."""
     @cache
     def read(directory: Path) -> dict[str, object]:
         state = worker_panes.run_state(directory)
         if isinstance(retry, RetryingAssignment) and directory.resolve() == retry.run:
-            remaining = {str(passed.get("team_slot", "")): passed for passed in _pass_records(state)
-                         if passed.get("instance_id") != retry.instance}
+            remaining = {str(index): passed for index, passed in enumerate(_pass_records(state))
+                         if passed.get("instance_id") != retry.instance or passed.get("worker_id") != row.id}
             return {**state, "pass": remaining}
         return state
 
-    state = _worker_dispatch_state(row, record, detached, lock, read=read)
+    def reply_checks(directory: Path) -> dict[str, object]:
+        state = read(directory)
+        passes = _pass_records(state)
+        stopped = [passed for passed in passes if passed.get("worker_id") == row.id
+                   and passed.get("status") == "canceled"
+                   and isinstance(hook := progress_history.hook_completion(passed), progress_history.HookCompletion)
+                   and hook.outcome == "stopped"]
+        if not stopped:
+            return state
+        receipts = {receipt.instance_id: receipt for receipt in progress_history.stopped_pass_receipts(directory, row.id)}
+        reusable: set[str] = set()
+        for passed in stopped:
+            instance = passed.get("instance_id")
+            receipt = receipts.get(instance) if isinstance(instance, str) else None
+            delivery = progress_history.dispatch_delivery(passed)
+            if receipt is None or receipt.completion_id != delivery.completion_id or receipt.line != delivery.line:
+                continue
+            result = dispatch_receipt(row, receipt.line, receipt.completion_id, run=directory, pane_pass=receipt,
+                                      require_transcript=True)
+            if isinstance(result, DispatchEvidenceUnknown):
+                raise ValueError(f"completion evidence is unavailable: {result.reason}")
+            reusable.add(receipt.instance_id)
+        if not reusable:
+            return state
+        return {**state, "pass": {str(index): passed for index, passed in enumerate(passes)
+                                if passed.get("worker_id") != row.id or passed.get("instance_id") not in reusable}}
+
+    state = _worker_dispatch_state(row, record, detached, lock, read=reply_checks)
     if isinstance(state, worker_panes.DispatchHoldsWorker):
         return state
     statuses = {status_file} if status_file and not isinstance(retry, RetryingAssignment) else set[str]()
@@ -1429,6 +1524,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 print(f"{chosen.reason.value}: {chosen.detail}", file=sys.stderr)
                 return ExitCode.BUSY
             return startup_result(WorkerName.parse(role), chosen)
+        selected_row = worker_admission.find_worker(record, parent, chosen.value)
         hold = operations.enter_context(worker_panes.worker_lock(parent, chosen))
         if isinstance(hold, worker_panes.Kept):
             pending = progress_history.select_dispatch(session_dir, slot=chosen.value, phase=phase, role=role,
@@ -1440,11 +1536,14 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             return ExitCode.BUSY
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, chosen.value)
+        if ((row is None and hold.bound) or (row is not None and not hold.owns(row))
+                or (selected_row is not None and (row is None or row.id != selected_row.id
+                                                 or row.current_session != selected_row.current_session))):
+            print(f"{chosen.value}: the worker changed before assignment", file=sys.stderr)
+            return ExitCode.BUSY
         selection: progress_history.DispatchSelection | DispatchSelectionAtUse = DispatchSelectionAtUse.READ
         availability: CheckAssignmentAvailability | AvailabilityAtUse = AvailabilityAtUse.DIRECT_DISPATCH
         if row is not None:
-            if not hold.owns(row):
-                hold.bind(row)
             selected = progress_history.select_dispatch(session_dir, slot=chosen.value, phase=phase, role=role,
                 prompt=prompt.resolve(), launcher_command=launcher_command,
                 work=progress_history.DispatchWork(kind, lens, fix_pass), target=chosen)
@@ -1453,7 +1552,10 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             selection = selected
             paths = runs.by_worker.get(row.id)
             if paths is None:
-                paths = _assignment_runs(record, parent, chosen, additional=(session_dir,)).by_worker[row.id]
+                paths = _assignment_runs(record, parent, row, additional=(session_dir,)).by_worker.get(row.id)
+            if not paths:
+                print(f"{row.name}: the worker's assignment folders are unavailable", file=sys.stderr)
+                return ExitCode.BUSY
             refreshed = list(paths)
             owner = record.parent_of(row)
             if owner is not None and isinstance(owner.run, staff.OpenRun):
@@ -1538,12 +1640,19 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
 def end(parent: StaffId, name: WorkerName, *,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
         retire: bool = True) -> ExitCode:
+    expected = worker_admission.find_worker(staff.snapshot(), parent, name.value)
     with ExitStack() as operations:
         hold = operations.enter_context(worker_panes.worker_lock(parent, name, blocking=True)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.KEPT
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        if (not hold.active or hold.parent != parent or hold.name != name
+                or (row is None and (hold.bound or expected is not None))
+                or (row is not None and (expected is None or not hold.owns(row)
+                    or row.id != expected.id or row.current_session != expected.current_session))):
+            print(f"{name.value}: the worker changed before end", file=sys.stderr)
+            return ExitCode.KEPT
         if row is None:
             return ExitCode.OK
         result = worker_panes.close(parent, name, lock=hold)
@@ -1712,7 +1821,8 @@ def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     return None
 
 
-@herdr.pane_evidence_run()
+@herdr.process_action()
+@herdr.restore_pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
             started_panes: dict[StaffId, str] | Literal["discard"] = "discard",
@@ -1725,10 +1835,11 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     outcome = ExitCode.OK
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
-    observed = _read_workers(holder, record, only=only, scanned=runs)
+    observed = _read_workers(holder, record, scanned=runs)
+    states = observed.states if only == "all" else [state for state in observed.states if state.row.id in only]
     workers_held = quota_state.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
-    selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
+    selected_workers = tuple(dict.fromkeys(state.row.name for state in states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
             worker_panes.StoppedWorker, worker_panes.ClosedWorker)))) if only != "all" else ()
     for run in held_runs:
@@ -1743,17 +1854,33 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 outcome = ExitCode.UNCERTAIN
     runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
     with progress_history.dispatch_reads(record, observed.runs):
-        for state in observed.states:
-            if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+        for previous in states:
+            if isinstance(previous, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
-                with worker_panes.worker_lock(parent, WorkerName.parse(state.row.name)) as hold, ExitStack() as cleanup:
+                name = WorkerName.parse(previous.row.name)
+                with worker_panes.worker_lock(parent, name) as hold, ExitStack() as cleanup:
                     if isinstance(hold, worker_panes.Kept):
                         outcome = ExitCode.REFUSED
                         continue
-                    run = worker_panes.worker_run(state.row, record=record, scanned=runs)
-                    recovery = completion_notices.recover_completion(state.row, holder, run, hold, record=record)
+                    current_record = staff.snapshot()
+                    current = worker_admission.find_worker(current_record, parent, name.value)
+                    current_holder = current_record.by_id(parent)
+                    if (current is None or current.id != previous.row.id or not hold.owns(current)
+                            or current.current_session != previous.row.current_session or current_holder is None):
+                        outcome = ExitCode.UNCERTAIN
+                        continue
+                    herdr.refresh_restore_pane_evidence()
+                    selection = worker_panes.SelectedWorkerRows(frozenset({current.id}))
+                    refreshed = worker_panes.observe_parents([current_holder], current_record, selection=selection)
+                    state = next(iter(refreshed[parent]), None)
+                    if state is None or isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+                        outcome = ExitCode.UNCERTAIN
+                        continue
+                    run = worker_panes.worker_run(state.row, record=current_record, scanned=runs)
+                    recovery = completion_notices.recover_completion(state.row, current_holder, run, hold,
+                                                                     record=current_record)
                     if recovery is CompletionRecovery.RECOVERED:
                         changed = True
                         continue
@@ -1791,7 +1918,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         role = worker_panes.dispatch_role(state.row)
                         before = rows_before_launch()
                         result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role,
-                            account=launch_account, lock=hold, runs=runs, codex=codex)
+                            account=launch_account, lock=hold, runs=runs, codex=codex, selection=selection)
                         arm_launch_cleanup(cleanup, before, result)
                         code = startup_result(WorkerName.parse(state.row.name), result)
                         if code != ExitCode.OK:
@@ -1813,7 +1940,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         _ = cleanup.pop_all()
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                     staff.StaffRefused, staff.StaffUnreadable) as error:
-                print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+                print(f"anomaly: {previous.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:
         print(f"{holder.name}: workers {'restored' if changed else 'unchanged'}")

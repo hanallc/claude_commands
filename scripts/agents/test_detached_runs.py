@@ -239,7 +239,7 @@ class DetachedRunsTests(unittest.TestCase):
         runs.mkdir()
         error = PermissionError(13, "Permission denied", str(runs))
         for name, reader in (
-                ("live_twin", lambda: detached_runs.live_twin(runs, WORKER, ["fixture"], "key-1")),
+                ("live_twin", lambda: detached_runs.live_twin(runs, self.worker_id, ["fixture"], "key-1")),
                 ("worker_runs", lambda: detached_runs.worker_runs(runs, WORKER))):
             with self.subTest(reader=name), patch("os.scandir", side_effect=error):
                 with self.assertRaises(PermissionError) as raised:
@@ -423,6 +423,10 @@ class DetachedRunsTests(unittest.TestCase):
 
         with self.subTest(target="worker shares the director's name"):
             member = self.record_worker(self.unit.name, fixture_runtime_id("shared-detached-target"))
+            _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=1\n")
+            command = ["shared-name-check"]
+            director_run = self.live_run(command)
+            self.update_record(director_run, worker=self.unit.name, staff_id=self.unit.id)
 
             def spawn_while_locked(*_arguments: object, **_options: object) -> SimpleNamespace:
                 with self.assertRaises(BlockingIOError), worker_panes.worker_id_lock(member.id):
@@ -433,11 +437,48 @@ class DetachedRunsTests(unittest.TestCase):
                   self.supervisor_spawns() as spawn, contextlib.redirect_stdout(io.StringIO())):
                 spawn.side_effect = spawn_while_locked
                 self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.session), "--to", member.name,
-                                                    "--", "shared-name-check"]), 0)
+                                                    "--", *command]), 0)
             spawn.assert_called_once()
             new_path = Path(cast(list[str], spawn.call_args.args[0])[-1])
             self.assertTrue(new_path.stem.endswith(f"@{member.id}"))
             self.assertEqual(worker_lifecycle.read_json_object(new_path)["staff_id"], member.id)
+
+        original, = self.seat_runs(1)
+        command = ["rename-check"]
+        self.update_record(original, command=command)
+        renamed = staff.rename(self.worker_id, "renamed-worker")
+        with patch.object(detached_runs, "caller_from_environment", return_value=detached_runs.NotDetachedWorker()):
+            with self.subTest(target="renamed owner"):
+                spawned, output = self.start(command, to=renamed.name)
+                spawned.assert_not_called()
+                self.assertIn(f"run {original.stem} is already running", output)
+                with self.supervisor_spawns() as spawn, contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.session), "--to",
+                                                        renamed.name, "--", "other command"]), 4)
+                spawn.assert_not_called()
+                self.assertIn(original.stem, errors.getvalue())
+
+            with self.subTest(target="another owner receives the old name"):
+                replacement = self.record_worker(WORKER, fixture_runtime_id("reused-detached-target"))
+                spawned, _ = self.start(command, to=replacement.name)
+                spawned.assert_called_once()
+                new_path = Path(cast(list[str], spawned.call_args.args[0])[-1])
+                self.assertEqual(worker_lifecycle.read_json_object(new_path)["staff_id"], replacement.id)
+
+            legacy_command = ["legacy-owner-check"]
+            self.update_record(original, staff_id="", command=legacy_command)
+            legacy_before = original.read_bytes()
+            for limit in (1, 3):
+                with self.subTest(target="legacy record has no owner ID", limit=limit):
+                    _ = write_config_fixture(self.root / "config/detached_runs.conf", f"LIVE_RUN_LIMIT={limit}\n")
+                    with (self.supervisor_spawns() as spawn, contextlib.redirect_stderr(io.StringIO()) as errors,
+                          contextlib.redirect_stdout(io.StringIO()) as output):
+                        self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.session), "--to",
+                                                            WORKER, "--", *legacy_command]), 2)
+                    spawn.assert_not_called()
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn(f"{original}: a matching run has no owner staff ID", errors.getvalue())
+                    self.assertEqual(original.read_bytes(), legacy_before)
 
     def test_run_uses_the_start_folder_instead_of_the_staff_worktree(self) -> None:
         start_folder = self.root / "repair-checkout"
@@ -935,8 +976,8 @@ with socket.socket(socket.AF_UNIX) as connection:
 sys.exit(1)
 """
         guard = LauncherHangGuard("supervisor publication after start exits")
-        address = str(self.root / "ready.sock")
-        with socket.socket(socket.AF_UNIX) as listener:
+        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            address = str(Path(directory) / "ready.sock")
             listener.bind(address)
             listener.listen()
             listener.settimeout(guard.remaining())
@@ -1752,7 +1793,7 @@ exit 143
             with (patch.object(Path, "exists", exists_without_proc),
                   patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5))):
                 self.assertEqual(detached_runs.reap_orphans(str(self.session)), [ready.stem])
-                self.assertIsNotNone(detached_runs.live_twin(running.parent, WORKER, ["pending supervisor"], "key-1"))
+                self.assertIsNotNone(detached_runs.live_twin(running.parent, self.worker_id, ["pending supervisor"], "key-1"))
                 popen, _ = self.start(["new command"])
                 popen.assert_called_once()
             self.assertEqual((running.read_bytes(), finished.read_bytes()), saved)
@@ -3379,7 +3420,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with (patch.object(detached_run_process, "supervises", return_value=False),
               patch.object(detached_run_process, "supervisor_records", return_value={}),
               patch.object(detached_runs, "_group_is_live", side_effect=[True, False, False])):
-            self.assertEqual(detached_runs.live_twin(path.parent, row.name, ["true"], "private-tree"), pending)
+            self.assertEqual(detached_runs.live_twin(path.parent, row.id, ["true"], "private-tree"), pending)
             self.assertEqual(detached_runs.live_runs(path.parent, row.name), [pending])
             self.assertEqual(detached_runs.live_runs_in_folders({self.run_dir: identities}), [pending])
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
@@ -4045,9 +4086,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.holder_sender.close()
         self.fixture.world.remove_pane("w1:p0")
         tree_key = "private-tree"
-        name, command = record["worker"], record["command"]
+        command = record["command"]
+        name = record["worker"]
         destination = f"staff:{self.fixture.parent.id}"
-        self.assertIsNotNone(detached_runs.live_twin(path.parent, name, command, tree_key))
+        self.assertIsNotNone(detached_runs.live_twin(path.parent, staff.StaffId(record["staff_id"]), command, tree_key))
         with (patch.object(send, "STATE", self.fixture.root / "messages"),
               patch.object(roster, "roster", return_value=roster.Roster([], [])),
               patch.object(roster, "peer_roster", return_value=roster.Roster([], [])),

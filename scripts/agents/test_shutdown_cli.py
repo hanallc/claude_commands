@@ -803,7 +803,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
             self.assertTrue(tree.exists())
         self.assertFalse(self.worktree.exists())
@@ -812,7 +812,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
         code, output = self.retire()
         self.assertEqual(code, 0, output)

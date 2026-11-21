@@ -859,17 +859,29 @@ def _run_record_paths(runs: Path) -> list[Path]:
         return []
 
 
-def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
+def live_twin(runs: Path, identity: staff.StaffId, command: list[str], tree_key: str) -> RunRecord | None:
     """A pending run for the same worker, command, folder and tree key.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
+    if not identity or not tree_key:
+        return None
+    for path in _run_record_paths(runs):
+        raw = worker_lifecycle.read_json_object(path)
+        if (raw.get("staff_id") == identity and raw.get("command") == command and raw.get("tree_key") == tree_key
+                and _run_is_pending(path, raw, lambda pid: detached_run_process.supervises(pid, path))):
+            return cast(RunRecord, cast(object, raw))
+    return None
+
+
+def _ambiguous_legacy_twin(runs: Path, name: str, command: list[str], tree_key: str) -> Path | None:
     if not tree_key:
         return None
     for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
-        if (raw.get("worker") == worker and raw.get("command") == command and raw.get("tree_key") == tree_key
+        if (not raw.get("staff_id") and raw.get("worker") == name and raw.get("command") == command
+                and raw.get("tree_key") == tree_key
                 and _run_is_pending(path, raw, lambda pid: detached_run_process.supervises(pid, path))):
-            return cast(RunRecord, cast(object, raw))
+            return path
     return None
 
 
@@ -1162,25 +1174,39 @@ def command_start(args: argparse.Namespace) -> int:
                 from scripts.herdr import worker_panes
 
                 locks.enter_context(worker_panes.worker_id_lock(target.staff_id, blocking=True))
-                unchanged = (caller_from_environment(environment) == caller if isinstance(caller, PaneCaller)
-                             else _run_seat(session_dir, requested_name) == target)
+                if isinstance(caller, PaneCaller):
+                    current = caller_from_environment(environment)
+                    unchanged = (isinstance(current, PaneCaller) and current.staff_id == identity
+                                 and Path(current.session_dir).resolve() == Path(session_dir))
+                else:
+                    membership = staff.local_snapshot()
+                    try:
+                        owner = worker_admission.parent(membership, run=Path(session_dir))
+                    except worker_admission.RunOwnerUnavailable as error:
+                        print(f"detached_runs: {error}; started nothing", file=sys.stderr)
+                        return 2
+                    member = membership.by_id(identity)
+                    unchanged = member is not None and member.kind == "worker" and member.reports_to(owner.id)
                 if not unchanged:
                     print(f"detached_runs: {name}: worker changed before admission; started nothing", file=sys.stderr)
                     return 2
             admission = locks.enter_context((runs / ".start.lock").open("a"))
             fcntl.flock(admission, fcntl.LOCK_EX)
             reaped = _reap_orphans_locked(runs)
-            if twin := live_twin(runs, name, command, tree_key):
+            if twin := live_twin(runs, identity, command, tree_key):
                 started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
                 print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
                       + f"log {twin['log']}); started nothing; its result arrives as your next message")
                 return 0
+            if legacy := _ambiguous_legacy_twin(runs, name, command, tree_key):
+                print(f"detached_runs: {legacy}: a matching run has no owner staff ID; started nothing", file=sys.stderr)
+                return 2
             try:
                 limit = conf.read("detached_runs").whole("LIVE_RUN_LIMIT")
             except conf.Unusable as error:
                 print(f"detached_runs: {error}", file=sys.stderr)
                 return 2
-            active = live_runs(runs, name)
+            active = live_runs(runs, name, identity=identity)
             if len(active) >= limit:
                 details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
                 print(f"detached_runs: live-run limit {limit} reached for {name}; started nothing.\n"

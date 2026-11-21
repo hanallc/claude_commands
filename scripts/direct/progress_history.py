@@ -2396,24 +2396,47 @@ def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: st
         return isinstance(slot, str) and completion_id in _string_list(passes[slot].get("confirmed_delivery_ids"))
 
 
-def handoff_busy_dispatch_notice(run: Path, worker_id: staff.StaffId, instance_id: str,
-                                 completion_id: str, attempt_id: uuid.UUID) -> bool:
-    """Save the notice handoff while the exact delivery is active and unconfirmed."""
+def _pending_dispatch_notice_pass(state: dict[str, object], worker_id: staff.StaffId,
+                                  instance_id: str, completion_id: str) -> dict[str, object]:
+    matches = [passed for passed in _open_passes(state).values() if passed.get("worker_id") == worker_id]
+    if len(matches) != 1:
+        return {}
+    passed, = matches
+    if (passed.get("instance_id") != instance_id or passed.get("status") != "active"
+            or not completion_id or dispatch_delivery(passed).completion_id != completion_id
+            or completion_id in _string_list(passed.get("confirmed_delivery_ids"))):
+        return {}
+    return passed
+
+
+def dispatch_uncertainty_pending(run: Path, worker_id: staff.StaffId, instance_id: str, completion_id: str) -> bool:
+    """Check the exact pending delivery under the recorder lock before sending a notice."""
     with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if not _state_path(run).is_file():
             return False
         state = _read_state(run, resolve_staff=False)
-        matches = [passed for passed in _open_passes(state).values() if passed.get("worker_id") == worker_id]
-        if len(matches) != 1:
+        return bool(_pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id))
+
+
+def handoff_busy_dispatch_notice(run: Path, worker_id: staff.StaffId, instance_id: str,
+                                 completion_id: str, attempt_id: uuid.UUID, *, owner_id: staff.StaffId) -> bool:
+    """Accept a notice for the recorded owner and exact unconfirmed delivery."""
+    record = staff.snapshot()
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not _state_path(run).is_file():
             return False
-        passed, = matches
+        state = _read_state(run, resolve_staff=False)
+        passed = _pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id)
         stamp = f"busy:{attempt_id}"
-        if (passed.get("instance_id") != instance_id or passed.get("status") != "active"
-                or not completion_id or dispatch_delivery(passed).completion_id != completion_id
-                or completion_id in _string_list(passed.get("confirmed_delivery_ids"))
-                or passed.get("hook_notice") == stamp):
+        if not passed or passed.get("hook_notice") == stamp:
             return False
+        owner = unit_runs.run_owner(state, record)
+        if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+            raise ValueError(f"{run}: {owner.reason}")
+        if owner.id != owner_id:
+            raise ValueError(f"{run}: recorded owner {owner.id} differs from notice recipient {owner_id}")
         passed["hook_notice"] = stamp
         _write_state(run, state)
         return True
