@@ -14,7 +14,7 @@ class DefaultDocRoutingTests(VerifyDocFixture):
         workspace = self.repo
         original = workspace.rename(self.root / ".claude")
         self.repo = original
-        _ = self.git("remote", "add", "origin", "git@fixture.invalid:claude_commands")
+        _ = self.git("remote", "set-url", "origin", "git@fixture.invalid:claude_commands")
         _ = self.git("worktree", "add", "-qb", "doc-fixture", str(workspace))
         self.repo = workspace
         self.enable_held_mac_doc()

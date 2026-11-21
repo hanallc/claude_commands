@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.copies import copies
+from scripts.copies.workspace_test_support import registered_workspace
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -143,9 +144,9 @@ class EndSessionTests(unittest.TestCase):
                 with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
                     other_cache = (other / "target").resolve().parent
                 self.assertNotEqual(tree, other)
-            with copies.workspace(owner, source, "HEAD", name="worker", branch="worker") as workspace:
+            with registered_workspace(owner, source, "HEAD", name="worker", branch="worker") as workspace:
                 self.assertTrue(workspace.is_dir())
-            with copies.workspace("other-unit", source, "HEAD", name="other-worker", branch="other-worker") as other_workspace:
+            with registered_workspace("other-unit", source, "HEAD", name="other-worker", branch="other-worker") as other_workspace:
                 self.assertTrue(other_workspace.is_dir())
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -191,11 +192,11 @@ class EndSessionTests(unittest.TestCase):
         with patch.dict(os.environ, environment):
             source = self.seed()
             owner = str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit"))
-            with copies.workspace("another-unit", source, "HEAD", name="other", branch="other") as other:
+            with registered_workspace("another-unit", source, "HEAD", name="other", branch="other") as other:
                 pass
             owned: list[Path] = []
             for name in ("first", "second"):
-                with copies.workspace(owner, source, "HEAD", name=name, branch=name) as tree:
+                with registered_workspace(owner, source, "HEAD", name=name, branch=name) as tree:
                     owned.append(tree)
             broken = other / copy_record.RECORD
             _ = broken.write_text("{invalid")

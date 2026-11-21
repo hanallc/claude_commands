@@ -42,7 +42,8 @@ class GateFoldersDeleteTests(unittest.TestCase):
         top = self.root / "build"
         top.mkdir()
         _ = (config / "build_folders.conf").write_text(
-            f"removal.forms={top}/<repo>/<unit>/<short>\nroots.workspace={self.root / 'workspaces'}\n")
+            f"removal.path_templates={top}/<repo>/<unit>/<short>\nroots.workspace={self.root / 'workspaces'}\n"
+            + f"roots.build={top}\n")
 
     def git(self, folder: Path, *arguments: str) -> str:
         result = subprocess.run(

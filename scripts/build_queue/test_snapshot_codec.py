@@ -151,7 +151,7 @@ class SnapshotCodecTests(unittest.TestCase):
                 reservation = fixture_reservation(42, GIB)
                 reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
                     "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": reserved})
-                facts = records.EndedStepFacts("merge-gate", "hana", "hana", "/fixture/hana", member.id,
+                facts = records.EndedStepFacts("gate", "hana", "hana", "/fixture/hana", member.id,
                                                caller_name=stored)
                 held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
                 current = replace(inputs, reservations=(reservation,), slots=(held,))
@@ -343,6 +343,8 @@ class SnapshotCodecTests(unittest.TestCase):
             records.BehindHead: records.BehindHead("organon", 900.0, "session"),
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
             placement.CargoFolderWait: placement.CargoFolderWait(),
+            records.BuildSpaceLow: records.BuildSpaceLow(125, 150),
+            records.BuildSpaceUnreadable: records.BuildSpaceUnreadable("fixture disk offline"),
             records.ReadyForAdmission: records.ReadyForAdmission(),
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
@@ -363,9 +365,12 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_reason = cast(object, getattr(parse_reply(line), "reason"))
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
+                        legacy_wait = (records.GpuSlotWait | records.NatedevHeld | placement.CargoFolderWait
+                                       | records.BuildSpaceHold)
                         self.assertEqual(type(older_cause).__name__,
-                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld, placement.CargoFolderWait))
-                                         else type(cause).__name__)
+                                         "BehindHead" if isinstance(cause, legacy_wait) else type(cause).__name__)
+                        if isinstance(cause, records.BuildSpaceHold):
+                            self.assertEqual(cast(str, getattr(older_cause, "head_name")), "the build space floor")
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
         held = records.NatedevHeld("fps", "Phase 3 timing")

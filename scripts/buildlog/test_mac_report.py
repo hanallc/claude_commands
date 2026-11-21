@@ -30,6 +30,7 @@ from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_
 from scripts.buildlog.test_memory_window import configured_local_host
 from scripts.lib.user_zone import user_zone
 from scripts.lib import test_hang_guard
+from scripts.mac_test.offload import MirrorBusyCheck, RecordedMirrorSession
 
 CLI = Path(__file__).with_name("cli.py")
 NOW = datetime(2026, 10, 12, 15, 9, tzinfo=UTC)
@@ -633,6 +634,30 @@ class MacReportTests(unittest.TestCase):
         summary = self.summary()
         self.assertEqual(len(summary.busy_holders), 2)
         self.assertEqual(sorted(summary.busy_holders.values()), [1, 1])
+
+    def test_recorded_mirror_sessions_read_and_print_the_stored_holder_text(self) -> None:
+        cases = (
+            ("last recorded mirror session reader", MirrorBusyCheck.UNREPORTED),
+            ("last recorded mirror session reader (mirror lease)", MirrorBusyCheck.LEASE),
+            ("last recorded mirror session reader (mirror process check)", MirrorBusyCheck.PROCESS),
+        )
+        for number, (text, _) in enumerate(cases):
+            self.write(self.mac_call(f"mirror-{number}", "declined", "busy", mac_holder=text))
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            holders = {call.call_id: call.holder for call in mac_report.read_test_calls(connection, START, END)}
+        output = self.report()
+        for number, (text, check) in enumerate(cases):
+            holder = holders[f"mirror-{number}"]
+            with self.subTest(text=text, stage="read"):
+                assert isinstance(holder, RecordedMirrorSession), holder
+                self.assertEqual(holder.session, "reader")
+                self.assertEqual(holder.mirror_check, check)
+            with self.subTest(text=text, stage="print"):
+                self.assertIn(f"- {text}: 1", output)
+
+    def test_holder_text_formats_a_recorded_mirror_session(self) -> None:
+        self.assertEqual(mac_report.holder_text(RecordedMirrorSession("reader")), "last recorded mirror session reader")
 
     def test_mac_block_intervals_replace_decline_bounds_and_natedev_holds_use_the_union(self) -> None:
         self.write(hold_event("began", "mac-block", "2026-10-12T07:00:00Z", "mac"),
