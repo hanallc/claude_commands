@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import IO, ClassVar, NamedTuple, cast, override
 
 from scripts.lib import process_group
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import fixture_git_environment
 
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
@@ -44,10 +44,20 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production import fake_unit_host, staff
+from scripts.production import fake_unit_host, production_doc, staff, unit_lookup
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.message import sessions
 from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
+
+
+def save_promotion_verdict(state_root: Path, doc: Path, tip: str,
+                           policy: checkpoint_gate.PromotionCiPolicy = "standard") -> Path:
+    owner = unit_lookup.doc_owner(doc, staff.snapshot())
+    verdict = state_root / owner.id / "session/waiting_state/ci_points.json"
+    verdict.parent.mkdir(parents=True, exist_ok=True)
+    _ = verdict.write_text(json.dumps({"count": 1, "tip": tip, "policy": policy}), encoding="utf-8")
+    return verdict
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -55,6 +65,16 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
     """Run the real CLI and current fake scripts, keeping Git as real processes."""
     real_run = subprocess.run
     python_launcher = (Path(__file__).resolve().parents[1] / "lib/py").resolve()
+    promote_request = merge_checkpoint.promote
+
+    def promote_after_ci(request: merge_checkpoint.MergeRequest | merge_checkpoint.ChildHandoffRequest,
+                         tip: str, *, local_only: bool = False) -> None:
+        if isinstance(request.promotion, production_doc.PromoteTo):
+            production = request.production
+            policy = ("cargo-liner" if production.name == CARGO_LINER_PRODUCTION
+                      and isinstance(production.merge_checkout, Path) else "standard")
+            _ = save_promotion_verdict(Path(environment["SHOWRUNNER_STATE_DIR"]), production.doc, tip, policy)
+        promote_request(request, tip, local_only=local_only)
 
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
@@ -87,7 +107,8 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
                         timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input,
                         pass_fds=pass_fds)
 
-    with mock.patch.object(subprocess, "run", run), mock.patch.object(
+    with mock.patch.object(merge_checkpoint, "promote", side_effect=promote_after_ci), \
+        mock.patch.object(subprocess, "run", run), mock.patch.object(
         change_review, "lists_directory", return_value=Path(environment["HOME"]) / "rust/hanadocs/change-review",
     ):
         return invoke_cli(merge_checkpoint, merge_checkpoint.main, arguments, environment, cwd,
@@ -307,6 +328,8 @@ class MergeCheckpointFixture(unittest.TestCase):
             shutil.rmtree(self.fixture_root)
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        environment = {**fixture_git_environment(self.fixture_root.parent), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         _ = self.enterContext(isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env))
 
     def bind_fixture(self, root: Path) -> None:
@@ -323,8 +346,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         home = self.root / "home"
         private = copies_environment(root, repository="origin")
         _ = shutil.copyfile(Path(private["CONF_DIR"]) / "build_folders.conf", root / "build_folders.conf")
-        self.env = {**os.environ, **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
-                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
+        self.env = {**fixture_git_environment(root.parent), **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+                    "GIT_CONFIG_SYSTEM": os.devnull,
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),

@@ -554,7 +554,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+        with mock.patch.dict(os.environ, self.environment, clear=True), mock.patch.object(
             merge_gate, "notify_style", side_effect=malformed_notification,
         ), redirect_stdout(output):
             code = merge_gate.main(arguments)

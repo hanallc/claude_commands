@@ -28,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import fake_unit_host
-from scripts.production import merge_checkpoint, production_lifecycle
+from scripts.production import merge_checkpoint, production_lifecycle, promotion as publication
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
 from scripts.agents import stop_resume
@@ -46,6 +46,7 @@ from scripts.usage import agents_log
 from scripts.worktree import worktrees
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
+from scripts.production.merge_checkpoint_test_support import save_promotion_verdict
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.production.add_showrunner_test_support import write_guard_proof
 from scripts.lib.atomic_file import prepared_replacement
@@ -917,8 +918,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.merge_tip()
         destination = self.promotion_checkout("installed")
         hook = destination / ".claude/config/post_push.sh"
-        self.write(hook, 'test "$(git rev-parse HEAD)" = "$LANDED_SHA" || exit 0\n'
-                   + 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
+        self.write(hook, 'test "$(git rev-parse HEAD)" = "$LANDED_SHA" || exit 9\n'
+                   + 'printf "%s\\n" "$LANDED_SHA" >> "$(git rev-parse --git-common-dir)/hook-runs"\n')
         self.production_doc("running", promote=f"`{destination}`")
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "declare promotion")
@@ -959,12 +960,15 @@ class LifecycleTests(LifecycleFixture):
             _ = self.git("fetch", "origin", "production", cwd=destination)
             _ = self.git("merge", "--ff-only", later, cwd=destination)
             promotion = production_doc.PromoteTo((destination,), production_doc.NoMac())
-            with mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(io.StringIO()) as output:
+            with (mock.patch.dict(os.environ, self.env, clear=True), production_paths(self.env),
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, earlier)
                 merge_checkpoint.promote_targets(promotion, "production", earlier, source=self.checkout,
+                                                 approval=publication.CollectedCi(self.doc),
                                                  label="fixture checkpoint", local_only=True)
-            self.assertIn(f"{destination} already at {later}", output.getvalue())
+            self.assertIn(f"{destination} main at {earlier}; local main remains at {later}", output.getvalue())
             self.assertIn("post-push hook: done", output.getvalue())
-            self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], later)
+            self.assertEqual((destination / ".git/hook-runs").read_text().splitlines()[-1], earlier)
             self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
 

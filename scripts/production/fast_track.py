@@ -725,7 +725,7 @@ def reconcile(runner: GitRunner, repo: Path, unit: str, *, finish: bool = False,
 
 
 def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: str) -> None:
-    from scripts.production import merge_checkpoint, production_doc
+    from scripts.production import merge_checkpoint, production_doc, promotion as publication
 
     try:
         promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
@@ -733,9 +733,11 @@ def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: s
             # Promotion uses this checkout only to supply a Git ref.
             with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit), step="promote") as source:
                 _ = runner.git(source, "update-ref", "refs/heads/main", commit)
-                merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
+                merge_checkpoint.promote_targets(promotion, "main", commit, source=source,
+                                                 approval=publication.FastTrackInstall(), label=f"fast-track {unit}")
         else:
-            merge_checkpoint.promote_targets(promotion, "main", commit, source=repo, label=f"fast-track {unit}")
+            merge_checkpoint.promote_targets(promotion, "main", commit, source=repo,
+                                             approval=publication.FastTrackInstall(), label=f"fast-track {unit}")
     except (checkpoint_gate.Stop, copies.CopyError, production_doc.Refusal) as error:
         raise PublishedFailure(str(error)) from error
 

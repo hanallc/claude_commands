@@ -34,7 +34,7 @@ from typing import NamedTuple, cast
 from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import change_review, checkpoint_gate, land_runs
+from scripts.production import change_review, checkpoint_gate, land_runs, promotion
 from scripts.worktree import worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -103,9 +103,13 @@ class PromotionOriginPushed(NamedTuple):
     tip: str
 
 
+class PromotionRetainedNewerCheckout(NamedTuple):
+    tip: str
+    local_tip: str
+
+
 class PromotionNotPushed(NamedTuple):
     tip: str
-    already_at_tip: bool
 
 
 class CodeCheckpoint(NamedTuple):
@@ -962,13 +966,33 @@ def prepare_checkpoint(production: ProductionDocument, merge_head: str, *, publi
     return tuple(output.splitlines())
 
 
+def direct_main_promotion(production: ProductionDocument) -> bool:
+    return production.merge_branch == "main" and isinstance(
+        production_doc.promotion_from_doc(production.doc.read_text(encoding="utf-8").splitlines()),
+        production_doc.PromoteTo)
+
+
+def publish_checkpoint_main(production: ProductionDocument, tip: str) -> None:
+    checkout = production.checkout
+    try:
+        landed = promotion.publish(promotion.CollectedCi(production.doc), checkout, "main", tip,
+                                   lambda approved: approved.land(checkout))
+    except land_main.LandError as error:
+        raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
+    checkpoint_gate.report("post-push", "warning" if isinstance(landed.hook, land_main.HookFailed) else "ok",
+                           land_main.hook_report(landed.hook))
+
+
 def push_git(production: ProductionDocument, may_undo: bool) -> str:
     checkout = production.checkout
     before_merge_tip = good(git(checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
     with push_rollback(production, before_merge_tip):
         tip = good(git(checkout, "rev-parse", "HEAD"), "push")
         require_live_files_clear(checkout, tip, "push")
-        _ = good(git(checkout, "push", "origin", production.merge_branch), "push")
+        if direct_main_promotion(production):
+            publish_checkpoint_main(production, tip)
+        else:
+            _ = good(git(checkout, "push", "origin", production.merge_branch), "push")
     checkpoint_gate.report("push", "ok", f"{production.merge_branch} pushed at {tip}")
     end_pushed_worktrees(production)
     return tip
@@ -1094,7 +1118,10 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
         base = good(git(production.checkout, "rev-parse", "HEAD"), "push")
         require_live_files_clear(production.checkout, base, "push")
         environment = main_push_lock.held_environment(production.checkout)
-        if isinstance(paths, EnrolledPaths):
+        if direct_main_promotion(production):
+            tip = validate_checkpoint_copy(production.checkout, base, command)
+            publish_checkpoint_main(production, tip)
+        elif isinstance(paths, EnrolledPaths):
             tip = validate_checkpoint_copy(production.checkout, base, command)
             push = ["bash", str(Path(script).resolve().with_name("push_direct.sh"))]
             environment.update(PUSH_TARGET_BRANCH=production.merge_branch, CI_VALIDATED_BASE=base,
@@ -1119,46 +1146,13 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
     return tip
 
 
-def run_installed_main_hook(checkout: Path, head: str) -> land_main.HookAbsent | land_main.HookDone | land_main.HookSkipped | land_main.HookFailed:
-    """Run the post-push hook for the newer commit already installed in main."""
-    checkout = checkout.resolve()
-    default = git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD")
-    if default.returncode == 0 and default.stdout.strip() != "refs/remotes/origin/main":
-        return land_main.HookSkipped()
-    hook = checkout / ".claude/config/post_push.sh"
-    if not hook.is_file():
-        return land_main.HookAbsent()
-    rerun = f"cd {shlex.quote(str(checkout))} && LANDED_SHA={head} LANDED_BRANCH=main bash {shlex.quote(str(hook))}"
-    common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if common.returncode:
-        return land_main.HookFailed(1, rerun)
-    record = Path(common.stdout.strip()) / "post-push-completed"
-    try:
-        if record.read_text(encoding="utf-8").strip() == head:
-            return land_main.HookSkipped()
-    except OSError:
-        pass
-    try:
-        installed = git(checkout, "rev-parse", "HEAD")
-        if installed.returncode or installed.stdout.strip() != head:
-            return land_main.HookFailed(1, rerun)
-        result = subprocess.run(["bash", str(hook)], cwd=checkout, check=False,
-                                env={**os.environ, "LANDED_SHA": head, "LANDED_BRANCH": "main"})
-        if result.returncode:
-            return land_main.HookFailed(result.returncode, rerun)
-        write_text_atomic(record, head + "\n")
-    except OSError:
-        return land_main.HookFailed(1, rerun)
-    return land_main.HookDone()
-
-
-def promote_local_checkout(checkout: Path, merge_branch: str, tip: str | VerifiedIntegrationTip,
+def promote_local_checkout(checkout: Path, merge_branch: str, approved: promotion.ApprovedPromotion,
                            *, integration: Path | None = None) -> (
-        PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed):
+        PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed |
+        PromotionRetainedNewerCheckout):
     """Fast-forward a main checkout and publish the requested commit."""
     source = integration if integration is not None else checkout
-    target = tip
-    tip = target.sha if isinstance(target, VerifiedIntegrationTip) else target
+    tip = approved.sha
     with main_push_lock.main_push_lock(source):
         _ = good(git(source, "fetch", "origin", f"+refs/heads/{merge_branch}:refs/remotes/origin/{merge_branch}"), "promote")
         current_branch = good(git(checkout, "branch", "--show-current"), "promote")
@@ -1167,10 +1161,9 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str | Verifie
                        "switch the promotion checkout to main and rerun this checkpoint")
         current = good(git(source, "rev-parse", "refs/heads/main"), "promote")
         _ = good(git(source, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "promote")
-        checkpoint_gate.require_cargo_liner_promotion_ci(checkout.resolve(), merge_branch, tip)
         require_live_files_clear(source, tip, "promote")
         at_tip = current == tip
-        unpushed = at_tip and bool(good(git(source, "rev-list", f"refs/remotes/origin/main..{tip}"), "promote"))
+        published = good(git(source, "rev-parse", "refs/remotes/origin/main"), "promote")
         if not at_tip:
             if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
                 raise checkpoint_gate.Stop("promote", "failed", conflict,
@@ -1182,46 +1175,57 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str | Verifie
                 if git(source, "merge-base", "--is-ancestor", current, tip).returncode:
                     raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",
                                "the showrunner will clear the listed checkout paths and rerun this checkpoint")
-                if isinstance(target, VerifiedIntegrationTip):
-                    target.require_current(merge_branch, source)
                 try:
-                    waiting_rows.move_to(checkout, tip, fast_forward=True, expected_head=current)
+                    approved.install(checkout, current)
                 except (OSError, UnicodeError) as error:
                     status = git(checkout, "status", "--short").stdout.strip()
                     raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
                                "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
         head = good(git(source, "rev-parse", "refs/heads/main"), "promote")
         foreign = good(git(source, "rev-list", head, "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"), "promote")
-        if isinstance(target, VerifiedIntegrationTip):
-            target.require_current(merge_branch, source)
         if foreign:
-            return PromotionNotPushed(head, head == current)
-        if head == tip:
-            try:
-                hook = land_main.land(checkout, tip).hook
-            except land_main.LandError as error:
-                raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
-        else:
-            if git(source, "merge-base", "--is-ancestor", tip, "refs/remotes/origin/main").returncode:
-                _ = good(git(source, "push", "origin", f"{tip}:refs/heads/main"), "promote")
-            hook = run_installed_main_hook(checkout, head)
+            return PromotionNotPushed(published)
+        try:
+            landed = approved.land(checkout)
+        except land_main.LandError as error:
+            raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
+        hook = landed.hook
         checkpoint_gate.report("post-push", "warning" if isinstance(hook, land_main.HookFailed) else "ok",
                                land_main.hook_report(hook))
         if head != tip:
-            return PromotionAlreadyAtTip(head)
+            return PromotionRetainedNewerCheckout(tip, head)
         if at_tip:
-            return PromotionOriginPushed(tip) if unpushed else PromotionAlreadyAtTip(tip)
+            return (PromotionOriginPushed(tip) if published != tip and isinstance(landed.push, land_main.Pushed)
+                    else PromotionAlreadyAtTip(tip))
         return PromotionAdvanced(tip)
 
 
-def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulled | main_publish.MacPullPending:
+class SyncPublishedMain(NamedTuple):
+    """Update the Mac to the advertised main tip."""
+
+
+SYNC_PUBLISHED_MAIN = SyncPublishedMain()
+
+
+def pull_mac_checkout(mac: PurePosixPath, source: Path, tip: str | SyncPublishedMain = SYNC_PUBLISHED_MAIN) -> (
+        main_publish.MacPulled | main_publish.MacPullPending):
     settings_read = conf.read('merge_checkpoint')
     try:
         tries = settings_read.whole("MAC_PULL_TRIES")
         retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
-    remote = main_publish.mac_pull_command(mac, source)
+    if isinstance(tip, SyncPublishedMain):
+        remote = main_publish.mac_pull_command(mac, source)
+    else:
+        url = f"natedev:{shlex.quote(str(source))}"
+        sha = shlex.quote(tip)
+        remote = (f"cd {main_publish.remote_path(mac)} "
+                  f"&& git fetch -q --no-write-fetch-head {url} main "
+                  f"&& if git merge-base --is-ancestor {sha} HEAD; then :; "
+                  "elif [ -f scripts/lib/waiting_rows.py ]; then "
+                  f"scripts/lib/py scripts/lib/waiting_rows.py fast-forward {sha}; "
+                  f"else git merge -q --ff-only {sha}; fi; printf 'rc=%s\\n' \"$?\"")
     attempt = 0
     while True:
         result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
@@ -1259,39 +1263,46 @@ def promote(request: MergeRequest | ChildHandoffRequest, tip: str, *, local_only
 
     paths = resolve_production_paths(request.production.doc)
     promote_targets(request.promotion, request.production.merge_branch, tip,
-                    source=request.production.checkout, label=promotion_label(request), local_only=local_only,
+                    source=request.production.checkout, approval=promotion.CollectedCi(request.production.doc),
+                    label=promotion_label(request), local_only=local_only,
                     enrolled_main=paths.main if isinstance(paths, EnrolledPaths) else None)
 
 
-def finish_promotion(request: MergeRequest | ChildHandoffRequest) -> None:
+def finish_promotion(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
     finish_promotion_targets(request.promotion, source=request.production.checkout,
-                             label=promotion_label(request))
+                             label=promotion_label(request), tip=tip)
 
 
-def promote_targets(promotion: production_doc.NoPromotion | production_doc.PromoteTo,
-                    branch: str, tip: str, *, source: Path, label: str, local_only: bool = False,
+def promote_targets(destinations: production_doc.NoPromotion | production_doc.PromoteTo,
+                    branch: str, tip: str, *, source: Path, approval: promotion.PromotionApproval,
+                    label: str, local_only: bool = False,
                     enrolled_main: Path | None = None) -> None:
     """Install a pushed tip at the production's local and Mac destinations."""
-    if isinstance(promotion, production_doc.NoPromotion):
+    if isinstance(destinations, production_doc.NoPromotion):
         checkpoint_gate.report("promote", "ok", "no promotion configured")
         return
-    for checkout in promotion.checkouts:
-        if enrolled_main is not None and checkout.resolve() == enrolled_main:
-            result = promote_local_checkout(checkout, branch, tip, integration=source)
-        else:
-            result = promote_local_checkout(checkout, branch, tip)
-        already_at = isinstance(result, (PromotionAlreadyAtTip, PromotionOriginPushed)) or (
-            isinstance(result, PromotionNotPushed) and result.already_at_tip)
-        detail = f"{checkout} {'already at' if already_at else 'main at'} {result.tip}"
-        if isinstance(result, PromotionNotPushed):
-            detail += "; main holds commits not on origin/" + branch + " and was not pushed"
-        checkpoint_gate.report("promote", "ok", detail)
+    def install(approved: promotion.ApprovedPromotion) -> None:
+        for checkout in destinations.checkouts:
+            if enrolled_main is not None and checkout.resolve() == enrolled_main:
+                result = promote_local_checkout(checkout, branch, approved, integration=source)
+            else:
+                result = promote_local_checkout(checkout, branch, approved)
+            already_at = isinstance(result, (PromotionAlreadyAtTip, PromotionOriginPushed))
+            detail = f"{checkout} {'already at' if already_at else 'main at'} {result.tip}"
+            if isinstance(result, PromotionNotPushed):
+                detail += f"; main holds commits not on origin/{branch} and was not pushed"
+            elif isinstance(result, PromotionRetainedNewerCheckout):
+                detail += f"; local main remains at {result.local_tip}"
+            checkpoint_gate.report("promote", "ok", detail)
+
+    promotion.publish(approval, source, branch, tip, install)
     if not local_only:
-        finish_promotion_targets(promotion, source=source, label=label)
+        mac_tip = SyncPublishedMain() if isinstance(approval, promotion.FastTrackInstall) else tip
+        finish_promotion_targets(destinations, source=source, label=label, tip=mac_tip)
 
 
 def finish_promotion_targets(promotion: production_doc.NoPromotion | production_doc.PromoteTo,
-                             *, source: Path, label: str) -> None:
+                             *, source: Path, label: str, tip: str | SyncPublishedMain) -> None:
     """Announce local installs and pull the Mac after the main push lock is released."""
     if isinstance(promotion, production_doc.NoPromotion):
         return
@@ -1301,7 +1312,7 @@ def finish_promotion_targets(promotion: production_doc.NoPromotion | production_
     if isinstance(promotion.mac, production_doc.MacCheckout):
         mac = promotion.mac.path
         source = promotion.checkouts[0] if promotion.checkouts else source
-        outcome = pull_mac_checkout(mac, source)
+        outcome = pull_mac_checkout(mac, source, tip)
         if isinstance(outcome, main_publish.MacPullPending):
             checkpoint_gate.report("promote", "ok", f"mac unreachable, pull pending: {mac}")
             return
@@ -1700,7 +1711,7 @@ def run(request: MergeRequest) -> int:
                         deliver_gate_result(request, merge_head, tip)
                     into(request.production.checkout, request.production.merge_branch,
                          "the merge branch collects every unit's checkpoints", "the unit’s next checkpoint")
-            finish_promotion(request)
+            finish_promotion(request, tip)
         finally:
             if tip:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
@@ -1908,7 +1919,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                 if tip:
                     into(shared.production.checkout, shared.production.merge_branch,
                          "the merge branch collects every unit's checkpoints", "the unit’s next checkpoint")
-            finish_promotion(shared)
+            finish_promotion(shared, tip)
         finally:
             if tip:
                 for item in items:
@@ -2230,10 +2241,10 @@ def promote_handoff(request: ChildHandoffRequest, merge_head: str, tip: str) -> 
         promote(request, tip, local_only=True)
 
 
-def finish_handoff_promotion(request: ChildHandoffRequest, merge_head: str) -> None:
+def finish_handoff_promotion(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
     done = production_checkpoint_step_record(request.production, merge_head, "handoff-promotion")
     if isinstance(request.promotion, production_doc.PromoteTo) and not done.exists():
-        finish_promotion(request)
+        finish_promotion(request, tip)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
 
@@ -2291,7 +2302,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
                 if tested_tip != tip:
                     tip = push_git(request.production, False)
                 promote_handoff(request, delivery.merge_head, tip)
-            finish_handoff_promotion(request, delivery.merge_head)
+            finish_handoff_promotion(request, delivery.merge_head, tip)
         finally:
             record_handoff_publication(request, delivery.merge_head, tip)
         record_publication_changes(request.production, report_unchanged=False)
@@ -2340,7 +2351,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
             if isinstance(request.promotion, production_doc.NoPromotion):
                 promote(request, tip)
             promote_handoff(request, merge_head, tip)
-        finish_handoff_promotion(request, merge_head)
+        finish_handoff_promotion(request, merge_head, tip)
     finally:
         if tip:
             record_handoff_publication(request, merge_head, tip)

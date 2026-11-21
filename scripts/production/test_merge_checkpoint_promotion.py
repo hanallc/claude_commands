@@ -30,14 +30,18 @@ from scripts.lib import land_main, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
-from scripts.production import merge_checkpoint
+from scripts.production import merge_checkpoint, production_doc, promotion, showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.agents import remote
 from scripts.production import change_review
 from scripts.production.production_doc import Production, ProductionDocument
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import (
+    DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment, save_promotion_verdict,
+)
 
 
 MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -60,11 +64,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     _ = self.git("commit", "-am", "advance production", cwd=self.checkout)
                     _ = self.git("push", "origin", "production", cwd=self.checkout)
                 tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+                _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, tip)
                 output = StringIO()
-                with mock.patch.dict(os.environ, self.env), redirect_stdout(output), mock.patch.object(
+                with mock.patch.dict(os.environ, self.env, clear=True), redirect_stdout(output), mock.patch.object(
                         land_main, "land", return_value=land_main.Landed(
                             tip, "main", land_main.Pushed(), land_main.HookFailed(9, "retry"))):
-                    result = merge_checkpoint.promote_local_checkout(self.promote, "production", tip)
+                    result = promotion.publish(promotion.CollectedCi(self.doc), self.checkout, "production", tip,
+                        lambda approved: merge_checkpoint.promote_local_checkout(self.promote, "production", approved))
                 self.assertIsInstance(result, merge_checkpoint.PromotionAdvanced if advances
                                       else merge_checkpoint.PromotionAlreadyAtTip)
                 self.assertIn("post-push: warning — post-push hook: failed (exit 9); rerun: retry", output.getvalue())
@@ -477,9 +483,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             check_lock("into")
             original_into(path, branch, reason, gates)
 
-        def pull(mac: Path, source: Path) -> None:
+        def pull(mac: Path, source: Path, tip: str) -> None:
             self.assertEqual(mac, self.root / "mac-installed")
             self.assertEqual(source, self.promote)
+            self.assertEqual(tip, self.git("rev-parse", "HEAD", cwd=self.promote))
             check_lock("mac")
 
         def zone(mac: PurePosixPath) -> None:
@@ -678,9 +685,10 @@ with lock.open("a") as held:
             started.append(time.monotonic())
             return original_push(production, may_undo)
 
-        def promote_with_contender(checkout: Path, branch: str, tip: str) -> (
+        def promote_with_contender(checkout: Path, branch: str, approved: promotion.ApprovedPromotion) -> (
                 merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
-                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed):
+                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed |
+                merge_checkpoint.PromotionRetainedNewerCheckout):
             with lock_path.open("a") as held:
                 with self.assertRaises(BlockingIOError, msg="promotion must hold the common push lock"):
                     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -691,7 +699,7 @@ with lock.open("a") as held:
             wait_until(lambda: attempted.exists() and attempted.read_text() != "", self.root,
                        processes=(process,))
             self.assertEqual(attempted.read_text(), "contended")
-            result = original_promote(checkout, branch, tip)
+            result = original_promote(checkout, branch, approved)
             spans.append(time.monotonic() - started[0])
             return result
 
@@ -754,6 +762,78 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
         self.assertIn(f"already pushed at {pushed}", retried.process.stdout)
         self.assertIn(f"promote: ok — {self.promote} already at {pushed}\n", retried.process.stdout)
+
+        for enrolled in (False, True):
+            with self.subTest(secondary=True, enrolled=enrolled):
+                self.check_secondary_promotion_verdict(enrolled=enrolled)
+
+    def check_secondary_promotion_verdict(self, *, enrolled: bool) -> None:
+        primary = self.checkout
+        secondary = self.root / f"secondary-{enrolled}"
+        _ = self.git("clone", "--branch", "main", str(self.origin), str(secondary), cwd=self.root)
+        source = primary
+        doc = self.doc
+        name = "example"
+        policy: checkpoint_gate.PromotionCiPolicy = "standard"
+        if enrolled:
+            _ = self.git("switch", "--detach", cwd=self.promote)
+            _ = self.git("switch", "main", cwd=primary)
+            source = self.root / "integration"
+            _ = self.git("worktree", "add", str(source), "production", cwd=primary)
+            doc = primary / "cargo-liner-production.md"
+            self.write(primary, doc.name, f"- **Merge checkout:** `{primary}`\n"
+                       + f"- **Showrunner checkout:** `{source}`\n"
+                       + "- **Merge branch:** `production`\n- **Log:** `production.log`\n")
+            name = "cargo-liner"
+            policy = "cargo-liner"
+            with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                owner = showrunners.owner_for("example")
+                owner = staff.rename(owner.id, name)
+                _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+
+        def next_tip(label: str) -> str:
+            self.write(source, "secondary.txt", label)
+            _ = self.git("add", "secondary.txt", cwd=source)
+            _ = self.git("commit", "-m", label, cwd=source)
+            _ = self.git("push", "origin", "production", cwd=source)
+            return self.git("rev-parse", "HEAD", cwd=source)
+
+        def refs() -> tuple[str, str, str]:
+            return (self.git("rev-parse", "main", cwd=primary),
+                    self.git("rev-parse", "main", cwd=secondary),
+                    self.git("rev-parse", "main", cwd=self.origin))
+
+        def publish(tip: str) -> None:
+            destinations = production_doc.PromoteTo((secondary,), production_doc.NoMac())
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                merge_checkpoint.promote_targets(destinations, "production", tip, source=source,
+                    approval=promotion.CollectedCi(doc), label="fixture secondary", local_only=True)
+
+        first = next_tip(f"{name} first candidate")
+        before = refs()
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), doc, first, policy).unlink()
+        with self.assertRaisesRegex(checkpoint_gate.Stop, f"collect {name} CI on"):
+            publish(first)
+        self.assertEqual(refs(), before)
+
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), doc, first, policy)
+        hook = self.origin / "hooks/pre-receive"
+        self.executable(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                        + '  if [ "$ref" = refs/heads/main ]; then echo "hold main" >&2; exit 1; fi\n'
+                        + "done\n")
+        with self.assertRaisesRegex(checkpoint_gate.Stop, "hold main"):
+            publish(first)
+        self.assertEqual(refs(), (before[0], first, before[2]))
+        hook.unlink()
+
+        latest = next_tip(f"{name} second candidate")
+        before = refs()
+        with self.assertRaisesRegex(checkpoint_gate.Stop, f"collect {name} CI on"):
+            publish(latest)
+        self.assertEqual(refs(), before)
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), doc, latest, policy)
+        publish(latest)
+        self.assertEqual(refs(), (before[0], latest, latest))
     def test_local_foreign_main_commit_never_reaches_origin(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
@@ -783,7 +863,7 @@ with lock.open("a") as held:
                       + "main holds commits not on origin/production and was not pushed\n",
                       rerun.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
-    def test_promote_at_tip_with_foreign_remote_history_says_already_at_without_push(self) -> None:
+    def test_promote_at_tip_with_foreign_remote_history_reports_published_main(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
         sha = self.checkpoint()
@@ -802,11 +882,14 @@ with lock.open("a") as held:
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
             ))
         output = StringIO()
-        with redirect_stdout(output):
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, tip)
+        with mock.patch.dict(os.environ, self.env, clear=True), redirect_stdout(output):
             promote(request, tip)
-        self.assertIn(f"promote: ok — {self.promote} already at {tip}; "
+        self.assertIn(f"promote: ok — {self.promote} main at {base}; "
                       + "main holds commits not on origin/production and was not pushed\n", output.getvalue())
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), base)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+
     def test_promote_reports_already_at_tip_when_both_mains_match(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
@@ -855,12 +938,13 @@ with lock.open("a") as held:
             missing_at.append("push")
             return original_push(production, may_undo)
 
-        def promote_without_refs(checkout: Path, branch: str, tip: str) -> (
+        def promote_without_refs(checkout: Path, branch: str, approved: promotion.ApprovedPromotion) -> (
                 merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
-                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed):
+                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed |
+                merge_checkpoint.PromotionRetainedNewerCheckout):
             remove_origin_refs(checkout)
             missing_at.append("promote")
-            return original_promote(checkout, branch, tip)
+            return original_promote(checkout, branch, approved)
 
         with (mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now),
               mock.patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=prepare_without_refs),

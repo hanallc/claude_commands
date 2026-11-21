@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
 
+import ast
 import unittest
 
 import json
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from collections.abc import Generator
@@ -57,6 +59,51 @@ def green_ci_after_merge(fixture: MergeGateFixture) -> Generator[None]:
 
     with mock.patch.object(merge_gate, "promote", side_effect=promote_with_verdict):
         yield
+
+
+class ProductionPublicationBoundaryTests(unittest.TestCase):
+    def test_production_main_publication_uses_the_promotion_operation(self) -> None:
+        for path in sorted(Path(__file__).parent.glob("*.py")):
+            if path.name.startswith("test_") or path.name.endswith("_test_support.py") or path.name == "promotion.py":
+                continue
+            with self.subTest(module=path.name):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                direct_calls: list[int] = []
+                land_modules = {"land_main"}
+                land_names: set[str] = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom):
+                        if node.module == "scripts.lib":
+                            land_modules.update(alias.asname or alias.name for alias in node.names
+                                                if alias.name == "land_main")
+                        if node.module == "scripts.lib.land_main":
+                            land_names.update(alias.asname or alias.name for alias in node.names if alias.name == "land")
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        function = node.func
+                        primitive = (isinstance(function, ast.Name) and function.id in land_names
+                                     or isinstance(function, ast.Attribute) and function.attr == "land"
+                                     and isinstance(function.value, ast.Name) and function.value.id in land_modules)
+                        if primitive and path.name != "fast_track.py":
+                            direct_calls.append(node.lineno)
+                        if isinstance(function, (ast.Name, ast.Attribute)):
+                            name = function.id if isinstance(function, ast.Name) else function.attr
+                            if name == "ApprovedPromotion" or name == "FastTrackInstall" and path.name != "fast_track.py":
+                                direct_calls.append(node.lineno)
+                        arguments = node.args
+                    elif isinstance(node, (ast.List, ast.Tuple)):
+                        arguments = node.elts
+                    else:
+                        continue
+                    for index, argument in enumerate(arguments):
+                        if not isinstance(argument, ast.Constant) or argument.value != "push":
+                            continue
+                        refspecs = [ast.unparse(item) for item in arguments[index + 1:]]
+                        if (refspecs and not refspecs[0].startswith(("'fetch'", "'ls-remote'", "'rev-parse'"))
+                                and any(item in ("'main'", "'refs/heads/main'") or item.endswith(":main'")
+                                        or item.endswith(":refs/heads/main'") for item in refspecs)):
+                            direct_calls.append(node.lineno)
+                self.assertEqual(direct_calls, [], "Use promotion.publish for production main publication")
 
 
 @final
@@ -204,6 +251,30 @@ sys.meta_path.insert(0, NoRepositoryModules())
                 if route != "legacy":
                     self.restore_fixture(self.suites)
                 self.check_promotion_retry(route)
+        with self.subTest(route="legacy main checkpoint"):
+            self.restore_fixture(self.suites)
+            self.check_direct_main_checkpoint_verdict()
+
+    def check_direct_main_checkpoint_verdict(self) -> None:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        options = ("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
+        held = self.run_gate(*options)
+        self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
+        verdict = re.search(r"collect quiet CI on ([0-9a-f]+)", held.stderr)
+        assert verdict is not None, held.stderr
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+        tip = verdict[1]
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            owner = showrunners.owner_for("quiet")
+        save_fixture_verdict(self, owner, tip)
+        result = self.run_gate(*options)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), tip)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)
 
     def check_promotion_retry(self, route: str) -> None:
         _ = super().publish_for_promotion()
