@@ -598,19 +598,41 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry name
-    local names=()
-    local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
-        has_input=1
+        set -- 1 "$@"
+    else
+        set -- 0 "$@"
+    fi
+    if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
+        if [[ "$2" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$2" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
+            export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
+        fi
+        # Read caller values before local variables can replace them.
+        if [[ ! -v verify_helper_names && ! -v verify_helper_name && ! -v verify_helper_environment ]] &&
+                compgen -V verify_helper_names -e 2>/dev/null; then
+            verify_helper_environment=()
+            for verify_helper_name in "${verify_helper_names[@]}"; do
+                [[ -v "$verify_helper_name" && "${!verify_helper_name@a}" != *[aA]* ]] || continue
+                verify_helper_environment+=("$verify_helper_name=${!verify_helper_name}")
+            done
+            verify_helper_environment+=("")
+        else
+            # Bash opens the stream before it declares the array.
+            {
+                local -a verify_helper_environment=()
+                mapfile -d '' -t verify_helper_environment
+            } < <(command env -0 && printf '\0')
+        fi
+    fi
+    local input="" has_input=$1 status output errors entry
+    local forwarded=()
+    shift
+    if [[ "$has_input" == 1 ]]; then
         input="$(cat; printf '\001')"
         input="${input%$'\001'}"
     fi
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
-        if [[ "$1" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$1" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
-            export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
-        fi
         if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
             # The empty list's NUL terminator does not represent an environment entry.
             while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do
@@ -618,11 +640,16 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
+        # An incomplete environment must not reach the request pipe.
+        if [[ ${#verify_helper_environment[@]} -gt 0 && -z "${verify_helper_environment[-1]}" ]] &&
+                lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            for name in "${names[@]}"; do
-                [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
-                printf '%s=%s\0' "$name" "${!name}"
+            for entry in "${verify_helper_environment[@]}"; do
+                # Match Bash's exported variables. Skip function entries and the external command's _.
+                case "${entry%%=*}" in
+                    ''|_|[0-9]*|*[!a-zA-Z0-9_]*) continue ;;
+                esac
+                printf '%s\0' "$entry"
             done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
