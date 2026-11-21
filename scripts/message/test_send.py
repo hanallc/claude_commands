@@ -48,7 +48,7 @@ from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, sto
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import review_hold, send, send_later
 from scripts.message import failed_lookup
-from scripts.message.send_result import SEND_CLOSED_EXIT
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import publish_relay_identity, relay_session_name
@@ -7414,7 +7414,8 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
             + "if 'roster.py' in sys.argv[-1]:\n"
             + "    print(os.environ['SSH_SNAPSHOT'])\n"
             + "    raise SystemExit(int(os.environ.get('SSH_ROSTER_STATUS', '0')))\n"
-            + "print(os.environ.get('SSH_SEND_RESULT', 'SENT: fixture recipient'))\n",
+            + "print(os.environ.get('SSH_SEND_RESULT', 'SENT: fixture recipient'))\n"
+            + "raise SystemExit(int(os.environ.get('SSH_SEND_STATUS', '0')))\n",
             encoding="utf-8",
         )
         ssh.chmod(0o755)
@@ -7508,6 +7509,67 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
                                return_value=(SEND_CLOSED_EXIT, "CLOSED: closed worker\n", "")):
             status, output, errors = self.run_main("codex:peer-thread", "--skip-closed", "--machine", "mac")
         self.assertEqual((status, output, errors), (SEND_CLOSED_EXIT, "CLOSED: on mac: closed worker\n", ""))
+
+    def test_skip_closed_reports_proven_absence_after_a_clean_peer_miss(self) -> None:
+        with mock.patch.object(failed_lookup, "report") as report:
+            status, output, errors = self.run_main("codex:gone", "--skip-closed")
+        self.assertEqual((status, output, errors),
+                         (SEND_ABSENT_EXIT, "ABSENT: no live Codex session has address codex:gone\n", ""))
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertEqual(self.forwarded(), [])
+        report.assert_not_called()
+
+    def test_skip_closed_cannot_prove_absence_with_an_incomplete_roster(self) -> None:
+        unknown = replace(self.row("", "codex:unknown"), thread=roster.NoCodexThread(),
+                          reach=roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+        clean = self.recipient_roster([], [])
+        unreadable = self.recipient_roster([], ["Codex daemon: socket unreadable"])
+        unidentified = self.recipient_roster([unknown], [])
+        for local, peer in ((unreadable, clean), (clean, unreadable),
+                            (unidentified, clean), (clean, unidentified)):
+            with self.subTest(local=local, peer=peer):
+                self.local = local
+                self.peer(peer.entries, problems=tuple(peer.problems))
+                with mock.patch.object(failed_lookup, "report") as report:
+                    status, output, errors = self.run_main("codex:gone", "--skip-closed")
+                self.assertEqual(status, 3, output + errors)
+                self.assertTrue(output.startswith("FAILED: "), output)
+                report.assert_called_once()
+        self.assertEqual(self.forwarded(), [])
+
+    def test_skip_closed_accepts_only_a_confirmed_peer_absence_result(self) -> None:
+        reply = "ABSENT: no live Codex session has address codex:gone\n"
+        for code, flags, expected in (
+            (SEND_ABSENT_EXIT, ("--skip-closed",), SEND_ABSENT_EXIT),
+            (SEND_ABSENT_EXIT, (), 3),
+            (3, ("--skip-closed",), 3),
+        ):
+            with (self.subTest(code=code, flags=flags),
+                  mock.patch.object(send, "run", return_value=(code, reply, ""))):
+                status, output, errors = self.run_main("codex:gone", "--machine", "mac", *flags)
+            self.assertEqual((status, errors), (expected, ""), output)
+            if expected == SEND_ABSENT_EXIT:
+                self.assertEqual(output, "ABSENT: on mac: no live Codex session has address codex:gone\n")
+            else:
+                self.assertTrue(output.startswith("FAILED: "), output)
+
+    def test_skip_closed_requires_local_absence_when_the_peer_loses_its_route(self) -> None:
+        address = "codex:peer-thread"
+        self.peer([self.row("peer", address)])
+        for problems, expected in ((["Codex daemon: socket unreadable"], 3), ([], SEND_ABSENT_EXIT)):
+            with (self.subTest(problems=problems), mock.patch.dict(os.environ, {
+                "SSH_SEND_RESULT": f"ABSENT: no live Codex session has address {address}",
+                "SSH_SEND_STATUS": str(SEND_ABSENT_EXIT),
+            })):
+                self.local = self.recipient_roster([], problems)
+                status, output, errors = self.run_main(address, "--skip-closed")
+            self.assertEqual((status, errors), (expected, ""), output)
+            if expected == SEND_ABSENT_EXIT:
+                self.assertEqual(output, f"ABSENT: on mac: no live Codex session has address {address}\n")
+            else:
+                self.assertEqual(output, f"FAILED: cannot prove local absence of {address} after the peer lost its route\n")
+        self.assertEqual(len(self.ssh_calls()), 4)
+        self.assertEqual(len(self.forwarded()), 2)
 
     def test_peer_worker_staff_identity_uses_the_native_thread(self) -> None:
         previous = self.row("peer worker", "worker:peer-run/impl")

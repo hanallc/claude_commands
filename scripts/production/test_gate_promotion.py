@@ -13,17 +13,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from collections.abc import Generator
 from types import SimpleNamespace
-from typing import cast, final, override
-from contextlib import contextmanager, redirect_stdout
+from typing import final, override
+from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, merge_gate, showrunners, staff
-from scripts.production.checkpoint_gate import PromotionCiPolicy
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
+from scripts.production import change_review, gate, staff
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
+from scripts.production.gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib import land_main, waiting_rows
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -32,32 +30,6 @@ from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
-
-
-def save_fixture_verdict(fixture: MergeGateFixture, owner: staff.StaffRow, tip: str,
-                         policy: PromotionCiPolicy = "standard") -> None:
-    folder = Path(fixture.environment["HOME"]) / ".local/state/showrunner" / owner.id / "session/waiting_state"
-    fixture.write(folder / "ci_points.json", json.dumps({"count": 1, "tip": tip, "policy": policy}))
-
-
-@contextmanager
-def green_ci_after_merge(fixture: MergeGateFixture) -> Generator[None]:
-    """Supply the CI verdict for tests of the steps after a merge."""
-    from scripts.production.unit_lookup import doc_owner
-
-    promote = merge_gate.promote
-
-    def promote_with_verdict(args: merge_gate.GateArguments) -> None:
-        record = staff.snapshot()
-        doc = change_review.production_doc(args.production, record=record)
-        tip = fixture.git(fixture.origin, "rev-parse", f"refs/heads/{args.merge_branch}")
-        save_fixture_verdict(fixture, doc_owner(doc, record), tip)
-        state_dir = Path(fixture.environment["HOME"]) / ".local/state/showrunner"
-        with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state_dir):
-            promote(args)
-
-    with mock.patch.object(merge_gate, "promote", side_effect=promote_with_verdict):
-        yield
 
 
 class ProductionPublicationBoundaryTests(unittest.TestCase):
@@ -92,7 +64,7 @@ class ProductionPublicationBoundaryTests(unittest.TestCase):
                         primitive = (isinstance(function, ast.Name) and function.id in land_names
                                      or isinstance(function, ast.Attribute) and function.attr == "land"
                                      and isinstance(function.value, ast.Name) and function.value.id in land_modules)
-                        if primitive and path.name != "fast_track.py":
+                        if primitive and path.name not in ("fast_track.py", "gate.py"):
                             direct_calls.append(node.lineno)
                         if isinstance(function, (ast.Name, ast.Attribute)):
                             name = function.id if isinstance(function, ast.Name) else function.attr
@@ -139,30 +111,6 @@ class MergeGatePromotionTests(MergeGateFixture):
             "GIT_CONFIG_SYSTEM": os.devnull,
             "SHOWRUNNER_STATE_DIR": str(Path(self.environment["HOME"]) / ".local/state/showrunner"),
         }
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
-        _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR",
-                                                Path(self.environment["SHOWRUNNER_STATE_DIR"])))
-
-    @override
-    def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
-        with green_ci_after_merge(self):
-            return super().run_gate(*extra, checkpoint=checkpoint, previous=previous, ignored_signals=ignored_signals,
-                                    callers_production=callers_production, own_process=own_process, preamble=preamble)
-
-    @override
-    def publish_for_promotion(self) -> merge_gate.GateArguments:
-        args = super().publish_for_promotion()
-        args.production = "quiet"
-        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            owner = showrunners.owner_for("quiet")
-        save_fixture_verdict(self, owner, self.checkpoint)
-        return args
 
     @override
     def review_list(self) -> tuple[Path, Path]:
@@ -234,7 +182,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
                 if edited:
                     self.write(self.main / "subject.txt", "remote local edit\n")
                 result = subprocess.run([sys.executable, "-I", "-c",
-                                         isolation + merge_gate.PROMOTION_TRACKED_CHECK, self.checkpoint],
+                                         isolation + gate.PROMOTION_TRACKED_CHECK, self.checkpoint],
                                         cwd=empty, env=environment, text=True,
                                         capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, int(edited), result.stdout + result.stderr)
@@ -246,106 +194,35 @@ sys.meta_path.insert(0, NoRepositoryModules())
                 self.assertEqual(index_path.read_bytes(), index)
 
     def test_mac_timeout_or_interruption_reports_that_main_was_already_promoted(self) -> None:
-        args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
-                                       production="quiet", ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
-        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            owner = showrunners.owner_for("quiet")
-        save_fixture_verdict(self, owner, self.base)
+        args = gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
+                                       ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
         for failure in (subprocess.TimeoutExpired("fake-ssh", 25), GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
-            with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
-                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, self.base]), mock.patch.object(
+            with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(gate, "wait_for_release_lock"), mock.patch.object(
+                    gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, self.base]), mock.patch.object(
                     land_main, "land", return_value=land_main.Landed(
                         self.base, "main", land_main.Pushed(), land_main.HookAbsent())) as landed, mock.patch.object(
                     waiting_rows, "move_to"), mock.patch.object(
-                    merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
-                    merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
-                    merge_gate, "live_state_refusal", return_value=""), mock.patch.object(
-                    merge_gate, "subprocess", SimpleNamespace(run=mock.Mock(side_effect=failure),
+                    gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
+                    gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
+                    gate, "live_state_refusal", return_value=""), mock.patch.object(
+                    gate, "subprocess", SimpleNamespace(run=mock.Mock(side_effect=failure),
                                                             DEVNULL=subprocess.DEVNULL,
                                                             SubprocessError=subprocess.SubprocessError)):
                 with self.assertRaisesRegex(GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
-                    merge_gate.promote(args)
+                    gate.promote(args)
             landed.assert_called_once_with(self.main, self.base)
 
     def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
-        routes = ("legacy", "enrolled", "enroll-after-failure", "legacy main checkpoint",
-                  "checkpoint branch mismatch", "promote-only branch mismatch")
-        for route in routes:
-            with self.subTest(route=route):
-                if route != "legacy":
-                    self.restore_fixture(self.suites)
-                if route in ("legacy main checkpoint", "checkpoint branch mismatch", "promote-only branch mismatch"):
-                    self.check_legacy_main_route(route)
-                else:
-                    self.check_promotion_retry(route)
-
-    def check_legacy_main_route(self, route: str) -> None:
-        _ = self.git(self.main, "switch", "--detach", "main")
-        _ = self.git(self.checkout, "switch", "main")
-        options = ("--merge-branch", "main", "--main-repo", str(self.checkout))
-        if route != "legacy main checkpoint":
-            if route == "promote-only branch mismatch":
-                result = self.run_promote_only(*options)
-            else:
-                result = super().run_gate("--promote", *options)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn(f"{self.quiet_production}: expected merge branch integration", result.stderr)
-            self.assertEqual(self.git(self.checkout, "rev-parse", "refs/heads/main"), self.base)
-            self.assertEqual(self.git(self.origin, "rev-parse", "refs/heads/main"), self.base)
-            self.assertEqual(self.calls(), [])
-            return
-        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
-        result = super().run_gate("--promote", *options)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        tip = self.git(self.checkout, "rev-parse", "HEAD")
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^2"), self.checkpoint)
-
-    def check_promotion_retry(self, route: str) -> None:
-        _ = super().publish_for_promotion()
-        _ = self.git(self.main, "switch", "--detach", "main")
-        main = self.checkout
-        _ = self.git(main, "switch", "main")
-        integration = self.root / "integration"
-        _ = self.git(main, "worktree", "add", str(integration), "integration")
-        doc = main / "docs/plans/cargo-liner-production-live.md"
-        legacy = f"- **Showrunner checkout:** `{main}`\n- **Merge branch:** `integration`\n- **Log:** `production.log`\n"
-        enrolled = legacy.replace(str(main), str(integration)) + f"- **Merge checkout:** `{main}`\n"
-        self.write(doc, enrolled if route == "enrolled" else legacy)
-        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            owner = recorded_showrunner("cargo-liner", doc)
-        save_fixture_verdict(self, owner, self.checkpoint, "cargo-liner" if route == "enrolled" else "standard")
-        options = ("--production", "cargo-liner", "--main-repo", str(main))
-
-        hook = self.origin / "hooks/pre-receive"
-        self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
-                   + '  if [ "$ref" = refs/heads/main ]; then echo "injected push failure" >&2; exit 1; fi\n'
-                   + "done\n")
-        hook.chmod(0o755)
-        stopped = self.run_promote_only(*options)
-        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
-        self.assertIn("injected push failure", stopped.stderr)
-        self.assertEqual(self.git(main, "rev-parse", "HEAD"), self.checkpoint)
+        args = self.publish_for_promotion()
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+                land_main, "land", side_effect=land_main.LandError("injected push failure")):
+            with self.assertRaisesRegex(GateRefused, "injected push failure"):
+                gate.promote(args)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-        hook.unlink()
-        if route == "enroll-after-failure":
-            self.write(doc, enrolled)
-
-        self.write(integration / "next.txt", "next candidate\n")
-        latest = self.commit(integration, "new integration candidate")
-        _ = self.git(integration, "push", "origin", "integration")
-        held = self.run_promote_only(*options)
-        self.assertNotEqual(held.returncode, 0, held.stdout + held.stderr)
-        self.assertIn("collect cargo-liner CI on", held.stderr)
-        self.assertIn(latest, held.stderr)
-        self.assertEqual(self.git(main, "rev-parse", "HEAD"), self.checkpoint)
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-
-        save_fixture_verdict(self, owner, latest, "standard" if route == "legacy" else "cargo-liner")
-        result = self.run_promote_only(*options)
+        result = self.run_promote_only()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git(main, "rev-parse", "HEAD"), latest)
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), latest)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
 
     def test_promotion_rejects_an_unrecorded_commit_with_the_same_tree(self) -> None:
@@ -353,7 +230,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
                 land_main, "land", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
-                merge_gate.promote(args)
+                gate.promote(args)
         _ = self.git(self.main, "commit", "--allow-empty", "-m", "unrelated local commit")
         local = self.git(self.main, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD^{tree}"),
@@ -380,7 +257,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
             self.write(self.unit / "second.txt", "another promotion\n")
             self.checkpoint = self.commit(self.unit, "another promotion")
             _ = self.publish_for_promotion()
-            command = [sys.executable, str(Path(merge_gate.__file__)), "--repo", str(self.checkout),
+            command = [sys.executable, str(Path(gate.__file__)), "--repo", str(self.checkout),
                        "--merge-branch", "integration", "--promote-only", "--main-repo", str(self.main),
                        "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
             _ = publish_after_contender(self, self.main, self.origin, command, self.environment, cwd=self.root)
@@ -416,7 +293,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         try:
             wait_for_file(ready)
             with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
-                merge_gate.promote(args)
+                gate.promote(args)
             self.assertIsNone(process.poll())
             self.assertEqual(list(holders.iterdir()), [])
             self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
@@ -438,8 +315,8 @@ sys.meta_path.insert(0, NoRepositoryModules())
             pause = mock.Mock(side_effect=release_during_wait)
             clock = SimpleNamespace(monotonic=mock.Mock(side_effect=[10.0, 10.0, 11.0]), sleep=pause)
             with mock.patch.dict(os.environ, self.environment), \
-                    mock.patch.object(merge_gate, "time", clock), redirect_stdout(io.StringIO()):
-                merge_gate.promote(args, release_lock_wait_s=0.5, release_lock_poll_s=0.01)
+                    mock.patch.object(gate, "time", clock), redirect_stdout(io.StringIO()):
+                gate.promote(args, release_lock_wait_s=0.5, release_lock_poll_s=0.01)
             pause.assert_called_once_with(0.01)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
@@ -449,10 +326,10 @@ sys.meta_path.insert(0, NoRepositoryModules())
         pause = mock.Mock()
         clock = SimpleNamespace(monotonic=mock.Mock(side_effect=[10.0, 10.0, 70.0]), sleep=pause)
         with self.release_lock_held_by_child(), mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "time", clock):
+                mock.patch.object(gate, "time", clock):
             with self.assertRaisesRegex(GateRefused,
                     "^build-hold state stayed locked for 60 s; main promotion refused$"):
-                merge_gate.promote(args)
+                gate.promote(args)
             pause.assert_called_once_with(0.2)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
@@ -462,10 +339,10 @@ sys.meta_path.insert(0, NoRepositoryModules())
         args = self.publish_for_promotion()
         release = Path(self.environment["BUILD_HOLD_RELEASE_DIR"])
         with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
-            merge_gate.promote(args)
+            gate.promote(args)
             self.assertFalse(release.exists())
             release.mkdir()
-            merge_gate.promote(args)
+            gate.promote(args)
             self.assertEqual(list(release.iterdir()), [])
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
@@ -501,7 +378,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_promotion_refuses_a_tree_that_cannot_read_live_state(self) -> None:
-        self.write(self.unit / "config/merge_gate.conf",
+        self.write(self.unit / "config/gate.conf",
                    "# text:\nlive_state_checks=state_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
         self.write(self.unit / "state_reader.py",
                    "import sys\nprint('stored rows need conversion', file=sys.stderr)\nsys.exit(2)\n")
@@ -513,9 +390,14 @@ sys.meta_path.insert(0, NoRepositoryModules())
                       result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        with self.subTest(config="merge_gate.conf"):
+            _ = (self.unit / "config/gate.conf").rename(self.unit / "config/merge_gate.conf")
+            older = self.commit(self.unit, "use the old gate config path")
+            self.assertIn("cannot read live state: state_reader: stderr: stored rows need conversion; run its conversion",
+                          gate.live_state_refusal(self.unit, older))
 
     def test_promotion_runs_the_target_tree_state_check(self) -> None:
-        self.write(self.unit / "config/merge_gate.conf",
+        self.write(self.unit / "config/gate.conf",
                    "# text:\nlive_state_checks=state_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
         self.write(self.unit / "state_reader.py", "import sys\nassert sys.argv[1:] == ['state-check']\n")
         self.checkpoint = self.commit(self.unit, "add a state reader that reads")
@@ -525,7 +407,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_promotion_refuses_a_listed_state_check_absent_from_the_tree(self) -> None:
-        self.write(self.unit / "config/merge_gate.conf",
+        self.write(self.unit / "config/gate.conf",
                    "# text:\nlive_state_checks=state_reader absent_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
         self.write(self.unit / "state_reader.py", "import sys\nassert sys.argv[1:] == ['state-check']\n")
         self.checkpoint = self.commit(self.unit, "list a state reader the tree does not have")
@@ -566,9 +448,9 @@ sys.meta_path.insert(0, NoRepositoryModules())
                 self.write(self.main / "subject.txt", "edited during hold\n")
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=edit_during_wait):
+                mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=edit_during_wait):
             with self.assertRaisesRegex(GateRefused, 'promotion refused: tracked edits overlap promotion: "subject.txt"'):
-                merge_gate.promote(args)
+                gate.promote(args)
         self.assertEqual((self.main / "subject.txt").read_text(), "edited during hold\n")
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
@@ -610,11 +492,11 @@ sys.meta_path.insert(0, NoRepositoryModules())
                     self.write(mac / "local.lock", "keep\n")
                 with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
                     if state in ("unrelated", "untracked", "clean"):
-                        merge_gate.promote(args)
+                        gate.promote(args)
                         self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.checkpoint)
                     else:
                         with self.assertRaisesRegex(GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
-                            merge_gate.promote(args)
+                            gate.promote(args)
                         self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.base)
                         self.assertEqual((mac / "subject.txt").read_text(), "Mac local contents\n")
                 self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)

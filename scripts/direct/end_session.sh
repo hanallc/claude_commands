@@ -8,13 +8,9 @@
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
 # Removes only Claude workers no longer held by a unit or live director.
-# Removes the unit's idle standing trees and workspaces.
-#
-# Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
-# records (verify_cache/), whose saved time is already in
-# ~/.local/state/verify/saved.jsonl, and every git checkout and cargo target in
-# the run folder, at any depth, except any non-retired worker's live command cwd and
-# its containing checkout. Tracked run scratch follows the same retention rule.
+# Keeps the unit's standing trees and workspaces.
+# Reports retained workspaces, Verify caches, Git checkouts, and Cargo targets.
+# Ends tracked scratch tasks and protects live command working directories.
 #
 # UNIT_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
@@ -23,6 +19,7 @@
 
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+# shellcheck source=../lib/unit_env.sh
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
@@ -85,6 +82,7 @@ if (( ${#RUNS[@]} > 0 )); then
   if [[ -n "${SESSION_DIR}" && ! -e "${SESSION_DIR}/progress_history_state.json" && ! -L "${SESSION_DIR}/progress_history_state.json" ]]; then
     PREPARED_RUN="${SESSION_DIR}"
   fi
+  ENDED_RUNS=()
   for run in "${RUNS[@]}"; do
     [[ "${run}" != "${PREPARED_RUN}" ]] || continue
     if ! "$PY" -c 'from scripts.direct import progress_history; progress_history.main()' \
@@ -92,11 +90,12 @@ if (( ${#RUNS[@]} > 0 )); then
       echo "end_session: run end failed for ${run}. If work still runs, run end_session.sh again after it stops." >&2
       exit 1
     fi
+    ENDED_RUNS+=("${run}")
   done
   if [[ -n "${PREPARED_RUN}" ]]; then
     if ! "$PY" -c 'import sys; from pathlib import Path; from scripts.direct import remove_run_scratch, workers
-sys.exit(workers.finish_prepared_session(Path(sys.argv[2]), tuple(map(Path, sys.argv[3:])), remove_run_scratch.main))' \
-      --tracked "${RUNS[@]}"; then
+sys.exit(workers.finish_prepared_session(Path(sys.argv[3]), tuple(map(Path, sys.argv[4:])), remove_run_scratch.main))' \
+      --tracked --owned-workspaces "${PREPARED_RUN}" "${ENDED_RUNS[@]}"; then
       echo "end_session: failed to end and clean ${PREPARED_RUN}. If work still runs, run end_session.sh again after it stops." >&2
       exit 1
     fi
@@ -109,11 +108,11 @@ sys.exit(workers.finish_prepared_session(Path(sys.argv[2]), tuple(map(Path, sys.
       cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
     done
     cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
-    cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}"
+    cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked --owned-workspaces "${RUNS[@]}"
   fi
+else
+  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --owned-workspaces
 fi
-
-"$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
 
 if [[ -n "${SESSION_DIR}" ]]; then
   if CURRENT_RUN="$(read_run_pointer)"; then

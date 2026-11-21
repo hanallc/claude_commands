@@ -36,6 +36,7 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, recorded_showrunner
 
 from scripts.style.style_reader_test_support import oracle_reader
+from scripts.worktree import worktrees
 
 
 def setUpModule() -> None:
@@ -178,6 +179,17 @@ class AddStyleTests(unittest.TestCase):
         self.checkout = home / "worktrees" / self.repo.name / self.merge_name / "integration-sample-style"
         self.doc = self.repo / "docs" / f"sample-style-production{LIVE_DOCUMENT_SUFFIX}"
         _ = shutil.copytree(self.repository_seed, self.repo)
+        _ = self.git("remote", "add", "origin", str(self.repo.with_suffix(".git")))
+        home = self.root / "home"
+        config = home / ".claude/config"
+        config.mkdir(parents=True)
+        _ = (config / "build_folders.conf").write_text(
+            f"roots.workspace={home / 'worktrees'}\nroots.build={self.root / 'build'}\n"
+            + "# one of: report, enforce\nfolders.check=report\n"
+            + "# range: 0.001..1\nlocks.probe_wait_seconds=0.01\n"
+            + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+        copies_config = config / "copies.conf"
+        _ = copies_config.write_text("# range: 0.001..\ngit_timeout_seconds=10\n")
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
         for family in add_style.FAMILIES:
@@ -191,6 +203,8 @@ class AddStyleTests(unittest.TestCase):
             **fixture_git_environment(self.root),
             "GIT_CONFIG_SYSTEM": os.devnull,
             "HOME": str(home),
+            "COPIES_CONFIG": str(copies_config),
+            "WORKTREES_STATE_DIR": str(self.root / "worktree-records"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "ledger"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners"),
@@ -867,6 +881,39 @@ class AddStyleTests(unittest.TestCase):
         for family in add_style.FAMILIES:
             self.assertIn(f"global:rust/{family}.md", plan.read_text())
         self.assertIn("# cargo-liner-style", plan.read_text())
+
+    def test_retry_finishes_a_registered_style_checkout(self) -> None:
+        layout = worktrees.output_record("sample", self.merge_name, self.checkout.name)
+        pending = replace(worktrees.new_record(self.checkout, self.style_branch, self.repo,
+                                               self.initial_tip, "sample-style", ""),
+                          layout=layout, stage=worktrees.MakeStage.MAKING)
+        worktrees.write_record(pending)
+        with mock.patch.object(worktrees, "ensure_target_link", side_effect=OSError("output setup stopped")):
+            stopped = self.run_bootstrap(success=False)
+        self.assertEqual(stopped.returncode, 2, stopped.stdout + stopped.stderr)
+        self.assertIn("output setup stopped", stopped.stderr)
+        inode = self.checkout.stat().st_ino
+        with mock.patch.dict(os.environ, self.env):
+            record_path = worktrees.record_file(self.checkout)
+            pending = worktrees.read_record(record_path)
+        self.assertIs(pending.stage, worktrees.MakeStage.MAKING)
+        self.assertFalse((self.checkout / "target").is_symlink())
+
+        _ = self.run_bootstrap()
+
+        self.assertEqual(worktrees.read_record(record_path), replace(pending, stage=worktrees.MakeStage.DONE))
+        self.assertEqual(self.checkout.stat().st_ino, inode)
+        self.assertIsInstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        assert isinstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        self.assertEqual((self.checkout / "target").readlink(), pending.layout.output)
+
+    def test_retry_completes_worktree_left_before_production_doc_was_written(self) -> None:
+        _ = self.run_bootstrap()
+
+        self.assertTrue(self.doc.exists())
+        self.assertEqual(len(tuple((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
+        self.assertEqual(self.sync()[:2], (self.initial_tip, f"refs/heads/{self.style_branch}"))
+        self.assertEqual(len(self.calls()), 2)
 
     def test_interrupted_bootstrap_rewrites_destination_for_the_next_parent_only(self) -> None:
         self.env["TEST_FAIL_LAUNCH"] = "1"

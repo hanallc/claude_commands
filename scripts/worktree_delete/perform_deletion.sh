@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove a worktree after verification of its cleanup or confirmation.
+# Verify the checkout and report it for manual removal.
 # Usage: perform_deletion.sh <worktree_path> <branch_name> [<preview_id> [--automatic]]
 #        perform_deletion.sh --branch-only <worktree_path> <repository> <branch_ref> <preview_id>
 
@@ -75,7 +75,6 @@ if [[ "$BRANCH_NAME" == main || "$BRANCH_NAME" == "${ORIGIN_DEFAULT#origin/}" ]]
 fi
 cd "$DELETION_REPOSITORY"
 
-# Retry a failed config removal when the worktree and ref are already absent.
 if git show-ref --verify --quiet "$BRANCH_REF"; then
     :
 else
@@ -106,7 +105,6 @@ fi
     IFS= read -r CHECKED_LOCAL_TIP
     IFS= read -r ORIGIN_ACTION
     IFS= read -r ORIGIN_VALUE || true
-    IFS= read -r ORIGIN_PUSH_URL || true
 } <<< "$CHECKED_TIPS"
 
 check_local_state() {
@@ -139,33 +137,9 @@ case "$ORIGIN_ACTION" in
     absent)
         printf 'No origin deletion was selected for %s.\n' "$BRANCH_REF"
         ;;
-    delete)
-        if ! "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/origin_deletion.py" \
-            "$DELETION_REPOSITORY" origin "$BRANCH_REF" "$ORIGIN_VALUE" --expected-push-url="$ORIGIN_PUSH_URL"; then
-            echo "Error: origin branch deletion failed; the worktree and local branch stay."
-            exit 1
-        fi
-        ;;
+    delete) ;;
     *) exit 1 ;;
 esac
 
-"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"
-
-wt_command protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$DELETION_REPOSITORY"
-check_local_state
-echo "Removing worktree: $WORKTREE_PATH"
-if ! git worktree remove "$WORKTREE_PATH"; then
-    echo "Error: the tree changed after the cleanup check; deletion stops."
-    exit 1
-fi
-
-wt_command release-pair -- "$WORKTREE_PATH" || true
-"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-clean "$WORKTREE_PATH"
-
-echo "Deleting branch: $BRANCH_NAME"
-if ! git update-ref -d "$BRANCH_REF" "$CHECKED_LOCAL_TIP"; then
-    echo "Error: the local branch changed after the cleanup check; the local branch stays."
-    exit 1
-fi
-remove_branch_config "$BRANCH_NAME"
-echo "Branch deleted."
+echo "Reviewing worktree: $WORKTREE_PATH"
+wt_command remove -- "$WORKTREE_PATH"

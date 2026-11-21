@@ -147,6 +147,10 @@ class StandingCheckpointTests(unittest.TestCase):
             self.write(self.repo / member / "src/lib.rs", "fn value() -> usize {\n    1\n}\n")
         _ = self.git(self.repo, "add", "--all")
         _ = self.git(self.repo, "commit", "-qm", "Initial sources")
+        origin = self.root / "remotes" / self.repo.name
+        _ = self.git(self.repo, "init", "--bare", str(origin))
+        _ = self.git(self.repo, "remote", "add", "origin", str(origin))
+        _ = self.git(self.repo, "push", "-u", "origin", "main")
         self.tip = self.git(self.repo, "rev-parse", "HEAD")
         _ = self.git(self.repo, "worktree", "add", "-q", "-b", "style/main", str(self.style))
         _ = self.git(self.repo, "worktree", "add", "-q", "-b", "sample-style-names", str(self.unit))

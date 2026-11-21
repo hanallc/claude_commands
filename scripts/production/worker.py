@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Select staff workers and dispatch work through their native conversations."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import argparse
 import fcntl
@@ -351,7 +354,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
 
 
-def completion_close_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+def completion_close_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                               run: Path, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
     receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
     return _saved_reply_evidence(receipt, reply_file)
@@ -373,7 +376,7 @@ def _saved_reply_evidence(receipt: DispatchReceipt, reply_file: str) -> worker_p
     return worker_panes.Kept("the transcript has no completed dispatch receipt")
 
 
-def pass_reply_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+def pass_reply_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                         run: Path, reply_file: str, require_completion: bool,
                         detached_results: worker_panes.PassDetachedResults) -> worker_panes.CloseAllowed | worker_panes.Kept:
     """Check one pass receipt for detached results and any required DONE."""
@@ -858,13 +861,13 @@ def launched_agent(row: staff.StaffRow) -> progress_history.CalledAgent:
     return progress_history.CalledAgent(kind, settings.model, settings.effort or "unset")
 
 
-def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) -> ExitCode:
+def _prompt_conflict(conflict: pass_recorder.ActiveDispatchPromptConflict) -> ExitCode:
     print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content; no prompt sent",
           file=sys.stderr)
     return ExitCode.BUSY
 
 
-def _selection_changed(error: progress_history.DispatchSelectionChanged) -> ExitCode:
+def _selection_changed(error: pass_recorder.DispatchSelectionChanged) -> ExitCode:
     print(f"{error}; no prompt sent", file=sys.stderr)
     return ExitCode.BUSY
 
@@ -947,7 +950,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
              policy: worker_panes.LaunchPolicy | worker_panes.UseRolePolicy = worker_panes.UseRolePolicy.CURRENT,
              started: worker_panes.OpenWorker | StartAtDispatch = START_AT_DISPATCH,
-             completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
+             completion_actions: pass_recorder.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
              on_submission: Callable[[], object] = lambda: None,
              lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
              notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
@@ -984,7 +987,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
             prompt=prompt, launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
             target=name)
-        if isinstance(selection, progress_history.ActiveDispatchPromptConflict):
+        if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
             return _prompt_conflict(selection)
         matched = selection.action
         if (unit_runs.terminal_run(unit_runs.read_run_fields(session_dir))
@@ -1028,18 +1031,18 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                     return ExitCode.BUSY
                 if recovered is CompletionRecovery.PENDING_CLOSE:
                     return ExitCode.UNCERTAIN
-        if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
+        if (isinstance(matched, pass_recorder.MatchedDispatch) and matched.worker_name == name.value
                 and row is not None):
             passed = worker_panes.worker_pass(row, session_dir)
             retired = recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None
             if retired or (passed.get("instance_id") == matched.instance_id and passed.get("status") == "completed"):
                 try:
                     progress_history.validate_dispatch_selection(session_dir, selection)
-                except progress_history.DispatchSelectionChanged as error:
+                except pass_recorder.DispatchSelectionChanged as error:
                     return _selection_changed(error)
                 if recovered is CompletionRecovery.RECOVERED:
                     return DispatchSubmission.SUBMITTED
-                delivery = progress_history.dispatch_delivery(passed)
+                delivery = pass_recorder.dispatch_delivery(passed)
                 receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
                 if isinstance(receipt, DispatchComplete):
                     holder = record.by_id(parent)
@@ -1062,7 +1065,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not isinstance(current_start, worker_panes.OpenWorker):
             return startup_result(name, current_start)
         started = current_start
-        if not isinstance(matched, progress_history.MatchedDispatch):
+        if not isinstance(matched, pass_recorder.MatchedDispatch):
             ready = _dispatch_ready(parent, started, _client())
             if not isinstance(ready, worker_panes.OpenWorker):
                 return ready
@@ -1082,9 +1085,9 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
                 new_pass_instance_id=new_pass_instance_id, selection=selection)
-        except progress_history.DispatchPromptRefused as refused:
+        except pass_recorder.DispatchPromptRefused as refused:
             return _prompt_conflict(refused.conflict)
-        except progress_history.DispatchSelectionChanged as error:
+        except pass_recorder.DispatchSelectionChanged as error:
             return _selection_changed(error)
         finally:
             if enrolled and record_status:
@@ -1092,7 +1095,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
-        saved = progress_history.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
+        saved = pass_recorder.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
         if not saved.line:
             dispatch_id = dispatch_id or instance
             line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. " + _done_instruction(dispatch_id)
@@ -1102,7 +1105,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 if extract.is_file():
                     line = f"Read the transcript extract: {extract}.\n" + line
             destination = reply if isinstance(reply, Path) else prompt.with_name(prompt.stem + "_reply.txt")
-            saved = progress_history.DispatchDelivery(line, dispatch_id, str(destination),
+            saved = pass_recorder.DispatchDelivery(line, dispatch_id, str(destination),
                 str(early_ready) if isinstance(early_ready, Path) else "", completion_actions)
             progress_history.save_dispatch_delivery(session_dir, instance, saved)
             if enrolled and kind == "assign" and completion_actions.status_file:
@@ -1369,7 +1372,7 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
             return result
         if progress_history.dispatch_submission_confirmed(run, instance, completion_id):
             return ExitCode.OK
-        if progress_history.dispatch_delivery(passed).completion_id != completion_id:
+        if pass_recorder.dispatch_delivery(passed).completion_id != completion_id:
             return ExitCode.OK
         print(detail, file=sys.stderr)
         if not submission_unproved:
@@ -1483,16 +1486,16 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
-           completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
+           completion_actions: pass_recorder.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
            new_pass_instance_id: uuid.UUID | None = None) -> DispatchSubmission | ExitCode:
     with ExitStack() as cleanup, ExitStack() as notices, ExitStack() as operations:
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
                 prompt=prompt.resolve(), launcher_command=launcher_command,
                 work=progress_history.DispatchWork(kind, lens, fix_pass))
-            if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+            if isinstance(matched, pass_recorder.ActiveDispatchPromptConflict):
                 return _prompt_conflict(matched)
-            if isinstance(matched, progress_history.MatchedDispatch):
+            if isinstance(matched, pass_recorder.MatchedDispatch):
                 name = matched.worker_name
         record = staff.snapshot()
         rows = record.find(kind="worker", parent=parent)
@@ -1606,7 +1609,7 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         if isinstance(active, progress_history.NoActiveDispatch):
             return _refuse_answer(name, "no active pass")
         passed = worker_panes.worker_pass(row, run, record=record)
-        delivery = progress_history.dispatch_delivery(passed)
+        delivery = pass_recorder.dispatch_delivery(passed)
         if passed.get("instance_id") != active.instance_id or not all((delivery.line, delivery.completion_id, delivery.reply_file)):
             return _refuse_answer(name, "the active pass has no saved delivery")
 
@@ -1962,7 +1965,7 @@ def _dispatch_fields(run: str, entry: dict[str, object]) -> dict[str, object]:
     """Read dispatch evidence from a pass or its recorder event."""
     completion = progress_history.hook_completion(entry)
     reply = (completion.reply_file if isinstance(completion, progress_history.HookCompletion) else
-             progress_history.dispatch_delivery(entry).reply_file)
+             pass_recorder.dispatch_delivery(entry).reply_file)
     if not reply:
         saved_reply = entry.get("reply_file")
         reply = saved_reply if isinstance(saved_reply, str) else ""
@@ -2473,7 +2476,7 @@ def main(arguments: list[str] | None = None) -> int:
                 launcher_command=_launcher_arguments(args.launcher_command), fix_cause=args.fix_cause,
                 fix_pass=args.fix_pass, activity=args.activity,
                 early_ready=Path(args.early_ready) if args.early_ready else SINGLE_STAGE_REVIEW, policy=policy,
-                completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
+                completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
                 new_pass_instance_id=args.new_pass_instance_id)
         if isinstance(code, DispatchSubmission):
             print("submitted")

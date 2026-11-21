@@ -1,39 +1,24 @@
-"""Wait for repository slot capacity through the build queue."""
+"""Name steps from queued commands and recorded work."""
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Sequence
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
 from enum import Enum
-from functools import cache, cached_property, lru_cache
-import os
+from functools import cache, lru_cache
 from pathlib import Path
 import re
-import select
 import shlex
 import subprocess
-from threading import Thread
 
-from scripts.lib import conf
-from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
+from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_VERBS,
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
-from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
                                                 GateJobNotRecorded, NotVerifyCall, VerifyCall, VerifyStep)
+from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text as public_queue_text, select_queue_name
 from scripts.message.owner_role import OwnerRole
 
 
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"})
-
-
-def public_queue_text(text: str) -> str:
-    """Return text that can appear in a queue name or owner field."""
-    text = " ".join(text.split())
-    if text in ("", "—", "owner not recorded") or "$" in text or RAW_ID.search(text):
-        return ""
-    return text
 
 
 class QueueKind(Enum):
@@ -57,8 +42,8 @@ class QueueRowName(str):
         return str.__new__(cls, kind.value)
 
     @classmethod
-    def owner_only(cls, owner: str) -> QueueRowName:
-        return str.__new__(cls, public_queue_text(owner) or "—")
+    def owner_only(cls, *candidates: object) -> QueueRowName:
+        return str.__new__(cls, select_queue_name(*candidates))
 
     @classmethod
     def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
@@ -135,40 +120,6 @@ def recorded_step(text: str, names: StepNames, package: str = "") -> QueueRowNam
         verb, _, recorded_package = text.partition(" ")
         return QueueRowName.step(verb, recorded_package or package, names)
     return QueueRowName.script(text)
-
-
-@dataclass(frozen=True)
-class SlotCaller:
-    """The copy owner and command for a slot wait."""
-
-    staff_id: str
-    showrunner: str
-    source: Path
-    command: tuple[str, ...]
-    work: str
-
-    @cached_property
-    def named_job(self) -> tuple[QueueRowName | NoNamedStep, StepJob | GateJobNotRecorded, VerifyStep]:
-        """Classify the command when the slot must wait."""
-        if self.command:
-            return command_slot_job(self.command, RECORDED_STEP_NAMES)
-        return recorded_step(self.work, RECORDED_STEP_NAMES), GATE_JOB_NOT_RECORDED, NotVerifyCall()
-
-    @property
-    def step(self) -> QueueRowName | NoNamedStep:
-        return self.named_job[0]
-
-SLOT_CALLER: ContextVar[SlotCaller | None] = ContextVar("slot_caller", default=None)
-
-
-@contextmanager
-def slot_caller(staff_id: str, showrunner: str, source: Path, command: Sequence[str], work: str) -> Generator[None]:
-    """Carry the caller identity until the slot is available."""
-    token = SLOT_CALLER.set(SlotCaller(staff_id, showrunner, source, tuple(command), work))
-    try:
-        yield
-    finally:
-        SLOT_CALLER.reset(token)
 
 
 def command_programs(argv: Sequence[str]) -> Iterator[Sequence[str]]:
@@ -287,80 +238,3 @@ def command_slot_job(command: Sequence[str], names: StepNames
     except (ValueError, RecursionError):
         pass
     return (QueueRowName.script(script) if script else NoNamedStep.FOUND), GATE_JOB_NOT_RECORDED, NotVerifyCall()
-
-
-class SlotWaitExpired(RuntimeError):
-    """The repository pool has no capacity before the wait ends."""
-
-
-def read_pool(repository: str, machine: str, root: Path, locks: str) -> wire.RepositorySlotWaiting:
-    """Read lock holders without taking a slot lock or changing a slot."""
-    settings = conf.read_or_repository("build_folders")
-    key = f"slots.{machine}.{repository}.max"
-    maximum = settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
-    holders: set[tuple[int, int, int]] = set()
-    for line in locks.splitlines():
-        fields = line.split()
-        if len(fields) < 6 or fields[1] != "FLOCK" or fields[3] != "WRITE":
-            continue
-        major, minor, inode = fields[5].split(":")
-        holders.add((int(major, 16), int(minor, 16), int(inode)))
-    held: list[int] = []
-    for number in range(1, maximum + 1):
-        try:
-            info = (root / f"{repository}-slot{number}.lock").stat()
-        except FileNotFoundError:
-            continue
-        if (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino) in holders:
-            held.append(number)
-    return wire.RepositorySlotWaiting(repository, tuple(held), maximum, key)
-
-
-def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, episode: str,
-                  since: float, showrunner: str, unit: str, work: str, purpose: str,
-                  expires_at: float | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-                  owner_pid: int = 0) -> None:
-    """Block on one queue connection; retain episode and since after a lost race."""
-    from scripts.build_queue import admission_client as client, admission_records as records
-    from scripts.build_queue import admission_protocol as wire
-
-    seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
-    deadline = since + seconds if isinstance(expires_at, conf.UseConfiguredValue) else expires_at
-    pid = owner_pid or os.getpid()
-    start = records.process_start_time(pid)
-    if start is None:
-        raise RuntimeError("the slot waiter has no process identity")
-    caller = SLOT_CALLER.get()
-    if caller is None:
-        session = os.environ.get("CLAUDE_CODE_SESSION_ID", "") or os.environ.get("CODEX_THREAD_ID", "")
-        identity = wire.Identity(session, showrunner, work, "")
-    else:
-        step, job, verify = caller.named_job
-        identity = wire.Identity(caller.staff_id, caller.showrunner,
-                                 step if isinstance(step, QueueRowName) else "", str(caller.source), job=job, verify=verify)
-    del unit, purpose
-    request = wire.RepositorySlotRequest(episode, wire.Owner(pid, start), since,
-        repository, machine, str(root), maximum, deadline, identity)
-    if owner_pid:
-        watch_parent(owner_pid)
-    reply = client.repository_slot(request)
-    if isinstance(reply, wire.RepositorySlotExpired):
-        raise SlotWaitExpired(reply.reason)
-    if isinstance(reply, wire.Refused):
-        raise RuntimeError(reply.reason)
-
-
-def watch_parent(pid: int) -> None:
-    """End a standalone waiter when its parent ends."""
-    if os.getppid() != pid:
-        raise SlotWaitExpired("slots: the step ended before its folder wait")
-    descriptor = os.pidfd_open(pid)
-    if os.getppid() != pid:
-        os.close(descriptor)
-        raise SlotWaitExpired("slots: the step ended before its folder wait")
-
-    def stop() -> None:
-        _ = select.select([descriptor], [], [])
-        os._exit(75)
-
-    Thread(target=stop, daemon=True, name="slot-wait-owner").start()
