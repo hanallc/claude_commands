@@ -753,6 +753,7 @@ A batch can contain one item.
 
 A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
 A red test or main conflict returns every pending item in the resumed batch.
+A published merge with a promotion marker keeps its completed result.
 For other stops, the existing resume rules apply.
 
 Shrink and as-built items add no test paths of their own.
@@ -767,7 +768,9 @@ A hold, failure, or cancellation ends a fresh batch and returns each row to its 
 A red report names the failed test step and says whether the row selects it.
 The batch stops at the first failed test command.
 The next queued item can proceed after the batch exits.
-Before publication, the stop path restores the starting tip.
+Before publication, the stop path attempts to restore the starting tip before it sends notices.
+It sends every notice before it writes result records.
+Rollback and result-record errors appear after the notices.
 Reset aborts an unfinished merge only when no merge was unfinished at batch start.
 An earlier unfinished merge and its staged edits remain unchanged.
 Each run starts a fresh shared test log. Tests after main moves append to the same log.

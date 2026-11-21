@@ -576,8 +576,6 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
         for notice in notices:
             self.assertIn("package alpha-proof", notice)
             self.assertIn(str(self.state / f"merge_{alpha[:7]}_test.log"), notice)
-        self.assertNotIn("bisect:", result.stdout)
-        self.assertNotIn("batch: retry", result.stdout)
         self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]])
         self.assertEqual(self.events("checkpoint-test"), [])
 
@@ -659,10 +657,125 @@ raise SystemExit(1)
         self.assertEqual(next_item.returncode, 0, next_item.stdout + next_item.stderr)
         _ = self.assert_landed(start, [beta])
 
+    def test_batch_stop_keeps_the_gate_failure_and_notifies_pending_rows(self) -> None:
+        for case in ("invalid result log", "unrelated later row", "completed later row",
+                     "reset fails", "later merge parent"):
+            with self.subTest(case=case):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.promotions = str(self.promote)
+                self.production_doc()
+                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                with patch.dict("os.environ", self.env):
+                    results = land_runs.results_path()
+                start = self.git("rev-parse", "HEAD")
+                alpha = self.checkpoint("crates/alpha-proof/Cargo.toml",
+                                        '[package]\nname = "alpha-proof"\nversion = "0.1.0"\n')
+                beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+                alpha_row = self.batch_line("alpha", "2", alpha)
+                beta_row = self.batch_line("beta", "2", beta)
+                rows = [alpha_row, beta_row]
+                expected = ["send alpha", "send beta"]
+                rollback_tip = start
+                beta_result: land_runs.LandResult | None = None
+                if case == "invalid result log":
+                    results.parent.mkdir(parents=True)
+                    _ = results.write_bytes(b"\xff\n")
+                elif case == "unrelated later row":
+                    unrelated = self.git("commit-tree", "HEAD^{tree}", "-m", "Unrelated checkpoint", cwd=self.other)
+                    _ = self.git("push", "origin", f"{unrelated}:refs/heads/unrelated", cwd=self.other)
+                    rows.insert(1, self.batch_line("beta", "1", unrelated))
+                    expected.insert(1, "send beta")
+                    merge_checkpoint_row = merge_checkpoint.merge_checked_checkpoint
+
+                    def interrupt_after_alpha(request: merge_checkpoint.MergeRequest) -> merge_checkpoint.CheckedCheckpointMerge:
+                        if request.commit != alpha:
+                            raise KeyboardInterrupt
+                        return merge_checkpoint_row(request)
+
+                    with (patch.object(merge_checkpoint, "merge_checked_checkpoint", interrupt_after_alpha),
+                          self.assertRaises(KeyboardInterrupt)):
+                        _ = self.land_batch(rows)
+                    self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
+                elif case == "completed later row":
+                    with (patch.object(merge_checkpoint, "finish_checkpoint", side_effect=KeyboardInterrupt),
+                          self.assertRaises(KeyboardInterrupt)):
+                        _ = self.land_batch(rows)
+                    completed = self.land_batch([beta_row])
+                    self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                    rollback_tip = self.git("rev-parse", "HEAD")
+                    with patch.dict("os.environ", self.env):
+                        beta_result = land_runs.last_results()[beta]
+                    self.assertTrue(beta_result["landed"])
+                    _ = self.push_main_change("crates/alpha-proof/src/lib.rs", "pub fn main_fix() {}\n")
+                    (self.state / "events.jsonl").unlink()
+                    expected = ["send alpha"]
+                elif case == "later merge parent":
+                    later = self.checkpoint("src/later.txt", "change outside the package\n")
+                    rows.insert(1, self.batch_line("alpha", "3", later))
+                    expected.insert(1, "send alpha")
+                    with (patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
+                          self.assertRaises(KeyboardInterrupt)):
+                        _ = self.land_batch(rows)
+                    self.assertEqual(self.git("rev-parse", "HEAD^1^2"), later)
+
+                (self.state / "fail-always-test-alpha-proof").touch()
+                if case == "reset fails":
+                    with patch.object(merge_checkpoint, "reset_batch", side_effect=OSError("fixture reset failed")):
+                        result = self.land_batch(rows)
+                else:
+                    result = self.land_batch(rows)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                self.assertEqual([line.split(":", 1)[0] for line in notices], expected, result.stdout)
+                self.assertTrue(all("package alpha-proof" in line for line in notices), result.stdout)
+                self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]])
+                self.assertEqual(self.events("checkpoint-test"), [])
+                if case == "invalid result log":
+                    self.assertEqual(results.read_bytes(), b"\xff\n")
+                    self.assertEqual(result.stdout.count("land result: not recorded"), 2)
+                    self.assertLess(result.stdout.index(notices[-1]), result.stdout.index("land result: not recorded"))
+                elif case == "unrelated later row":
+                    self.assertIn("changed paths unknown", notices[1])
+                    self.assertIn("this row's tests include no reported red step", notices[2])
+                elif case == "completed later row":
+                    with patch.dict("os.environ", self.env):
+                        self.assertEqual(land_runs.last_results()[beta], beta_result)
+                elif case == "reset fails":
+                    self.assertIn("red: failed — package alpha-proof failed", result.stdout)
+                    warning = "rollback failed: fixture reset failed"
+                    self.assertIn(warning, result.stdout)
+                    self.assertLess(result.stdout.index(notices[-1]), result.stdout.index(warning))
+                    self.assertEqual(self.git("rev-parse", "HEAD^2"), beta)
+                    self.assertTrue(self.batch_record().exists())
+                    continue
+                elif case == "later merge parent":
+                    self.assertIn("this row's tests include no reported red step", notices[1])
+
+                if case == "completed later row":
+                    self.assertEqual(self.git("rev-parse", "HEAD"), rollback_tip)
+                    self.assertFalse(self.batch_record().exists())
+                    (self.state / "fail-always-test-alpha-proof").unlink()
+                    next_checkpoint = self.beta_checkpoint("src/independent.txt", "independent beta change\n")
+                    next_item = self.land_batch([self.batch_line("beta", "3", next_checkpoint)])
+                    self.assertEqual(next_item.returncode, 0, next_item.stdout + next_item.stderr)
+                    self.assertEqual(self.git("show", "origin/production:src/independent.txt"), "independent beta change")
+                else:
+                    self.assert_rolled_back(rollback_tip)
+                    next_item = self.land_batch([beta_row])
+                    self.assertEqual(next_item.returncode, 0, next_item.stdout + next_item.stderr)
+                    _ = self.assert_landed(start, [beta])
+
     def test_fetch_failure_returns_each_current_row(self) -> None:
         start = self.git("rev-parse", "HEAD")
         alpha = self.checkpoint()
         beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+        self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+        with patch.dict("os.environ", self.env):
+            results = land_runs.results_path()
+        results.parent.mkdir(parents=True)
+        _ = results.write_bytes(b"\xff\n")
         _ = self.git("remote", "set-url", "origin", str(self.root / "missing-origin"))
         result = self.land_batch([self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -671,6 +784,8 @@ raise SystemExit(1)
         for notice in notices:
             self.assertIn("fetch failed", notice)
             self.assertIn("send this checkpoint again when origin is available", notice)
+        self.assertEqual(result.stdout.count("land result: not recorded"), 2)
+        self.assertLess(result.stdout.index(notices[-1]), result.stdout.index("land result: not recorded"))
         self.assertEqual(self.git("rev-parse", "HEAD"), start)
         self.assertFalse(self.batch_record().exists())
 
