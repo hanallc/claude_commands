@@ -2278,6 +2278,46 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
         self.assertEqual(self.entry["name"], "alpha")
 
+        runner = fixture_member("showrunner", name="resume-runner")
+        unit = fixture_member("unit", name="resume-unit", parent=runner.id,
+                              worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        worker = fixture_worker("resume-worker", unit.id)
+        _ = staff.set_worker_role(worker.id, staff.KnownWorkerRole("impl"))
+        home = self.root / ".claude3"
+        _ = staff.set_home(worker.id, staff.SessionHome(home))
+        transcript = home / "projects/resume-worker" / f"{worker.current_session}.jsonl"
+        tab = herdr.TabSession("w1:p2", worker.name, "w1", worker.current_session)
+
+        for family, saved_model, turn_model, turn_effort, expected_model, expected_effort in (
+            ("claude", "sonnet", "opus", "", "opus", "high"),
+            ("claude", "sonnet", "opus", "xhigh", "opus", "xhigh"),
+            ("claude", "opus", "", "", "opus", "high"),
+            ("claude", "", "", "", "sonnet", "high"),
+            ("codex", "sonnet", "opus", "xhigh", "opus", "xhigh"),
+            ("codex", "opus", "", "", "opus", ""),
+        ):
+            with self.subTest(family=family, saved_model=saved_model, turn_model=turn_model, turn_effort=turn_effort):
+                _ = write_registry(self.root / "configuration/models.conf", {
+                    "assignments": {"direct": family},
+                    "direct.claude": {"impl": "sonnet:high" if family == "claude" else None},
+                }, update=True)
+                turn: dict[str, object] = {"type": "assistant", "message": {"model": turn_model}}
+                if turn_effort:
+                    turn["effort"] = turn_effort
+                atomic_file.write_text_atomic(transcript, json.dumps(turn) + "\n" if turn_model else "")
+                entry: pane_launch.CurrentLaunch = {**self.entry, "staff_id": worker.id,
+                    "session_id": worker.current_session, "model": saved_model}
+                self.launched.clear()
+                _ = stop_resume._start_session(tab, entry, "claude3", "")  # pyright: ignore[reportPrivateUsage]
+                arguments = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+                self.assertEqual(arguments[arguments.index("--resume") + 1], worker.current_session)
+                model_flag = arguments.index("--model")
+                self.assertEqual(arguments[model_flag:model_flag + 2], ("--model", expected_model))
+                if expected_effort:
+                    self.assertEqual(arguments[model_flag + 2:model_flag + 4], ("--effort", expected_effort))
+                else:
+                    self.assertNotIn("--effort", arguments)
+
     def test_resume_reuses_the_open_shell_with_the_fixed_row_id(self) -> None:
         fixed = staff.StaffId(self.entry["session_id"])
         current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")

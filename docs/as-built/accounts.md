@@ -372,9 +372,12 @@ Normal recovery takes about two to three minutes plus reading, restoration, and 
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
 A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
-`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
-`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
-So a change of the role's assigned family never moves a worker to another family.
+The move reads the role settings for the worker's current family through `worker_panes.launch_policy(role, family)`.
+After the stop, `pane_moves._own_policy` reads the latest real Claude assistant turn for the model and effort.
+The launch record or role supplies missing settings. A turn without effort keeps the fallback effort.
+An explicit unit resume `--model` overrides the model.
+For Codex, `worker_panes.kept_settings` keeps the saved model, effort, and service tier.
+The destination and rollback use the same policy.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.

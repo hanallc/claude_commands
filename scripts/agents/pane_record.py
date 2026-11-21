@@ -52,6 +52,7 @@ from scripts.herdr.pane_launch import (
     RESUME_FLAGS as RESUME_FLAGS,
     ClaudeArguments as ClaudeArguments,
     parse_claude_arguments as parse_claude_arguments,
+    parse_claude_flags as parse_claude_flags,
 )
 
 RECORD_DIR = pane_launch.record_directory()
@@ -145,12 +146,15 @@ class ClaudeResumeSettings(NamedTuple):
         return arguments
 
 
+NO_CLAUDE_RESUME_SETTINGS = ClaudeResumeSettings()
+
+
 def claude_resume_settings(preferred: ClaudeTurnSettings | NoClaudeTurn | ClaudeResumeSettings, *,
-                           fallback: ClaudeResumeSettings = ClaudeResumeSettings(),
+                           fallback: ClaudeResumeSettings = NO_CLAUDE_RESUME_SETTINGS,
                            explicit_model: str = "") -> ClaudeResumeSettings:
     """Resolve each Claude resume flag from its own available settings."""
     if isinstance(preferred, NoClaudeTurn):
-        preferred = ClaudeResumeSettings()
+        preferred = NO_CLAUDE_RESUME_SETTINGS
     return ClaudeResumeSettings(explicit_model or preferred.model or fallback.model,
                                 preferred.effort or fallback.effort)
 
@@ -220,12 +224,27 @@ def claude_turn_settings(session_id: str, *config_dirs: Path) -> ClaudeTurnSetti
     return turns[max(turns)] if turns else NoClaudeTurn()
 
 
-def resume_arguments(entry: PaneLaunch) -> list[str]:
-    """Build backend arguments from a launch with its current conversation id."""
-    return _resume_arguments(resume_launch(entry) if "session_id" not in entry else entry)
+def _no_claude_role_fallback() -> ClaudeResumeSettings:
+    return NO_CLAUDE_RESUME_SETTINGS
 
 
-def _resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
+def resume_arguments(entry: PaneLaunch, *,
+                     claude_role_fallback: Callable[[], ClaudeResumeSettings] = _no_claude_role_fallback) -> list[str]:
+    """Build resume arguments with the latest Claude settings when available."""
+    current = resume_launch(entry) if "session_id" not in entry else entry
+    if pane_launch.saved_kind(current) == "codex":
+        return _resume_arguments(current)
+    homes = tuple(Path(directory) for directory in (current.get("config_dir", ""),
+        current["environment"].get("CLAUDE_CONFIG_DIR", "")) if directory)
+    turn = claude_turn_settings(current["session_id"], *homes)
+    settings = claude_resume_settings(turn, fallback=ClaudeResumeSettings(model=current["model"]))
+    if not settings.model or not settings.effort:
+        settings = claude_resume_settings(settings, fallback=claude_role_fallback())
+    return _resume_arguments(current, claude_settings=settings)
+
+
+def _resume_arguments(entry: pane_launch.NativePaneLaunch, *,
+                      claude_settings: ClaudeResumeSettings = NO_CLAUDE_RESUME_SETTINGS) -> list[str]:
     if pane_launch.saved_kind(entry) == "codex":
         arguments = ["resume", entry["session_id"]]
         if entry["model"]:
@@ -237,8 +256,7 @@ def _resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
         arguments.extend(("-n", entry["name"]))
     if entry["remote_control"]:
         arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
-    if entry["model"]:
-        arguments.extend(("--model", entry["model"]))
+    arguments.extend(claude_settings.arguments())
     for directory in entry.get("plugin_directories", []):
         arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
@@ -261,7 +279,7 @@ def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
                 continue
             policy.extend((option, value))
         current["codex_policy"] = policy
-    arguments = _resume_arguments(current)
+    arguments = _resume_arguments(current, claude_settings=ClaudeResumeSettings(model=settings.model))
     if settings.kind == "claude":
         arguments.extend(("--effort", settings.effort))
     return arguments
