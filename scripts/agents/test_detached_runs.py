@@ -392,6 +392,51 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(record["session_dir"], str(self.session))
         self.assertTrue(Path(cast(str, record["log"])).is_absolute())
 
+    def test_start_refuses_systemd_run_without_an_exact_scope_prefix(self) -> None:
+        for command in (
+            ["systemd-run", "--user", "--quiet", "--pipe", "--wait", "-p", "MemoryMax=4G", "true"],
+            ["env", "/usr/bin/systemd-run", "--user", "--", "true", "--scope"],
+            ["systemd-run", "--user", "true", "--scope"],
+            ["systemd-run", "--description", "--scope", "true"],
+            ["systemd-run", "--descript", "--scope", "--wait", "true"],
+            ["systemd-run", "--scop", "true"],
+            ["systemd-run", "--quiet", "--scope", "true"],
+            ["env", "-u", "X", "A=B", "systemd-run", "--wait", "true"],
+            ["env", "-S", "systemd-run --wait true"],
+            ["env", "-vu", "X", "systemd-run", "--wait", "true"],
+            ["env", "--split-string=systemd-run --wait true"],
+        ):
+            with (self.subTest(command=command), self.supervisor_spawns() as popen,
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(detached_runs.main(["start", "--", *command]), 2)
+                popen.assert_not_called()
+                self.assertFalse((self.session / detached_runs.DETACHED_RUNS_DIR).exists())
+                self.assertEqual(errors.getvalue().splitlines(), [
+                    "detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+                    + "Use the exact option names in that order.",
+                ])
+
+    def test_start_accepts_scope_plain_command_and_shell_text(self) -> None:
+        for command in (
+            ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=2G", "--", "true"],
+            ["env", "/usr/bin/systemd-run", "--scope", "true"],
+            ["env", "-u", "X", "A=B", "systemd-run", "--scope", "true"],
+            ["true"],
+            ["printf", "%s", "/usr/bin/systemd-run"],
+            ["env", "--unset", "X", "A=B", "printf", "%s", "/usr/bin/systemd-run"],
+            ["env", "-i", "true"],
+            ["sh", "-c", "systemd-run --user --wait true"],
+            ["/bin/sh", "-c", "exec /usr/bin/systemd-run"],
+        ):
+            with self.subTest(command=command):
+                popen, _ = self.start(command)
+                popen.assert_called_once()
+                arguments = cast(list[str], popen.call_args.args[0])
+                path = Path(arguments[-1])
+                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                self.assertEqual(record["command"], command)
+                path.unlink()
+
     def test_run_uses_the_start_folder_instead_of_the_staff_worktree(self) -> None:
         start_folder = self.root / "repair-checkout"
         start_folder.mkdir()
@@ -2028,12 +2073,13 @@ send.deliver_worker_text = fake_sender
                             run_command.assert_called_with([sys.executable, "-c", "pass"], ANY, Path(record["log"]))
                 message, = cast(list[str], self.pending()["messages"])
                 self.assertTrue(cancelled.is_set())
-                self.assertIn("Result: PASS (exit 0)", message)
                 self.assertNotIn(reason, message)
                 if previous:
+                    self.assertIn("Result: STOPPED (exit 0)", message)
                     self.assertEqual(record.get("stop_reason"), previous)
                     self.assertIn("Stop reason: " + previous, message)
                 else:
+                    self.assertIn("Result: PASS (exit 0)", message)
                     self.assertNotIn("stop_reason", record)
                 if timing == "during recheck":
                     self.assertIn("Stage 2: go", message)
@@ -2048,6 +2094,21 @@ send.deliver_worker_text = fake_sender
         self.assertNotIn("FAIL", message)
         self.assertNotIn("Stage 2: go", message)
         self.assertEqual(record.get("exit_code"), 76)
+
+    def test_stopped_results_keep_the_exit_instructions(self) -> None:
+        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record["stop_reason"] = "Build hold."
+        cancellation = "verify.sh: cancelled — The worktree changed."
+        _ = Path(record["log"]).write_text(cancellation + "\n" + "cleanup\n" * 30, encoding="utf-8")
+
+        for code, instruction in ((76, "Read the newer call's result."), (77, "Resubmit after your edits.")):
+            with self.subTest(code=code):
+                message = detached_runs.result_text(record, detached_runs.CompletedCommand(code))
+                self.assertIn(f"Result: STOPPED (exit {code})", message)
+                self.assertIn("Stop reason: Build hold.", message)
+                self.assertIn(instruction, message)
+                if code == 77:
+                    self.assertIn(cancellation, message)
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         _ = write_config_fixture(self.root / "config/detached_runs.conf",

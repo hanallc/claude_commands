@@ -692,13 +692,20 @@ After the command ends, the supervisor starts `detached_runs.py deliver <record>
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor waits for this process before it marks the run finished.
 The command runs in its own session, including through a systemd scope prefix.
+`detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
+Other `systemd-run` forms return exit 2.
+The guard skips `env` assignments and the two-word `-u` and `--unset` options.
+If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
+To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
 `detached_runs.py stop` and a build hold stop send TERM to the command group.
 Each checks the supervisor and the command leader identity before it signals the group.
 Each stages the stop reason before it sends TERM.
 The supervisor stays alive to record the exit status and deliver the result.
-The result uses the command's exit status and includes the saved reason.
+A run with a saved stop reason reports `STOPPED` and includes the reason.
+The result includes the command's exit status.
+Exits 76 and 77 also include instructions for the next action.
 A self-stop requires a native Claude session record or Codex pane report for the caller.
 The caller's worker staff ID must match the run's owner.
 Missing records, unreadable records, and conflicting identities prevent a self-stop.
