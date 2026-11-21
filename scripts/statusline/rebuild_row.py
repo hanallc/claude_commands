@@ -275,7 +275,7 @@ class ComparedChanges:
     """The commits from the running system revision to the configured revision."""
 
     running_path: str
-    running_revision: str
+    switch_revision: str
     configured_revision: str
     commits: tuple[Change, ...]
 
@@ -303,7 +303,7 @@ def switched_commit(log: str, running: str, *, require_match: bool = False) -> s
                 if len(fields) == SWITCH_FIELDS and fields[1] == "switch"]
     fallback = switches[-1] if switches and not require_match else None
     last = next((fields for fields in reversed(switches) if fields[4] == running), fallback)
-    return last[3].removesuffix("-dirty") if last is not None else ""
+    return last[3] if last is not None else ""
 
 
 def transcript_session(bridge: str, run: CommandRunner) -> str:
@@ -331,9 +331,14 @@ def machine_changes(settings: RebuildSettings, command: list[str], known: dict[s
     running = lines[0]
     log = "\n".join(lines[1:])
     matching = switched_commit(log, running, require_match=True)
-    commit = matching or switched_commit(log, running)
+    revision = matching or switched_commit(log, running)
+    commit = revision.removesuffix("-dirty")
     if not REVISION.fullmatch(commit):
         return None
+    if configured and revision != commit:
+        if matching and system_path(running):
+            return ComparedChanges(running, revision, configured, ())
+        return ()
     listing = run(["git", "-C", str(settings.repo), "log",
                    "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
                    f"{commit}..{configured or settings.ref}"])
@@ -347,7 +352,7 @@ def machine_changes(settings: RebuildSettings, command: list[str], known: dict[s
             known[bridge[1]] = transcript_session(bridge[1], run)
         changes.append(Change(fields[0], fields[1], fields[2], known[bridge[1]] if bridge is not None else ""))
     if configured and matching and system_path(running):
-        return ComparedChanges(running, commit, configured, tuple(changes))
+        return ComparedChanges(running, revision, configured, tuple(changes))
     return tuple(changes)
 
 
@@ -410,9 +415,13 @@ def _read_changes(cache: Path) -> dict[str, CachedChanges]:
         for machine, changes in cast(dict[str, object], value).items():
             if isinstance(changes, dict):
                 fields = cast(dict[str, object], changes)
-                path, running, configured = fields["running_path"], fields["running_revision"], fields["configured_revision"]
+                if "switch_revision" not in fields and "running_revision" in fields:
+                    # The old cache did not record whether the running system had local changes.
+                    result[machine] = _decode_commits(fields["commits"])
+                    continue
+                path, running, configured = fields["running_path"], fields["switch_revision"], fields["configured_revision"]
                 if (not isinstance(path, str) or not system_path(path)
-                        or not isinstance(running, str) or not REVISION.fullmatch(running)
+                        or not isinstance(running, str) or not REVISION.fullmatch(running.removesuffix("-dirty"))
                         or not isinstance(configured, str) or not REVISION.fullmatch(configured)):
                     continue
                 result[machine] = ComparedChanges(path, running, configured, _decode_commits(fields["commits"]))
@@ -443,7 +452,7 @@ def read_compared_changes(config: Path, answer: RebuildAnswer) -> dict[str, Comp
         return {}
     return {machine: changes for machine, changes in _recorded_changes(config).items()
             if isinstance(changes, ComparedChanges) and changes.configured_revision == configured
-            and changes.running_path == answer.running_paths.get(machine)}
+            and answer.probes.succeeded(machine) and changes.running_path == answer.running_paths.get(machine)}
 
 
 def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time) -> RebuildAnswer:
