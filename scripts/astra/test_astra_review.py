@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -13,15 +14,18 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_test_support as codex_fixture
+from scripts.agents import detached_runs, remote
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
-from scripts.production import staff, worker_admission  # noqa: E402
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
+from scripts.production import staff, worker, worker_admission, worker_capacity  # noqa: E402
+from scripts.production.production_doc import EnrolledPaths
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
-from scripts.direct import assign, progress_history
+from scripts.direct import assign, progress_history, remove_run_scratch, workers
 from scripts.message import send
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 from scripts.lib import unit_runs
@@ -388,33 +392,207 @@ class AstraReviewTests(StaffTestCase):
                 self.assertIn("w1:p0", self.world.locations)
 
     def test_staff_review_uses_its_staff_target_and_saves_the_report(self) -> None:
-        self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)
-        self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
-        self.fixture.agent.without_done = False
-        self.fixture.agent.finish_after = 1
-        with self.world.process_starts():
-            result = self.run_script(str(self.document))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        command = self.router.commands[-1]
-        self.assertEqual(command[command.index("--target") + 1], "staff-worker")
-        self.assertEqual(command[command.index("--policy") + 1], "astra-reviewer")
-        review = self.saved_prompt().with_name("review.md")
-        self.assertFalse(review.exists())
-        self.assertIn(f"Submitted: {review}", result.stdout)
-        self.assertNotIn(self.fixture.agent.final, result.stdout)
-        pending = self.run_script("--read", str(review), "--run-directory", str(review.parent))
-        self.assertEqual(pending.returncode, 1)
-        self.assertIn("not completed", pending.stderr)
-        pane = self.fixture.agent.submitted[-1][0]
-        row = self.fixture.agent.row(pane)
-        self.fixture.agent.complete(pane)
-        with patch.dict(os.environ, self.environment):
-            self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
-        saved = self.run_script("--read", str(review), "--run-directory", str(review.parent))
-        self.assertEqual(saved.returncode, 0, saved.stderr)
-        self.assertEqual(review.read_text().strip(), self.fixture.agent.replies[-1])
-        self.assertIn(self.fixture.agent.replies[-1], saved.stdout)
-        self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
+        ordinary_owner = self.fixture.fixture.parent
+        for scenario in ("unit", "enrolled", "end prepared run", "end prepared run during admission",
+                         "recorder state appears during start", "recover after release", "release interrupted",
+                         "concurrent reviewers", "run end while a reviewer runs", "capacity stop"):
+            with self.subTest(scenario=scenario), contextlib.ExitStack() as context:
+                owner = ordinary_owner
+                reviewed_run = self.root / "runs" / scenario.replace(" ", "-")
+                if scenario != "unit":
+                    main = self.root / "enrolled-main"
+                    integration = self.root / "enrolled-integration"
+                    main.mkdir(exist_ok=True)
+                    integration.mkdir(exist_ok=True)
+                    paths = EnrolledPaths(main, main / "production.md", main / "LOG.md", main / "notes", integration)
+                    owner = fixture_member("showrunner", name="astra-showrunner",
+                                           doc=staff.LiveDoc(remote.local_machine(), paths.live_doc))
+                    self.fixture.fixture.parent_id = owner.id
+                    reviewed_run.mkdir(parents=True)
+                    owner = staff.set_run(owner.id, staff.OpenRun(reviewed_run))
+                    _ = context.enter_context(patch.object(worker_panes, "resolve_production_paths", return_value=paths))
+                    _ = context.enter_context(patch.object(astra_review, "run_folder", return_value=reviewed_run))
+                self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
+                self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
+                state_file = reviewed_run / unit_runs.STATE_FILE
+                start_run = ["start-run", "--session-dir", str(reviewed_run), "--working-dir", str(self.root),
+                             "--main-session-id", owner.current_session, "--main-family", "codex",
+                             "--main-model", "gpt-main", "--main-effort", "xhigh"]
+                if scenario.startswith("end prepared run"):
+                    cache = reviewed_run / "verify_cache"
+                    cache.mkdir()
+                    cleanup_environment = {
+                        **self.environment,
+                        "SCRATCH_ROOT": str(self.root / "prepared-scratch"),
+                        "SCRATCH_VISIBLE_ROOT": str(self.root / "prepared-scratch-visible"),
+                        "SCRATCH_HOLDS": str(self.root / "prepared-scratch-holds.json"),
+                    }
+
+                    def end_prepared() -> subprocess.CompletedProcess[str]:
+                        return invoke_cli(workers, lambda: workers.finish_prepared_session(
+                            reviewed_run, (), remove_run_scratch.main),
+                            ["--tracked", str(reviewed_run)], cleanup_environment, self.root)
+
+                    if scenario == "end prepared run during admission":
+                        admission = reviewed_run / detached_runs.DETACHED_RUNS_DIR / ".start.lock"
+                        admission.parent.mkdir()
+                        with admission.open("a") as lock:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                            refused = end_prepared()
+                        self.assertEqual(refused.returncode, 1, refused.stderr)
+                        self.assertIn("a detached command is starting", refused.stderr)
+                        self.assertEqual(unit_runs.open_run(owner.current_session), reviewed_run)
+                        self.assertTrue(cache.is_dir())
+                    ended = end_prepared()
+                    self.assertEqual(ended.returncode, 0, ended.stderr)
+                    self.assertIsNone(unit_runs.open_run(owner.current_session))
+                    self.assertFalse(state_file.exists())
+                    self.assertFalse(cache.exists())
+                    _ = staff.set_run(owner.id, staff.OpenRun(reviewed_run))
+                    restarted = invoke_recorder(start_run, self.environment, self.root)
+                    self.assertEqual(restarted.returncode, 0, restarted.stderr)
+                    phase = invoke_recorder(["start-phase", "--session-dir", str(reviewed_run), "--phase-id", "review"],
+                                            self.environment, self.root)
+                    self.assertEqual(phase.returncode, 0, phase.stderr)
+                    closed = invoke_recorder(["finish-run", "--session-dir", str(reviewed_run), "--status", "stopped"],
+                                             self.environment, self.root)
+                    self.assertEqual(closed.returncode, 0, closed.stderr)
+                    continue
+                if scenario == "recorder state appears during start":
+                    published = json.dumps({unit_runs.OWNER_FIELD: owner.id, "run_id": "published"})
+                    set_run = staff.set_run
+
+                    def publish(identity: staff.StaffId, pointer: staff.OpenRun) -> staff.StaffRow:
+                        result = set_run(identity, pointer)
+                        _ = state_file.write_text(published)
+                        return result
+
+                    with (patch.object(unit_runs, "is_unit_run", return_value=True),
+                          patch.object(staff, "set_run", side_effect=publish),
+                          self.assertRaises(FileExistsError)):
+                        _ = invoke_recorder(start_run, self.environment, self.root)
+                    self.assertEqual(state_file.read_text(), published)
+                    continue
+                self.fixture.agent.without_done = False
+                self.fixture.agent.finish_after = 1
+                with self.world.process_starts():
+                    result = self.run_script(str(self.document))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                command = self.router.commands[-1]
+                self.assertEqual(command[command.index("--target") + 1], "staff-worker")
+                self.assertEqual(command[command.index("--policy") + 1], "astra-reviewer")
+                run = Path(command[command.index("--session-dir") + 1])
+                review = run / "review.md"
+                self.assertFalse(review.exists())
+                self.assertIn(f"Submitted: {review}", result.stdout)
+                self.assertNotIn(self.fixture.agent.final, result.stdout)
+                pending = self.run_script("--read", str(review), "--run-directory", str(run))
+                self.assertEqual(pending.returncode, 1)
+                self.assertIn("not completed", pending.stderr)
+                pane = self.fixture.agent.submitted[-1][0]
+                row = self.fixture.agent.row(pane)
+                self.fixture.agent.complete(pane)
+
+                def completion() -> progress_history.HookCompletion:
+                    state = cast(dict[str, dict[str, dict[str, object]]],
+                                 json.loads((run / unit_runs.STATE_FILE).read_text()))
+                    saved = progress_history.hook_completion(state["pass"][row.name])
+                    self.assertIsInstance(saved, progress_history.HookCompletion)
+                    assert isinstance(saved, progress_history.HookCompletion)
+                    return saved
+
+                save = progress_history.save_hook_completion
+
+                def interrupt_final_save(directory: Path, instance: str, saved: progress_history.HookCompletion) -> None:
+                    if saved.recording_done:
+                        raise InterruptedError("final record interrupted")
+                    save(directory, instance, saved)
+
+                def finish_run() -> subprocess.CompletedProcess[str]:
+                    return invoke_recorder(["finish-run", "--session-dir", str(run), "--status", "completed"],
+                                           self.environment, self.root)
+
+                def run_pointer() -> staff.OpenRun | staff.NoRun:
+                    current = staff.by_id(owner.id)
+                    assert current is not None
+                    return current.run
+
+                with patch.dict(os.environ, self.environment):
+                    if scenario in ("concurrent reviewers", "run end while a reviewer runs", "capacity stop"):
+                        second_name = staff.WorkerName.parse("second-review")
+                        prompt = run / "second-prompt.md"
+                        _ = prompt.write_text("Review the second document.\n")
+                        with self.world.process_starts():
+                            self.assertEqual(worker.dispatch(owner.id, second_name, "review", prompt, session_dir=run,
+                                slot=second_name.value, phase="astra-review", kind="review", launcher_command=["review"],
+                                reply=run / "second-review.md"), worker.DispatchSubmission.SUBMITTED)
+                        second_pane = self.fixture.agent.submitted[-1][0]
+                        second = self.fixture.agent.row(second_pane)
+                        second_id = str(worker_panes.worker_pass(second, run)["instance_id"])
+                        self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
+                        self.assertEqual(run_pointer(), staff.OpenRun(run))
+                        self.assertEqual(progress_history.pass_for_finalization(run, second_id)["status"], "active")
+                        self.assertIn(second_pane, self.world.locations)
+                        if scenario == "capacity stop":
+                            stopped = worker_capacity.stop_worker(owner, second, herdr.Herdr(herdr.shared_session()))
+                            self.assertIsInstance(stopped, worker_capacity.WorkerStopped)
+                            saved = progress_history.hook_completion(progress_history.pass_for_finalization(run, second_id))
+                            assert isinstance(saved, progress_history.HookCompletion)
+                            self.assertEqual(saved.outcome, turn_end.TurnOutcome.STOPPED)
+                            self.assertEqual(saved.stopped_reply, progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE)
+                            self.assertTrue(saved.finished and saved.pane_closed and saved.role_released and saved.recording_done)
+                            self.assertNotIn(second_pane, self.world.locations)
+                        else:
+                            if scenario == "run end while a reviewer runs":
+                                pending_end = finish_run()
+                                self.assertNotEqual(pending_end.returncode, 0)
+                                self.assertIn("can still be running", pending_end.stderr)
+                                self.assertEqual(run_pointer(), staff.OpenRun(run))
+                                self.assertEqual(progress_history.pass_for_finalization(run, second_id)["status"], "interrupted")
+                            self.fixture.agent.complete(second_pane)
+                            outcome = (turn_end.TurnOutcome.STOPPED if scenario == "run end while a reviewer runs"
+                                       else turn_end.TurnOutcome.DONE)
+                            self.assertEqual(self.fixture.finish(second.name), outcome)
+                        self.assertEqual(run_pointer(), staff.OpenRun(run))
+                    elif scenario == "recover after release":
+                        with (patch.object(progress_history, "save_hook_completion", side_effect=interrupt_final_save),
+                              self.assertRaisesRegex(InterruptedError, "final record interrupted")):
+                            _ = self.fixture.finish(row.name)
+                        self.assertTrue(completion().pane_closed)
+                        self.assertFalse(completion().finished)
+                        ended = finish_run()
+                        self.assertEqual(ended.returncode, 0, ended.stderr)
+                        self.assertIsInstance(run_pointer(), staff.NoRun)
+                        self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
+                    else:
+                        self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
+                    if scenario == "unit":
+                        self.assertEqual(unit_runs.read_run_fields(run)["status"], "completed")
+                    else:
+                        self.assertTrue(completion().finished)
+                        if scenario != "recover after release":
+                            self.assertEqual(run_pointer(), staff.OpenRun(run))
+                        if scenario == "release interrupted":
+                            with (patch.object(staff, "clear_run", side_effect=InterruptedError("release interrupted")),
+                                  self.assertRaisesRegex(InterruptedError, "release interrupted")):
+                                _ = finish_run()
+                            self.assertEqual(run_pointer(), staff.OpenRun(run))
+                            recovered = invoke_recorder(["recover-run-ends", "--root", str(run.parent)],
+                                                        self.environment, self.root)
+                            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        else:
+                            ended = finish_run()
+                            self.assertEqual(ended.returncode, 0, ended.stderr)
+                        self.assertIsInstance(run_pointer(), staff.NoRun)
+                        with patch.object(progress_history, "_recorder_lock",
+                                          side_effect=AssertionError("a closed run needs no recorder lock")):
+                            repeated = finish_run()
+                        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                saved_report = self.run_script("--read", str(review), "--run-directory", str(run))
+                self.assertEqual(saved_report.returncode, 0, saved_report.stderr)
+                self.assertEqual(review.read_text().strip(), self.fixture.agent.last_replies[str(row.current_session)])
+                self.assertIn(self.fixture.agent.last_replies[str(row.current_session)], saved_report.stdout)
+                self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
 
     def test_read_delivers_late_done_after_launcher_error_before_the_notice_stamp(self) -> None:
         self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)

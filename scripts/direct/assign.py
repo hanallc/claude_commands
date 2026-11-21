@@ -21,6 +21,7 @@ import uuid
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, NoReturn, cast, final, overload
 
@@ -211,6 +212,8 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
 
 def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> tuple[Path, str]:
     director = staff.runtime_id()
+    record = staff.initial_snapshot()
+    owner = record.owner_of(director)
     session = args.session_dir
     if not session:
         opened = unit_runs.open_run(director)
@@ -219,11 +222,23 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
         elif unit_runs.environ("RUN_DIR"):
             session = unit_runs.environ("RUN_DIR")
         else:
+            if owner is not None and owner.kind == "showrunner" and staff_worker.CompletionArtifacts(owner, Path.cwd()).protected:
+                refuse("showrunner reviews require the owner's recorded run directory")
             result = call(["bash", str(SCRIPTS / "prepare_session.sh")], env, capture=True)
             session = result.stdout.strip().splitlines()[-1].removeprefix("Session ready at ")
             print(session, flush=True)
-    run = Path(session).expanduser().resolve()
-    run.mkdir(parents=True, exist_ok=True)
+    run = Path(session).expanduser().absolute()
+    owner = next((row for row in record.find(kind="showrunner") if isinstance(row.run, staff.OpenRun)
+                  and row.run.path.absolute() == run), owner)
+    if (owner is not None and owner.kind == "showrunner"
+            and (artifacts := staff_worker.initializing_review_run_artifacts(owner, run)).protected):
+        paths = worker_panes.enrolled_worker_owner(owner)
+        if not isinstance(paths, worker_panes.OrdinaryWorkerOwner) and (refusal := worker_panes.review_run_refusal(owner, run, paths)):
+            refuse(refusal.reason)
+        _ = artifacts.authorized_path(run)
+    else:
+        run = run.resolve()
+        run.mkdir(parents=True, exist_ok=True)
     env["UNIT_RUN_DIR"] = str(run)
     state_path = run / "progress_history_state.json"
     if not state_path.exists():
@@ -287,10 +302,11 @@ class AssignmentResult:
     def failed_pass_command(self) -> list[str]:
         return [PYTHON, PROGRESS, "finish-pass", "--session-dir", str(self.run), "--status", "error"]
 
-    def capture_style(self, code: int) -> None:
+    def capture_style(self, code: int, artifacts: staff_worker.CompletionArtifacts) -> None:
         assignment = self.style_assignment
         if isinstance(assignment, StyleAssignment) and not assignment.captured:
-            style_review.finish(assignment.directory, assignment.summary, code)
+            style_review.finish(assignment.directory, assignment.summary, code,
+                                artifacts=artifacts if artifacts.protected else style_review.StyleArtifactPolicy.STANDALONE)
             assignment.captured = True
 
 
@@ -337,13 +353,16 @@ class CompletionApplied(StrEnum):
 
 
 def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
-                   actions: progress_history.CompletionActions, reply: Path, *, completed: bool = True) -> CompletionApplied | CompletionFailed:
+                   actions: progress_history.CompletionActions, reply: Path, *,
+                   owner: staff.StaffRow, completed: bool = True) -> CompletionApplied | CompletionFailed:
     """Run the saved completion actions after the hook proves DONE."""
-    if actions.summary_file:
-        write_text_atomic(Path(actions.summary_file), reply.read_text())
+    artifacts = staff_worker.CompletionArtifacts(owner, run)
     summary = Path(actions.summary_file) if actions.summary_file else reply
+    if actions.summary_file:
+        artifacts.write(summary, artifacts.read(reply))
     if actions.style_directory:
-        style_review.finish(Path(actions.style_directory), summary, 0 if completed else 1)
+        style_review.finish(Path(actions.style_directory), summary, 0 if completed else 1,
+                            artifacts=artifacts if artifacts.protected else style_review.StyleArtifactPolicy.STANDALONE)
     phase = object_map(passed.get("phase"))
     phase_id = text(phase.get("id"))
     if passed.get("kind") == "review" and actions.summary_file:
@@ -351,13 +370,12 @@ def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
         write_review_result(run, phase_id, row.name, str(row.current_session), text(passed.get("lens")),
             actions.review_pass, float(stamp) if isinstance(stamp, (int, float)) else 0, completed, summary)
     if actions.summary_file:
-        owner = worker_admission.parent(staff.local_snapshot(), run=run)
         shown = f"{owner.name} · {text(passed.get('kind'))}"
-        content = summary.read_text()
+        content = artifacts.read(summary)
         if shown not in content:
-            write_text_atomic(summary, shown + "\n\n" + content)
+            artifacts.write(summary, shown + "\n\n" + content)
     if actions.report_file:
-        write_text_atomic(Path(actions.report_file), summary.read_text())
+        artifacts.write(Path(actions.report_file), artifacts.read(summary))
     failure = ""
     if actions.resolve_fix:
         env = dict(os.environ, UNIT_RUN_DIR=str(run), UNIT_TEAM_ROLE=text(passed.get("team_slot")), UNIT_PASS_OWNER="launcher")
@@ -368,13 +386,18 @@ def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
             failure = ("assign.sh: repair resolution failed; run these commands:\n" + command + "\n"
                        + failure_detail(result))
     if actions.status_file:
-        write_text_atomic(Path(actions.status_file), "done\n" if completed and not failure else "error\n")
+        artifacts.write(Path(actions.status_file), "done\n" if completed and not failure else "error\n")
     return CompletionFailed(failure) if failure else CompletionApplied.APPLIED
 
 
-def finish_herdr_recording(run: Path, actions: progress_history.CompletionActions, *,
-                           completed: bool) -> CompletionApplied | CompletionFailed:
+def finish_herdr_recording(run: Path, instance: str, actions: progress_history.CompletionActions, *,
+                           status: Literal["completed", "stopped", "error"]) -> CompletionApplied | CompletionFailed:
     """Record the phase and run ends after the hook completes the pass."""
+    if actions.finish_phase == "astra-review" and actions.finish_run:
+        slot = progress_history.pass_for_finalization(run, instance).get("team_slot")
+        private = unit_runs.read_run_fields(run).get(unit_runs.PRIVATE_HELPER_SLOT)
+        if not private or private != slot:
+            return CompletionApplied.APPLIED
     commands = [["finish-phase", "--phase-id", actions.finish_phase]] if actions.finish_phase else []
     if actions.finish_run:
         commands.append(["finish-run"])
@@ -382,7 +405,7 @@ def finish_herdr_recording(run: Path, actions: progress_history.CompletionAction
     for arguments in commands:
         try:
             result = call([PYTHON, PROGRESS, *arguments, "--session-dir", str(run),
-                           "--status", "completed" if completed and not failures else "error"],
+                           "--status", "error" if failures and status == "completed" else status],
                           dict(os.environ), capture=True, check=False)
             if result.returncode:
                 failures.append(failure_detail(result))
@@ -412,17 +435,21 @@ def finish_repair(dispatch: AssignmentResult, code: int) -> bool:
 def settle_dispatch(dispatch: AssignmentResult, code: int, completed: bool, shown: str,
                     status: Path, summary: Path, reply: Path) -> int:
     """Completed work wins; otherwise ownership loss precedes refusal or failure."""
+    owner = worker_admission.parent(staff.local_snapshot(), run=dispatch.run)
+    artifacts = staff_worker.CompletionArtifacts(owner, dispatch.run)
     if dispatch.args.early_ready:
         lens_suffix = f"_{dispatch.args.lens}" if dispatch.args.lens else ""
-        _ = (status.parent / f"{dispatch.worker}_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
+        artifacts.write(status.parent / f"{dispatch.worker}_status{lens_suffix}", "reviewed\n" if completed else "error\n")
     if completed and reply.exists():
-        _ = summary.write_text(reply.read_text())
-    dispatch.capture_style(0 if completed else code or 1)
+        artifacts.write(summary, artifacts.read(reply))
+    dispatch.capture_style(0 if completed else code or 1, artifacts)
     record_review(dispatch, completed, summary)
-    if shown not in summary.read_text():
-        _ = summary.write_text(shown + "\n\n" + summary.read_text())
+    content = artifacts.read(summary)
+    if shown not in content:
+        content = shown + "\n\n" + content
+        artifacts.write(summary, content)
     if dispatch.args.reply_file:
-        _ = Path(dispatch.args.reply_file).write_text(summary.read_text())
+        artifacts.write(Path(dispatch.args.reply_file), content)
     if not 3 <= code <= 8:
         if dispatch.role == "fix" and dispatch.env.get("UNIT_RESOLVES_ROUND") == "1":
             if not finish_repair(dispatch, 0 if completed else code or 1):
@@ -430,7 +457,7 @@ def settle_dispatch(dispatch: AssignmentResult, code: int, completed: bool, show
         elif dispatch.pass_open and not completed:
             _ = call(dispatch.failed_pass_command(), dispatch.env)
             dispatch.pass_open = False
-    _ = status.write_text("done\n" if completed else "error\n")
+    artifacts.write(status, "done\n" if completed else "error\n")
     return 0 if completed else code if 3 <= code <= 8 else 2 if code == 2 else 1
 
 
@@ -472,7 +499,19 @@ def launcher_command() -> list[str]:
     return ["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]]
 
 
-def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_history.AssignmentLaunchExit,
+@dataclass(frozen=True)
+class ProtectedLauncherStatus:
+    artifacts: staff_worker.CompletionArtifacts
+    slot: str
+    path: Path
+
+
+class RecorderLauncherStatus(StrEnum):
+    RECORDER = "the recorder owns the launcher status"
+
+
+def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_history.AssignmentLaunchExit, *,
+                              status: ProtectedLauncherStatus | RecorderLauncherStatus = RecorderLauncherStatus.RECORDER,
                               ) -> progress_history.RecordedAssignmentLaunch | progress_history.AssignmentLaunchNotRecorded:
     """Wait for the worker to finish confirming submission before recording a failure."""
     if outcome is progress_history.AssignmentLaunchExit.SUBMITTED:
@@ -481,14 +520,45 @@ def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_
     if isinstance(target, progress_history.AssignmentLaunchNotRecorded):
         return target
     with worker_panes.worker_id_lock(target, blocking=True):
-        return progress_history.record_assignment_launch_exit(run, instance, outcome)
+        if isinstance(status, ProtectedLauncherStatus):
+            record = staff.local_snapshot()
+            row = record.by_id(target)
+            if row is None:
+                raise OSError(f"{target}: launcher status owner is unavailable")
+            status.artifacts.validate_status(worker_panes.worker_pass(row, run, record=record))
+        result = progress_history.record_assignment_launch_exit(run, instance, outcome)
+        if (isinstance(status, ProtectedLauncherStatus)
+                and isinstance(result, progress_history.RecordedAssignmentLaunch) and result.failure_recorded):
+            status.artifacts.write(progress_history.worker_artifact(status.path, status.slot, result.slot), "error\n")
+        return result
+
+
+def post_launch_board(artifacts: staff_worker.CompletionArtifacts, slot: str, kind: Literal["register", "blocked"],
+                      message: str, env: dict[str, str]) -> None:
+    if not artifacts.protected:
+        _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(artifacts.run), slot, kind, message], env)
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", slot) or slot in (".", ".."):
+        raise ValueError(f"invalid board slot: {slot}")
+    override = env.get("UNIT_NOW_EPOCH")
+    stamp = (datetime.fromtimestamp(int(override.split(".")[0])).astimezone()
+             if override else datetime.now().astimezone()).strftime("%Y-%m-%dT%H:%M:%S%z")
+    flattened = message.translate(str.maketrans("\n\r\t", "   "))
+    body = "".join(character for character in flattened if character.isprintable())[:900]
+    with artifacts.append(artifacts.run / "board.log") as stream:
+        _ = stream.write(f"{stamp} [{slot}] {kind}: {body}\n")
 
 
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
+    owner = worker_admission.parent(staff.local_snapshot(), run=run)
+    artifacts = staff_worker.CompletionArtifacts(owner, run)
+    enrolled = artifacts.protected
+    if enrolled and (refusal := worker_panes.review_role_refusal(owner, cast(staff.WorkerRole, role))):
+        refuse(refusal.reason)
     directory = phase_reservation.phase_directory(run, phase)
-    directory.mkdir(parents=True, exist_ok=True)
+    artifacts.mkdir(directory)
     launcher = launcher_command()
     slot = args.to or args.new_worker or role
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
@@ -501,12 +571,12 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
-    if not message.is_file() or message.read_text() != content:
-        write_text_atomic(message, content)
+    artifacts.write(message, content)
     end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
     style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
     if args.style_since:
-        style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
+        style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end,
+            artifacts=artifacts if enrolled else style_review.StyleArtifactPolicy.STANDALONE), summary)
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
@@ -523,25 +593,34 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         selection = resolve_model(args, role, env)
         command += ["--model", selection[1], "--effort", selection[2]]
     if args.early_ready:
-        command += ["--early-ready", str(Path(args.early_ready).resolve())]
+        command += ["--early-ready", str(Path(args.early_ready).absolute() if enrolled else Path(args.early_ready).resolve())]
     number = sum(entry.get("event_type") == "pass_started" for entry in recorded_passes(run)) + 1
-    write_text_atomic(directory / f"dispatch_{number}_paths.json",
+    artifacts.write(directory / f"dispatch_{number}_paths.json",
                       json.dumps({"worker": slot, "round": number, "paths": paths}))
     actions = progress_history.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
         style_directory=str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
+    worker_env = dict(env)
+    if enrolled:
+        _ = worker_env.pop(progress_history.ASSIGN_STATUS_FILE_ENV, None)
+        actions = replace(actions, status_file=str(status))
+    else:
+        worker_env[progress_history.ASSIGN_STATUS_FILE_ENV] = str(status)
     instance = uuid.uuid4()
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
                 "--new-pass-instance-id", str(instance)]
-    worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
-    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
-              f"role={role}; status in {status}"], env)
-    _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
-              "header", slot, role], env, check=False)
-    with log.open("a") as output:
+    post_launch_board(artifacts, slot, "register", f"role={role}; status in {status}", env)
+    if enrolled:
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+        with artifacts.append(run / "heartbeat.log") as stream:
+            _ = stream.write(f"---- {stamp} [{slot}] ----\n{role}\n")
+    else:
+        _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
+                  "header", slot, role], env, check=False)
+    with artifacts.append(log) as output:
         offset = output.tell()
         result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
-    with log.open() as output:
+    with artifacts.open_read(log) as output:
         _ = output.seek(offset)
         for line in output:
             if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
@@ -550,7 +629,8 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     if result.returncode:
         outcome = (progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS if result.returncode in (1, 2)
                    else progress_history.AssignmentLaunchExit.FAILED)
-    recorded = record_worker_launch_exit(run, instance, outcome)
+    launcher_status = ProtectedLauncherStatus(artifacts, slot, status) if enrolled else RecorderLauncherStatus.RECORDER
+    recorded = record_worker_launch_exit(run, instance, outcome, status=launcher_status)
     selected, failure_recorded = slot, False
     if isinstance(recorded, progress_history.RecordedAssignmentLaunch):
         selected, failure_recorded = recorded.slot, recorded.failure_recorded
@@ -560,8 +640,8 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         selected = progress_history.launch_slot(run, slot, launcher)
     if selected != slot:
         target_log = progress_history.worker_artifact(log, slot, selected)
-        _ = log.replace(target_log)
-        write_text_atomic(directory / f"dispatch_{number}_paths.json",
+        artifacts.rename(log, target_log)
+        artifacts.write(directory / f"dispatch_{number}_paths.json",
                           json.dumps({"worker": selected, "round": number, "paths": paths}))
     if result.returncode:
         if (failure_recorded and outcome is progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS
@@ -569,8 +649,10 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
             env["UNIT_PASS_OWNER"] = "launcher"
             failed = AssignmentResult(args, run, phase, role, selected, env, style_assignment=style)
             _ = finish_repair(failed, result.returncode)
-        _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), selected, "blocked",
-                  f"role={role}; exit {result.returncode}; log {log}"], env)
+        if isinstance(style, StyleAssignment) and failure_recorded:
+            style_review.finish(style.directory, summary, result.returncode,
+                                artifacts=artifacts if enrolled else style_review.StyleArtifactPolicy.STANDALONE)
+        post_launch_board(artifacts, selected, "blocked", f"role={role}; exit {result.returncode}; log {log}", env)
     return result.returncode or staff_worker.DispatchSubmission.SUBMITTED
 
 
@@ -737,7 +819,12 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                       import_module("scripts.herdr.turn_end").repeat_completion_notice)
         repeat(args.new_worker, parent, run, passed)()
         return staff_worker.DispatchSubmission.SUBMITTED
-    for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
+    state = unit_runs.read_run_fields(run)
+    start = ["start-run", "--session-dir", str(run), "--working-dir", str(cwd)]
+    if (not state and run.resolve().parent == unit_runs.ASTRA_RUN_ROOT.resolve()
+            and not any(unit_runs.points_to_run(row, run) for row in staff.initial_snapshot().rows)):
+        start += ["--private-helper", args.new_worker]
+    for arguments in (start,
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
                        "--phase-title", "Astra review"]):
         recorded = subprocess.run([PYTHON, PROGRESS, *arguments], env=env, text=True,
@@ -745,6 +832,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         if recorded.returncode:
             return recorded.returncode
     parent = worker_admission.parent(staff.snapshot(), run=run)
+    private_helper = unit_runs.read_run_fields(run).get(unit_runs.PRIVATE_HELPER_SLOT) == args.new_worker
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
     before = staff_worker.rows_before_launch()
@@ -766,7 +854,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                 session_dir=run, slot=args.new_worker, phase="astra-review", kind="astra",
                 reply=Path(args.reply_file), policy=policy, started=current,
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
-                    finish_phase="astra-review", finish_run=True),
+                    finish_phase="astra-review" if private_helper else "", finish_run=private_helper),
                 launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold, notices=notices)
             if result is staff_worker.DispatchSubmission.SUBMITTED:
                 _ = cleanup.pop_all()
@@ -778,7 +866,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
 
 def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> int:
     """Publish, hold, review, and close one managed Astra worker."""
-    run = Path(args.session_dir).expanduser().resolve()
+    run = Path(args.session_dir).expanduser().absolute()
     return execute_astra_review_herdr(args, run, cwd, prompt, env)
 
 

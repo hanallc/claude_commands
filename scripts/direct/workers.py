@@ -13,13 +13,15 @@ except FileNotFoundError:
 import argparse
 import sys
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Never, Protocol, cast
 
 from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.direct import recorder_state
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib import unit_runs
 
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
     from scripts.lib.names import JobKey
 
 STATE = "progress_history_state.json"
+_scratch_cleanup_owner: ContextVar[unit_runs.PreparedRunEnded | unit_runs.CleanupOwnerFromState] = ContextVar(
+    "scratch_cleanup_owner", default=unit_runs.CleanupOwnerFromState.RECORDED)
 
 
 class WorkerUnavailable(Exception):
@@ -126,19 +130,58 @@ def protected_working_directories(run: Path) -> tuple[Path, ...]:
 
     membership = staff.local_snapshot()
     return tuple(worker_panes.worker_directory(membership, staff.StaffId(str(record["staff_id"]))).resolve()
-                 for _, record in retained_detached_runs(run))
+                 for _, record in retained_detached_runs(run, prepared=_scratch_cleanup_owner.get()))
 
 
-def retained_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
+def retained_detached_runs(
+    run: Path, *,
+    prepared: unit_runs.PreparedRunEnded | unit_runs.CleanupOwnerFromState = unit_runs.CleanupOwnerFromState.RECORDED,
+) -> tuple[tuple[Path, dict[str, object]], ...]:
     """Commands owned by unit workers, including workers about to be paused."""
     membership = staff.local_snapshot()
-    owner = worker_admission.parent(membership, run=run)
+    owner = worker_admission.cleanup_parent(membership, run, prepared)
     members = membership.find(kind="worker", parent=owner.id)
     references = {str(row.id) for row in members}
     histories = {run, *(path for row in members for path in session_staff.worker_run_index(membership).get(row.id, ()))}
     return tuple((path, record) for history in sorted(histories)
                  for path, record in live_detached_runs(history)
                  if record.get("staff_id") in references)
+
+
+def finish_prepared_session(run: Path, ended_runs: Sequence[Path], remove_scratch: Callable[[], int]) -> int:
+    """End the current pointer last and pass its verified owner to batch cleanup."""
+    from scripts.astra import design_roles
+    from scripts.direct import progress_history, remove_workers
+
+    membership = staff.local_snapshot()
+    owner = membership.by_current_session(staff.runtime_id())
+    if owner is None or owner.kind not in ("unit", "showrunner") or not unit_runs.points_to_run(owner, run):
+        print(f"end_session: {run}: the prepared run pointer changed.", file=sys.stderr)
+        return 1
+    for folder in ended_runs:
+        state = recorder_state.read_state(folder / unit_runs.STATE_FILE)
+        if state.get(unit_runs.OWNER_FIELD) != owner.id or not unit_runs.terminal_run(state):
+            print(f"end_session: {folder}: the run has no completed end for this owner.", file=sys.stderr)
+            return 1
+    ended = progress_history.end_run(run, progress_history.RunEndRequested("stopped"))
+    if isinstance(ended, unit_runs.RunExecutionBlocker):
+        print(f"end_session: {run}: run end remains pending. {ended.reason}.", file=sys.stderr)
+        return 1
+    prepared = ended if isinstance(ended, unit_runs.PreparedRunEnded) else unit_runs.CleanupOwnerFromState.RECORDED
+    if worker_admission.cleanup_parent(staff.local_snapshot(), run, prepared).id != owner.id:
+        print(f"end_session: {run}: the run owner changed before cleanup.", file=sys.stderr)
+        return 1
+    status = 0
+    runs = (run, *ended_runs)
+    for folder in runs:
+        status |= design_roles.main(["unbind-run", str(folder)])
+    status |= remove_workers.remove_selected_workers({folder.resolve() for folder in runs}, prepared=prepared)
+    token = _scratch_cleanup_owner.set(prepared)
+    try:
+        status |= remove_scratch()
+    finally:
+        _scratch_cleanup_owner.reset(token)
+    return status
 
 
 def held_claude_sessions() -> set[str]:

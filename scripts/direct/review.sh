@@ -46,9 +46,10 @@
 
 set -euo pipefail
 LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
-"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
+
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/assign_gate.py"
 
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
@@ -69,6 +70,23 @@ while [[ "${1:-}" == --* ]]; do
   shift 2
 done
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
+# Resolve the owner before this launcher writes artifacts.
+"${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${SESSION_DIR}" <<'PYOWNER'
+import sys
+from pathlib import Path
+
+with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+
+from scripts.direct import progress_history, recorder_state
+from scripts.production import staff
+
+try:
+    progress_history.require_ordinary_review_run(Path(sys.argv[2]))
+except (OSError, ValueError, recorder_state.OldRecorderState, staff.StaffUnreadable, staff.StaffRefused) as error:
+    raise SystemExit(f"review.sh: {error}. Use assign.sh --role review --style-since.") from error
+PYOWNER
+
 # A named phase keeps its review files in its own directory, so two phases reviewing at once
 # never write the same pass's findings, status or log. Run-wide files stay in the session.
 ARTIFACT_DIR="${SESSION_DIR}"
