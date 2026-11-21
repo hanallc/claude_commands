@@ -542,6 +542,7 @@ Send saves the capture intent with the native item.
 The capture key belongs to the browser draft, even when The List saves a different request ID.
 The server recreates a missing capture lookup from the native item after a restart.
 The item retains its page data if the screenshot is unavailable.
+The server skips the legacy screenshot when the saved capture intent is unavailable.
 An invalid capture object, address, or viewport makes the screenshot unavailable.
 An address for a different page also makes the screenshot unavailable.
 Send still saves the capture intent and the List draft link.
@@ -549,6 +550,12 @@ Send rejects an invalid capture key or a key that belongs to another draft or it
 The server attaches the screenshot when the capture finishes, even if you leave the page.
 A saved capture remains available after the preview expires.
 The server retries a failed attachment and keeps one screenshot on the item.
+If a read error prevents the server from locating the item, it keeps the screenshot for a retry.
+The server marks the capture complete after it attaches the screenshot or finds it unavailable.
+It saves any Bug case update before it marks the capture complete.
+The server then removes the bound capture record from the private capture store.
+Startup skips completed captures and resumes the remaining work.
+A later request for a completed key does not start another screenshot.
 After a lost response, Send retries the original payload, draft ID and capture key.
 The dialog keeps any edits for a new Send.
 Review and the List refresh the saved row and keep the current address, scroll position, and focus while the dialog holds edits.
