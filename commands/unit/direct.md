@@ -186,6 +186,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
   to the working branch's own name on origin, never to the default branch except <FastTrack/>.
+  A branch whose hash went to the showrunner is never amended, rebased or force-pushed.
   <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
   phases.
 - A phase reservation is released only by the successful-checkpoint path in
@@ -330,6 +331,12 @@ worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
 Records are in `${SESSION_DIR}/detached_runs/`, each log beside its record.
 For Python test runs, pass `--kind python-tests` before `--`.
+To limit memory for the detached command, use this scope form.
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>
+```
+
 `start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.

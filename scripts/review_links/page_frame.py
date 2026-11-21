@@ -14,10 +14,11 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
+from scripts.review_links import setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
-OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "rebuilds", "review"))
+OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "rebuilds", "review"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
 
@@ -148,7 +149,8 @@ def rendered(content: bytes, started: float, read_at: float) -> bytes:
 def template(source: str, text: str, page: str) -> str:
     """Fill the shared title, style and script in a static page template."""
     return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
-            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT))
+            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT)
+            .replace("__PAGE_SETTING_CONTROLS__", setting_controls.ASSETS))
 
 
 REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
