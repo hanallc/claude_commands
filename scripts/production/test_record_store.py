@@ -50,6 +50,9 @@ class NumberedRecordsTests(unittest.TestCase):
         _ = self.git(doc.parent, "worktree", "add", "--detach", str(linked))
         self.assertEqual(set(record_store.historical_issue_folders(doc)), {current})
         alternate = self.commit_folder(linked / doc.name, former)
+        alias = doc.parent / "old-linked"
+        alias.symlink_to(linked, target_is_directory=True)
+        self.assertEqual(set(record_store.historical_issue_folders(alias / doc.name)), {current, former})
         self.assertEqual(set(record_store.historical_issue_folders(doc)), {current, former})
         _ = self.git(linked, "switch", "--detach", first)
         self.assertEqual(set(record_store.historical_issue_folders(doc)), {current})

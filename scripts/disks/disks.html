@@ -358,11 +358,11 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
       return (name ? `<span class="tag run">${parts ? stepTip.nameParts(parts) : esc(name)}</span>` : "")
         + (row.used_by.showrunner ? `<span class="dim">${stepTip.roleName(row.used_by.showrunner)}</span>` : "");
     }
-    return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
+    return row.needs_review ? '<span class="tag go">review</span>' : "";
   };
   const slotRow = row => {
     const use = usedBy(row);
-    return `<tr data-tip="slot:${esc(row.name)}"><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
+    return `<tr data-tip="slot:${esc(row.key ?? row.name)}"><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
       + `<td class="n">${slotSize(row.size)}</td><td>${lastUsedText(row, now)}</td>`
       + (use ? `<td class="use wide">${use}</td>` : '<td class="dim wide">—</td>') + "</tr>";
   };
@@ -658,7 +658,7 @@ function slotStep(slot) {
   const age = builds ? Date.now() / 1000 - builds.read_at : NaN;
   // A missing read time gives NaN, which fails this check.
   if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
-  const here = row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine;
+  const here = row => row.key && row.slot_folder === (slot.key ?? slot.name) && row.slot_machine === slotReport.machine;
   const run = builds.walk?.find(here);
   if (run) return {tip: "row:" + run.key, name: run.name, name_parts:run.name_parts};
   const wait = builds.waiters?.find(here);
@@ -676,7 +676,7 @@ function tipFor(key) {
   }
   if (kind === "slot" && slotReport) {
     for (const group of slotReport.groups) {
-      const slot = group.slots.find(slot => slot.name === name);
+      const slot = group.slots.find(slot => (slot.key ?? slot.name) === name);
       if (!slot) continue;
       const step = slotStep(slot);
       return step ? stepTip.tooltipHtml(step.tip, builds)
@@ -695,12 +695,11 @@ function tipFor(key) {
 
 function slotsAbout(report) {
   const field = stepTip.field;
-  return [field("Build slots", "", "title"),
-    field("", "A slot is a worktree of one repository that build runs use again.", "long"),
-    field("", "A run takes the lowest free slot, checks out its commit and builds there. The slot keeps the build output, so the next run builds less.", "long"),
-    field("", "Each repository has a slot limit. A run waits when all its slots are in use.", "long"),
-    field("", `The nightly sweep deletes a free slot unused for ${report ? report.unused_days : "some"} days.`, "long"),
-    field("", "Size counts the worktree and its build output. A slot in use shows its step as the Builds page shows it.", "long")];
+  return [field("Test copies", "", "title"),
+    field("", "A test takes the lowest free copy number in its unit and checks out the commit.", "long"),
+    field("", "If all copies are in use, the test takes the smallest missing number.", "long"),
+    field("", "The copy keeps its build output for the next test.", "long"),
+    field("", `The nightly sweep deletes a free copy after ${report ? report.unused_days : "some"} days without use.`, "long")];
 }
 
 const SESSIONS_ABOUT = [stepTip.field("Session folders", "", "title"),
@@ -718,11 +717,11 @@ function groupTip(group, keepBytes) {
 
 function slotTip(slot, group, keepBytes, now, unusedDays) {
   const field = stepTip.field;
-  const rows = [field(slot.name, slot.used_by ? "in use" : slot.deleted_tonight ? "deleted tonight" : "free", "title"),
+  const rows = [field(slot.name, slot.used_by ? "in use" : slot.needs_review ? "review" : "free", "title"),
     field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
   if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
     stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"]));
-  if (slot.deleted_tonight) rows.push(field("", `No run used it for ${unusedDays} days, so the nightly sweep deletes it.`, "long", true));
+  if (slot.needs_review) rows.push(field("", `The nightly sweep lists this folder after ${unusedDays} days without use.`, "long", true));
   return rows;
 }
 
