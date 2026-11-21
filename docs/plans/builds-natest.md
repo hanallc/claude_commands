@@ -698,7 +698,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** each old test name is a row label in the new tables (compare the names before and after); the 3 broken-code checks of step 7 fail as stated; `module_cost.py` CPU of each changed module is not above its base, with both numbers and the host; 20 repeated runs of each changed module pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review.
 
-### Phase 404 — each dead-code candidate has its owner's answer  · status: todo
+### Phase 404 — each dead-code candidate has its owner's answer  · status: done (no code change)
+
+**As built:** 30 candidates on main 9f3459ec1b; every owner answered on 2026-11-21 (section "Dead-code answers" in `docs/plans/builds-natest-next.md`). Delete: 21 files in 9 owner groups. Keep: 8 (`roles_audit.py`, `worker_usage.py`, `phase_process.py`, `install_codex_agents.py`, `coverage_overlap.py`, and three style reader tools that the cargo-liner repository runs). The audit missed the cargo-liner callers; later audits read `~/rust/cargo-liner` as a root. Evidence: the session folder of this phase (`phases/404/evidence.md`).
 **Depends on:** none
 
 #### Work Order
