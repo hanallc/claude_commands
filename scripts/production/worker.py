@@ -1452,14 +1452,19 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
-    """Supply Claude child launchers and pane dispatch ids to the shared builder."""
+    """Supply pane dispatches and legacy Claude child launchers."""
     from scripts.agents.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:
         return ResumeWorkers()
+    try:
+        enrolled = isinstance(worker_panes.enrolled_worker_owner(holder), EnrolledPaths)
+    except ProductionPathsError as error:
+        raise ValueError(str(error)) from error
+    legacy_launches = [] if enrolled else worker_resumes(holder, record)
     results = {staff.StaffId(result.staff_id if isinstance(result, Unavailable) else result.seat["staff_id"]): result
-               for result in worker_resumes(holder, record)}
+               for result in legacy_launches}
     members = record.find(kind="worker", parent=parent)
     unavailable = [row for row in members if isinstance(results.get(row.id), Unavailable)]
     recorded = session_staff.worker_run_entries(record, unavailable) if unavailable else {}
@@ -1471,6 +1476,9 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
     scanned = {str(holder.current_session): [str(path) for path in runs]}
     with progress_history.dispatch_reads(record, runs):
         for row in members:
+            role = worker_panes.dispatch_role(row)
+            if enrolled and (not isinstance(role, str) or role not in worker_panes.REVIEW_ROLES):
+                continue
             run = worker_panes.worker_run(row, record=record, scanned=scanned)
             active = progress_history.active_dispatch(row.id, run)
             if isinstance(active, progress_history.ActiveDispatchUnavailable):
@@ -1478,6 +1486,12 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
                 continue
             if isinstance(active, progress_history.ActiveDispatch):
                 _ = results.pop(row.id, None)
+                if enrolled:
+                    try:
+                        _require_review_delivery(holder, row, run, worker_panes.worker_pass(row, run, record=record))
+                    except (OSError, ValueError, ProductionPathsError) as error:
+                        print(f"anomaly: {row.name}: {error}", file=sys.stderr)
+                        continue
                 step = resume_step(row, active)
                 if isinstance(step, (BusyPass, UnsubmittedAssignment)):
                     panes.append(PaneWorkerResume(row.id, step))
