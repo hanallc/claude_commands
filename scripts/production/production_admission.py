@@ -42,16 +42,9 @@ type DocumentBinding = staff.LiveDoc | staff.WrappedDoc
 
 @dataclass(frozen=True)
 class PendingDocumentRebind:
-    source: DocumentBinding
+    source_binding: DocumentBinding
+    source_path: Path
     destination: DocumentBinding
-    device: int
-    inode: int
-
-    def verify_file(self, binding: DocumentBinding) -> None:
-        info = binding.path.lstat()
-        if (not stat.S_ISREG(info.st_mode) or binding.path.resolve() != binding.path
-                or (info.st_dev, info.st_ino) != (self.device, self.inode)):
-            raise staff.StaffRefused(f"{binding.path}: the document differs from the prepared file")
 
 
 @dataclass(frozen=True)
@@ -98,8 +91,9 @@ class AdmissionReceipt:
                 [str(rename.admitted), str(rename.source), str(rename.destination)] for rename in self.renames]
         if isinstance(self.pending, PendingDocumentRebind):
             fields["pending"] = {
-                "source": _binding_fields(self.pending.source), "destination": _binding_fields(self.pending.destination),
-                "device": self.pending.device, "inode": self.pending.inode,
+                "source": _binding_fields(self.pending.source_binding),
+                "source_path": str(self.pending.source_path),
+                "destination": _binding_fields(self.pending.destination),
             }
         return fields
 
@@ -194,12 +188,10 @@ def _parse_receipt(raw: object, source: Path) -> AdmissionReceipt:
     if "pending" not in fields:
         return receipt
     pending = _fields(fields["pending"], source)
-    device, inode = pending.get("device"), pending.get("inode")
-    if not isinstance(device, int) or not isinstance(inode, int):
-        raise Refusal(f"{source}: invalid prepared file identity")
+    source_binding = _parse_binding(pending.get("source"), machine, source)
     return replace(receipt, pending=PendingDocumentRebind(
-        _parse_binding(pending.get("source"), machine, source),
-        _parse_binding(pending.get("destination"), machine, source), device, inode))
+        source_binding, _absolute_path(pending.get("source_path", str(source_binding.path)), source),
+        _parse_binding(pending.get("destination"), machine, source)))
 
 
 def _new_inventory(identities: frozenset[staff.StaffId]) -> dict[str, dict[str, object]]:
@@ -275,55 +267,87 @@ def _document_row(identity: staff.StaffId) -> staff.StaffRow:
     return row
 
 
+def canonical_document_path(path: Path) -> Path:
+    """Resolve a local document path and refuse a symbolic link at that path."""
+    if path.is_symlink():
+        raise staff.StaffRefused(f"{path}: the document path is a symbolic link")
+    return path.resolve()
+
+
+def _require_regular_document(path: Path) -> None:
+    if path.resolve() != path or not stat.S_ISREG(path.lstat().st_mode):
+        raise staff.StaffRefused(f"{path}: expected a regular document at the authorized path")
+
+
 def _require_moved_file(pending: PendingDocumentRebind) -> None:
-    if pending.source.path != pending.destination.path and os.path.lexists(pending.source.path):
-        raise staff.StaffRefused(f"{pending.source.path}: the source document still exists")
-    pending.verify_file(pending.destination)
+    source = pending.source_path
+    if source != pending.destination.path and (source.resolve() != source or os.path.lexists(source)):
+        raise staff.StaffRefused(f"{source}: the source document still exists or its path changed")
+    _require_regular_document(pending.destination.path)
 
 
 def _finish_receipt(path: Path, saved: bytes, receipt: AdmissionReceipt, pending: PendingDocumentRebind) -> AdmissionReceipt:
     renames = receipt.renames
-    if pending.source.path != pending.destination.path:
-        original = next((item for item in receipt.original_paths() if receipt.current_path(item) == pending.source.path), None)
+    if pending.source_path != pending.destination.path:
+        original = next((item for item in receipt.original_paths() if receipt.current_path(item) == pending.source_path), None)
         if original is None:
             raise staff.StaffRefused(f"{path}: the pending source is outside the receipt")
-        renames += (DocumentRename(original, pending.source.path, pending.destination.path),)
+        renames += (DocumentRename(original, pending.source_path, pending.destination.path),)
     finished = replace(receipt, renames=renames, pending=NoPendingDocumentRebind())
     _write_receipt(path, saved, finished)
     return finished
 
 
+def _read_required_receipt(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError as error:
+        raise staff.StaffRefused(f"{path}: the document change requires an admission receipt") from error
+
+
+def require_document_receipt(identity: staff.StaffId) -> None:
+    """Check for a valid receipt before changing production state."""
+    path = _receipt_path(identity)
+    _ = _parse_receipt(cast(object, json.loads(_read_required_receipt(path))), path)
+
+
 def prepare_document_rebind(row: staff.StaffRow, destination: DocumentBinding) -> None:
-    """Record the current binding and file identity before moving the file."""
+    """Record the change before moving the document.
+
+    Recovery trusts the current regular file at the authorized source before the move.
+    After the move, recovery trusts the current regular file at the authorized destination.
+    """
     source = row.doc
     if (isinstance(source, staff.DocUnfilled) or source.machine != destination.machine
             or source.machine != remote.local_machine()):
         raise staff.StaffRefused(f"{row.id}: prepare the change on the document machine")
     with _locked_receipt(row.id) as path:
-        try:
-            saved = path.read_bytes()
-        except FileNotFoundError:
-            return
+        saved = _read_required_receipt(path)
         if _document_row(row.id).doc != source:
             raise staff.StaffRefused(f"{row.id}: the staff document changed before the move")
         receipt = _parse_receipt(cast(object, json.loads(saved)), path)
+        destination = replace(destination, path=canonical_document_path(destination.path))
         if isinstance(receipt.pending, PendingDocumentRebind):
             pending = receipt.pending
-            if destination != pending.destination or source not in (pending.source, pending.destination):
+            if destination != pending.destination or source not in (pending.source_binding, pending.destination):
                 raise staff.StaffRefused(f"{row.id}: finish the pending document change to {pending.destination.path}")
-            if source == pending.source and os.path.lexists(source.path):
-                pending.verify_file(source)
+            if source == pending.source_binding and os.path.lexists(pending.source_path):
+                if canonical_document_path(source.path) != pending.source_path:
+                    raise staff.StaffRefused(f"{source.path}: the source path changed during the move")
+                _require_regular_document(pending.source_path)
             else:
                 _require_moved_file(pending)
             return
+        source_path = canonical_document_path(source.path)
+        if (receipt.machine != source.machine or source_path not in receipt.paths()
+                or destination.path != source_path and destination.path in receipt.paths()):
+            raise staff.StaffRefused(f"{row.id}: the receipt does not authorize this document change")
+        _require_regular_document(source_path)
         if source == destination:
             return
-        if (receipt.machine != source.machine or source.path not in receipt.paths()
-                or destination.path != source.path and destination.path in receipt.paths()):
-            raise staff.StaffRefused(f"{row.id}: the receipt does not authorize this document change")
-        info = source.path.lstat()
-        pending = PendingDocumentRebind(source, destination, info.st_dev, info.st_ino)
-        pending.verify_file(source)
+        if destination.path != source_path and os.path.lexists(destination.path):
+            raise staff.StaffRefused(f"{destination.path}: the destination already exists")
+        pending = PendingDocumentRebind(source, source_path, destination)
         _write_receipt(path, saved, replace(receipt, pending=pending))
 
 
@@ -332,22 +356,25 @@ def complete_document_rebind(row: staff.StaffRow, destination: DocumentBinding) 
     if destination.machine != remote.local_machine():
         raise staff.StaffRefused(f"{row.id}: complete the change on the document machine")
     with _locked_receipt(row.id) as path:
-        try:
-            saved = path.read_bytes()
-        except FileNotFoundError:
-            return row if row.doc == destination else staff.set_doc(row.id, destination)
+        saved = _read_required_receipt(path)
         receipt = _parse_receipt(cast(object, json.loads(saved)), path)
         pending = receipt.pending
-        if not isinstance(pending, PendingDocumentRebind):
-            return row if row.doc == destination else staff.set_doc(row.id, destination, expected=row.doc)
         actual = _document_row(row.id)
-        if destination != pending.destination or actual.doc not in (pending.source, pending.destination):
+        destination = replace(destination, path=canonical_document_path(destination.path))
+        if not isinstance(pending, PendingDocumentRebind):
+            if (isinstance(actual.doc, staff.DocUnfilled) or actual.doc.machine != receipt.machine
+                    or replace(actual.doc, path=canonical_document_path(actual.doc.path)) != destination
+                    or destination.path not in receipt.paths()):
+                raise staff.StaffRefused(f"{row.id}: the document change requires preparation")
+            _require_regular_document(destination.path)
+            return actual
+        if destination != pending.destination or actual.doc not in (pending.source_binding, pending.destination):
             raise staff.StaffRefused(f"{row.id}: the staff document conflicts with the pending change")
         _require_moved_file(pending)
-        for directory in dict.fromkeys((pending.source.path.parent, pending.destination.path.parent)):
+        for directory in dict.fromkeys((pending.source_path.parent, pending.destination.path.parent)):
             sync_folder(directory)
-        if actual.doc == pending.source:
-            actual = staff.set_doc(row.id, destination, expected=pending.source)
+        if actual.doc == pending.source_binding:
+            actual = staff.set_doc(row.id, destination, expected=pending.source_binding)
         _ = _finish_receipt(path, saved, receipt, pending)
         return actual
 
@@ -364,21 +391,25 @@ def verify_document_change(identity: staff.StaffId, source: DocumentBinding,
         raise staff.StaffUnreadable(f"{identity}: cannot read the admission receipt: {error}") from error
     try:
         receipt = _parse_receipt(cast(object, json.loads(saved)), path)
+        if receipt.machine != source.machine or source.machine != remote.local_machine():
+            raise staff.StaffRefused(f"{identity}: verify the change on the document machine")
         pending = receipt.pending
         if isinstance(pending, PendingDocumentRebind):
-            if conditional and (source, destination) == (pending.source, pending.destination):
+            if conditional and (source, destination) == (pending.source_binding, pending.destination):
                 _require_moved_file(pending)
                 return
         elif isinstance(destination, staff.DocUnfilled):
             # A demotion removes the live binding. The receipt can serve a rollback.
             return
-        elif (isinstance(destination, staff.WrappedDoc) and destination.machine == source.machine == receipt.machine
-              and destination.path == source.path and source.path in receipt.paths()):
-            return
-        elif (isinstance(source, staff.LiveDoc) and isinstance(destination, staff.LiveDoc)
-              and destination.machine == source.machine == receipt.machine
-              and len(receipt.paths()) == 2 and {source.path, destination.path} == set(receipt.paths())):
-            return
+        elif destination.machine == source.machine:
+            source_path = canonical_document_path(source.path)
+            destination_path = canonical_document_path(destination.path)
+            paths = receipt.paths()
+            if isinstance(destination, staff.WrappedDoc) and destination_path == source_path and source_path in paths:
+                return
+            if (isinstance(source, staff.LiveDoc) and isinstance(destination, staff.LiveDoc)
+                    and len(paths) == 2 and {source_path, destination_path} == set(paths)):
+                return
     except (OSError, ValueError, Refusal) as error:
         raise staff.StaffRefused(f"{identity}: cannot verify the document change: {error}") from error
     raise staff.StaffRefused(f"{identity}: an admitted document change requires a prepared move")

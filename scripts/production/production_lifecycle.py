@@ -36,7 +36,8 @@ from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, staged_notes_directory
 from scripts.production.production_admission import (
-    capture_rollout_inventory, complete_document_rebind, prepare_document_rebind, record_verified_move, require_admission,
+    canonical_document_path, capture_rollout_inventory, complete_document_rebind, prepare_document_rebind,
+    record_verified_move, require_admission, require_document_receipt,
     require_guard_ready as require_guard_ready,
     require_new_document as require_new_document,
 )
@@ -842,7 +843,7 @@ def wrap_production(name: str) -> Production:
     record = staff.snapshot()
     owner = showrunners.owner_for(name, record)
     if isinstance(owner.doc, staff.LiveDoc) and not owner.doc.path.exists():
-        source = owner.doc.path
+        source = canonical_document_path(owner.doc.path)
         checkout = Path(checked(source.parent, "wrap", "rev-parse", "--show-toplevel"))
         renames = checked(checkout, "wrap", "diff", "--cached", "--name-status",
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
@@ -1061,6 +1062,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if item not in done:
                 raise LifecycleStop("close-out", "held", f'{item} is not recorded done; finish it or get the owner\'s OK, then pass --close-out-done "{item}"')
             report("close-out", "ok", f"{item} (recorded done)")
+    require_document_receipt(runner.id)
     prepared = prepare_wrap_units(production, rows)
     tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
     commit_count = "0"

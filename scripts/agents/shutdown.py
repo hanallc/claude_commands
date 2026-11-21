@@ -2025,8 +2025,7 @@ def rename_check_branch(checkout: Path, target: str) -> str:
     return branch
 
 
-def _live_rename(doc: staff.LiveDoc, destination: Path, branch: str, name: str) -> LiveDocBranchMove | KeepDocBranch:
-    source = doc.path
+def _live_rename(source: Path, destination: Path, branch: str, name: str) -> LiveDocBranchMove | KeepDocBranch:
     if source != destination and source.exists() and unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
     path = source if source.exists() else destination
@@ -2093,25 +2092,26 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
         raise RenameRefused(f"{row.name}: the staff document is unfilled")
     if doc.machine != remote.local_machine():
         raise RenameRefused(f"{row.name}: run the document move on {doc.machine}")
-    destination = Path(to_doc).expanduser().resolve() if to_doc else doc.path
+    source = production_admission.canonical_document_path(doc.path)
+    destination = production_admission.canonical_document_path(Path(to_doc).expanduser()) if to_doc else source
     if isinstance(doc, staff.LiveDoc):
-        document = doc.path if doc.path.exists() else destination
+        document = source if source.exists() else destination
         if document.is_file() and isinstance(optional_field(
                 document.read_text(encoding="utf-8").splitlines(), MERGE_CHECKOUT_FIELD), FieldPresent):
-            return RenamePlan(row, new, _live_rename(doc, destination, to_branch, row.name))
+            return RenamePlan(row, new, _live_rename(source, destination, to_branch, row.name))
     if bool(to_doc) != bool(to_branch):
         raise RenameRefused("--to-doc and --to-branch are required together")
-    checkout = unit_move.checkout_folders(doc.path.parent).toplevel
+    checkout = unit_move.checkout_folders(source.parent).toplevel
     _ = destination.relative_to(checkout)
     branch = rename_check_branch(checkout, to_branch)
-    if doc.path != destination and doc.path.exists() and unit_move.exists(destination):
+    if source != destination and source.exists() and unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
-    if doc.path == destination and branch == to_branch:
+    if source == destination and branch == to_branch:
         return RenamePlan(row, new, KeepDocBranch())
-    source = str(doc.path.relative_to(checkout))
+    relative_source = str(source.relative_to(checkout))
     target = str(destination.relative_to(checkout))
-    entry = unit_move.git(checkout, "ls-files", "-s", "--", source)
-    if doc.path != destination and not doc.path.exists() and unit_move.exists(destination):
+    entry = unit_move.git(checkout, "ls-files", "-s", "--", relative_source)
+    if source != destination and not source.exists() and unit_move.exists(destination):
         target_entry = unit_move.git(checkout, "ls-files", "-s", "--", target)
         if unit_move.git(checkout, "ls-tree", "HEAD", "--", target):
             raise RenameRefused(f"destination already exists: {destination}")
@@ -2120,15 +2120,15 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
                 raise RenameRefused(f"destination already exists: {destination}")
         elif not entry:
             changes = unit_move.git(checkout, "diff", "--cached", "--name-status", "-z", "--find-renames",
-                                    "--", source, target).split("\0")
-            if len(changes) != 4 or not changes[0].startswith("R") or changes[1:3] != [source, target]:
+                                    "--", relative_source, target).split("\0")
+            if len(changes) != 4 or not changes[0].startswith("R") or changes[1:3] != [relative_source, target]:
                 raise RenameRefused(f"destination already exists: {destination}")
         entry = entry or target_entry
     staged_blob: StagedDocumentBlob | NoStagedDocumentBlob = NoStagedDocumentBlob()
     parts = entry.split(maxsplit=3)
     if len(entry.splitlines()) == 1 and len(parts) == 4 and parts[2] == "0":
         staged_blob = StagedDocumentBlob(parts[0], parts[1])
-    return RenamePlan(row, new, DocBranchMove(doc.path, destination, checkout, branch, to_branch, bool(entry), staged_blob))
+    return RenamePlan(row, new, DocBranchMove(source, destination, checkout, branch, to_branch, bool(entry), staged_blob))
 
 
 def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
@@ -2143,7 +2143,7 @@ def _rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
     row = staff.by_id(request.member.id)
     if row is None or isinstance(row.doc, staff.DocUnfilled):
         raise RenameRefused(f"{request.member.id}: the staff document is unavailable")
-    if row.doc.path not in (move.source, move.destination):
+    if production_admission.canonical_document_path(row.doc.path) not in (move.source, move.destination):
         raise RenameRefused(f"{row.id}: the staff document changed during the move")
     source = str(move.source.relative_to(move.checkout))
     destination = str(move.destination.relative_to(move.checkout))
@@ -2370,6 +2370,8 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
             return request
         move = request.move
         row = request.member
+        if isinstance(move, DocBranchMove) or to_doc:
+            production_admission.require_document_receipt(row.id)
         changed = row.name != request.name
         if not changed:
             changed = rename_qualified_workers(row)
