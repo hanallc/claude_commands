@@ -1,7 +1,8 @@
 """Shared excludes protect a unit file in every worktree, including clean tracked files."""
 import subprocess
 
-from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
+from scripts.lib.git_exclude import ExcludeRefused, ensure_exact_excluded, ensure_excluded, require_untracked_ignored
+from scripts.production.production_doc import NOTES_DIRECTORY
 from scripts.production.unit_config_test_support import UnitConfigFixture
 
 
@@ -75,3 +76,10 @@ class GitExcludeTests(UnitConfigFixture):
                 ensure_excluded(checkout, pattern)
         self.assertEqual(list(outside.iterdir()), [])
         self.assertNotIn("/one", self.exclude.read_text())
+
+    def test_the_exclusion_matches_an_empty_notes_directory(self) -> None:
+        relative = f"{NOTES_DIRECTORY}/fixture/"
+        (self.worktree / relative).mkdir(parents=True)
+        ensure_exact_excluded(self.worktree, relative)
+        require_untracked_ignored(self.worktree, relative)
+        self.assertIn("/" + relative, self.exclude.read_text().splitlines())

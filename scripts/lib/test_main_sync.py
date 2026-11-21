@@ -18,6 +18,10 @@ from typing import override
 
 from scripts.lib import live_settings, main_sync, waiting_rows
 from scripts.message import session_send
+from scripts.agents import remote
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.test_production_doc import enrolled_document
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -36,6 +40,7 @@ class MainSyncTests(unittest.TestCase):
         _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(unittest.mock.patch.dict(os.environ, {main_sync.STATE_ENV: str(self.root / "state")}))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         config = self.root / "config"
         config.mkdir()
         _ = (config / "send.conf").write_text("# range: 0.001..\nmain_sync_repeat_minutes=17\n")
@@ -146,6 +151,57 @@ class MainSyncTests(unittest.TestCase):
             _ = path.write_text("# whole: 1..\namount=2\n")
             self.assertEqual(main_sync.sync(self.checkout).state, main_sync.CURRENT)
         self.assertEqual(path.read_text(), "# whole: 1..\namount=3\n")
+
+    def test_enrolled_live_files_refuse_incoming_entries_and_keep_refs(self) -> None:
+        integration = self.root / "integration"
+        _ = git(self.checkout, "worktree", "add", "-qb", "integration", str(integration))
+        doc = self.checkout / "fixture-production-live.md"
+        enrolled_document(doc, self.checkout, integration, "integration", log="live/log.md")
+        log = self.checkout / "live/log.md"
+        log.parent.mkdir()
+        _ = log.write_text("current log\n")
+        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
+        refs = git(self.checkout, "for-each-ref", "--format=%(refname) %(objectname)")
+        doc_bytes = doc.read_bytes()
+        base = git(self.writer, "rev-parse", "HEAD")
+        for incoming, contents in (("live/log.md", "current log\n"), ("live/log.md", "different\n"),
+                                      ("live", "file in place of a directory\n"), ("live/log.md/entry", "entry\n")):
+            with self.subTest(incoming=incoming, contents=contents):
+                _ = git(self.writer, "reset", "--hard", base)
+                path = self.writer / incoming
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(contents)
+                _ = git(self.writer, "add", "--", incoming)
+                _ = git(self.writer, "commit", "-qm", "Conflicting entry")
+                _ = git(self.writer, "push", "-q", "--force", "origin", "HEAD:main")
+                outcome = main_sync.sync(self.checkout)
+                self.assertEqual(outcome.state, "live-file-conflict", outcome.detail)
+                self.assertIn(str(log), outcome.detail)
+                self.assertEqual((doc.read_bytes(), log.read_bytes()), (doc_bytes, b"current log\n"))
+                self.assertEqual(git(self.checkout, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
+
+        _ = git(self.writer, "reset", "--hard", base)
+        _ = git(self.writer, "push", "-q", "--force", "origin", "HEAD:main")
+        tip = self.commit("unrelated")
+        self.assertEqual(main_sync.sync(self.checkout).state, main_sync.ADVANCED)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), tip)
+        self.assertEqual((doc.read_bytes(), log.read_bytes()), (doc_bytes, b"current log\n"))
+
+        other_origin, other = self.root / "hana.git", self.root / "hana"
+        _ = git(self.root, "clone", "-q", "--bare", str(self.writer), str(other_origin))
+        _ = git(self.root, "clone", "-q", str(other_origin), str(other))
+        hana_integration = self.root / "hana-integration"
+        _ = git(other, "worktree", "add", "-qb", "init/catalyst", str(hana_integration))
+        hana_doc = other / "docs/plans/hana-production-live.md"
+        enrolled_document(hana_doc, other, hana_integration, "init/catalyst", log="docs/plans/hana-log.md")
+        hana_log = other / "docs/plans/hana-log.md"
+        _ = hana_log.write_text("hana log\n")
+        _ = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(remote.local_machine(), hana_doc))
+        later = self.commit("hana-update")
+        _ = git(self.writer, "push", "-q", str(other_origin), "HEAD:main")
+        self.assertEqual(main_sync.sync(other).state, main_sync.ADVANCED)
+        self.assertEqual(git(other, "rev-parse", "HEAD"), later)
+        self.assertEqual(hana_log.read_bytes(), b"hana log\n")
 
     def test_each_blocked_case_leaves_the_checkout_alone(self) -> None:
         _ = self.commit("b")

@@ -16,6 +16,10 @@ import unittest
 from scripts.lint import gate_folders_delete
 from scripts.lint.sweep import gib
 from scripts.lib import scratch
+from scripts.agents import remote
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.test_production_doc import enrolled_document
 
 
 class GateFoldersDeleteTests(unittest.TestCase):
@@ -25,6 +29,7 @@ class GateFoldersDeleteTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.gates = self.root / "gates"
         self.gates.mkdir()
 
@@ -197,6 +202,23 @@ class GateFoldersDeleteTests(unittest.TestCase):
                 else:
                     self.assertIn(f"kept {gate}: rescue failed: ", result.stdout)
                     self.assertEqual((gate / "checkout" / "source.txt").read_text(), "edited source\n")
+
+    def test_protected_integration_keeps_its_parent_gate_in_both_modes(self) -> None:
+        gate = self.gate()
+        source, checkout = self.linked_checkout(gate)
+        _ = self.git(source, "branch", "-M", "main")
+        _ = self.git(checkout, "switch", "-c", "integration")
+        doc = source / "fixture-production-live.md"
+        enrolled_document(doc, source, checkout, "integration")
+        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
+        refs = self.git(source, "for-each-ref", "--format=%(refname) %(objectname)")
+        before = {path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.assertIn(f"kept {gate}: contains protected production checkout {checkout}",
+                              self.delete(dry_run=dry_run))
+                self.assertEqual({path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}, before)
+                self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
 
     def test_remote_mirrors_dot_folders_and_root_files_are_kept(self) -> None:
         entries = {".remote-mirrors": "mirror record", ".claude": "private state", ".other": "other state"}

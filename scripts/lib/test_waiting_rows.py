@@ -21,6 +21,10 @@ from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_ro
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import pending_rows
+from scripts.agents import remote
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.test_production_doc import enrolled_document
 
 SETTINGS = "# whole: 1..\namount=2\n# whole: 1..\nlimit=5\n"
 REGISTRY = "[assignments]\ndirect=codex\nreview=gpt-a:high\n"
@@ -41,6 +45,7 @@ class WaitingRowsTests(unittest.TestCase):
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Rows Test", GIT_AUTHOR_EMAIL="rows@example.invalid",
                            GIT_COMMITTER_NAME="Rows Test", GIT_COMMITTER_EMAIL="rows@example.invalid")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         origin = self.root / "origin.git"
         self.run_git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
         self.checkout, self.peer = self.root / "checkout", self.root / "peer"
@@ -86,6 +91,28 @@ class WaitingRowsTests(unittest.TestCase):
     def peer_order(self, stem: str, key: str, order: int) -> None:
         _ = (self.peer / waiting_rows.ORDER_PATH).write_text(json.dumps({stem: {key: order}}) + "\n")
         self.run_git(self.peer, "add", waiting_rows.ORDER_PATH)
+
+    def test_a_checkout_move_keeps_an_ignored_live_log_on_incoming_conflict(self) -> None:
+        integration = self.root / "integration"
+        self.run_git(self.checkout, "worktree", "add", "-qb", "integration", str(integration))
+        doc = self.checkout / "fixture-production-live.md"
+        enrolled_document(doc, self.checkout, integration, "integration", log="live.log")
+        log = self.checkout / "live.log"
+        _ = log.write_text("live log\n")
+        _ = (self.checkout / ".git/info/exclude").write_text("/live.log\n")
+        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
+        _ = (self.peer / "live.log").write_text("incoming log\n")
+        self.run_git(self.peer, "add", "live.log")
+        self.run_git(self.peer, "commit", "-qm", "Incoming log")
+        self.run_git(self.peer, "push", "-q", "origin", "main")
+        self.run_git(self.checkout, "fetch", "-q", "origin")
+        head = self.output("rev-parse", "HEAD")
+        index = (self.checkout / ".git/index").read_bytes()
+        with self.assertRaisesRegex(OSError, "conflicts with incoming live.log"):
+            waiting_rows.move_to(self.checkout, "origin/main", fast_forward=True)
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual((self.checkout / ".git/index").read_bytes(), index)
+        self.assertEqual(log.read_bytes(), b"live log\n")
 
     def test_replace_value_preserves_only_whitespace_comments(self) -> None:
         for original, expected in (
