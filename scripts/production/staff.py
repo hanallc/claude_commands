@@ -651,15 +651,18 @@ class StaffSnapshot:
 
     def by_worktree(self, machine: str, path: Path) -> StaffRow | None:
         """A producer's worktree is its launch folder and owns no path."""
-        matches = [row for row in self.rows if row.kind != "producer" and isinstance(row.worktree, PresentWorktree)
-                   and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
-        return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
+        resolved = path.expanduser().resolve()
+        matches = [(row, folder) for row in self.rows if row.kind != "producer"
+                   and isinstance(row.worktree, PresentWorktree) and row.worktree.machine == machine
+                   and resolved.is_relative_to(folder := row.worktree.path.resolve())]
+        return max(matches, key=lambda match: len(match[1].parts))[0] if matches else None
 
     def unit_by_worktree(self, machine: str, path: Path) -> StaffRow | None:
         """A path that a live unit holds belongs to that unit; the newest row wins within each state."""
+        resolved = path.expanduser().resolve()
         matches = [row for row in reversed(self.rows) if row.kind == "unit"
                    and isinstance(row.worktree, (PresentWorktree, RemovedWorktree))
-                   and row.worktree.machine == machine and row.worktree.path == path]
+                   and row.worktree.machine == machine and row.worktree.path.resolve() == resolved]
         return next((row for row in matches if isinstance(row.worktree, PresentWorktree)),
                     next(iter(matches), None))
 
@@ -1332,8 +1335,10 @@ def _found_backends(rows: Sequence[StaffRow],
     if running is None:
         running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
                    if any(identity not in codex_sessions for identity in wanted.values()) else frozenset())
-    for current, identity in wanted.items():
-        if identity not in codex_sessions and (current in running or bool(sessions.transcript_locations(current))):
+    claude_candidates = {current: identity for current, identity in wanted.items() if identity not in codex_sessions}
+    transcripts = sessions.transcript_session_ids(claude_candidates.keys() - running)
+    for current, identity in claude_candidates.items():
+        if current in running or current in transcripts:
             found[identity] = ClaudeBackend()
     return found
 

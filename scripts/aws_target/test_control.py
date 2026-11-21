@@ -66,6 +66,7 @@ class ControlTests(CostFixture):
         self.notice_accepted = True
         self.failure_reason = 'AccessDenied: account 123456789012'
         self.omitted = ''
+        _ = (self.root / 'build_steps.conf').write_text('names.gate=gate\n')
         values_path = self.root / 'cloud_gate.conf'
         self.configure_gate("""spot_candidate_regions=us-east-1 us-west-1 us-east-1
 instance_types=c7a.4xlarge m7a.2xlarge
@@ -545,10 +546,10 @@ region_transfer_usd={"us-west-1":0.00015}
         home, other = self.regions
         events: list[dict[str, object]] = []
         for attempt, size, region, box_s in (('fast', fast, home, 360), ('slow', slow, home, 720)):
-            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': region}
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'gate', 'region': region}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
-        events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'merge-gate', 'region': home, 'result': 'refused',
+        events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'gate', 'region': home, 'result': 'refused',
                        'time': self.clock.now - 3600 - 400, 'error_code': 'InsufficientInstanceCapacity'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
@@ -568,10 +569,10 @@ region_transfer_usd={"us-west-1":0.00015}
                              * len(self.regions))
         # Every column after the region holds a number.
         self.assertEqual(tables[fast].headers[-1], 'paid runs')
-        self.assertIn('merge gate (minutes)', tables[fast].headers)
+        self.assertIn('gate (minutes)', tables[fast].headers)
         self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
         self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
-                         f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+                         f'Cheapest gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
         self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
         self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
@@ -584,7 +585,7 @@ region_transfer_usd={"us-west-1":0.00015}
         region = self.regions[0]
         size = self.standard[0]
         attempt: dict[str, object] = {
-            'attempt': 'fixture', 'instance_type': size, 'mode': 'merge-gate', 'region': region}
+            'attempt': 'fixture', 'instance_type': size, 'mode': 'gate', 'region': region}
         launched = {**attempt, 'result': 'launched', 'time': now - 600}
         finished = {**attempt, 'result': 'finished', 'time': now - 240, 'gate_s': 300}
         book = ledger.CostLedger(self.state)
@@ -621,7 +622,7 @@ region_transfer_usd={"us-west-1":0.00015}
         # The billed type runs yesterday and today; the other type runs only today. Only yesterday has a bill.
         for attempt, size, finished in (('old', billed_size, midnight - 3600), ('new', billed_size, midnight + 60),
                                         ('due', due_size, midnight + 60)):
-            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'gate', 'region': home}
             events.extend(({**row, 'time': finished - 360, 'result': 'launched'},
                            {**row, 'time': finished, 'result': 'finished', 'gate_s': 300}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
@@ -642,19 +643,19 @@ region_transfer_usd={"us-west-1":0.00015}
         size = self.standard[0]
         home = self.regions[0]
         events: list[dict[str, object]] = []
-        for attempt, mode, box_s in (('gate', 'merge-gate', 360), ('targeted', 'targeted-test', 120)):
+        for attempt, mode, box_s in (('gate', 'gate', 360), ('targeted', 'test-affected', 120)):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
         refusal: dict[str, object] = {'instance_type': size, 'region': home, 'result': 'refused',
                                       'time': self.clock.now - 7200, 'error_code': 'InsufficientInstanceCapacity'}
-        events.extend(({**refusal, 'attempt': 'gate', 'mode': 'merge-gate'},
-                       *({**refusal, 'attempt': 'targeted', 'mode': 'targeted-test'} for _ in range(2)),
+        events.extend(({**refusal, 'attempt': 'gate', 'mode': 'gate'},
+                       *({**refusal, 'attempt': 'targeted', 'mode': 'test-affected'} for _ in range(2)),
                        # A request from before launch rows recorded a mode counts only when every kind counts.
                        {**refusal, 'attempt': 'old'}, {**refusal, 'attempt': 'old', 'result': 'launched'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertEqual([costs.scope.name for costs in tables.runs], ['merge-gate', 'targeted-test', 'both'])
+        self.assertEqual([costs.scope.name for costs in tables.runs], ['gate', 'test-affected', 'both'])
         self.assertEqual([(costs.refused.rows[0][:2], costs.launched.rows[0][:2]) for costs in tables.runs],
                          [((size, count), (size, launched)) for count, launched in (('1', '1'), ('2', '1'), ('4', '3'))])
         end = datetime.fromtimestamp(self.clock.now, UTC)
@@ -676,7 +677,7 @@ region_transfer_usd={"us-west-1":0.00015}
         home = self.regions[0]
         events: list[dict[str, object]] = []
         for attempt, size, box_s in (('eight', 'c7a.8xlarge', 240), ('four', 'c7a.4xlarge', 420)):
-            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'gate', 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
         end = datetime.fromtimestamp(self.clock.now, UTC)
@@ -687,7 +688,7 @@ region_transfer_usd={"us-west-1":0.00015}
                                             ('m7a.8xlarge', home, [240], same), ('m7a.4xlarge', home, [420], same),
                                             ('m7a.2xlarge', home, [], same), ('unknown', home, [], same)):
             with self.subTest(size=size, region=region):
-                self.assertEqual(evidence.box_seconds(size, region, ('merge-gate',)), ([Decimal(time) for time in times], source))
+                self.assertEqual(evidence.box_seconds(size, region, ('gate',)), ([Decimal(time) for time in times], source))
 
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -711,7 +712,10 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertGreater(data["render_seconds"], 0)
         self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
-                         [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
+                         [('gate', 'Gates'), ('test-affected', 'Targeted runs'), ('both', 'Both')])
+        self.assertTrue(data['runs'][0]['explanation'].startswith('USD per gate, '))
+        self.assertEqual(data['runs'][0]['refused']['title'], 'Refused gate requests (capacity and quota)')
+        self.assertEqual(data['runs'][0]['launched']['title'], 'Launched gate boxes')
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
         # The fixture lowest zone price is 0.25 USD/h for every type and region; the region column has no number.
@@ -722,6 +726,8 @@ region_transfer_usd={"us-west-1":0.00015}
             self.assertNotIn('title', table)
         # The Spot and Gate columns in Prices and quotas show these values.
         run_headers = data['runs'][0]['tables'][0]['headers']
+        self.assertEqual(data['runs'][0]['scope'], 'gate')
+        self.assertIn('gate (minutes)', run_headers)
         self.assertNotIn(spot_table.SPOT_HEADER, run_headers)
         self.assertNotIn(spot_table.ESTIMATE_HEADER, run_headers)
         self.assertEqual(data['runs'][0]['tables'][0]['right'], list(range(1, len(run_headers))))
@@ -792,15 +798,15 @@ region_transfer_usd={"us-west-1":0.00015}
         home = self.regions[0]
         events: list[dict[str, object]] = []
         # The ledger contains a short targeted run of a type outside the deployment.
-        for attempt, kind, mode, box_s in (('a', self.standard[0], 'merge-gate', 360), ('b', size, 'targeted-test', 60)):
+        for attempt, kind, mode, box_s in (('a', self.standard[0], 'gate', 360), ('b', size, 'test-affected', 60)):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': kind, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
         paid = {costs.scope.name: next(table for table in costs.tables if table.title == size).rows[0][5:] for costs in tables.runs}
-        self.assertEqual(paid, {'merge-gate': ('bill due', 'no runs', '0'),
-                                'targeted-test': ('bill due', '1 bill due', '0'),
+        self.assertEqual(paid, {'gate': ('bill due', 'no runs', '0'),
+                                'test-affected': ('bill due', '1 bill due', '0'),
                                 'both': ('bill due', '1 bill due', '0')})
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],
                          [self.standard[0], None, self.standard[0]])
