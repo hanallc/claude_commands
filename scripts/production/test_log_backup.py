@@ -1,159 +1,115 @@
-"""Keep the newest LOG copies from explicit backup calls and production checks."""
+"""Use temporary Git repositories to verify backup and restore."""
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import foreign_hostname
-
 import os
-import subprocess
-import sys
-import tempfile
-import unittest
-from unittest import mock
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
-from zoneinfo import ZoneInfo
+import subprocess
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from tempfile import TemporaryDirectory
+import tarfile
+import unittest
+from unittest.mock import patch
 
 from scripts.agents import remote
 from scripts.production import log_backup, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-
-# Script completion deadlines only bound hangs; startup can be slow under load.
-SCRIPT = Path(__file__).with_name("log_backup.py")
-CHECK = Path(__file__).with_name("production_check.sh")
-ZONE = ZoneInfo("America/Los_Angeles")
-NOON = datetime(2026, 10, 12, 12, 0, tzinfo=ZONE)
-
-
-def setUpModule() -> None:
-    unittest.enterModuleContext(foreign_hostname())
 
 
 class LogBackupTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.root: Path = Path()
-        self.log: Path = Path()
-        self.doc: Path = Path()
-        self.state: Path = Path()
-        self.backups: Path = Path()
-        self.owner_id: staff.StaffId = staff.StaffId("")
+    def test_production_check_reports_status_without_starting_backup(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            document = root / "production.md"
+            check = Path(__file__).with_name("production_check.sh")
+            with isolated_staff_file(root / "staff.json", {}):
+                owner = fixture_member("showrunner", name="backup-owner",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
+                for status, code in (("running", 0), ("wrapped", 2), ("paused", 1)):
+                    with self.subTest(status=status):
+                        _ = document.write_text(f"> **Status: PRODUCTION — {status}.**\n")
+                        result = subprocess.run(["zsh", str(check), owner.id], capture_output=True, text=True,
+                                                env={**os.environ, "HOME": str(root), "XDG_STATE_HOME": str(root)},
+                                                check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual((result.returncode, result.stdout, result.stderr), (code, "", ""))
+                        self.assertFalse((root / log_backup.BACKUP_ROOT).exists())
 
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        checkout = self.root / "checkout"
-        self.log = checkout / "docs/plans/demo-log.md"
-        self.log.parent.mkdir(parents=True)
-        self.state = self.root / "state"
-        self.doc = self.root / "demo-production.md"
-        self.write_doc("running")
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
-            "SHOWRUNNER_STATE_DIR": str(self.state),
-        })))
-        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
-        _ = staff.update_current_session(owner.id, staff.native_id("2798657c-063d-4dcb-9c0a-b20bb56cfa53"))
-        self.owner_id = owner.id
-        self.backups = self.state / owner.id / "log-backups"
+    def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
+        with (TemporaryDirectory() as folder,
+              patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})):
+            root = Path(folder)
+            state = root / "staff-state"
+            backup_root = root / "backups"
+            checkout = root / "worktree"
+            checkout.mkdir()
+            document = checkout / "demo-production.md"
+            log = checkout / "LOG.md"
+            notes = checkout / "notes"
+            notes.mkdir()
+            _ = document.write_bytes(b"Production\r\n")
+            _ = log.write_bytes(b"First entry\r\n")
+            note = notes / "review.txt"
+            _ = note.write_bytes(b"\x00\xff\r\n")
+            _ = (notes / ".gitattributes").write_text("* text eol=lf\n")
+            mirror = root / "mac.git"
+            mirror.mkdir()
+            _ = log_backup.git(mirror, "init", "--bare", "--initial-branch=main")
 
-    def write_doc(self, status: str, *, log_field: bool = True) -> None:
-        fields = [
-            f"> **Status: PRODUCTION — {status}.** demo",
-            "- **Merge branch:** `demo`",
-            f"- **Showrunner checkout:** `{self.root / 'checkout'}`",
-            "- **User zone:** America/Los_Angeles — demo",
-        ]
-        if log_field:
-            fields.insert(2, "- **Log:** `docs/plans/demo-log.md`")
-        _ = self.doc.write_text("\n".join(fields) + "\n", encoding="utf-8")
+            def measure(repack: bool) -> str:
+                if repack:
+                    _ = log_backup.git(mirror, "gc", "--no-prune")
+                return log_backup.command("du", "-sk", str(mirror))
 
-    def names(self) -> list[str]:
-        return sorted(path.name for path in self.backups.iterdir()) if self.backups.exists() else []
+            def destination(identity: str) -> log_backup.BackupMirror:
+                self.assertEqual(identity, owner.id)
+                return log_backup.BackupMirror(str(mirror), measure)
 
-    def run_script(self, script: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
-                              env={**os.environ, "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state)})
+            with isolated_staff_file(root / "staff.json", {}):
+                owner = fixture_member("showrunner", name="backup-owner",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
+                sources = log_backup.BackupSources(document, log, notes)
+                live = staff.local_snapshot()
+                legacy = state / owner.id / log_backup.LEGACY_COPIES
+                legacy.mkdir(parents=True)
+                _ = (legacy / "log-old.md").write_bytes(b"Original copy\r\n")
+                repository = backup_root / owner.id / log_backup.BACKUP_CHECKOUT
+                with patch.object(log_backup, "production_sources", return_value=sources):
+                    displaced = mirror.with_name("unavailable.git")
+                    _ = mirror.rename(displaced)
+                    self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 1)
+                    first = log_backup.git(repository, "rev-parse", "HEAD")
+                    mirror = displaced.rename(mirror)
+                    for item in (document, log):
+                        item.unlink()
+                    wrapped = staff.StaffSnapshot(())
+                    self.assertEqual(log_backup.backup_all(backup_root, state, wrapped, destination, 1), 0)
+                    self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), first)
+                    self.assertEqual((backup_root / owner.id / log_backup.LEGACY_COPIES / "log-old.md").read_bytes(),
+                                     b"Original copy\r\n")
 
-    def test_a_log_is_copied_under_its_stamp(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        target = log_backup.backup(self.log, self.backups, NOON)
-        self.assertEqual(target, self.backups / "log-20261012T1200.md")
-        self.assertEqual(self.names(), ["log-20261012T1200.md"])
-        self.assertEqual((self.backups / "log-20261012T1200.md").read_text(encoding="utf-8"), "- 11:59 PDT: merged\n")
-
-    def test_an_unchanged_log_is_not_copied_again(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        _ = log_backup.backup(self.log, self.backups, NOON)
-        self.assertIsNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=15)))
-        self.assertEqual(self.names(), ["log-20261012T1200.md"])
-        _ = self.log.write_text("- 11:59 PDT: merged\n- 12:20 PDT: gate green\n", encoding="utf-8")
-        self.assertIsNotNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=30)))
-        self.assertEqual(self.names(), ["log-20261012T1200.md", "log-20261012T1230.md"])
-
-    def test_an_emptied_or_missing_log_is_never_copied(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        _ = log_backup.backup(self.log, self.backups, NOON)
-        for emptied in ("", " \n\n"):
-            with self.subTest(emptied=emptied):
-                _ = self.log.write_text(emptied, encoding="utf-8")
-                self.assertIsNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=15)))
-        self.log.unlink()
-        self.assertIsNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=30)))
-        self.assertEqual(self.names(), ["log-20261012T1200.md"])
-        self.assertEqual((self.backups / "log-20261012T1200.md").read_text(encoding="utf-8"), "- 11:59 PDT: merged\n")
-
-    def test_only_the_newest_copies_are_kept(self) -> None:
-        for tick in range(log_backup.KEEP + 2):
-            _ = self.log.write_text(f"- event {tick}\n", encoding="utf-8")
-            _ = log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=15 * tick))
-        names = self.names()
-        self.assertEqual(len(names), log_backup.KEEP)
-        self.assertEqual(names[0], "log-20261012T1230.md")
-        self.assertEqual((self.backups / names[-1]).read_text(encoding="utf-8"), f"- event {log_backup.KEEP + 1}\n")
-
-    def test_the_command_copies_into_the_production_s_own_directory(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        names = self.names()
-        self.assertEqual(len(names), 1)
-        self.assertRegex(names[0], r"^log-\d{8}T\d{4}\.md$")
-        self.assertEqual(result.stdout, f"copied to {self.backups / names[0]}\n")
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), "backup-owner"]).stdout, "nothing new to copy\n")
-
-    def test_the_command_refuses_a_doc_it_cannot_read(self) -> None:
-        self.write_doc("running", log_field=False)
-        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("log_backup: production doc lacks Log", result.stderr)
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT)]).returncode, 2)
-
-    def test_the_update_check_copies_the_log_of_a_running_production_only(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        for status, code, copied in (("wrapped", 2, 0), ("paused", 1, 0), ("running", 0, 1)):
-            with self.subTest(status=status):
-                self.write_doc(status)
-                result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
-                self.assertEqual(result.returncode, code, result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(len(self.names()), copied)
-
-    def test_an_unknown_staff_id_keeps_the_check_unsuccessful(self) -> None:
-        result = self.run_script(["zsh", str(CHECK), "00000000-0000-4000-8000-000000000000"])
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(self.names(), [])
-
-    def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
-        self.write_doc("running", log_field=False)
-        result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("log_backup: production doc lacks Log", result.stderr)
-        self.assertEqual(self.names(), [])
-
-
-if __name__ == "__main__":
-    _ = unittest.main()
+                    _ = document.write_bytes(b"Production\r\n")
+                    _ = log.write_bytes(b"Second entry\r\n")
+                    self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 0)
+                    self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 0)
+                    second = log_backup.git(repository, "rev-parse", "HEAD")
+                    self.assertEqual(log_backup.git(repository, "rev-list", "--count", second), "2")
+                    for label, source in (("natedev", repository), ("mac", mirror)):
+                        restored = root / label
+                        _ = log_backup.command("git", "clone", "--quiet", "--no-checkout", str(source), str(restored))
+                        for commit, content in ((second, b"Second entry\r\n"), (first, b"First entry\r\n")):
+                            with self.subTest(label=label, commit=commit):
+                                archive = root / f"{label}-{commit}.tar"
+                                _ = log_backup.git(restored, "archive", f"--output={archive}", commit)
+                                destination_folder = root / f"{label}-restore-{commit}"
+                                destination_folder.mkdir()
+                                with tarfile.open(archive) as files:
+                                    files.extractall(destination_folder, filter="data")
+                                expected = {"document/demo-production.md": b"Production\r\n",
+                                            "log/LOG.md": content, "notes/review.txt": note.read_bytes(),
+                                            "notes/.gitattributes": b"* text eol=lf\n"}
+                                self.assertEqual({str(path.relative_to(destination_folder))
+                                                  for path in destination_folder.rglob("*") if path.is_file()},
+                                                 set(expected))
+                                for name, data in expected.items():
+                                    self.assertEqual((destination_folder / name).read_bytes(), data)

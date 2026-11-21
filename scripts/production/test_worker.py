@@ -32,6 +32,7 @@ from scripts.direct import assign, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
+from scripts.production.production_doc import EnrolledPaths
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, detached, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
@@ -827,7 +828,8 @@ class WorkerCommandTests(unittest.TestCase):
             agents_log.append(native.current_session, "impl", None, datetime.now(timezone.utc))
             _ = staff.set_worker_role(child.id, staff.KnownWorkerRole("impl"))
             _ = staff.set_worker_role(native.id, staff.KnownWorkerRole("impl"))
-            result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+            record = staff.snapshot()
+            result = worker.resume_workers(self.fixture.parent.id, record)
         saved = next(item for item in result.results if isinstance(item, Resumable))
         self.assertEqual(saved.seat["staff_id"], child.id)
         self.assertEqual(saved.seat["launcher_command"], command)
@@ -846,6 +848,30 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("legacy-child (impl, was working):", text)
         self.assertIn(str(self.run_dir / "legacy-child.resume-prompt.md"), text)
         self.assertIn(missing.reason, text)
+
+        main = self.fixture.root / "main"
+        integration = self.fixture.root / "integration"
+        doc = main / "production-live.md"
+        paths = EnrolledPaths(main=main, live_doc=doc, log=main / "LOG.md", notes=main / "notes",
+                              integration=integration)
+        holder = replace(self.fixture.parent, kind="showrunner", doc=staff.LiveDoc("natedev", doc),
+                         worktree=staff.PresentWorktree("natedev", integration), unit_type=staff.NotUnit())
+        reviewers = {row.id: replace(row, role=staff.KnownWorkerRole("review"))
+                     for row in record.rows if row.id in {child.id, native.id}}
+        enrolled = replace(record, rows=tuple(holder if row.id == holder.id else reviewers.get(row.id, row)
+                                              for row in record.rows))
+        for reply, keep_dispatch in ((self.reply, True), (main / "reply.md", False)):
+            with self.subTest(enrolled_reply=reply), patch.object(worker_panes, "resolve_production_paths", return_value=paths):
+                progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+                    progress_history.DispatchDelivery("Read the source.", dispatch, str(reply)))
+                resumed = worker.resume_workers(holder.id, enrolled)
+                self.assertEqual(resumed.results, [])
+                note = resume_message("a shutdown", workers=resumed)
+                self.assertNotIn("legacy-child.resume-prompt.md", note)
+                if keep_dispatch:
+                    self.assertIn(PaneWorkerResume(native.id, BusyPass(dispatch)), resumed.panes)
+                else:
+                    self.assertNotIn(native.id, {pane.staff_id for pane in resumed.panes})
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
         from scripts.lib.resume_message import UnsubmittedAssignment, NO_OWN_PASS

@@ -122,8 +122,10 @@ def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
 
 
 def protected_working_directories(run: Path) -> tuple[Path, ...]:
+    from scripts.herdr import worker_panes
+
     membership = staff.local_snapshot()
-    return tuple(session_staff.worker_directory(membership, staff.StaffId(str(record["staff_id"]))).resolve()
+    return tuple(worker_panes.worker_directory(membership, staff.StaffId(str(record["staff_id"]))).resolve()
                  for _, record in retained_detached_runs(run))
 
 
