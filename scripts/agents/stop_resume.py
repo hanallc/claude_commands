@@ -571,11 +571,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
             pending = _reserve_producer_pane(request, kind, home, client)
             _save_producer_reservation(request, pending, client)
-        try:
-            pane_row = client.pane_row(pending.pane)
-        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            failure = herdr.agent_start_failure(error, session=client.session, pane=pending.pane, agent=request.name)
-            return ResumeFailed(request.name, herdr.format_start_failure(failure))
+        pane_row = client.pane_row(pending.pane)
         if isinstance(pane_row, herdr.NoPane) or pane_row.get("terminal_id") != pending.terminal:
             if resend_opening:
                 raise ValueError("the reserved pane changed. Run agents resume without the resend option.")
@@ -601,11 +597,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             _save_producer_reservation(request, pending, client)
             if retained is not None:
                 pane_launch.retire_launch(pane_record.record_path(client.session), lost.pane, retained)
-        try:
-            starting = isinstance(client.pane_activity(pending.pane), herdr.PaneAtShell)
-        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            failure = herdr.agent_start_failure(error, session=client.session, pane=pending.pane, agent=request.name)
-            return ResumeFailed(request.name, herdr.format_start_failure(failure))
+        starting = isinstance(client.pane_activity(pending.pane), herdr.PaneAtShell)
         if resend_opening and starting:
             raise ValueError("the reserved pane is at a shell. Run agents resume without the resend option.")
         if starting:
@@ -620,36 +612,25 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
                 _, _, arguments = starter.producer_launch(member)
                 if not isinstance(herdr.read_conversation(member.current_session, kind), herdr.StoppedConversation):
                     raise ValueError("the admitted producer conversation is not proved stopped")
-            with herdr.collect_diagnostics() as diagnostics:
-                try:
-                    shell_setup = ":"
-                    if kind == "claude":
-                        if recovering_admission:
-                            if not to and isinstance(opening, herdr.NoOpeningPrompt) and isinstance(pending.opening, ProducerOpeningUnconfirmed):
-                                selected = member_account.producer_account(kind)
-                                assert isinstance(selected, accounts.NamedAccount)
-                                if selected.dir.resolve() != pending.home.resolve():
-                                    pending = replace(pending, home=selected.dir)
-                                    _write_producer_reservation(request, pending)
-                            # A retry can follow an interruption between the write and the shell update.
-                            exports = shlex.join([f"{key}={value}" for key, value in account_reader.named_account_environment(pending.home).items()])
-                            shell_setup = f"export {exports}"
-                        herdr.trust_claude_launch(request.folder, pending.home)
-                        arguments = models_registry.claude_arguments(arguments,
-                            herdr.agent_base_environment(account_reader.named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
-                    client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
-                    outcome = herdr.start_agent(client.session, pending.pane, kind,
-                        trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
-                        int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)
-                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    outcome = herdr.agent_start_failure(error, session=client.session, pane=pending.pane, agent=request.name)
-            if isinstance(outcome, herdr.AgentNotStarted):
-                detail = "; ".join(filter(None, (*diagnostics, outcome.pane_detail)))
-                failure = herdr.start_failure_pane(client, replace(outcome, session=client.session,
-                    pane=pending.pane, agent=request.name, pane_detail=detail), pending.terminal)
-                return ResumeFailed(request.name, herdr.format_start_failure(failure))
-            for diagnostic in diagnostics:
-                herdr.report_diagnostic(diagnostic)
+            shell_setup = ":"
+            if kind == "claude":
+                if recovering_admission:
+                    if not to and isinstance(opening, herdr.NoOpeningPrompt) and isinstance(pending.opening, ProducerOpeningUnconfirmed):
+                        selected = member_account.producer_account(kind)
+                        assert isinstance(selected, accounts.NamedAccount)
+                        if selected.dir.resolve() != pending.home.resolve():
+                            pending = replace(pending, home=selected.dir)
+                            _write_producer_reservation(request, pending)
+                    # A retry can follow an interruption between the write and the shell update.
+                    exports = shlex.join([f"{key}={value}" for key, value in account_reader.named_account_environment(pending.home).items()])
+                    shell_setup = f"export {exports}"
+                herdr.trust_claude_launch(request.folder, pending.home)
+                arguments = models_registry.claude_arguments(arguments,
+                    herdr.agent_base_environment(account_reader.named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
+            client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
+            outcome = herdr.start_agent(client.session, pending.pane, kind,
+                trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
+                int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)
             if isinstance(outcome, herdr.PromptNotSubmitted):
                 raise OSError(outcome.reason)
         entry = client.producer_admission_launch(pending.pane, kind)
@@ -1593,7 +1574,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
     identity = session
     original: pane_launch.LaunchPublication | None = None
     attempt_pane = ""
-    start_failure: herdr.AgentNotStarted | None = None
     source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
     name_scope = _resume_names.set(names)
     start_scope = ExitStack()
@@ -1803,10 +1783,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 trust_arguments(kind, entry["cwd"], resume_arguments(entry)), herdr.NoOpeningPrompt(),
                 int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000),
                 agent=entry["name"] or identity, client=client)
-            if isinstance(launched.outcome, herdr.AgentNotStarted):
-                start_failure = launched.outcome
-                attempt_pane = launched.pane or tab.pane_id
-                raise herdr_types.HerdrFailure(start_failure.reason)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
             if message:
@@ -1849,40 +1825,16 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             _watch_resume(identity, tab.pane_id, label, started, requester, why)
         return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-        closed = False
-        cleanup_details: list[str] = []
         if original is not None and attempt_pane:
             try:
-                cleanup_client = (client if start_failure is not None and not isinstance(client, herdr.LaunchClientSource)
-                                  else herdr.Herdr(herdr.shared_session()))
+                cleanup_client = herdr.Herdr(herdr.shared_session())
                 destination_path = pane_record.record_path(cleanup_client.session)
                 attempt = pane_launch.resume_attempt(destination_path, attempt_pane)
-
-                def close_attempt(pane: str) -> bool:
-                    nonlocal closed
-                    if start_failure is None:
-                        return cleanup_client.close_tab_confirmed(pane)
-                    if not start_failure.terminal or start_failure.code == "wrong_target":
-                        return False
-                    with herdr.collect_diagnostics() as messages:
-                        try:
-                            closed = cleanup_client.close_tab_confirmed(pane, terminal=start_failure.terminal)
-                            return closed
-                        finally:
-                            cleanup_details.extend(messages)
-
                 pane_launch.finish_restore(original.path, original.entry, attempt, pane_launch.FailedResume(),
-                                           close=close_attempt, destination=destination_path, source_pane=source_pane)
+                                           close=cleanup_client.close_tab_confirmed, destination=destination_path, source_pane=source_pane)
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup:
-                cleanup_details.append(f"cleanup failed: {cleanup}")
-        if start_failure is not None:
-            if closed:
-                start_failure = replace(start_failure, pane_result=herdr.StartPaneResult.CLOSED)
-            elif not isinstance(client, herdr.LaunchClientSource):
-                start_failure = herdr.start_failure_pane(client, start_failure, start_failure.terminal)
-            failure = replace(start_failure, pane_detail="; ".join(filter(None, (start_failure.pane_detail, *cleanup_details))))
-            return ResumeFailed(identity, herdr.format_start_failure(failure))
-        return ResumeFailed(identity, "; ".join((str(error), *cleanup_details)))
+                return ResumeFailed(identity, f"{error}; cleanup failed: {cleanup}")
+        return ResumeFailed(identity, str(error))
     finally:
         _resume_names.reset(name_scope)
         start_scope.close()

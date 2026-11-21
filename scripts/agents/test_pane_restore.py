@@ -563,31 +563,10 @@ class PaneRestoreTests(unittest.TestCase):
         client = self.restored()
         code, output = self.run_restore(client)
         self.assertEqual(code, 1)
-        self.assertEqual(output.splitlines(), [
-            f"herdr agents:w1:p2: agent start failed: /work/alpha: trust anomaly: {target}: JSONDecodeError; pane retained"])
+        self.assertEqual(output.splitlines(), [f"/work/alpha: trust anomaly: {target}: JSONDecodeError"])
         self.assertEqual(client.started, [])
         self.assertEqual(client.closed, [])
         self.assertEqual(self.opened, [])
-
-    def test_pane_restore_start_failure_exit_table(self) -> None:
-        pane = "w1:p3"
-        for failure, expected in (
-                (herdr.AgentNotStarted("start timed out", screen="First line\nSecond line",
-                    session="agents", pane=pane, pane_result=herdr.StartPaneResult.CLOSED), 1),
-                (herdr.AgentNotStarted("shell target changed", code="wrong_target", launch_refused=True), 1),
-                (herdr.ClaudeTrustNotWritten("trust write failed"), 1)):
-            with (self.subTest(cause=failure.reason),
-                  mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(()))):
-                self.entry()
-                client = self.restored()
-                saved = pane_record.read("agents")
-                with (client.empty_shell(998042, self.root),
-                      mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched(pane, failure))):
-                    code, output = self.run_restore(client)
-                self.assertEqual(code, expected)
-                self.assertEqual(output.splitlines(), [herdr.format_start_failure(failure)])
-                self.assertEqual(pane_record.read("agents"), saved)
-                self.assertEqual(client.closed, [])
 
     def test_restore_of_a_unit_uses_the_saved_account(self) -> None:
         self.row = replace(self.row, kind="unit")

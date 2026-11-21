@@ -263,7 +263,6 @@ class LabeledSessionFound:
     """The unit has a session with its native runtime identity."""
 
     unit: unit_lookup.LabeledSession
-    terminal: str = ""
 
 
 @dataclass(frozen=True)
@@ -950,16 +949,10 @@ def close_unsent_session(request: UnitLaunch, outcome: herdr.PromptSubmitOutcome
     found = launched_unit(request)
     if isinstance(found, NoLabeledSession):
         return "; run the same command again"
-    with herdr.collect_diagnostics() as diagnostics:
-        try:
-            closed = herdr.close_agent(found.unit.place.session, found.unit.place.pane, terminal=found.terminal)
-        except herdr_types.HerdrFailure as error:
-            detail = " ".join(" ".join((*diagnostics, str(error))).splitlines())
-            return f"; its session {found.unit.place.session} could not be closed: {detail}"
-    if not closed:
-        detail = " ".join(" ".join(diagnostics).splitlines())
-        reason = f"; its session {found.unit.place.session} closure is unconfirmed"
-        return f"{reason}: {detail}" if detail else reason
+    try:
+        herdr.close_agent(found.unit.place.session, found.unit.place.pane)
+    except herdr_types.HerdrFailure as error:
+        return f"; its session {found.unit.place.session} could not be closed: {error}"
     return "; its session is closed: run the same command again"
 
 
@@ -1014,18 +1007,10 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> LabeledSessionFo
         return LabeledSessionFound(unit_lookup.LabeledSession(name,
             unit_lookup.LiveClaude(name, native, "", pending.process.pid), place, identity=unit_lookup.LiveSession(native)))
     try:
-        with herdr.observation_snapshot():
-            pane = unit_lookup.labeled_session(request.production.name, name)
-            if pane is None:
-                return NoLabeledSession()
-            if isinstance(pane.claude, unit_lookup.ClaudeNotRunning):
-                place = pane.place
-                observed = herdr.Herdr(place.session).pane_row(place.pane)
-                terminal = "" if isinstance(observed, herdr.NoPane) else observed.get("terminal_id", "")
-                return LabeledSessionFound(pane, terminal)
+        pane = unit_lookup.labeled_session(request.production.name, name)
     except OSError as error:
         raise Refusal(f"cannot tell whether Claude runs for {name}: {error}") from error
-    return LabeledSessionFound(pane)
+    return NoLabeledSession() if pane is None else LabeledSessionFound(pane)
 
 
 def registry_remote_control(claude: unit_lookup.Claude) -> bool:
@@ -1456,16 +1441,10 @@ def _main(argv: list[str]) -> int:
             _ = publish_unit(ready, record=identity_record)
             if isinstance(stopped_tab, LabeledSessionFound):
                 place = stopped_tab.unit.place
-                with herdr.collect_diagnostics() as diagnostics:
-                    try:
-                        closed = herdr.close_agent(place.session, place.pane, terminal=stopped_tab.terminal)
-                    except herdr_types.HerdrFailure as error:
-                        reason = " ".join(" ".join((*diagnostics, str(error))).splitlines())
-                        raise Refusal(f"cannot end session {place.session}: {reason}") from error
-                if not closed:
-                    detail = " ".join(" ".join(diagnostics).splitlines())
-                    reason = f"cannot confirm closure of session {place.session}"
-                    raise Refusal(f"{reason}: {detail}" if detail else reason)
+                try:
+                    herdr.close_agent(place.session, place.pane)
+                except herdr_types.HerdrFailure as error:
+                    raise Refusal(f"cannot end session {place.session}: {error}") from error
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if isinstance(labeled_session, NoLabeledSession):
@@ -1479,11 +1458,8 @@ def _main(argv: list[str]) -> int:
                     outcome = recovered
                 if isinstance(recovered, herdr.PromptNotSubmitted):
                     raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
-            if isinstance(outcome, herdr.AgentNotStarted):
-                print(herdr.format_start_failure(outcome), file=sys.stderr)
-                if outcome.launch_refused or isinstance(outcome, herdr.ClaudeTrustNotWritten):
-                    return 1
-                return 2 if isinstance(handoff, StoppedSessionHandoff) else 1
+            if isinstance(outcome, herdr.ClaudeTrustNotWritten):
+                return 1
             if outcome.state == "confirmed" and outcome.publication_error is not None:
                 raise RuntimeError(f"{request.identity.unit}: staff publication failed: {outcome.publication_error}")
             if outcome.state != "confirmed" and isinstance(labeled_session, NoLabeledSession):

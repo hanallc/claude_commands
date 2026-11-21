@@ -159,15 +159,12 @@ A Claude child cannot claim the Codex pane.
 If a foreground Codex process has no arguments, the pane owner stays unproved.
 If the identity remains unknown, the pane notice lists the foreground program names.
 An agent report without a process identity cannot prove the agent exited during startup.
-Herdr returns the cause, visible screen, and pane result when an agent fails to start.
-The launch caller formats and prints one diagnostic.
+The worker start reports the cause, visible screen, and pane result in one line.
 Herdr checks the original terminal identity to confirm closure.
-The worker skips publication and cleanup after Herdr reports a failed start.
-The launcher returns exit 2 if Herdr opens no pane or confirms closure.
-The launcher returns exit 8 when the failed start leaves the pane present or its state unknown.
-After a publication failure, the launcher returns exit 2 if a fresh pane list proves the original terminal absent.
-A close acknowledgment alone leaves the publication failure at exit 8.
-The caller reports the publication failure and the cleanup reason in one line.
+The worker start commands return exit 2 if Herdr opens no pane or confirms closure.
+They return exit 8 if the pane stays open or its state is unknown.
+After a publication failure, a fresh pane list must prove that the original terminal is absent for exit 2.
+The worker start reports the publication failure and the cleanup reason in one line.
 After its first turn, the launcher clears the cached pane list before it checks the published worker.
 This refresh includes the pane session report and the process evidence within an observation snapshot.
 An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.
@@ -335,24 +332,17 @@ Only successful publication permits successful dispatch.
 A publication failure runs the caller's cleanup callback and reports the native id.
 The Claude coordinator tries to stop an unpublished session.
 A failed stop reports `cleanup unproved`.
-A failed pane admission closes only the new pane that this call created.
-A reviewer hold failure or a failure before dispatch submission ends only the worker pane that this call created.
-The same cleanup applies when worker restore fails before it submits its resume prompt.
-Cleanup closes only the saved pane and terminal.
-The close target is the worker's current session for both Claude and Codex.
-It retires a staff row only if this launch created the row.
-A resumed worker keeps its existing row after cleanup.
-An existing pane keeps its pane and staff row.
-A failed close prints `anomaly: <pane>: cleanup failed: <reason>` and preserves the original failure code.
-An incomplete start also closes its new pane.
-The start result identifies a new pane and its saved terminal.
-Dispatch reads staff rows before start and adds no pane scan for cleanup.
-A target refusal before prompt delivery runs cleanup.
-Cleanup stops only after target checks pass and the prompt can reach the agent.
-Restore cancels cleanup through the callback in `Herdr.prompt`.
-For an existing pane, the launcher quits its own agent and keeps the shell.
-Both paths compare the current terminal and process with the identities saved after launch.
-A replacement process remains open. Cleanup prints one anomaly with the pane id.
+Launch cleanup closes only a pane that the command opened.
+The start result identifies that pane and its terminal.
+Cleanup uses the worker's current session as the close target for Claude and Codex.
+Cleanup retires a staff row only if this start created it and the terminal is absent.
+A resumed worker keeps its existing row.
+A recorder refusal or a failure before prompt submission runs cleanup.
+This applies to dispatch, default team setup, worker restore, and Astra review.
+Prompt submission cancels cleanup.
+Layout or role update failures after the final scan preserve the pane and row.
+A start failure reports the result of the close.
+An incomplete close after a dispatch failure reports the pane state on one line.
 
 A new slot takes the parent/name lock before the row lock.
 If a sibling split fails with `pane_not_found`, the start retries once from the parent pane.

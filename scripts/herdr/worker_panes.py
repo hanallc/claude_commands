@@ -96,6 +96,7 @@ class HolderRun(Enum):
 class CreatedWorkerPane:
     """This start created the pane with this terminal."""
 
+    pane: str
     terminal: str
 
 
@@ -155,12 +156,14 @@ class IncompleteStart:
     pane: str
     reason: str
     created_pane: CreatedWorkerPane | NoCreatedWorkerPane = field(default=NO_CREATED_WORKER_PANE, compare=False)
+    failure: herdr.WorkerStartFailed | None = field(default=None, compare=False)
 
 
 class UnpublishedCleanup(Enum):
     NOT_STARTED = "pane {pane} retained; this call did not start it"
     PANE_CLOSED = "pane {pane} closed"
     PANE_CLOSE_FAILED = "pane {pane} close failed"
+    PANE_UNKNOWN = herdr.StartPaneResult.UNKNOWN.value
     AGENT_STOPPED = "agent stopped; existing pane {pane} retained at its shell"
     AGENT_STOP_FAILED = "agent stop failed; existing pane {pane} retained"
 
@@ -176,14 +179,6 @@ class UnpublishedWorker:
 @dataclass(frozen=True)
 class DestinationAfterSourceRelease:
     """Select the switch destination after the source pane closes."""
-
-
-class _AgentNotStarted(Exception):
-    """Herdr has reported a failed start."""
-
-    def __init__(self, outcome: herdr.AgentNotStarted) -> None:
-        super().__init__(outcome.reason)
-        self.outcome: herdr.AgentNotStarted = outcome
 
 
 class StartRefusal(Enum):
@@ -650,7 +645,7 @@ def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, li
             selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
                         else worker_run(row, record=record, scanned=scanned))
         except recorder_state.OldRecorderState as error:
-            print(error, file=sys.stderr)
+            herdr.report_diagnostic(str(error))
             # Detached records prove their worker by staff id.
             selected = first
         found[row.id] = tuple(dict.fromkeys((selected, *shared, *((dispatched,) if dispatched is not None else ()))))
@@ -1109,8 +1104,8 @@ def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | 
             return account_reader.named_account_environment(account.dir)
         if isinstance(account, (accounts.CodexWorkersAccount, accounts.NamedAccount)):
             family = "codex" if isinstance(account, accounts.CodexWorkersAccount) else "claude"
-            print(f"anomaly: {account.label}: account family {family} does not match the {policy.settings.kind} worker; "
-                  + "using the configured account", file=sys.stderr)
+            herdr.report_diagnostic(f"anomaly: {account.label}: account family {family} does not match the {policy.settings.kind} worker; "
+                                    + "using the configured account")
             account = ConfiguredWorkerAccount.CURRENT
         if policy.settings.kind == "codex":
             selected = (agent_accounts.codex_account_home(account.label) if isinstance(account, DestinationWorkerAccount)
@@ -1209,8 +1204,29 @@ def _parent_split(pane: str, ratio: float, label: str) -> herdr.SplitPane:
     return herdr.SplitPane(pane, "right", ratio, label)
 
 
+def _recovery_activity(client: herdr.Herdr, pane: str, terminal: str, name: str
+                       ) -> herdr.PaneAtShell | herdr.PaneRunning | herdr.WorkerStartFailed:
+    with herdr.collect_diagnostics() as messages:
+        try:
+            activity = client.pane_activity(pane)
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = herdr.agent_start_failure(error, session=client.session, pane=pane, agent=name)
+            return replace(failure, terminal=terminal, pane_detail="; ".join(messages))
+    for message in messages:
+        herdr.report_diagnostic(message)
+    return activity
+
+
+def _failed_worker_start(row: staff.StaffRow, failure: herdr.WorkerStartFailed) -> StartRefused | UncertainWorker:
+    diagnostic = herdr.format_start_failure(failure)
+    if failure.pane_result in (herdr.StartPaneResult.NO_PANE, herdr.StartPaneResult.CLOSED):
+        return StartRefused(StartRefusal.AGENT_START_FAILED, diagnostic)
+    return UncertainWorker(row, diagnostic, start_failed=True)
+
+
 def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
-                 client: herdr.Herdr) -> herdr.SplitPane | herdr.ExistingPane | StartRefused | UncertainWorker | ProcessUnknownWorker:
+                 client: herdr.Herdr
+                 ) -> herdr.SplitPane | herdr.ExistingPane | StartRefused | UncertainWorker | ProcessUnknownWorker | herdr.WorkerStartFailed:
     parents = evidence.scan.found.get(parent.id, [])
     if len(parents) != 1:
         return _uncertain(parent, "parent pane is unavailable or duplicated")
@@ -1222,7 +1238,10 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         return pane
     if not isinstance(pane, herdr.NoPane):
         identity, terminal = str(pane["pane_id"]), str(pane["terminal_id"])
-        if not isinstance(client.pane_activity(identity), herdr.PaneAtShell):
+        activity = _recovery_activity(client, identity, terminal, name)
+        if isinstance(activity, herdr.WorkerStartFailed):
+            return activity
+        if not isinstance(activity, herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "interrupted recovery pane is live")
         return herdr.ExistingPane(identity, terminal)
     ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
@@ -1258,6 +1277,35 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
+    diagnostics: list[str] = []
+    try:
+        with herdr.collect_diagnostics() as diagnostics:
+            result = _start_or_resume(parent, name, role, account=account, lock=lock, policy=policy, runs=runs, codex=codex)
+    except BaseException:
+        for diagnostic in diagnostics:
+            herdr.report_diagnostic(diagnostic)
+        raise
+    if diagnostics:
+        detail = "; ".join(" ".join(message.splitlines()) for message in dict.fromkeys(diagnostics))
+        if isinstance(result, UnpublishedWorker):
+            return replace(result, cleanup_reason="; ".join(filter(None, (result.cleanup_reason, detail))))
+        if isinstance(result, StartRefused):
+            return replace(result, detail=f"{result.detail}; {detail}")
+        if isinstance(result, IncompleteStart) and result.failure is not None:
+            return replace(result, failure=herdr.start_diagnostics(result.failure, diagnostics))
+        if isinstance(result, (IncompleteStart, AdmissionRefused)) or (
+                isinstance(result, UncertainWorker) and result.start_failed):
+            return replace(result, reason=f"{result.reason}; {detail}")
+        for diagnostic in diagnostics:
+            herdr.report_diagnostic(diagnostic)
+    return result
+
+
+def _start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
+                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
+                     lock: WorkerLockHold | WorkerLockAtUse, policy: UseRolePolicy | LaunchPolicy,
+                     runs: dict[str, list[str]] | None,
+                     codex: herdr.CodexConversations | herdr.CodexLaunchRead) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -1362,9 +1410,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if not isinstance(pane, herdr.NoPane):
             pane = dict(pane)
             identity = _text(pane, "pane_id")
+            activity = _recovery_activity(client, identity, _text(pane, "terminal_id"), name.value)
+            if isinstance(activity, herdr.WorkerStartFailed):
+                return _failed_worker_start(owner, activity)
             unknown = next((item for item in evidence.scan.unknown if item.pane == identity), None)
             try:
-                activity = client.pane_activity(identity)
                 if unknown is not None:
                     info = herdr.json_object(client.result("pane", "process-info", "--pane", identity).get("process_info"),
                                              "recovery process info")
@@ -1450,7 +1500,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
     directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
-    prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
+    prepared = herdr.prepare_worker_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
@@ -1469,6 +1519,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             destination = _destination(owner, name.value, evidence, client)
         except conf.Unusable as error:
             return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
+        if isinstance(destination, herdr.WorkerStartFailed):
+            return _failed_worker_start(row or owner, destination)
         if isinstance(destination, (StartRefused, UncertainWorker, ProcessUnknownWorker)):
             return destination
     if isinstance(destination, herdr.ExistingPane):
@@ -1482,17 +1534,25 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 at_shell = isinstance(current, StoppedWorker) or isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell)
             except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 failure = herdr.agent_start_failure(error, session=client.session, pane=destination.pane, agent=name.value)
-                return UncertainWorker(row or owner, herdr.format_start_failure(
-                    replace(failure, pane_detail="; ".join(messages))), start_failed=True)
+                return _failed_worker_start(row or owner, replace(failure, terminal=destination.terminal,
+                                                                   pane_detail="; ".join(messages)))
         for message in messages:
             herdr.report_diagnostic(message)
         if not at_shell:
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
-    launches: list[herdr.AgentLaunched] = []
-    launch_terminals: dict[str, str] = {}
+    launches: list[herdr.WorkerAgentLaunched] = []
     launch_processes: dict[str, herdr.AgentProcessIdentity] = {}
     launch_destinations: dict[str, herdr.SplitPane | herdr.ExistingPane] = {}
     first_turn_launches: dict[str, pane_launch.PaneLaunch] = {}
+
+    def launch_row(launched: herdr.WorkerAgentLaunched) -> herdr.PaneIdentity:
+        herdr.forget_pane_evidence(client.session, launched.pane)
+        pane = client.pane_row(launched.pane)
+        if isinstance(pane, herdr.NoPane) or not pane.get("terminal_id"):
+            raise herdr_types.HerdrFailure("launched terminal is missing")
+        if pane.get("terminal_id") != launched.terminal:
+            raise herdr_types.HerdrFailure("launched terminal changed")
+        return pane
 
     def start(handoff: worker_admission.FamilyHandoff) -> str:
         del handoff
@@ -1501,12 +1561,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if isinstance(launch_destination, DestinationAfterSourceRelease):
             if isinstance(current, (OpenWorker, StoppedWorker)):
                 with herdr.collect_diagnostics() as messages:
-                    closed = client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal)
+                    closed = client.close_worker_terminal(current.pane, current.terminal, target=str(current.row.current_session))
                 if not closed:
                     raise herdr_types.HerdrFailure("; ".join(("source pane close is incomplete", *messages)))
                 _retire_launch(current.row, client, record)
             fresh = _evidence(owner.id, record, client, selection=selection)
             selected = _destination(owner, name.value, fresh, client)
+            if isinstance(selected, herdr.WorkerStartFailed):
+                raise worker_admission.WorkerStartError(selected)
             if isinstance(selected, StartRefused):
                 raise worker_admission.AdmissionRefused(selected.detail)
             if isinstance(selected, (UncertainWorker, ProcessUnknownWorker)):
@@ -1514,7 +1576,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             launch_destination = selected
             launch_evidence = fresh
         identity = str(row.current_session) if row is not None and not switching else ""
-        launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
+        launch = partial(herdr.launch_prepared_worker, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_worker
         arguments = launch_arguments(policy, identity, directory)
         def launch_at(selected: herdr.SplitPane | herdr.ExistingPane) -> herdr.AgentLaunched:
             return launch(client.session, selected, prepared, policy.settings.kind,
@@ -1522,7 +1584,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
 
         launched = launch_at(launch_destination)
-        if (isinstance(launched.outcome, herdr.AgentNotStarted)
+        if (isinstance(launched.outcome, herdr.WorkerStartFailed)
                 and launched.outcome.pane_result is herdr.StartPaneResult.NO_PANE
                 and launched.outcome.code == "pane_not_found"
                 and isinstance(launch_destination, herdr.SplitPane)):
@@ -1531,37 +1593,58 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 launch_destination = _parent_split(_text(parents[0], "pane_id"), launch_destination.ratio,
                                                    launch_destination.label)
                 launched = launch_at(launch_destination)
-        if isinstance(launched.outcome, herdr.AgentNotStarted):
-            raise _AgentNotStarted(launched.outcome)
+        failure = launched.outcome if isinstance(launched.outcome, herdr.WorkerStartFailed) else None
+        if failure is not None and (
+                failure.error is not None or failure.pane_result is herdr.StartPaneResult.CLOSED):
+            raise worker_admission.WorkerStartError(failure)
+        if not isinstance(launched, herdr.WorkerAgentLaunched) or not launched.terminal:
+            raise worker_admission.WorkerStartError(failure or herdr.WorkerStartFailed(
+                "launch has no terminal ID", session=client.session, pane=launched.pane, agent=name.value))
         launches.append(launched)
         launch_destinations[launched.pane] = launch_destination
-        pane = client.pane_row(launched.pane)
-        if isinstance(pane, herdr.NoPane) or not (terminal := pane.get("terminal_id", "")):
-            raise herdr_types.HerdrFailure("launched terminal is missing")
-        if isinstance(launch_destination, herdr.ExistingPane) and terminal != launch_destination.terminal:
-            raise herdr_types.HerdrFailure("launched terminal changed")
-        launch_terminals[launched.pane] = terminal
-        process = client.pane_agent_process(launched.pane, terminal)
-        if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable):
-            raise herdr_types.HerdrFailure(process.start_ticks.reason)
-        launch_processes[launched.pane] = process
+        native = None
+        with herdr.collect_diagnostics() as diagnostics:
+            try:
+                pane = launch_row(launched)
+                process = client.pane_agent_process(launched.pane, launched.terminal)
+                if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable):
+                    raise herdr_types.HerdrFailure(process.start_ticks.reason)
+                launch_processes[launched.pane] = process
+                if not identity and policy.settings.kind == "codex":
+                    if failure is not None:
+                        raise worker_admission.WorkerStartError(herdr.start_diagnostics(failure, diagnostics))
+                    if isinstance(launched.outcome, herdr.PromptNotSubmitted):
+                        raise herdr_types.HerdrFailure(launched.outcome.reason)
+                    native = _codex_start_session(client, launched.pane, pane_row=pane)
+                else:
+                    native = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+                _ = launch_row(launched)
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                if failure is not None:
+                    current_failure = herdr.start_failure_pane(client, failure, launched.terminal)
+                    combined = herdr.start_diagnostics(current_failure, (*diagnostics, str(error)))
+                    raise worker_admission.WorkerStartError(combined) from error
+                lookup_error = error
+            else:
+                lookup_error = None
+        for diagnostic in diagnostics:
+            herdr.report_diagnostic(diagnostic)
+        if lookup_error is not None:
+            raise lookup_error
+        assert native is not None
         if not identity and policy.settings.kind == "codex":
-            if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                raise herdr_types.HerdrFailure(launched.outcome.reason)
-            native = _codex_start_session(client, launched.pane)
             entry = pane_launch.launch(launched.pane, native, str(prepared.directory),
                 prepared.env, ["codex", *arguments], kind="codex")
             entry["name"] = name.value
             pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
             first_turn_launches[launched.pane] = entry
-            return native
-        return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        return native
 
     def created_pane() -> CreatedWorkerPane | NoCreatedWorkerPane:
         launched = launches[-1]
         if isinstance(launch_destinations[launched.pane], herdr.ExistingPane):
             return NO_CREATED_WORKER_PANE
-        return CreatedWorkerPane(launch_terminals.get(launched.pane, ""))
+        return CreatedWorkerPane(launched.pane, launched.terminal)
 
     closed_destination = ""
 
@@ -1569,40 +1652,51 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         nonlocal closed_destination
         if not launches:
             return worker_admission.NoDestinationToStop()
-        pane = launches[-1].pane
+        launched = launches[-1]
+        pane = launched.pane
+        terminal = launched.terminal
         with herdr.collect_diagnostics() as errors:
             try:
-                terminal = launch_terminals.get(pane, "")
-                observed = client.pane_row(pane)
-                if not terminal or isinstance(observed, herdr.NoPane) or not observed.get("terminal_id"):
-                    raise herdr_types.HerdrFailure("launched terminal is missing")
-                if observed.get("terminal_id") != terminal:
-                    raise herdr_types.HerdrFailure("launched terminal changed")
-                process = launch_processes.get(pane)
-                if process is None:
-                    raise herdr_types.HerdrFailure("launched process identity is unavailable")
-                proved = identity
-                if switching or isinstance(launch_destinations[pane], herdr.ExistingPane):
-                    proved = client.native_session(pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=observed)
-                if client.pane_agent_process(pane, terminal) != process:
-                    raise herdr_types.HerdrFailure("launched agent process changed")
                 existing = isinstance(launch_destinations[pane], herdr.ExistingPane)
+                process = launch_processes.get(pane)
                 if switching or existing:
+                    herdr.forget_pane_evidence(client.session, pane)
+                    observed = client.pane_row(pane)
+                    if terminal and not existing and isinstance(observed, herdr.NoPane) and client.pane_closed(pane, terminal):
+                        closed_destination = pane
+                        return worker_admission.DestinationStopped()
+                    if not terminal or isinstance(observed, herdr.NoPane) or not observed.get("terminal_id"):
+                        raise herdr_types.HerdrFailure("launched terminal is missing")
+                    if observed.get("terminal_id") != terminal:
+                        raise herdr_types.HerdrFailure("launched terminal changed")
+                    if process is None:
+                        raise herdr_types.HerdrFailure("launched process identity is unavailable")
+                    proved = client.native_session(pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=observed)
+                    try:
+                        if client.pane_agent_process(pane, terminal) != process:
+                            raise herdr_types.HerdrFailure("launched agent process changed")
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        raise herdr.WorkerProcessUnproved(pane, str(error)) from error
                     if identity and proved != identity:
                         raise herdr_types.HerdrFailure("launched agent identity changed")
                     client.quit_agent(pane, terminal, proved, start_seconds)
                     if existing:
                         return worker_admission.DestinationStopped()
-                    closed = client.close_terminal_pane(pane, terminal)
+                    closed = client.close_worker_terminal(pane, terminal, target="")
+                elif process is not None:
+                    closed = client.close_worker_terminal(pane, terminal, target=process)
                 else:
-                    close_pane = cast(Callable[..., bool], client.close_pane)
-                    closed = close_pane(pane, target=process) and client.pane_closed(pane, terminal)
+                    closed = bool(terminal) and client.pane_closed(pane, terminal)
+                    if not closed:
+                        raise herdr_types.HerdrFailure("launched process identity is unavailable")
                 if not closed:
                     raise herdr_types.HerdrFailure("pane close was not confirmed")
                 closed_destination = pane
             except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                detail = " ".join("; ".join(dict.fromkeys((str(error), *errors))).split())
-                return worker_admission.DestinationRetained(pane, detail)
+                process_error = error if isinstance(error, herdr.WorkerProcessUnproved) else None
+                reason = process_error.reason if process_error is not None else str(error)
+                detail = " ".join("; ".join(dict.fromkeys((reason, *errors))).split())
+                return worker_admission.DestinationRetained(pane, detail, process_error)
             else:
                 return worker_admission.DestinationStopped()
 
@@ -1619,43 +1713,57 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         else:
             identity = start(worker_admission.NoFamilyHandoff())
             if row is not None and identity != row.current_session:
-                return _uncertain(row, "launch proves another native session; pane retained")
+                mismatch = "launch proves another native session"
+                outcome = launches[-1].outcome
+                if isinstance(outcome, herdr.WorkerStartFailed):
+                    return _failed_worker_start(row, herdr.start_diagnostics(outcome, (mismatch,)))
+                return _uncertain(row, f"{mismatch}; pane retained")
             if row is None:
                 row = worker_admission.publish(allowed, identity, launch_home=launch_home).row
                 lock.bind(row, deadline=time.monotonic() + publish_lock_seconds)
         launched = launches[-1]
         if launched.pane in first_turn_launches:
             pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", first_turn_launches[launched.pane])
-    except _AgentNotStarted as error:
-        diagnostic = herdr.format_start_failure(error.outcome)
-        if error.outcome.pane_result in (herdr.StartPaneResult.NO_PANE, herdr.StartPaneResult.CLOSED):
-            return StartRefused(StartRefusal.AGENT_START_FAILED, diagnostic)
-        return UncertainWorker(row or owner, diagnostic, start_failed=True)
+    except worker_admission.WorkerStartError as error:
+        failure = error.outcome
+        if not switching and launches and launches[-1].pane in launch_processes:
+            pane = launches[-1].pane
+            if row is None or isinstance(launch_destinations[pane], herdr.SplitPane):
+                cleanup_result = cleanup(identity)
+                if isinstance(cleanup_result, worker_admission.DestinationRetained):
+                    failure = error.with_cleanup_failure(cleanup_result)
+        if closed_destination:
+            failure = replace(failure, pane_result=herdr.StartPaneResult.CLOSED)
+        elif launches:
+            failure = herdr.start_failure_pane(client, failure, launches[-1].terminal)
+        return _failed_worker_start(row or owner, failure)
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:
             return _uncertain(row or owner, f"{name.value}: agent launch is incomplete; pane state unknown: {error}")
         launched = launches[-1]
         existing_pane = isinstance(launch_destinations[launched.pane], herdr.ExistingPane)
-        if row is not None and not existing_pane and (not switching or switched):
-            stopped = cleanup(identity)
-            if isinstance(stopped, worker_admission.DestinationRetained):
-                return UnpublishedWorker(stopped.pane, str(error), UnpublishedCleanup.PANE_CLOSE_FAILED, stopped.reason)
+        if row is None and identity and not closed_destination:
+            admitted = staff.initial_snapshot().by_current_session(identity)
+            if admitted is not None and admitted.name == name.value and admitted.reports_to(owner.id):
+                return IncompleteStart(admitted, launched.pane, str(error), created_pane())
+        if not closed_destination and (row is None or not existing_pane and (not switching or switched)):
+            outcome = cleanup(identity)
+            if isinstance(outcome, worker_admission.DestinationRetained):
+                if outcome.process_error is not None:
+                    status = UnpublishedCleanup.PANE_UNKNOWN
+                else:
+                    status = UnpublishedCleanup.AGENT_STOP_FAILED if existing_pane else UnpublishedCleanup.PANE_CLOSE_FAILED
+                return UnpublishedWorker(outcome.pane, str(error), status, outcome.reason)
         if closed_destination:
             return UnpublishedWorker(closed_destination, str(error), UnpublishedCleanup.PANE_CLOSED)
         if row is not None:
             return _uncertain(row, f"launch proof is incomplete: {error}")
-        admitted = staff.initial_snapshot().by_current_session(identity) if identity else None
-        if admitted is not None:
-            return IncompleteStart(admitted, launched.pane, str(error), created_pane())
-        outcome = cleanup(identity)
-        stopped = isinstance(outcome, worker_admission.DestinationStopped)
-        status = ((UnpublishedCleanup.AGENT_STOPPED if stopped else UnpublishedCleanup.AGENT_STOP_FAILED)
-                  if existing_pane else (UnpublishedCleanup.PANE_CLOSED if closed_destination else UnpublishedCleanup.PANE_CLOSE_FAILED))
-        detail = outcome.reason if isinstance(outcome, worker_admission.DestinationRetained) else ""
-        return UnpublishedWorker(launched.pane, str(error), status, detail)
+        status = UnpublishedCleanup.AGENT_STOPPED if existing_pane else UnpublishedCleanup.PANE_CLOSE_FAILED
+        return UnpublishedWorker(launched.pane, str(error), status)
     launched = launches[-1]
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-        return IncompleteStart(row, launched.pane, launched.outcome.reason, created_pane())
+        failure = launched.outcome if isinstance(launched.outcome, herdr.WorkerStartFailed) else None
+        return IncompleteStart(row, launched.pane, launched.outcome.reason, created_pane(), failure)
     herdr.forget_pane_evidence(client.session, launched.pane)
     fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
     result = next((state for state in fresh.states if state.row.id == row.id), None)
@@ -1664,12 +1772,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return replace(result, created_pane=created_pane())
     if isinstance(result, UncertainWorker):
         return result
-    state_kind = type(result).__name__ if result is not None else "missing"
-    scan_reason = next((item.reason for item in fresh.scan.unknown if item.pane == launched.pane), "none")
+    state = type(result).__name__ if result is not None else "missing"
+    scan = next((item.reason for item in fresh.scan.unknown if item.pane == launched.pane), "none")
     tab = next((_text(pane, "tab_id") for pane in fresh.panes if _text(pane, "pane_id") == launched.pane), "")
     parent_tab = "yes" if tab and tab in fresh.parent_tabs else "no"
-    return _uncertain(row,
-        f"agent launch is incomplete; state={state_kind}; scan={scan_reason}; parent_tab={parent_tab}")
+    return _uncertain(row, f"agent launch is incomplete; state={state}; scan={scan}; parent_tab={parent_tab}")
 
 
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:
@@ -1708,13 +1815,8 @@ def close(parent: StaffId, name: WorkerName, *,
                 permission = can_close(observed, lock=held)
                 if isinstance(permission, Kept):
                     return permission
-                with herdr.collect_diagnostics() as messages:
-                    closed = client.close_terminal_pane(observed.pane, observed.terminal)
-                if not closed:
-                    reason = "; ".join(("pane close is incomplete", *messages))
-                    return _uncertain(row, reason)
-                for message in messages:
-                    herdr.report_diagnostic(message)
+                if not client.close_terminal_pane(observed.pane, observed.terminal):
+                    return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
             return Closed()
@@ -1725,7 +1827,7 @@ def forget_restart(row: staff.StaffRow) -> None:
     try:
         shutdown_record.forget([str(row.id)])
     except (OSError, ValueError) as error:
-        print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
+        herdr.report_diagnostic(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}")
 
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
@@ -1777,7 +1879,10 @@ def _result(result: WorkerStart | Closed | Kept) -> ExitCode:
         elif isinstance(result, UncertainWorker) and result.start_failed:
             print(result.reason, file=sys.stderr)
         elif isinstance(result, IncompleteStart):
-            print(f"{result.row.name}: {result.reason}; retain the pane and retry", file=sys.stderr)
+            if result.failure is not None:
+                print(herdr.format_start_failure(result.failure), file=sys.stderr)
+            else:
+                print(f"{result.row.name}: {result.reason}; retain the pane and retry", file=sys.stderr)
         return ExitCode.UNCERTAIN
     print("done")
     return ExitCode.OK

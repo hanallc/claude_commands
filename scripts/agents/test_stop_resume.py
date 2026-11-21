@@ -677,22 +677,6 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(staff.initial_snapshot().rows[0].home, staff.SessionHome(target))
             self.assertEqual(len(world.case.client.opened), 1)
 
-    def test_producer_admission_start_failure_exit_table(self) -> None:
-        for code, reason, expected in (("agent_not_ready", "fixture dialog", 1),
-                                         ("agent_pane_busy", "pane busy", 1),
-                                         ("wrong_target", "shell target changed", 1)):
-            with self.subTest(cause=code), producer_first_fixture("claude") as world:
-                failure = herdr.AgentNotStarted(reason, screen="Trust this folder?\n1. Yes", code=code)
-                with (patch.object(world.case.client, "start_agent", return_value=failure),
-                      redirect_stderr(io.StringIO()) as errors):
-                    self.assertEqual(shutdown.main(["resume", "dwight"]), expected)
-                lines = [line for line in errors.getvalue().splitlines() if "agent start failed:" in line]
-                self.assertEqual(lines, [
-                    f"dwight: herdr {world.case.client.session}:{world.pane}: agent start failed: "
-                    + f"{reason}; visible screen: Trust this folder? 1. Yes; pane retained"])
-                self.assertEqual(errors.getvalue().count("Trust this folder?"), 1)
-                self.assertEqual(staff.initial_snapshot().rows, ())
-
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
         first_ownership_stages = {"foreign-first", "native-first"}
@@ -1447,38 +1431,6 @@ class StopResumeTests(unittest.TestCase):
                             role.assert_called_once_with("workers")
                         else:
                             role.assert_not_called()
-
-    def test_codex_resume_start_failure_exit_table(self) -> None:
-        identity = self.saved_codex_name()
-        home = self.root / ".codex2"
-        source = pane_record.launch("w1:p1", identity, str(self.root / "project"),
-            {"CODEX_HOME": str(home)}, ["codex", "resume", identity], kind="codex")
-        source["name"] = "saved-worker"
-        pane_record.write("agents", source)
-        saved = pane_record.read("agents")
-        pane, terminal = "w1:p2", "replacement-terminal"
-        failure = herdr.AgentNotStarted("client not ready", screen="Trust dialog\nAccept",
-            session="agents", pane=pane, terminal=terminal, pane_result=herdr.StartPaneResult.RETAINED)
-        for confirmed, expected in ((True, 1), (False, 1)):
-            with (self.subTest(confirmed=confirmed),
-                  patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(identity)),
-                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
-                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
-                  patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.root / ".codex1")),
-                  patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"),
-                  patch.object(self.client, "open_tab", return_value=pane),
-                  patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession(pane, "saved-worker", "w1", "")]),
-                  patch.object(self.client, "pane_row", return_value={"pane_id": pane, "terminal_id": terminal}),
-                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(self.root, {})),
-                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(pane, failure)),
-                  patch.object(self.client, "close_tab_confirmed", return_value=confirmed) as close,
-                  redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(shutdown.main(["resume", identity]), expected)
-            close.assert_called_once_with(pane, terminal=terminal)
-            state = "pane closed" if confirmed else "pane retained"
-            self.assertEqual([line for line in errors.getvalue().splitlines() if "agent start failed:" in line], [
-                f"{identity}: herdr agents:{pane}: agent start failed: client not ready; visible screen: Trust dialog Accept; {state}"])
-            self.assertEqual(pane_record.read("agents"), saved)
 
     def test_unknown_codex_process_does_not_block_a_stopped_thread_without_a_pane(self) -> None:
         identity = self.saved_codex_name()

@@ -389,13 +389,15 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
     result = attempt.code
     diagnostics = attempt.diagnostics if attempt.error is None else (*attempt.diagnostics, str(attempt.error))
     diagnostic_text = "\n".join(diagnostics) + "\n" if diagnostics else ""
-    if diagnostic_text:
+    prefix = f"{row.name}: compaction failed: "
+    compaction = next((line for line in attempt.diagnostics if line.startswith(prefix)), "")
+    if compaction:
         path = worker.dispatch_log_path(run, instance)
         try:
             with path.open("a", encoding="utf-8", errors="backslashreplace") as log:
-                _ = log.write(diagnostic_text)
+                _ = log.write(compaction + "\n")
         except OSError as error:
-            unit_runs.report_anomaly(f"anomaly: {path}: cannot save stage-two diagnostics: {error}")
+            unit_runs.report_anomaly(f"anomaly: {path}: cannot save the compaction failure: {error}")
     if result is worker.DispatchSubmission.SUBMITTED:
         progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
         print(diagnostic_text, end="", file=sys.stderr)

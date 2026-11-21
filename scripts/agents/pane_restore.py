@@ -51,8 +51,6 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
         int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=title, reported_unknown=reported_unknown)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr_types.HerdrFailure(launched.reason)
-    if isinstance(launched.outcome, herdr.AgentNotStarted):
-        raise restart.AgentStartFailed(herdr.format_start_failure(launched.outcome))
     path = pane_record.record_path(session)
     attempt = pane_launch.resume_attempt(path, launched.pane)
     if restart.pane_holds_other_work(client, pane.pane_id, entry["session_id"]):
@@ -128,9 +126,8 @@ def restore(session: str, *, dry_run: bool) -> int:
                 if row is not None:
                     with herdr.restore_staff(current):
                         _ = restart.start_row(row, current, client, target_account=target_accounts.get(holder.id, ""))
-        except restart.AgentStartFailed as error:
+        except restart.ClaudeTrustWriteFailed:
             failures += 1
-            print(error, file=sys.stderr)
         except (herdr_types.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{holder.name}: not resumed: {error}", file=sys.stderr)
@@ -165,9 +162,6 @@ def restore(session: str, *, dry_run: bool) -> int:
                             observed.reason if isinstance(observed, herdr.UnknownConversation) else ""))
             live.add(entry["session_id"])
             print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
-        except restart.AgentStartFailed as error:
-            failures += 1
-            print(error, file=sys.stderr)
         except (herdr_types.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{pane.pane_id} {pane.label}: not resumed: {error}", file=sys.stderr)

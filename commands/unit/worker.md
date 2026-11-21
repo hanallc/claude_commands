@@ -53,7 +53,9 @@ The pass and any held role stay active.
 The launcher returns at once. End the director turn after any assigned synchronous review.
 When compaction is due, the launcher prints `<worker>: compaction runs detached; the prompt follows`.
 The child survives a signal to the caller's process group.
-It requires a compaction record within `WORKER_COMPACT_SECONDS`, then sends the prompt and confirms its transcript receipt.
+The child waits for compaction proof within `WORKER_COMPACT_SECONDS`.
+If compaction fails, the child prints one line with the cause.
+The child then sends the prompt and confirms its transcript receipt.
 A detached failure ends the pass with `error` and sends the director a completion notice.
 Assignments with no compaction due keep their attached delivery path.
 The turn hook saves the result, completes the pass, and sends the director its reply path.

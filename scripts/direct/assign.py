@@ -747,15 +747,15 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
     parent = worker_admission.parent(staff.snapshot(), run=run)
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
-    before = staff_worker.rows_before_launch()
     with ExitStack() as notices, worker_panes.worker_lock(target.parent, target.name) as hold, ExitStack() as cleanup:
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return staff_worker.ExitCode.BUSY
+        before = staff_worker.rows_before_launch()
         current = launch(target, policy, lock=hold)
-        staff_worker.arm_launch_cleanup(cleanup, before, current)
         if not isinstance(current, worker_panes.OpenWorker):
-            return staff_worker.startup_result(target.name, current)
+            return staff_worker.startup_result(target.name, current, before=before)
+        staff_worker.arm_launch_cleanup(cleanup, before, current)
         try:
             client = herdr.Herdr(herdr.shared_session())
             process = client.pane_agent_process(current.pane, current.terminal)
@@ -767,7 +767,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                 reply=Path(args.reply_file), policy=policy, started=current,
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
                     finish_phase="astra-review", finish_run=True),
-                launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold, notices=notices)
+                launcher_command=launcher_command(), launch_cleanup=cleanup, lock=hold, notices=notices)
             if result is staff_worker.DispatchSubmission.SUBMITTED:
                 _ = cleanup.pop_all()
             return result

@@ -9,6 +9,7 @@ from scripts.herdr.test_worker_panes import PaneWorld
 import io
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
@@ -666,6 +667,22 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
+    def test_worker_scan_leaves_a_parallel_start_failure_on_stderr(self) -> None:
+        from scripts.message import process_table
+
+        start_failure = "fixture: agent start failed: the command could not start"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            def failed_snapshot() -> dict[int, process_table.Process]:
+                executor.submit(herdr.report_diagnostic, start_failure).result(timeout=5)
+                raise OSError("process table unavailable")
+
+            with (mock.patch.object(process_table, "snapshot", side_effect=failed_snapshot),
+                  redirect_stderr(io.StringIO()) as errors):
+                evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
+
+        self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
+        self.assertEqual(errors.getvalue().splitlines(), [start_failure])
+
 
     def test_live_staff_includes_codex_showrunner_and_unit_by_current_thread_without_role_inference(self) -> None:
         from scripts.message import process_table
@@ -1142,3 +1159,30 @@ class StaffWorkerIdentityTests(StaffTestCase):
         self.assertEqual(staff.snapshot().rows, tuple(sorted((runner, owner), key=lambda row: row.id)))
         self.assertEqual(errors.getvalue().splitlines(), [
             "anomaly: staff sources: Codex process 42401: cannot establish the herdr session of process 42401"])
+
+    def test_worker_retirement_reports_local_and_peer_diagnostics_to_the_caller(self) -> None:
+        from scripts.message import process_table, roster
+
+        runner = fixture_member("showrunner", name="runner")
+        owner = fixture_member("unit", name="unit", parent=runner.id,
+                               worktree=staff.PresentWorktree("mac", self.root / "remote-tree"))
+        worker = fixture_worker("impl", owner.id)
+        record = staff.snapshot()
+        expected = [
+            "anomaly: staff sources: Codex processes: process table unavailable",
+            "anomaly: mac: peer registry unavailable",
+        ]
+
+        with (mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(())),
+              mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], ["mac: peer registry unavailable"]))):
+            with redirect_stderr(io.StringIO()) as errors, herdr.collect_diagnostics() as diagnostics:
+                with self.assertRaisesRegex(staff.StaffRefused, "remote native session state is uncertain"):
+                    staff_sources.require_worker_stopped(record, worker.id)
+            self.assertEqual(diagnostics, expected)
+            self.assertEqual(errors.getvalue(), "")
+
+            with redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaisesRegex(staff.StaffRefused, "remote native session state is uncertain"):
+                    staff_sources.require_worker_stopped(record, worker.id)
+            self.assertEqual(errors.getvalue().splitlines(), expected)

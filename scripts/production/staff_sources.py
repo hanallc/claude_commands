@@ -7,8 +7,6 @@ try:
 except FileNotFoundError:
     pass
 
-from contextlib import redirect_stderr
-import io
 import json
 import os
 import shlex
@@ -16,7 +14,6 @@ import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -117,9 +114,11 @@ def _observation_session(value: ClaudeSession | CodexThread) -> str:
 
 
 def _problem(path: Path | str, error: object, *, pid: int = 0) -> None:
+    from scripts.herdr import herdr
+
     message = f"staff sources: {path}: {error}".replace("\n", " ").replace("\r", " ")
     if not session_staff.collect_anomaly(f"pid {pid} (codex): {message}" if pid else message, pid=pid):
-        print(message, file=sys.stderr)
+        herdr.report_diagnostic(message)
 
 
 def codex_thread_host(arguments: list[str]) -> bool:
@@ -390,16 +389,16 @@ class WorkerEvidence:
 def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
                     current_only: bool = False) -> WorkerEvidence:
     """Expose the shared scanner without dropping missing rows or acquiring a lock."""
-    errors = io.StringIO()
-    with redirect_stderr(errors):
+    from scripts.herdr import herdr
+
+    with herdr.collect_diagnostics() as messages:
         scan = _WorkerSources(record, sources)
         observed = scan.collect(current_only=current_only)
     if scan.claude_registry_incomplete:
-        _ = errors.write("Claude session registry is incomplete\n")
-    diagnostics = tuple(errors.getvalue().splitlines())
+        messages.append("Claude session registry is incomplete")
     completeness = (WorkerScanIncomplete(scan.claude_registry_incomplete, scan.codex_scan_incomplete)
                     if scan.claude_registry_incomplete or scan.codex_scan_incomplete else WorkerScanComplete())
-    return WorkerEvidence(observed, scan.identities, diagnostics, completeness)
+    return WorkerEvidence(observed, scan.identities, tuple(messages), completeness)
 
 
 def production_units(slug: str) -> tuple[staff.StaffRow, ...]:
@@ -543,9 +542,11 @@ def cli_live() -> int:
 
 def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId) -> None:
     """Refuse removal while worker or peer evidence still names the native id."""
+    from scripts.herdr import herdr
+
     evidence = observe_workers(record, session_staff.member_sources(), current_only=True)
     for diagnostic in evidence.diagnostics:
-        print(f"anomaly: {diagnostic}", file=sys.stderr)
+        herdr.report_diagnostic(f"anomaly: {diagnostic}")
     member = record.by_id(identity)
     current_session = member.current_session if member is not None else identity
     if identity in evidence.identities or any(
@@ -571,7 +572,7 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
                 if isinstance(peer, roster.PeerNotReached):
                     raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.reason}")
                 for diagnostic in peer.problems:
-                    print(f"anomaly: {diagnostic}", file=sys.stderr)
+                    herdr.report_diagnostic(f"anomaly: {diagnostic}")
                 for entry in peer.entries:
                     native = (entry.session.session_id if isinstance(entry.session, roster.ClaudeSession)
                               else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "")

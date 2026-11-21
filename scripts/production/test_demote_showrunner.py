@@ -819,24 +819,6 @@ class DemoteShowrunnerTests(StaffTestCase):
                 else:
                     self.assertFalse(self.journal().exists())
 
-    def test_demote_restore_start_failure_exit_table(self) -> None:
-        self.start.side_effect = None
-        self.start.return_value = 2
-        self.assertEqual(self.run_command()[0], 1)
-        for failure, expected in (
-                (herdr.AgentNotStarted("start timed out", screen="Trust dialog\nAccept",
-                    session="fixture", pane="w1:p2", pane_result=herdr.StartPaneResult.RETAINED), 1),
-                (herdr.AgentNotStarted("shell target changed", code="wrong_target", launch_refused=True), 1),
-                (herdr.ClaudeTrustNotWritten("trust write failed"), 1)):
-            with (self.subTest(cause=failure.reason),
-                  mock.patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(self.child.current_session)),
-                  mock.patch.object(herdr, "shared_session", return_value="fixture"),
-                  mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched(failure.pane, failure)),
-                  redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(demote.restore(self.journal()), expected)
-            self.assertTrue(self.journal().exists())
-            self.assertEqual(errors.getvalue().splitlines(), [herdr.format_start_failure(failure)])
-
 
 @final
 class PerformanceDemotionTests(DemoteShowrunnerTests):

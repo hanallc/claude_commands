@@ -3,20 +3,19 @@ from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 from collections.abc import Callable, Generator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import hashlib
 import ast
 from importlib import import_module
 import json
 import re
-import sys
 from enum import Enum
 from pathlib import Path
 from typing import cast
 
 from scripts.agents import worker_lifecycle
-from scripts.herdr import pane_launch
+from scripts.herdr import herdr, pane_launch
 from scripts.lib import unit_runs
 from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from scripts.production import staff, session_staff
@@ -28,6 +27,20 @@ UNKNOWN_LAUNCH_HOME = staff.HomeUnknown()
 
 class AdmissionRefused(ValueError):
     """Permission or native publication failed; no work may be dispatched."""
+
+
+class WorkerStartError(Exception):
+    """Keep the start failure through publication cleanup."""
+
+    def __init__(self, outcome: herdr.WorkerStartFailed) -> None:
+        super().__init__(outcome.reason)
+        self.outcome: herdr.WorkerStartFailed = outcome
+
+    def with_cleanup_failure(self, cleanup: DestinationRetained) -> herdr.WorkerStartFailed:
+        if cleanup.process_error is not None:
+            failure = replace(self.outcome, pane_result=herdr.StartPaneResult.UNKNOWN, error=cleanup.process_error)
+            return herdr.start_diagnostics(failure, (cleanup.reason,))
+        return herdr.start_diagnostics(self.outcome, (cleanup.detail,))
 
 
 class RunOwnerUnavailable(ValueError):
@@ -118,6 +131,13 @@ class DestinationRetained:
 
     pane: str
     reason: str
+    process_error: herdr.WorkerProcessUnproved | None = None
+
+    @property
+    def detail(self) -> str:
+        if self.process_error is not None:
+            return f"{herdr.StartPaneResult.UNKNOWN.value}; {self.reason}"
+        return f"destination pane {self.pane} retained: {self.reason}"
 
 
 @dataclass(frozen=True)
@@ -182,7 +202,7 @@ def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
         owner = parent(record, staff_id=staff.runtime_id(), run=run)
         _ = staff.WorkerName.parse(name)
         if isinstance(owner.worktree, staff.RemovedWorktree):
-            print(f"staff: {name}: parent {owner.id} is retired; admission continues", file=sys.stderr)
+            herdr.report_diagnostic(f"staff: {name}: parent {owner.id} is retired; admission continues")
         existing = find_worker(record, owner.id, name)
         return WorkerStartAllowed(name, owner.id, run, ExistingWorkerSlot(existing) if existing else NewWorkerSlot())
     except worker_lifecycle.OperationDeadlineExpired:
@@ -333,11 +353,11 @@ def extract_transcript(row: staff.StaffRow, run: Path, backend: staff.ClaudeBack
         from scripts.lib.atomic_file import write_text_atomic
         write_text_atomic(extract, f"{HANDOFF_SOURCE_PREFIX}{source}\n\n" + "\n\n".join(messages) + "\n\nChanged files:\n" + "\n".join(sorted(changed)) + "\n")
         if malformed:
-            print(f"anomaly: {row.name}: malformed transcript record", file=sys.stderr)
+            herdr.report_diagnostic(f"anomaly: {row.name}: malformed transcript record")
         return TranscriptHandoff(extract, source)
     except (OSError, ValueError) as error:
         reason = str(error).replace("\n", " ")
-        print(f"anomaly: {row.name}: transcript extract: {reason}", file=sys.stderr)
+        herdr.report_diagnostic(f"anomaly: {row.name}: transcript extract: {reason}")
         return TranscriptUnavailable(reason)
 
 
@@ -381,7 +401,7 @@ def dispatch_record(run: Path, name: str, *, report_anomaly: bool = True) -> Dis
                               SwitchState(fields.get("dispatch_state", SwitchState.NO_RECORD)))
     except ValueError:
         if report_anomaly:
-            print(f"anomaly: {name}: unknown dispatch_state {fields.get('dispatch_state')!r}; using NO_RECORD", file=sys.stderr)
+            herdr.report_diagnostic(f"anomaly: {name}: unknown dispatch_state {fields.get('dispatch_state')!r}; using NO_RECORD")
         return DispatchRecord(str(fields.get("assignment_id", "")), SwitchState.NO_RECORD)
 
 
@@ -389,7 +409,7 @@ def dispatch_pending(run: Path, name: str, prompt: Path) -> bool:
     try:
         record = dispatch_record(run, name)
     except (OSError, worker_lifecycle.WorkerStateUnreadable) as error:
-        print(f"anomaly: {name}: {error}".replace("\n", " "), file=sys.stderr)
+        herdr.report_diagnostic(f"anomaly: {name}: {error}".replace("\n", " "))
         return False
     return record.assignment_id == assignment_id(prompt) and record.state is not SwitchState.ASSIGNMENT_ACCEPTED
 
@@ -421,7 +441,9 @@ def _cleanup_on_failure(cleanup: Callable[[str], CleanupOutcome], identity: str 
     except BaseException as error:
         outcome = cleanup(identity)
         if isinstance(outcome, DestinationRetained) and isinstance(error, Exception):
-            raise AdmissionRefused(f"{error}; destination pane {outcome.pane} retained: {outcome.reason}") from error
+            if isinstance(error, WorkerStartError):
+                raise WorkerStartError(error.with_cleanup_failure(outcome)) from error
+            raise AdmissionRefused(f"{error}; {outcome.detail}") from error
         raise
 
 
@@ -475,7 +497,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                     source = uncompressed_path(Path(saved.readline().removeprefix(HANDOFF_SOURCE_PREFIX).strip()))
                 handoff = TranscriptHandoff(extract, source)
             except OSError as error:
-                print(f"anomaly: {row.name}: transcript extract: {error}".replace("\n", " "), file=sys.stderr)
+                herdr.report_diagnostic(f"anomaly: {row.name}: transcript extract: {error}".replace("\n", " "))
                 handoff = TranscriptUnavailable(str(error))
         else:
             if row is not None and not same:

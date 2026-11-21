@@ -2144,11 +2144,11 @@ class StageTwoCompactionTests(unittest.TestCase):
         before = len(case.agent.submitted)
 
         diagnostic = f"{name}: compaction failed: herdr agent compact: compact_failed: compact unavailable"
-        log = run / f"compact-{delivery.completion_id}.log"
         if native_stop:
             case.agent.complete(pane)
             payload = json.dumps({"hook_event_name": "Stop", "session_id": str(row.current_session),
                                   "last_assistant_message": case.agent.last_replies[str(row.current_session)]})
+            log = run / f"compact-{delivery.completion_id}.log"
             atomic_file.write_text_atomic(log, "Earlier dispatch output\n")
             with (patch.object(sys, "stdin", io.StringIO(payload)),
                   open(os.devnull, "w", encoding="utf-8") as discarded,
@@ -2160,7 +2160,6 @@ class StageTwoCompactionTests(unittest.TestCase):
                 outcome = case.finish(name, turn_end.EventKind.STAGE_READY)
             self.assertIs(outcome, turn_end.TurnOutcome.SUBMITTED)
             self.assertEqual(errors.getvalue().splitlines(), [diagnostic])
-
         self.assertEqual(len(case.agent.submitted), before + 1)
         target, prompt = case.agent.submitted[-1]
         self.assertEqual(target, pane)

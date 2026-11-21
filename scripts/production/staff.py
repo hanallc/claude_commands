@@ -39,6 +39,17 @@ OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
 Kind = Literal["showrunner", "unit", "worker", "producer"]
 _KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
+
+
+class _DiagnosticReporter(Protocol):
+    def __call__(self, message: str, *, end: str = "\n") -> None: ...
+
+
+def _report_diagnostic(message: str, *, end: str = "\n") -> None:
+    report = cast(_DiagnosticReporter, import_module("scripts.herdr.herdr").report_diagnostic)
+    report(message, end=end)
+
+
 UnitType = Literal["direct", "merge", "style"]
 UNIT_TYPES: tuple[UnitType, ...] = ("direct", "merge", "style")
 
@@ -469,7 +480,7 @@ class StaffRow:
                 invalid.append(key)
         if invalid:
             # _clean_parse finds this print from the data; a new parse print must update it too.
-            print(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}", file=sys.stderr)
+            _report_diagnostic(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}")
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
@@ -1185,7 +1196,7 @@ def _rows(value: object) -> list[StaffRow]:
         if isinstance(fields.get("kind"), str) and fields["kind"] not in _KINDS:
             unknown.append(fields)
             # _clean_parse finds this print from the data; a new parse print must update it too.
-            print(f"staff anomaly: row {fields.get('id')}: unknown kind {fields['kind']}; skipped", file=sys.stderr)
+            _report_diagnostic(f"staff anomaly: row {fields.get('id')}: unknown kind {fields['kind']}; skipped")
             continue
         rows.append(StaffRow.from_json(cast(object, item)))
     try:
@@ -1304,7 +1315,7 @@ def _found_backends(rows: Sequence[StaffRow],
                         if recorded_homes.get(identity) == home:
                             found[identity] = CodexBackend(home)
         except OSError as error:
-            print(f"anomaly: {home}: {error}", file=sys.stderr)
+            _report_diagnostic(f"anomaly: {home}: {error}")
     if running is None:
         running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
                    if any(identity not in codex_sessions for identity in wanted.values()) else frozenset())
@@ -1368,7 +1379,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     if done.returncode != 0:
         raise StaffUnreadable(reason)
     if done.stderr:
-        print(done.stderr, end="", file=sys.stderr)
+        _report_diagnostic(done.stderr, end="")
     return _decode(done.stdout)
 
 
@@ -1641,7 +1652,7 @@ mv -f "$temporary" "$directory/staff.json"
                 _ = signal.signal(signal.SIGTERM, previous_handler)
                 _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
     except (OSError, subprocess.SubprocessError) as error:
-        print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
+        _report_diagnostic(f"staff: Mac copy failed: {' '.join(str(error).split())}")
 
 
 def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
@@ -1673,7 +1684,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
-                print("unchanged", file=sys.stderr)
+                _report_diagnostic("unchanged")
             else:
                 _store(proposed, pending)
             return result
@@ -2170,7 +2181,7 @@ def _forget_restart(staff_ids: list[StaffId]) -> None:
     try:
         forget([str(staff_id) for staff_id in staff_ids])
     except (OSError, ValueError) as error:
-        print(f"staff: restart record anomaly: {error}", file=sys.stderr)
+        _report_diagnostic(f"staff: restart record anomaly: {error}")
 
 
 @dataclass(frozen=True)

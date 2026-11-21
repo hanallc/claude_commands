@@ -41,7 +41,7 @@ from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.direct import progress_history
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 
-LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
+LAUNCH_PREPARED_WORKER = herdr.launch_prepared_worker
 
 
 def final_reply(row: staff.StaffRow, message: str = "The conversation is complete.") -> None:
@@ -307,9 +307,9 @@ class PaneWorld(herdr.Herdr):
         return herdr.PaneStartupObservation(herdr.PaneShell(991000), activity)
 
     @override
-    def pane_agent_process(self, pane: str, terminal: str) -> herdr.AgentProcessIdentity:
+    def foreground_agent_identity(self, pane: str) -> herdr.AgentProcessIdentity:
         with patch.dict(os.environ, {"HERDR_PROC": str(self.process_root)}):
-            return super().pane_agent_process(pane, terminal)
+            return super().foreground_agent_identity(pane)
 
     @override
     def native_pane_process(self, pane: str, kind: str, timeout: float, *,
@@ -335,29 +335,33 @@ class PaneWorld(herdr.Herdr):
                             reported_unknown: str = "",
                             agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
         """Use the real command builder with the private pane transport."""
+        del reported_unknown
+        assert not isinstance(destination, herdr.NewTab)
+        assert isinstance(opening, herdr.NoOpeningPrompt)
         server_result = self.result
 
         def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
             if arguments[:2] == ("pane", "split"):
                 number = 1 + max((int(pane.split(":p")[-1]) for pane in self.used_panes
                                   if pane.split(":p")[-1].isdigit()), default=0)
-                return {"pane": {"pane_id": "w1:p" + str(number)}}
+                pane = "w1:p" + str(number)
+                return {"pane": {"pane_id": pane, "terminal_id": "terminal-" + pane}}
             return server_result(*arguments, deadline=deadline)
 
         def start(session: str, pane: str, family: str, arguments: list[str],
                   prompt: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *,
-                  agent: str) -> herdr.PromptSubmitOutcome | herdr.PromptSubmissionNotRequired:
+                  agent: str, terminal: str) -> herdr.PromptSubmitOutcome | herdr.PromptSubmissionNotRequired:
             launched = self.launch(session, destination, prepared, family, arguments, prompt, timeout,
                                    agent=agent, agent_name=agent_name)
-            if launched.pane != pane:
-                raise AssertionError(f"fixture started {launched.pane}; expected {pane}")
+            if not isinstance(launched, herdr.WorkerAgentLaunched) or (launched.pane, launched.terminal) != (pane, terminal):
+                raise AssertionError(f"The fixture did not start {pane} with terminal {terminal}.")
             return launched.outcome
 
         with (patch.object(self, "result", side_effect=result), patch.object(self, "run_in_pane"),
               patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
-              patch.object(herdr, "start_agent", side_effect=start)):
-            return LAUNCH_PREPARED_AGENT(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
-                agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
+              patch.object(herdr, "_start_worker_agent", side_effect=start)):
+            return LAUNCH_PREPARED_WORKER(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
+                agent=agent, agent_name=agent_name)
 
     def launch(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
@@ -421,9 +425,12 @@ class PaneWorld(herdr.Herdr):
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
+        terminal = str(self.locations[pane]["terminal_id"])
         if self.disappear_after_launch:
             del self.locations[pane]
-        return herdr.AgentLaunched(pane, self.outcome)
+        if isinstance(self.outcome, herdr.WorkerStartFailed) and not self.outcome.terminal:
+            return herdr.AgentLaunched(pane, self.outcome)
+        return herdr.WorkerAgentLaunched(pane, self.outcome, terminal)
 
     def remove_pane(self, pane: str) -> None:
         self.closed.append((pane, str(self.locations[pane]["terminal_id"])))
@@ -567,7 +574,7 @@ class WorkerPaneTests(StaffTestCase):
         self.world.add(self.parent, "w1:p0")
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit-runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
-        _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch))
+        _ = self.enterContext(patch.object(herdr, "launch_prepared_worker", side_effect=self.world.launch))
         _ = self.enterContext(patch.object(restart, "stop_row", side_effect=self.world.stop))
 
     def worker(self, name: str = "impl2", *, family: Literal["claude", "codex"] = "claude") -> staff.StaffRow:
@@ -671,7 +678,7 @@ class WorkerPaneTests(StaffTestCase):
                             path.unlink()
                     return result
 
-                with patch.object(herdr, "launch_prepared_agent", side_effect=started):
+                with patch.object(herdr, "launch_prepared_worker", side_effect=started):
                     result = self.start(f"TEST-admission-{retained_launch}")
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 assert isinstance(result, worker_panes.OpenWorker)
@@ -1302,18 +1309,18 @@ class WorkerPaneTests(StaffTestCase):
             assert isinstance(hold, worker_panes.WorkerLockHold)
             with patch.object(fcntl, "flock", side_effect=acquire):
                 result = worker_panes.start_or_resume(self.parent.id, name, "astra-reviewer", lock=hold)
-        self.assertIsInstance(result, worker_panes.UncertainWorker)
-        assert isinstance(result, worker_panes.UncertainWorker)
-        self.assertIn("launch proof is incomplete", result.reason)
-        self.assertIn("[Errno 11]", result.reason)
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIs(result.cleanup, worker_panes.UnpublishedCleanup.PANE_CLOSED)
+        self.assertIn("[Errno 11]", result.cause)
         self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
-        self.assertEqual(staff.by_id(result.row.id), result.row)
-        self.assertNotEqual(result.row.current_session, "")
-        self.assertIsInstance(self.observation(result.row), worker_panes.ClosedWorker)
+        saved, = staff.snapshot().find(kind="worker", parent=self.parent.id)
+        self.assertNotEqual(saved.current_session, "")
+        self.assertIsInstance(self.observation(saved), worker_panes.ClosedWorker)
         resumed = self.start(name.value, "astra-reviewer")
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
         assert isinstance(resumed, worker_panes.OpenWorker)
-        self.assertEqual((resumed.row.id, resumed.row.current_session), (result.row.id, result.row.current_session))
+        self.assertEqual((resumed.row.id, resumed.row.current_session), (saved.id, saved.current_session))
 
     def test_launch_proof_failure_keeps_a_pane_that_already_existed(self) -> None:
         row = self.worker("existing-pane", family="codex")
@@ -1446,7 +1453,7 @@ class WorkerPaneTests(StaffTestCase):
         first = self.start()
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
-        self.assertEqual(first.created_pane, worker_panes.CreatedWorkerPane(first.terminal))
+        self.assertEqual(first.created_pane, worker_panes.CreatedWorkerPane(first.pane, first.terminal))
         self.dispatch(first.row, "impl")
         before = self.staff_state()
         locations = {key: dict(value) for key, value in self.world.locations.items()}
@@ -1466,7 +1473,7 @@ class WorkerPaneTests(StaffTestCase):
         selected = accounts.NamedAccount("claude2", selected_home)
         for status in ("idle", "working"):
             with (self.subTest(status=status, policy="explicit"), patch.dict(os.environ, caller),
-                  patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch_through_herdr)):
+                  patch.object(herdr, "launch_prepared_worker", side_effect=self.world.launch_through_herdr)):
                 name = staff.WorkerName.parse("catalog-" + status)
                 opened = worker_panes.start_or_resume(self.parent.id, name, "impl", account=selected, policy=policy)
                 self.assertIsInstance(opened, worker_panes.OpenWorker)
@@ -1811,7 +1818,7 @@ class WorkerPaneTests(StaffTestCase):
 
                 _ = scope.enter_context(patch.object(self.world, "result", side_effect=result))
                 _ = scope.enter_context(patch.object(self.world, "run", side_effect=transport))
-                _ = scope.enter_context(patch.object(herdr, "launch_prepared_agent", side_effect=started))
+                _ = scope.enter_context(patch.object(herdr, "launch_prepared_worker", side_effect=started))
                 _ = scope.enter_context(patch.object(herdr, "native_process", side_effect=process))
                 _ = scope.enter_context(patch.object(time, "monotonic", return_value=100.0))
                 _ = scope.enter_context(patch.object(time, "sleep", side_effect=AssertionError("worker start must not sleep")))
@@ -2036,6 +2043,21 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIn("activity is unreadable", result.reason)
         self.assertEqual(self.prompts(), [])
 
+    def test_recovery_activity_can_become_unreadable_after_the_first_read(self) -> None:
+        self.world.interrupt = "split"
+        _ = self.start()
+        pane = "w1:p1"
+        error = herdr_types.HerdrFailure("activity is unreadable")
+        with patch.object(self.world, "pane_activity", side_effect=[herdr.PaneAtShell(), error]) as activity:
+            result = self.start()
+        self.assertEqual([call.args for call in activity.call_args_list], [(pane,), (pane,)])
+        assert isinstance(result, worker_panes.UncertainWorker)
+        self.assertTrue(result.start_failed)
+        self.assertEqual(result.reason, f"herdr agents:{pane}: agent start failed: {error}; pane state unknown")
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.prompts(), [])
+
     def test_fresh_codex_pane_missing_before_the_first_turn_stays_unpublished(self) -> None:
         self.world.disappear_after_launch = True
         result = self.start("reviewer", "review")
@@ -2059,13 +2081,13 @@ class WorkerPaneTests(StaffTestCase):
 
         pane = "w1:p1"
         reason = str(herdr.AgentExited(self.world.session, pane))
-        self.world.outcome = herdr.AgentNotStarted(reason, pane_result=pane_result, session=self.world.session, pane=pane)
+        self.world.outcome = herdr.WorkerStartFailed(reason, pane_result=pane_result, session=self.world.session, pane=pane)
         self.world.disappear_after_launch = pane_result is herdr.StartPaneResult.CLOSED
         with (patch.object(self.world, "pane_row", wraps=self.world.pane_row) as pane_row,
               patch.object(worker_admission, "publish", side_effect=AssertionError("worker did not start")),
               redirect_stderr(io.StringIO()) as errors):
             result = self.start("reviewer", "review")
-            self.assertEqual(worker.startup_result(staff.WorkerName.parse("reviewer"), result), exit_code)
+            self.assertEqual(worker.startup_result(staff.WorkerName.parse("reviewer"), result, start_only=True), exit_code)
 
         diagnostic = f"herdr {self.world.session}:{pane}: agent start failed: {reason}; {label}"
         expected = (worker_panes.StartRefused(worker_panes.StartRefusal.AGENT_START_FAILED, diagnostic) if exit_code == 2
@@ -2075,6 +2097,173 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [diagnostic])
         self.assertEqual(self.prompts(), [])
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+
+    def test_successful_split_keeps_its_original_terminal_through_process_selection(self) -> None:
+        launch = cast(Callable[..., herdr.AgentLaunched], self.world.launch)
+
+        def replace_terminal(*arguments: object, **options: object) -> herdr.AgentLaunched:
+            result = launch(*arguments, **options)
+            assert isinstance(result, herdr.WorkerAgentLaunched)
+            self.world.locations[result.pane]["terminal_id"] = "replacement-terminal"
+            return result
+
+        with (patch.object(herdr, "launch_prepared_worker", side_effect=replace_terminal),
+              patch.object(self.world, "pane_agent_process", wraps=self.world.pane_agent_process) as process,
+              patch.object(worker_admission, "publish") as publish):
+            result = self.start("reviewer", "review")
+
+        pane = "w1:p1"
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIn("launched terminal changed", result.cause)
+        self.assertFalse(any(call.args[0] == pane for call in process.call_args_list))
+        publish.assert_not_called()
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.locations[pane]["terminal_id"], "replacement-terminal")
+
+    def test_failed_start_keeps_its_screen_when_the_native_session_differs(self) -> None:
+        from scripts.production import worker
+
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        row = self.worker("reviewer")
+        pane = "w1:p1"
+        terminal = "terminal-" + pane
+        self.world.add(row, pane, live=False)
+        self.world.outcome = herdr.WorkerStartFailed("agent did not become ready", screen="Trust\ndialog",
+            pane_result=herdr.StartPaneResult.RETAINED, session=self.world.session, pane=pane, terminal=terminal)
+        with (patch.object(self.world, "native_session", return_value=fixture_runtime_id("another-conversation")),
+              patch.object(worker_admission, "publish") as publish,
+              redirect_stderr(io.StringIO()) as errors):
+            result = self.start(row.name, "review")
+            self.assertIs(worker.startup_result(staff.WorkerName.parse(row.name), result, start_only=True), worker.ExitCode.UNCERTAIN)
+
+        assert isinstance(result, worker_panes.UncertainWorker)
+        self.assertTrue(result.start_failed)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"herdr {self.world.session}:{pane}: agent start failed: agent did not become ready; "
+            + "visible screen: Trust dialog; pane retained; launch proves another native session"])
+        publish.assert_not_called()
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_failed_family_switch_keeps_start_and_lookup_details_after_cleanup_refusal(self) -> None:
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        row = self.worker("reviewer", family="codex")
+        self.completed_dispatch(row, "review")
+        pane = "w1:p1"
+        self.world.outcome = herdr.WorkerStartFailed("agent did not become ready", screen="Trust dialog",
+            pane_result=herdr.StartPaneResult.RETAINED, session=self.world.session, pane=pane, terminal="terminal-" + pane)
+
+        def release(_source: staff.StaffRow, _backend: object) -> SourceReleased:
+            return SourceReleased()
+
+        native = self.world.native_session
+
+        def prove(selected: str, kind: str, timeout: float, *,
+                  pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> str:
+            if selected == pane:
+                raise herdr_types.HerdrFailure("native session lookup failed")
+            return native(selected, kind, timeout, pane_row=pane_row)
+
+        with (patch.object(stop_resume, "release_source", side_effect=release),
+              patch.object(self.world, "native_session", side_effect=prove),
+              patch.object(staff, "update_current_session") as publish):
+            result = self.start(row.name, "review")
+
+        assert isinstance(result, worker_panes.UncertainWorker)
+        self.assertTrue(result.start_failed)
+        for part in ("agent did not become ready", "visible screen: Trust dialog", "native session lookup failed",
+                     f"destination pane {pane} retained"):
+            self.assertIn(part, result.reason)
+        self.assertEqual(len(result.reason.splitlines()), 1)
+        publish.assert_not_called()
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.locations[pane]["terminal_id"], "terminal-" + pane)
+
+    def test_failed_split_preserves_start_failure_when_process_proof_fails(self) -> None:
+        from scripts.production import worker
+
+        pane = "w1:p1"
+        terminal = "terminal-" + pane
+        for moved in (True, False):
+            with self.subTest(moved=moved):
+                case = WorkerPaneTests("runTest")
+                case.setUp()
+                try:
+                    world = case.world
+                    launch = cast(Callable[..., herdr.AgentLaunched], world.launch)
+                    find_process = world.pane_agent_process
+                    world.outcome = herdr.WorkerStartFailed("agent did not become ready", screen="Trust dialog",
+                        pane_result=herdr.StartPaneResult.RETAINED, session=world.session, pane=pane, terminal=terminal)
+
+                    def start(*arguments: object, **options: object) -> herdr.AgentLaunched:
+                        result = launch(*arguments, **options)
+                        case.assertEqual(result.pane, pane)
+                        if moved:
+                            world.locations[pane]["terminal_id"] = "replacement-terminal"
+                        return result
+
+                    def process(selected: str, selected_terminal: str) -> herdr.AgentProcessIdentity:
+                        if selected != pane:
+                            return find_process(selected, selected_terminal)
+                        case.assertFalse(moved, "The process lookup must leave the replacement terminal alone.")
+                        case.assertEqual(selected_terminal, terminal)
+                        raise OSError("process lookup failed")
+
+                    with (patch.object(herdr, "launch_prepared_worker", side_effect=start),
+                          patch.object(world, "pane_agent_process", side_effect=process),
+                          patch.object(worker_admission, "publish") as publish,
+                          redirect_stderr(io.StringIO()) as errors):
+                        result = case.start("reviewer", "review")
+                        case.assertIs(worker.startup_result(staff.WorkerName.parse("reviewer"), result, start_only=True),
+                                      worker.ExitCode.UNCERTAIN)
+                    publish.assert_not_called()
+                    case.assertEqual(world.closed, [])
+                    case.assertEqual(world.locations[pane]["terminal_id"], "replacement-terminal" if moved else terminal)
+                    expected = "pane state unknown; launched terminal changed" if moved else "pane retained; process lookup failed"
+                    case.assertEqual(errors.getvalue().splitlines(), [
+                        f"herdr {world.session}:{pane}: agent start failed: agent did not become ready; visible screen: Trust dialog; {expected}"])
+                finally:
+                    case.doCleanups()
+
+    def test_failed_split_reports_only_unknown_when_the_cleanup_pid_is_reused(self) -> None:
+        from scripts.production import worker
+
+        pane = "w1:p1"
+        terminal = "terminal-" + pane
+        self.world.outcome = herdr.WorkerStartFailed("agent did not become ready", screen="Trust dialog",
+            pane_result=herdr.StartPaneResult.RETAINED, session=self.world.session, pane=pane, terminal=terminal)
+        close_terminal = self.world.close_worker_terminal
+        read_panes = self.world.panes
+
+        def close_after_reuse(selected: str, selected_terminal: str, *, target: str | herdr.AgentProcessIdentity) -> bool:
+            self.assertEqual((selected, selected_terminal), (pane, terminal))
+            assert isinstance(target, herdr.AgentProcessIdentity)
+
+            def inventory() -> list[herdr.PaneIdentity]:
+                rows = read_panes()
+                stat = self.world.process_root / str(target.pid) / "stat"
+                write_text_atomic(stat, f"{target.pid} (fixture) S " + "0 " * 18 + "2\n")
+                return rows
+
+            with patch.object(self.world, "panes", side_effect=inventory) as panes:
+                try:
+                    return close_terminal(selected, selected_terminal, target=target)
+                finally:
+                    panes.assert_called_once_with()
+
+        with (patch.object(self.world, "close_worker_terminal", side_effect=close_after_reuse),
+              redirect_stderr(io.StringIO()) as errors):
+            result = self.start("reviewer", "review")
+            self.assertIs(worker.startup_result(staff.WorkerName.parse("reviewer"), result, start_only=True),
+                          worker.ExitCode.UNCERTAIN)
+
+        diagnostic, = errors.getvalue().splitlines()
+        self.assertIn("agent did not become ready; visible screen: Trust dialog; pane state unknown", diagnostic)
+        self.assertIn("reused process", diagnostic)
+        self.assertNotIn("retained", diagnostic)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.locations[pane]["terminal_id"], terminal)
 
     def test_existing_pane_target_change_reports_unknown_and_keeps_the_replacement(self) -> None:
         from scripts.production import worker
@@ -2090,9 +2279,9 @@ class WorkerPaneTests(StaffTestCase):
             self.world.locations[pane]["terminal_id"] = "replacement-terminal"
             raise herdr_types.HerdrFailure("terminal changed", "wrong_target")
 
-        with (patch.object(herdr, "launch_prepared_agent", wraps=LAUNCH_PREPARED_AGENT),
+        with (patch.object(herdr, "launch_prepared_worker", wraps=LAUNCH_PREPARED_WORKER),
               patch.object(self.world, "run_in_pane", side_effect=refuse),
-              patch.object(herdr, "start_agent") as started,
+              patch.object(herdr, "_start_worker_agent") as started,
               patch.object(worker_admission, "publish") as publish,
               redirect_stderr(io.StringIO()) as errors):
             result = self.start(name, "review")
@@ -2109,12 +2298,12 @@ class WorkerPaneTests(StaffTestCase):
 
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
         reason = "trust write failed"
-        with (patch.object(herdr, "launch_prepared_agent", wraps=LAUNCH_PREPARED_AGENT),
+        with (patch.object(herdr, "launch_prepared_worker", wraps=LAUNCH_PREPARED_WORKER),
               patch.object(herdr, "trust_claude_launch", side_effect=herdr_types.HerdrFailure(reason)),
-              patch.object(herdr, "start_agent") as started,
+              patch.object(herdr, "_start_worker_agent") as started,
               redirect_stderr(io.StringIO()) as errors):
             result = self.start("reviewer", "review")
-            self.assertIs(worker.startup_result(staff.WorkerName.parse("reviewer"), result), worker.ExitCode.REFUSED)
+            self.assertIs(worker.startup_result(staff.WorkerName.parse("reviewer"), result, start_only=True), worker.ExitCode.REFUSED)
 
         diagnostic = f"herdr {self.world.session}:reviewer: agent start failed: {reason}; no pane opened"
         self.assertEqual(result, worker_panes.StartRefused(worker_panes.StartRefusal.AGENT_START_FAILED, diagnostic))
@@ -2130,11 +2319,11 @@ class WorkerPaneTests(StaffTestCase):
         identity = fixture_runtime_id("already-running")
         with (patch.object(worker_panes, "launch_arguments", return_value=["resume", identity]),
               patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", (123,))),
-              patch.object(herdr, "launch_prepared_agent", wraps=LAUNCH_PREPARED_AGENT),
-              patch.object(herdr, "start_agent") as started,
+              patch.object(herdr, "launch_prepared_worker", wraps=LAUNCH_PREPARED_WORKER),
+              patch.object(herdr, "_start_worker_agent") as started,
               redirect_stderr(io.StringIO()) as errors):
             result = self.start("reviewer", "review")
-            self.assertIs(worker.startup_result(staff.WorkerName.parse("reviewer"), result), worker.ExitCode.REFUSED)
+            self.assertIs(worker.startup_result(staff.WorkerName.parse("reviewer"), result, start_only=True), worker.ExitCode.REFUSED)
         reason = f"would start a second copy of running session {identity}"
         diagnostic = f"herdr {self.world.session}:reviewer: agent start failed: {reason}; no pane opened"
         self.assertEqual(result, worker_panes.StartRefused(worker_panes.StartRefusal.AGENT_START_FAILED, diagnostic))
@@ -2231,7 +2420,7 @@ class WorkerPaneTests(StaffTestCase):
         for failure in (False, OSError("TEST close failed\nsecond line")):
             with self.subTest(failure=failure):
                 with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
-                      patch.object(self.world, "close_pane", side_effect=failure if isinstance(failure, OSError) else None,
+                      patch.object(self.world, "close_worker_terminal", side_effect=failure if isinstance(failure, OSError) else None,
                                    return_value=False), redirect_stderr(io.StringIO()) as errors):
                     result = self.start("TEST-close-" + str(isinstance(failure, OSError)))
                 self.assertIsInstance(result, worker_panes.UnpublishedWorker)
@@ -2241,6 +2430,34 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(result.cleanup_reason, "TEST close failed second line" if isinstance(failure, OSError)
                                  else "pane close was not confirmed")
                 self.assertIn(result.pane, self.world.locations)
+
+    def test_failed_publication_keeps_the_replacement_after_the_process_check(self) -> None:
+        pane = "w1:p1"
+        terminal = "terminal-" + pane
+        find_process = self.world.foreground_agent_identity
+        publication_refused = False
+
+        def refuse(*_arguments: object) -> staff.StaffRow:
+            nonlocal publication_refused
+            publication_refused = True
+            raise staff.StaffRefused("fixture publication failed")
+
+        def lookup(selected: str) -> herdr.AgentProcessIdentity:
+            found = find_process(selected)
+            if publication_refused and selected == pane:
+                self.assertEqual(self.world.locations[pane]["terminal_id"], terminal)
+                self.world.locations[pane]["terminal_id"] = "replacement-terminal"
+            return found
+
+        with (patch.object(staff, "ensure_worker", side_effect=refuse),
+              patch.object(self.world, "foreground_agent_identity", side_effect=lookup)):
+            result = self.start()
+
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIs(result.cleanup, worker_panes.UnpublishedCleanup.PANE_CLOSE_FAILED)
+        self.assertIn("terminal identity changed; pane state unknown", result.cleanup_reason)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.locations[pane]["terminal_id"], "replacement-terminal")
 
     def test_failed_recovery_admission_keeps_the_pane_this_call_did_not_start(self) -> None:
         self.world.interrupt = "agent"
@@ -2469,9 +2686,10 @@ class WorkerPaneTests(StaffTestCase):
                     f"herdr pane split: {code}: pane not found", code)) as split,
               patch.object(self.world, "label_pane") as label,
               patch.object(self.world, "run_in_pane") as run,
-              patch.object(herdr, "start_agent") as start,
+              patch.object(herdr, "_start_worker_agent") as start,
               patch.object(pane_launch, "write") as write):
-            launched = LAUNCH_PREPARED_AGENT(session, destination, prepared, kind, arguments, opening, timeout_ms,
+            assert isinstance(opening, herdr.NoOpeningPrompt)
+            launched = LAUNCH_PREPARED_WORKER(session, destination, prepared, kind, arguments, opening, timeout_ms,
                                              agent=agent, agent_name=agent_name, client=self.world)
         self.assertEqual(split.call_count, 1)
         self.assertEqual(split.call_args.args[:3], ("pane", "split", destination.of_pane))
@@ -2482,7 +2700,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.locations, panes)
         self.assertEqual(self.world.launches, launches)
         self.assertEqual(pane_launch.read_valid_entries(path), records)
-        assert isinstance(launched.outcome, herdr.AgentNotStarted)
+        assert isinstance(launched.outcome, herdr.WorkerStartFailed)
         self.assertEqual(launched.outcome.code, code)
         return launched
 
@@ -2513,7 +2731,7 @@ class WorkerPaneTests(StaffTestCase):
                 return self.world.launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
                                          agent=agent, agent_name=agent_name)
 
-            with patch.object(herdr, "launch_prepared_agent", side_effect=split):
+            with patch.object(herdr, "launch_prepared_worker", side_effect=split):
                 return self.start("impl")
 
         event = turn_end.WorkerEvent(str(sibling.row.current_session), reply="ready")
@@ -2617,10 +2835,10 @@ class WorkerPaneTests(StaffTestCase):
                 timeout_ms, agent=agent, agent_name=agent_name, code=codes[len(attempts) - 1])
 
         pane_absent = codes[-1] == "pane_not_found"
-        with (patch.object(herdr, "launch_prepared_agent", side_effect=split),
+        with (patch.object(herdr, "launch_prepared_worker", side_effect=split),
               redirect_stderr(io.StringIO()) as errors):
             result = self.start("failed")
-            self.assertEqual(worker.startup_result(staff.WorkerName.parse("failed"), result), 2 if pane_absent else 8)
+            self.assertEqual(worker.startup_result(staff.WorkerName.parse("failed"), result, start_only=True), 2 if pane_absent else 8)
         self.assertIsInstance(result, worker_panes.StartRefused if pane_absent else worker_panes.UncertainWorker)
         label = "no pane opened" if pane_absent else "pane state unknown"
         self.assertEqual(errors.getvalue().splitlines(), [
@@ -2826,7 +3044,7 @@ class WorkerPaneTests(StaffTestCase):
                         with patch.object(stop_resume, "release_source", side_effect=release):
                             with ExitStack() as faults:
                                 if family == "claude" and failure == "none":
-                                    _ = faults.enter_context(patch.object(herdr, "launch_prepared_agent", side_effect=started))
+                                    _ = faults.enter_context(patch.object(herdr, "launch_prepared_worker", side_effect=started))
                                 if failure == "publication":
                                     _ = faults.enter_context(patch.object(staff, "update_current_session",
                                         side_effect=staff.StaffRefused("publication unavailable")))
@@ -3055,7 +3273,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(result, worker_panes.ProcessUnknownWorker)
         self.assertEqual(len(self.world.launches), 1)
 
-    def test_start_rerun_after_row_write_retains_the_published_native_row(self) -> None:
+    def test_start_rerun_after_row_write_replaces_the_retired_native_row(self) -> None:
         publish = staff.ensure_worker
 
         def interrupted(identity: staff.StaffId, name: str, parent: staff.StaffId) -> staff.StaffRow:
@@ -3064,14 +3282,13 @@ class WorkerPaneTests(StaffTestCase):
 
         with patch.object(staff, "ensure_worker", side_effect=interrupted):
             _ = self.start()
-        rows = staff.snapshot().find(kind="worker", parent=self.parent.id)
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
-        self.assertEqual(result.row, replace(rows[0], role=staff.KnownWorkerRole("impl")))
-        self.assertEqual(staff.by_id(rows[0].id), result.row)
-        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(result.row.role, staff.KnownWorkerRole("impl"))
+        self.assertEqual(staff.by_id(result.row.id), result.row)
+        self.assertEqual(len(self.world.launches), 2)
 
     def test_concurrent_starts_publish_one_row_and_one_pane(self) -> None:
         with ThreadPoolExecutor(max_workers=2) as callers:
@@ -3270,7 +3487,7 @@ class WorkerPaneTests(StaffTestCase):
                             accounts.NamedAccount("claude", destination))
                 with (patch.object(agent_accounts, "codex_account_home", wraps=agent_accounts.codex_account_home) as codex,
                       patch.object(accounts, "prepare_claude_launch", wraps=accounts.prepare_claude_launch) as claude,
-                      patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch_through_herdr)):
+                      patch.object(herdr, "launch_prepared_worker", side_effect=self.world.launch_through_herdr)):
                     result = self.start(row.name, account=selected)
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 assert isinstance(result, worker_panes.OpenWorker)
@@ -3506,6 +3723,40 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(result, worker_panes.Closed)
         self.assertEqual(self.world.layouts["w1:t1"], expected)
         self.assertEqual(self.world.closed, [])
+
+    def test_final_staff_scan_error_keeps_the_new_worker_and_row(self) -> None:
+        scan = self.world.scan_row_panes
+
+        def fail_after_publication(record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> herdr.RowPaneScan:
+            if record.find(kind="worker", parent=self.parent.id):
+                raise OSError("fixture final staff scan failed")
+            return scan(record, panes)
+
+        with patch.object(self.world, "scan_row_panes", side_effect=fail_after_publication):
+            with self.assertRaisesRegex(OSError, "fixture final staff scan failed"):
+                _ = self.start("impl")
+
+        row, = staff.snapshot().find(kind="worker", parent=self.parent.id)
+        self.assertIsInstance(self.observation(row), worker_panes.OpenWorker)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_new_worker_stays_open_when_the_layout_read_fails(self) -> None:
+        request = self.world.socket_request
+
+        def interrupt(method: str, **params: object) -> dict[str, object]:
+            if method == "layout.export":
+                raise OSError("fixture layout read failed")
+            return request(method, **params)
+
+        with patch.object(self.world, "socket_request", side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, "fixture layout read failed"):
+                _ = self.start("impl")
+
+        row, = staff.snapshot().find(kind="worker", parent=self.parent.id)
+        self.assertIsInstance(self.observation(row), worker_panes.OpenWorker)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(len(self.world.launches), 1)
 
     def test_start_rerun_finishes_layout_after_a_failed_layout_read(self) -> None:
         for name in ("a", "b", "c"):
