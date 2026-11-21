@@ -2885,8 +2885,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_new_item_offers_the_list_producer_and_sends_to_its_current_session(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
-        morty = fixture_member("producer", name="morty",
-                               doc=staff.LiveDoc(local_machine(), self.root.parent / "unavailable.md"))
+        morty = fixture_member("producer", name="morty")
         morty = staff.update_current_session(morty.current_session, staff.native_id(str(uuid4())))
         self.assertNotEqual(morty.id, morty.current_session)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={owner.id}\n")
@@ -2923,7 +2922,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(details.page, page)
                     send.assert_called_once_with(f"session:{morty.current_session}", change_page.SENDER, ANY)
 
-    def test_standard_new_item_files_for_the_list_producer_with_an_unreadable_document(self) -> None:
+    def test_standard_new_item_refuses_the_list_producer_with_an_unreadable_document(self) -> None:
         case = self.review_fixture()
         document = self.root.parent / "unreadable.md"
         _ = document.write_text("# Morty\n")
@@ -2941,7 +2940,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(Path, "read_text", read),
               patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "send_message")):
+              patch.object(change_page, "send_message") as send):
             options = self.new_item_http()
             self.assertEqual(options.status, 200, options.body)
             fields = cast(dict[str, object], json.loads(options.body))
@@ -2952,9 +2951,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             for request in (question, replace(question, request_id="r2-" + uuid4().hex)):
                 with self.subTest(request_id=request.request_id):
                     reply = self.new_item_http(self.new_item_body(request), finished=True)
-                    self.assertEqual(reply.status, 200, reply.body)
-                    saved = cast(dict[str, str], json.loads(reply.body))
-                    self.assertEqual(cache.get().records[saved["key"]].owner, producer.id)
+                    self.assertEqual(reply.status, 400, reply.body)
+                    self.assertEqual(json.loads(reply.body), {"error": "Cannot read the production document for morty."})
+            self.assertEqual(update_registration.question_records_for_owner(producer.id), [])
+            send.assert_not_called()
 
     def test_new_item_excludes_the_retired_list_producer(self) -> None:
         case = self.review_fixture()

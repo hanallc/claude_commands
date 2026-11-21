@@ -506,7 +506,7 @@ def has_all_linked_reviews(item: the_list.ListItem, reviews: ReviewRecords) -> b
 
 def read_linked_reviews(root: Path, *, members: staff.StaffSnapshot) -> list[review_items.ReviewItem]:
     """Read the Review records without assigning IDs to legacy questions."""
-    return review_items.read(root, members=members, assign_ids=False)
+    return review_items.read(root, members=members)
 
 
 def linked_reviews(root: Path, members: staff.StaffSnapshot, records: ImmediateReviewRecords,

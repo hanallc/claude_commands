@@ -19,7 +19,6 @@ from scripts.production import change_review, change_routing, investigation, pro
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_record
-from scripts.review_links import review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
 PY = '~/.claude/scripts/lib/py ~/.claude/scripts/'
@@ -130,7 +129,7 @@ def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
 
 def question_action(item: review_items.ReviewItem, action: change_page.QuestionOutcome, words: str,
                     status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
-    """Replace an open follow-up before the normal question action saves."""
+    """Save the action against the selected Question."""
     from scripts.review_links import change_browser
     source = item.source
     assert isinstance(source, review_items.QuestionSource)
@@ -141,19 +140,9 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
         scope = review_submissions.sent_question_scope(item.owner, identities.record)
         return sent_question_action(item, source.record, scope, action, words, status)
     scope = update_registration.question_scope(item.owner, identities.record)
-    with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
-        current = update_registration.current_open_question(source.record, 'followup')
-        pending = current.item.pop('followup', None)
-        if pending is None:
-            raise review_items.ReviewRecordChanged('No follow-up waits for a reply on this question.')
-        events = review_events.decode(current.item.get('review_log', ''))
-        event = review_events.ReviewLog(datetime.now(user_zone()), 'nate', 'Superseded followup: '+pending['text'])
-        current.item['review_log'] = review_events.encode(review_events.append(events, event))
-        update_registration.write_question_record(current)
-    record_superseded(item, action)
-    question = change_browser.WaitingQuestion(item.key, review_items.name(item.owner, identities.record), current,
-        update_registration.question_source(scope), item.owner, review_items.name(current.asker, identities.record))
-    return change_browser.submit_question(question, action, words, status)
+    question = change_browser.WaitingQuestion(item.key, review_items.name(item.owner, identities.record), source.record,
+        update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, identities.record))
+    return change_browser.submit_question(question, action, words, status, save=change_browser.SelectedQuestionSave())
 
 
 def sent_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,

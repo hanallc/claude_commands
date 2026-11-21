@@ -470,7 +470,11 @@ Open items count in the status line.
 An open investigation and a deferred efficiency item do not count.
 Questions receive a stable, shared `Q<n>` ID in their registration records.
 The native writer assigns the ID under the question owner's lock.
-The snapshot uses the file name for a legacy question until a native write assigns its ID.
+All Review reads use the file name for a legacy Question until a native write assigns its ID.
+This includes the Open read and the Review snapshot.
+When the allocator cannot read a named local document needed to find record folders, it refuses the allocation.
+Proposal filing reports the reason before it saves a record or reserves its ID.
+Review checks that the selected Question still matches the saved record before it replaces a pending follow-up.
 Ordinary reminders serve the owner's session; Review excludes them from items and counts.
 Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
@@ -580,6 +584,10 @@ Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
+Standard Send, List Send and Review Send to the List owner use the same owner check.
+Send uses an active parent when the selected owner has wrapped.
+If a named local document cannot be read, Send reports the reason and leaves the request free for an edit.
+Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
 The page owner dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
 The dialog keeps **Send** available while it takes the screenshot.
@@ -660,7 +668,6 @@ Requests retain the current snapshot during an update.
 The server starts recovery before the snapshot worker.
 The live service requests the initial Review build at startup.
 Creating a console manifest after server construction does not start a Review build.
-The native Question writer assigns stable IDs to legacy Questions under the owner lock.
 The same guard tracks and skips each source or record that fails during a build.
 A notice names each skipped source or record.
 An invalid efficiency mark or Later time leaves the other entries available.

@@ -39,7 +39,7 @@ from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
-from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, staff, update_registration
+from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
@@ -960,7 +960,10 @@ window.fetch=(url,options)=>{
 
     def test_question_note_does_not_block_native_id_allocation(self) -> None:
         key = self.question()
-        folder = self.question_path(key).parent
+        first = self.question_path(key)
+        folder = first.parent
+        record, = update_registration.selected_question_records([first], (), None)
+        update_registration.write_question_record(record, assign_id=True)
         _ = (folder/'question-notes.md').write_text('# Notes about questions\n')
         _ = (folder/'question-broken.md').write_text('---\nrecord_type: question\n')
         _ = (folder/'question-other.md').write_text('---\nrecord_type: note\n---\n')
@@ -1433,17 +1436,20 @@ window.fetch=(url,options)=>{
     def test_review_reads_a_legacy_question_and_the_native_writer_allocates_its_id(self) -> None:
         key = self.question()
         path = self.question_path(key)
-        text = path.read_text()
-        line = next(line for line in text.splitlines() if line.startswith('registration: '))
-        fields = cast(dict[str, object], json.loads(line.removeprefix('registration: ')))
-        _ = fields.pop('review_id', None)
-        legacy = text.replace(line, 'registration: '+json.dumps(fields))
-        _ = path.write_text(legacy)
-        (investigation.state_root() / 'record-ids' / 'question.water').unlink()
+        legacy = path.read_bytes()
+        modified = path.stat().st_mtime_ns
+        sequence = record_store.state_root() / 'record-ids' / 'question.water'
+        self.assertNotIn(b'"review_id"', legacy)
+        opened = next(item for item in review_items.read_open(self.root) if item.key == key)
+        self.assertEqual(opened.id, 'page-owner/'+path.stem)
+        self.assertEqual(path.read_bytes(), legacy)
+        self.assertEqual(path.stat().st_mtime_ns, modified)
+        self.assertFalse(sequence.exists())
         page = review_page.render(self.root).decode()
         index = page.split('<script type="application/json" data-review-index>', 1)[1].split('</script>', 1)[0]
         self.assertEqual(next(entry['id'] for entry in unpack_index(index) if entry['key']==key), 'page-owner/'+path.stem)
-        self.assertEqual(path.read_text(), legacy)
+        self.assertEqual(path.read_bytes(), legacy)
+        self.assertEqual(path.stat().st_mtime_ns, modified)
         record, = update_registration.selected_question_records([path], (), None)
         update_registration.write_question_record(record, assign_id=True)
         page = review_page.render(self.root).decode()
@@ -2584,13 +2590,17 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     def test_question_ids_remain_after_closure_and_later_registration(self) -> None:
         key = self.question('First question?')
+        first, = update_registration.selected_question_records([self.question_path(key)], (), None)
+        update_registration.write_question_record(first, assign_id=True)
         original = next(item for item in review_items.read(self.root) if item.key == key)
         self.assertEqual(original.id, 'page-owner/Q1', 'F013: show the native ID on the first read')
         self.assertIsInstance(original.source,review_items.QuestionSource)
         assert isinstance(original.source,review_items.QuestionSource)
         record = original.source.record
         update_registration.write_question_record(replace(record,status='closed'))
-        _ = self.question('Second question?')
+        second = self.question('Second question?')
+        registered, = update_registration.selected_question_records([self.question_path(second)], (), None)
+        update_registration.write_question_record(registered, assign_id=True)
         items = review_items.read(self.root)
         self.assertEqual(next(item.id for item in items if item.key == key),original.id)
         self.assertEqual(len({item.id for item in items if item.type == review_items.ReviewType.QUESTION}),2)

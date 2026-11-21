@@ -209,7 +209,7 @@ class ReviewSnapshot:
         if key in self.records:
             return self.body(key, view=view)
         item = next((item for item in review_items.read(
-            root, members=self.members, kinds=TYPES, show=ReviewState.DONE, assign_ids=False)
+            root, members=self.members, kinds=TYPES, show=ReviewState.DONE)
             if item.key == key), None)
         if item is None:
             raise LookupError('This item is not in the current snapshot.')
@@ -424,7 +424,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
     status = change_page.DeliveryStatus(root)
-    for item in review_items.read(root, members=members, show='active', sources=sources, assign_ids=False):
+    for item in review_items.read(root, members=members, show='active', sources=sources):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
             item = review_items.normalize_times(item, zone)

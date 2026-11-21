@@ -20,7 +20,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from functools import cached_property
@@ -247,8 +247,13 @@ def _proposal_id(path: Path) -> str:
     return record_store.number_fields(path, frozenset({NUMBER_FIELD})).value(NUMBER_FIELD)
 
 
-def proposal_numbers() -> AbstractContextManager[record_store.LockedRecordNumbers]:
-    return record_store.record_numbers(record_store.RecordKind.PROPOSAL, _proposal_id)
+@contextmanager
+def proposal_numbers() -> Generator[record_store.LockedRecordNumbers]:
+    with record_store.record_numbers(record_store.RecordKind.PROPOSAL, _proposal_id) as numbers:
+        try:
+            yield numbers
+        except record_store.RecordAllocationRefused as error:
+            raise Refusal(str(error)) from error
 
 
 def proposal_owner(issue: Issue, legacy_owner: str) -> staff.StaffId:
@@ -449,7 +454,7 @@ def file_review_proposal(folder: Path, recipient: staff.StaffId, title: str, wor
     today = datetime.now(user_zone()).date()
     why = review_events.require_waiting_why(waiting_why)
     with _folder_lock(folder), proposal_numbers() as numbers:
-        folders = _proposal_folders(folder, recipient, strict=True)
+        folders = _proposal_folders(folder, recipient, strict=True, require_existing_document=True)
         names = {path.name for path in record_store.stored_paths(folders, strict=True)}
         identity = numbers.next_id(*folders, covered_owner=recipient)
         # An inline JSON object stays one frontmatter value in the issue reader.
@@ -462,9 +467,9 @@ def file_review_proposal(folder: Path, recipient: staff.StaffId, title: str, wor
         while True:
             path = _free_proposal_path(folder / f"{slug}.md", identity, names)
             text, _ = set_fields(draft, {**fields, NUMBER_FIELD: identity}, path)
-            before_write(identity, path)
             try:
-                with numbers.write(path, identity, recipient, new_record=True):
+                with numbers.write(path, identity, recipient, new_record=True,
+                                   before_write=lambda: before_write(identity, path)):
                     try:
                         record_store.create_record_text(path, text)
                     except record_store.ReusedReviewRecord:

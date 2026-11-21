@@ -16,7 +16,6 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
@@ -1424,7 +1423,6 @@ class NewItemDialogTests(unittest.TestCase):
         other = staff.StaffRow(OTHER_RECIPIENT, "producer", "cargo-liner", staff.StaffRoot(),
                                current_session=OTHER_RECIPIENT)
         morty = staff.StaffRow(LIST_PRODUCER, "producer", "morty", staff.StaffRoot(),
-                               doc=staff.LiveDoc(local_machine(), temporary / "unavailable.md"),
                                current_session=staff.StaffId("fixture-morty-session"))
         snapshot = staff.StaffSnapshot((recipient, other, morty))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=snapshot))
