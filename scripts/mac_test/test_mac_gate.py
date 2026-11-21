@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import final, override
+from typing import cast, final, override
 import unittest
 from unittest import mock
 
@@ -21,6 +21,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import scratch
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -316,7 +317,7 @@ class MacGateTests(unittest.TestCase):
                 cloud_gate.save(folder / 'request.json', request)
                 cloud_gate.save(folder / 'checkout.json', {'path': str(clone)})
                 _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# fixture\n')
-                self.exercise_bundle(clone, folder, request, expected=kind != 'current')
+                _ = self.exercise_bundle(clone, folder, request, expected=kind != 'current')
 
                 bundle = folder / 'source.bundle'
                 if kind != 'current':
@@ -331,10 +332,46 @@ class MacGateTests(unittest.TestCase):
                 self.assertEqual(gate.checked_git(clone, 'rev-parse', 'origin/main'), base)
                 self.assertEqual(gate.checked_git(clone, 'remote', 'get-url', 'origin'), origin)
 
-    def exercise_bundle(self, clone: Path, folder: Path, request: dict[str, object], *, expected: bool) -> None:
+    def test_remote_commands_set_pythonpath_in_zsh(self) -> None:
+        folder = self.root / 'mac-gate-fixture'
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        cloud_gate.save(folder / 'request.json', request)
+        clone = self.exercise_bundle(self.repo, folder, request, expected=False)
+
+        home = self.root / 'mac home'
+        remote = home / mac_gate.REMOTE_ROOT / folder.name
+        entry = remote / 'mac_gate.py'
+        remote.mkdir(parents=True)
+        entry.with_suffix('.py.new').touch()
+        shim = home / '.claude/scripts/lib/py'
+        shim.parent.mkdir(parents=True)
+        write_stdlib_tool(shim, """\
+import json, os, sys
+print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
+""")
+        environment = {**os.environ, 'HOME': str(home), 'ZDOTDIR': str(home),
+                       'PYTHONPATH': str(self.root / 'local-pythonpath')}
+        argv_file = folder / 'argv.json'
+        stage = cast(list[str], json.loads(argv_file.read_text()))
+        self.assertEqual(stage[:2], ['/bin/zsh', '-c'])
+        stop = argv_file.with_suffix('.json.close').read_text()
+        for action, command, arguments in (
+            ('clone', ['/bin/zsh', '-c', clone], ['fixture-owner', 'fixture-project', folder.name]),
+            ('stage', stage, ['1']),
+            ('stop', ['/bin/zsh', '-c', stop], []),
+        ):
+            with self.subTest(action=action):
+                result = subprocess.run(command, cwd=home, env=environment, capture_output=True,
+                                        text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout),
+                                 [str(home / '.claude'), str(entry), action, str(remote), *arguments])
+
+    def exercise_bundle(self, clone: Path, folder: Path, request: dict[str, object], *, expected: bool) -> str:
         argv_file = folder / 'argv.json'
         _ = (folder / 'local-repo').write_text(str(self.repo))
         captured = subprocess.run
+        clone_commands: list[str] = []
 
         def reply(command: list[str], *, text: bool) -> str:
             self.assertTrue(text)
@@ -343,6 +380,7 @@ class MacGateTests(unittest.TestCase):
                 return captured(['/bin/sh', '-c', remote], capture_output=True, check=True, text=True).stdout
             if ' clone ' in remote:
                 self.assertIn('fixture-owner fixture-project', remote)
+                clone_commands.append(remote)
                 return f'mac_gate_checkout={clone}'
             return 'created'
 
@@ -354,7 +392,7 @@ class MacGateTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0)
 
         lease = self.root / 'lease'
-        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac'}),
+        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac', 'CODEX_THREAD_ID': folder.name}),
               mock.patch.object(copies, 'source_owner', return_value='fixture-owner'),
               mock.patch.object(copies, 'repository_name', return_value='fixture-project'),
               mock.patch.object(copies, 'remote_lease_path', return_value=lease),
@@ -370,6 +408,8 @@ class MacGateTests(unittest.TestCase):
         self.assertIn(' stage ', argv_file.read_text())
         self.assertIn(' stop ', argv_file.with_suffix('.json.close').read_text())
         self.assertEqual(request['source_key'], '')
+        clone_command, = clone_commands
+        return clone_command
 
     def test_checkout_probe_rejects_a_nonzero_remote_status(self) -> None:
         folder = self.root / 'mac-gate-fixture'
