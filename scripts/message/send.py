@@ -143,7 +143,7 @@ from enum import Enum
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TextIO, TypedDict, cast, get_args
+from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TextIO, TypedDict, cast, get_args, overload
 
 from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
@@ -895,6 +895,24 @@ class RemoteDelivery:
 
 
 @dataclass(frozen=True)
+class RecipientClosed:
+    """The sender found a closed or stopped Codex worker with no route."""
+    address: str
+
+    def as_result(self) -> Result:
+        return Result("closed", f"{self.address} has a closed or stopped worker pane")
+
+
+@dataclass(frozen=True)
+class RecipientAbsent:
+    """The roster search proved that the Codex thread has no match."""
+    address: str
+
+    def as_result(self) -> Result:
+        return Result("absent", f"no live Codex session has address {self.address}")
+
+
+@dataclass(frozen=True)
 class RecipientLookupFailed:
     reason: str
 
@@ -932,7 +950,7 @@ class TransportQueueOwner:
 TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
 
 
-DeliveryRoute = SessionRecipient | QueuedStaffRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+DeliveryRoute = SessionRecipient | QueuedStaffRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientClosed | RecipientAbsent | RecipientLookupFailed
 
 
 @dataclass(frozen=True)
@@ -1046,6 +1064,7 @@ class Options(NamedTuple):
     silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE
     review_delivery: bool = False
     urgent: bool = False
+    skip_closed: bool = False
 
     @property
     def to(self) -> str:
@@ -3136,11 +3155,33 @@ def _matched_recipient(
     return _messageable_recipient(entry)
 
 
+def _closed_codex_worker(entry: roster.RosterEntry) -> bool:
+    from scripts.message import roster
+
+    return (entry.role == "worker" and isinstance(entry.thread, roster.CodexThread)
+            and isinstance(entry.reach, roster.CannotReceiveMessages)
+            and (entry.status == "closed" or entry.status.startswith("stopped; pane ")))
+
+
+@overload
 def matching_recipients(
     to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
-    membership: staff.StaffSnapshot | None = None,
-) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
-    """Find rows without delivering or exiting; ask the peer only after a local miss."""
+    membership: staff.StaffSnapshot | None = None, skip_closed: Literal[False] = False,
+) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed: ...
+
+
+@overload
+def matching_recipients(
+    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
+    membership: staff.StaffSnapshot | None = None, skip_closed: bool,
+) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed | RecipientClosed | RecipientAbsent: ...
+
+
+def matching_recipients(
+    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
+    membership: staff.StaffSnapshot | None = None, skip_closed: bool = False,
+) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed | RecipientClosed | RecipientAbsent:
+    """Find routes here and check the peer when there is no usable local match."""
     from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
@@ -3156,11 +3197,52 @@ def matching_recipients(
         for anomaly in observed.row_anomalies:
             if anomaly.row.id == member.id:
                 return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
-    matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
-               else _native_address_matches(to, observed.entries)
-               or (_registry_name_matches(to, observed.entries) if isinstance(staff_alias, NoStaffRecipient) else []))
-    if matches or isinstance(scope, LocalOnly):
-        return RecipientMatches(matches, LocalOnly(), observed.diagnostics)
+    thread = roster.CodexThread(to[6:]) if skip_closed and to.startswith("codex:") else roster.NoCodexThread()
+
+    def matches_in(entries: list[roster.RosterEntry], owner: staff.StaffRow | NoStaffRecipient) -> list[roster.RosterEntry]:
+        if isinstance(thread, roster.CodexThread):
+            matches = [entry for entry in entries if entry.thread == thread]
+            return [entry for entry in matches if not _closed_codex_worker(entry)] or matches
+        if isinstance(owner, staff.StaffRow):
+            return _staff_transport_matches(owner, entries)
+        return (_native_address_matches(to, entries)
+                or (_registry_name_matches(to, entries) if isinstance(staff_alias, NoStaffRecipient) else []))
+
+    def all_closed(matches: list[roster.RosterEntry]) -> bool:
+        return isinstance(thread, roster.CodexThread) and bool(matches) and all(_closed_codex_worker(entry) for entry in matches)
+
+    def resolved(matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
+                 *sources: roster.Roster) -> RecipientMatches | RecipientSearchFailed | RecipientClosed | RecipientAbsent:
+        problems = [problem for source in sources for problem in source.diagnostics]
+        if isinstance(thread, roster.CodexThread) and not matches:
+            if any(source.problems for source in sources) or _recipient_roster_problems(to, problems, observed, membership):
+                return RecipientSearchFailed(f"recipient lookup failed for {to!r}", problems)
+            if any(entry.kind == "codex" and isinstance(entry.thread, roster.NoCodexThread)
+                   for source in sources for entry in source.entries):
+                return RecipientSearchFailed(f"cannot prove absence of {to}: a Codex thread identity is unknown", problems)
+            return RecipientAbsent(to)
+        if all_closed(matches):
+            related = _recipient_roster_problems(to, problems, observed, membership)
+            failures: list[str] = []
+            for problem in problems:
+                diagnostic = problem.removeprefix(f"{destination.host}: ") if isinstance(destination, NamedMachine) else problem
+                if diagnostic.startswith("Claude session records:"):
+                    continue
+                if problem in related or diagnostic.startswith((
+                        "Codex daemon ", "Codex daemon:", "staff membership:", "pane workers:",
+                        "herdr session", "not reached:")):
+                    failures.append(problem)
+            if failures:
+                return RecipientSearchFailed("; ".join(failures), problems)
+            return RecipientClosed(to)
+        if (isinstance(thread, roster.CodexThread) and matches
+                and all(isinstance(entry.reach, roster.CannotReceiveMessages) for entry in matches)):
+            return RecipientSearchFailed("; ".join(entry.status for entry in matches), problems)
+        return RecipientMatches(matches, destination, problems)
+
+    local = matches_in(observed.entries, member)
+    if (local and not all_closed(local)) or isinstance(scope, LocalOnly):
+        return resolved(local, LocalOnly(), observed)
     addressed = to.startswith(("session:", "worker:", "codex:"))
     if observed.problems and not addressed:
         return LocalRosterIncomplete(observed.diagnostics)
@@ -3169,22 +3251,20 @@ def matching_recipients(
     member = NoStaffRecipient() if native else _staff_recipient_match(to, membership, observed=[*observed.entries, *peer.entries])
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [*problems, member.reason])
-    if isinstance(member, staff.StaffRow):
-        matches = _staff_transport_matches(member, observed.entries)
-        if matches:
-            return RecipientMatches(matches, LocalOnly(), problems)
-        matches = _staff_transport_matches(member, peer.entries)
-    else:
-        matches = (_native_address_matches(to, peer.entries)
-                   or (_registry_name_matches(to, peer.entries) if isinstance(staff_alias, NoStaffRecipient) else []))
-    if not matches and peer.problems:
+    if isinstance(member, staff.StaffRow) and isinstance(thread, roster.NoCodexThread):
+        local = matches_in(observed.entries, member)
+        if local:
+            return RecipientMatches(local, LocalOnly(), problems)
+    matches = matches_in(peer.entries, member)
+    if not matches and not local and peer.problems:
         return RecipientSearchFailed("; ".join(peer.problems), problems)
-    return RecipientMatches(matches, NamedMachine(roster.remote.other_machine()), problems)
+    return resolved(matches or local, NamedMachine(roster.remote.other_machine()), observed, peer)
 
 
 def resolve_recipient(
     target: str | FixedStaffLookup, scope: RecipientResolutionScope, observed: roster.Roster, *,
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
+    skip_closed: bool = False,
 ) -> DeliveryRoute:
     """Resolve locally first and require a current staff row for a fixed staff lookup."""
     from scripts.message import roster
@@ -3196,6 +3276,7 @@ def resolve_recipient(
         usage_error(fixed_member.reason)
     problems = observed.diagnostics
     native = not isinstance(target, FixedStaffLookup) and to.startswith("session:")
+    check_closed = skip_closed and to.startswith("codex:")
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
@@ -3208,7 +3289,7 @@ def resolve_recipient(
                   else _staff_recipient_match(to, membership, observed=observed.entries))
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
-        if (not isinstance(scope, NamedMachine)
+        if (not check_closed and not isinstance(scope, NamedMachine)
                 and isinstance(member, staff.StaffRow) and member.kind == "worker"):
             holder = membership.parent_of(member)
             if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
@@ -3217,6 +3298,8 @@ def resolve_recipient(
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
+                    if check_closed:
+                        return RecipientLookupFailed(anomaly.diagnostic)
                     usage_error(anomaly.diagnostic)
         if isinstance(scope, NamedMachine):
             return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
@@ -3227,9 +3310,19 @@ def resolve_recipient(
             if not thread_id:
                 usage_error("codex: needs a thread id")
         resolution_scope = LocalOnly() if native and sessions.addressed(to, records or []) is not None else scope
-        result = matching_recipients(to, resolution_scope, observed, membership=membership)
+        result = matching_recipients(to, resolution_scope, observed, membership=membership, skip_closed=check_closed)
+        if isinstance(result, (RecipientClosed, RecipientAbsent)):
+            return result
         problems = result.problems
         if isinstance(result, RecipientMatches) and result.entries:
+            if check_closed and len(result.entries) == 1:
+                entry = result.entries[0]
+                if isinstance(entry.reach, roster.Messageable):
+                    if isinstance(result.destination, NamedMachine):
+                        return RemoteDelivery(result.destination.host, to)
+                    if (entry.reach.address.startswith("worker:") and isinstance(member, staff.StaffRow)
+                            and member.kind == "worker"):
+                        return PaneWorkerRecipient(member)
             route = _matched_recipient(to, result.entries, result.destination)
             if (isinstance(route, RemoteDelivery) and route.selected_conversation
                     and isinstance(member, staff.StaffRow)):
@@ -4378,6 +4471,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     forwarded += ["--forwarded-sender-stamp", sender_native_id(message.stamp)]
     if isinstance(options.selection, ForwardedConversation):
         forwarded += ["--forwarded-conversation"]
+    if options.skip_closed:
+        forwarded += ["--skip-closed"]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
         if options.urgent:
@@ -4429,6 +4524,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
     parsed = outcome.header
+    if parsed.outcome == "absent" and not options.skip_closed:
+        return Result("failed", f"ssh {host}: unexpected ABSENT result")
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
@@ -4628,6 +4725,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--recipient-kind", choices=get_args(staff.Kind),
                             help="require a current staff row of this kind at the fixed staff ID in --to")
     _ = parser.add_argument("--urgent", action="store_true", help="send now through a Claude review hold")
+    _ = parser.add_argument("--skip-closed", action="store_true", help="return CLOSED for a closed Codex worker or ABSENT for a confirmed missing Codex thread")
     _ = parser.add_argument("--text-id", default="", help="registered script push")
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
@@ -4801,7 +4899,10 @@ def parse(argv: list[str]) -> Options:
                       silence_policy=(silence.SilencePolicy.SEND_THROUGH_SILENCE if attr(args, "through_silence") is True
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
-                      review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True)
+                      review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True,
+                      skip_closed=get["skip_closed"] is True)
+    if options.skip_closed and (not to.startswith("codex:") or not isinstance(selection, RosterLookup)):
+        parser.error("--skip-closed needs a codex: thread address")
     if options.to == USER and options.summary is None:
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -4999,7 +5100,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True) -> Result:
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5086,10 +5187,10 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
             reason = state.reason
-        elif isinstance(state, worker_panes.StoppedWorker):
-            reason = "worker is stopped"
         else:
-            reason = "worker pane is closed"
+            if skip_closed:
+                return RecipientClosed(f"codex:{worker.current_session}").as_result()
+            reason = "worker is stopped" if isinstance(state, worker_panes.StoppedWorker) else "worker pane is closed"
     if worker_only:
         return Result("retry", reason)
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
@@ -5182,12 +5283,15 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     else:
         try:
             selected = options.selection if isinstance(options.selection, FixedStaffLookup) else target
-            route = resolve_recipient(selected, options.scope, observed, membership=membership, records=running)
+            route = resolve_recipient(selected, options.scope, observed, membership=membership, records=running,
+                                      skip_closed=options.skip_closed)
         except RecipientNameMissing as error:
             from scripts.message import failed_lookup
 
             failed_lookup.report(options.sender or default_sender(), options.to, f"send.py: {error.reason}")
             raise
+    if isinstance(route, (RecipientClosed, RecipientAbsent)):
+        return route.as_result()
     destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
     if isinstance(route, RemoteDelivery) and route.selected_conversation:
         mailbox = ConversationRecipient(route.host, route.address[8:])
@@ -5346,6 +5450,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         elif isinstance(route, RemoteDelivery):
             forwarded = options._replace(selection=ForwardedConversation(route.address)) if route.selected_conversation else options
             result = remote(message, route.host, forwarded)
+            if result.outcome == "absent" and isinstance(options.scope, LocalThenPeer):
+                local = matching_recipients(options.to, LocalOnly(), observed, membership=membership, skip_closed=True)
+                if not isinstance(local, RecipientAbsent):
+                    result = Result("failed", f"cannot prove local absence of {options.to} after the peer lost its route")
         elif isinstance(route, UserDelivery):
             if isinstance(options.action, NoUserRecipient):
                 raise AssertionError("a user message must state its action")
@@ -5363,17 +5471,12 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             enqueue(replace(transport_message, key=None if transport_message.review_batch else message.key), result.detail, started,
                     recipient=attempt_recipient, order=order, membership=membership, mailbox=queue_mailbox)
         elif isinstance(route, PaneWorkerRecipient):
-            if batch_only:
-                result = deliver_worker_text(route.row, membership, agent_text(transport_message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                             allow_holder_fallback=False)
-            elif transport_message.review_batch:
-                result = deliver_worker_text(route.row, membership, agent_text(message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                             review_text=agent_text(transport_message))
-            else:
-                result = deliver_worker_text(route.row, membership, agent_text(message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection)
+            worker_message = transport_message if batch_only else message
+            review_text = agent_text(transport_message) if transport_message.review_batch and not batch_only else ""
+            result = deliver_worker_text(route.row, membership, agent_text(worker_message),
+                                         sender=message.sender, timeout=options.timeout, selection=options.selection,
+                                         review_text=review_text, allow_holder_fallback=not batch_only,
+                                         skip_closed=options.skip_closed)
         else:
             claude_started = time.monotonic()
             def relay_and_queue(relay_message: Message, timeout: float) -> Result:
@@ -5518,7 +5621,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 and isinstance(claim_result, ClaimGranted)
                 and not isinstance(result, (UncertainRelayDelivery, WorkerMessageUnconfirmed))
                 and ((emergency and result.outcome != "sent")
-                     or result.outcome in {"failed", "refused", "held", "pending"})):
+                     or result.outcome in {"failed", "refused", "held", "pending", "closed", "absent"})):
             forget_sent(key, attempt_recipient.value, started)
         elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
               and not isinstance(result, RecordedDeliveryAcceptance)
