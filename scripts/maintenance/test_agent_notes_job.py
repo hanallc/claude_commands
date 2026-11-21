@@ -158,6 +158,14 @@ class JobTests(unittest.TestCase):
             self.assertTrue(all(result.outcome is job.Outcome.SUCCESS for result in job.run_job()))
         self.assertTrue(logins_started.is_set())
 
+    def test_folder_size_part_calls_the_check(self) -> None:
+        from scripts.maintenance import folder_size
+
+        with (patch.dict(os.environ, {"HOME": str(self.root)}),
+              patch.object(folder_size, "run") as check):
+            self.assertEqual(job._perform(Part.FOLDER_SIZE), 0)  # pyright: ignore[reportPrivateUsage]
+        check.assert_called_once_with()
+
     def vault_git(self, *arguments: str) -> str:
         return subprocess.run(
             ["git", "-C", str(self.root / "rust/hanadocs"), *arguments], check=True,
@@ -272,15 +280,41 @@ class JobTests(unittest.TestCase):
     def test_runtime_configuration_controls_each_parts_interval_and_deadline(self) -> None:
         original = self.config.read_text()
         _ = self.config.write_text(original.replace("timeout_seconds = 60", "timeout_seconds = 0.5"))
-        self.assertEqual(settings().parts[Part.NOTES].timeout_seconds, 0.5)
+        self.assertEqual(settings().parts[Part.NOTES], Schedule(120, 0.5))
         def result(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
             return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
         with patch.object(job, "run_part", side_effect=result):
             _ = job.run_job()
-        _ = self.config.write_text(original.replace("interval_seconds = 120", "interval_seconds = 0.000000001"))
+        fast = ["interval_seconds = 0.000000001" if line.startswith("interval_seconds = ") else line
+                for line in original.splitlines()]
+        _ = self.config.write_text("\n".join(fast) + "\n")
         with patch.object(job, "run_part", side_effect=result) as run:
             _ = job.run_job()
         self.assertEqual(run.call_count, len(Part))
+
+    def test_an_invalid_part_schedule_leaves_other_parts_running(self) -> None:
+        original = self.config.read_text()
+
+        def launch(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+            return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
+
+        for invalid in Part:
+            with self.subTest(part=invalid):
+                header = f"\n[parts.{invalid.value}]\n"
+                before, _, after = original.partition(header)
+                next_section = after.index("\n[")
+                _ = self.config.write_text(before + header + "interval_seconds = 0\n" + after[next_section:])
+                with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / invalid.value)}),
+                      patch.object(job, "run_part", side_effect=launch) as run):
+                    results = {result.part: result for result in job.run_job()}
+                    forced = job.run_now(invalid)
+                failed = results[invalid]
+                self.assertEqual(failed.outcome, job.Outcome.FAILED)
+                self.assertIn(f"[parts.{invalid.value}]", failed.output)
+                self.assertEqual(forced, failed)
+                self.assertEqual({part for part, result in results.items() if result.outcome is job.Outcome.SUCCESS},
+                                 set(Part) - {invalid})
+                self.assertEqual(run.call_count, len(Part) - 1)
 
 
 if __name__ == "__main__":

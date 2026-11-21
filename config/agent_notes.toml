@@ -52,6 +52,11 @@ timeout_seconds = 45
 # Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 60
+[parts.folder_size]
+# Set the minimum time between successful producer folder size checks.
+# Use a finite positive number.
+interval_seconds = 3600
+timeout_seconds = 60
 [parts.vault]
 # Sets the minimum time after a successful vault check for note changes before the next scheduled check.
 # Use a finite positive number.
