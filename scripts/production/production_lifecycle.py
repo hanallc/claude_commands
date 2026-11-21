@@ -225,17 +225,16 @@ def read_move_approval(path: Path) -> MoveApproval | NoMoveApproval:
         if destinations.live_doc == destinations.log:
             raise ValueError("the move destinations must be different")
         status: MoveOpen | MoveClosed
-        match fields["status"]:
-            case {"kind": "open"} if fields["status"] == {"kind": "open"}:
-                status = MoveOpen()
-            case {"kind": "closed", "closed_at": closed}:
-                _ = move_fields(fields["status"], {"kind", "closed_at"})
-                closed_at = saved_move_time(cast(object, closed))
-                if not max(start, approved) <= closed_at < end:
-                    raise ValueError("the move record has an invalid close time")
-                status = MoveClosed(closed_at)
-            case _:
+        if fields["status"] == {"kind": "open"}:
+            status = MoveOpen()
+        else:
+            closed = move_fields(fields["status"], {"kind", "closed_at"})
+            if closed["kind"] != "closed":
                 raise ValueError("the move record has an invalid status")
+            closed_at = saved_move_time(closed["closed_at"])
+            if not max(start, approved) <= closed_at < end:
+                raise ValueError("the move record has an invalid close time")
+            status = MoveClosed(closed_at)
         return MoveApproval(move_text(fields["production"]), staff.native_id(move_text(fields["target_staff_id"])),
                             staff.native_id(move_text(fields["executor_staff_id"])), approved, start, end,
                             destinations, status)
