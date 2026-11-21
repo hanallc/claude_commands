@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, redirect_stderr
+from dataclasses import replace
 import fcntl
 import io
 import json
@@ -17,6 +18,11 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, reply_bytes
 from scripts.lib.build_slots_test_support import SlotTestConfiguration, private_slot_config
 from scripts.lib.proc_text import read_proc_text
+
+
+class QueueRowNameTests(unittest.TestCase):
+    def test_an_unknown_repository_uses_the_folder_name(self) -> None:
+        self.assertEqual(slot_wait.QueueRowName.repository("unregistered session", "/private/widget"), "widget build")
 
 
 class RepositorySlotWaitTests(unittest.TestCase):
@@ -55,6 +61,18 @@ class RepositorySlotWaitTests(unittest.TestCase):
         return wire.RepositorySlotRequest(original.episode, original.owner, original.since, repository,
             settings.machine, str(settings.slots), 1, original.since + 30,
             wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"))
+
+    def test_service_names_a_repository_slot_waiter_with_no_name(self) -> None:
+        fixture, settings = self.pool()
+        _ = self.hold(settings)
+        request = self.request(fixture, settings)
+        request = replace(request, identity=replace(request.identity, name=""))
+        self.assertIsInstance(fixture.connect(request).replies()[-1], wire.RepositorySlotWaiting)
+        reply, = fixture.connect(wire.ViewRequest()).replies()
+        assert isinstance(reply, wire.ViewReply)
+        assert isinstance(reply.reading, wire.CloudQueueRead)
+        row, = reply.reading.repository_slots
+        self.assertEqual(row.identity.name, "unregistered session")
 
     def test_capacity_grants_when_a_slot_frees_or_the_pool_can_grow(self) -> None:
         for state in ("released", "below maximum"):

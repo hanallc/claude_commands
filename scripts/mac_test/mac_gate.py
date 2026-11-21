@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 import fcntl
 import io
 import json
@@ -13,7 +14,7 @@ import os
 import re
 from pathlib import Path
 import select
-import selectors
+from selectors import DefaultSelector, EVENT_READ
 import shlex
 import shutil
 import signal
@@ -46,10 +47,31 @@ if TYPE_CHECKING:
 MODULE_LIST = Path('config/mac_gate_modules.txt')
 MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
 REMOTE_ROOT = '.local/state/mac-gate'
+CHECKOUT_NAME = 'mac-gate'
+ATTEMPT_PREFIX = CHECKOUT_NAME + '-'
+ATTEMPT_PATTERN = rf'{ATTEMPT_PREFIX}[A-Za-z0-9_]+'
+CHECKOUT_TASK_PREFIX = 'gate:'
 RESULT_PREFIX = 'mac_gate_result='
+TESTS_STARTED_PREFIX = 'mac_gate_tests_started='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
-MAC_TIME_LIMIT_S = 3600
+QUEUE_WAIT_LIMIT_KEY = 'time_limit.queue_wait_seconds'
+TEST_RUN_LIMIT_KEY = 'time_limit.test_run_seconds'
+
+
+@dataclass(frozen=True)
+class MacGateTimes:
+    queue_wait_seconds: float
+    test_run_seconds: float
+
+
+class MacGateTimeout(GateRefused):
+    """The Mac queue wait or test run reached its bound."""
+
+
+class CheckoutCleanup(StrEnum):
+    REMOVED = 'mac_gate_cleaned'
+    RETAINED = 'mac_gate_retained'
 
 
 @dataclass(frozen=True)
@@ -86,10 +108,15 @@ def read_modules(repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing:
 
 def attempt_name(folder: Path) -> str:
     attempt = folder.name
-    suffix = attempt.removeprefix('mac-gate-')
-    if suffix == attempt or not suffix.isascii() or not suffix.replace('_', 'a').isalnum():
+    if re.fullmatch(ATTEMPT_PATTERN, attempt) is None:
         raise GateRefused('Invalid Mac gate attempt')
     return attempt
+
+
+def is_mac_gate_checkout(mirror: copies.RemoteMirror) -> bool:
+    # A record without a task goes through the manual removal list.
+    return (mirror.task.startswith(CHECKOUT_TASK_PREFIX)
+            and re.fullmatch(ATTEMPT_PATTERN, mirror.task.removeprefix(CHECKOUT_TASK_PREFIX)) is not None)
 
 
 def running_owner(pid: int, start: str) -> bool:
@@ -148,7 +175,7 @@ def stop_guest(folder: Path, deadline: float) -> None:
 
 
 def checkout_task(folder: Path) -> str:
-    return 'gate:' + attempt_name(folder)
+    return CHECKOUT_TASK_PREFIX + attempt_name(folder)
 
 
 def read_checkout(folder: Path) -> Path:
@@ -159,14 +186,14 @@ def read_checkout(folder: Path) -> Path:
     return path
 
 
-def stop_checkout(folder: Path) -> None:
+def stop_checkout(folder: Path) -> CheckoutCleanup:
     root = (Path.home() / REMOTE_ROOT).resolve()
     if folder.resolve() != root / attempt_name(folder):
         raise GateRefused('The folder is outside the Mac gate state directory')
     try:
         lock = (folder / 'cleanup.lock').open('a')
     except FileNotFoundError:
-        return
+        return CheckoutCleanup.REMOVED
     with lock:
         grace = conf.read('mac_gate').number('terminate_grace_seconds')
         deadline = time.monotonic() + admission_records.read_memory_config().program_stop_seconds + grace
@@ -179,15 +206,52 @@ def stop_checkout(folder: Path) -> None:
                     raise GateRefused('The Mac gate cleanup lock is held') from None
                 time.sleep(0.05)
         if not folder.exists():
-            return
-        stop_guest(folder, deadline)
-        paths: set[Path] = {read_checkout(folder)} if (folder / 'checkout.json').exists() else set()
-        ended = scratch.end(checkout_task(folder))
-        if ended.kept:
-            raise GateRefused(f'The Mac kept {ended.kept[0].path}: {ended.kept[0].reason}')
-        for path in paths.union(ended):
-            copies.unregister_remote('localhost', str(path))
-        shutil.rmtree(folder)
+            return CheckoutCleanup.REMOVED
+        checkout_file = folder / 'checkout.json'
+        receipt = folder / 'task-ended.json'
+        cleanup_paths: dict[str, object]
+        try:
+            cleanup_paths = cloud_gate.read(receipt)
+        except FileNotFoundError:
+            stop_guest(folder, deadline)
+            # Until Mac promotion, scratch.end can return removed paths and a separate kept list.
+            ended = cast(Sequence[Path | scratch.KeptFolder], scratch.end(checkout_task(folder)))
+            legacy_kept = cast(Sequence[scratch.KeptFolder], getattr(ended, 'kept', ()))
+            for entry in legacy_kept:
+                print(f'kept for a manual removal list: {entry.path} (scratch, {entry.reason})', file=sys.stderr)
+            cleanup_paths = {str(entry.path): entry.reason for entry in (*ended, *legacy_kept)
+                             if isinstance(entry, scratch.KeptFolder)}
+            removed = {entry for entry in ended if isinstance(entry, Path)}
+            checkout = read_checkout(folder) if removed and checkout_file.exists() else None
+            for path in sorted(removed):
+                if not path.is_absolute():
+                    raise GateRefused('The Mac removed folder path is not absolute')
+                if str(path) in cleanup_paths:
+                    continue
+                try:
+                    _ = path.lstat()
+                except FileNotFoundError:
+                    copies.unregister_remote('localhost', str(path))
+                    if path == checkout:
+                        checkout_file.unlink()
+                else:
+                    cleanup_paths[str(path)] = 'the folder is still present'
+            cloud_gate.save(receipt, cleanup_paths)
+        paths: set[Path] = {read_checkout(folder)} if checkout_file.exists() else set()
+        paths.update(Path(name) for name in cleanup_paths)
+        outcome = CheckoutCleanup.REMOVED
+        for path in sorted(paths):
+            if not path.is_absolute():
+                raise GateRefused('The Mac retained folder path is not absolute')
+            try:
+                _ = path.lstat()
+            except FileNotFoundError:
+                copies.unregister_remote('localhost', str(path))
+            else:
+                outcome = CheckoutCleanup.RETAINED
+        if outcome is CheckoutCleanup.REMOVED:
+            shutil.rmtree(folder)
+        return outcome
 
 
 def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> Path:
@@ -198,7 +262,7 @@ def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> P
         # Leave the lock with copies if the SSH command ends during clone setup.
         output = subprocess.check_output([
             str(scripts / 'lib/py'), str(scripts / 'copies/copies.py'), 'clone', str(scripts.parent),
-            '--task', checkout_task(folder), '--name', 'mac-gate', '--owner', owner,
+            '--task', checkout_task(folder), '--name', CHECKOUT_NAME, '--owner', owner,
             '--repository', repository, '--session', session,
         ], text=True, pass_fds=(lock.fileno(),))
         path = Path(output.strip().splitlines()[-1]) if output.strip() else Path()
@@ -237,6 +301,15 @@ def checkout_bundle(ssh: list[str], checkout: str, repo: Path, folder: Path,
     return [bundle]
 
 
+def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
+    fallback = f'printf "{CheckoutCleanup.RETAINED}\\n"'
+    if Path(checkout).is_absolute():
+        probe = copies.path_missing_command(checkout)
+        fallback = f'if {probe}; then printf "{CheckoutCleanup.REMOVED}\\n"; else {fallback}; fi'
+    return (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
+            f'else rm -rf -- {root} && {fallback}; fi')
+
+
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
     root = '"$HOME"/' + shlex.quote(remote)
@@ -244,17 +317,22 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
-    cleanup = (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
-               f'else rm -rf -- {root}; fi')
     if phase == 'cleanup':
-        result = subprocess.run([*ssh, cleanup + ' && printf "mac_gate_cleaned\n"'],
-                                capture_output=True, text=True, check=False)
-        if result.returncode or result.stdout.strip() != 'mac_gate_cleaned':
+        try:
+            checkout = checkout_file.read_text()
+        except FileNotFoundError:
+            checkout = ''
+        cleanup = checkout_cleanup_command(root, runner, checkout)
+        result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
+        outcome = result.stdout.strip()
+        if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
             detail = ' '.join(result.stderr.split()) or 'The Mac did not confirm checkout cleanup'
             print(f'{CLEANUP_ERROR_PREFIX}{folder.name}:{detail}', flush=True)
             return 1
-        if checkout_file.exists():
-            copies.unregister_remote(host, checkout_file.read_text())
+        if result.stderr:
+            print(result.stderr, end='', file=sys.stderr)
+        if outcome == CheckoutCleanup.REMOVED and Path(checkout).is_absolute():
+            copies.unregister_remote(host, checkout)
         return 0
 
     request = cloud_gate.read(folder / 'request.json')
@@ -270,16 +348,18 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
         raise GateRefused('Could not create the Mac gate state folder')
     _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(Path(__file__).resolve()),
                         f'{host}:{remote}/mac_gate.py.new'], check=True)
-    _ = argv_file.with_suffix('.json.close').write_text(cleanup)
     clone = f'mv -- {root}/mac_gate.py.new {root}/mac_gate.py && {runner} clone {root} '
     response = subprocess.check_output([*ssh, clone + shlex.join([owner, repository, session])], text=True)
     checkout = response.strip().removeprefix('mac_gate_checkout=')
     if not response.startswith('mac_gate_checkout=') or not Path(checkout).is_absolute() or '\n' in checkout:
         raise GateRefused('The Mac did not confirm the gate checkout')
     write_text_atomic(checkout_file, checkout)
-    mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session)
+    _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, runner, checkout))
+    mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
+                                 task=checkout_task(folder))
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
     copies.register_remote(mirror)
+    copies.reconcile_remote_mirrors(host, is_mac_gate_checkout)
     files.extend(checkout_bundle(ssh, checkout, local_repo, folder, request))
     _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', *map(str, files), f'{host}:{remote}/'], check=True)
     _ = argv_file.write_text(json.dumps(['/bin/zsh', '-c', f'exec {runner} stage {root} {full}']))
@@ -300,6 +380,7 @@ def stage_checkout(folder: Path, full: str) -> None:
         _ = gate.checked_git(repo, 'update-ref', 'refs/remotes/origin/main', base)
         _ = gate.checked_git(repo, 'checkout', '-q', '--detach', commit)
         shim = str(repo / 'scripts/lib/py')
+        print('\n' + TESTS_STARTED_PREFIX + attempt_name(folder), flush=True)
         os.execv(shim, [shim, str(repo / 'scripts/mac_test/mac_gate.py'), 'guest', str(folder), full])
 
 
@@ -322,6 +403,8 @@ def record_guest(folder: Path, repo: Path) -> Generator[None]:
     recovery = MacGateRecovery(folder / 'run.json', str(repo.resolve()), pid, owner.start)
     with (folder / 'cleanup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if (folder / 'task-ended.json').exists():
+            raise GateRefused('The Mac gate checkout task has ended')
         recovery.save()
     recovery_token = gate.ACTIVE_GATE_RECOVERY.set(recovery)
     try:
@@ -392,6 +475,63 @@ def report_interrupted_gate(report: str) -> None:
             _ = sys.stderr.write(report)
 
 
+def wait_for_queue_exit(pid: int, deadline: float) -> bool:
+    """Detect exit by the deadline and keep the PID reserved for group cleanup.
+
+    Cleanup after the kill is outside this deadline.
+    """
+    while (remaining := deadline - time.monotonic()) > 0:
+        status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if (status is not None and status.si_pid == pid
+                and status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)):
+            return True
+        time.sleep(min(0.01, remaining))
+    return False
+
+
+def capture_queue(process: subprocess.Popen[bytes], output: bytearray, requested_at: float, attempt: str, *,
+                  queue_wait_limit: int, test_run_limit: int) -> MacGateTimes:
+    """Capture queue output and change the deadline when the Mac starts its tests."""
+    assert process.stdout is not None
+    fd = process.stdout.fileno()
+    start_line = (TESTS_STARTED_PREFIX + attempt + '\n').encode()
+    line_start = scanned = 0
+    test_started: float | None = None
+    deadline = requested_at + queue_wait_limit
+    expired_bound = f'{QUEUE_WAIT_LIMIT_KEY} ({queue_wait_limit}s)'
+    exited = False
+    with DefaultSelector() as readable:
+        _ = readable.register(fd, EVENT_READ)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not readable.select(remaining):
+                continue
+            chunk = os.read(fd, 65536)
+            output.extend(chunk)
+            received_at = time.monotonic()
+            if received_at >= deadline:
+                break
+            if not chunk:
+                exited = wait_for_queue_exit(process.pid, deadline)
+                break
+            if test_started is None:
+                while (newline := output.find(b'\n', scanned)) != -1:
+                    if output.startswith(start_line, line_start):
+                        test_started = received_at
+                        deadline = test_started + test_run_limit
+                        expired_bound = f'{TEST_RUN_LIMIT_KEY} ({test_run_limit}s)'
+                        break
+                    line_start = scanned = newline + 1
+                scanned = len(output)
+    finished = time.monotonic()
+    times = MacGateTimes((finished if test_started is None else test_started) - requested_at,
+                         0.0 if test_started is None else finished - test_started)
+    if not exited or finished >= deadline:
+        raise MacGateTimeout(
+            f'The Mac gate exceeded {expired_bound}. '
+            + f'Queue wait {times.queue_wait_seconds:.3f}s. Test run {times.test_run_seconds:.3f}s.')
+    return times
+
+
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                selected: gate.AllModules | gate.TreeSelection,
                cancellation: MacGateCancellation | UseCallerProcessLifetime,
@@ -432,29 +572,14 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
     return report
 
 
-def collect_queue_output(process: subprocess.Popen[bytes], output: bytearray, deadline: float) -> int:
-    """Read queue output and wait for exit within the same time limit."""
-    assert process.stdout is not None
-    descriptor = process.stdout.fileno()
-    with selectors.DefaultSelector() as ready:
-        _ = ready.register(descriptor, selectors.EVENT_READ)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not ready.select(remaining):
-                raise subprocess.TimeoutExpired(process.args, MAC_TIME_LIMIT_S)
-            chunk = os.read(descriptor, 65536)
-            if not chunk:
-                break
-            output.extend(chunk)
-    return process.wait(timeout=max(0, deadline - time.monotonic()))
-
-
 def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagnostics, *,
                        mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                        selected: gate.AllModules | gate.TreeSelection,
                        cancellation: MacGateCancellation | UseCallerProcessLifetime) -> MacGateResult | str:
     from scripts.production.gate_routes import MacGateCancellation
 
+    if not hasattr(os, 'waitid'):
+        raise GateRefused('The Mac gate requires Python 3.13 or newer with os.waitid')
     repo = repo.resolve()
     if isinstance(cancellation, MacGateCancellation):
         caller = os.dup(cancellation.caller_fd)
@@ -466,7 +591,7 @@ def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagn
     cancelled.register(caller, select.POLLIN)
     if cancelled.poll(0):
         return 'The Mac gate was cancelled'
-    folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='mac-gate-')))
+    folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix=ATTEMPT_PREFIX)))
     failure_file = folder / 'queue-failure'
     # Read the record before the stack removes the temporary folder.
     _ = cleanup.callback(diagnostics.read_failure_record, failure_file)
@@ -482,25 +607,33 @@ def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagn
                '--lifecycle-script', str(Path(__file__).resolve()),
                '--', str(folder), str(int(full))]
     command[2:2] = ['--caller-fd', str(caller)]
+    settings = conf.read('mac_gate')
+    queue_wait_limit = settings.whole(QUEUE_WAIT_LIMIT_KEY)
+    test_run_limit = settings.whole(TEST_RUN_LIMIT_KEY)
     if cancelled.poll(0):
         return 'The Mac gate was cancelled'
+    requested_at = time.monotonic()
     process = cleanup.enter_context(subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                       start_new_session=True, pass_fds=(caller,)))
+    owns_queue_pid = True
     try:
-        status = collect_queue_output(process, diagnostics.output, time.monotonic() + MAC_TIME_LIMIT_S)
-    except BaseException as error:
-        timed_out = isinstance(error, subprocess.TimeoutExpired)
-        if timed_out:
-            diagnostics.gate_failures.append(f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds')
-        try:
-            process_group.send_process_group(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as stop_error:
-            diagnostics.gate_failures.append(f'The Mac gate could not stop the queue call: {stop_error}')
-        if timed_out:
-            return ''
-        raise
+        times = capture_queue(process, diagnostics.output, requested_at, attempt_name(folder),
+                              queue_wait_limit=queue_wait_limit, test_run_limit=test_run_limit)
+    except ChildProcessError:
+        owns_queue_pid = False
+        raise GateRefused('The Mac queue exit is unknown') from None
+    except MacGateTimeout as error:
+        diagnostics.gate_failures.append(str(error))
+        return ''
+    finally:
+        if owns_queue_pid:
+            try:
+                process_group.send_process_group(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as error:
+                diagnostics.gate_failures.append(f'The Mac gate could not stop the queue call: {error}')
+    status = process.wait()
     if cancelled.poll(0):
         return 'The Mac gate was cancelled'
     if status:
@@ -513,6 +646,8 @@ def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagn
     row = ledger.mapping(cast(object, json.loads(results[0])))
     run = cloud_gate.decode_requested_run(row, request)
     cloud_gate.validate_run_modules(run, request)
+    row['queue_wait_seconds'] = times.queue_wait_seconds
+    row['test_run_seconds'] = times.test_run_seconds
     return MacGateResult(row, run)
 
 
@@ -630,8 +765,7 @@ def main() -> int:
         elif args.action == 'guest':
             print(RESULT_PREFIX + json.dumps(run_guest(args.folder, full=args.full == '1')), flush=True)
         elif args.action == 'stop':
-            if args.folder.exists():
-                stop_checkout(args.folder)
+            print(stop_checkout(args.folder))
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:

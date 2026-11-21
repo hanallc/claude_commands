@@ -1,154 +1,19 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Keep a cargo project's target directory under a size budget.
+"""Measure build output and list folders for review.
 
-invoke.sh's run() starts `lint sweep` in the background after every build
-step, at most once every 5 minutes per working directory, and cargo-port runs
-it last in every per-project lint run; `invoke.sh` hands the call here. When
-the target directory is over budget, this removes the least recently used
-build output until it fits:
+The workspace assessment compares Cargo output with its configured budget.
+The floor assessment measures available space and reports the shortfall.
+Cargo output outside the declared forms goes on a manual review list.
 
-    build unit        every entry under a build tree's .fingerprint/, build/,
-                      deps/ and examples/ that carries one unit's 16-hex-digit
-                      hash, and the copies cargo made of its output (below),
-                      removed together
-    incremental dir   one direct child of a build tree's incremental/
+The guard approves whole build folders from the declared forms.
+The list orders these folders by their last recorded use.
+Review the list and pass its SHA-256 to removal_guard.py to remove a folder.
+The guard checks the folder, its maker, and its locks again at removal.
 
-The budget is the first of: LINT_SWEEP_BUDGET_GIB in the environment;
-sweep_budget_gib.<repo> in config/lint.conf, where <repo> is the name of the
-directory holding the git common dir, so every worktree of a repo shares it;
-sweep_budget_gib there; 24 GiB. It is summed over every file under the target
-and build directories, so output the budget sweep never
-removes (test-run folders, files it cannot match to a build unit) still
-counts. doc/ has its own rule, below. --dry-run reports what would go and
-removes nothing. --target-dir DIR sweeps DIR in place of the directories
-cargo metadata reports for the working directory: hana's CI runners call it
-that way after every job, with no workspace to ask (/etc/nixos,
-modules/linux/hana-runners.nix).
-
-Copied-up output. For a binary, an example, a dylib or a library named on the
-command line, cargo also puts the unit's file under its unhashed name, from
-deps/ into the build tree itself and within examples/, and writes a dep-info
-file beside it (<name without extension>.d) whose first line names that copy.
-It hard-links on Linux and copies on macOS (clonefile, cargo #10060), and does
-so again on every build of the unit, fresh or not. A copy belongs to the unit
-whose file has its inode or, for a copy that is not a link, the same name and
-size; it and its dep-info go with that unit. A copy no unit claims, holding
-its only link, that its dep-info names, is output of a unit already removed:
-the next build of that unit replaces it, so every run removes it, over budget
-or not. Before this rule a copy outlived its unit and its blocks counted
-against the budget for good: 51 GiB of examples in one hana worktree
-(2026-10-02), so each sweep there evicted units the next lint run rebuilt.
-Any other unhashed file stays.
-
-Why hana's is 96. A budget below the working set evicts output the next lint run needs,
-and because this runs after every lint run, that rebuild repeats on every
-save. Replaying hana's cycle into an empty target (2026-09-15: scoped and
-workspace clippy, doc and mend, the nextest test build, the external-client
-fixture, the app build) came to 56.9 GiB, of which the test build alone was
-33.5 GiB; the clerestory-tests suite adds 9.4 GiB. A rerun rebuilt nothing,
-but sweeping that target to 48 GiB made the next cycle rebuild nearly every
-workspace unit. 96 covers that working set with room for feature and profile
-variants. The 24 GiB default covers the other projects' whole targets
-(cargo-liner 12 GiB, nateroids 11 GiB on 2026-10-02) twice over.
-
-The disk floor. Each budget fits the disk; together they do not (hana 96 GiB
-in each of 9 worktrees, 24 in 7 other repos, CI 160 x 2), and natedev's disk
-filled on 2026-10-03. When lint.conf sets sweep_free_floor_gib.<host> or
-sweep_free_floor_gib, the shortfall below that free-space floor sets how much
-build output goes. A target is a directory under the configured sweep_floor_roots holding
-.rustc_info.json, or Cargo's cache tag beside a build tree: a folder cargo
-creates carries the tag from its first moment, and .rustc_info.json may come
-only when the first build ends, or never. Cargo's registry carries the same
-tag with no build tree. A folder made before a build with
-CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
-from every idle target. Then whole takes and build-unit batches share target
-last-use order, oldest first, then build-unit use within each target. Recent targets are not
-held back. Each scan under the floor records its shortfall and idle targets.
-On 2026-10-08 the tag rule found 76 targets where
-.rustc_info.json alone found 41: 31 finished scratch targets carried only the
-tag, and one in its first build had reached 22 GiB unseen. A target's last use
-is the newer of its use stamp and its units' last uses. A target
-whose cargo locks a build holds is never touched. One sweep holds the floor at
-a time. Candidate and size scans take no cargo locks. Up to four independent target
-scans run together, and their inode accounting is combined before selection. Only one target's locks
-are taken for deletion, without waiting, and released before the next target.
-The pass stops once successful deletions cover the shortfall. Changed output
-and targets used since candidate discovery began are skipped. Output checks
-compare identity, size and mtime; unlinking another hard link does not change them.
-For real floor and budget passes, each unlink uses the current link count:
-only a successful last-link unlink credits file blocks. A failed or partial
-removal credits only the files it removed. Dry runs use the scan's link counts
-as an estimate and do not delete files.
---floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
-Each such pass first runs tmp_sweep.py once an hour, which deletes agent
-scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
-uses and where nothing changed in 4 hours, before the floor takes any build
-cache. Gate copies and scratch builds there had stayed until the disk filled.
-CI's targets are outside the configured sweep_floor_roots, and its accounts cannot read lint.conf.
-By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
-used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
-active hana targets that the prior global unit order reached.
-
-The doc index. rustdoc rewrites doc/search.index, doc/trait.impl and
-doc/type.impl when a crate finishes, and its peak memory tracks what those
-already hold rather than the crate it is documenting. They only grow: twelve
-consecutive `cargo doc --no-deps -p hana_video` runs, each preceded by
-appending a comment line that adds no documented item, grew search.index by
-313 KB per run while its file count held near 1850 (2026-09-22). hana's whole
-24-crate workspace documented into an empty target comes to a 21 MiB index and
-never peaks above 3 GiB, but the 1.18 GiB index that a week of per-save lint
-runs had left in place made that same single-crate build peak at 24.2 GiB —
-near 19 GiB of resident memory per GiB of index. That overflowed an 8 GiB swap
-file and held IO pressure at 90% while the CPU sat idle. So when those three
-directories together pass LINT_SWEEP_DOC_INDEX_MIB (default 250, which keeps
-the peak near 6 GiB), the whole doc tree goes and the next doc run rebuilds it
-in one pass. Removal takes doc/.lock, the only lock a rustdoc writing HTML
-holds: cargo's build locks cover compilation, which a doc build has left
-behind by then.
-
-Why a budget and not an age window. An age window only removes what active
-development has stopped touching, and active development touches almost
-everything: hana's target reached 123 GiB in five days (2026-09-10 to
-2026-09-15), all of it inside any window that keeps the cache useful. Scoped
-lint runs (-p <changed members>) change feature unification for shared
-dependencies, so each package set compiles its own copies (36 syn builds in
-hana's deps/), and a rustflags change strands a whole second copy of the tree
-(24.5 GiB there when mold landed). cargo-sweep cannot enforce a budget either:
---maxsize counts incremental/ against the cap but never removes from it.
-
-Last use. cargo reads a unit's fingerprint JSON whenever the unit is in a
-build graph, so the newest atime of the files in .fingerprint/<unit>/ is its
-last use. relatime refreshes an atime at most once a day. Within one target,
-the floor and budget order by whole days since last use, then by compile time
-(newest mtime) inside a day. The budget puts recent units last. A no-op build writes nothing under target/, so only the target's use
-stamp records that step reliably. An incremental dir's mtime moves on every
-compile of its crate. Anything that reads every fingerprint JSON resets every
-atime and erases that order;
-cargo-sweep --installed does exactly that, and running it before --time kept
-this sweep's predecessor from removing anything at all. Listing a directory
-refreshes the directory's own atime the same way, so this scan, or a du,
-would mark every unit used if that atime counted; it does not.
-
-Removal evidence. Budget and floor takes append one sweep_trim build-log row
-per target, with confirmed freed bytes, whole or partial extent and the cause.
-Each floor row is written after that target's deletions, before its locks are
-released. Dry runs write no trim rows. The read-only rebuilds --days N command
-combines them with the journal and legacy removals.jsonl rows; nothing writes
-the legacy file.
-
-Concurrency. cargo 1.98.1 holds flock() on .cargo-lock, .cargo-build-lock
-and .cargo-artifact-lock for the whole build.
-Probes with LOCK_EX|LOCK_NB confirmed this on 2026-09-15 while a build script slept.
-The sweep takes these locks in every build tree without waiting before it scans.
-If any lock is held, it skips the sweep.
-These locks prevent deletion during a build and make a new build wait until the sweep finishes.
-A nextest test run holds none of these locks and executes binaries from deps/.
-On 2026-10-15, a floor sweep at test 2105 of 4072 left 1965 hana tests unable to execute their binaries.
-A target is also busy when a live process uses an executable, working directory, or mapped file under it.
-The scan reads /proc/<pid>/exe, cwd and maps for this check.
-A cargo-nextest or verify.sh process keeps its workspace targets busy.
-This protection includes time between test binaries and time in the build queue.
-A running app also keeps its target busy until the app exits.
+Use --target-dir to assess one named folder.
+Use --floor-only to omit workspace assessment.
+Use --dry-run to print the assessment without writing a list.
+Use rebuilds --days N to report cold rebuild costs from the recorded history.
 """
 
 from __future__ import annotations
@@ -165,7 +30,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import socket
 import stat
 import subprocess
@@ -188,7 +52,7 @@ from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, conf, removal_guard
 from scripts.lib.cargo_target_config import (
     NoCargoManifest,
     cargo_build_folder,
@@ -244,6 +108,9 @@ PROC_DIR = "/proc"
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
 NEXTEST_ARG = "nextest"
+MAC_BUILD_PS = ("ps", "-axww", "-o", "pid=,ppid=,args=")
+MAC_BUILD_PS_TIMEOUT = 10
+MAC_TARGET_ARGUMENT = re.compile(rf"(?:^|\s){TARGET_DIR_FLAG}(?:=|\s+)(\S+)")
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
 INCREMENTAL_DIR = "incremental"
@@ -1190,27 +1057,27 @@ def output_lock_trees(roots: Sequence[str], trees: Sequence[str], paths: Sequenc
 
 
 def lock_trees(trees: list[str]) -> TargetLocksAcquired | TargetLockBusy:
-    """Take every build-folder lock without waiting; on a held one, release and name it."""
+    """Take every regular build folder lock without waiting."""
     held: list[int] = []
-    try:
+    with ExitStack() as acquired:
         for path in target_lock_paths(trees):
             try:
-                fd = os.open(path, os.O_RDONLY)
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    return TargetLockBusy(path)
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
             except FileNotFoundError:
                 continue
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                release(held)
+            except OSError:
                 return TargetLockBusy(path)
-            except BaseException:
-                os.close(fd)
-                raise
+            _ = acquired.callback(os.close, fd)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return TargetLockBusy(path)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return TargetLockBusy(path)
             held.append(fd)
-    except BaseException:
-        release(held)
-        raise
+        _ = acquired.pop_all()
     return TargetLocksAcquired(held)
 
 
@@ -1378,6 +1245,26 @@ def mapped_files(maps: bytes) -> Iterator[str]:
             yield fields[5].decode(errors="replace")
 
 
+class BuildRunner(Enum):
+    VERIFY = "verify.sh"
+    NEXTEST = "cargo-nextest"
+    OTHER = ""
+
+
+def build_runner(argv: Sequence[str]) -> BuildRunner:
+    if not argv:
+        return BuildRunner.OTHER
+    command = os.path.basename(argv[0])
+    if command == BuildRunner.VERIFY.value:
+        return BuildRunner.VERIFY
+    if command in ("bash", "sh", "zsh", "dash") and os.path.basename(
+            next((arg for arg in argv[1:] if not arg.startswith("-")), "")) == BuildRunner.VERIFY.value:
+        return BuildRunner.VERIFY
+    if command == BuildRunner.NEXTEST.value or NEXTEST_ARG in argv[1:2]:
+        return BuildRunner.NEXTEST
+    return BuildRunner.OTHER
+
+
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
     """Find one live process that uses each target, with one scan of /proc.
 
@@ -1435,14 +1322,12 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
                 _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}", start))
-        command = os.path.basename(argv[0]) if argv else ""
-        verify = command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
-            next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
-        if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
-            runner = "verify.sh" if verify else "cargo-nextest"
-            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners, verify_runner=verify):
+        runner = build_runner(argv)
+        if runner is not BuildRunner.OTHER:
+            for target in workspace_targets(
+                    argv, cwd, os.path.join(base, "environ"), owners, verify_runner=runner is BuildRunner.VERIFY):
                 if target in checked:
-                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}", start))
+                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner.value} in {cwd}", start))
     return {target: found[target] for target in owners if target in found}
 
 
@@ -1683,7 +1568,9 @@ def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence
     except (OSError, ValueError):
         return list(targets)
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
-    return [owner.target for path, owner in owners.by_path.items() if path in chosen
+    chosen_owners = {owner.target for path in chosen
+                     if isinstance(owner := owners.process_owner(path), TargetOwner)}
+    return [owner.target for path, owner in owners.by_path.items() if owner.target in chosen_owners
             or ("target-dir" not in settings
                 and (cwd + os.sep).startswith(os.path.dirname(path) + os.sep))]
 
@@ -2057,24 +1944,6 @@ class TrimTake:
             account = removed_entry_account(entry, False)
             paths.extend(path for path in account.paths if path not in self.unconfirmed_paths)
         result = UnconfirmedReclaim(len(paths), tuple(paths)) if paths else ConfirmedDeletion(0, 0)
-        if len(self.output_roots) > 1 and self.stage == "deleting" and self.pending:
-            remaining: list[str] = []
-            for path in list(self.group_paths):
-                observed = {entry.path: OutputVersion(entry.device, entry.inode, entry.size, entry.modified_ns)
-                            for entry in self.pending if Path(entry.path).is_relative_to(path)}
-                retry = Group("unit", self.target, entries=[path], observed=observed)
-                if observed and group_unchanged(retry):
-                    remaining.append(path)
-                else:
-                    self.group_paths.remove(path)
-                    self.remaining_groups = max(1, self.remaining_groups)
-            if remaining:
-                retry = Group("unit", self.target, entries=remaining)
-                account = remove([retry])
-                self.bytes_freed += account.bytes
-                self.removed += account.removed
-                if account.removed:
-                    self.at = time.time()
         self.confirm(result)
         return result
 
@@ -2341,120 +2210,276 @@ def unit_age(group: Group, now: float) -> tuple[float, float]:
     return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
 
 
-def remove_entry(path: str) -> ConfirmedDeletion:
-    """Anchor deletion to the parent directory; never traverse a replacement symlink."""
-    parent, name = os.path.split(os.path.normpath(path))
-    try:
-        parent_fd = os.open(parent or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            return remove_entry_at(name, parent_fd, path)
-        finally:
-            os.close(parent_fd)
-    except FileNotFoundError:
-        return ConfirmedDeletion(0, 0)
-    except OSError as error:
-        print(f"lint sweep: could not remove {path}: {error}", file=sys.stderr)
-        return ConfirmedDeletion(0, 1)
-
-
-def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDeletion:
-    """Check opened directory identity and account for each unlink relative to its parent."""
-    freed = failures = removed = 0
-    device_bytes: dict[int, int] = {}
-    try:
-        before = os.lstat(name, dir_fd=parent_fd)
-        if stat.S_ISDIR(before.st_mode):
-            directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-            try:
-                if not os.path.samestat(before, os.fstat(directory_fd)):
-                    raise OSError("directory changed before open")
-                with os.scandir(directory_fd) as entries:
-                    children = [entry.name for entry in entries]
-                for child in children:
-                    account = remove_entry_at(child, directory_fd, os.path.join(display_path, child))
-                    freed += account.bytes
-                    failures += account.failures
-                    removed += account.removed
-                    for device, size in account.device_bytes.items():
-                        device_bytes[device] = device_bytes.get(device, 0) + size
-                if not os.path.samestat(before, os.lstat(name, dir_fd=parent_fd)):
-                    raise OSError("directory changed before removal")
-                os.rmdir(name, dir_fd=parent_fd)
-                account = removed_entry_account(PendingUnlink(
-                    display_path, before.st_dev, before.st_ino, before.st_blocks * 512, before.st_nlink, True), True)
-                removed += account.removed
-            finally:
-                os.close(directory_fd)
-        else:
-            os.unlink(name, dir_fd=parent_fd)
-            account = removed_entry_account(PendingUnlink(
-                display_path, before.st_dev, before.st_ino, before.st_blocks * 512, before.st_nlink, False), True)
-            removed += account.removed
-            freed = account.bytes
-            device_bytes.update(account.device_bytes)
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        failures += 1
-        print(f"lint sweep: could not remove {display_path}: {error}", file=sys.stderr)
-    return ConfirmedDeletion(freed, failures, removed, device_bytes)
-
-
-def remove(groups: Sequence[FloorTake], *,
-    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> ConfirmedDeletion:
-    if isinstance(lint_settings, UseConfiguredValue):
-        lint_settings = conf.read("lint")
-    failures = 0
+def remove_checked_entry(checked: removal_guard.CheckedEntry) -> ConfirmedDeletion:
     freed = removed = 0
     device_bytes: dict[int, int] = {}
-    for group in groups:
-        identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
-        take = TRIM_TAKES.get().get(identity)
-        known_targets = ([group.target] if isinstance(group, WholeTargetTake) else
-                         list(take.output_roots) if take is not None and take.output_roots else
-                         [take.target] if take is not None else
-                         list(OUTPUT_ROOTS.get().roots_for(physical_root(group.build_tree)))
-                         if physical_root(group.build_tree) in OUTPUT_ROOTS.get().output_roots() else [])
-        if not record_before_delete([identity], known_targets=known_targets, lint_settings=lint_settings):
-            failures += 1
-            continue
-        markers = {os.path.join(group.target, name) for name in (RUSTC_INFO, CACHE_TAG)} if isinstance(
-            group, WholeTargetTake) else set[str]()
-        paths = [path for path in group.entries if path not in markers]
-        paths.extend(path for path in group.entries if path in markers)
-        group_failures = 0
-        for path in paths:
-            if path in markers and group_failures:
-                break
-            account = remove_entry(path)
-            freed += account.bytes
-            failures += account.failures
-            group_failures += account.failures
-            removed += account.removed
-            for device, size in account.device_bytes.items():
-                device_bytes[device] = device_bytes.get(device, 0) + size
+
+    def account(path: str, before: os.stat_result) -> None:
+        nonlocal freed, removed
+        entry = PendingUnlink(path, before.st_dev, before.st_ino, before.st_blocks * 512,
+                              before.st_nlink, stat.S_ISDIR(before.st_mode))
+        result = removed_entry_account(entry, True)
+        freed += result.bytes
+        removed += result.removed
+        device_bytes[entry.device] = device_bytes.get(entry.device, 0) + result.bytes
+
+    failures = 0
+    try:
+        removal_guard.remove(checked, account=account)
+    except (OSError, removal_guard.Refused) as error:
+        print(f"kept {checked.path}: {removal_guard.single_line(error)}")
+        failures = 1
     return ConfirmedDeletion(freed, failures, removed, device_bytes)
+
+
+def remove(groups: Sequence[FloorTake], *, recovery_roots: Sequence[str] = (),
+           lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+           ) -> ConfirmedDeletion:
+    """Keep the legacy group API read-only."""
+    _ = groups, recovery_roots, lint_settings
+    return ConfirmedDeletion(0, 0)
+
+
+BUILD_LIST: ContextVar[removal_guard.RemovalList | removal_guard.ListMode] = ContextVar(
+    "sweep_removal_list", default=removal_guard.ListMode.PRINT_ONLY)
 
 
 def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
             dry_run: bool, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> ReclamationEstimate | ConfirmedDeletion:
-    """Keep scan estimates separate from the live unlink account."""
-    if dry_run:
-        projected = replace(group, inodes=selected_inodes(group))
-        return freed_by(projected, scan, remaining)
-    identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
-    take = TRIM_TAKES.get().get(identity) if isinstance(group, WholeTargetTake) or group.kind != "orphan" else None
-    if take is not None:
-        if take.stage == "publishing" or len(take.output_roots) > 1 and take.pending:
-            return ConfirmedDeletion(0, 1)
-        take.prepare(group)
-    account = remove([group], lint_settings=lint_settings)
-    if take is not None:
-        take.confirm(account)
-    return account
+    anchor: str = "",
+    reason: str = "over the workspace budget",
+) -> ReclamationEstimate:
+    """Record legacy Cargo output for manual review without counting it as reclaimable."""
+    _ = remaining, dry_run, lint_settings
+    target = Path(anchor or (group.target if isinstance(group, WholeTargetTake) else physical_root(group.build_tree)))
+    plan = BUILD_LIST.get()
+    if isinstance(plan, removal_guard.RemovalList) and target not in plan.rows:
+        size = scan.target_bytes.get(str(target), 0)
+        _ = plan.add_manual(removal_guard.Tool.BUILD, target, target, size,
+                            reason, removal_guard.review_evidence(target))
+    return ReclamationEstimate(0)
+
+
+@contextmanager
+def form_folder_locks(path: Path) -> Generator[str]:
+    """Check existing leases, busy marks, and Cargo locks without adding files."""
+    with build_folders.folder_removal_lease(path, children=True, wait=False) as lease:
+        if isinstance(lease, build_folders.RefusedRemovalLease):
+            yield "the folder or a child holds a lease"
+            return
+        with scratch.busy_locks(path, create=False) as idle:
+            if not idle:
+                yield "the folder is busy"
+                return
+            doc = path / DOC_DIR
+            has_doc = removal_guard.is_real_directory(doc)
+            doc_lock = try_lock(str(doc / DOC_LOCK_NAME), create=False) if has_doc else None
+            if has_doc and doc_lock is None:
+                yield "the rustdoc lock is held or missing"
+                return
+            try:
+                locks = lock_trees([str(path), *build_trees(str(path))])
+                if isinstance(locks, TargetLockBusy):
+                    yield f"the Cargo lock is busy: {locks.path}"
+                    return
+                try:
+                    yield ""
+                finally:
+                    release(locks.held)
+            finally:
+                if doc_lock is not None:
+                    os.close(doc_lock)
+
+
+@dataclass(frozen=True)
+class BuildProcessScanUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class NoBuildProcessUse:
+    """No process names this target."""
+
+
+@dataclass(frozen=True)
+class MacProcess:
+    parent_pid: int
+    arguments: str
+
+
+def mac_build_process_use(path: Path) -> TargetUse | BuildProcessScanUnavailable | NoBuildProcessUse:
+    """Find the folder path in the Mac process list."""
+    try:
+        result = subprocess.run(MAC_BUILD_PS, capture_output=True, text=True, check=True,
+                                timeout=MAC_BUILD_PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        return BuildProcessScanUnavailable(f"cannot read the Mac process list: {removal_guard.single_line(error)}")
+    processes: dict[int, MacProcess] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3 or any(not re.fullmatch(r"[0-9]{1,10}", value) for value in fields[:2]):
+            return BuildProcessScanUnavailable("invalid Mac process list from ps")
+        pid = int(fields[0])
+        if pid in processes:
+            return BuildProcessScanUnavailable("duplicate PID in the Mac process list from ps")
+        processes[pid] = MacProcess(int(fields[1]), fields[2])
+    if not processes:
+        return BuildProcessScanUnavailable("empty Mac process list from ps")
+
+    caller = os.getpid()
+    excluded = {caller}
+    caller_row = processes.get(caller)
+    parent = caller_row.parent_pid if caller_row is not None else os.getppid()
+    while parent and parent not in excluded:
+        excluded.add(parent)
+        ancestor = processes.get(parent)
+        if ancestor is None:
+            break
+        parent = ancestor.parent_pid
+
+    # ps can print paths with spaces without quotes.
+    folder = str(path).casefold()
+    target = re.compile(re.escape(folder) + r"(?=$|[/ ])")
+    for pid, process in processes.items():
+        if pid in excluded:
+            continue
+        if target.search(process.arguments.casefold()):
+            return TargetUse(pid, "names this folder in its arguments")
+        for token in process.arguments.split():
+            argument = token.partition("=")[2] if token.startswith("--") else token
+            argument = argument.strip("\"'")
+            if not os.path.isabs(argument):
+                continue
+            normalized = os.path.normpath(argument).casefold()
+            if normalized == folder or normalized.startswith(folder + "/"):
+                return TargetUse(pid, "names this folder in its arguments")
+            if os.path.exists(argument):
+                resolved = os.path.realpath(argument).casefold()
+                if resolved == folder or resolved.startswith(folder + "/"):
+                    return TargetUse(pid, "names this folder in its arguments")
+        # ps does not report the working folder for a relative target.
+        for argument in MAC_TARGET_ARGUMENT.finditer(process.arguments):
+            named = argument[1].lstrip("\"'")
+            if named and not named.startswith("/"):
+                return BuildProcessScanUnavailable(f"Mac process {pid} names a relative target with an unknown working folder")
+    return NoBuildProcessUse()
+
+
+def form_folder_use(path: Path, guard: removal_guard.RemovalGuard) -> str:
+    from scripts.lint import tmp_sweep
+
+    target = str(path)
+    if sys.platform == "darwin":
+        settings = conf.read("mac_test")
+        claims = floor_claims.read_claims(settings.number("probe_timeout_s"))
+        if path.relative_to(guard.root).parts[0] in claims.repositories or claims.holds(
+                target, MacMirrorRoot.read(settings).local_path()):
+            return "a Mac claim protects this folder"
+    elif build_hold_targets([target], {}):
+        return "a build hold protects this folder"
+    if use := tmp_sweep.live_entry_use(path):
+        return use
+    if sys.platform == "darwin":
+        mac_use = mac_build_process_use(path)
+        if isinstance(mac_use, BuildProcessScanUnavailable):
+            return mac_use.reason
+        if isinstance(mac_use, TargetUse):
+            return f"pid {mac_use.pid} {mac_use.how}"
+    elif use := process_uses([target]).get(target):
+        return f"pid {use.pid} {use.how}"
+    return ""
+
+
+def form_last_used(path: Path, mtime: float) -> float:
+    try:
+        return max(mtime, (path / USE_STAMP).lstat().st_mtime)
+    except FileNotFoundError:
+        return mtime
+
+
+def assess_form_folders(guard: removal_guard.RemovalGuard, plan: removal_guard.RemovalList | removal_guard.ListMode,
+                        target: Path | None = None) -> None:
+    """List whole folders in order of last use."""
+    candidates: list[tuple[float, Path]] = []
+    def collect(path: Path) -> None:
+        if target is not None and target != path:
+            return
+        try:
+            _ = guard.matching_form(path.relative_to(guard.root).parts)
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                candidates.append((form_last_used(path, info.st_mtime), path))
+        except (FileNotFoundError, removal_guard.Refused):
+            return
+
+    for name in sorted(removal_guard.LEGACY_TOP - {"session"}):
+        legacy = guard.root / name
+        if (target is None or target == legacy) and removal_guard.is_real_directory(legacy):
+            print(f"review {legacy}: legacy build folder")
+            if isinstance(plan, removal_guard.RemovalList):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, legacy, guard.root, 0, "legacy build folder")
+    for repo in sorted(guard.names.repositories - removal_guard.LEGACY_TOP):
+        repo_path = guard.root / repo
+        collect(repo_path)
+        if not removal_guard.is_real_directory(repo_path):
+            continue
+        for entry in listing(str(repo_path)):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            path = Path(entry.path)
+            collect(path)
+            if entry.name.casefold() not in guard.names.units and entry.name.casefold() != "ci":
+                continue
+            for inner in listing(str(path)):
+                if inner.is_dir(follow_symlinks=False):
+                    collect(Path(inner.path))
+    for _, path in sorted(candidates):
+        try:
+            with guard.check(path) as checked, form_folder_locks(path) as busy:
+                checked.recheck()
+                if reason := busy or form_folder_use(path, guard):
+                    print(f"kept {str(path)!r}: {reason}")
+                    continue
+                size = directory_blocks(str(path))
+                stamp = removal_guard.fingerprint(path, checked)
+                if isinstance(plan, removal_guard.RemovalList):
+                    _ = plan.add_checked(checked, size, "idle build folder", stamp)
+                print(f"would remove {path}: {gib(size)}")
+        except (OSError, removal_guard.Refused) as error:
+            print(f"kept {path}: {removal_guard.single_line(error)}")
+
+
+def remove_listed_output(row: removal_guard.ListedEntry, guard: removal_guard.RemovalGuard,
+                         ) -> removal_guard.Removed | removal_guard.Kept:
+    if row.path != row.anchor:
+        return removal_guard.Kept("a whole build folder must match the selected path")
+    path = str(row.path)
+    settings = conf.read("lint")
+    with guard.check(row.path) as checked, form_folder_locks(row.path) as busy:
+        checked.recheck()
+        if reason := busy or form_folder_use(row.path, guard):
+            return removal_guard.Kept(reason)
+        if form_last_used(row.path, checked.info.st_mtime) > row.assessed_ns / 1_000_000_000:
+            return removal_guard.Kept("the build folder was used after assessment")
+        row.verify(checked)
+        account = remove_checked_entry(checked)
+        cause = "floor take" if row.reason == "below the free-space floor" else "budget take"
+        extent = "partial" if account.failures else "whole"
+        stamp_error = ""
+        if account.removed and not account.failures:
+            try:
+                record_target_deletes([path], known_targets=[path], lint_settings=settings)
+            except OSError as error:
+                stamp_error = f"cannot save the deletion stamp: {removal_guard.single_line(error)}"
+        if account.removed and not record_sweep_removal(path, cause, account.bytes, extent, time.time()):
+            if not account.failures:
+                detail = "cannot save the removal in the build log"
+                return removal_guard.Removed(f"{stamp_error}. {detail}" if stamp_error else detail)
+            return removal_guard.Kept("cannot save the partial removal in the build log")
+        if account.failures or not account.removed:
+            return removal_guard.Kept("removal did not complete")
+        return removal_guard.Removed(stamp_error)
 
 
 def directory_blocks(directory: str, seen: set[InodeKey] | None = None,
@@ -2503,11 +2528,14 @@ def measure_directory(directory: str, walk: CacheFolderWalk,
     return DirectoryMeasurement(total, folder_total)
 
 
-def try_lock(path: str) -> int | None:
+def try_lock(path: str, *, create: bool = True) -> int | None:
     """An exclusive lock on path, created if missing, without waiting; None when
     another process holds it."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+        fd = os.open(path, flags, 0o600)
     except OSError:
         return None
     try:
@@ -2521,44 +2549,32 @@ def try_lock(path: str) -> int | None:
 def prune_doc_index(roots: list[str], budget: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
-    """Remove a doc tree whose cross-crate index has grown past the budget."""
-    if isinstance(lint_settings, UseConfiguredValue):
-        lint_settings = conf.read("lint")
-    failures = 0
+    """List a rustdoc folder whose index exceeds the budget."""
+    _ = lint_settings
+    plan = BUILD_LIST.get()
     for root in roots:
-        doc = os.path.join(root, DOC_DIR)
-        if not os.path.isdir(doc):
+        doc = Path(root) / DOC_DIR
+        if not removal_guard.is_real_directory(doc):
             continue
-        index = sum(directory_blocks(os.path.join(doc, name)) for name in MERGE_DIRS)
+        index = sum(directory_blocks(str(doc / name)) for name in MERGE_DIRS)
         if index <= budget:
             if dry_run:
                 print(f"lint sweep: {doc} index is {mib(index)}, within the {mib(budget)} budget")
             continue
-        # rustdoc's own lock.
-        held = try_lock(os.path.join(doc, DOC_LOCK_NAME))
+        lock = doc / DOC_LOCK_NAME
+        held = try_lock(str(lock), create=False)
         if held is None:
-            print(f"lint sweep: a rustdoc run holds {doc}/{DOC_LOCK_NAME}; doc kept")
+            print(f"lint sweep: rustdoc lock unavailable at {lock}; doc kept")
             continue
         try:
-            size = directory_blocks(doc)
-            if not dry_run:
-                if not record_before_delete([root], known_targets=[root], lint_settings=lint_settings):
-                    failures += 1
-                    continue
-                try:
-                    shutil.rmtree(doc)
-                except OSError as error:
-                    print(f"lint sweep: could not remove {doc}: {error}", file=sys.stderr)
-                    failures += 1
-                    continue
-            verb = "would remove" if dry_run else "removed"
-            print(
-                f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget;"
-                + f" {verb} {doc} ({mib(size)}), rebuilt by the next doc run"
-            )
+            size = directory_blocks(str(doc))
+            if isinstance(plan, removal_guard.RemovalList) and not dry_run:
+                _ = plan.add_manual(removal_guard.Tool.DOC, doc, Path(root), size,
+                                    "rustdoc index exceeds its budget", removal_guard.review_evidence(Path(root)))
+            print(f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget; manual review")
         finally:
             os.close(held)
-    return 1 if failures else 0
+    return 0
 
 
 def gib(size: int) -> str:
@@ -2592,6 +2608,18 @@ def scan_roots(roots: list[str], trees: list[str], *,
     return scan
 
 
+def choose_whole_entries(scan: Scan) -> None:
+    for whole in scan.whole_targets:
+        orphan_paths = [path for orphan in scan.orphans for path in orphan.entries
+                        if Path(path).is_relative_to(whole.target)]
+        protected = {str(parent) for path in (*whole.retained, *orphan_paths)
+                     for parent in Path(path).parents if parent.is_relative_to(whole.target)}
+        removable = set(whole.observed) - protected
+        whole.entries = [path for path in whole.observed if path in removable
+                         and str(Path(path).parent) not in removable]
+        whole.observed = {path: version for path, version in whole.observed.items() if path not in protected}
+
+
 def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Scan:
@@ -2604,15 +2632,7 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
         _ = OUTPUT_ROOTS.set(output_index)
         scan = scan_roots(DiscoveredTargetRoots(cluster, discovered),
                           [tree for root in cluster for tree in trees[root]], lint_settings=lint_settings)
-        for whole in scan.whole_targets:
-            orphan_paths = [path for orphan in scan.orphans for path in orphan.entries
-                            if Path(path).is_relative_to(whole.target)]
-            protected = {str(parent) for path in (*whole.retained, *orphan_paths)
-                         for parent in Path(path).parents if parent.is_relative_to(whole.target)}
-            removable = set(whole.observed) - protected
-            whole.entries = [path for path in whole.observed if path in removable
-                             and str(Path(path).parent) not in removable]
-            whole.observed = {path: version for path, version in whole.observed.items() if path not in protected}
+        choose_whole_entries(scan)
         for root in cluster:
             scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
         return scan
@@ -2658,26 +2678,25 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
             # The workspace sweep that saved it finishes it.
             print(f"lint sweep: {outside} has a saved trim with output outside it; skipped")
             return 0
-    if not dry_run:
-        recover_pending_trims(roots, lint_settings=lint_settings, scope=trim_recovery, proc=proc)
     scan = scan_roots(roots, trees, lint_settings=lint_settings)
     total = sum(scan.blocks.values())
     label = ", ".join(roots)
     state = "within" if total <= budget else "over"
     print(f"lint sweep: {label} is {gib(total)}, {state} the {gib(budget)} budget ({source})")
     now = time.time()
-    owners = TargetOwnerIndex(roots)
-    with ExitStack() as takes:
+    if not dry_run:
         for root in roots:
-            uses = takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run, owners,
-                                                       lint_settings=lint_settings, proc=proc))
-            if uses:
+            try:
+                saved = read_trim_intent(trim_intent_path(root))
+            except (OSError, ValueError, KeyError):
+                continue
+            if trim_output_uses(saved, lint_settings=lint_settings, proc=proc):
                 print(f"lint sweep: saved trim for {root} has active output; skipped")
                 return WorkspaceSweepSkip.BUSY_TRIM
-        left, failures = shrink(
-            scan, total, budget, dry_run,
-            lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
-         lint_settings=lint_settings)[:2]
+    left, failures = shrink(
+        scan, total, budget, dry_run,
+        lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
+        lint_settings=lint_settings, roots=roots)[:2]
     if left > budget:
         print(
             f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
@@ -2690,24 +2709,24 @@ def shrink(
     scan: Scan, total: int, budget: int, dry_run: bool, removal_order: RemovalOrder
 , *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    roots: Sequence[str] = (),
 ) -> tuple[int, int, list[tuple[Group, int]]]:
-    """Remove the orphans, then groups in removal_order until total fits budget,
-    and say what went; return the size left, failures, and groups taken."""
+    """List the orphans first. Then list groups until the estimate fits the budget."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
+    verb, result = "review", "would leave"
     remaining = dict(scan.links)
     failures = 0
     taken: list[tuple[Group, int]] = []
     if scan.orphans:
         orphaned = 0
         for group in scan.orphans:
-            account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
+            anchor = max((root for root in roots if Path(group.build_tree).is_relative_to(root)), key=len,
+                         default="")
+            account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings, anchor=anchor,
+                              reason="copied output whose build unit is gone")
             orphaned += account.bytes
-            failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
-            failures += failed
-            if not failed or (isinstance(account, ConfirmedDeletion) and account.removed):
-                taken.append((group, account.bytes))
+            taken.append((group, account.bytes))
         total -= orphaned
         print(
             f"lint sweep: {verb} {sum(len(group.entries) for group in scan.orphans)} orphaned files ({gib(orphaned)}),"
@@ -2721,12 +2740,10 @@ def shrink(
         if left <= budget:
             break
         chosen.append(group)
-        account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
+        anchor = max((root for root in roots if Path(group.build_tree).is_relative_to(root)), key=len, default="")
+        account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings, anchor=anchor)
         left -= account.bytes
-        failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
-        failures += failed
-        if not failed or (isinstance(account, ConfirmedDeletion) and account.removed):
-            taken.append((group, account.bytes))
+        taken.append((group, account.bytes))
     if chosen:
         units = sum(1 for group in chosen if group.kind == "unit")
         uses = [group.last_used for group in chosen]
@@ -2870,7 +2887,7 @@ def shrink_floor(
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     policy: MacFloor | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> tuple[int, int, list[tuple[FloorTake, int]]]:
-    """Plan unlocked; lock just one target for its deletions, then release it."""
+    """Lock one target at a time to verify the proposed entries."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     orphan_batches: dict[str, list[FloorTake]] = {}
@@ -2917,7 +2934,7 @@ def shrink_floor(
             busy.update(current_uses)
             continue
         with ExitStack() as guards:
-            lock = scratch.judgment_lock if dry_run else scratch.removal_lock
+            lock = scratch.judgment_lock
             blocked_pair = False
             for paired in paired_roots:
                 for slot in output_slot_leases(paired):
@@ -2952,7 +2969,7 @@ def shrink_floor(
                 doc_lock = os.path.join(root, "doc", ".lock")
                 whole_batch = any(isinstance(candidate, WholeTargetTake) for candidate in candidates)
                 if whole_batch and os.path.isdir(os.path.dirname(doc_lock)) and (
-                        not dry_run or os.path.exists(doc_lock)):
+                        os.path.exists(doc_lock)):
                     held = try_lock(doc_lock)
                     if held is None:
                         busy[root] = LockHeld(doc_lock)
@@ -2973,40 +2990,26 @@ def shrink_floor(
                         locks.held.append(held)
                     if blocked:
                         continue
-                with recoverable_trim(root, "floor take", scan, dry_run, owners,
-                                      lint_settings=lint_settings, proc=PROC_DIR) as uses:
-                    if uses:
-                        busy.update(uses)
+                for group in candidates:
+                    if left <= budget:
+                        break
+                    if not group_unchanged(group):
                         continue
-                    for group in candidates:
-                        if left <= budget:
+                    if isinstance(policy, MacFloor):
+                        current_claims = policy.claims_before_removal(paired_roots)
+                        if current_claims:
+                            busy.update(current_claims)
                             break
-                        if not group_unchanged(group):
-                            continue
-                        if isinstance(policy, MacFloor) and not dry_run:
-                            current_claims = policy.claims_before_removal(paired_roots)
-                            if current_claims:
-                                busy.update(current_claims)
-                                break
-                        attempted.append(group)
-                        account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
-                        if isinstance(account, ConfirmedDeletion) and account.removed:
-                            scan.changed_targets.add(root)
-                            scan.changed_targets.update(OUTPUT_ROOTS.get().roots_for(root))
-                        filesystem = FLOOR_FILESYSTEM.get()
-                        credited = (account.device_bytes.get(filesystem.device, 0)
-                                    if isinstance(account, ConfirmedDeletion) and isinstance(filesystem, FilesystemFloor)
-                                    else account.bytes)
-                        left -= credited
-                        failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
-                        failures += failed
-                        if not failed:
-                            taken.append((group, credited))
-                        if isinstance(group, Group) and group.kind == "orphan":
-                            orphaned_bytes += account.bytes
+                    attempted.append(group)
+                    account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings,
+                                      anchor=root, reason="below the free-space floor")
+                    left -= account.bytes
+                    taken.append((group, account.bytes))
+                    if isinstance(group, Group) and group.kind == "orphan":
+                        orphaned_bytes += account.bytes
             finally:
                 release(locks.held)
-    verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
+    verb, result = "review", "would leave"
     orphans = [group for group in attempted if isinstance(group, Group) and group.kind == "orphan"]
     if orphans:
         print(f"lint sweep: {verb} {sum(len(group.entries) for group in orphans)} orphaned files ({gib(orphaned_bytes)}),"
@@ -3087,7 +3090,7 @@ def read_target_deletes(path: Path, now: float) -> dict[str, float]:
     if not isinstance(raw, dict):
         return {}
     return {root: float(at) for root, at in cast(dict[str, object], raw).items()
-            if _finite_number(at) and now - DAY_SECONDS <= at <= now and os.path.isdir(root)}
+            if _finite_number(at) and now - DAY_SECONDS <= at <= now}
 
 
 def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] = (),
@@ -3112,18 +3115,6 @@ def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] 
         deleted = read_target_deletes(path, now)
         deleted.update(dict.fromkeys(roots, now))
         write_text_atomic(path, json.dumps(deleted) + "\n")
-
-
-def record_before_delete(paths: Sequence[str], *, known_targets: Sequence[str] = (),
-    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> bool:
-    """Refuse a deletion whose warm-promise invalidation cannot be saved."""
-    try:
-        record_target_deletes(paths, known_targets=known_targets, lint_settings=lint_settings)
-    except OSError as error:
-        print(f"lint sweep: could not record deletion of {', '.join(paths)}: {error}", file=sys.stderr)
-        return False
-    return True
 
 
 def floor_record_or_new(previous: NoFloorRecord | FloorRecord, free: int) -> FloorRecord:
@@ -3529,7 +3520,7 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     protected: Sequence[tuple[str, int]] = (),
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
-    """The natedev report when no idle build output is left: what holds the space, and who was told."""
+    """Report disk pressure and the targets in use."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     def holder_line(holder: FloorHolder, path_limit: int) -> str:
@@ -3543,8 +3534,8 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
 
     def render(path_limit: int) -> str:
         return "\n".join([
-            f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No idle build cache is left to remove.",
-            *(["These target dirs are in use; the sweep removes their output when that use ends:"] if holders else []),
+            f"Build cache cleanup removed {gib(removed)}. natedev still has only {gib(free)} free. Builds need {gib(floor)} free.",
+            *(["These targets are in use. The sweep keeps their output."] if holders else []),
             *(holder_line(holder, path_limit) for holder in holders),
             f"Not swept: CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
@@ -3564,7 +3555,7 @@ def holder_message_text(holders: Sequence[FloorHolder], free: int, floor: int, r
     path_limit = int(lint_settings.words("sweep_message_path_widths")[0])
     limit = lint_settings.whole("sweep_message_limit")
     cleanup = ("The disk floor sweep removed all idle build output." if removed > 0
-               else "The disk floor sweep found no idle build output to remove.")
+               else "The disk floor sweep lists idle build output for review.")
     count = len(holders)
     size = gib(sum(holder.bytes for holder in holders))
     pid = holders[0].pid if holders else None
@@ -3574,7 +3565,7 @@ def holder_message_text(holders: Sequence[FloorHolder], free: int, floor: int, r
         f"natedev has {gib(free)} free, and builds need {gib(floor)} free.",
         f"{process} in your session holds {count} {'target' if count == 1 else 'targets'} ({size}).",
     ]
-    footer = "When the process ends, the next sweep removes the output. If the process is stale, stop it."
+    footer = "When the process ends, the next sweep can list the output. If the process is stale, stop it."
     remaining = limit - len("\n".join([*header, footer]))
     lines: list[str] = []
     for holder in sorted(holders, key=lambda item: (-item.bytes, item.path)):
@@ -3868,6 +3859,9 @@ def send_floor_alert(message: str, *,
     """Send the natedev message and return its channel outcome."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    plan = BUILD_LIST.get()
+    if isinstance(plan, removal_guard.RemovalList):
+        message += f"\nRemoval list: {plan.publish()}"
     filesystem = FLOOR_FILESYSTEM.get()
     if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
         message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
@@ -4225,10 +4219,9 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = (), lock: str =
     output = io.StringIO()
     with redirect_stdout(output):
         result = _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock)
-    if dry_run:
-        for line in output.getvalue().splitlines():
-            if "the floor would take" in line:
-                print(line)
+    for line in output.getvalue().splitlines():
+        if line.startswith("lint sweep: the floor lists "):
+            print(line)
     print(f"lint sweep: removed_bytes={result.removed} free_before_bytes={result.before} "
           + f"free_after_bytes={result.after} busy_targets_skipped={result.busy} dry_run={str(dry_run).lower()}")
     return result.status
@@ -4563,7 +4556,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     roots: Sequence[str] = (), lock: str = "",
     planned_at: float | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> FloorOutcome:
-    """Below the floor, take the shortfall from the least used idle targets."""
+    """List output from the least used idle targets when free space falls below the floor."""
     from scripts.lint import tmp_sweep
     from scripts.buildlog import record
 
@@ -4581,8 +4574,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         roots = policy.roots if isinstance(policy, MacFloor) else roots or floor_roots(lint_settings=lint_settings)
         filesystem = FLOOR_FILESYSTEM.get()
         lock = lock or str(floor_record_path().with_suffix(".lock"))
-        if not dry_run and isinstance(policy, NatedevFloor):
-            recover_pending_trims(lint_settings=lint_settings, proc=PROC_DIR)
         home = filesystem.probe_path if isinstance(filesystem, FilesystemFloor) else os.path.expanduser("~")
         free = free_bytes(home)
         if free >= floor:
@@ -4603,8 +4594,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         print(f"lint sweep: cannot report the floor lock: {error}", file=sys.stderr)
                 outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment(), before=free, after=free)
                 return outcome
-        if guard is not None:
-            record_floor_lock(str(lock), guard, time.time())
         record_path = floor_record_path()
         try:
             if guard is not None:
@@ -4721,7 +4710,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         unchanged_caches = 0
         busy_bytes: dict[str, int] = {}
         ci_bytes = 0
-        before_caches = total
         cache_walk = CacheFolderWalk.from_scan(scan, [path for path in scan.target_bytes if on_floor_filesystem(path)])
         if not dry_run:
             # Build holds and Mac claims prevent size walks of their output.
@@ -4746,7 +4734,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                     del cache_walk.folders[path]
             ci_bytes = sum(item[1] for item in cache_walk.sizes(ci_paths))
             unchanged_caches = held_bytes + ci_bytes
-            before_caches = total + unchanged_caches
         before_folders = cache_walk.snapshot()
         # The growth check compares this pair with the previous record. The scan takes minutes, so
         # free is read again after it: a target another process deletes during the scan is then out
@@ -4760,14 +4747,14 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             + f" target dirs ({gib(total)}), {len(busy)} left alone {protection_reason}"
         )
         budget = total - max(0, floor - scanned_free)
-        left, failures = total, 0
+        failures = 0
         chosen: list[tuple[FloorTake, int]] = []
         if scanned_free < floor:
             if not dry_run:
                 record.floor_scan(scanned_free, floor, floor_scan_targets(
                     scan, [root for root in idle if on_floor_filesystem(root)], target_uses, tree_targets), time.time(),
                     filesystem=f"{filesystem.key}:{filesystem.probe_path}" if isinstance(filesystem, FilesystemFloor) else "")
-            left, failures, chosen = shrink_floor(
+            _, failures, chosen = shrink_floor(
                 scan, total, budget, dry_run, tree_targets, known_trees, busy,
                 lambda group: (
                     target_uses[tree_targets[group.build_tree]],
@@ -4782,17 +4769,12 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         for group, freed in chosen:
             root = group.target if isinstance(group, WholeTargetTake) else tree_targets[group.build_tree]
             taken[root] = taken.get(root, 0) + freed
-        for root, size in taken.items():
-            if size:
-                verb = "would take" if dry_run else "took"
-                print(f"lint sweep: the floor {verb} {gib(size)} from {root},"
-                      + f" last used {when(target_uses[root])}")
+        for root in taken:
+            print(f"lint sweep: the floor lists {root}, last used {when(target_uses[root])}")
         after_free = free_bytes(home)
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run and isinstance(policy, NatedevFloor):
             now = time.time()
-            unchanged = {key for path in idle if path not in scan.changed_targets and on_floor_filesystem(path)
-                         for key in scan.target_links.get(path, {})}
             changed = {path for path in idle if path in scan.changed_targets and on_floor_filesystem(path)}
             cache_walk.forget(changed, (key for path in changed for key in scan.target_links.get(path, {})))
             for path in idle:
@@ -4800,12 +4782,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                     cache_walk.folders[path] = measure_directory(path, cache_walk, excluded_targets)
             after_folders = cache_walk.snapshot()
             after_caches = common_cache_bytes(after_folders, {path for path in idle if on_floor_filesystem(path)}) + unchanged_caches
-            # This pass did not remove these blocks.
-            externally_removed_keys = {key for root in idle if root not in taken and not os.path.lexists(root)
-                                      for key in scan.target_links.get(root, {})
-                                      if key not in unchanged
-                                      and (not isinstance(filesystem, FilesystemFloor) or key[0] == filesystem.device)}
-            removed = max(0, before_caches - after_caches - sum(scan.blocks[key] for key in externally_removed_keys))
             try:
                 with locked_floor_record(record_path) as previous:
                     base = floor_record_or_new(previous, after_free)
@@ -4830,50 +4806,32 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                                 and now - measurement.measured_at.timestamp() >= lint_settings.number("sweep_walk_request_interval_seconds")):
                             store.write_disk_walk_request({"requested_at": store.utc_iso(now),
                                                           "alert_at": store.utc_iso(now), "unnamed_bytes": unnamed})
-                    history = base.alert_history
                     push_history = base.push_history
                     alert_interval = lint_settings.number("sweep_alert_interval_seconds")
                     push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= alert_interval
-                    if left > budget and after_free < floor and push_due:
+                    if after_free < floor and push_due:
                         holders = floor_holders(busy, busy_bytes, lint_settings=lint_settings)
                         holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
                                        for root, use in busy.items() if isinstance(use, BuildHoldTarget))
-                        told = send_floor_holder_messages(holders, after_free, floor, removed, lint_settings=lint_settings)
+                        told = send_floor_holder_messages(holders, after_free, floor, 0, lint_settings=lint_settings)
                         measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"))
-                        message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
+                        message = floor_out_of_reach_text(now, 0, after_free, floor, holders, told,
                                                           ci_bytes, measurement, failures, protected=protected,
                                                           lint_settings=lint_settings)
                         delivered = send_floor_alert(message, lint_settings=lint_settings)
                         if delivered.accepted or told:
                             push_history = DeliveredAlert(time.time())
-                    elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
-                        unexplained_fall = lint_settings.whole("sweep_unexplained_fall_bytes")
-                        large_removal = lint_settings.whole("sweep_large_removal_bytes")
-                        growth_fired = recent and same_held_roots and same_filesystem and free_fall - cache_growth > unexplained_fall
-                        removal_fired = removed > large_removal
-                        if growth_fired or removal_fired:
-                            reasons: list[str] = []
-                            if growth_fired:
-                                reasons.append(f"free space fell more than {unexplained_fall / GIB:g} GiB beyond build-cache growth")
-                            if removal_fired:
-                                reasons.append(f"removed more than {large_removal / GIB:g} GiB in one sweep")
-                            message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
-                                                       reasons, read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
-                                                       or filesystem.root_device else UnavailableDiskMeasurement("missing"),
-                                                       lint_settings=lint_settings)
-                            if send_floor_alert(message, lint_settings=lint_settings).accepted:
-                                history = DeliveredAlert(time.time())
                     write_floor_record(record_path, replace(
                         base, measured_at=now, free_bytes=after_free, build_cache_bytes=after_caches,
-                        alert_history=history, push_history=push_history,
+                        push_history=push_history,
                         held_roots=KnownHeldRoots(frozenset(hold_targets)),
                         filesystem=filesystem.key if isinstance(filesystem, FilesystemFloor) else "",
                         measured_roots=tuple(sorted(idle)), cache_folders=after_folders))
             except OSError as error:
                 print(f"lint sweep: cannot save floor accounting: {error}", file=sys.stderr)
         outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0 if isinstance(policy, MacFloor) else (1 if failures else 0)),
-                               0 if dry_run else max(0, total - left), free, after_free, len(busy),
+                               0, free, after_free, len(busy),
                                protected=protected, targets=target_search)
         return outcome
     except (conf.Unusable, OSError) as error:
@@ -5223,10 +5181,28 @@ def rebuilds_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    from scripts.lint import tmp_sweep
-
     if argv and argv[0] == "rebuilds":
         return rebuilds_main(argv[1:])
+    if "--dry-run" in argv:
+        return assess(argv)
+    plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
+    token = BUILD_LIST.set(plan)
+    try:
+        status = assess(argv)
+        plan.report()
+        return status
+    except InterruptedError:
+        raise
+    except (OSError, removal_guard.Refused) as error:
+        print(f"lint sweep: {removal_guard.single_line(error)}", file=sys.stderr)
+        return 1
+    finally:
+        BUILD_LIST.reset(token)
+
+
+def assess(argv: list[str]) -> int:
+    from scripts.lint import tmp_sweep
+
     dry_run = False
     floor_only = False
     host = ""
@@ -5250,6 +5226,11 @@ def main(argv: list[str]) -> int:
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
+    try:
+        guard = removal_guard.read()
+        assess_form_folders(guard, BUILD_LIST.get(), Path(target_dir).absolute() if target_dir else None)
+    except removal_guard.Refused as refusal:
+        print(f"kept build folders: {refusal}")
     if host == "mac":
         if not floor_only:
             print("lint sweep: --host mac requires --floor-only", file=sys.stderr)
@@ -5313,6 +5294,8 @@ def assess_scope(run: Callable[[], tmp_sweep.SweepAssessment],
 
     try:
         return run(), ""
+    except InterruptedError:
+        raise
     except (conf.Unusable, OSError) as error:
         print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
         return tmp_sweep.CompletedSweepAssessment(1), str(error)
@@ -5322,6 +5305,31 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                     recent_minutes: float, *,
                     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
                     proc: str = PROC_DIR) -> int:
+    """Publish the workspace list when the caller has no list of its own."""
+    if dry_run or isinstance(BUILD_LIST.get(), removal_guard.RemovalList):
+        return assess_workspace(target_dir, budget_config, dry_run, recent_minutes,
+                                lint_settings=lint_settings, proc=proc)
+    plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
+    token = BUILD_LIST.set(plan)
+    try:
+        status = assess_workspace(target_dir, budget_config, dry_run, recent_minutes,
+                                  lint_settings=lint_settings, proc=proc)
+        if plan.rows:
+            try:
+                plan.report()
+            except InterruptedError:
+                raise
+            except OSError as error:
+                print(f"lint sweep: cannot write removal list: {removal_guard.single_line(error)}", file=sys.stderr)
+                return 1
+        return status
+    finally:
+        BUILD_LIST.reset(token)
+
+
+def assess_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
+                     recent_minutes: float, *,
+                     lint_settings: conf.ConfigRead | UseConfiguredValue, proc: str) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     # Read the working folder once: a gate can remove its checkout while this sweep runs in it.
@@ -5344,7 +5352,7 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                         Path(root, USE_STAMP).touch()
                     except OSError:
                         pass
-            # A named target folder finishes only its own saved trims.
+            # A named target folder skips a saved trim that includes other output.
             recovery = TrimRecovery.EVERY_SAVED_TRIM if target_dir is None else TrimRecovery.INSIDE_SWEPT_ROOTS
             return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings,
                                     trim_recovery=recovery, proc=proc)
