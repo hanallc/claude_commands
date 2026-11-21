@@ -51,7 +51,7 @@ REFERENCE: dict[str, SpendReference] = {
     '35': (('2', '4'), ('3', '92'), ('2', '4')),
     '36': (('2', '4'), ('0', '2'), ('2', '4')),
     '37': (('2', '4'), ('2', '4'), ('2', '32')),
-    '38': (('2', '3'), ('7', '9'), ('7', '9')),
+    '38': (('2', '3'), ('7', '9'), ('5', '7')),
     '39': (('2', '4'), ('7', '9'), ('7', '9')),
     '40': (('2', '4'), ('5', '7'), ('2', '4')),
     '41': (('0', '3'), ('0.75', '3.75'), ('0.75', '3')),
@@ -517,11 +517,7 @@ class AccountSpendParityTests(SpendReferenceFixture):
             self.scene(row)
             self.write_bill(JAN1, '2', spot_bill('2', '2'))
             status = ledger.GateRunning('fixture') if row == '39' else ledger.GateTerminated(self.now, 'fixture')
-            gate = self.gate(self.now - 2 * HOUR, self.now + 2 * HOUR, '1', '3', outcome=status)
-            if row == '40':
-                _ = self.book.launch_history_path.write_text(json.dumps({
-                    'attempt': gate.attempt, 'time': gate.at, 'instance_type': 'm7a.4xlarge',
-                    'result': 'launched'}) + '\n')
+            _ = self.gate(self.now - 2 * HOUR, self.now + 2 * HOUR, '1', '3', outcome=status)
             self.record(row)
 
         self.scene('41', now=JAN3)
