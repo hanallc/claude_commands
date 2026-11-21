@@ -1861,7 +1861,8 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 2. A shared detached stop sends only a notice and never runs the cleanup callback (main: `turn_end.py:245-254`, `detached_runs.py:747-749`). Phase 103 F025.
 3. Run end misses a live early reviewer, because the early reviewer starts before its pass record exists (main: `review.sh:339-357`).
 4. A generic completion action can end a shared run (main: `assign.py:375-385,718-722`).
-**Files:** `progress_history.py`, `turn_end.py`, `detached_runs.py`, `review.sh`, `assign.py`, and their tests.
+5. A failed cleanup step still clears the run pointer, so a retry of `end_session.sh` cannot find the run (main: `end_session.sh:41-48,96`). Phase 103 F032.
+**Files:** `progress_history.py`, `turn_end.py`, `detached_runs.py`, `review.sh`, `assign.py`, `end_session.sh`, `workers.py`, and their tests.
 **Tests:** rows in the existing tables of `test_astra_review.py`, `test_detached_runs.py` and `test_turn_end.py`, one for each spec item.
 **Acceptance gate:** as phase 100.
 
