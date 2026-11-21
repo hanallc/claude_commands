@@ -2,18 +2,17 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, admission_service, placement
+from scripts.build_queue import admission_records, admission_service, placement, queue_evidence
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
-import fcntl
 import json
 import io
 import os
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from contextlib import nullcontext, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
@@ -43,12 +42,14 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import atomic_file, build_folders, build_slots, conf, test_hang_guard
+from scripts.lib import atomic_file, build_slots, conf, test_hang_guard
+from scripts.lib.build_slots_test_support import private_slot_config, write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
+from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production.merge_gate import SuiteMode
 from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
@@ -58,11 +59,12 @@ REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
 UNIT_LABELS_FOR = unit_labels.unit_labels_for
 STEVIE = Path("/fixture/bin/stevie")
+FIXTURE_MACHINE = "fixture"
 
 
 def needs_all_page_proof_views(repo: Path) -> bool:
-    """Use all views while the nightly run holds its slot."""
-    return lease_record(repo).get("work") == "test-nightly" and build_folders.build_folder_state(repo) == "held"
+    """Use all views when the checkout lease shows nightly work."""
+    return lease_record(repo).get("work") == "test-nightly"
 
 
 class FeedStopped(Exception):
@@ -265,6 +267,7 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
         mac_machine = "private-mac-host"
         _ = (self.root / "machines.conf").write_text(f"mac.hosts={mac_machine}\n")
         roots = {"natedev": self.root / "linux-slots", mac_machine: self.root / "mac-slots"}
@@ -359,6 +362,7 @@ class MemoryFeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_private_slot_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_steps.conf",
@@ -386,7 +390,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
-        _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
@@ -800,6 +804,58 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(memory_feed.cargo_job((*front, *words)), job)
                 self.assertEqual(memory_feed.cargo_job(("/store/bin/cargo", *words)), job)
 
+    def test_decoded_ci_rows_use_the_configured_label_when_the_recorded_label_is_unknown(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("ci_label=Fixture CI · {runner} · {job}\n")
+        base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        inputs = base.explanation.decided_from
+        runner = "hana-linux-2"
+        running = replace(inputs.running[0], ci_runner=runner, session_name="unregistered session")
+        waiting = replace(base.view.waiting[0], ci_runner=runner, session_name="unregistered session")
+        reading = gate.queue_read_from(replace(inputs, running=(running,)), admission_policy_fixture())
+        reading = replace(reading, view=replace(reading.view, waiting=(waiting,)))
+        reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
+        assert isinstance(reply, wire.ViewReply)
+        with mock.patch.object(admission_client, "view", return_value=reply.reading):
+            page = memory_feed.reading()
+        run, = page["walk"]
+        wait, = page["waiters"]
+        for row, pid in ((run, 50), (wait, 200)):
+            with self.subTest(pid=pid):
+                self.assertEqual((row["pid"], row["name"]), (pid, "CI nextest"))
+                self.assertEqual(row.get("ci_label"), "hana CI")
+                self.assertEqual(row["title"], {"unit": "", "step": "hana CI"})
+
+    def test_ci_feed_rejects_incomplete_label_templates(self) -> None:
+        for template, valid in (("CI {runner} {job}", "CI hana-linux-2 compile"),
+                                ("CI {runner} ({job})", "CI hana-linux-2 (compile)")):
+            _ = (self.root / "build_admission.conf").write_text(f"ci_label={template}\n")
+            for job, expected in (("compile", valid), ("—", "hana CI"), ("", "hana CI"), ("  ", "hana CI")):
+                with self.subTest(template=template, job=job):
+                    self.assertEqual(memory_feed.ci_step_label("hana-linux-2", job), expected)
+
+    def test_current_step_parts_check_the_configured_step_and_owner(self) -> None:
+        step = reservation_reading().view.running[0]
+        for unit, shown, expected in (("panes", "tests", "panes tests"),
+                                      ("panes", "—", "panes"),
+                                      ("—", "tests", "tests"),
+                                      ("—", "—", "unregistered session")):
+            with self.subTest(unit=unit, shown=shown):
+                identity = unit_labels.UnitLabels("caller", "", unit)
+                row = replace(step, unit=unit, project="")
+                names = StepNames({f"names.{row.step}": shown})
+                parts = memory_feed.current_step_parts(row, names, identity, {row.session_id: identity})
+                self.assertEqual(staff_names.parts_text(parts), expected)
+                self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
+                                 ["panes"] if unit == "panes" else [])
+
+    def test_mac_work_uses_the_caller_after_an_unknown_owner(self) -> None:
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana")
+        identity = unit_labels.UnitLabels("mac caller", "unregistered session")
+        row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)), identity,
+                                      names=read_step_names(), slot_roots={}, slot_machine="private-mac-host")
+        self.assertEqual((row.get("caller"), row.get("owner_text")), ("mac caller", "mac caller"))
+        self.assertEqual(row["name"], "hana nextest")
+
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         memory = admission_records.UnownedSliceMemory(admission_records.GIB // 8,
@@ -1101,7 +1157,6 @@ process.stdout.write(JSON.stringify({
                 assert_status_states(self, page, seconds, cast(dict[str, object], json.loads((self.output / "memory.json").read_text())))
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
-        _ = write_config_fixture(self.root / "build_folders.conf")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         chrome = self.root / "chrome"
         report = self.root / "chrome-report.json"
@@ -1371,6 +1426,35 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(all(count == 1 for count in reads.values()))
         self.assertNotIn(agent / "memory.swap.current", reads)
 
+    def test_swap_app_titles_check_the_program_name(self) -> None:
+        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        _ = self.cgroup("app.slice", admission_records.GIB)
+        _ = self.cgroup("app.slice/app-test.scope", admission_records.GIB)
+        for program, expected in (("browser", "other apps: browser"), ("—", "unregistered session"),
+                                  (" ", "unregistered session")):
+            with self.subTest(program=program), mock.patch.object(memory_feed, "program_name", return_value=program):
+                reading = memory_feed.read_swap((), {}, 6, read_step_names())
+                assert isinstance(reading, memory_feed.SwapReading)
+                self.assertEqual([row["name"] for row in reading.rows if row["kind"] == "owner"], [expected])
+
+    def test_swap_step_titles_check_the_configured_step_and_owner(self) -> None:
+        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        _ = self.cgroup("builds.slice", admission_records.GIB)
+        scope = self.cgroup("builds.slice/test.scope", admission_records.GIB)
+        step = reservation_reading().view.running[0]
+        memory = step.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        step = replace(step, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
+        for unit, shown, expected in (("widget", "tests", "widget tests"),
+                                      ("widget", "—", "widget"),
+                                      ("—", "tests", "tests"),
+                                      ("—", "—", "unregistered session")):
+            with self.subTest(unit=unit, shown=shown):
+                row = replace(step, unit="", project=unit)
+                reading = memory_feed.read_swap((row,), {}, 6, StepNames({f"names.{row.step}": shown}))
+                assert isinstance(reading, memory_feed.SwapReading)
+                self.assertEqual([item["name"] for item in reading.rows if item["kind"] == "owner"], [expected])
+
     def owner_swap_reading(self, owner: unit_labels.UnitLabels) -> memory_feed.SwapReading:
         """Read a real swap counter with its recorded staff owner."""
         self.host_swap(2 * admission_records.GIB, admission_records.GIB)
@@ -1534,6 +1618,97 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row["unit"], "startup")
         self.assertEqual(row.get("detail"), "between steps")
 
+    def test_released_holds_keep_the_recorded_caller(self) -> None:
+        members = staff.StaffSnapshot(())
+        for continuation in (False, True):
+            with (self.subTest(continuation=continuation), AdmissionFixture() as fixture,
+                  mock.patch.object(staff, "local_snapshot", return_value=members),
+                  mock.patch.object(staff, "snapshot", return_value=members)):
+                run = fixture.run_owner()
+                first = fixture.request(run=run, step="merge-gate", need=6 * admission_records.GIB)
+                first = replace(first, identity=replace(first.identity, name="caller with no staff record"))
+                grant = only_admitted(fixture.server.handle_request(first))
+                if continuation:
+                    fixture.free(0)
+                    _ = fixture.server.handle_request(fixture.request(run=run, need=8 * admission_records.GIB))
+                fixture.release(grant)
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                slot, = reply.reading.explanation.decided_from.slots
+                self.assertIsInstance(slot, admission_records.ContinuationSlot if continuation
+                                      else admission_records.BetweenStepsSlot)
+                for stage, current in (("released", reply), ("snapshot", wire.parse_reply(wire.encode_reply(reply)))):
+                    with self.subTest(stage=stage):
+                        assert isinstance(current, wire.ViewReply)
+                        with mock.patch.object(admission_client, "view", return_value=current.reading):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("between_steps")]
+                        self.assertEqual(row["name"], first.identity.name)
+                        self.assertEqual(row.get("caller"), first.identity.name)
+
+    def test_legacy_gate_holds_recover_the_fixed_staff_caller(self) -> None:
+        inputs = captured_reading().explanation.decided_from
+        policy = admission_policy_fixture()
+        run = LiveBuildRun(101, "start", inputs.now - 15)
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "fixture unit", staff.StaffRoot(),
+                                  current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "fixture worker", staff.ReportsTo(director.id),
+                                current_session=staff.StaffId("worker-session"))
+        members = staff.StaffSnapshot((director, worker))
+        absent = admission_records.EndedStepFactNotRecorded()
+        for caller, member, expected in (
+            (None, worker.id, worker.name),
+            ({"kind": "EndedStepFactNotRecorded"}, worker.id, worker.name),
+            ("", worker.id, worker.name),
+            (" \t", worker.id, worker.name),
+            ("—", worker.id, worker.name),
+            (None, staff.StaffId("missing"), "unregistered session"),
+            (None, admission_records.NoEndedStepStaff(), "unregistered session"),
+            ("—", admission_records.NoEndedStepStaff(), "unregistered session"),
+            ("owner not recorded", worker.id, worker.name),
+            ("$CALLER", worker.id, worker.name),
+            ("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", worker.id, worker.name),
+            ("saved caller", staff.StaffId("missing"), "saved caller"),
+        ):
+            for legacy in (False, True):
+                for continuation in (False, True):
+                    with self.subTest(caller=caller, member=member, legacy=legacy, continuation=continuation):
+                        facts = admission_records.EndedStepFacts("merge-gate", admission_records.PackageNotRecorded(),
+                                                                 absent, absent, member)
+                        held = admission_records.BetweenStepsSlot(run, "finished", admission_records.GIB,
+                                                                  inputs.now + 10, facts)
+                        slot = admission_records.ContinuationSlot(held, "next") if continuation else held
+                        reading = gate.queue_read_from(replace(inputs, slots=(slot,), reservations=()), policy)
+                        raw = cast(dict[str, object], codec.snapshot_value(reading))
+                        explanation = cast(dict[str, object], raw["explanation"])
+                        decided = cast(dict[str, object], explanation["decided_from"])
+                        encoded, = cast(list[dict[str, object]], decided["slots"])
+                        if continuation:
+                            encoded = cast(dict[str, object], encoded["slot"])
+                        identity = cast(dict[str, object], encoded["identity"])
+                        if legacy:
+                            identity.update(kind="EndedStepIdentity", source="step", name="merge-gate")
+                        _ = identity.pop("caller_name", None)
+                        if caller is not None:
+                            identity["caller_name"] = caller
+                        encoded["identity"] = identity
+
+                        def view() -> admission_records.QueueRead:
+                            decoded = cast(admission_records.QueueRead, codec.parse_snapshot_value(raw, admission_records.QueueRead))
+                            decoded_slot, = decoded.explanation.decided_from.slots
+                            restored = decoded_slot.slot if isinstance(decoded_slot, admission_records.ContinuationSlot) else decoded_slot
+                            self.assertEqual(restored.identity, replace(facts, caller_name=expected))
+                            self.assertEqual(restored.bytes, held.bytes)
+                            return decoded
+
+                        with (mock.patch.object(staff, "snapshot", return_value=members),
+                              mock.patch.object(admission_client, "view", side_effect=view)):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("between_steps")]
+                        self.assertEqual(row["name"], expected)
+                        self.assertEqual(row.get("caller"), expected)
+                        self.assertEqual(page["reserved"], 1.0)
+
     def test_between_steps_holds_name_their_distinct_owners(self) -> None:
         inputs = captured_reading().explanation.decided_from
         policy = admission_policy_fixture()
@@ -1656,7 +1831,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
             (placement.CargoFolderWait(), placement.CARGO_FOLDER_WAIT_REASON, False),
             (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
-            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · second · nextest · compiler", True),
+            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · compiler · nextest", True),
         )
         for reason, expected, has_blocker in reasons:
             with self.subTest(reason=reason):
@@ -1868,10 +2043,10 @@ process.stdout.write(JSON.stringify({
 
     def test_copies_sends_the_wrapped_step_and_staff_unit_in_the_slot_request(self) -> None:
         from scripts.copies import copies
-        from scripts.lib import build_slots
 
         owner = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
         source = self.root / "repository"
+        pool = private_slot_config(self.root / "slot-request", repository="hana")
         runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "hana", staff.StaffRoot(),
                                current_session=staff.StaffId("runner-session"))
         member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
@@ -1888,13 +2063,13 @@ process.stdout.write(JSON.stringify({
         )
         for command, step, job, verify, about in cases:
             with (self.subTest(step=step),
-                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": runner.current_session}),
+                  mock.patch.dict(os.environ, {
+                      "CONF_DIR": str(pool.settings.parent), "CLAUDE_CODE_SESSION_ID": runner.current_session}),
                   mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
                   mock.patch.object(copies, "source_commit", return_value="abc"),
                   mock.patch.object(copies, "slot_source", return_value=source),
                   mock.patch.object(copies, "main_checkout", return_value=source),
                   mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
-                  mock.patch.object(build_slots, "configured_slot_root", return_value=self.root / "slots"),
                   mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
                 with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
                     with copies.command_tree(owner, source, copies.CommittedSource("HEAD"),
@@ -1902,6 +2077,7 @@ process.stdout.write(JSON.stringify({
                         self.fail("The slot is full")
                 send.assert_called_once()
                 request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
+                self.assertEqual(request.root, str(pool.slots.resolve()))
                 saved = wire.parse_request(wire.encode_request(request))
                 assert isinstance(saved, wire.RepositorySlotRequest)
                 self.assertEqual(saved.identity.step, step)
@@ -2649,13 +2825,16 @@ process.stdout.write(JSON.stringify({
                 expected = " · ".join(filter(None, (detail, "7 of 12 modules", "1 failed module")))
                 self.assertEqual(remote["status"], expected)
 
-    def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels) -> memory_feed.MemoryPage:
-        """Supply one owner for running and waiting cloud steps."""
+    def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels | None = None, *,
+                         identity: wire.Identity | None = None) -> memory_feed.MemoryPage:
+        """Use the same identity for running and waiting cloud steps."""
         reading = cloud_reading(reservation_reading())
-        rows = tuple(replace(row, identity=replace(row.identity, step=step)) for row in reading.cloud)
+        rows = tuple(replace(row, identity=identity or replace(row.identity, step=step)) for row in reading.cloud)
         labels = {row.identity.session_id: owner for row in rows}
-        with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
-              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)):
+            if owner is not None:
+                with mock.patch.object(unit_labels, "unit_labels_for", return_value=labels):
+                    return memory_feed.reading()
             return memory_feed.reading()
 
     def gate_job_page(self, step: str, argv: tuple[str, ...], *,
@@ -2758,7 +2937,8 @@ process.stdout.write(JSON.stringify({
             with self.subTest(ended_step=step):
                 run = LiveBuildRun(101, "101", inputs.now - 15)
                 reservation = memory_tests.ProgressKeepAsideTests.reservation(step, need=admission_records.GIB)
-                reservation.update(run_origin=admission_records.CallerRun(run), slot_staff=owner.id)
+                reservation.update(run_origin=admission_records.CallerRun(run), slot_staff=owner.id,
+                                   session_name=owner.name)
                 hold = gate.ended_step_slot(reservation, inputs.now, policy)
                 assert isinstance(hold, admission_records.BetweenStepsSlot)
                 reading = gate.queue_read_from(replace(inputs, slots=(hold,)), policy)
@@ -2831,6 +3011,96 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("showrunner"), "hana")
                     self.assertEqual(row["unit"], owner.unit)
 
+    def test_decoded_work_rows_keep_caller_names_separate_from_display_labels(self) -> None:
+        for stored, reservation, caller, held in (
+            ("recorded caller", "reservation caller", "recorded caller", "recorded caller"),
+            ("", "reservation caller", "staff member", "reservation caller"),
+            (" \t", "reservation caller", "staff member", "reservation caller"),
+            ("—", "reservation caller", "staff member", "reservation caller"),
+            ("$CALLER", "reservation caller", "staff member", "reservation caller"),
+            ("unregistered session", "reservation caller", "staff member", "reservation caller"),
+            ("unregistered session", "unregistered session", "staff member", "staff member"),
+        ):
+            with self.subTest(stored=stored, reservation=reservation):
+                page = self.caller_selection_page(stored_caller=stored, reservation_caller=reservation)
+                running, waiting = page["walk"], page["waiters"]
+                self.assertEqual([row["pid"] for row in running], [700001, 50, 301, 302, 304])
+                self.assertEqual([row["pid"] for row in waiting], [200, 700002, 303])
+                self.assertEqual(len({row.get("key") for row in (*running, *waiting)}), 8)
+                self.assertEqual(page["reserved"], 11.0)
+                self.assertEqual((running[1]["name"], running[1].get("ci_label")),
+                                 ("CI nextest", "hana CI"))
+                self.assertEqual((running[2].get("caller"), running[2].get("owner_text")), (held, held))
+                for row in (running[0], *waiting):
+                    with self.subTest(pid=row["pid"]):
+                        self.assertEqual((row.get("caller"), row.get("owner_text")), (caller, caller))
+                        self.assertEqual((row["unit"], row.get("showrunner")), ("fixture unit", "fixture showrunner"))
+                self.assertEqual(waiting[0]["name"], "fixture unit")
+                self.assertEqual(waiting[0]["title"]["step"], "fixture unit")
+                self.assertEqual(waiting[2]["name"], "fixture unit")
+                for cloud_row in (running[0], waiting[1]):
+                    self.assertEqual(cloud_row["name"], "fixture unit nextest")
+                    self.assertEqual(cloud_row["title"], {"unit": "fixture unit", "step": "nextest"})
+
+    def caller_selection_page(self, *, stored_caller: str | None = None,
+                              reservation_caller: str = "") -> memory_feed.MemoryPage:
+        """Decode work rows with both usable and unusable names."""
+        initial = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        inputs = initial.explanation.decided_from
+        now = inputs.now
+        worker = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "held caller", staff.StaffRoot(),
+                                current_session=staff.StaffId("new-worker-session"))
+        absent = admission_records.EndedStepFactNotRecorded()
+        facts = admission_records.EndedStepFacts("merge-gate", admission_records.PackageNotRecorded(),
+                                                  absent, absent, worker.id, caller_name="$CALLER")
+        retained = admission_records.BetweenStepsSlot(LiveBuildRun(301, "301", now - 5), "retained",
+                                                      admission_records.GIB, now + 10, facts)
+        continued = replace(retained, run=LiveBuildRun(302, "302", now - 5), reservation="continued",
+                            identity=replace(facts, staff_id=admission_records.NoEndedStepStaff()))
+        ci = replace(inputs.running[0], ci_runner="hana-linux-2", session_name="—")
+        local = replace(initial.view.waiting[0], session_name="recorded local", step="merge-gate")
+        members = staff.StaffSnapshot((worker,))
+        reservations = inputs.reservations
+        if stored_caller is not None:
+            runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "fixture showrunner", staff.StaffRoot(),
+                                    current_session=staff.StaffId("runner-session"))
+            director = staff.StaffRow(staff.StaffId("director"), "unit", "fixture unit", staff.ReportsTo(runner.id),
+                                      current_session=staff.StaffId("director-session"))
+            worker = replace(worker, name="staff member", parent=staff.ReportsTo(director.id))
+            members = staff.StaffSnapshot((runner, director, worker))
+            local = replace(local, session_id=worker.current_session, session_name=stored_caller)
+            retained = replace(retained, reservation="step", identity=replace(facts, caller_name=stored_caller))
+            reservations = tuple({**row, "session_name": reservation_caller} for row in inputs.reservations)
+        reading = gate.queue_read_from(replace(inputs, running=(ci,), reservations=reservations,
+            slots=(retained, admission_records.ContinuationSlot(continued, "next"))), admission_policy_fixture())
+        cloud = cloud_reading(replace(reading, view=replace(reading.view, waiting=(local,))))
+        cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
+            row.identity, name="recorded cloud", step="merge-gate")) for row in cloud.cloud))
+        slot = wire.RepositorySlotRow(wire.Owner(303, "303"),
+            wire.Identity("slot-session", "recorded slot", "merge-gate", "/private/widget"),
+            now - 30, "natedev", wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+        if stored_caller is not None:
+            cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
+                row.identity, session_id=worker.current_session, name=stored_caller, step="nextest")) for row in cloud.cloud))
+            slot = replace(slot, identity=replace(slot.identity, session_id=worker.id, name=stored_caller))
+        message = wire.encode_reply(wire.ViewReply(replace(cloud, repository_slots=(slot,))))
+        mac = queue_view.MacBuild(304, "/private/hana", now - 45, "cargo nextest run --jobs=8", "hana",
+                                   queue_view.MacTesting(305), admission_records.GIB)
+
+        def view() -> wire.CloudQueueRead:
+            reply = wire.parse_reply(message)
+            assert isinstance(reply, wire.ViewReply) and isinstance(reply.reading, wire.CloudQueueRead)
+            return reply.reading
+
+        unknown = unit_labels.UnitLabels("$OWNER")
+        labels = {session: unknown for session in (local.session_id, *(row.identity.session_id for row in cloud.cloud))}
+        with (mock.patch.object(admission_client, "view", side_effect=view),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (mac,))),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={mac.pid: unknown})):
+            return memory_feed.reading()
+
     def test_mac_ci_uses_the_configured_label_without_a_staff_owner(self) -> None:
         _ = (self.root / "build_admission.conf").write_text("ci_label=hana CI · {runner} · {job}\n")
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown"), ci=True)
@@ -2840,8 +3110,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(mac["title"]["step"], "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac.get("showrunner"), "")
         self.assertEqual(mac["unit"], "")
-        for runner, job, label in (("", "", "hana CI"), ("hana-mac-1", "", "hana CI · hana-mac-1"),
-                                   ("", "test-hana", "hana CI · test-hana")):
+        for runner, job, label in (("", "", "hana CI"), ("hana-mac-1", "", "hana CI"),
+                                   ("", "test-hana", "hana CI")):
             with self.subTest(runner=runner, job=job):
                 build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
                     origin=queue_view.MacBuildOrigin.CI, ci_runner=runner, ci_job=job)
@@ -2881,8 +3151,8 @@ process.stdout.write(JSON.stringify({
         stat = process / "stat"
         for members, tty, name, unit, showrunner, caller in (
             ((), 34816, "hana build", "", "", "terminal · hana_catalyst"),
-            ((), 0, "hana build", "", "", "hana_catalyst"),
-            ((runner, director), 34816, "startup build", "startup", "hana", ""),
+            ((), 0, "hana build", "", "", "terminal · hana_catalyst"),
+            ((runner, director), 34816, "startup build", "startup", "hana", "startup"),
         ):
             with self.subTest(tty=tty, unit=unit):
                 fields = ["S", "1", str(pid), str(pid), str(tty), *(["0"] * 14), str(pid)]
@@ -2925,6 +3195,8 @@ process.stdout.write(JSON.stringify({
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
             ("targeted-test", director, "panes"),
+            ("build", director, "panes build"),
+            ("literal{step}", director, "panes literal{step}"),
             ("merge-gate", runner, "builds"),
             ("merge-gate", director, "panes"),
             ("merge-gate", merge_staff, "sdlc-merge-gate"),
@@ -2943,6 +3215,121 @@ process.stdout.write(JSON.stringify({
                 waiting = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
+
+        config = self.root / "build_steps.conf"
+        _ = config.write_text(config.read_text().replace("owned.targeted-test={unit} targeted",
+                                                         "owned.targeted-test=targeted for {unit}"))
+        step = "targeted-test"
+        for owner, expected in ((director, "targeted for panes"), (None, "unregistered session")):
+            with self.subTest(owner=owner, expected=expected):
+                page = self.cloud_owner_page(step, owner, identity=wire.Identity("old-cloud", "", step, ""))
+                self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], [expected])
+                self.assertEqual([row["name"] for row in page["waiters"] if row.get("kind") == "cloud"], [expected])
+
+    def test_cloud_gate_uses_the_configured_template_after_an_unknown_caller(self) -> None:
+        with isolated_staff_file(self.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="sdlc")
+            unit = fixture_member("unit", name="panes", parent=runner.id)
+            director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                               unit_labels.DirectsUnit("panes"))
+            config = self.root / "build_steps.conf"
+            _ = config.write_text(config.read_text().replace("owned.targeted-test={unit} targeted",
+                                                             "owned.targeted-test=targeted for {unit}"))
+            identity = wire.Identity(unit.current_session, "unregistered session", "targeted-test", "")
+            page = self.cloud_owner_page(identity.step, director, identity=identity)
+            for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
+                row, = [row for row in table if row.get("kind") == "cloud"]
+                self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "targeted for panes", "panes"))
+
+    def test_cloud_owner_templates_check_the_configured_step_and_unit(self) -> None:
+        config = self.root / "build_steps.conf"
+        original = config.read_text()
+        for unit, showrunner, shown, expected in (("panes", "sdlc", "selected tests", "panes selected tests"),
+                                                  ("panes", "sdlc", "—", "panes"),
+                                                  ("—", "sdlc", "selected tests", "sdlc"),
+                                                  ("—", "—", "—", "unregistered session")):
+            with self.subTest(unit=unit, showrunner=showrunner, shown=shown):
+                _ = config.write_text(original.replace("owned.targeted-test={unit} targeted",
+                    "owned.targeted-test={unit} {step}").replace("names.targeted-test=targeted test",
+                    f"names.targeted-test={shown}"))
+                owner = unit_labels.UnitLabels("", showrunner, unit, unit_labels.OwnerRole.UNIT)
+                identity = wire.Identity("old-cloud", "", "targeted-test", "")
+                page = self.cloud_owner_page(identity.step, owner, identity=identity)
+                for table in (page["walk"], page["waiters"]):
+                    row, = [row for row in table if row.get("kind") == "cloud"]
+                    self.assertEqual((row["name"], row["title"]["step"]), (expected, expected))
+
+    def test_unusable_cloud_templates_keep_the_owner_name(self) -> None:
+        director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                          unit_labels.DirectsUnit("panes"))
+        config = self.root / "build_steps.conf"
+        template = config.read_text()
+        step = "targeted-test"
+        for text in ("—", "owner not recorded", "${unit}", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"):
+            with self.subTest(template=text):
+                _ = config.write_text(template.replace("owned.targeted-test={unit} targeted",
+                                                        f"owned.targeted-test={text}"))
+                page = self.cloud_owner_page(step, director, identity=wire.Identity("legacy", "", step, ""))
+                for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
+                    row, = [row for row in table if row.get("kind") == "cloud"]
+                    self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
+
+    def test_detached_and_systemd_cloud_rows_use_the_fixed_staff_owner(self) -> None:
+        with isolated_staff_file(self.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="hana")
+            unit = fixture_member("unit", name="panes", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            current = fixture_runtime_id("cloud-owner-after-restart")
+            worker = staff.update_current_session(worker.current_session, staff.native_id(current))
+            for source, member, role, worker_name in (
+                ("detached", worker, unit_labels.Runner.WORKER, worker.name),
+                ("systemd", unit, unit_labels.Runner.UNIT_DIRECTOR, ""),
+            ):
+                with (self.subTest(source=source), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(member.id),
+                }), mock.patch.object(unit_labels, "unit_labels_for", new=UNIT_LABELS_FOR),
+                      mock.patch.object(unit_labels, "newest_sessions", return_value=[])):
+                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    self.assertEqual(identity.session_id, member.current_session)
+                    page = self.cloud_owner_page(identity.step, identity=identity)
+                    for table in (page["walk"], page["waiters"]):
+                        row, = [cast(memory_feed.CloudWorkRow, row) for row in table if row.get("kind") == "cloud"]
+                        self.assertEqual((row["name"], row["showrunner"], row["unit"], row.get("runner"), row.get("worker")),
+                                         ("panes", "hana", "panes", role, worker_name))
+
+    def test_cloud_page_shows_the_recorded_staff_role(self) -> None:
+        for name, role, worker in (("impl", unit_labels.Runner.WORKER, "impl"),
+                                   ("panes", unit_labels.Runner.UNIT_DIRECTOR, "")):
+            with self.subTest(role=role):
+                owner = unit_labels.UnitLabels(name, "sdlc", "panes", unit_labels.OwnerRole.UNIT, role)
+                page = self.cloud_owner_page("targeted-test", owner)
+                rows = [cast(memory_feed.CloudWorkRow, row) for row in (*page["walk"], *page["waiters"])
+                        if row.get("kind") == "cloud"]
+                self.assertEqual([(row["showrunner"], row["unit"], row.get("runner"), row.get("worker")) for row in rows],
+                                 [("sdlc", "panes", role, worker)] * 2)
+
+    def test_queue_views_keep_recorded_names_when_registry_labels_are_empty(self) -> None:
+        base = cloud_reading(with_wait_reason(captured_reading(), admission_records.NeedsMemory()))
+        waiter = replace(base.view.waiting[0], step="merge-gate", session_name="local caller name")
+        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
+            wire.Identity("slot-session", "slot caller name", "merge-gate", str(self.root)),
+            base.explanation.now - 60, "natedev",
+            wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+        reading = replace(base, view=replace(base.view, waiting=(waiter,)), repository_slots=(slot,))
+        labels = {session: unit_labels.UnitLabels("") for session in (
+            waiter.session_id, slot.identity.session_id, *(row.identity.session_id for row in base.cloud))}
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            page = memory_feed.reading()
+        rows = {row["pid"]: row for row in (*page["walk"], *page["waiters"])}
+        for pid, name in ((waiter.pid, waiter.session_name), (slot.owner.pid, slot.identity.name),
+                          *((row.owner.pid, row.identity.name) for row in base.cloud)):
+            with self.subTest(pid=pid):
+                self.assertEqual(rows[pid]["name"], name)
+                self.assertEqual(rows[pid].get("caller") or rows[pid].get("showrunner"), name)
+        self.assertEqual(queue_evidence.step_labels(waiter, labels).owner_text, waiter.session_name)
 
     def test_cloud_without_staff_does_not_publish_the_stored_unit(self) -> None:
         base = cloud_reading(captured_reading())
@@ -3256,42 +3643,223 @@ process.stdout.write(JSON.stringify({
             with self.subTest(gpu_slot=code):
                 self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
-    def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
+    def tool_process(self, pid: int, command: str, kib: int, *, parent: int = 1,
+                     children: tuple[int, ...] = (), shared_kib: int = 0) -> Path:
+        proc = self.root / "proc"
+        write_process(proc, pid, kib * 1024, parent=parent)
+        process = proc / str(pid)
+        _ = (process / "cmdline").write_bytes(command.encode().replace(b" ", b"\0") + b"\0")
+        _ = (process / "status").write_text(
+            f"VmRSS: {kib + 2 * shared_kib} kB\nRssAnon: {kib} kB\nRssShmem: {2 * shared_kib} kB\n")
+        _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {kib} kB\nPss_Shmem: {shared_kib} kB\n")
+        task = process / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        _ = (task / "children").write_text(" ".join(map(str, children)))
+        return process
+
+    def tool_scope_unit(self, scope: Path, command: str) -> Path:
+        unit = self.root / "runtime" / "systemd" / "transient" / scope.name
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        _ = unit.write_text(f"[Scope]\nDescription=[systemd-run] {command}\n")
+        return unit
+
+    def tool_split(self, *waiting: int) -> memory_feed.BuildToolRam:
+        waiters: list[admission_records.RankedWaiter] = [
+            {"pid": pid, "start_time": str(pid), "need": 1024, "since": 0, "order": admission_records.NormalOrder()}
+            for pid in waiting]
+        with (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+              mock.patch.object(memory_feed, "PROC", self.root / "proc"),
+              mock.patch.object(memory_feed, "CGROUP", self.root),
+              mock.patch.object(gate, "builds_slice_cgroup", return_value=self.root / "builds.slice")):
+            return memory_feed.build_tool_ram((), 0, waiters)
+
+    def test_detect_scope_estimates_test_only_and_mixed_charges(self) -> None:
+        _ = self.tool_process(101, "python -m unittest", 10, children=(102,))
+        _ = self.tool_process(102, "python3 -c child", 20, parent=101, children=(103,))
+        _ = self.tool_process(103, "sleep 10", 10, parent=102)
+        _ = self.tool_process(104, "other", 50)
+        builds = self.root / "builds.slice"
+        scope = builds / "builds-detached.slice" / "detached-detect-20261117T192504-3473301-5b4c.scope"
+        cases: tuple[tuple[tuple[int, ...], int], ...] = (
+            ((101, 102, 103), 100),
+            ((101, 102, 103, 104), 40),
+            ((), 0),
+        )
+        for members, expected in cases:
+            with self.subTest(members=members):
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(scope.parent, anonymous=100 * 1024)
+                write_scope(scope, members=members, anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, (100 - expected) * 1024,
+                                                                           python_tests=expected * 1024))
+
+    def test_detached_test_scope_keeps_its_class_after_the_runner_exits(self) -> None:
+        _ = self.tool_process(102, "python3 -c child", 20)
+        builds = self.root / "builds.slice"
+        run_id = "20261117T192504-3473301-5b4c"
+        scope = builds / "builds-detached.slice" / f"detached-python-tests-{run_id}.scope"
+        child_group = scope / "children"
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(scope.parent, anonymous=100 * 1024)
+        write_scope(scope, anonymous=100 * 1024)
+        write_scope(child_group, members=(102,), anonymous=70 * 1024)
+        record = self.root / "detached_runs" / f"{run_id}.json"
+        record.parent.mkdir()
+        _ = record.write_text('{"status": "finished", "kind": "python-tests"}')
+        expected = memory_feed.BuildToolRam(0, 0, 0, python_tests=100 * 1024)
+        with (mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.root)}),
+              mock.patch.object(memory_feed.ToolProcessReader, "command", side_effect=AssertionError("live command read"))):
+            self.assertEqual(self.tool_split(), expected)
+            record.unlink()
+            self.assertEqual(self.tool_split(), expected)
+
+    def test_detached_scope_without_test_evidence_counts_as_other_tools(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        for name, command in (
+            ("run-test.scope", "python3 -c child"),
+            ("detached-other-20261117T192504-3473301-5b4c.scope", "python3 -m unittest"),
+        ):
+            with self.subTest(name=name):
+                _ = self.tool_process(102, command, 20)
+                scope = detached / name
+                unit = self.tool_scope_unit(scope, "/usr/bin/python3 -m unittest")
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(detached, anonymous=100 * 1024)
+                write_scope(scope, members=(102,), anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, 100 * 1024))
+                unit.unlink()
+                _ = scope.rename(self.root / name)
+
+    def test_tool_group_split_names_both_byte_counts(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        scope = detached / "test.scope"
+        _ = self.tool_process(101, "python3 -m unittest", 10)
+        _ = self.tool_process(102, "other", 20)
+        write_scope(detached, anonymous=30 * 1024)
+        write_scope(scope, members=(101, 102), anonymous=30 * 1024)
+        with (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+              mock.patch.object(memory_feed, "PROC", self.root / "proc")):
+            shares = memory_feed.split_tool_groups(builds, set(), set(), set(), ())[scope]
+        self.assertNotIsInstance(shares, tuple)
+        self.assertEqual(shares.python_tests_bytes, 10 * 1024)
+        self.assertEqual(shares.waiting_runs_bytes, 0)
+
+    def test_shared_pages_in_mixed_group_count_once_for_waiting_wrappers(self) -> None:
+        builds = self.root / "builds.slice"
+        for pid, command, parent, children, shared in (
+            (101, "bash /fixture/verify.sh test", 1, (102,), 15),
+            (102, "python3 local_release_wait.py", 101, (), 15),
+            (103, "other", 1, (), 0),
+        ):
+            process = self.tool_process(pid, command, 10 if shared else 50,
+                                        parent=parent, children=children, shared_kib=shared)
+            _ = (process / "cgroup").write_text("0::/builds.slice/mixed.scope\n")
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(builds / "mixed.scope", members=(101, 102, 103), anonymous=100 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 50 * 1024, waiting_runs=50 * 1024))
+
+    def test_waiting_verify_shell_with_options_counts_as_a_wrapper(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash -e /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        write_scope(builds, anonymous=20 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=20 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 0, waiting_runs=20 * 1024))
+
+    def test_waiting_tools_skip_unrelated_processes_and_cgroup_subtrees(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        thread = owner / "task" / "104"
+        thread.mkdir()
+        _ = (thread / "children").write_text("103")
+        helper = self.tool_process(103, "python3 verify_helper.py", 10, parent=102)
+        _ = self.tool_process(199, "other", 20)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        _ = (helper / "cgroup").write_text("0::/builds.slice/verify.scope/helper.scope\n")
+        write_scope(builds, anonymous=50 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=30 * 1024)
+        write_scope(builds / "verify.scope" / "helper.scope", members=(103,), anonymous=10 * 1024)
+        unrelated = builds / "unrelated.scope" / "child.scope"
+        write_scope(unrelated.parent, anonymous=20 * 1024)
+        write_scope(unrelated, members=(199,), anonymous=20 * 1024)
+        with (mock.patch.object(gate, "process_table", wraps=gate.process_table) as table,
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read):
+            tools = self.tool_split(102)
+        table.assert_not_called()
+        self.assertNotIn(mock.call(unrelated / "cgroup.procs"), read.call_args_list)
+        self.assertEqual(tools, memory_feed.BuildToolRam(0, 0, 20 * 1024, waiting_runs=30 * 1024))
+
+    def test_python_tests_and_waiting_wrappers_split_tools_without_counting_cargo_twice(self) -> None:
+        gib = admission_records.GIB
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
                 python = fixture.fixture_owner(700001, "100")
                 process = fixture.proc.path / str(python.pid)
                 _ = process.joinpath("comm").write_text("python3\n")
                 _ = process.joinpath("cmdline").write_bytes(b"python3\0-m\0unittest\0")
-                python_use = 4 * admission_records.GIB
+                proc = fixture.proc.path
+                shell, waiter_pid, helper, unknown = 700010, 700011, 700012, 700013
+                for pid, parent, use, command in (
+                    (shell, 1, gib // 4, b"bash\0/fixture/verify.sh\0test\0"),
+                    (waiter_pid, shell, gib // 4, b"python3\0local_release_wait.py\0"),
+                    (helper, shell, gib // 2, b"python3\0verify_helper.py\0"),
+                    (unknown, 1, gib, b"python3\0tree_watch.py\0"),
+                ):
+                    write_process(proc, pid, use, parent=parent)
+                    process = proc / str(pid)
+                    _ = (process / "cmdline").write_bytes(command)
+                    _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {use // 1024} kB\nPss_Shmem: 0 kB\n")
+                    task = process / "task" / str(pid)
+                    task.mkdir(parents=True)
+                    children = {shell: f"{waiter_pid} {helper}"}
+                    _ = (task / "children").write_text(children.get(pid, ""))
+                python_use = 4 * gib
                 builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
                 detached = builds / "builds-detached.slice"
-                write_scope(builds, current=python_use + cargo_use, anonymous=python_use + cargo_use)
-                write_scope(detached, current=python_use + cargo_use, anonymous=python_use + cargo_use)
-                write_scope(detached / "python.scope", members=(python.pid,),
+                write_scope(builds, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                write_scope(detached, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                python_scope = detached / "detached-python-tests-20261117T192504-3473301-5b4c.scope"
+                write_scope(python_scope, members=(python.pid,),
                     current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(detached / "verify.scope", members=(shell, waiter_pid, helper, unknown),
+                            current=2 * gib, anonymous=2 * gib)
                 if cargo_use:
                     cargo = fixture.fixture_owner(700002, "200")
-                    sidecar = fixture.scope(cargo, folder="builds.slice/builds-detached.slice/python.scope/cargo.scope",
+                    sidecar = fixture.scope(cargo, folder=str((python_scope / "cargo.scope").relative_to(builds.parent)),
                         current=cargo_use, anonymous=cargo_use)
                     request = replace(fixture.request(owner=cargo, need=8 * admission_records.GIB), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))
                     self.assertEqual(len(fixture.server.reservations), 1)
                     self.assertIn(grant.reservation, [record.reservation_id for record in fixture.server.reservations.values()])
-                fixture.free(60 * admission_records.GIB - python_use - cargo_use)
+                fixture.free(60 * gib - python_use - cargo_use - 2 * gib)
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
-                reading = reply.reading
-                with mock.patch.object(admission_client, "view", return_value=reading):
-                    page = memory_feed.reading()
-                self.assertEqual(page["used"], cargo_use / admission_records.GIB)
-                self.assertEqual(page["ram"]["other_build_tools_bytes"], python_use)
-                build_rows = [row for row in page["walk"] if not row.get("ci", False)]
-                self.assertEqual(len(build_rows), int(bool(cargo_use)))
-                self.assertEqual(page["leftovers"], [])
-                self.assertTrue(all(row.get("queued", False) for row in build_rows))
-                room = reading.explanation.room
+                inputs = reply.reading.explanation.decided_from
+                for start_time, wrapper_use in ((str(waiter_pid), gib), ("reused pid", 0)):
+                    waiter: admission_records.Waiter = {"pid": waiter_pid, "start_time": start_time,
+                        "since": inputs.now, "need": 60 * gib, "step": "nextest", "folder": "/fixture"}
+                    reading = gate.queue_read_from(replace(inputs, ordered=[(Path("waiter"), waiter)]),
+                                                   admission_policy_fixture())
+                    with (mock.patch.object(admission_client, "view", return_value=reading),
+                          mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+                          mock.patch.object(memory_feed, "PROC", proc)):
+                        page = memory_feed.reading()
+                    ram = page["ram"]
+                    self.assertEqual((ram["python_tests_bytes"], ram["waiting_runs_bytes"], ram["other_build_tools_bytes"]),
+                                     (python_use, wrapper_use, 2 * gib - wrapper_use))
+                    self.assertEqual(ram["build_tools_bytes"], python_use + 2 * gib)
+                    self.assertEqual(page["used"], cargo_use / gib)
+                    build_rows = [row for row in page["walk"] if not row.get("ci", False)]
+                    self.assertEqual(len(build_rows), int(bool(cargo_use)))
+                    self.assertTrue(all(row.get("queued", False) for row in build_rows))
+                room = reply.reading.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)
@@ -3488,31 +4056,28 @@ class MemoryMacSwitchTests(unittest.TestCase):
 
 
 class BuildsPageProofTests(unittest.TestCase):
-    def test_held_nightly_lease_selects_all_page_proof_views(self) -> None:
+    def test_only_a_nightly_lease_selects_all_page_proof_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            _ = write_config_fixture(Path(directory) / "build_folders.conf")
             checkout = Path(directory) / "checkout"
             checkout.mkdir()
-            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
-                self.assertFalse(needs_all_page_proof_views(checkout))
-                _ = build_slots.lease_path(checkout).write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
-                with checkout.with_name(checkout.name + ".lock").open("wb") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.assertTrue(needs_all_page_proof_views(checkout))
-                self.assertFalse(needs_all_page_proof_views(checkout))
+            lease = build_slots.lease_path(checkout)
+            self.assertFalse(needs_all_page_proof_views(checkout))
+            _ = lease.write_text(json.dumps({"work": "test-all"}), encoding="utf-8")
+            self.assertFalse(needs_all_page_proof_views(checkout))
+            _ = lease.write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
+            self.assertTrue(needs_all_page_proof_views(checkout))
 
     def test_builds_page_renders_the_queue_and_tooltips_in_chrome(self) -> None:
         source = Path(__file__).resolve()
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         proof = source.with_name("memory_page_proof.mjs")
+        all_views = needs_all_page_proof_views(source.parents[2])
+        mode = [] if all_views else ["--gate"]
         environment = {**os.environ, "PYTHON": sys.executable}
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
-            _ = write_config_fixture(Path(directory) / "build_folders.conf")
-            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
-                all_views = needs_all_page_proof_views(source.parents[2])
-            mode = [] if all_views else ["--gate"]
+            write_private_slot_roots(Path(directory) / "build_folders.conf", Path(directory), FIXTURE_MACHINE)
             result = subprocess.run([executable, str(proof), *mode, directory],
                 env={**environment, "CONF_DIR": directory, "TMPDIR": directory}, text=True, capture_output=True,
                 timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
@@ -3619,20 +4184,21 @@ def write_browser_fixture(folder: Path) -> None:
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}
+        pages["caller_selection"] = json.loads(memory_feed.page_json(fixture.caller_selection_page()))
         reports: dict[str, memory_feed.ReportFile] = {}
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        names = read_step_names()
         for version in ("before", "after"):
-            def recorded_name(row: wire.CloudRow, model: queue_view.QueueModel) -> str:
-                return model.names.shown(row.identity.step)
-            naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
-            with (naming if version == "before" else nullcontext()):
-                targeted = fixture.cloud_owner_page("targeted-test", director)
-                merge = fixture.cloud_owner_page("merge-gate", runner)
-            targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
-            targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
-            pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))
+            named_pages: list[memory_feed.MemoryPage] = []
+            for step, label in (("targeted-test", director), ("merge-gate", runner)):
+                name = names.shown(step) if version == "before" else names.for_owner(step, label.unit, label.role)
+                named_pages.append(fixture.cloud_owner_page(step, identity=wire.Identity("", name, step, "")))
+            comparison = named_pages[0]
+            comparison["walk"] = [row for page in named_pages for row in page["walk"] if row.get("kind") == "cloud"]
+            comparison["waiters"] = [row for page in named_pages for row in page["waiters"] if row.get("kind") == "cloud"]
+            pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(comparison))
         owner = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
                                         unit_labels.UnderDirector("research", "research", ""))
         pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))

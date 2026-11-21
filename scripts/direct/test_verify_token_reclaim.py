@@ -122,3 +122,48 @@ exit 0
             self.assertEqual(self.live_group_processes(step_group), [])
         finally:
             self.end_group(first.pid)
+
+    def test_old_cleanup_keeps_the_new_grant_in_a_reused_wait_folder(self) -> None:
+        memory_gate = VERIFY.parent.parent / "lint/memory_gate.sh"
+        harness = self.root / "reuse-placement.sh"
+        _ = harness.write_text("set -e\n"
+                               + shell_functions(VERIFY, "placement_once")
+                               + shell_functions(memory_gate, "buildlog_release_memory", "buildlog_wait_for_memory")
+                               + '''
+verify_helper() { :; }
+buildlog_check_nested_step() { :; }
+buildlog_memory_python() { :; }
+
+HOLD_WAIT_DIR=$1
+DOC_REPO_TOP=$PWD DOC_SOURCE_KEY=fixture-tree
+BUILDLOG_FIRST_STEP_REQUEST="$HOLD_WAIT_DIR/request"
+mkdir "$HOLD_WAIT_DIR"
+
+place() {
+    BUILDLOG_CALL_ID=$1 PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE=""
+    placement_once
+    printf 'BUILDLOG_MEM_RESERVATION=%s\\n' "$1" > "$PLACEMENT_GRANT_FILE"
+}
+
+place old
+old_grant=$PLACEMENT_GRANT_FILE old_assignment=$PLACEMENT_ASSIGNMENT_FILE
+old_episode=$PLACEMENT_EPISODE
+rm -- "$old_grant"
+place new
+
+BUILDLOG_MEM_RESERVATION=old BUILDLOG_SELECTED_LOCAL_GRANT=$old_grant \\
+    BUILDLOG_PLACEMENT_FILE=$old_assignment BUILDLOG_PLACEMENT_EPISODE=$old_episode \\
+    buildlog_release_memory 0
+
+BUILDLOG_SELECTED_LOCAL_GRANT=$PLACEMENT_GRANT_FILE
+buildlog_wait_for_memory
+[[ "$BUILDLOG_MEM_RESERVATION" == new ]]
+[[ "$PLACEMENT_ASSIGNMENT_FILE" != "$old_assignment" ]]
+[[ ! -e "$PLACEMENT_GRANT_FILE.outcome" ]]
+''')
+        result = subprocess.run(
+            ["bash", str(harness), str(self.root / "wait")], cwd=self.root,
+            env=self.environment, capture_output=True, text=True, check=False,
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

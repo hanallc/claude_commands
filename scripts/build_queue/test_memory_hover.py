@@ -40,6 +40,43 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page = fixture.caller_selection_page()
+        expected = (
+            (700001, "recorded cloud", "recorded cloud", "recorded cloud"),
+            (50, "CI nextest", "hana CI", "hana CI"),
+            (301, "held caller", "held caller", "held caller"),
+            (302, "unregistered session", "unregistered session", "unregistered session"),
+            (304, "hana nextest", "unregistered session", "hana nextest"),
+            (200, "recorded local", "recorded local", "recorded local"),
+            (700002, "recorded cloud", "recorded cloud", "recorded cloud"),
+            (303, "recorded slot", "recorded slot", "recorded slot"),
+        )
+        self.assertEqual(page["reserved"], 11.0)
+        self.assertEqual([row["pid"] for row in (*page["walk"], *page["waiters"])],
+                         [pid for pid, *_ in expected])
+        keys = [f"{kind}:{row.get('key')}" for kind, table in (("row", page["walk"]), ("wait", page["waiters"]))
+                for row in table]
+        self.assertEqual(len(set(keys)), len(expected))
+        rendered = cast(list[str], self.page_expression(
+            f"(renderWalk(data), [$('walk').innerHTML, ...{json.dumps(keys)}.map(key => tooltipHtml(key, data))])",
+            cast(object, json.loads(memory_feed.page_json(page))), walk=True))
+        table = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
+        for (pid, name, caller, title), key, hover in zip(expected, keys, rendered[1:], strict=True):
+            with self.subTest(pid=pid):
+                cell = table.find(f".//tr[@data-tip='{key}']/th[@class='step']")
+                chart = table.find(f".//div[@data-tip='{key}']")
+                assert cell is not None and chart is not None
+                self.assertEqual("".join(cell.itertext()), name)
+                self.assertEqual(chart.findtext(".//span[@class='name']"), name)
+                owner = chart.find(".//span[@class='owner']")
+                assert owner is not None
+                self.assertEqual("".join(owner.itertext()), caller)
+                self.assertEqual("".join(ElementTree.fromstring(hover)[0].itertext()), title)
+
     def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
         names = staff_names.StaffNames(staff.StaffSnapshot((unit,)))
@@ -1064,6 +1101,21 @@ function fitLabels() {}
         groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(data.ram, group))", {}))
         self.assertEqual(groups, [7 * GIB, 30 * GIB, 27 * GIB])
 
+    def test_build_tool_parts_keep_the_displayed_total_and_hide_an_empty_remainder(self) -> None:
+        for remainder, python_tests, waiting_runs, expected in (
+            (0, 264, 248, ["+ Python tests  0.3 GiB", "+ Waiting runs  0.2 GiB"]),
+            (128, 136, 248, ["+ Python tests  0.1 GiB", "+ Waiting runs  0.3 GiB", "+ Other build tools  0.1 GiB"]),
+            (192, 256, 64, ["+ Python tests  0.3 GiB", "+ Waiting runs  <0.1 GiB", "+ Other build tools  0.2 GiB"]),
+            (492, 20, 0, ["+ Python tests  <0.1 GiB", "+ Waiting runs  0.0 GiB", "+ Other build tools  0.5 GiB"]),
+        ):
+            ram = {**RAM_FIXTURE, "python_tests_bytes": python_tests * MIB, "waiting_runs_bytes": waiting_runs * MIB,
+                   "other_build_tools_bytes": remainder * MIB}
+            with self.subTest(remainder=remainder):
+                result = self.page_expression("[tipText('tools', data), tipText('cap', data)]", {"ram": ram, "cap": 31})
+                self.assertEqual(result, [["Build tools  2.0 GiB", "\n".join([
+                    "RAM that build tools use now", "rust-analyzer  1.0 GiB", "+ sccache  0.5 GiB", *expected])],
+                    ["Queue cap  31.0 GiB", "What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB"]])
+
     def test_missing_reserves_small_amounts_and_unavailable_readings_have_their_own_text(self) -> None:
         for description, needed, covered, expected in (
                 ("Running builds grow into it.", 9, 5,
@@ -1088,7 +1140,7 @@ function fitLabels() {}
         self.assertEqual(tips[0], ["Shortfall  7.0 GiB", "Reserves that free RAM does not cover\nUncovered swap  1.0 GiB\n+ Uncovered reserve  6.0 GiB"])
         self.assertEqual(tips[1], ["Build reserved  0.0 GiB", "Held for running builds to grow into\nTarget  6.0 GiB\nNot covered  6.0 GiB"])
         self.assertEqual(tips[2], ["Kernel  unavailable", ""])
-        self.assertEqual(tips[3], ["Build tools  0.5 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n+ Other build tools  0.5 GiB"])
+        self.assertEqual(tips[3], ["Build tools  0.5 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  <0.1 GiB\n+ Other build tools  0.5 GiB"])
         self.assertEqual(tips[5], ["Not attributed  2.0 GiB", "RAM that the readings do not explain\nKernel, no counter  0.0 GiB\n+ No program name  2.0 GiB"])
         self.assertEqual(tips[4], "0.0 GiB")
         self.assertEqual(tips[6], ["System reserved  5.0 GiB", "RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  1.0 GiB"])

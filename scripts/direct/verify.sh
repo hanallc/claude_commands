@@ -1835,22 +1835,31 @@ collect_hold_wait() {
 }
 
 interrupt_hold_wait() {
-    if [[ -n "$HOLD_WAITER_PID" ]]; then
-        if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
-            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$HOLD_WAITER_PID" TERM 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$HOLD_WAITER_PID" >&2; }
-            if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
-                kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
-                VERIFY_HELPER_PID=""
-            fi
-            exec 70>&- 71<&-
-            VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
-            PLACEMENT_CLIENT_ACTIVE=0
-        else
-            kill -TERM "$HOLD_WAITER_PID" 2>/dev/null || true
+    local waiter_pid=$HOLD_WAITER_PID last_job_pid=${!:-}
+    if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
+        # A signal can arrive after Bash starts the job and before Verify saves its PID.
+        if [[ -z "$waiter_pid" && -n ${placement_previous_job_pid+x} &&
+                "$last_job_pid" != "$placement_previous_job_pid" ]]; then
+            waiter_pid=$last_job_pid
         fi
-        # Bash can wait for log readers after the waiter exits.
-        HOLD_WAITER_PID=""
+        if [[ -n "$waiter_pid" ]]; then
+            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" \
+                "$waiter_pid" TERM 2>/dev/null || {
+                [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$waiter_pid" >&2
+            }
+        fi
+        # Stop the helper before cleanup makes another request.
+        if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
+            kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
+            VERIFY_HELPER_PID=""
+        fi
+        exec 70>&- 71<&-
+        VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
+        PLACEMENT_CLIENT_ACTIVE=0
+    elif [[ -n "$waiter_pid" ]]; then
+        kill -TERM "$waiter_pid" 2>/dev/null || true
     fi
+    HOLD_WAITER_PID=""
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
         verify_helper "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
     fi
@@ -2221,7 +2230,8 @@ LINT_MAC_FIX=0
 MAC_FIX_RESULT=""
 # The local lint fix pass runs on a private copy in a repository that cargo-berth
 # configures (lint_copy_begin). LINT_COPY_MODE is empty until the first pass asks.
-LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET=""
+LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET="" LINT_COPY_REPO=""
+LINT_COPY_ALLOCATION=""
 LINT_COPY_ARGS=()
 
 forward_mac_runner_signal() {
@@ -2836,13 +2846,15 @@ placement_once() {
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
+    local parent_run=${BUILDLOG_RUN:-}
     # A step with its own slot can leave its grant without a memory handoff.
-    local BUILDLOG_RUN=${BUILDLOG_RUN:-}
-    if [[ -n "${COPIES_STEP_SOURCE:-${VERIFY_SLOT_SOURCE:-}}" ]]; then BUILDLOG_RUN=""; fi
+    local BUILDLOG_RUN=$parent_run
+    if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
-        PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+        local step_id="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+        PLACEMENT_EPISODE=$step_id
         PLACEMENT_OWNER_PID=$$
         if [[ "$refresh_source" == 0 ]]; then
             PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$PLACEMENT_EPISODE}"
@@ -2858,8 +2870,10 @@ placement_once() {
             key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$repository") || return $?
         fi
         VERIFY_SLOT_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_SLOT_HEAD=$head
-        PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
-        PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
+        # A step can still clean up after a new call reuses the wait directory.
+        local placement_path="$HOLD_WAIT_DIR/placement-$step_id"
+        PLACEMENT_ASSIGNMENT_FILE="$placement_path.json"
+        PLACEMENT_GRANT_FILE="$placement_path.sh"
         if [[ "$refresh_source" == 0 && -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
             mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
             LINT_MEMORY_WAIT_FILE=""
@@ -2893,7 +2907,7 @@ placement_once() {
         PLACEMENT_ASSIGNMENT_FILE="$BUILDLOG_FIRST_STEP_ASSIGNMENT"
         IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
             PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$BUILDLOG_FIRST_STEP_ROUTE"
-        PLACEMENT_OWNER_PID="${BUILDLOG_RUN%%:*}"
+        PLACEMENT_OWNER_PID="${parent_run%%:*}"
         PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
         export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
         unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
@@ -2903,7 +2917,8 @@ placement_once() {
         return 0
     fi
     [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
-    # A builtin wait lets the parent handle TERM during a service outage.
+    # A builtin wait lets the parent handle signals during a service outage.
+    local placement_previous_job_pid=${!:-}
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
@@ -2912,8 +2927,7 @@ placement_once() {
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
     wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID=""
-    PLACEMENT_CLIENT_ACTIVE=0
+    HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
     reply=$(< "$HOLD_WAIT_DIR/placement-reply")
     while IFS= read -r line; do
         case "$line" in
@@ -3063,7 +3077,7 @@ wait_for_step_folder() {
 }
 
 route_test() {
-    local last_decline="" wait_reason="" name eligibility reason settings platform refresh_source=0
+    local last_decline="" wait_reason="" wait_holder="" name eligibility reason settings platform refresh_source=0
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -3210,6 +3224,11 @@ route_test() {
         fi
         if [[ "$MAC_ONLY" == 1 && "${LAST_TARGET_REASON:-}" != busy ]]; then
             mac_only_refuse "${LAST_TARGET_REASON:-runner}"
+        fi
+        if [[ "$STEP_ASSIGNED_PLATFORM" == macos && "$last_decline" == busy \
+                && -n "$BUILDLOG_MAC_HOLDER" && "$BUILDLOG_MAC_HOLDER" != "$wait_holder" ]]; then
+            printf 'verify.sh: Mac holder: %s.\n' "$BUILDLOG_MAC_HOLDER" >&2
+            wait_holder=$BUILDLOG_MAC_HOLDER
         fi
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
@@ -4398,14 +4417,22 @@ lint_copy_begin() {
     [[ "${LINT_COPY_MODE:-}" != in-place ]] || return 0
     local answer manifest
     load_metadata
+    LINT_COPY_REPO="$(git rev-parse --show-toplevel)" || exit 2
     answer="$(verify_helper --stdin "$FIX_RETURN_SCRIPT" copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --owner "$$" <<< "$GATE_METADATA")" || exit 2
+        --repo-root "$LINT_COPY_REPO" --owner "$$" <<< "$GATE_METADATA")" || exit 2
     if [[ "$answer" == in-place ]]; then
         LINT_COPY_MODE=in-place
         return 0
     fi
     LINT_COPY_MODE=copy
-    { read -r _; read -r LINT_COPY_DIR; read -r LINT_COPY_TREE; read -r manifest; read -r LINT_COPY_TARGET; } <<< "$answer"
+    {
+        read -r _
+        read -r LINT_COPY_DIR
+        read -r LINT_COPY_TREE
+        read -r manifest
+        read -r LINT_COPY_TARGET
+        read -r LINT_COPY_ALLOCATION
+    } <<< "$answer"
     LINT_COPY_ARGS=(--manifest-path "$manifest")
 }
 
@@ -4421,15 +4448,15 @@ lint_rewrite() {
     "$@" "${LINT_COPY_ARGS[@]}"
 }
 
-# Write the held changes of the copy into the worktree and delete the copy.
+# Write the held changes into the worktree and close the lint copy.
 # A fixed path that no reservation holds fails the pass.
 lint_copy_return() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    local folder="$LINT_COPY_DIR" status
-    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    local folder="$LINT_COPY_DIR" allocation_id="$LINT_COPY_ALLOCATION" status
+    LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_ALLOCATION=""
     LINT_COPY_ARGS=()
     verify_helper "$FIX_RETURN_SCRIPT" return-copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --folder "$folder" || {
+        --repo-root "$LINT_COPY_REPO" --folder "$folder" --allocation-id "$allocation_id" || {
         status=$?
         LINT_FIX_INCOMPLETE=1
         return "$status"
@@ -4438,9 +4465,10 @@ lint_copy_return() {
 
 lint_copy_drop() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    rm -rf -- "$LINT_COPY_DIR"
-    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    local folder="$LINT_COPY_DIR"
+    LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_ALLOCATION=""
     LINT_COPY_ARGS=()
+    verify_helper "$FIX_RETURN_SCRIPT" drop-copy --repo-root "$LINT_COPY_REPO" --folder "$folder" || true
 }
 
 # The clippy fix loop stops when its tree stops changing: the copy or the worktree.

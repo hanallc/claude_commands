@@ -36,11 +36,6 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
     @override
     def build_fixture(self) -> None:
         super().build_fixture()
-        self.environment = {name: value for name, value in self.environment.items()
-                            if not name.startswith("GIT_") or name in {
-                                "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
-                                "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
-                            }}
         # The class owns the bytecode cache. Each test restores source at the same path.
         self.environment["PYTHONPYCACHEPREFIX"] = str(self.root.parent / "bytecode")
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)

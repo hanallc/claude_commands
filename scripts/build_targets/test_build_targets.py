@@ -905,20 +905,27 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                         self.assertEqual(mac.eligibility,
                                          placement.AllowedHost() if allowed else placement.FixedExclusion("linux_only"))
 
-    def test_a_repository_without_cargo_reaches_the_mac_only_through_its_linux_only_key(self) -> None:
-        (self.root / "Cargo.toml").unlink(missing_ok=True)
-        claude = eligibility.KnownRepository(".claude")
-        for settings, expected in (("linux_only..claude=\n", placement.AllowedHost()),
-                                   ("", placement.FixedExclusion("repo"))):
-            with self.subTest(settings=settings), mock.patch.object(eligibility, "repository_identity",
-                                                                    return_value=claude):
-                _ = write_config_fixture(self.settings, settings, template="mac_test")
-                if not settings:
-                    _ = self.settings.write_text("\n".join(line for line in self.settings.read_text().splitlines()
-                        if not line.startswith("linux_only..claude=")) + "\n")
+    def test_mac_run_bypasses_repository_policy_without_cargo_manifest(self) -> None:
+        repo = self.root / "repositories" / ".claude"
+        repo.mkdir(parents=True)
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
+                                                return_value=eligibility.KnownRepository(repo.name)))
+        key = f"linux_only.{repo.name}="
+        cases: tuple[tuple[placement.CommandKind, bool, placement.AllowedHost | placement.FixedExclusion], ...] = (
+            ("run", True, placement.AllowedHost()),
+            ("run", False, placement.AllowedHost()),
+            ("check", False, placement.FixedExclusion("repo")),
+        )
+        for kind, configured, expected in cases:
+            with self.subTest(kind=kind, configured=configured):
+                _ = write_config_fixture(self.settings, f"{key}\n", template="mac_test")
+                if not configured:
+                    _ = self.settings.write_text("\n".join(
+                        line for line in self.settings.read_text().splitlines() if not line.startswith(key)
+                    ) + "\n")
+                command = ("python3", "-m", "unittest") if kind == "run" else ("cargo", "check")
                 constraints = build_targets.fixed_placement_constraints(
-                    self.root, "claude", "run", ("python3", "-m", "unittest"), NoOwningSession(), "fixed-source",
-                    selection=Pinned("mac"))
+                    repo, "", kind, command, NoOwningSession(), "fixed-source", selection=Pinned("mac"))
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
                 self.assertEqual(mac.eligibility, expected)
 

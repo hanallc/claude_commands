@@ -177,7 +177,8 @@ def mapping(value: object) -> dict[str, object]:
 
 
 def read_json(path: Path) -> dict[str, object]:
-    return mapping(cast(object, json.loads(path.read_text())))
+    with open_regular_input(path) as descriptor, os.fdopen(descriptor, encoding='utf-8', closefd=False) as record:
+        return mapping(cast(object, json.load(record)))
 
 
 def write_json(path: Path, value: object) -> None:
@@ -298,8 +299,25 @@ def required_vcpus(limits: TrialLimits) -> int:
     return needed
 
 
+@contextmanager
+def open_regular_input(path: Path) -> Generator[int]:
+    from stat import S_ISREG
+
+    before = path.lstat()
+    if not S_ISREG(before.st_mode):
+        raise ValueError(f'{path}: expected a regular file without links')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        after = os.fstat(descriptor)
+        if not S_ISREG(after.st_mode) or not os.path.samestat(before, after):
+            raise ValueError(f'{path}: input changed before it could be read')
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
 def digest(path: Path) -> str:
-    with path.open('rb') as content:
+    with open_regular_input(path) as descriptor, os.fdopen(descriptor, 'rb', closefd=False) as content:
         return hashlib.file_digest(content, 'sha256').hexdigest()
 
 
@@ -394,24 +412,51 @@ def trial_root() -> Path:
 
 def host_trial_folder(folder: Path) -> Path:
     """Require a canonical direct child of the host trial root."""
+    root = trial_root().absolute()
+    if any(part.is_symlink() for part in (root, *root.parents)) or root.resolve() != root:
+        raise ValueError('The GPU trial root must be canonical and contain no directory links')
     path = folder.expanduser().absolute()
     resolved = path.resolve()
-    if path != resolved or resolved.parent != trial_root().resolve() or resolved.name == '.locks':
+    if path != resolved or resolved.parent != root or resolved.name == '.locks':
         raise ValueError('The host trial folder must be a canonical direct child of the trial root without directory links')
     return resolved
 
 
-def remove_path(path: Path) -> None:
-    """Remove owned output without following a directory link."""
-    if path.is_symlink() or not path.is_dir():
+def _trial_entry(folder: Path, path: Path) -> Path:
+    folder, path = folder.absolute(), path.absolute()
+    if (path == folder or not path.is_relative_to(folder) or path.name == '..'
+            or path.parent.resolve() != path.parent):
+        raise ValueError(f'Cannot remove {path}: expected an entry below {folder} without linked parents')
+    return path
+
+
+def remove_trial_file(folder: Path, path: Path) -> None:
+    """Unlink a file or a link below the run folder."""
+    path = _trial_entry(folder, path)
+    try:
         path.unlink(missing_ok=True)
-    else:
-        shutil.rmtree(path)
+    except IsADirectoryError as error:
+        raise ValueError(f'Cannot remove {path}: expected a file and found a directory') from error
+
+
+def remove_trial_folder(folder: Path, path: Path) -> None:
+    """Remove an owned directory below the run folder."""
+    from stat import S_ISDIR
+
+    path = _trial_entry(folder, path)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if not S_ISDIR(mode):
+        raise ValueError(f'Cannot remove {path}: expected an owned directory without links')
+    shutil.rmtree(path)
 
 
 def trial_lock_directory(folder: Path) -> Path:
-    key = hashlib.sha256(str(folder.resolve()).encode()).hexdigest()
-    return trial_root() / '.locks' / key
+    folder = host_trial_folder(folder)
+    key = hashlib.sha256(str(folder).encode()).hexdigest()
+    return folder.parent / '.locks' / key
 
 
 def cleanup_receipt(folder: Path) -> Path:
@@ -450,15 +495,19 @@ def new_trial(folder: Path, *, prune_previous: bool = True) -> Generator[None]:
         with control_lock(root):
             if folder.exists() or folder.is_symlink():
                 raise FileExistsError('The new trial folder already exists: ' + str(folder))
+            # The existing option now reports previous trials for manual removal.
             if prune_previous:
-                previous_folders = [host_trial_folder(path) for path in sorted(root.iterdir())
+                previous_folders = [path for path in sorted(root.iterdir())
                                     if path.name != '.locks' and (path.is_dir() or path.is_symlink())]
                 busy = False
                 for previous in previous_folders:
+                    print(f'kept for a manual removal list: {previous} (gpu_size_trial, earlier trial)', file=sys.stderr)
+                    if previous.is_symlink():
+                        continue
+                    _ = host_trial_folder(previous)
                     try:
                         with trial_lock(previous, exclusive=True):
-                            _ = host_trial_folder(previous)
-                            remove_path(previous)
+                            pass
                     except BlockingIOError:
                         busy = True
                 if busy:
@@ -468,11 +517,97 @@ def new_trial(folder: Path, *, prune_previous: bool = True) -> Generator[None]:
         yield
 
 
-def remove_run_inputs(folder: Path, at: float) -> None:
-    folder = host_trial_folder(folder)
-    cloud_gate.save(folder / 'inputs-removed.json', {'at': at})
+def report_kept_run_inputs(folder: Path, reason: str) -> None:
     for name in RUN_INPUT_NAMES:
-        remove_path(folder / name)
+        print(f'kept for a manual removal list: {folder / name} (gpu_size_trial, {reason})', file=sys.stderr)
+
+
+def require_cleanup_trial(folder: Path, trial_id: str) -> None:
+    online = folder / 'online.json'
+    try:
+        if read_json(online).get('trial') == trial_id:
+            return
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as error:
+        reason = f'Cannot read the saved trial record: {error}'
+    else:
+        reason = 'The saved trial ID differs from the manifest'
+    report_kept_run_inputs(folder, reason)
+    raise ValueError(reason)
+
+
+def manifest_file_version(status: os.stat_result) -> tuple[int, int, int, int, int]:
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
+
+
+@dataclass(frozen=True)
+class ValidatedManifestIdentity:
+    trial_id: str
+    sha256: str
+    file_version: tuple[int, int, int, int, int]
+
+    def cleanup_authorization(self) -> dict[str, object]:
+        return {'trial': self.trial_id, 'manifest_sha256': self.sha256}
+
+
+@dataclass(frozen=True)
+class ValidatedTrialManifest:
+    fields: dict[str, object]
+    identity: ValidatedManifestIdentity
+
+
+def has_cleanup_authorization(folder: Path, identity: ValidatedManifestIdentity) -> bool:
+    path = folder / 'inputs-removal-authorized.json'
+    try:
+        with open_regular_input(path) as descriptor, os.fdopen(descriptor, encoding='utf-8', closefd=False) as record:
+            return cast(object, json.load(record)) == identity.cleanup_authorization()
+    except (OSError, ValueError):
+        return False
+
+
+def remove_run_inputs(folder: Path, at: float, identity: ValidatedManifestIdentity) -> None:
+    from stat import S_ISDIR, S_ISREG
+
+    folder = host_trial_folder(folder)
+    refused: list[str] = []
+    for name in RUN_INPUT_NAMES:
+        path = folder / name
+        try:
+            mode = _trial_entry(folder, path).lstat().st_mode
+            if name == 'cargo-home':
+                if not S_ISDIR(mode):
+                    raise ValueError('expected an owned directory without links')
+            elif not S_ISREG(mode):
+                raise ValueError('expected a regular file without links')
+            elif name == 'payload.tar':
+                raise ValueError('no ownership evidence for the payload file')
+        except FileNotFoundError:
+            continue
+        except (OSError, RuntimeError, ValueError) as error:
+            refused.append(f'{path}: {error}')
+    if refused:
+        reason = 'run input cleanup refused: ' + ' | '.join(refused)
+        report_kept_run_inputs(folder, reason)
+        raise ValueError(reason)
+    manifest = folder / 'manifest.json'
+    try:
+        unchanged = manifest_file_version(manifest.lstat()) == identity.file_version
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        reason = 'The validated manifest changed before input removal'
+        report_kept_run_inputs(folder, reason)
+        raise ValueError(reason)
+    authorization = folder / 'inputs-removal-authorized.json'
+    cloud_gate.save(authorization, identity.cleanup_authorization())
+    for name in RUN_INPUT_NAMES:
+        if name == 'cargo-home':
+            remove_trial_folder(folder, folder / name)
+        elif name != 'payload.tar':
+            remove_trial_file(folder, folder / name)
+    cloud_gate.save(folder / 'inputs-removed.json', {'at': at})
+    authorization.unlink(missing_ok=True)
 
 
 def prepare(repo: Path, commit: str, folder: Path) -> None:
@@ -520,7 +655,10 @@ def prepare_locked(repo: Path, commit: str, folder: Path,
         for path in folder.iterdir():
             if path == log:
                 continue
-            remove_path(path)
+            if not path.is_symlink() and path.is_dir():
+                remove_trial_folder(folder, path)
+            else:
+                remove_trial_file(folder, path)
         raise
     if isinstance(mode, GpuSizeComparison):
         print(folder)
@@ -794,7 +932,7 @@ def measure_machine(folder: Path, machine: str, source: Path, environment: Mappi
             if host:
                 _ = host_trial_folder(folder)
             for name in ('archive', 'source', 'cargo-target'):
-                remove_path(run / name)
+                remove_trial_folder(folder, run / name)
 
 
 def prepare_worker(folder: Path) -> None:
@@ -851,19 +989,23 @@ def prepare_worker_locked(folder: Path) -> None:
     write_json(folder / 'manifest.json', manifest)
     if isinstance(mode, GpuSizeComparison):
         _ = host_trial_folder(folder)
-        remove_path(source)
+        remove_trial_folder(folder, source)
         source.mkdir()
         with tarfile.open(folder / 'source.tar') as archive:
             archive.extractall(source, filter='data')
-        remove_path(folder / 'archive-nextest.toml')
-        remove_path(folder / 'toolchain-probe-home')
+        remove_trial_file(folder, folder / 'archive-nextest.toml')
+        remove_trial_folder(folder, folder / 'toolchain-probe-home')
         measure_machine(folder, 'natedev', source, environment, prefix=prefix, vulkaninfo=tools['vulkaninfo'])
     manifest['state'] = 'prepared'
     write_json(folder / 'manifest.json', manifest)
     _ = host_trial_folder(folder)
     for path in folder.iterdir():
-        if path.name not in PREPARED_NAMES:
-            remove_path(path)
+        if path.name in PREPARED_NAMES:
+            continue
+        if not path.is_symlink() and path.is_dir():
+            remove_trial_folder(folder, path)
+        else:
+            remove_trial_file(folder, path)
 
 
 @dataclass(frozen=True)
@@ -979,8 +1121,13 @@ def compare(folder: Path) -> str:
     return report
 
 
-def validate_prepared(folder: Path) -> dict[str, object]:
-    manifest = read_json(folder / 'manifest.json')
+def validate_prepared(folder: Path, *, allow_removed_before_upload: bool = False) -> ValidatedTrialManifest:
+    with (open_regular_input(folder / 'manifest.json') as descriptor,
+          os.fdopen(descriptor, encoding='utf-8', closefd=False) as record):
+        version = manifest_file_version(os.fstat(descriptor))
+        manifest = mapping(cast(object, json.load(record)))
+        if manifest_file_version(os.fstat(descriptor)) != version:
+            raise ValueError('The GPU trial manifest changed while it was read')
     mode = nextest_request(manifest)
     if isinstance(mode, HanaGpuNextestRequest):
         if any(not re.fullmatch(r'[0-9a-f]{40}', str(manifest[key])) for key in ('commit', 'tree')):
@@ -989,18 +1136,32 @@ def validate_prepared(folder: Path) -> dict[str, object]:
         raise ValueError('Prepare the trial again with the Nix toolchain and current GPU system module')
     if manifest.get('state') != 'prepared' or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(manifest['trial'])):
         raise ValueError('The trial folder has no completed preparation')
-    removed = (folder / 'inputs-removed.json').exists()
-    uploaded = removed and (folder / 'online.json').exists() and read_json(folder / 'online.json').get('uploaded') is True
+    receipt = folder / 'inputs-removed.json'
+    completed = (receipt.is_file() and not receipt.is_symlink()
+                 and not any(os.path.lexists(folder / name) for name in RUN_INPUT_NAMES))
+    encoded = json.dumps(manifest, sort_keys=True).encode()
+    identity = ValidatedManifestIdentity(ledger.text(manifest, 'trial'), hashlib.sha256(encoded).hexdigest(), version)
+    cleanup_started = has_cleanup_authorization(folder, identity) or completed
+    uploaded = (cleanup_started and (folder / 'online.json').exists()
+                and read_json(folder / 'online.json').get('uploaded') is True)
     for name, checksum in mapping(manifest['sha256']).items():
         if Path(name).name != name:
             raise ValueError('The manifest contains an invalid artifact name')
-        if removed and name in RUN_INPUT_NAMES and not (folder / name).exists():
-            if not uploaded:
-                raise ValueError('The trial inputs were removed before upload; prepare another trial')
-            continue
-        if digest(folder / name) != checksum:
+        try:
+            actual = digest(folder / name)
+        except FileNotFoundError as error:
+            if cleanup_started and name in RUN_INPUT_NAMES:
+                if not uploaded and not allow_removed_before_upload:
+                    raise ValueError('The trial inputs were removed before upload; prepare another trial') from error
+                continue
+            report_kept_run_inputs(folder, str(error))
+            raise
+        except (OSError, ValueError) as error:
+            report_kept_run_inputs(folder, str(error))
+            raise
+        if actual != checksum:
             raise ValueError('The prepared artifact differs from the manifest: ' + name)
-    return manifest
+    return ValidatedTrialManifest(manifest, identity)
 
 
 def gpu_service_name(trial: str) -> str:
@@ -1067,7 +1228,7 @@ def start_service(folder: Path, directory: Path, settings_path: Path,
                   execute: Callable[[Sequence[str]], int], *, assigned: bool = False) -> int:
     folder = host_trial_folder(folder)
     with held_trial(folder):
-        manifest = validate_prepared(folder)
+        manifest = validate_prepared(folder).fields
         trial = ledger.text(manifest, 'trial')
         arguments = ['--worker', str(folder), '--directory', str(directory), '--settings', str(settings_path)]
         if assigned:
@@ -1179,12 +1340,14 @@ finally:
 
 
 def guest_program() -> str:
-    functions = (mapping, read_json, write_json, digest, checked, hardware_vulkan, trial_environment, remove_path,
-                 archive_arguments, junit_config, no_publish, measure_machine, string_list, verify_hana_nextest, run_hana_nextest)
+    definitions = (mapping, read_json, write_json, open_regular_input, digest, checked, hardware_vulkan, trial_environment,
+                   _trial_entry, remove_trial_folder, archive_arguments, junit_config, no_publish, measure_machine, string_list,
+                   verify_hana_nextest, run_hana_nextest)
     return ('from __future__ import annotations\n'
-            + 'from pathlib import Path\nfrom collections.abc import Callable, Mapping, Sequence\n'
+            + 'from pathlib import Path\nfrom collections.abc import Callable, Generator, Mapping, Sequence\n'
+            + 'from contextlib import contextmanager\n'
             + 'from typing import cast\nimport hashlib, json, os, re, shlex, shutil, subprocess, sys, tarfile, time\n'
-            + '\n'.join(inspect.getsource(function) for function in functions) + GUEST)
+            + '\n'.join(inspect.getsource(definition) for definition in definitions) + GUEST)
 
 
 def gpu_user_data(links: dict[str, str], system: str, toolchain: str, expires: int, stop_at: int) -> str:
@@ -1509,20 +1672,33 @@ class GpuTrialWorker:
         if isinstance(nextest_request(read_json(folder / 'manifest.json')), GpuSizeComparison):
             payload_names += ['inventory.json', 'gpu_trial_wrapper.py']
             upload_names.insert(2, 'hana-tests.tar.zst')
-        try:
-            with tarfile.open(payload, 'w') as archive:
-                for name in payload_names:
-                    archive.add(folder / name, arcname=name)
-            prefix = GPU_TRIAL_REQUEST_PREFIX + str(online['trial'])
-            for name in upload_names:
-                self.upload(str(online['bucket']), prefix + '/' + name, folder / name,
-                            ledger.instant(online, 'lifetime_minutes') * 60)
-            online['uploaded'] = True
-            online['payload_sha256'] = digest(payload)
-            cloud_gate.save(folder / 'online.json', {key: value for key, value in online.items() if key != 'bucket'})
-        finally:
-            _ = host_trial_folder(folder)
-            remove_path(payload)
+        descriptor = os.open(payload, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'wb') as stream:
+            created = os.fstat(stream.fileno())
+            try:
+                with tarfile.open(fileobj=stream, mode='w') as archive:
+                    for name in payload_names:
+                        archive.add(folder / name, arcname=name)
+                stream.flush()
+                prefix = GPU_TRIAL_REQUEST_PREFIX + str(online['trial'])
+                for name in upload_names:
+                    self.upload(str(online['bucket']), prefix + '/' + name, folder / name,
+                                ledger.instant(online, 'lifetime_minutes') * 60)
+                online['uploaded'] = True
+                online['payload_sha256'] = digest(payload)
+                cloud_gate.save(folder / 'online.json', {key: value for key, value in online.items() if key != 'bucket'})
+            finally:
+                _ = host_trial_folder(folder)
+                try:
+                    current = payload.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if os.path.samestat(created, current):
+                        remove_trial_file(folder, payload)
+                    else:
+                        print(f'kept for a manual removal list: {payload} (gpu_size_trial, payload changed)',
+                              file=sys.stderr)
 
     def signed_links(self, folder: Path, online: dict[str, object], request: dict[str, object]) -> dict[str, str]:
         signing = gpu_signing_key(self.gates.api)
@@ -1548,14 +1724,15 @@ class GpuTrialWorker:
                             for number in (1, 2)})
         return links
 
+    def open_trial_bookings(self, trial_id: str) -> list[ledger.GateReservation]:
+        return [reservation for reservation in self.gates.book.read_snapshot().gate_reservations
+                if isinstance(reservation.trial, ledger.GateTrialBudget)
+                and reservation.trial.trial_id == trial_id and ledger.gate_is_open(reservation)]
+
     def cleanup(self, folder: Path) -> bool:
         trial_id = str(read_json(folder / 'manifest.json')['trial'])
         attempts: list[cloud_gate.GateCleanupAttempt] = []
-        for reservation in self.gates.book.read_snapshot().gate_reservations:
-            if not isinstance(reservation.trial, ledger.GateTrialBudget) or reservation.trial.trial_id != trial_id:
-                continue
-            if not ledger.gate_is_open(reservation):
-                continue
+        for reservation in self.open_trial_bookings(trial_id):
             box = gpu_box(folder, trial_id, reservation.instance_type, reservation.attempt)
             path = box / 'launch.json'
             recorded = path.is_file()
@@ -1616,16 +1793,20 @@ class GpuTrialWorker:
     def execute(self, folder: Path, deployment: dict[str, object]) -> None:
         folder = host_trial_folder(folder)
         with held_trial(folder):
+            prepared = validate_prepared(folder)
+            trial_id = prepared.identity.trial_id
+            require_cleanup_trial(folder, trial_id)
             try:
-                self.run_trial(folder, deployment)
+                self.run_trial(folder, deployment, prepared.fields)
             except Exception as error:
                 cloud_gate.save(folder / 'run-error.json', {'status': 'failed', 'reason': str(error)})
                 raise
             finally:
-                remove_run_inputs(folder, self.gates.clock())
+                require_cleanup_trial(folder, trial_id)
+                if not self.open_trial_bookings(trial_id):
+                    remove_run_inputs(folder, self.gates.clock(), prepared.identity)
 
-    def run_trial(self, folder: Path, deployment: dict[str, object]) -> None:
-        manifest = validate_prepared(folder)
+    def run_trial(self, folder: Path, deployment: dict[str, object], manifest: dict[str, object]) -> None:
         mode = nextest_request(manifest)
         allowed_types = string_list(deployment.get('gpu_instance_types', [])) if isinstance(mode, HanaGpuNextestRequest) else ()
         path = folder / 'online.json'
@@ -1889,17 +2070,25 @@ def online_main(arguments: Sequence[str]) -> int:
         try:
             if cleanup is not None:
                 with held_trial(folder):
+                    trial_id = ledger.text(read_json(folder / 'manifest.json'), 'trial')
                     try:
-                        if not worker.cleanup(folder):
-                            return 1
-                        if isinstance(nextest_request(read_json(folder / 'manifest.json')), HanaGpuNextestRequest):
-                            cloud_gate.save(cleanup_receipt(folder), {'trial': folder.name})
-                        return 0
+                        confirmed = worker.cleanup(folder)
                     finally:
                         if not (folder / 'online-result.json').exists() and not (folder / 'run-error.json').exists():
                             cloud_gate.save(folder / 'run-error.json', {'status': 'failed',
                                 'reason': 'The online worker ended before it saved a final result'})
-                        remove_run_inputs(folder, worker.gates.clock())
+                    if not confirmed:
+                        return 1
+                    require_cleanup_trial(folder, trial_id)
+                    prepared = validate_prepared(folder, allow_removed_before_upload=True)
+                    if prepared.identity.trial_id != trial_id:
+                        reason = 'The manifest trial ID changed during cloud cleanup'
+                        report_kept_run_inputs(folder, reason)
+                        raise ValueError(reason)
+                    remove_run_inputs(folder, worker.gates.clock(), prepared.identity)
+                    if isinstance(nextest_request(prepared.fields), HanaGpuNextestRequest):
+                        cloud_gate.save(cleanup_receipt(folder), {'trial': folder.name})
+                    return 0
             deployment = gate_deployment(directory / 'gate-deployment.json', api.region)
             if cast(bool, args.assigned):
                 confirm_assigned_gpu_service(folder.name)
@@ -1932,6 +2121,16 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
         with redirect_stdout(sys.stderr):
             prepare_locked(repo, commit, folder, request)
 
+        def remove_unstarted_inputs() -> None:
+            if (folder / 'online.json').exists():
+                return
+            try:
+                _ = (folder / 'manifest.json').lstat()
+            except FileNotFoundError:
+                return
+            prepared = validate_prepared(folder, allow_removed_before_upload=True)
+            remove_run_inputs(folder, datetime.now(UTC).timestamp(), prepared.identity)
+
         def service(command: Sequence[str]) -> int:
             if isinstance(launch, AssignedHanaGpuLaunch):
                 launch.before_service()
@@ -1946,7 +2145,7 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
             if not assigned_gpu_cleanup_confirmed(launch.trial):
                 if assigned_gpu_cleanup_pending(launch.trial):
                     raise ValueError('The Hana GPU service has no cleanup confirmation')
-                remove_run_inputs(folder, datetime.now(UTC).timestamp())
+                remove_unstarted_inputs()
                 raise ValueError(f'The Hana GPU service did not start (status {status})')
         else:
             status = start_service(folder, directory, settings, service)
@@ -1965,7 +2164,7 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
         error = folder / 'run-error.json'
         if error.is_file():
             raise ValueError(ledger.text(read_json(error), 'reason'))
-        remove_run_inputs(folder, datetime.now(UTC).timestamp())
+        remove_unstarted_inputs()
         raise ValueError(f'The Hana GPU worker exited with status {status} and has no result')
 
 

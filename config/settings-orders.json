@@ -21,5 +21,8 @@
   },
   "merge_gate": {
     "GATE_TIME_LIMIT_FACTOR": 5
+  },
+  "statusline": {
+    "role.worker": 12
   }
 }

@@ -109,6 +109,15 @@ def fixture_runtime_id(label: str) -> str:
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
 
 
+def build_fixture_sessions(fallback: str) -> dict[str, str]:
+    """Keep the runner's session in children that build or test."""
+    return {
+        "CLAUDE_CODE_SESSION_ID": (os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+                                   if staff.caller_identity() else fallback),
+        "CODEX_THREAD_ID": os.environ.get("CODEX_THREAD_ID", ""),
+    }
+
+
 def _claude_home() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
