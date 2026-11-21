@@ -46,9 +46,8 @@ from scripts.production import (
     unit_names,
 )
 from scripts.production.production_doc import (
-    FieldPresent, Production, ProductionPathsError, Refusal,
+    FieldPresent, OriginRefRemoval, Production, ProductionPathsError, Refusal, check_checkout_removal,
     live_paths_lock_file, optional_field, read_new_production, read_production, remember_document_rename,
-    require_removable_checkout,
 )
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.production.unit_move import RenameRefused, read_json, write_json
@@ -1283,7 +1282,7 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
     try:
-        require_removable_checkout(unit.worktree, unit.production.checkout, unit.branch)
+        removal = check_checkout_removal(unit.worktree, unit.production.checkout, unit.branch)
     except ProductionPathsError as error:
         return [str(error)]
     failed: list[str] = []
@@ -1298,11 +1297,15 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
             if result.returncode:
                 failed.append(retirement_failure(result))
-        observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
+        if removal is OriginRefRemoval.KEEP:
+            print(f"Kept protected origin ref refs/heads/{unit.branch}")
+            return failed
+        ref = f"refs/heads/{unit.branch}"
+        observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", ref, settings=settings)
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
         if observed.returncode == 0:
-            result = retirement_git(unit, "push", "-q", "origin", "--delete", unit.branch, settings=settings)
+            result = retirement_git(unit, "push", "-q", "origin", "--delete", ref, settings=settings)
             if result.returncode:
                 failed.append(retirement_failure(result))
     return failed

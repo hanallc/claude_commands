@@ -157,21 +157,28 @@ class MainSyncTests(unittest.TestCase):
             self.assertEqual(git(self.checkout, "for-each-ref", "refs/main-sync"), "")
 
     def test_an_advanced_checkout_cannot_move_back_during_claude_sync(self) -> None:
+        base = git(self.checkout, "rev-parse", "HEAD")
         older = self.commit("b")
         newer = self.commit("c")
         _ = git(self.checkout, "fetch", "-q", "origin")
         _ = git(self.writer, "push", "-q", "--force", "origin", f"{older}:main")
         flock = fcntl.flock
+        for case, start, concurrent, expected, tip in (
+                ("behind origin", base, False, main_sync.ADVANCED, older),
+                ("ahead of origin", newer, False, "diverged", newer),
+                ("concurrent advance", base, True, "diverged", newer)):
+            with self.subTest(case=case):
+                _ = git(self.checkout, "reset", "--hard", start)
+                _ = git(self.checkout, "update-ref", "refs/remotes/origin/main", newer)
 
-        def finish_newer_pull(descriptor: int, operation: int) -> None:
-            if operation == fcntl.LOCK_EX:
-                _ = git(self.checkout, "merge", "--ff-only", newer)
-            flock(descriptor, operation)
+                def finish_newer_pull(descriptor: int, operation: int) -> None:
+                    if operation == fcntl.LOCK_EX and concurrent:
+                        _ = git(self.checkout, "merge", "--ff-only", newer)
+                    flock(descriptor, operation)
 
-        with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
-            self.assertEqual(main_sync.sync(self.checkout).state, "diverged")
-        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), newer)
-        self.assertEqual(git(self.checkout, "rev-parse", "origin/main"), newer)
+                with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
+                    self.assertEqual(main_sync.sync(self.checkout).state, expected)
+                self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(), [tip, tip])
 
         run_git = main_sync._git  # pyright: ignore[reportPrivateUsage]
         for race, expected in (("after fetch", "diverged"), ("before update-ref", "fetch-failed")):

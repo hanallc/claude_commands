@@ -16,6 +16,12 @@ if [[ -z "$WORKTREE_PATH" || -z "$BRANCH_NAME" ]]; then
     exit 1
 fi
 
+BRANCH_REF="refs/heads/$BRANCH_NAME"
+if ! git check-ref-format "$BRANCH_REF"; then
+    echo "Error: invalid branch ref: $BRANCH_REF"
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=confirm_gate.sh
@@ -27,8 +33,8 @@ DELETION_REPOSITORY="$PWD"
 if [[ -n "$MAIN_WORKTREE" && -d "$MAIN_WORKTREE" ]]; then
     DELETION_REPOSITORY="$MAIN_WORKTREE"
 fi
-"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
-    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$DELETION_REPOSITORY"
+ORIGIN_REMOVAL=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
+    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$DELETION_REPOSITORY")
 
 HAS_CONFIRMATION=false
 CHECKED_LOCAL_TIP=""
@@ -59,9 +65,9 @@ else
 fi
 
 # Refuse a branch lookup fault before origin deletion.
-if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+if git show-ref --verify --quiet "$BRANCH_REF"; then
     if [[ "$HAS_CONFIRMATION" == true ]]; then
-        CHECKED_LOCAL_TIP=$(git rev-parse --verify "refs/heads/$BRANCH_NAME")
+        CHECKED_LOCAL_TIP=$(git rev-parse --verify "$BRANCH_REF")
     fi
 else
     BRANCH_LOOKUP_STATUS=$?
@@ -100,10 +106,10 @@ if [[ -z "$MAIN_WORKTREE" || "$DELETION_REPOSITORY" != "$MAIN_WORKTREE" ]]; then
 fi
 cd "$DELETION_REPOSITORY"
 
-if [[ "$HAS_CONFIRMATION" == true ]]; then
+if [[ "$ORIGIN_REMOVAL" == delete-origin && "$HAS_CONFIRMATION" == true ]]; then
     REMOTE_NAMES=$(git remote)
     if [[ " ${REMOTE_NAMES//$'\n'/ } " == *" origin "* ]]; then
-        if ! ORIGIN_BRANCH=$(git ls-remote --heads origin "refs/heads/$BRANCH_NAME"); then
+        if ! ORIGIN_BRANCH=$(git ls-remote --heads origin "$BRANCH_REF"); then
             echo "Error: cannot read the origin branch; deletion stops."
             exit 1
         fi
@@ -111,9 +117,11 @@ if [[ "$HAS_CONFIRMATION" == true ]]; then
     fi
 fi
 
-if [[ -n "$CHECKED_ORIGIN_TIP" ]]; then
+if [[ "$ORIGIN_REMOVAL" == keep-origin ]]; then
+    echo "Kept protected origin ref $BRANCH_REF"
+elif [[ "$ORIGIN_REMOVAL" == delete-origin && -n "$CHECKED_ORIGIN_TIP" ]]; then
     echo "Deleting origin/$BRANCH_NAME"
-    if ! git push "--force-with-lease=refs/heads/$BRANCH_NAME:$CHECKED_ORIGIN_TIP" origin --delete "$BRANCH_NAME"; then
+    if ! git push "--force-with-lease=$BRANCH_REF:$CHECKED_ORIGIN_TIP" origin --delete "$BRANCH_REF"; then
         echo "Error: origin branch deletion failed; the worktree and local branch stay."
         exit 1
     fi
@@ -123,7 +131,7 @@ fi
 "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"
 
 echo "Removing worktree: $WORKTREE_PATH"
-if [[ -n "$CHECKED_LOCAL_TIP" ]] && [[ "$(git rev-parse --verify "refs/heads/$BRANCH_NAME")" != "$CHECKED_LOCAL_TIP" ]]; then
+if [[ -n "$CHECKED_LOCAL_TIP" ]] && [[ "$(git rev-parse --verify "$BRANCH_REF")" != "$CHECKED_LOCAL_TIP" ]]; then
     echo "Error: the local branch changed after the cleanup check; the worktree stays."
     exit 1
 fi
@@ -155,7 +163,7 @@ fi
 echo ""
 echo "Deleting branch: $BRANCH_NAME"
 if [[ -n "$CHECKED_LOCAL_TIP" ]]; then
-    if ! git update-ref -d "refs/heads/$BRANCH_NAME" "$CHECKED_LOCAL_TIP"; then
+    if ! git update-ref -d "$BRANCH_REF" "$CHECKED_LOCAL_TIP"; then
         echo "Error: the local branch changed after the cleanup check; the local branch stays."
         exit 1
     fi

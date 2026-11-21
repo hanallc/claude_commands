@@ -234,11 +234,6 @@ def sync(checkout: Path) -> Outcome:
                 if ancestor.returncode == 1:
                     if old_tip != before_fetch.stdout.strip():
                         return Outcome("diverged", f"{TRACKING_REF} changed during the fetch")
-                    older = _git(checkout, "merge-base", "--is-ancestor", tip, old_tip)
-                    if older.returncode == 0:
-                        return Outcome("diverged", f"{TRACKING_REF} is ahead of the fetched tip {tip}")
-                    if older.returncode != 1:
-                        return Outcome("fetch-failed", _first_line(older))
                 elif ancestor.returncode:
                     return Outcome("fetch-failed", _first_line(ancestor))
             move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)

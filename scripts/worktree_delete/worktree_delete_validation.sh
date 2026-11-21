@@ -44,10 +44,10 @@ if [[ "$CURRENT_DIR" == "$SELECTED_ABSOLUTE" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if ! PROTECTION_REASON=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
+if ! ORIGIN_REMOVAL=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
     protect-deletion "$SELECTED_WORKTREE" "$TARGET_BRANCH" "$SELECTED_WORKTREE" 2>&1); then
     "$SCRIPT_DIR/../lib/py" -c 'import json, sys; print(json.dumps({"status": "error", "message": sys.argv[1]}))' \
-        "$PROTECTION_REASON"
+        "$ORIGIN_REMOVAL"
     exit 1
 fi
 CLEANUP=false
@@ -63,8 +63,11 @@ if [[ -n "$UNCOMMITTED" ]]; then
     HAS_UNCOMMITTED=true
 fi
 
-# Check for unpushed commits, and for commits that only origin/<branch> holds:
-# deletion removes that remote branch too.
+# Check for unpushed commits and for commits lost when deletion removes the origin ref.
+KEEP_ORIGIN=false
+if [[ "$ORIGIN_REMOVAL" == keep-origin ]]; then
+    KEEP_ORIGIN=true
+fi
 HAS_UNPUSHED=false
 UNPUSHED_COUNT=0
 HAS_REMOTE_BRANCH=false
@@ -80,7 +83,8 @@ if git -C "$SELECTED_WORKTREE" remote get-url origin >/dev/null 2>&1; then
     if [[ "$UNPUSHED_COUNT" -gt 0 ]]; then
         HAS_UNPUSHED=true
     fi
-    if git -C "$SELECTED_WORKTREE" rev-parse --verify -q "refs/remotes/origin/$TARGET_BRANCH" >/dev/null; then
+    if [[ "$KEEP_ORIGIN" == false ]] && \
+        git -C "$SELECTED_WORKTREE" rev-parse --verify -q "refs/remotes/origin/$TARGET_BRANCH" >/dev/null; then
         HAS_REMOTE_BRANCH=true
         # --exclude patterns for --remotes are relative to refs/remotes/.
         REMOTE_ONLY_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list --count "refs/remotes/origin/$TARGET_BRANCH" \
@@ -99,6 +103,7 @@ echo "{
   \"has_unpushed\": $HAS_UNPUSHED,
   \"unpushed_count\": $UNPUSHED_COUNT,
   \"has_remote_branch\": $HAS_REMOTE_BRANCH,
+  \"keep_origin\": $KEEP_ORIGIN,
   \"has_remote_only\": $HAS_REMOTE_ONLY,
   \"remote_only_count\": $REMOTE_ONLY_COUNT,
   \"cleanup\": $CLEANUP,

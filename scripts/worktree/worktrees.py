@@ -15,7 +15,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
@@ -85,7 +85,7 @@ class CheckedLocalTip:
 @dataclass(frozen=True)
 class CleanupReady:
     local: CheckedLocalTip
-    origin: OriginBranchAbsent | CheckedOriginTip
+    origin: OriginBranchAbsent | CheckedOriginTip | Literal[production_doc.OriginRefRemoval.KEEP]
 
 
 class Refused(Exception):
@@ -303,7 +303,11 @@ def local_branch_tip(repo: Path, branch: str) -> LocalBranchAbsent | CheckedLoca
     return CheckedLocalTip(git(repo, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip())
 
 
-def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedOriginTip | Kept:
+def origin_branch_state(
+    record: WorktreeRecord, removal: production_doc.OriginRefRemoval,
+) -> OriginBranchAbsent | CheckedOriginTip | Literal[production_doc.OriginRefRemoval.KEEP] | Kept:
+    if removal is production_doc.OriginRefRemoval.KEEP:
+        return removal
     repo = Path(record.repo)
     remote_branch = git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{record.branch}").stdout
     if not remote_branch:
@@ -333,7 +337,7 @@ def cleanup(path: Path) -> CleanupReady | Kept:
         raise Refused(1, head.stderr.strip())
     branch = head.stdout.strip()
     try:
-        production_doc.require_removable_checkout(path, path, branch)
+        removal = production_doc.check_checkout_removal(path, path, branch)
     except production_doc.ProductionPathsError as error:
         return Kept(path, str(error))
     _ = git(path, "fetch", "--no-prune", "origin")
@@ -362,7 +366,7 @@ def cleanup(path: Path) -> CleanupReady | Kept:
     result = landed(record)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
-    origin = origin_branch_state(record)
+    origin = origin_branch_state(record, removal)
     if isinstance(origin, Kept):
         return origin
     if local_branch_tip(repo, branch) != local:
@@ -385,7 +389,7 @@ def release_worktree_pair(path: Path) -> None:
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
     try:
-        production_doc.require_removable_checkout(path, repo, record.branch)
+        removal = production_doc.check_checkout_removal(path, repo, record.branch)
     except production_doc.ProductionPathsError as error:
         return Kept(path, str(error))
     resolver = session_staff.RowResolver(snapshot)
@@ -412,7 +416,7 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))
         return Kept(path, f"work has not landed: {detail}")
-    origin = origin_branch_state(record)
+    origin = origin_branch_state(record, removal)
     if isinstance(origin, Kept):
         return origin
     cargo_mark = scratch.cargo_removal_mark(path.resolve())
@@ -423,9 +427,11 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
             return Kept(path, f"Cargo output kept: {error}")
         if isinstance(origin, CheckedOriginTip):
             deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
-                           "origin", "--delete", record.branch, check=False)
+                           "origin", "--delete", f"refs/heads/{record.branch}", check=False)
             if deletion.returncode:
                 return Kept(path, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
+        elif origin is production_doc.OriginRefRemoval.KEEP:
+            print(f"Kept protected origin ref refs/heads/{record.branch}")
         registered = path in worktree_branches(repo)
         if local_branch_tip(repo, record.branch) != local:
             return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
@@ -562,11 +568,12 @@ def main() -> int:
         return 0
     if cast(str, arguments.command) == "protect-deletion":
         try:
-            production_doc.require_removable_checkout(
+            removal = production_doc.check_checkout_removal(
                 Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), cast(str, arguments.branch))
         except production_doc.ProductionPathsError as error:
             print(str(error), file=sys.stderr)
             return 1
+        print(removal.value)
         return 0
     if cast(str, arguments.command) == "release-pair":
         release_worktree_pair(Path(cast(str, arguments.path)).absolute())

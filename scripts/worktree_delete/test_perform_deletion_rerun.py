@@ -47,7 +47,7 @@ class DeletionRerunTests(unittest.TestCase):
         for name in ("lib", "worktree"):
             (self.scripts.parent / name).symlink_to(source.parent / name, target_is_directory=True)
 
-    def test_protected_integration_stops_validation_and_both_deletion_routes(self) -> None:
+    def test_protected_integration_refs_during_validation_and_deletion(self) -> None:
         repo, origin, tree = self.root / "repo", self.root / "origin.git", self.root / "integration"
         _ = subprocess.run(["git", "init", "-qb", "main", str(repo)], check=True)
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -64,15 +64,10 @@ class DeletionRerunTests(unittest.TestCase):
         enrolled_document(doc, repo, tree, "integration")
         local = remote.local_machine()
         owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(local, doc))
-        clone = self.root / "clone"
-        clone_tree = self.root / "clone-integration"
-        _ = git(self.root, "clone", "-q", origin.as_uri(), str(clone))
-        _ = git(clone, "worktree", "add", "-qb", "integration", str(clone_tree), "origin/integration")
-        other_origin, other_repo = self.root / "other.git", self.root / "other"
-        other_tree = self.root / "other-integration"
+        other_origin = self.root / "other.git"
         _ = git(self.root, "clone", "-q", "--bare", str(origin), str(other_origin))
-        _ = git(self.root, "clone", "-q", str(other_origin), str(other_repo))
-        _ = git(other_repo, "worktree", "add", "-qb", "integration", str(other_tree), "origin/integration")
+        alias = self.root / "alias.git"
+        alias.symlink_to(origin)
 
         config = self.root / "machines"
         config.mkdir()
@@ -85,19 +80,9 @@ class DeletionRerunTests(unittest.TestCase):
         other_host = remote.other_machine()
         ssh = binaries / "ssh"
         _ = ssh.write_text("#!/bin/sh\n"
-                           + 'if [ "$1" = -G ]; then\n'
-                           + '    for alias do :; done\n'
-                           + '    case "$alias" in\n'
-                           + '        candidate|registered) printf "hostname git.fixture.invalid\\nport 2222\\n";;\n'
-                           + '        *) exit 255;;\n'
-                           + '    esac\n'
-                           + '    exit 0\n'
-                           + 'fi\n'
                            + f'[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = {other_host} ] || exit 255\n'
-                           + 'case "$4" in\n'
-                           + f'  *" origin-path "*) printf "%s\\n" {shlex.quote(str(other_origin.resolve()))}; exit 0;;\n'
-                           + 'esac\n'
-                           + 'exec sh -c "$4"\n')
+                           + f'[ "$4" = {shlex.quote(shlex.join(("cat", str(doc))))} ] || exit 255\n'
+                           + f'exec cat {shlex.quote(str(doc))}\n')
         ssh.chmod(0o755)
 
         def attempt(checkout: Path, worktree: Path, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -105,29 +90,37 @@ class DeletionRerunTests(unittest.TestCase):
                                   capture_output=True, text=True, check=False)
 
         pattern = ("for-each-ref", "--format=%(refname) %(objectname)")
-        refs = tuple(git(folder, *pattern) for folder in (repo, clone, origin))
+        protected_repos = (repo, origin, other_origin)
+        protected_refs = tuple(git(folder, *pattern) for folder in protected_repos)
         staff_file = self.root / "staff.json"
-        for case, checkout, worktree, confirmed, refusal in (
-                ("local worktree", repo, tree, False, "protected production"),
-                ("confirmed local worktree", repo, tree, True, "protected production"),
-                ("local clone", clone, clone_tree, False, "protected production"),
-                ("confirmed local clone", clone, clone_tree, True, "protected production"),
-                ("SSH aliases", clone, clone_tree, False, "protected production"),
-                ("confirmed SSH aliases", clone, clone_tree, True, "protected production"),
-                ("unknown SSH alias", clone, clone_tree, True, "cannot resolve SSH origin"),
-                ("missing staff record", clone, clone_tree, True, "cannot read the staff record"),
-                ("same file path on separate hosts", other_repo, other_tree, True, "")):
-            with self.subTest(case=case):
-                aliases = "SSH alias" in case
-                host = other_host if aliases or not refusal else local
-                _ = staff.set_doc(owner.id, staff.LiveDoc(host, doc))
-                if aliases:
-                    _ = git(repo, "remote", "set-url", "--push", "origin", "ssh://registered:2222/srv/repo.git")
-                    alias = "unknown" if case == "unknown SSH alias" else "candidate"
-                    _ = git(clone, "remote", "set-url", "--push", "origin", f"git@{alias}:/srv/repo.git")
+        for index, (case, confirmed, refusal) in enumerate((
+                ("local worktree", False, "protected production"),
+                ("local worktree", True, "protected production"),
+                ("local clone", False, ""),
+                ("local clone", True, ""),
+                ("missing staff record", True, "cannot read the staff record"),
+                ("unrelated repository with the same origin ref", True, ""),
+                ("different basenames", False, ""),
+                ("file and SSH access", True, ""),
+                ("HTTPS and SSH access", True, ""),
+                ("wrapped registration", True, ""))):
+            with self.subTest(case=case, confirmed=confirmed):
+                upstream = other_origin if case == "unrelated repository with the same origin ref" else origin
+                host = other_host if upstream == other_origin else local
+                location = staff.WrappedDoc(host, doc) if case == "wrapped registration" else staff.LiveDoc(host, doc)
+                _ = staff.set_doc(owner.id, location)
+                if case == "local worktree":
+                    checkout, worktree = repo, tree
                 else:
-                    _ = git(repo, "remote", "set-url", "--push", "origin", str(origin))
-                    _ = git(clone, "remote", "set-url", "--push", "origin", origin.as_uri())
+                    checkout, worktree = self.root / f"clone-{index}", self.root / f"tree-{index}"
+                    _ = git(self.root, "clone", "-q", upstream.as_uri(), str(checkout))
+                    _ = git(checkout, "worktree", "add", "-qb", "integration", str(worktree), "origin/integration")
+                    if case == "different basenames":
+                        _ = git(checkout, "remote", "set-url", "--push", "origin", str(alias))
+                    if case == "HTTPS and SSH access":
+                        _ = git(repo, "remote", "set-url", "--push", "origin", f"https://candidate{origin}")
+                    if case in ("file and SSH access", "HTTPS and SSH access"):
+                        _ = git(checkout, "remote", "set-url", "--push", "origin", f"ssh://candidate{origin}")
                 staff_bytes = staff_file.read_bytes()
                 if case == "missing staff record":
                     staff_file.unlink()
@@ -145,10 +138,14 @@ class DeletionRerunTests(unittest.TestCase):
                     self.assertIn(refusal, validation.stdout)
                     self.assertIn(refusal, result.stderr)
                     self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
+                    self.assertIn("refs/heads/integration", git(checkout, "show-ref"))
                 else:
+                    self.assertIn('"keep_origin": true', validation.stdout)
+                    self.assertIn('"has_remote_branch": false', validation.stdout)
+                    self.assertIn('"cleanup": true', validation.stdout)
+                    self.assertIn("Kept protected origin ref refs/heads/integration", result.stdout)
                     self.assertEqual(git(checkout, "branch", "--list", "integration"), "")
-                    self.assertEqual(git(other_origin, "branch", "--list", "integration"), "")
-                self.assertEqual(tuple(git(folder, *pattern) for folder in (repo, clone, origin)), refs)
+                self.assertEqual(tuple(git(folder, *pattern) for folder in protected_repos), protected_refs)
                 if case == "missing staff record":
                     _ = staff_file.write_bytes(staff_bytes)
 
