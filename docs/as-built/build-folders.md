@@ -20,6 +20,8 @@ The unit word names the unit. Use a unit word for only one active unit. A new un
 
 A short name is one nonempty path component. It must contain a character other than an ASCII digit. The tool refuses `.`, `..`, slashes, and NUL characters. A short name must be free within its repo and unit. A copy number is a positive decimal integer without leading zeroes.
 
+A new unit or style production uses `worktree` as its main short name. The branch is `<unit>-worktree`.
+
 ## Worktree commands
 
 - `worktrees.py make <repo word> <unit> <short-name>` creates the source, the output link, and the worktree record.

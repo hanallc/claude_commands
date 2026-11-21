@@ -196,9 +196,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         config = Path(self.environment["CONF_DIR"])
         build = self.root / "build"
         scratch_root = self.root / "scratch"
+        session_root = self.root / "session-root"
         _ = write_config_fixture(config / "build_folders.conf",
             f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_name()}={build}\n"
             + f"roots.scratch={scratch_root}\nroots.scratch.{host_name()}={scratch_root}\n"
+            + f"roots.session={session_root}\nroots.session.{host_name()}={session_root}\n"
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies = config / "copies.conf"
@@ -323,6 +325,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         catalyst = self.add_linked_tree(main, self.home / "rust/hana_catalyst", "protected-catalyst")
         user_tree = self.add_linked_tree(main, self.home / "worktrees/nate_style-message-clarity", "user-branch")
         maker = self.add_linked_tree(main, self.root / "b44doc-123", "maker-branch")
+        session_tree = self.add_linked_tree(main, self.root / "session-root/fixture-unit-probe", "session-probe")
+        scratch_tree = self.add_linked_tree(main, self.root / "scratch/fixture-unit-probe", "scratch-probe")
         conflict = self.add_linked_tree(main, self.trees / "conflict", "branch-conflict")
         occupied = self.trees / "origin/fixture-unit/taken"
         occupied.mkdir(parents=True)
@@ -353,7 +357,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertNotIn(f"move {shared} ->", dry.stdout)
         self.assertIn(f"keep {catalyst}: showrunner checkout awaits question 4", dry.stdout)
         self.assertIn(f"keep {user_tree}: the user's worktree", dry.stdout)
-        self.assertIn(f"keep {maker}: the maker owns this worktree", dry.stdout)
+        for protected in (maker, session_tree, scratch_tree):
+            self.assertIn(f"keep {protected}: the maker owns this worktree", dry.stdout)
         self.assertIn(f"keep {conflict}: short name occupied", dry.stdout)
         self.assertEqual(self.git(main, "worktree", "list", "--porcelain"), registered)
         self.assertEqual(staff_file.read_bytes(), staff_before)
