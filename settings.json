@@ -552,5 +552,6 @@
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "precomputeCompactionEnabled": false
+  "precomputeCompactionEnabled": false,
+  "cleanupPeriodDays": 3650
 }
