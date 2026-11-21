@@ -1,5 +1,6 @@
 """Test cleanup for nested unittest fixtures."""
 
+from contextlib import ExitStack
 from typing import override
 import unittest
 
@@ -10,7 +11,7 @@ from scripts.lib.fixture_test_support import (
 )
 
 
-def raise_cleanup_error(error: Exception) -> None:
+def raise_cleanup_error(error: BaseException) -> None:
     raise error
 
 
@@ -30,6 +31,49 @@ class FixtureCleanupTests(unittest.TestCase):
         self.assertEqual(caught.exception.message, "TestCase cleanup failed")
         self.assertEqual(caught.exception.exceptions, (first, second))
         self.assertEqual(completed, ["last callback"])
+
+    def test_instance_interrupt_preserves_errors_and_runs_all_callbacks(self) -> None:
+        fixture = unittest.TestCase()
+        completed: list[str] = []
+        first = ValueError("first cleanup")
+        interrupt = KeyboardInterrupt("interrupt cleanup")
+        later = OSError("later cleanup")
+        fixture.addCleanup(completed.append, "last callback")
+        fixture.addCleanup(raise_cleanup_error, later)
+        fixture.addCleanup(raise_cleanup_error, interrupt)
+        fixture.addCleanup(raise_cleanup_error, first)
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            clean_up_fixture(fixture)
+
+        self.assertIs(caught.exception, interrupt)
+        self.assertEqual(completed, ["last callback"])
+        errors = caught.exception.__cause__
+        assert isinstance(errors, ExceptionGroup)
+        self.assertEqual(errors.exceptions, (first, later))
+
+    def test_class_exit_preserves_errors_and_runs_all_callbacks(self) -> None:
+        class Fixture(unittest.TestCase):
+            pass
+
+        completed: list[str] = []
+        first = ValueError("first class cleanup")
+        exit_error = SystemExit("exit class cleanup")
+        later = OSError("later class cleanup")
+        Fixture.addClassCleanup(completed.append, "last callback")
+        Fixture.addClassCleanup(raise_cleanup_error, later)
+        Fixture.addClassCleanup(raise_cleanup_error, exit_error)
+        Fixture.addClassCleanup(raise_cleanup_error, first)
+
+        with self.assertRaises(SystemExit) as caught:
+            with ExitStack() as scope:
+                _ = register_fixture_class_cleanup(scope.callback, Fixture)
+
+        self.assertIs(caught.exception, exit_error)
+        self.assertEqual(completed, ["last callback"])
+        errors = caught.exception.__cause__
+        assert isinstance(errors, ExceptionGroup)
+        self.assertEqual(errors.exceptions, (first, later))
 
     def test_setup_and_cleanup_errors_reach_the_outer_result(self) -> None:
         class Fixture(unittest.TestCase):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -514,7 +515,7 @@ class DetachedRunsTests(unittest.TestCase):
         write_text_atomic(path, "".join(json.dumps(entry) + "\n" for entry in entries))
         write_text_atomic(reply_file, reply + "\n")
         progress_history.save_dispatch_delivery(self.session, "pass-1",
-            progress_history.DispatchDelivery(line, completion_id, str(reply_file)))
+            pass_recorder.DispatchDelivery(line, completion_id, str(reply_file)))
 
     def run_files(self, run_id: str) -> list[str]:
         folder = self.session / detached_runs.DETACHED_RUNS_DIR
@@ -2428,7 +2429,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
                     reply = self.fixture.root / "finished-reply.txt"
                     progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
-                        progress_history.DispatchDelivery(line, dispatch_id, str(reply)))
+                        pass_recorder.DispatchDelivery(line, dispatch_id, str(reply)))
                     agent.append(pane, "user", line)
                     agent.append(pane, "assistant", "The command is complete.\nDONE " + dispatch_id)
                     self.fixture.world.locations[pane]["agent_status"] = "done"
@@ -2455,7 +2456,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
             kind="impl", lens="")
         progress_history.save_dispatch_delivery(self.run_dir, dispatch,
-            progress_history.DispatchDelivery(str(prompt), dispatch, str(reply)))
+            pass_recorder.DispatchDelivery(str(prompt), dispatch, str(reply)))
         return dispatch, reply
 
     def test_result_from_an_earlier_pass_does_not_reach_the_holder(self) -> None:
@@ -2852,7 +2853,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.fixture.world.add(row, pane, family="codex")
                 dispatch, reply = self.begin_pane_pass(row)
                 reply.unlink(missing_ok=True)
-                delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+                delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
                 result = f"The work is complete.\nDONE {dispatch}"
                 agent.append(pane, "user", delivery.line)
                 if before_stop:
@@ -3086,7 +3087,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
-        old_delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        old_delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", old_delivery.line)
         path = self.create_stopped_run(row, dispatch)
         with patch.object(detached_runs, "_group_is_live", return_value=False):
@@ -3099,7 +3100,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         new_reply = reply.with_name("replacement-reply.txt")
         new_line = f"Read the unchanged prompt file {prompt}. End your final reply with DONE {replacement}."
         progress_history.save_dispatch_delivery(self.run_dir, replacement,
-            progress_history.DispatchDelivery(new_line, replacement, str(new_reply)))
+            pass_recorder.DispatchDelivery(new_line, replacement, str(new_reply)))
         agent.append(pane, "user", new_line)
         self.fixture.world.locations[pane]["agent_status"] = pane_status
         state_path = self.run_dir / unit_runs.STATE_FILE
@@ -3184,7 +3185,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
-        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", delivery.line)
         result = "The work needs more time."
         agent.append(pane, "assistant", result)
@@ -3293,7 +3294,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
-        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", delivery.line)
         result = f"The work is complete.\nDONE {dispatch}"
         agent.append(pane, "assistant", result)
@@ -3572,7 +3573,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                       ) -> progress_history.StoppedPassNotice | progress_history.StopDispatchRefused:
                     if phase_first:
                         finish_phase()
-                    with patch.object(progress_history, "write_text_atomic", side_effect=observe_write):
+                    with patch.object(pass_recorder, "write_text_atomic", side_effect=observe_write):
                         return commit(run, slot, instance_id, owner, director, run_id=run_id, reason=reason)
 
                 with (patch.object(detached_runs, "_group_is_live", return_value=False),

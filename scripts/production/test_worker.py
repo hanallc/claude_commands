@@ -1,6 +1,8 @@
 """Worker commands preserve native identity and use transcripts as dispatch receipts."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import io
 import fcntl
 import json
@@ -429,7 +431,7 @@ class WorkerCommandTests(unittest.TestCase):
 
     def receipt(self, name: str = "impl") -> worker.DispatchReceipt:
         row = next(row for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id) if row.name == name)
-        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         return worker.dispatch_receipt(row, delivery.line, delivery.completion_id, run=self.run_dir)
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -572,7 +574,7 @@ class WorkerCommandTests(unittest.TestCase):
                         launcher_command=command,
                         prompt=prompt, kind="impl", lens="")
                     progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
-                        progress_history.DispatchDelivery("fixture", dispatch_id, str(reply)))
+                        pass_recorder.DispatchDelivery("fixture", dispatch_id, str(reply)))
                     atomic_file.write_text_atomic(reply, f"result {number}\n")
                     progress_history.complete_dispatch(self.run_dir, "impl", dispatch_id)
                     expected.insert(0, f"impl: phase 8; dispatch {dispatch_id}; reply {reply}")
@@ -1138,7 +1140,7 @@ class WorkerCommandTests(unittest.TestCase):
             line = f"Complete the work. End your reply with DONE {dispatch}."
             reply = self.run_dir / f"{name}_reply.md"
             progress_history.save_dispatch_delivery(self.run_dir, dispatch,
-                progress_history.DispatchDelivery(line, dispatch, str(reply)))
+                pass_recorder.DispatchDelivery(line, dispatch, str(reply)))
             self.agent.append(opened.pane, "user", line)
 
         backend = staff.backend(impl.row)
@@ -1414,7 +1416,7 @@ class WorkerCommandTests(unittest.TestCase):
                     result = worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(current.row.name), "impl", self.prompt,
                         session_dir=self.run_dir, slot=current.row.name, phase="8", kind="impl", launcher_command=["assign.sh"],
                         reply=self.run_dir / (current.row.name + "_reply.md"),
-                        completion_actions=progress_history.CompletionActions(status_file=str(status),
+                        completion_actions=pass_recorder.CompletionActions(status_file=str(status),
                             summary_file=str(self.run_dir / "failed-summary.md") if outcome == "reply write" else ""))
                     self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                     if outcome == "attached":
@@ -1809,7 +1811,7 @@ class WorkerCommandTests(unittest.TestCase):
                 if repeated == 4:
                     row = self.agent.row(pane)
                     passed = worker_panes.worker_pass(row, self.run_dir)
-                    delivery = progress_history.dispatch_delivery(passed)
+                    delivery = pass_recorder.dispatch_delivery(passed)
                     status = self.run_dir / "shared-status"
                     progress_history.save_dispatch_delivery(self.run_dir, str(passed["instance_id"]),
                         replace(delivery, actions=replace(delivery.actions, status_file=str(status))))
@@ -1822,7 +1824,7 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("next-pass"), "impl", self.prompt,
                             session_dir=self.run_dir, slot="next-pass", phase="8", kind="impl", launcher_command=["next-assign"],
                             reply=self.run_dir / "next-reply.md",
-                            completion_actions=progress_history.CompletionActions(status_file=str(status)),
+                            completion_actions=pass_recorder.CompletionActions(status_file=str(status)),
                             on_submission=lambda: atomic_file.write_text_atomic(status, "running\n")), worker.DispatchSubmission.SUBMITTED)
                     self.assertEqual(status.read_text(), "running\n")
                     continue
@@ -1890,7 +1892,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), "impl", self.prompt,
                     session_dir=self.run_dir, slot=name, phase="8", kind="impl", launcher_command=[name],
                     reply=self.run_dir / f"{name}-reply.md",
-                    completion_actions=progress_history.CompletionActions(end_worker=end_worker)),
+                    completion_actions=pass_recorder.CompletionActions(end_worker=end_worker)),
                     worker.DispatchSubmission.SUBMITTED)
                 pane = self.agent.submitted[-1][0]
                 row = self.agent.row(pane)
@@ -2061,7 +2063,7 @@ class WorkerCommandTests(unittest.TestCase):
         second_id = dispatch_id + "-2"
         second_line = "Stage 2: " + line.replace(dispatch_id, second_id)
         run = self.run_dir
-        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run))
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, run))
         progress_history.save_dispatch_delivery(run, dispatch_id,
             replace(delivery, line=second_line, completion_id=second_id))
         self.agent.append(pane, "user", second_line)
@@ -2097,7 +2099,7 @@ class WorkerCommandTests(unittest.TestCase):
                     instance = str(passed["instance_id"])
                     second_id = worker_panes.stage_two_completion_id(instance)
                     second_line = "Stage 2: " + line.replace(instance, second_id)
-                    delivery = progress_history.dispatch_delivery(passed)
+                    delivery = pass_recorder.dispatch_delivery(passed)
                     progress_history.save_dispatch_delivery(self.run_dir, instance,
                         replace(delivery, line=second_line, completion_id=second_id))
                     state = self.run_dir / "progress_history_state.json"
@@ -2305,10 +2307,12 @@ class WorkerCommandTests(unittest.TestCase):
 
         instance = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
             worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.prompt, kind="impl", lens="")
-        for delivery in (progress_history.DispatchDelivery("", "", ""),
-                         progress_history.DispatchDelivery("fixture prompt", "", str(self.reply)),
-                         progress_history.DispatchDelivery("fixture prompt", instance, str(self.reply))):
-            progress_history.save_dispatch_delivery(self.run_dir, instance, delivery)
+        for delivery in (None,
+                         pass_recorder.DispatchDelivery("", "", ""),
+                         pass_recorder.DispatchDelivery("fixture prompt", "", str(self.reply)),
+                         pass_recorder.DispatchDelivery("fixture prompt", instance, str(self.reply))):
+            if delivery is not None:
+                progress_history.save_dispatch_delivery(self.run_dir, instance, delivery)
             for state in ("idle", "blocked"):
                 with (self.subTest(delivery=delivery, state=state),
                       patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt,
@@ -2322,6 +2326,7 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), saved)
                     prompt.assert_not_called()
                     answer.assert_not_called()
+                    self.assertEqual(self.agent.answers, [])
 
     def test_answer_refuses_after_done_before_the_hook_updates_the_pass(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
@@ -2390,7 +2395,7 @@ class WorkerCommandTests(unittest.TestCase):
             assert isinstance(active, progress_history.ActiveDispatch)
             status = self.run_dir / "resubmit.status"
             passed = worker_panes.worker_pass(opened.row, self.run_dir)
-            delivery = progress_history.dispatch_delivery(passed)
+            delivery = pass_recorder.dispatch_delivery(passed)
             progress_history.save_dispatch_delivery(self.run_dir, active.instance_id,
                 replace(delivery, actions=replace(delivery.actions, status_file=str(status))))
             atomic_file.write_text_atomic(status, "running\n")
@@ -3518,7 +3523,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(path, self.run_dir / unit_runs.STATE_FILE)
             raise OSError("confirmation save failed")
 
-        with (patch.object(progress_history, "write_text_atomic", side_effect=fail_state_write) as writes,
+        with (patch.object(pass_recorder, "write_text_atomic", side_effect=fail_state_write) as writes,
               self.assertRaisesRegex(OSError, "confirmation save failed")):
             _ = self.finish(row.name, turn_end.EventKind.STAGE_READY)
 
@@ -3595,7 +3600,7 @@ class WorkerCommandTests(unittest.TestCase):
                                         prompt: Path, launcher_command: list[str],
                                         work: progress_history.DispatchWork | progress_history.DispatchWorkAtUse,
                                         target: staff.WorkerName | progress_history.DispatchTargetAtUse,
-                                        ) -> progress_history.DispatchSelection | progress_history.ActiveDispatchPromptConflict:
+                                        ) -> pass_recorder.DispatchSelection | pass_recorder.ActiveDispatchPromptConflict:
                     result = read_dispatch(session_dir, slot=slot, phase=phase, role=role,
                                            prompt=prompt, launcher_command=launcher_command, work=work, target=target)
                     atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
@@ -3653,9 +3658,9 @@ class WorkerCommandTests(unittest.TestCase):
         for role in ("review", "astra-designer"):
             with self.subTest(role=role):
                 self.assertEqual(self.dispatch(), worker.ExitCode.OK)
-                with patch.object(sys, "argv", ["progress_history.py", "finish-pass", "--session-dir", str(self.run_dir),
+                with patch.object(sys, "argv", ["pass_record.py", "finish-pass", "--session-dir", str(self.run_dir),
                                                "--status", "completed"]):
-                    progress_history.main()
+                    pass_recorder.main()
                 before_roles: list[object] = []
                 launch = cast(Callable[..., herdr.AgentLaunched], self.fixture.world.launch)
                 def changing(*args: object, **kwargs: object) -> herdr.AgentLaunched:
@@ -3666,9 +3671,9 @@ class WorkerCommandTests(unittest.TestCase):
                 with patch.object(herdr, "launch_prepared_agent", side_effect=changing):
                     self.assertEqual(self.dispatch(role=role), worker.ExitCode.OK)
                 self.assertEqual(before_roles, ["impl"])
-                with patch.object(sys, "argv", ["progress_history.py", "finish-pass", "--session-dir", str(self.run_dir),
+                with patch.object(sys, "argv", ["pass_record.py", "finish-pass", "--session-dir", str(self.run_dir),
                                                "--status", "completed"]):
-                    progress_history.main()
+                    pass_recorder.main()
 
     def test_dispatch_role_survives_a_new_phase_with_an_empty_pass_map(self) -> None:
         self.assertEqual(self.dispatch(role="review"), worker.ExitCode.OK)
@@ -3676,8 +3681,9 @@ class WorkerCommandTests(unittest.TestCase):
         for arguments in (["finish-pass", "--status", "completed"],
                           ["finish-phase", "--status", "completed"],
                           ["start-phase", "--phase-id", "9", "--phase-title", "Next phase"]):
-            with patch.object(sys, "argv", ["progress_history.py", *arguments, "--session-dir", str(self.run_dir)]):
-                progress_history.main()
+            recorder = pass_recorder if arguments[0] == "finish-pass" else progress_history
+            with patch.object(sys, "argv", [Path(recorder.__file__).name, *arguments, "--session-dir", str(self.run_dir)]):
+                recorder.main()
         state = cast(dict[str, object], json.loads((self.run_dir / "progress_history_state.json").read_text()))
         self.assertEqual(state["pass"], {})
         self.assertEqual(worker_panes.dispatch_role(row), "review")
@@ -3697,9 +3703,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(self.dispatch(role="review"), worker.ExitCode.OK)
         row = self.agent.row(self.agent.submitted[-1][0])
-        with patch.object(sys, "argv", ["progress_history.py", "finish-pass", "--status", "completed",
+        with patch.object(sys, "argv", ["pass_record.py", "finish-pass", "--status", "completed",
                                       "--session-dir", str(self.run_dir)]):
-            progress_history.main()
+            pass_recorder.main()
         dispatch_id = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
         private_root = self.fixture.root / "private"
         private_root.mkdir()
