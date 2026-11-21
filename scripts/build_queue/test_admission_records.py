@@ -343,3 +343,9 @@ class PlacementWaitRecordsTests(unittest.TestCase):
                 row, = records.read_placement_waits(key.call_id)
             self.assertIs(row["reason"], reasons.SLOT)
             self.assertEqual(notes.getvalue().count("invalid placement wait"), 1)
+
+
+class QueueCallerTests(unittest.TestCase):
+    def test_an_unknown_worktree_does_not_get_a_terminal_prefix(self) -> None:
+        caller = records.queue_caller("", "", "", "", "/private/unregistered session")
+        self.assertEqual(caller.name, "unregistered session")

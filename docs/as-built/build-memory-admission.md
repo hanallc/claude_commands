@@ -992,6 +992,15 @@ BRP launches use `launch`; launch permission creates no reservation.
 
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
+The client checks the staff name, the exported name, and the session folder name in that order.
+It uses `terminal · <folder>` for a direct command with a known folder.
+The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
+The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
+It returns `unregistered session` when no candidate is usable.
+A later read can replace this fallback with a usable name.
+The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
+A staff unit uses its own name for priority. A worker uses its parent unit.
+A showrunner keeps its caller name and has an empty unit.
 A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
 A first checker failure or explicit refusal stops at once. A launch deadline applies during transport and checker retries.
 A zero launch limit refuses its first hold and accepts an immediate grant.
@@ -1061,6 +1070,9 @@ A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+The service logs the changed source paths before `execv`.
+The replacement sends `READY=1`, then hashes the Python sources under `scripts` and logs the hash.
+The hash includes sources that load only after startup.
 A failed start of the new code exits, and `Restart=always` starts the service again.
 A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 `down-alert` waits `silence_seconds` and claims `build-admission`.
@@ -2190,6 +2202,20 @@ CI and ownerless scopes do not count as admitted runs for this exception.
 Each new start sets the next start time through `start_spacing_after`.
 The interval is `recovery_start_seconds`, currently 5 seconds, for launches and build steps alike.
 A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seconds.
+The slot keeps the caller name from the reservation, including when a continuation claims the slot.
+The snapshot decoder restores a missing caller name from the matching reservation.
+If the reservation has no usable name, the decoder looks up the fixed staff ID in the supplied staff snapshot.
+If the decoder finds no usable name, it supplies the label `unregistered session`.
+The feed uses separate rules for caller names, step labels, and CI labels.
+The client and service use the same formatter for wait names.
+The formatter selects the unit, caller, or folder name in that order.
+It adds the step when the step name is usable.
+The client also accepts the head name from older replies.
+The service and feed require a usable value for every field in a CI label template.
+An incomplete CI template uses the generic CI label.
+The feed omits unusable parts from step titles.
+The wait subject joins the usable repository and step names. It shows `build` when both names are unusable.
+The Builds page uses the names and hover titles from the feed.
 A continuation within the slot bypasses order, spacing, and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.

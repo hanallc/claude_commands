@@ -69,7 +69,7 @@ from typing import Protocol, cast
 from scripts.lint import sweep, tmp_sweep
 from scripts.message import session_send
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-from scripts.lib import cargo_output, conf, copy_record, scratch, unit_runs
+from scripts.lib import cargo_output, conf, copy_record, removal_guard, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
@@ -97,6 +97,7 @@ HELD = "a hold keeps it"
 TOO_LARGE = "too many entries to read"
 LIVE_SOCKET = "a live process binds a socket in it"
 TARGET_REMOVED = "removed target; kept unsaved source"
+NO_SPACE_FREED = "no space freed. Unsaved source stays"
 WOULD_REMOVE_TARGET = "would remove target; keep unsaved source"
 
 
@@ -134,7 +135,7 @@ def free_bytes(path: Path) -> int:
 def remove_clone_targets(path: Path, removing: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
-    """Keep unsaved source. Delete only build output from its independent clones."""
+    """List build output from independent clones for review."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     saved = scratch.save_cargo_outputs(path) if removing else ()
@@ -148,12 +149,14 @@ def remove_clone_targets(path: Path, removing: bool, *,
         with scratch.coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False) as removal:
             scratch.check_cargo_cleanup(removal, path, saved, targets)
             scratch.clean_cargo_outputs(path, saved)
+            plan = removal_guard.RemovalList(removal_guard.Tool.CARGO)
             for target in targets:
-                tmp_sweep.delete_tree(str(target))
-            scratch.delete_entry(scratch.cargo_removal_mark(path.resolve()), scratch.RemovalKind.FILE, missing_ok=True)
+                _ = plan.add_manual(removal_guard.Tool.CARGO, target, path, 0, "local Cargo output")
+            if plan.rows:
+                plan.report()
     except (OSError, scratch.ScratchHoldsUnreadable) as error:
         return f"target removal failed: {error}"
-    return TARGET_REMOVED
+    return NO_SPACE_FREED
 
 
 @dataclass(frozen=True)
@@ -760,7 +763,7 @@ def clean_checkout_cargo_output(path: Path) -> None:
 
 def clean_external_cargo_output(path: Path, saved: tuple[scratch.SavedCargoOutput, ...], attempt_started: float,
                                removal: scratch.CoordinatedRemoval) -> None:
-    """Check ownership, use stamps, locks, and processes before removing external output."""
+    """Check ownership, use stamps, locks, and processes before listing external output."""
     outputs = [output for output in saved if not output.roots.build_directory.is_relative_to(path)
                and output.roots.build_directory.exists() and not output.borrows_build_directory()]
     if not outputs:
@@ -784,6 +787,7 @@ def clean_external_cargo_output(path: Path, saved: tuple[scratch.SavedCargoOutpu
                 print(f"skip unreadable checkout {peer}: {mapping.reason}", file=sys.stderr)
                 continue
             known.append(mapping)
+    plan = removal_guard.RemovalList(removal_guard.Tool.CARGO)
     for output in outputs:
         root = output.roots.build_directory
         if not root.exists():
@@ -810,33 +814,12 @@ def clean_external_cargo_output(path: Path, saved: tuple[scratch.SavedCargoOutpu
             stamp = root / scratch.USE_STAMP
             if stamp.exists() and stamp.stat().st_mtime > attempt_started:
                 raise OSError(f"Cargo output was used after cleanup started: {root}")
-            removal.delete(root, scratch.RemovalKind.TREE, repair_permissions=False)
-            remove_empty_mirror_parents(root, output.roots.workspace_root, path, removal)
+            removal.check(root)
+            _ = plan.add_manual(removal_guard.Tool.CARGO, root, path, 0, "external Cargo output")
         finally:
             sweep.release(locked.held)
-
-
-def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path, removal: scratch.CoordinatedRemoval) -> None:
-    """Remove the empty folders above a build-dir that mirror the removal tree, so no empty gate folder stays."""
-    tail = workspace.parts[1:]
-    if not tail or root.parts[-len(tail):] != tail:
-        return
-    top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
-    if path.is_relative_to(top):
-        return
-    folder = root.parent
-    while folder.is_relative_to(top):
-        try:
-            _ = checked_scan_roots([folder])
-            check_cargo_output_location(folder)
-            tmp_sweep.refuse_live_test_roots((folder,))
-            removal.delete(folder, scratch.RemovalKind.EMPTY_DIRECTORY)
-        except ValueError as error:
-            print(f"Cargo mirror kept: {error}", file=sys.stderr)
-            return
-        except OSError:
-            return
-        folder = folder.parent
+    if plan.rows:
+        plan.report()
 
 
 def main(argv: list[str]) -> int:

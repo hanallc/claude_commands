@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, cast
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
+from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, public_queue_text, select_queue_name
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
@@ -50,10 +51,8 @@ class StepNames:
     def prose(self, step: str) -> str:
         return self.settings.get(f"prose.{step}", self.shown(step))
 
-    def for_owner(self, step: str, unit: str, role: OwnerRole, *,
-                  ci: bool = False, current_name: str = "", step_name: str = "") -> str:
-        """Use the configured owner template when the owner is known."""
-        fallback = current_name or self.shown(step)
+    def owner_template(self, step: str, unit: str, role: OwnerRole, *, ci: bool = False) -> str:
+        """Read the template for this step and owner role."""
         if ci:
             prefix = "owned.ci-"
         elif role is OwnerRole.SHOWRUNNER:
@@ -61,9 +60,20 @@ class StepNames:
         elif role is OwnerRole.UNIT and unit:
             prefix = "owned."
         else:
-            return fallback
-        template = self.settings.get(prefix + step, self.settings.get(prefix + "default"))
-        return template.format(unit=unit, step=step_name or self.shown(step)) if template is not None else fallback
+            return ""
+        return self.settings.get(prefix + step, self.settings.get(prefix + "default", ""))
+
+    def for_owner(self, step: str, unit: str, role: OwnerRole, *,
+                  ci: bool = False, current_name: str = "", step_name: str = "") -> str:
+        """Use the configured owner template when its fields are usable."""
+        unit = public_queue_text(unit)
+        shown = public_queue_text(step_name or self.shown(step))
+        template = self.owner_template(step, unit, role, ci=ci)
+        label = format_queue_name(template, unit=unit, step=shown)
+        if label:
+            return label
+        owner = unit if template and role is OwnerRole.UNIT and not ci else ""
+        return select_queue_name(current_name, " ".join(part for part in (owner, shown) if part))
 
     def about_template(self, job: StepJob, unit: str = "") -> tuple[str, str]:
         """Return the description template and the unit it names."""
@@ -142,8 +152,6 @@ RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "t
 QUEUE_STEP_DISPLAY = {"run": "cargo run", "test-modules": "test named"}
 SHORT_OWNER_STEPS = {"merge-gate": "merge", "targeted-test": "targeted"}
 GATE_PROGRAMS = {"merge-gate": "merge_gate.py", "targeted-test": "targeted_test.py"}
-RAW_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?![0-9a-f])",
-                    re.IGNORECASE)
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 

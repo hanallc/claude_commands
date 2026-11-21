@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
@@ -867,7 +868,8 @@ def workspace_path(owner: str, repo: str | Path, name: str) -> Path:
 
 @contextmanager
 def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
-              task: str = "", path: Path | None = None, run_manifest: Path | None = None) -> Generator[Path]:
+              task: str = "", path: Path | None = None, run_manifest: Path | None = None,
+              on_create: build_folders.FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold a registered editable copy without resetting edits during recovery."""
     source = Path(repo).expanduser().resolve()
     for active in ACTIVE_GATES.get():
@@ -891,7 +893,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
         if path is None:
             spec = build_folders.BuildFolderSpec(kind="editable", parent=copy_record.copies_root(),
                 suffix_length=0, repository=identity, owner=owner, purpose=name)
-            tree = lifetime.enter_context(build_folders.leased_build_folder(spec))
+            tree = lifetime.enter_context(build_folders.leased_build_folder(spec, on_create=on_create))
             descriptors.append(build_folders.build_folder_lock_fd(tree))
         with claim_tree(tree, create=True, inherited_fds=descriptors) as state:
             if state is not ClaimState.ACQUIRED:
@@ -998,6 +1000,7 @@ class AcquireCrateRunLock:
 
 CrateRunRemovalLock = HeldCrateRunLock | AcquireCrateRunLock
 ACQUIRE_CRATE_RUN_LOCK = AcquireCrateRunLock()
+NO_CREATED_WORKSPACES: Mapping[Path, os.stat_result] = MappingProxyType({})
 
 
 def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
@@ -1027,57 +1030,46 @@ def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
 
 
 def end_workspaces(task: str, paths: list[Path], *,
-                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> None:
-    """End workspace records and remove copies linked to terminal crates."""
+                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK,
+                   created: Mapping[Path, os.stat_result] = NO_CREATED_WORKSPACES) -> None:
+    """End workspace records and remove terminal folders made by this run."""
+    moment = time.time()
     selected = {str(path.resolve()) for path in paths}
     with scratch.locked_holds() as holds:
         changed = False
         for path, hold in holds.items():
-            if path in selected and hold["task"] == task:
-                hold["ended"] = time.time()
+            if path in selected and hold["task"] == task and not hold["ended"]:
+                hold["ended"] = moment
                 changed = True
         if changed:
             scratch.write_holds(holds)
-    for tree in paths:
-        record = scratch.task_of(tree)
-        if (copy_record.copy_folder(tree) != tree.resolve()
-                and not (isinstance(record, copy_record.Registered) and "crate_run" in record.fields)):
-            if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
-                    or scratch.end_copy(tree, task, time.time())):
-                hold = scratch.holds().get(str(tree.resolve()))
-                if hold is not None and hold["task"] == task:
-                    _ = scratch.release(tree)
+
+    for tree in dict.fromkeys(paths):
+        if not os.path.lexists(tree):
             continue
-        if not tree.exists():
-            if isinstance(record, copy_record.Registered) and record.task == task:
-                with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, scratch.removal_lock(tree) as idle:
-                    if not idle:
-                        raise CopyError(f"{tree}: workspace is busy during task completion")
-                    validate()
-                    scratch.remove_marked(tree, ending_task=task)
-            hold = scratch.holds().get(str(tree.resolve()))
-            if hold is not None and hold["task"] == task:
-                _ = scratch.release(tree)
+        record = scratch.task_of(tree)
+        if isinstance(record, copy_record.NotRegistered):
+            scratch.report_retained_task_folder(tree, "the workspace has no task record")
             continue
         if not isinstance(record, copy_record.Registered) or record.task != task:
             raise CopyError(f"{tree}: workspace task differs")
+        removed = False
         with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
               scratch.removal_lock(tree) as idle,
               scratch.copy_record_lock(tree)):
             if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
-            def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(current, copy_record.Registered) or current.task != task:
-                    raise CopyError(f"{tree}: workspace task differs")
-                return {**current.fields, "ended": time.time(), "ended_task": task}
             validate()
-            # A deletion intent preserves ownership but does not certify saved work.
             if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
-                _ = scratch.update_record(tree, ended)
-            if "crate_run" not in record.fields:
-                continue
-            scratch.remove_marked(tree, ending_task=task)
-        _ = scratch.release(tree)
+                scratch.record_task_end(tree, task, moment)
+            if ("crate_run" in record.fields and tree in created
+                    and os.path.samestat(tree.lstat(), created[tree])):
+                scratch.remove_marked(tree, source_deletion=scratch.SourceDeletion.CRATE_WORKSPACE_ONLY, ending_task=task)
+                removed = True
+        if removed:
+            _ = scratch.release(tree)
+        else:
+            scratch.report_retained_task_folder(tree, f"task {task} ended")
 
 
 def slot_source(source: Path) -> Path:
@@ -1534,8 +1526,16 @@ def workspace_repository(record: copy_record.Registered) -> str:
     return identity
 
 
-def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[tuple[Path, copy_record.Registered]]:
-    """Select registered copies and adopted copies without depending on a live source."""
+class WorkspaceScanPurpose(Enum):
+    """Choose the checks for removal or session reporting."""
+
+    REMOVE = auto()
+    REPORT = auto()
+
+
+def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES, *,
+                     purpose: WorkspaceScanPurpose = WorkspaceScanPurpose.REMOVE) -> list[tuple[Path, copy_record.Registered]]:
+    """Select registered workspaces for the owner."""
     root = copy_record.copies_root()
     paths = set(scratch.registered_copy_paths())
     paths.update(scratch.pending_copy_paths(root))
@@ -1544,19 +1544,24 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
     found: list[tuple[Path, copy_record.Registered]] = []
     for tree in sorted(paths):
         record = scratch.task_of(tree)
-        if isinstance(record, copy_record.UnreadableRecord):
-            raise CopyError(record.reason)
         if isinstance(record, copy_record.NotRegistered):
             hold = held.get(str(tree))
             if (copy_record.copy_folder(tree) != tree.resolve()
                     and (hold is None or hold["reason"] != LEGACY_WORKER_HOLD_REASON)):
                 continue
-            raise CopyError(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+            record = copy_record.UnreadableRecord(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+        if isinstance(record, copy_record.UnreadableRecord):
+            if purpose is WorkspaceScanPurpose.REMOVE:
+                raise CopyError(record.reason)
+            print(f"copies: {' '.join(record.reason.splitlines())}", file=sys.stderr)
+            continue
         if copy_owner(str(record.fields.get("owner_unit", ""))) != copy_owner(owner):
             continue
         if isinstance(scope, SelectedRepository) and workspace_repository(record) != scope.name:
             continue
         found.append((tree, record))
+    if purpose is WorkspaceScanPurpose.REPORT:
+        return found
     selected = dict(found)
     ordered: list[tuple[Path, copy_record.Registered]] = []
     visited: set[Path] = set()
@@ -1704,6 +1709,9 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join(failures))
 
 
+REMOTE_MIRROR_PROBE_TIMEOUT_S = 5
+
+
 class RemoteRemoval(Enum):
     KEEP = "keep"
     DEFERRED = "deferred"
@@ -1719,6 +1727,7 @@ class RemoteMirror:
     path: str
     session: str
     removal: RemoteRemoval = RemoteRemoval.KEEP
+    task: str = ""
 
 
 @dataclass(frozen=True)
@@ -1838,12 +1847,15 @@ def register_remote(mirror: RemoteMirror) -> None:
     _ = checked_owner(mirror.owner)
     _ = repository_scope(mirror.repository)
     remote_registry().mkdir(parents=True, exist_ok=True)
+    fields: dict[str, object] = {
+        "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
+        "host": mirror.host, "path": mirror.path, "session": mirror.session,
+        "holder_pid": os.getpid(), "last_use": time.time(),
+    }
+    if mirror.task:
+        fields["task"] = mirror.task
     with file_lock.exclusive(remote_registry() / "records.lock"):
-        write_text_atomic(remote_record_path(mirror), json.dumps({
-            "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
-            "host": mirror.host, "path": mirror.path, "session": mirror.session,
-            "holder_pid": os.getpid(), "last_use": time.time(),
-        }) + "\n")
+        write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
     remove_deferred_mirrors(mirror.host)
 
 
@@ -1879,19 +1891,26 @@ def unregister_remote(host: str, path: str) -> None:
         (remote_registry() / (key + ".json")).unlink(missing_ok=True)
 
 
+def decode_remote_mirror(record: str) -> RemoteMirror:
+    raw = cast(object, json.loads(record))
+    if not isinstance(raw, dict):
+        raise ValueError("expected a remote mirror record")
+    fields = cast(dict[str, object], raw)
+    values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError("invalid remote mirror record")
+    task = fields.get("task", "")
+    if not isinstance(task, str):
+        raise ValueError("invalid remote mirror task")
+    unit, repo, host, remote, session = cast(list[str], values)
+    return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                        RemoteRemoval(fields.get("removal", "keep")), task=task)
+
+
 def read_remote_mirror(path: Path) -> RemoteMirror:
     """Decode one registry record without scanning other records."""
     try:
-        raw = cast(object, json.loads(path.read_text()))
-        if not isinstance(raw, dict):
-            raise ValueError("expected a remote mirror record")
-        fields = cast(dict[str, object], raw)
-        values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
-        if not all(isinstance(value, str) for value in values):
-            raise ValueError("invalid remote mirror record")
-        unit, repo, host, remote, session = cast(list[str], values)
-        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
-                            RemoteRemoval(fields.get("removal", "keep")))
+        return decode_remote_mirror(path.read_text())
     except (OSError, ValueError) as error:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
@@ -1923,6 +1942,99 @@ def remote_lease(mirror: RemoteMirror) -> Generator[None]:
             session = read_remote_mirror(record).session if record.exists() else mirror.session
             raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
+
+
+def path_missing_command(path: str) -> str:
+    """Build a remote check that succeeds only when lstat reports a missing path."""
+    program = "\n".join((
+        "import os, sys",
+        "try:",
+        "    os.lstat(sys.argv[1])",
+        "except FileNotFoundError:",
+        "    sys.exit(0)",
+        "sys.exit(1)",
+    ))
+    return '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join([program, path])
+
+
+@dataclass(frozen=True)
+class IdleRemoteMirror:
+    """The record of a mirror that was idle before the probe."""
+
+    mirror: RemoteMirror
+    record_path: Path
+    record: str
+
+
+def idle_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> list[IdleRemoteMirror]:
+    candidates: list[IdleRemoteMirror] = []
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            record = path.read_text()
+            mirror = decode_remote_mirror(record)
+            if (mirror.host != host or mirror.removal is not RemoteRemoval.KEEP
+                    or path != remote_record_path(mirror) or not select(mirror)):
+                continue
+            with remote_lease(mirror):
+                if path.read_text() == record:
+                    candidates.append(IdleRemoteMirror(mirror, path, record))
+        except (CopyError, OSError, ValueError):
+            continue
+    return candidates
+
+
+def probe_remote_mirrors(host: str, candidates: Sequence[IdleRemoteMirror]) -> list[IdleRemoteMirror]:
+    """Use one remote command to check the paths on this host."""
+    program = "\n".join((
+        "import os, sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        "from scripts.lib import scratch",
+        "from scripts.mac_test import floor_claims",
+        "def missing(path):",
+        "    try:",
+        "        os.lstat(path)",
+        "    except FileNotFoundError:",
+        "        return True",
+        "    return False",
+        "for path in sys.argv[1:]:",
+        "    tree = floor_claims.mirror_local_path(path)",
+        "    paths = (tree, floor_claims.removal_authority_path(tree),",
+        "             scratch.removal_mark(tree), scratch.cargo_removal_mark(tree))",
+        "    print('absent' if all(missing(item) for item in paths) else 'present')",
+    ))
+    command = '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join(
+        [program, *(candidate.mirror.path for candidate in candidates)])
+    answer = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", "--", host, command],
+                            capture_output=True, text=True, timeout=REMOTE_MIRROR_PROBE_TIMEOUT_S)
+    if answer.returncode:
+        raise CopyError(failure_detail(answer))
+    states = answer.stdout.splitlines()
+    if len(states) != len(candidates) or any(state not in ("present", "absent") for state in states):
+        raise CopyError("the host did not confirm the state of every path")
+    return [candidate for candidate, state in zip(candidates, states, strict=True) if state == "absent"]
+
+
+def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> None:
+    """Unregister a selected, unchanged mirror only after the host confirms its removal."""
+    try:
+        candidates = idle_remote_mirrors(host, select)
+        if not candidates:
+            return
+        missing = probe_remote_mirrors(host, candidates)
+    except (CopyError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+        detail = ("the probe timed out" if isinstance(error, subprocess.TimeoutExpired)
+                  else " ".join(str(error).split()))
+        print(f"anomaly: remote mirror check on {host}: {detail}", file=sys.stderr)
+        return
+    for candidate in missing:
+        path = candidate.record_path
+        try:
+            with remote_lease(candidate.mirror), file_lock.exclusive(path.parent / "records.lock"):
+                if path.read_text() == candidate.record:
+                    path.unlink()
+        except (CopyError, OSError, UnicodeError):
+            continue
 
 
 def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
@@ -2384,8 +2496,7 @@ def publish_files(tree: Path, paths: Sequence[str], before: Sequence[Publication
         repository = repository_name(tree)
         with ExitStack() as cleanup:
             publication = scratch.new(word="gate-binary", throwaway=True)
-            record = cast(copy_record.Registered, scratch.task_of(publication))
-            _ = cleanup.callback(scratch.end, record.task)
+            _ = cleanup.callback(shutil.rmtree, publication)
             for source in sources:
                 destination = publication / source.name
                 temporary = publication / f".{source.name}.tmp"
