@@ -1975,12 +1975,9 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
-    hold = BuildHoldWait()
-    hold.wait_until_free()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
-    hold.wait_until_free()
     with main_push_lock.main_push_lock(main_repo):
         fetch_branches(main_repo, "main", args.merge_branch)
         head = checked_git(main_repo, "rev-parse", "HEAD")
@@ -2090,8 +2087,6 @@ def check_local_doc_commits(repo: Path, origin: str) -> None:
 
 
 def merge_checkpoint(args: GateArguments) -> int:
-    hold = BuildHoldWait()
-    hold.wait_until_free()
     repo = Path(str(args.repo)).resolve()
     # Untracked files (each showrunner's LOG) never block; a merge that would
     # overwrite one fails on its own and is aborted.
@@ -2131,7 +2126,6 @@ def merge_checkpoint(args: GateArguments) -> int:
         recovery.rollback_source = checkpoint
         recovery.save()
     try:
-        hold.wait_until_free()
         result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
         if result.returncode:
             conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
@@ -2164,7 +2158,6 @@ def merge_checkpoint(args: GateArguments) -> int:
         fetch_branches(repo, "main")
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
-        hold.wait_until_free()
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:

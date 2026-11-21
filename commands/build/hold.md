@@ -19,8 +19,11 @@ Your fixed staff ID owns the hold.
 Repeated calls add checked PID and start-time pairs to the same keep list.
 The command stops existing queued gates and running work outside the allow rules.
 It keeps the sole holder's work, explicit keep entries and their children, user terminal work, and shared sccache work.
-Live Mac or AWS claims also keep their runs.
+Live Mac or AWS claims protect their runs from stops.
+The command also protects steps routed to the Mac or AWS.
+Live remote admission reservations protect their owners from stops.
 Unreadable claim records prevent enforcement until those records become readable.
+Unreadable admission state prevents queued gate stops until that state becomes readable.
 The release notifies stopped sessions.
 New natedev work waits until release.
 CI work that the service cannot stop continues if already admitted.
@@ -32,14 +35,17 @@ Other CI requests stay queued until release.
 2. Add `--keep <pid>` for an additional run that must continue.
 3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 
-The command keeps CI workers, builds that the enforcer could stop, and outermost gates that hold work.
-A gate holds work when it has a cargo child, an admission reservation, a live Mac or AWS claim, or a remote waiter.
+The command keeps natedev CI workers, builds that the enforcer could stop, and outermost gates with natedev work.
+A cargo child or a natedev admission reservation establishes local work for a gate.
+Mac and AWS work continues without adding to the drain count.
+If claim or admission records are unreadable, that scan treats every outermost gate as active.
 It publishes the hold and repeats discovery before starting the enforcer.
 The second discovery adds only processes whose boot-relative start ticks do not exceed the publication bound.
 A concurrent release ends the command without restoring the hold.
-Kept runs finish.
-A gate that only waits in the queue is not kept: it waits for the release like new work.
-New natedev work waits until explicit release.
+Kept builds and CI workers count while they remain live.
+A kept outermost gate stops counting when readable records show that its local work has ended.
+A gate that only waits for natedev admission waits for the release.
+New natedev work waits until explicit release, including later local steps from a remote gate.
 Each 60 seconds, the command prints `draining: N runs remain`.
 Completion prints `drained; natedev stays held until release` and returns 0.
 Ctrl-C returns 130 and retains the hold.

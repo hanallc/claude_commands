@@ -124,7 +124,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - hana had no `rust-toolchain.toml` on `origin/init/catalyst` on 2026-10-04, so the check stays silent until one lands.
 - The pin is whatever `origin/init/catalyst` was at hana's last fetch. The check never fetches hana.
 - The trial runs inside the hourly job, so sync, CI polling and the index update wait while it runs, at night only.
-- The hold is checked between steps, not during one. A hold that arrives during clippy waits for clippy to end, up to 2 h. `/build:hold` already waits for `pgrep` to print nothing before its test starts.
+- The trial checks the hold between steps. If a hold starts during Clippy, the trial checks it after Clippy ends. The Clippy step has a two-hour limit. On natedev, `/build:hold drain` waits for active local work before it reports `drained`.
 - hana's `.#ci` shell carries no Rust toolchain. The job `PATH`'s `cargo` is the rustup proxy, which is why `cargo +<ver>` selects the trial toolchain inside `nix develop`.
 - The clone has no `origin/init/catalyst` ref. The sha is resolved in hana and checked out by sha in the clone; copies.py fetches that commit from hana before checkout.
 - The trial toolchain stays installed for the bump. Nothing removes old trial toolchains.

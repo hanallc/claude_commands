@@ -2515,7 +2515,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def read_claims(self, proc_root: Path) -> build_hold.LiveClaims:
         self.assertEqual(proc_root, self.proc)
-        return build_hold.LiveClaims(self.claimed)
+        return build_hold.LiveClaims(self.claimed, local_admissions=hold_enforcer.admitted_processes())
 
     def process(self, pid: int, command: str, *, parent: int = 1, start: int = 0,
                 environment: dict[str, str] | None = None, argv: tuple[str, ...] = ()) -> Path:

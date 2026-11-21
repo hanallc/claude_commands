@@ -388,15 +388,16 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True)
-class LiveClaims:
-    """Name the processes that a hold must not stop.
+class AdmissionStateUnreadable:
+    reason: str
 
-    `routed` names the identities that only a step record routed off natedev claims. A drain does not keep them:
-    a later natedev step of that call waits for the release.
-    """
+
+@dataclass(frozen=True)
+class LiveClaims:
+    """Name the protected processes and the local admissions from the same scan."""
     identities: frozenset[ProcessIdentity]
-    routed: frozenset[ProcessIdentity] = frozenset()
     remote_waiters: frozenset[ProcessIdentity] = frozenset()
+    local_admissions: frozenset[ProcessIdentity] | AdmissionStateUnreadable = frozenset()
 
 
 @dataclass(frozen=True)
@@ -603,6 +604,7 @@ class HoldEnforcer(Protocol):
     def clear_queued_runs(self, proc_root: Path) -> None: ...
     def record_clear_cutoff(self, identity: HolderIdentity, since: datetime) -> None: ...
     def drain_identities(self, proc_root: Path, identity: HolderIdentity) -> tuple[ProcessIdentity, ...]: ...
+    def remaining_drain_runs(self, holder: Holder, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
     def wait_for_kept_runs(self, holder: Holder, proc_root: Path) -> int: ...
     def ci_placement_lines(self, proc_root: Path) -> list[str]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
@@ -618,10 +620,13 @@ def hold_enforcer() -> HoldEnforcer:
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    admitted = hold_enforcer().admitted_processes()
     claims = hold_enforcer().claimed_processes(proc_root) if holders else LiveClaims(frozenset())
     if isinstance(claims, ClaimsUnreadable):
         print(f"claims unreadable: {claims.reason}", file=sys.stderr)
+    admitted = (claims.local_admissions if holders and isinstance(claims, LiveClaims)
+                else hold_enforcer().admitted_processes())
+    if isinstance(admitted, AdmissionStateUnreadable):
+        raise OSError(f"admission state unavailable: {admitted.reason}")
     # A remote waiter does not grant its local build children an audit exemption.
     claimed: frozenset[ProcessIdentity] = (claims.identities - claims.remote_waiters
         if isinstance(claims, LiveClaims) else frozenset())
@@ -925,7 +930,7 @@ def live_kept_runs(holder: Holder, proc_root: Path = PROC_ROOT) -> tuple[Process
 
 
 def holder_state(holder: Holder, proc_root: Path = PROC_ROOT) -> str:
-    remaining = len(live_kept_runs(holder, proc_root))
+    remaining = len(hold_enforcer().remaining_drain_runs(holder, proc_root))
     return f"draining ({remaining} runs left)" if remaining else "held"
 
 

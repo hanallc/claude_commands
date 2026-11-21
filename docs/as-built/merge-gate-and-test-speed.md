@@ -341,7 +341,9 @@ A checkpoint rerun accepts its own recorded merge only for the same checkpoint, 
 
 **Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
 
-**Build holds.** SharedMachine waits before jobs, merging, and promotion while another session's natedev hold applies.
+**Build holds.** SharedMachine waits for another session's natedev hold only before natedev work: local suite jobs and the queue placement.
+A git merge, a push, a promotion and an AWS gate do not wait for a natedev hold.
+A live AWS admission reservation protects its owner from `/build:hold clear`.
 The gate uses `build_targets.caller_holds_only_own`, so the sole holder runs at once.
 The gate checks the hold before each new job.
 A job stopped by a signal during an applicable hold returns to the front of the queue.
@@ -843,7 +845,7 @@ Each class builds a complete Git/worktree fixture once and restores a private co
 Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary.
 Concurrent refill tests release on observed lock contention and check committed tickets and disjoint files.
 
-The gate's main promotion takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) after its hold and release waits.
+The gate's main promotion takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) after its release wait.
 It releases the lock after the local main push and before the Mac pull.
 
 ### Small fixes on main

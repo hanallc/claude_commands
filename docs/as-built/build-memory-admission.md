@@ -1262,15 +1262,17 @@ There is no releasing state.
 Only removal ends the holder's hold.
 
 **Drain.** `build_hold.py drain --for '<why>' --release-eta HH:MM --zone IANA` keeps the natedev runs that work until they finish.
-It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
-A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
+It captures outermost gates that work on natedev, CI `Runner.Worker` processes, and builds that the enforcer could stop.
+A gate works on natedev when it has a cargo child or a local admission reservation.
+A drain does not keep a gate whose only work is a Mac or AWS claim or a remote waiter, and it does not wait for that gate.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
-`remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
-A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+`claimed_processes` includes routed steps and live owners of remote admission reservations.
+Clear and the enforcer protect these processes from stops.
+A later natedev step of a gate that the drain did not keep waits for the release.
 An unreadable step record of a live writer makes the claims unreadable.
 On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
 A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
-Unreadable claims or admission state keep every outermost gate.
+When claims or admission state are unreadable, discovery treats every outermost gate as active.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
 A second scan adds only identities whose start ticks do not exceed that bound.
 The command merges those identities under the release lock before starting the enforcer.
@@ -1282,9 +1284,13 @@ New natedev runs wait for explicit release.
 The command stops no process and adds no stored state field.
 It accepts `--keep`, requires `--release-eta` and `--zone`, and refuses Mac and SSH targets.
 Each 60 seconds, it prints `draining: N runs remain`.
+Kept builds and CI workers count while their process identities remain live.
+On each scan, any kept gate counts while it has local work or the records are unreadable.
+This rule also applies to a nested gate named by `--keep`.
+The scan updates the count without changing the saved keep entries.
 Completion prints `drained; natedev stays held until release` and returns 0.
 Ctrl-C returns 130 and retains the hold.
-Status derives `draining (N runs left)` or `held` from matching live keep entries.
+Status derives `draining (N runs left)` or `held` from the same count.
 Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
@@ -1299,6 +1305,9 @@ An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
 It retains explicit keep entries and their children.
+Before signaling a gate, clear checks its process identity and reads remote claims and reservations again.
+A live remote claim or reservation prevents the signal.
+An unreadable recheck also prevents the signal.
 The command leaves the target held until release.
 `clear` and `drain` accept an optional positional target before their options.
 `release [target]` uses the same target form.
@@ -1438,7 +1447,7 @@ Those workers may build.
 | Command | Behavior |
 | --- | --- |
 | `clear [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Default natedev. A missing ETA returns exit 2 without changes. Use `HH:MM` for later today or `YYYY-MM-DDTHH:MM` for a later date. Starts the enforcer and prints its notice, keep list, and audit. Stops every test and build outside the allow rules. Registers each stopped session for release. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
-| `drain [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Requires the same future ETA as clear. Keeps existing work and holds new work until explicit release. |
+| `drain [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Requires the same future ETA as clear. Automatically keeps only existing natedev work. New natedev work waits until release. |
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
 | `record-recipient --session-id --name` | Written by `top_level.py`. |

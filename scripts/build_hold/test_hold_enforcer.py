@@ -23,13 +23,14 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
-from scripts.build_queue import admission_service, admission_records, placement
+from scripts.build_queue import admission_protocol, admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.boot_identity import boot_identity
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production import staff
 
@@ -68,7 +69,8 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = boot.write_text("test-boot\n")
         configuration = self.root / "config"
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
+        _ = write_config_fixture(configuration / "build_targets.conf",
+            "default_target=natedev\ntargets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
@@ -95,7 +97,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(proc_root, self.proc)
         return build_hold.LiveClaims(self.claimed)
 
-    def test_drain_keeps_a_verified_remote_waiter_without_local_admission(self) -> None:
+    def test_drain_excludes_a_verified_remote_waiter_without_local_admission(self) -> None:
         _ = self.process(700, 'bash', argv=('/bin/bash', '/scripts/direct/verify.sh'), session='other')
         processes = build_hold.read_audit_processes(self.proc)
         identity = processes[700].identity
@@ -103,9 +105,8 @@ class HoldEnforcerTests(unittest.TestCase):
         runs = hold_enforcer.classify_drain_runs(processes, frozenset(), claims)
         assert isinstance(runs, tuple)
         self.assertEqual(len(runs), 1)
-        self.assertIsInstance(runs[0], hold_enforcer.WorkingRun)
-        assert isinstance(runs[0], hold_enforcer.WorkingRun)
-        self.assertEqual(runs[0].reason, 'remote waiter')
+        self.assertIsInstance(runs[0], hold_enforcer.WaitingRun)
+        self.assertEqual(runs[0].process.identity, identity)
         unassigned = hold_enforcer.classify_drain_runs(processes, frozenset(), build_hold.LiveClaims(frozenset()))
         assert isinstance(unassigned, tuple)
         self.assertIsInstance(unassigned[0], hold_enforcer.WaitingRun)
@@ -128,11 +129,15 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = paths.run.write_text(json.dumps(record))
         return target, paths
 
-    def test_live_hana_claim_stays_claimed_during_drain_without_an_assignment_or_admission_state(self) -> None:
+    def test_drain_protects_a_live_hana_claim_and_keeps_only_local_work(self) -> None:
         target, paths = self.hana_claim()
-        table = self.table()
-        for admission in ('no matching assignment', 'missing state'):
-            with self.subTest(admission=admission):
+        cases = (('no matching assignment', False), ('missing state', False), ('no matching assignment', True))
+        for admission, local_cargo in cases:
+            with self.subTest(admission=admission, local_cargo=local_cargo):
+                if local_cargo:
+                    _ = self.process(800, 'bash', argv=('bash', 'verify.sh', 'check'), session='local-builder')
+                    _ = self.process(801, 'cargo', parent=800, argv=('cargo', 'check'))
+                table = self.table()
                 state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
                 with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
                         mock.patch.object(claim_state, 'state_paths', return_value=paths),
@@ -144,13 +149,40 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertEqual(claims.remote_waiters, frozenset())
                 runs = hold_enforcer.classify_drain_runs(table, frozenset(), claims)
                 assert isinstance(runs, tuple)
-                self.assertEqual(len(runs), 1)
-                assert isinstance(runs[0], hold_enforcer.WorkingRun)
-                self.assertEqual(runs[0].reason, 'Mac or AWS claim')
-                with (mock.patch.object(hold_enforcer, 'claimed_processes', return_value=claims),
-                        mock.patch.object(hold_enforcer, 'admitted_processes', return_value=frozenset())):
-                    kept = hold_enforcer.drain_identities(self.proc, build_hold.HolderIdentity('holder', 'holder'))
-                self.assertIn(table[700].identity, kept)
+                waiting = [run.process.identity for run in runs if isinstance(run, hold_enforcer.WaitingRun)]
+                working = [(run.process.identity, run.reason) for run in runs if isinstance(run, hold_enforcer.WorkingRun)]
+                self.assertEqual(waiting, [table[700].identity])
+                self.assertEqual(working, [(table[800].identity, 'cargo child')] if local_cargo else [])
+
+                def release(_seconds: float) -> None:
+                    (self.holders / 'holder').unlink()
+
+                signals: list[tuple[int, int]] = []
+                stopper = hold_enforcer.StopBuildsAndTests(self.proc,
+                    signal_process=lambda pid, signum: signals.append((pid, signum)))
+                identity = build_hold.HolderIdentity('holder', 'holder')
+                with mock.patch.object(hold_enforcer, 'claimed_processes', return_value=claims):
+                    kept = hold_enforcer.drain_identities(self.proc, identity)
+                    self.assertEqual(kept, (table[800].identity,) if local_cargo else ())
+                    self.write_holder(kept)
+                    holder = build_hold.read_holder(self.holders / identity.key)
+                    write_text_atomic(hold_enforcer.clear_cutoff_path(holder.key, holder.since),
+                        json.dumps({"boot_id": boot_identity(), "before": 12_000}))
+                    result = hold_enforcer.run(self.proc, self.holders, self.root / 'enforcer', uid=self.uid,
+                        enforcer_pid=999, stopper=stopper, sleep=release, cgroup_root=self.root / 'cgroup')
+                self.assertEqual(result, 0)
+                self.assertEqual(signals, [])
+                if local_cargo:
+                    paths.run.unlink()
+                    self.write_holder(kept)
+                    with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                            mock.patch.object(claim_state, 'state_paths', return_value=paths),
+                            mock.patch.object(hold_enforcer, 'claimed_processes', side_effect=self.claim_reader),
+                            redirect_stdout(io.StringIO())):
+                        result = hold_enforcer.run(self.proc, self.holders, self.root / 'enforcer', uid=self.uid,
+                            enforcer_pid=999, stopper=stopper, sleep=release, cgroup_root=self.root / 'cgroup')
+                    self.assertEqual(result, 0)
+                    self.assertEqual(signals, [(700, signal.SIGTERM), (701, signal.SIGTERM)])
 
     def test_only_an_exact_current_hana_assignment_adds_the_claim_and_coordinator_as_remote_waiters(self) -> None:
         target, paths = self.hana_claim()
@@ -487,6 +519,63 @@ class HoldEnforcerTests(unittest.TestCase):
                 sleep=mock.Mock(side_effect=KeyboardInterrupt), clock=lambda: 0), 130)
         self.assertEqual(build_hold.read_holder(self.holders / "holder"), holder)
 
+        identity = build_hold.HolderIdentity(holder.key, holder.name)
+        state = step_record.StepState
+        record = step_record.StepRecord("remote-gate", 10, "11000", self.root, "check",
+            step_record.NamedPackage("hana"), step_record.AnyTarget(("natedev", "aws"), ()), state.ON_SSH,
+            "2026-11-15T17:45:00+00:00")
+        admission = self.root / "buildlog/admission/state.json"
+        ready = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+        for recovery in ("cargo ends", "admission becomes readable", "nested gate cargo ends"):
+            with self.subTest(recovery=recovery):
+                nested = recovery == "nested gate cargo ends"
+                if nested:
+                    _ = self.process(9, "bash", argv=("bash", "verify.sh", "check"))
+                    step_record.record_path(record.call_id).unlink()
+                    reservation = self.cloud_reservation(10)
+                    cloud = replace(ready, reservations={reservation.episode: reservation})
+                    write_text_atomic(admission, admission_protocol.encode_record(cloud))
+                else:
+                    step_record.write(record)
+                _ = self.process(10, "bash", parent=9 if nested else 1, argv=("bash", "verify.sh", "check"))
+                if recovery != "admission becomes readable":
+                    _ = self.process(11, "cargo", parent=10, argv=("cargo", "check"))
+                else:
+                    write_text_atomic(admission, "{")
+                advances: list[float] = []
+
+                def advance(seconds: float) -> None:
+                    advances.append(seconds)
+                    self.assertEqual(advances, [1], "drain is still waiting for the remote gate")
+                    if recovery == "admission becomes readable":
+                        write_text_atomic(admission, admission_protocol.encode_record(ready))
+                    else:
+                        shutil.rmtree(self.proc / "11")
+
+                with (mock.patch.object(hold_enforcer, "claimed_processes", side_effect=self.claim_reader),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO())):
+                    kept = hold_enforcer.drain_identities(self.proc, identity)
+                    self.assertEqual(kept, (build_hold.ProcessIdentity(9 if nested else 10, "11000"),))
+                    if nested:
+                        kept = (*kept, build_hold.ProcessIdentity(10, "11000"))
+                    self.write_holder(kept)
+                    holder = build_hold.read_holder(self.holders / "holder")
+                    self.assertEqual(hold_enforcer.wait_for_kept_runs(holder, self.proc, sleep=advance, clock=lambda: 0), 0)
+                    self.assertEqual(build_hold.holder_state(holder, self.proc), "held")
+                self.assertEqual(advances, [1])
+                self.assertIn(f"draining: {2 if nested else 1} runs remain", output.getvalue())
+                self.assertEqual(output.getvalue().splitlines()[-1], "drained; natedev stays held until release")
+                self.assertEqual(build_hold.process_start_time(10, self.proc), "11000")
+
+    def cloud_reservation(self, pid: int) -> admission_service.ReservationRecord:
+        start = build_hold.process_start_time(pid, self.proc)
+        return admission_service.ReservationRecord(
+            episode="cloud-test", path="", owner=admission_protocol.Owner(pid, start), need=1, repo=str(self.root),
+            step="merge-gate", worktree=str(self.root), admitted_at="2026-11-16T12:00:00+00:00", sidecar="",
+            test_width=admission_records.NoTestWidth(), call=admission_records.NoCallRecord(),
+            reservation_id="cloud-reservation", queue_waiter={"pid": pid, "start_time": start, "need": 1, "since": 0},
+            place=admission_protocol.CloudPlace("aws"))
+
     def test_clear_stops_existing_gates_and_running_children_but_keeps_explicit_runs(self) -> None:
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         member = fixture_member("producer", name="holder")
@@ -495,28 +584,54 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="running")
         _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
         _ = self.process(30, "bash", argv=("bash", "verify.sh", "test"), session="kept")
+        _ = self.process(50, "python3", argv=("python3", "merge_gate.py"), session="cloud-gate")
+        reservation = self.cloud_reservation(50)
+        ready = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+        cloud = replace(ready, reservations={reservation.episode: reservation})
+        admission_path = self.root / "buildlog/admission/state.json"
         signals: list[tuple[int, int]] = []
         original_stop = hold_enforcer.stop_waiting_run
+        record_build = hold_enforcer.record_build
 
         def stop(run: hold_enforcer.WaitingRun, holder: build_hold.Holder,
                  processes: Mapping[int, build_hold.AuditProcess], proc_root: Path, *,
                  signal_process: Callable[[int, int], None] = os.kill,
-                 ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
+                 ) -> hold_enforcer.RunStopResult:
             _ = signal_process
             return original_stop(run, holder, processes, proc_root,
                 signal_process=lambda pid, signum: signals.append((pid, signum)))
 
-        with mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop), \
-             mock.patch.object(hold_enforcer, "start") as start, \
-             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
-                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
-                "--keep", "30", "--proc-root", str(self.proc)]), 0)
-        start.assert_called_once_with()
-        self.assertCountEqual(signals, [(10, signal.SIGTERM), (20, signal.SIGTERM), (21, signal.SIGTERM)])
-        self.assertEqual(build_hold.read_holder(self.holders / member.id).keep,
-                         (build_hold.ProcessIdentity(30, "11000"),))
-        self.assertEqual({row["session"] for row in self.rows() if row["action"] == "stopped"}, {"queued", "running"})
+        for timing in ("already granted", "granted after snapshot", "unreadable after snapshot", "released"):
+            with self.subTest(reservation=timing):
+                state = cloud if timing == "already granted" else ready
+                write_text_atomic(admission_path, admission_protocol.encode_record(state))
+                signals.clear()
+
+                def save_stop(build: build_hold.AuditedBuild, holder: build_hold.Holder, proc_root: Path,
+                              action: Literal["audit", "stopped"], *,
+                              stopped_run: build_hold.ProcessIdentity | hold_enforcer.NoStoppedRun) -> None:
+                    record_build(build, holder, proc_root, action, stopped_run=stopped_run)
+                    if action == "stopped" and build.process.identity.pid == reservation.owner.pid:
+                        if timing == "granted after snapshot":
+                            write_text_atomic(admission_path, admission_protocol.encode_record(cloud))
+                        elif timing == "unreadable after snapshot":
+                            write_text_atomic(admission_path, "{")
+
+                with (mock.patch.object(hold_enforcer, "claimed_processes", side_effect=self.claim_reader),
+                      mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop),
+                      mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop),
+                      mock.patch.object(hold_enforcer, "start") as start,
+                      mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO())):
+                    self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+                        "--release-eta", "23:59", "--zone", "Etc/GMT+12",
+                        "--keep", "30", "--proc-root", str(self.proc)]), 0)
+                start.assert_called_once_with()
+                expected_pids = (10, 20, 21, 50) if timing == "released" else (10, 20, 21)
+                self.assertCountEqual(signals, [(pid, signal.SIGTERM) for pid in expected_pids])
+                self.assertEqual(build_hold.read_holder(self.holders / member.id).keep,
+                                 (build_hold.ProcessIdentity(30, "11000"),))
+                expected_sessions = {"queued", "running", "cloud-gate"} if timing == "released" else {"queued", "running"}
+                self.assertEqual({row["session"] for row in self.rows() if row["action"] == "stopped"}, expected_sessions)
 
     def test_clear_keeps_the_gate_above_an_explicitly_kept_cargo_child(self) -> None:
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -594,7 +709,6 @@ class HoldEnforcerTests(unittest.TestCase):
                     claims = self.claim_reader(self.proc)
                 assert isinstance(claims, build_hold.LiveClaims)
                 self.assertEqual(table[10].identity in claims.identities, kept)
-                self.assertEqual(table[10].identity in claims.routed, kept)
                 signals: list[tuple[int, int]] = []
                 with redirect_stdout(io.StringIO()):
                     hold_enforcer.stop_queued_runs(table, holders, self.uid, 999, claims.identities, self.proc,
@@ -727,7 +841,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     (frozenset[build_hold.ProcessIdentity](), frozenset[build_hold.ProcessIdentity](),
                      hold_enforcer.WaitingRun),
                     (frozenset({identity}), frozenset[build_hold.ProcessIdentity](), hold_enforcer.WorkingRun),
-                    (frozenset[build_hold.ProcessIdentity](), frozenset({identity}), hold_enforcer.WorkingRun),
+                    (frozenset[build_hold.ProcessIdentity](), frozenset({identity}), hold_enforcer.WaitingRun),
                 ):
                     with self.subTest(admitted=admitted, claimed=claimed):
                         classified = hold_enforcer.classify_drain_runs(table, admitted, build_hold.LiveClaims(claimed))
@@ -1011,6 +1125,38 @@ class HoldEnforcerTests(unittest.TestCase):
                     elif status == "stopped":
                         hold_enforcer.set_stop_status(holder, process.identity, "stopped")
                 self.assertEqual(step_record.consume_stopped_build("drain-call", consumed), expected)
+
+        for pid, confirmation_first in ((20, True), (21, False)):
+            with self.subTest(confirmation_first=confirmation_first):
+                call_id = f"overlapping-stop-{pid}"
+                _ = self.process(pid, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner",
+                                 environment={"BUILDLOG_CALL_ID": call_id})
+                table = self.table()
+                process = table[pid]
+                run = hold_enforcer.WaitingRun(process, OwningSession("gate-owner"))
+                unclaimed = build_hold.LiveClaims(frozenset())
+                claimed = build_hold.LiveClaims(frozenset({process.identity}))
+                signals: list[tuple[int, int]] = []
+
+                def stop() -> hold_enforcer.RunStopResult:
+                    return hold_enforcer.stop_waiting_run(
+                        run, holder, table, self.proc, signal_process=lambda pid, signum: signals.append((pid, signum)),
+                    )
+
+                def overlapping_stop(_proc_root: Path) -> build_hold.LiveClaims:
+                    claims = unclaimed if confirmation_first else claimed
+                    with mock.patch.object(hold_enforcer, "claimed_processes", return_value=claims):
+                        expected = hold_enforcer.StoppedRun if confirmation_first else hold_enforcer.RunHasRemoteWork
+                        self.assertIsInstance(stop(), expected)
+                    return claimed if confirmation_first else unclaimed
+
+                with mock.patch.object(hold_enforcer, "claimed_processes", side_effect=overlapping_stop):
+                    expected = hold_enforcer.RunHasRemoteWork if confirmation_first else hold_enforcer.StoppedRun
+                    self.assertIsInstance(stop(), expected)
+                self.assertEqual(signals, [(pid, signal.SIGTERM)])
+                row, = [row for row in self.rows() if row["call_id"] == call_id]
+                self.assertEqual((row["action"], row["stop_status"]), ("stopped", "stopped"))
+                self.assertTrue(step_record.consume_stopped_build(call_id, consumed))
 
     def test_verify_controller_survives_every_live_state_while_local_compile_child_stops(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="other")
@@ -1748,9 +1894,10 @@ class HoldEnforcerTests(unittest.TestCase):
 
         stopper = hold_enforcer.StopBuildsAndTests(self.proc,
             signal_process=lambda pid, signum: signals.append((pid, signum)))
-        with mock.patch.object(hold_enforcer, "claimed_processes", side_effect=[
-                build_hold.ClaimsUnreadable("private claims are damaged"),
-                build_hold.LiveClaims(frozenset()), build_hold.LiveClaims(frozenset())]), \
+        def claims_for_pass(proc_root: Path) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
+            return self.read_claims(proc_root) if passes else build_hold.ClaimsUnreadable("private claims are damaged")
+
+        with mock.patch.object(hold_enforcer, "claimed_processes", side_effect=claims_for_pass), \
              mock.patch.object(time, "clock_gettime_ns", return_value=100_000_000_000) as boot_clock, \
              mock.patch.object(time, "time_ns", return_value=120_000_000_000) as wall_clock, \
              mock.patch.object(os, "sysconf", return_value=100), \
