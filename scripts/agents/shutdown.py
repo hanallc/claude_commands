@@ -30,7 +30,8 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, unit_runs, build_folders
+from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, unit_runs, build_folders, waiting_rows
+from scripts.lib.file_lock import exclusive
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
@@ -46,7 +47,8 @@ from scripts.production import (
 )
 from scripts.production.production_doc import (
     FieldPresent, Production, ProductionPathsError, Refusal,
-    optional_field, read_new_production, read_production, require_removable_checkout,
+    live_paths_lock_file, optional_field, read_new_production, read_production, remember_document_rename,
+    require_removable_checkout,
 )
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.production.unit_move import RenameRefused, read_json, write_json
@@ -2129,6 +2131,13 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
 
 
 def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
+    if isinstance(move, LiveDocBranchMove):
+        with exclusive(live_paths_lock_file(move.checkout)), waiting_rows.locked_journal(waiting_rows.journal_path()):
+            return _rename_move_doc(request, move)
+    return _rename_move_doc(request, move)
+
+
+def _rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
     changed = False
     row = staff.by_id(request.member.id)
     if row is None or isinstance(row.doc, staff.DocUnfilled):
@@ -2144,6 +2153,8 @@ def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
         notes = f"{NOTES_DIRECTORY}/{request.member.id}/"
         for relative in dict.fromkeys((source, destination, move.log.relative_to(move.checkout).as_posix(), notes)):
             git_exclude.ensure_exact_excluded(move.checkout, relative)
+        if source != destination:
+            remember_document_rename(move.checkout, row.id, move.source, move.destination)
     if move.source != move.destination and move.source.exists():
         if unit_move.exists(move.destination):
             raise RenameRefused(f"destination already exists: {move.destination}")
@@ -2166,11 +2177,11 @@ def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
         if unit_move.git(move.checkout, "ls-files", "--", source):
             _ = unit_move.git(move.checkout, "rm", "--cached", "--quiet", "--", source)
             changed = True
+    if isinstance(move, LiveDocBranchMove) and source != destination:
+        git_exclude.remove_exact_exclusion(move.checkout, source)
     if row.doc.path != move.destination:
         _ = staff.set_doc(row.id, replace(row.doc, path=move.destination))
         changed = True
-    if isinstance(move, LiveDocBranchMove) and source != destination:
-        git_exclude.remove_exact_exclusion(move.checkout, source)
     return changed
 
 

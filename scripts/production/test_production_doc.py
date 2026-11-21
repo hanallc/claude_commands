@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import unittest
 from dataclasses import replace
@@ -12,7 +13,7 @@ from scripts.lib.git_test_support import commit_repository, fixture_git_environm
 from scripts.production import production_doc, showrunners, staff
 from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.lib.user_zone import user_zone
-from scripts.production.staff_test_support import StaffTestCase, fixture_member
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 
 
 def enrolled_document(doc: Path, main: Path, integration: Path, branch: str, *, log: str = "production.log") -> None:
@@ -58,9 +59,17 @@ class ProductionDocumentTests(StaffTestCase):
 
     def test_enrolled_documents_share_main_and_keep_distinct_live_paths(self) -> None:
         repository = self.root / "main"
-        environment = fixture_git_environment(self.root)
+        environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull}
+        self.enterContext(patch.dict(os.environ, environment, clear=True))
         _ = subprocess.run(["git", "init", "-qb", "main", str(repository)], env=environment, check=True)
         _ = commit_repository(repository, "Fixture", allow_empty=True, env=environment)
+        parent = fixture_member("showrunner", name="parent")
+        staging = self.root / "merge-staging"
+        _ = subprocess.run(["git", "-C", str(repository), "worktree", "add", "-qb", "merge-staging", str(staging)],
+                           env=environment, check=True)
+        merge_unit = staff.ensure("unit", name="parent-merges", parent=staff.ReportsTo(parent.id),
+                                  worktree=staff.PresentWorktree("natedev", staging), unit_type="merge",
+                                  runtime_id=fixture_runtime_id("parent-merges"))
         for name, staged in (("alpha", False), ("beta", False), ("gamma", True)):
             with self.subTest(production=name):
                 integration = self.root / name
@@ -69,7 +78,10 @@ class ProductionDocumentTests(StaffTestCase):
                 document = repository / f"{name}-production-live.md"
                 old = integration / f"{name}-production.md"
                 _ = old.write_text(f"# Legacy production\n- **Repository:** `{repository}`\n")
-                owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", old))
+                owner = fixture_member("showrunner", name=name, parent=parent.id, doc=staff.LiveDoc("natedev", old))
+                legacy_server = staff.serving_merge_unit(owner.id)
+                assert legacy_server is not None
+                self.assertEqual(legacy_server.id, merge_unit.id)
                 self.assertIsInstance(production_doc.resolve_production_paths(old), production_doc.LegacyProduction)
                 notes = repository / NOTES_DIRECTORY / owner.id
                 self.assertIsNone(production_doc.staged_notes_directory(old))
@@ -84,12 +96,16 @@ class ProductionDocumentTests(StaffTestCase):
                                   else staff.LiveDoc("natedev", document))
                 self.assertEqual(production_doc.resolve_production_paths(document), paths)
                 self.assertEqual(production_doc.staged_notes_directory(document), notes if staged else None)
+                enrolled_server = staff.serving_merge_unit(owner.id)
+                assert enrolled_server is not None
+                self.assertEqual(enrolled_server.id, merge_unit.id)
                 parsed = production_doc.read_production(owner.id)
                 self.assertEqual((parsed.checkout, parsed.log), (integration, paths.log))
 
     def test_guard_ready_requires_current_registrations_and_a_revision_in_main(self) -> None:
         repo = self.root / "installed"
-        environment = fixture_git_environment(self.root)
+        environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull}
+        self.enterContext(patch.dict(os.environ, environment, clear=True))
         _ = subprocess.run(["git", "init", "-qb", "main", str(repo)], env=environment, check=True)
         revision = commit_repository(repo, "Install guard", allow_empty=True, env=environment)
         _ = subprocess.run(["git", "-C", str(repo), "switch", "-qc", "other"], env=environment, check=True)

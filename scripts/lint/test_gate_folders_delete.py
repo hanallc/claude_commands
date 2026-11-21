@@ -6,6 +6,7 @@ import io
 import os
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import unittest
 from scripts.lint import gate_folders_delete
 from scripts.lint.sweep import gib
 from scripts.lib import scratch
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.agents import remote
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -29,6 +31,9 @@ class GateFoldersDeleteTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {
+            **fixture_git_environment(self.root), "HOME": str(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.gates = self.root / "gates"
         self.gates.mkdir()
@@ -58,7 +63,7 @@ class GateFoldersDeleteTests(unittest.TestCase):
         return folder
 
     def linked_checkout(self, gate: Path) -> tuple[Path, Path]:
-        source = self.repository(self.root / "source")
+        source = self.repository(self.root / f"{gate.name}-source")
         checkout = gate / "checkout"
         _ = self.git(source, "worktree", "add", "--quiet", "--detach", str(checkout), "HEAD")
         _ = (checkout / "source.txt").write_text("edited source\n")
@@ -180,17 +185,32 @@ class GateFoldersDeleteTests(unittest.TestCase):
         self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
 
     def test_main_exit_status_reports_gate_errors(self) -> None:
-        for case, expected_status in (("free", 0), ("busy", 0), ("rescue-failure", 1)):
+        for case, expected_status in (("free", 0), ("busy", 0), ("rescue-failure", 1),
+                                      ("protected-dry-run", 1), ("protected-delete", 1)):
             with self.subTest(case=case), ExitStack() as contexts:
                 gate = self.gate(case)
+                source, checkout = self.root / "source", gate / "checkout"
+                protected = case.startswith("protected-")
+                before: dict[Path, bytes] = {}
+                refs = ""
                 if case == "busy":
                     busy = contexts.enter_context((gate / scratch.BUSY).open("w"))
                     fcntl.flock(busy, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 elif case == "rescue-failure":
-                    source = self.linked_checkout(gate)[0]
+                    source, checkout = self.linked_checkout(gate)
                     shutil.rmtree(source)
+                elif protected:
+                    source, checkout = self.linked_checkout(gate)
+                    _ = self.git(source, "branch", "-M", "main")
+                    _ = self.git(checkout, "switch", "-c", "integration")
+                    doc = source / "fixture-production-live.md"
+                    enrolled_document(doc, source, checkout, "integration")
+                    _ = fixture_member("showrunner", name=case, doc=staff.LiveDoc(remote.local_machine(), doc))
+                    refs = self.git(source, "for-each-ref", "--format=%(refname) %(objectname)")
+                    before = {path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}
+                flags = ["--dry-run"] if case == "protected-dry-run" else []
                 result = subprocess.run(
-                    [sys.executable, gate_folders_delete.__file__, "--root", str(self.gates)],
+                    [sys.executable, gate_folders_delete.__file__, "--root", str(self.gates), *flags],
                     capture_output=True, text=True, check=False, timeout=20)
                 self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
                 if case == "free":
@@ -199,26 +219,13 @@ class GateFoldersDeleteTests(unittest.TestCase):
                 elif case == "busy":
                     self.assertIn(f"kept {gate}: busy", result.stdout.splitlines())
                     self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
+                elif protected:
+                    self.assertIn(f"kept {gate}: contains protected production checkout {checkout}", result.stdout)
+                    self.assertEqual({path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}, before)
+                    self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
                 else:
                     self.assertIn(f"kept {gate}: rescue failed: ", result.stdout)
-                    self.assertEqual((gate / "checkout" / "source.txt").read_text(), "edited source\n")
-
-    def test_protected_integration_keeps_its_parent_gate_in_both_modes(self) -> None:
-        gate = self.gate()
-        source, checkout = self.linked_checkout(gate)
-        _ = self.git(source, "branch", "-M", "main")
-        _ = self.git(checkout, "switch", "-c", "integration")
-        doc = source / "fixture-production-live.md"
-        enrolled_document(doc, source, checkout, "integration")
-        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
-        refs = self.git(source, "for-each-ref", "--format=%(refname) %(objectname)")
-        before = {path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                self.assertIn(f"kept {gate}: contains protected production checkout {checkout}",
-                              self.delete(dry_run=dry_run))
-                self.assertEqual({path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}, before)
-                self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
+                    self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
 
     def test_remote_mirrors_dot_folders_and_root_files_are_kept(self) -> None:
         entries = {".remote-mirrors": "mirror record", ".claude": "private state", ".other": "other state"}

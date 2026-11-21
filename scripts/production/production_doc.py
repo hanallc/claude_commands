@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.agents import remote
 from scripts.lib import git_files
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff, showrunners
 from scripts.production.production_names import (
@@ -241,6 +242,42 @@ def legacy_document_path(doc: Path) -> Path:
     return doc
 
 
+def live_paths_lock_file(checkout: Path) -> Path:
+    """Use one lock for live paths across worktrees and state directories."""
+    return git_files.locate(checkout).common_dir / "production-live-paths.lock"
+
+
+def document_history_file(checkout: git_files.Checkout, owner: staff.StaffId) -> Path:
+    return checkout.common_dir / f"production-document-paths-{owner}.json"
+
+
+def former_live_documents(history: Path) -> tuple[Path, ...]:
+    """Read live document paths in rename order."""
+    try:
+        data = cast(object, json.loads(history.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return ()
+    except (ValueError, UnicodeError) as error:
+        raise OSError(f"{history}: cannot read document history: {error}") from error
+    if not isinstance(data, list):
+        raise OSError(f"{history}: expected a list of document paths")
+    paths: list[Path] = []
+    for value in cast(list[object], data):
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise OSError(f"{history}: expected absolute document paths")
+        paths.append(Path(value))
+    return tuple(paths)
+
+
+def remember_document_rename(main: Path, owner: staff.StaffId, source: Path, destination: Path) -> None:
+    """Record the live paths before moving a production document."""
+    history = document_history_file(git_files.at(main), owner)
+    paths = former_live_documents(history)
+    updated = tuple(dict.fromkeys((*paths, source, destination)))
+    if updated != paths:
+        write_text_atomic(history, json.dumps([str(path) for path in updated]) + "\n")
+
+
 def _bound_owner(doc: Path, *previous: Path) -> staff.StaffRow:
     rows = [(row, row.doc.path.resolve()) for row in local_production_documents()
             if isinstance(row.doc, staff.LiveDoc)]
@@ -311,6 +348,11 @@ def staged_notes_directory(doc: Path) -> Path | None:
         raise ProductionPathsError(f"{doc}: {error}") from error
 
 
+def _known_live_document(doc: Path, row: staff.StaffRow, checkout: git_files.Checkout) -> bool:
+    return (doc.name.endswith(LIVE_DOCUMENT_SUFFIX)
+            or doc in former_live_documents(document_history_file(checkout, row.id)))
+
+
 def _repository_live_paths(checkout: git_files.Checkout) -> dict[Path, Path]:
     paths: dict[Path, Path] = {}
     for row in local_production_documents():
@@ -322,7 +364,7 @@ def _repository_live_paths(checkout: git_files.Checkout) -> dict[Path, Path]:
                 continue
             lines = doc.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
-            if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
+            if _known_live_document(doc, row, checkout):
                 raise
             continue
         except git_files.NotACheckout:
@@ -383,6 +425,14 @@ def protected_checkouts() -> frozenset[ProtectedCheckout]:
             except FileNotFoundError:
                 if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
                     raise
+                try:
+                    parent = next(folder for folder in doc.parents if folder.is_dir())
+                    checkout = git_files.locate(parent)
+                except git_files.NotACheckout:
+                    pass
+                else:
+                    if _known_live_document(doc, row, checkout):
+                        raise
                 lines = []
             declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
             if isinstance(declared, FieldPresent):
@@ -400,7 +450,7 @@ def protected_checkouts() -> frozenset[ProtectedCheckout]:
 
 
 def require_removable_checkout(path: Path, repository: Path, branch: str) -> None:
-    """Refuse removal of a protected path or its branch in the same repository."""
+    """Keep protected checkout paths and branches that removal can delete on origin."""
     try:
         protected = protected_checkouts()
         candidate = path.resolve()
@@ -409,6 +459,8 @@ def require_removable_checkout(path: Path, repository: Path, branch: str) -> Non
             common = git_files.locate(repository).common_dir
             if any(checkout.repository == common for checkout in matching):
                 raise ProductionPathsError(f"{repository}: protected production branch {branch}")
+            # A separate clone or URL can name the same origin.
+            raise ProductionPathsError(f"{repository}: protected production origin branch {branch}")
         for checkout in protected:
             if checkout.path.is_relative_to(candidate):
                 raise ProductionPathsError(f"{candidate}: contains protected production checkout {checkout.path}")

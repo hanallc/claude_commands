@@ -41,7 +41,7 @@ class WaitingRowsTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="waiting-rows-")))
         environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         environment.update(HOME=str(self.root), XDG_STATE_HOME=str(self.root / "state"),
-                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Rows Test", GIT_AUTHOR_EMAIL="rows@example.invalid",
                            GIT_COMMITTER_NAME="Rows Test", GIT_COMMITTER_EMAIL="rows@example.invalid")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))

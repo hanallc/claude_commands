@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import math
@@ -18,10 +19,10 @@ from unittest.mock import call, patch
 from scripts.agents import pane_record, remote, shutdown, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
-from scripts.lib import atomic_file, conf, git_exclude
+from scripts.lib import atomic_file, conf, git_exclude, waiting_rows
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.message import sessions
-from scripts.production import production_doc, staff
+from scripts.production import production_doc, record_store, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.production.test_production_doc import enrolled_document
 
@@ -41,7 +42,9 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         super().setUp()
         self.repository = self.root / "main"
         self.integration = self.root / "integration"
-        self.environment = fixture_git_environment(self.root)
+        self.environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+                            "XDG_STATE_HOME": str(self.root / "state")}
+        self.enterContext(patch.dict(os.environ, self.environment, clear=True))
         _ = subprocess.run(["git", "init", "-qb", "main", str(self.repository)], env=self.environment, check=True)
         _ = commit_repository(self.repository, "Fixture", allow_empty=True, env=self.environment)
         _ = self.git("worktree", "add", "-qb", "integration", str(self.integration))
@@ -90,15 +93,36 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         self.assertTrue(self.git("ls-remote", "--heads", "origin", "integration"))
 
     def test_live_rename_resumes_an_interrupted_branch_rename_without_changing_main(self) -> None:
-        # Keep the index present so the comparison includes its original bytes.
-        _ = self.git("read-tree", "HEAD")
+        tracked = production_doc.legacy_document_path(self.document)
+        historical = self.repository / "former-proposals"
+        _ = tracked.write_text("- **Proposals:** former-proposals\n")
+        _ = commit_repository(self.repository, "Record former proposals", str(tracked), env=self.environment)
         index = self.repository / ".git/index"
         head, before = self.git("rev-parse", "HEAD"), index.read_bytes()
         destination = self.document.with_name("renamed-production-live.md")
         request = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch="renamed-integration")
         move = request.move
         assert isinstance(move, shutdown.LiveDocBranchMove)
-        self.assertTrue(shutdown.rename_move_doc(request, move))
+        with self.subTest(stage="interrupted exclusion removal"):
+            def interrupt(checkout: Path, source: str) -> None:
+                self.assertEqual(checkout / source, self.document)
+                locks = (production_doc.live_paths_lock_file(self.integration),
+                         waiting_rows.journal_path().with_suffix(".lock"))
+                for path in locks:
+                    with path.open("r") as lock, self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                raise OSError("interrupted exclusion removal")
+
+            with (patch.object(git_exclude, "remove_exact_exclusion", side_effect=interrupt),
+                  self.assertRaisesRegex(OSError, "interrupted exclusion removal")):
+                _ = shutdown.rename_move_doc(request, move)
+            self.assertEqual(self.owner.doc, staff.LiveDoc(remote.local_machine(), self.document))
+            self.assertTrue(destination.is_file())
+            with self.assertRaises(production_doc.ProductionPathsError):
+                _ = production_doc.live_file_conflicts(self.repository, "HEAD")
+            retry_doc = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch=move.branch)
+            assert isinstance(retry_doc.move, shutdown.LiveDocBranchMove)
+            self.assertTrue(shutdown.rename_move_doc(retry_doc, retry_doc.move))
         _ = self.git("-C", str(self.integration), "branch", "-m", move.branch)
         retry = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch=move.branch)
         assert isinstance(retry.move, shutdown.LiveDocBranchMove)
@@ -109,6 +133,10 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         self.assertFalse(self.document.exists())
         git_exclude.require_untracked_ignored(self.repository, destination.relative_to(self.repository).as_posix())
         self.assertEqual(production_doc.read_production(row).merge_branch, move.branch)
+        old_pattern = "/" + self.document.relative_to(self.repository).as_posix()
+        self.assertNotIn(old_pattern, (self.repository / ".git/info/exclude").read_text().splitlines())
+        self.assertIn(historical, record_store.known_folders(record_store.RecordKind.PROPOSAL, row.id,
+                                                            document=destination, strict=True))
         self.assertEqual((self.git("branch", "--show-current"), self.git("rev-parse", "HEAD"), index.read_bytes()),
                          ("main\n", head, before))
 
