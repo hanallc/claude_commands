@@ -840,7 +840,8 @@ function stepTooltip(key, data) {
   const rows = [title];
   if (row.about) rows.push(field('', row.about, 'caption'));
   if (row.changes) rows.push(field('Changes', row.changes));
-  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  const reasonFields = waiting && row.reason ? [field('Reason', row.reason, 'reason')] : [];
+  if (unavailable) return [...rows, ...stepFields, ...reasonFields, ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
@@ -852,9 +853,11 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.why || (row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : 'its turn')));
-    if (row.reason) rows.push(field('Reason', row.reason, 'reason'));
+    if (row.why !== 'gate job' || !reasonFields.length) {
+      rows.push(field('Waits for', row.why || (row.kind === 'cloud' ? 'AWS slot' :
+        row.kind === 'repository-slot' ? 'build slot' : 'its turn')));
+    }
+    rows.push(...reasonFields);
     rows.push(...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
       let free = row.free ?? queueCapMemory(data).free / GIB;

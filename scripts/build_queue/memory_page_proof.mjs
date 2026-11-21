@@ -62,7 +62,9 @@ const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(
 try {
   await mkdir(folder, {recursive:true});
   const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))'
+      + (landingWaitProof ? '; from scripts.build_queue.test_memory_feed import write_landing_wait_fixture; write_landing_wait_fixture(Path(sys.argv[1]))' : '')
+      + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
   const page = await readFile(join(folder, 'memory_live.html'));
@@ -262,19 +264,8 @@ try {
           })()`);
         };
         if (landingWaitProof) {
-          const reading = structuredClone(base);
-          const running = reading.walk.find(row => row.queued && !row.ci);
-          Object.assign(running, {name:'builds bb15', unit:'natemerge', showrunner:'natemerge',
-            title:{unit:'natemerge',step:'integrate'}, machine:'natedev', started_at:reading.read_at-8*60});
-          delete running.caller;
-          reading.walk = [running];
-          const waiting = reading.waiters[0];
+          const reading = JSON.parse(await readFile(join(folder,'landing_wait.json'),'utf8'));
           const reason = 'waits for natemerge integrate';
-          Object.assign(waiting, {name:'queue nextest', unit:'queue', showrunner:'builds',
-            why:'gate job', reason, need:4, targets:['natedev'], since:reading.read_at-2*60});
-          delete waiting.caller;
-          reading.waiters = [waiting];
-          reading.ram.build_tools_bytes = 0;
           servedReading = reading;
           await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1000,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
@@ -282,28 +273,49 @@ try {
             const running = document.querySelector('.wrow[data-run]');
             const waiting = document.querySelector('.wrow.wait');
             const note = waiting.querySelector('.wait-note');
-            const bar = waiting.querySelector('.waitb').getBoundingClientRect();
+            const bar = waiting.querySelector('.waitb')?.getBoundingClientRect();
+            const table = document.querySelector('.walk-table').getBoundingClientRect();
             const bounds = note?.getBoundingClientRect();
             const left = Math.floor(running.getBoundingClientRect().left) - 8;
-            const top = Math.floor(running.getBoundingClientRect().top + scrollY) - 6;
-            const bottom = Math.ceil(waiting.getBoundingClientRect().bottom + scrollY) + 6;
+            const row = waiting.getBoundingClientRect();
             return {
               text:note?.textContent, oneLine:note && getComputedStyle(note).whiteSpace === 'nowrap',
+              names:[running, waiting].map(row=>row.querySelector('.row-label .name').textContent),
               owners:[running, waiting].map(row=>row.querySelector('.row-label .owner').textContent),
               fits:note && note.scrollWidth <= note.clientWidth,
               inGap:bounds && bounds.left >= waiting.querySelector('.row-label').getBoundingClientRect().right
-                && bounds.right <= bar.left + 1,
-              clip:{x:left,y:top,width:innerWidth-2*left,height:bottom-top,scale:1}
+                && bounds.right <= (bar?.left ?? table.left) + 1,
+              pointer:{x:Math.floor((bounds.right+table.left)/2),y:Math.floor(row.bottom-4)},
+              clip:{x:left,top:Math.floor(running.getBoundingClientRect().top+scrollY)-6,
+                bottom:Math.ceil(row.bottom+scrollY)+6,width:innerWidth-2*left}
             };
           })()`);
           assert.equal(result.text, reason);
-          assert.deepEqual(result.owners, ['natemerge', 'builds']);
+          assert.deepEqual(result.names, ['builds bb15', 'queue nextest']);
+          assert.deepEqual(result.owners, ['natemerge', 'queue']);
           assert.ok(result.oneLine && result.fits && result.inGap, JSON.stringify(result));
-          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
-          await writeFile(join(folder,'builds-waits-for-natemerge-integrate-dark.png'),Buffer.from(shot.data,'base64'));
+          await call('Input.dispatchMouseEvent',{type:'mouseMoved',...result.pointer});
+          const tooltip = await evaluate(`(() => {
+            const tip = document.querySelector('#tip.on');
+            const fields = [...tip.querySelectorAll('dt')].filter(cell=>['Waits for','Reason'].includes(cell.textContent));
+            const bounds = tip.getBoundingClientRect();
+            const note = document.querySelector('.wrow.wait .wait-note').getBoundingClientRect();
+            const table = document.querySelector('.walk-table').getBoundingClientRect();
+            return {causes:fields.map(cell=>[cell.textContent,cell.nextElementSibling.textContent]),
+              text:tip.innerText,top:Math.floor(bounds.top+scrollY)-6,bottom:Math.ceil(bounds.bottom+scrollY)+6,
+              fits:bounds.left>=note.right && bounds.right<=table.left && tip.scrollWidth<=tip.clientWidth};
+          })()`);
+          assert.deepEqual(tooltip.causes,[['Reason',reason]]);
+          assert.ok(tooltip.fits,tooltip.text);
+          const {x, width, top, bottom} = result.clip;
+          const y = Math.min(top,tooltip.top);
+          const clip = {x,y,width,height:Math.max(bottom,tooltip.bottom)-y,scale:1};
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,'builds-waits-for-natemerge-integrate-dark-2.png'),Buffer.from(shot.data,'base64'));
 
           const longReason = 'waits for the build in the same Cargo folder '.repeat(12).trim();
-          Object.assign(waiting, {why:'the build in the same Cargo folder',reason:longReason,need:reading.total});
+          servedReading = {...structuredClone(base),waiters:[{...base.waiters[0],
+            why:'the build in the same Cargo folder',reason:longReason,need:base.total}]};
           await call('Emulation.setDeviceMetricsOverride',{width:390,height:1000,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
           const long = await evaluate(`(() => {
@@ -320,7 +332,15 @@ try {
                 && tooltip.getBoundingClientRect().right <= innerWidth};
           })()`);
           assert.deepEqual(long,{ellipsis:true,reason:longReason,tooltipFits:true});
-          console.log(JSON.stringify({pass:true,views:2,reason,output:folder}));
+          const tooltips = await evaluate(`(() => {
+            const head = {...latest.waiters[0],head_room:{unavailable:'missing room'}};
+            const cloud = {...head,kind:'cloud',why:'gate job',reason:${JSON.stringify(reading.waiters[0].reason)}};
+            return [head, cloud].map(row => tooltipRows('wait:'+row.key,{...latest,waiters:[row]})
+              .filter(field=>['Waits for','Reason'].includes(field.label))
+              .map(field=>[field.label,field.value]));
+          })()`);
+          assert.deepEqual(tooltips,[[['Reason',longReason]],[['Reason',reason]]]);
+          console.log(JSON.stringify({pass:true,views:2,reason,tooltip:tooltip.text,output:folder}));
           break browserProof;
         }
         if (buildToolsProof) {

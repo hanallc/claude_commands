@@ -426,7 +426,7 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
     if isinstance(request.identity.job, StepJob):
         return request.identity.job
     step = request.profile.step
-    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity) and step in GATE_PROGRAMS:
+    if isinstance(request.place, wire.LocalPlace) and step in GATE_PROGRAMS:
         job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
         if isinstance(job, StepJob):
             return job
@@ -2399,14 +2399,22 @@ class AdmissionServer:
         if isinstance(protected, landing_test_gate.RunningLandingTests):
             for record in self.reservations.values():
                 job = record.gate_job
-                unit = record.queue_waiter.get("unit", "")
+                session = record.queue_waiter.get("session_id", "")
                 if (isinstance(record.landing_test, land_runs.LandingTestReference)
-                        and record.landing_test in protected.references and isinstance(job, StepJob) and unit):
+                        and record.landing_test in protected.references and isinstance(job, StepJob) and session):
+                    members = records.queue_staff()
+                    owner = members.owner_of(session) if isinstance(members, staff.StaffSnapshot) else None
+                    if owner is None:
+                        continue
                     try:
                         names = read_step_names()
                     except conf.Unusable:
                         break
-                    return records.WaitsForLandingTest(names.for_owner(job.step, unit, OwnerRole.UNIT))
+                    if owner.kind == "unit":
+                        name = names.for_owner(job.step, owner.name, OwnerRole.UNIT)
+                    else:
+                        name = f"{owner.name} {names.shown(job.step)}"
+                    return records.WaitsForLandingTest(name)
         return records.WaitsForLandingTest()
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration

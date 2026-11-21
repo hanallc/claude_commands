@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_protocol as wire, admission_records
 from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.build_queue.test_landing_admission import request_behind_gate, running_gate_request
 
 from scripts.agents import remote
+from scripts.aws_target import cloud_gate
 
 import unittest
 import fcntl
@@ -19,7 +22,7 @@ from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
-from scripts.production import change_review, merge_gate, staff
+from scripts.production import change_review, land_runs, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
@@ -94,6 +97,52 @@ class MergeGateCheckpointTests(MergeGateFixture):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, ["fixture"])
+
+    def test_checkpoint_wait_names_the_staff_owner(self) -> None:
+        parent = fixture_member("showrunner", name="builds")
+        owner = fixture_member("unit", name="natemerge", parent=parent.id)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = owner.current_session
+        _ = self.environment.pop("CODEX_THREAD_ID", None)
+
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+            self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
+            members = staff.local_snapshot()
+            state = os.environ["MERGE_GATE_STATE_DIR"]
+            with (AdmissionFixture(skip_idle_spacing=True) as fixture,
+                  mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": state}),
+                  mock.patch.object(staff, "local_snapshot", return_value=members)):
+                _ = (fixture.root / "build_steps.conf").write_text("names.integrate=integrate\nowned.default={unit} {step}\n")
+                request = running_gate_request(fixture, run=True)
+                self.assertEqual(request.identity.unit, "fixture")
+                self.assertEqual(request.identity.session_id, owner.current_session)
+                cmdline = fixture.proc.path / str(request.owner.pid) / "cmdline"
+                _ = cmdline.write_bytes(b"python3\0merge_gate.py\0--unit\0fixture\0")
+                _ = only_admitted(fixture.connect(request).replies())
+                fixture.allow_next_start()
+                reply, = fixture.connect(request_behind_gate(fixture)).replies()
+                assert isinstance(reply, wire.Wait), reply
+                self.assertEqual(reply.text, "waits for natemerge integrate")
+            return merge_gate.GateRun((), 0, 0, tests_reused=True)
+
+        with (mock.patch.object(merge_gate, "run_suites", side_effect=suites),
+              mock.patch.object(cloud_gate, "route", return_value="private local fallback")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cloud_fallback_carries_the_gate_job_without_a_run_identity(self) -> None:
+        def local(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+            with AdmissionFixture(skip_idle_spacing=True) as fixture, land_runs.landing([self.checkpoint]):
+                request = running_gate_request(fixture)
+                self.assertEqual(request.run, wire.NO_RUN)
+                _ = only_admitted(fixture.connect(request).replies())
+                reservation, = fixture.caller_reservations().values()
+                self.assertEqual(reservation.gate_job, StepJob("test-all"))
+            return merge_gate.GateRun((), 0, 0, tests_reused=True)
+
+        with (mock.patch.object(merge_gate, "run_suites", side_effect=local),
+              mock.patch.object(cloud_gate, "route", return_value="private local fallback")):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_checkpoint_restores_the_unit_after_success_and_failure(self) -> None:
         checkpoint = merge_gate.merge_checkpoint

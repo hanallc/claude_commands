@@ -31,6 +31,7 @@ import uuid
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
 from scripts.build_targets import target_config
@@ -1742,6 +1743,18 @@ class InferProfileAtUse:
 
 INFER_PROFILE_AT_USE = InferProfileAtUse()
 
+_GATE_JOB: ContextVar[StepJob | GateJobNotRecorded] = ContextVar("gate_job", default=GATE_JOB_NOT_RECORDED)
+
+
+@contextmanager
+def local_gate_job(job: StepJob | GateJobNotRecorded) -> Generator[None]:
+    """Keep the gate job during local admission and request refreshes."""
+    token = _GATE_JOB.set(job)
+    try:
+        yield
+    finally:
+        _GATE_JOB.reset(token)
+
 
 def step_identity(step: str, worktree: str) -> wire.Identity:
     from scripts.build_queue import admission_records as records
@@ -1849,6 +1862,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                  ) -> wire.AdmitRequest:
     from scripts.build_queue import step_estimator, admission_records as records
     from scripts.buildlog import store
+    from scripts.lib.build_steps import GATE_PROGRAMS
 
     if isinstance(run, wire.NoRun):
         run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
@@ -1865,6 +1879,9 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
         records.UnspecifiedTestWidth() if request_profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
     identity = replace(step_identity(request_profile.step, request_profile.worktree), verify=verify_call())
+    job = _GATE_JOB.get()
+    if isinstance(job, StepJob) and request_profile.step in GATE_PROGRAMS:
+        identity = replace(identity, job=job)
     retry = _ACQUISITION_RETRY.get()
     if retry is not None and retry.launching:
         from scripts.buildlog import step_context

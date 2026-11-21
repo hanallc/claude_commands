@@ -3423,6 +3423,16 @@ process.stdout.write(JSON.stringify({
                     for field in ("used", "counted", "reserved", "need"):
                         self.assertNotIn(field, row)
 
+    def test_cloud_landing_wait_exposes_the_gate_cause(self) -> None:
+        reading = cloud_reading(reservation_reading())
+        active, waiting = reading.cloud
+        waiting = replace(waiting, wait=admission_records.WaitsForLandingTest("natemerge integrate"))
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=(active, waiting))):
+            page = memory_feed.reading()
+        row, = [row for row in page["waiters"] if row.get("kind") == "cloud"]
+        self.assertEqual(row.get("why"), "gate job")
+        self.assertEqual(row["reason"], "waits for natemerge integrate")
+
     def test_reserved_cloud_slot_counts_as_used_and_waits_in_the_queue(self) -> None:
         reading = cloud_reading(reservation_reading())
         first, waiting = reading.cloud
@@ -4060,6 +4070,54 @@ def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147
         _ = (agents_slice / "memory.current").write_text(f"{6 * gib}\n")
         _ = (agents_slice / "memory.stat").write_text(f"anon {5 * gib}\nshmem 0\ninactive_file {gib}\n")
         _ = (agents_slice / "memory.swap.current").write_text(f"{4 * gib}\n")
+
+
+def write_landing_wait_fixture(folder: Path) -> None:
+    """Render a private service reading with a gate and one waiting step."""
+    from scripts.build_queue.test_landing_admission import COMMIT, request_behind_gate, running_gate_request
+    from scripts.production import land_runs
+
+    builds = staff.StaffId(fixture_runtime_id("builds"))
+    natemerge = staff.StaffId(fixture_runtime_id("natemerge"))
+    queue = staff.StaffId(fixture_runtime_id("queue"))
+    members = staff.StaffSnapshot((
+        staff.StaffRow(builds, "showrunner", "builds", staff.StaffRoot(), current_session=builds),
+        staff.StaffRow(natemerge, "unit", "natemerge", staff.ReportsTo(builds), current_session=natemerge),
+        staff.StaffRow(queue, "unit", "queue", staff.ReportsTo(builds), current_session=queue),
+    ))
+    with (AdmissionFixture(skip_idle_spacing=True) as admission,
+          mock.patch.object(staff, "local_snapshot", return_value=members),
+          mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": natemerge, "CODEX_THREAD_ID": "",
+                                       admission_records.BUILDLOG_UNIT: "builds"}),
+          land_runs.landing([COMMIT], ["builds bb15"])):
+        _ = (admission.root / "build_steps.conf").write_text("names.integrate=integrate\nowned.default={unit} {step}\n")
+        with admission_client.local_gate_job(StepJob("integrate", unit="builds")):
+            request = running_gate_request(admission)
+        request = replace(request, sidecar=str(admission.scope(request.owner)))
+        _ = only_admitted(admission.connect(request).replies())
+        waiting = request_behind_gate(admission)
+        waiting = replace(waiting, identity=replace(waiting.identity, session_id=queue, name="queue"),
+                          route=target_config.PinnedTarget("natedev"))
+        reply, = admission.connect(waiting).replies()
+        assert isinstance(reply, wire.Wait), reply
+        view, = admission.connect(wire.ViewRequest()).replies()
+        assert isinstance(view, wire.ViewReply), view
+
+        fixture = MemoryFeedTests()
+        fixture.setUp()
+        try:
+            write_private_slot_roots(fixture.root / "build_folders.conf", fixture.root, "natedev")
+            with (staff.supplied_snapshot(members),
+                  mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+                  mock.patch.object(admission_client, "view", return_value=view.reading)):
+                page = memory_feed.reading()
+            running, = [row for row in page["walk"] if row["pid"] == request.owner.pid]
+            running["name"] = memory_feed.QueueRowName.owner_only("builds bb15")
+            running["name_parts"] = staff_names.text_parts(running["name"])
+            page["walk"] = [running]
+            _ = (folder / "landing_wait.json").write_text(memory_feed.page_json(page))
+        finally:
+            fixture.doCleanups()
 
 
 def write_browser_fixture(folder: Path) -> None:

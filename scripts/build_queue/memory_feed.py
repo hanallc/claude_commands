@@ -1072,6 +1072,7 @@ class CloudRunRow(CloudWorkRow):
 class CloudWaitRow(CloudWorkRow):
     since: float
     reason: str
+    why: NotRequired[WaitCause]
 
 
 @dataclass(frozen=True)
@@ -3147,8 +3148,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if not isinstance(cloud.wait, admission_records.ReadyForAdmission):
                 reason = (cloud.wait.text if isinstance(cloud.wait, wire.CloudSlotWait)
                           else reason_phrase(cloud.wait, ()))
-                cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": reason,
+                queued: CloudWaitRow = {**values, "since": cloud.since, "reason": reason,
                     "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
+                if not isinstance(cloud.wait, wire.CloudSlotWait):
+                    queued["why"] = wait_why(cloud.wait)
+                cloud_waiters[cloud.owner] = queued
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])

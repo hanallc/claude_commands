@@ -24,7 +24,8 @@ from scripts.lib import build_folders
 from scripts.lib.process_start import Started
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lint import memory_admit as gate
-from scripts.production import land_queue, land_runs
+from scripts.production import land_queue, land_runs, staff
+from scripts.production.staff_test_support import fixture_runtime_id
 
 
 REPOSITORY = records.RepositoryIdentity("https://github.com/natepiano/claude_commands", "claude_commands")
@@ -54,24 +55,41 @@ def local_test_clone(root: Path, source_name: str = "source", upstream: str = RE
     return clone
 
 
+def running_gate_request(fixture: AdmissionFixture, *, run: bool = False) -> wire.AdmitRequest:
+    request = fixture.request(step="merge-gate", need=GIB)
+    profile = records.ProgramProfile("merge-gate", "fixture", request.cwd,
+        records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now()))
+    identity = wire.RunIdentity(request.owner.pid, request.owner.start_time) if run else wire.NO_RUN
+    with patch.object(client, "CLOCK", fixture.clock):
+        request = client.step_request(["merge-gate"], request.cwd, request.owner, request.since, "",
+                                      request.episode, profile, run=identity)
+    return replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY))
+
+
+def request_behind_gate(fixture: AdmissionFixture, *, cloud: bool = False) -> wire.AdmitRequest:
+    waiting = fixture.request(step="nextest", need=GIB)
+    return replace(waiting, identity=replace(waiting.identity, unit="queue", landing_repository=LANDING_REPOSITORY),
+                   place=wire.CloudPlace("aws") if cloud else wire.LocalPlace())
+
+
 class LandingAdmissionTests(unittest.TestCase):
     def test_wait_names_the_live_gate_job_from_its_command_and_configuration(self) -> None:
+        session = staff.StaffId(fixture_runtime_id("natemerge"))
+        owner = staff.StaffRow(session, "unit", "natemerge", staff.StaffRoot(), current_session=session)
         for options, key, step in (((), "integrate", "integrate"), (("--tests-only",), "test-all", "test all")):
             with (self.subTest(options=options), AdmissionFixture(skip_idle_spacing=True) as fixture,
+                  patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session, "CODEX_THREAD_ID": "",
+                                          records.BUILDLOG_UNIT: "builds"}),
+                  patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((owner,))),
                   land_runs.landing([COMMIT], ["builds bb15"])):
                 config = fixture.root / "build_steps.conf"
                 _ = config.write_text(f"names.{key}={step}\nowned.default={{unit}} {{step}}\n")
-                running = fixture.request(step="merge-gate", need=GIB)
+                running = running_gate_request(fixture)
+                self.assertEqual(running.run, wire.NO_RUN)
                 command = ("python3", "/fixture/merge_gate.py", "--unit", "builds", *options)
                 _ = (fixture.proc.path / str(running.owner.pid) / "cmdline").write_text("\0".join(command) + "\0")
-                running = replace(running, run=wire.RunIdentity(running.owner.pid, running.owner.start_time),
-                    identity=replace(running.identity, unit="natemerge", landing_test=land_runs.test_reference(),
-                                     landing_repository=LANDING_REPOSITORY))
                 grant = only_admitted(fixture.connect(running).replies())
-                waiting = fixture.request(step="test", need=GIB)
-                waiting = replace(waiting, identity=replace(waiting.identity, unit="queue",
-                    landing_repository=LANDING_REPOSITORY))
-                peer = fixture.connect(waiting)
+                peer = fixture.connect(request_behind_gate(fixture))
                 reply, = peer.replies()
                 assert isinstance(reply, wire.Wait), reply
                 self.assertEqual(reply.text, f"waits for natemerge {step}")

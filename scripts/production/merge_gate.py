@@ -97,7 +97,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records  # noqa: E402
+from scripts.build_queue import admission_client, admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -2810,13 +2810,15 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Route merge gates through AWS. Split targeted tests between natedev and the Mac."""
     def run_local(types: Sequence[str]) -> GateRun:
-        return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
+        with admission_client.local_gate_job(gate_job):
+            return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
 
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
-        return run_suites(repo, types, module_time_limit_s, source=source, full=full,
-                          mode=mode, selected=SelectedModules(paths))
+        with admission_client.local_gate_job(gate_job):
+            return run_suites(repo, types, module_time_limit_s, source=source, full=full,
+                              mode=mode, selected=SelectedModules(paths))
 
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
         outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
