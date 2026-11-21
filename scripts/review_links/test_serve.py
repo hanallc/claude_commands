@@ -11,7 +11,6 @@ import importlib.util
 import json
 import gzip
 import os
-import re
 import select
 import shlex
 import shutil
@@ -54,9 +53,10 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
-from scripts.lib import atomic_file, conf, file_lock, scratch, urgency
+from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.whoami import usage_store
 
 
 ROLE_COLOR_CONFIG = (
@@ -131,6 +131,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -2892,6 +2893,30 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), prior_log)
                 self.assertEqual(review_later.path().read_bytes(), prior_deadline)
 
+    def test_review_shows_only_current_question_failures(self) -> None:
+        case = self.review_fixture(changes=1)
+        report = case.investigation()
+        investigation_key = f'investigation/{report.owner}/{report.id}'
+        proposal, efficiency = case.decisions()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        for key in ('page-owner/C1', investigation_key, proposal, efficiency):
+            with self.subTest(key=key):
+                saved = cache.save(case.card_body(cache.get(), key, 'question', 'Which checks passed?'), case.status)
+                assert isinstance(saved.delivery, change_page.MessageDelivery)
+                with patch.object(change_page, 'send_to_staff', side_effect=ValueError('The fixture owner is offline.')):
+                    change_page.deliver(saved.delivery, case.status)
+                current = review_page.build_snapshot(case.root)
+                self.assertIn('Question not delivered.', current.assets['question-delivery:'+key])
+                if key == investigation_key:
+                    question = case.status.slots(saved.delivery.page, saved.delivery.row).question
+                    assert isinstance(question, change_page.OpenQuestion)
+                    _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
+                                             question_id=question.question_id)
+                    current = review_page.build_snapshot(case.root)
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+                elif key in (proposal, efficiency):
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+
     def test_review_returns_conflict_for_a_deleted_investigation(self) -> None:
         case = self.review_fixture()
         report = case.investigation()
@@ -3311,12 +3336,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         ask = page_question.ask
 
         def claim(store: page_question.QuestionStore, target: change_page.QuestionDeliveryTarget, words: str,
-                  status: change_page.DeliveryStatus, *, resend_unknown: bool = False,
-                  resend_request: str = "") -> change_page.MessageDelivery:
+                  status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
             list_locked.set()
             if not finish_ask.wait(TEST_HANG_GUARD_SECS):
                 raise TimeoutError("The test did not finish Ask.")
-            return ask(store, target, words, status, resend_unknown=resend_unknown, resend_request=resend_request)
+            return ask(store, target, words, status)
 
         with (patch.object(page_question, "ask", side_effect=claim),
               patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
@@ -3827,6 +3851,102 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
                 self.assertEqual(status.request_attempts, {})
 
+    def test_list_question_claim_failure_and_deferred_recovery(self) -> None:
+        keeper = staff.StaffId("fixture-morty")
+        item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        status = change_page.DeliveryStatus(self.root)
+        words = "Which check passed?"
+        request = the_list.PageRequest(uuid4().hex, "question", words)
+        with (patch.object(process_start, "process_start",
+                           return_value=process_start.Unreadable("fixture read error")),
+              redirect_stderr(StringIO()) as errors):
+            refused = the_list.ask_question(keeper, item.id, request, status)
+        assert isinstance(refused, change_page.PageQuestionSend)
+        path = status.path(refused.page, refused.row)
+        failed = change_page.read_question_attempt(path)
+        self.assertEqual(failed.state, delivery_state.QuestionSendState.FAILED)
+        self.assertIsInstance(failed.owner, delivery_state.NoQuestionSendOwner)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+        # A new Ask can try the same saved question after a confirmed refusal.
+        request = the_list.PageRequest(uuid4().hex, "question", words)
+        pending = the_list.ask_question(keeper, item.id, request, status)
+        assert isinstance(pending, change_page.PageQuestionSend)
+        assert isinstance(pending.job, change_page.QuestionJob)
+        restarted = change_page.DeliveryStatus(self.root)
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            try:
+                change_page.recover_review_messages(restarted)
+                send.assert_not_called()
+                self.assertTrue(restarted.has_deferred_questions())
+            finally:
+                pending.job.release()
+            change_page.recover_deferred_questions(restarted)
+            change_page.recover_deferred_questions(restarted)
+        send.assert_called_once()
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+        self.assertFalse(restarted.has_deferred_questions())
+
+    def test_list_question_recovers_when_the_failure_cannot_be_recorded(self) -> None:
+        keeper = staff.StaffId("fixture-morty")
+        for fault in ("read", "write"):
+            with self.subTest(fault=fault):
+                item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE,
+                                    source="nate", changes={})
+                status = change_page.DeliveryStatus(self.root)
+                request = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
+                delivery = the_list.ask_question(keeper, item.id, request, status)
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                path = status.path(delivery.page, delivery.row)
+                attempt = change_page.read_question_attempt(path)
+                failure = OSError("Cannot access the delivery record.")
+                writer = change_page.publish_question_attempt
+
+                def write_attempt(path: Path, record: delivery_state.QuestionAttempt) -> None:
+                    if record.state is delivery_state.QuestionSendState.FAILED:
+                        raise failure
+                    writer(path, record)
+
+                fault_patch = (patch.object(change_page, "read_question_attempt", side_effect=failure)
+                               if fault == "read" else patch.object(change_page, "publish_question_attempt",
+                                                                    side_effect=write_attempt))
+                with (fault_patch, redirect_stderr(StringIO()) as errors,
+                      patch.object(change_page, "send_question", return_value=question_outcome("refused")) as send):
+                    change_page.deliver(delivery, status)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(str(failure), errors.getvalue())
+                self.assertTrue(status.has_deferred_questions())
+                self.assertFalse(status.question_jobs)
+                if fault == "read":
+                    send.assert_not_called()
+
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as recover:
+                    change_page.recover_deferred_questions(status)
+                    change_page.recover_deferred_questions(status)
+                recover.assert_called_once_with(keeper, attempt.message, attempt.message_id)
+                self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+
+    def test_list_question_shows_a_failed_saved_message_mismatch(self) -> None:
+        keeper = staff.StaffId("fixture-morty")
+        item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        status = change_page.DeliveryStatus(self.root)
+        request = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
+        pending = the_list.ask_question(keeper, item.id, request, status)
+        assert isinstance(pending, change_page.PageQuestionSend)
+        assert isinstance(pending.job, change_page.QuestionJob)
+        pending.job.release()
+        path = status.path(pending.page, pending.row)
+        attempt = change_page.read_question_attempt(path)
+        with status.locked():
+            change_page.advance_question_attempt(path, attempt, replace(attempt, message="Different message"))
+        with (patch.object(change_page, "send_question") as send, redirect_stderr(StringIO()) as errors):
+            change_page.recover_review_messages(status)
+        send.assert_not_called()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        saved = the_list.load(keeper, item.id)
+        view = the_list.question_visibility(keeper, saved, status)
+        self.assertEqual(view, the_list.QuestionAttention(frozenset({"Q1"})))
+
     def test_list_ask_preserves_unicode_separators(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
@@ -3857,7 +3977,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
 
-    def test_exhausted_list_question_returns_to_open_and_resends_the_same_id(self) -> None:
+    def test_exhausted_list_question_reports_failure_after_automatic_retries(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
         item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
@@ -3884,7 +4004,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "deliver", side_effect=deliver),
               patch.object(change_page, "alert_delivery_failures"),
               patch.object(change_page, "send_question", side_effect=[
-                  *([question_outcome("refused", "Producer offline")] * tries), question_outcome()]) as send):
+                  *([question_outcome("refused", "Producer offline")] * tries)]) as send):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
@@ -3897,22 +4017,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             markup = opened.body.decode().split('<script>', 1)[0]
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
             self.assertIn('data-open-question="true"', markup)
-            self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
-            signed = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', markup))
-            finished.clear()
-            code, response = self.post(list_page.PAGE_PATH, urlencode({
-                **signed, "action": "resend-Q1", "words": "Ignore these new words.", "until": ""}))
-            self.assertEqual(code, 200)
-            self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
-            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
-            self.assertEqual(send.call_count, tries + 1)
-            self.assertEqual(messages, [messages[0], messages[0]])
+            self.assertIn("Question not delivered.", markup)
+            self.assertNotIn('value="resend-', markup)
+            self.assertNotIn("ready to send", markup)
+            code, _ = self.post(list_page.PAGE_PATH, urlencode({**fields, "action": "resend-Q1"}))
+            self.assertEqual(code, 400)
+            self.assertEqual(the_list.load(morty.id, item.id), saved)
+            self.assertEqual(send.call_count, tries)
+            self.assertEqual(len(messages), 1)
             self.assertIn(f"\n{words}\n", messages[0])
             self.assertIn("answer L1 --question Q1", messages[0])
-            self.assertEqual(the_list.load(morty.id, item.id), saved)
-            waiting = self.request(list_page.PAGE_PATH).body.decode().split('<script>', 1)[0]
-            self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]*">')
-            self.assertNotIn('value="resend-Q1"', waiting)
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
@@ -4147,15 +4261,260 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if fail:
                     self.assertEqual(errors.getvalue(), "review-links accounts: no stored data\n")
 
+    def test_accounts_request_waits_for_a_new_render_when_cached_page_is_old(self) -> None:
+        cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"old page", .5, 100))):
+            self.assertEqual(cache.get(), b"old page")
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new page", .5, 200)) as render):
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(reply, b"new page")
+            render.assert_called_once_with()
+
+    def test_accounts_request_refreshes_in_background_within_current_configured_period(self) -> None:
+        cache = serve.AccountsPageCache()
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings, "page_refresh_seconds=37\n")
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"first page", .5, 100)
+            self.assertEqual(cache.get(), b"first page")
+            clock.return_value = 130
+            render.return_value = accounts_page.AccountsRender(b"second page", .5, 130)
+            self.assertEqual(cache.get(), b"first page")
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(cache.page, b"second page")
+            self.assertEqual(render.call_count, 2)
+            _ = write_config_fixture(settings, "page_refresh_seconds=15\n")
+            clock.return_value = 160
+            render.return_value = accounts_page.AccountsRender(b"third page", .5, 160)
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(reply, b"third page")
+            self.assertEqual(render.call_count, 3)
+
+    def test_old_accounts_requests_share_the_running_background_render(self) -> None:
+        entered, release, waiters_entered = threading.Event(), threading.Event(), threading.Event()
+        waiters: set[str] = set()
+
+        class WaiterCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("old-accounts-request"):
+                    waiters.add(name)
+                    if len(waiters) == 2:
+                        waiters_entered.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=WaiterCondition())
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(b"new page", .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        requests = [threading.Thread(target=request, name=f"old-accounts-request-{index}") for index in range(2)]
+        with (patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"old page", .5, 100)
+            self.assertEqual(cache.get(), b"old page")
+            render.reset_mock()
+            render.side_effect = render_page
+            try:
+                self.assertEqual(cache.get(), b"old page")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                clock.return_value = 101 + refresh
+                for reader in requests:
+                    reader.start()
+                self.assertTrue(waiters_entered.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                for reader in requests:
+                    if reader.ident is not None:
+                        reader.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"new page", b"new page"])
+            render.assert_called_once_with()
+
+    def test_old_accounts_request_keeps_last_good_page_when_the_new_render_fails(self) -> None:
+        cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("fixture render failure")),
+              redirect_stderr(StringIO())):
+            failed = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+        self.assertEqual(failed, good.replace(b'data-page-facts', b'data-page-facts data-read-error="The Accounts render failed."'))
+        self.assertEqual(cache.page, good)
+        self.assertEqual(tuple(cache.recent_times), (.25,))
+
+    def test_accounts_requests_share_a_new_render_after_the_store_changes_during_a_render(self) -> None:
+        entered, release, requests_entered = threading.Event(), threading.Event(), threading.Event()
+        readers: set[str] = set()
+
+        class ReaderCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("accounts-new-usage-"):
+                    readers.add(name)
+                    if len(readers) == 2:
+                        requests_entered.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=ReaderCondition())
+        store = usage_store.store_file()
+        _ = store.write_bytes(b"11%")
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            usage = store.read_bytes()
+            if usage == b"11%":
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(usage, .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        requests = [threading.Thread(target=request, name=f"accounts-new-usage-{index}") for index in range(2)]
+        with (patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"11%", .5, 100)
+            self.assertEqual(cache.get(), b"11%")
+            render.side_effect = render_page
+            try:
+                self.assertEqual(cache.get(), b"11%")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                updated = store.with_suffix(".new")
+                _ = updated.write_bytes(b"10%")
+                _ = updated.replace(store)
+                clock.return_value = 101 + refresh
+                for reader in requests:
+                    reader.start()
+                self.assertTrue(requests_entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertEqual(render.call_count, 2)
+            finally:
+                release.set()
+                for reader in requests:
+                    if reader.ident is not None:
+                        reader.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"10%", b"10%"])
+            self.assertEqual(render.call_count, 3)
+
+    def test_accounts_request_returns_after_one_new_render_during_repeated_store_updates(self) -> None:
+        entered, release, request_waiting = threading.Event(), threading.Event(), threading.Event()
+
+        class ReaderCondition(threading.Condition):
+            @override
+            def wait(self, timeout: float | None = None) -> bool:
+                request_waiting.set()
+                return super().wait(timeout)
+
+        cache = serve.AccountsPageCache(condition=ReaderCondition())
+        store = usage_store.store_file()
+        _ = store.write_bytes(b"1")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            usage = store.read_bytes()
+            if usage < b"4":
+                updated = store.with_suffix(".new")
+                _ = updated.write_bytes(str(int(usage) + 1).encode())
+                _ = updated.replace(store)
+            if usage == b"1":
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(usage, .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        with patch.object(accounts_page, "render_with_facts") as render:
+            render.return_value = accounts_page.AccountsRender(b"1", .5, 100)
+            self.assertEqual(cache.get(), b"1")
+            render.side_effect = render_page
+            reader = threading.Thread(target=request)
+            try:
+                self.assertEqual(cache.get(), b"1")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                reader.start()
+                self.assertTrue(request_waiting.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                if reader.ident is not None:
+                    reader.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"2"])
+            self.assertEqual(render.call_count, 3)
+            self.assertEqual(cache.get(), b"3")
+            self.assertEqual(store.read_bytes(), b"4")
+            self.assertEqual(render.call_count, 4)
+
+    def test_accounts_route_keeps_last_good_page_when_refresh_setting_is_unreadable(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings)
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(accounts_page, "render_with_facts", return_value=first) as render,
+              redirect_stderr(StringIO())):
+            good = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(good.status, 200)
+            settings.unlink()
+            failed = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(failed.status, 200)
+            self.assertIn(b'data-read-error="The Accounts refresh setting could not be read."', failed.body)
+            self.assertIn(b'data-read-at="100.000000"', failed.body)
+            self.assertIn(b'>board</p>', failed.body)
+
+            self.server.accounts_cache = serve.AccountsPageCache()
+            first_failure = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(first_failure.status, 503)
+            render.assert_called_once_with()
+
     def test_accounts_cached_http_response_carries_a_render_failure_then_recovers(self) -> None:
         cache = serve.AccountsPageCache()
         first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
-        with patch.object(accounts_page, "render_with_facts", return_value=first):
-            good = cache.replace()
-        with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
               redirect_stderr(StringIO())):
-            _ = cache.replace()
-        with patch.object(threading.Thread, "start"):
             failed = cache.get()
         self.assertIn(b'data-read-error="The Accounts render failed."', failed)
         self.assertIn(b'data-read-at="100.000000"', failed)
@@ -4166,8 +4525,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             response = self.request(accounts_page.PAGE_PATH)
         self.assertEqual(response.status, 200)
         self.assertEqual(response.body, failed)
-        with patch.object(accounts_page, "render_with_facts", return_value=first):
-            recovered = cache.replace()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            recovered = cache.get()
         self.assertNotIn(b'data-read-error', recovered)
 
     def test_accounts_first_request_waits_for_its_render(self) -> None:
@@ -4202,9 +4562,12 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_accounts_cache_keeps_only_the_last_ten_successful_render_times(self) -> None:
         cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
         for seconds in range(1, 13):
-            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds+100)):
-                _ = cache.replace()
+            with (patch.object(time, "monotonic", return_value=seconds * (refresh + 1)),
+                  patch.object(accounts_page, "render_with_facts",
+                               return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds + 100))):
+                _ = cache.get()
         self.assertEqual(tuple(cache.recent_times), tuple(range(3, 13)))
         self.assertIn(b'data-render-seconds="12.000000"', cache.page)
         self.assertIn(b'data-read-at="112.000000"', cache.page)

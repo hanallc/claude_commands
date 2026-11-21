@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from typing import cast, override
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_targets import build_targets, targets
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
@@ -36,7 +37,8 @@ class RoutingRuleTests(unittest.TestCase):
             for flag, message in cases:
                 with self.subTest(flag=flag):
                     result = subprocess.run(["bash", "-c", parser + '\nCMD=build\nparse_routing_arguments "$@"',
-                        "verify-parser", flag], cwd=directory, capture_output=True, text=True,
+                        "verify-parser", flag],
+                        env=verify_test_environment(), cwd=directory, capture_output=True, text=True,
                         check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 2)
                     self.assertIn(message, result.stderr)
@@ -52,6 +54,7 @@ printf '%s\n' "${ARGS[@]}"
         with tempfile.TemporaryDirectory() as directory:
             def parse(*words: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(["bash", "--noprofile", "--norc", "-c", parser, "verify-parser", *words],
+                                      env=verify_test_environment(),
                                       cwd=directory, capture_output=True, text=True, check=False,
                                       timeout=TEST_HANG_GUARD_SECS)
             build = parse("build", "sample", "--release", "--attached")
@@ -87,7 +90,8 @@ for CMD in check test doc lint example build final; do
 done
 '''
         with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(["bash", "--noprofile", "--norc", "-c", parser], cwd=directory,
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-c", parser],
+                                   env=verify_test_environment(), cwd=directory,
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
