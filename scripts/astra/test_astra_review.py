@@ -474,29 +474,7 @@ class AstraReviewTests(StaffTestCase):
                         else:
                             self.assertTrue(self.world.stop(second, self.world))
                             self.assertEqual(progress_history.cancel_worker_passes(run, second.id), 1)
-                    if scenario == "final save interrupted":
-                        with (patch.object(progress_history, "save_hook_completion", side_effect=interrupt_final_save),
-                              self.assertRaisesRegex(InterruptedError, "final record interrupted")):
-                            _ = self.fixture.finish(row.name)
-                        self.assertFalse(completion().recording_done)
-                        repeated = invoke_recorder(["finish-run", "--session-dir", str(run), "--status", "completed"],
-                                                   self.environment, self.root)
-                        self.assertEqual(repeated.returncode, 0, repeated.stderr)
-                        current = staff.by_id(owner.id)
-                        assert current is not None
-                        self.assertEqual(current.run, staff.OpenRun(run))
-                    if scenario == "release interrupted":
-                        with (patch.object(staff, "clear_run", side_effect=InterruptedError("release interrupted")),
-                              self.assertRaisesRegex(InterruptedError, "release interrupted")):
-                            _ = self.fixture.finish(row.name)
-                        self.assertTrue(completion().finished)
-                        self.assertTrue(completion().recording_done)
-                        current = staff.by_id(owner.id)
-                        assert current is not None
-                        self.assertEqual(current.run, staff.OpenRun(run))
-                    expected = turn_end.TurnOutcome.IGNORED if scenario == "release interrupted" else turn_end.TurnOutcome.DONE
-                    self.assertEqual(self.fixture.finish(row.name), expected)
-                    if scenario in ("second pass without completion", "stopped cleanup interrupted"):
+                        self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
                         repeated = invoke_recorder(["finish-run", "--session-dir", str(run), "--status", "completed"],
                                                    self.environment, self.root)
                         self.assertEqual(repeated.returncode, 0, repeated.stderr)
@@ -521,6 +499,29 @@ class AstraReviewTests(StaffTestCase):
                             assert isinstance(stopped, progress_history.HookCompletion)
                             self.assertTrue(stopped.finished and stopped.role_released and stopped.recording_done)
                             self.assertEqual(stopped.stopped_reply, progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE)
+                    else:
+                        if scenario == "final save interrupted":
+                            with (patch.object(progress_history, "save_hook_completion", side_effect=interrupt_final_save),
+                                  self.assertRaisesRegex(InterruptedError, "final record interrupted")):
+                                _ = self.fixture.finish(row.name)
+                            self.assertFalse(completion().recording_done)
+                            repeated = invoke_recorder(["finish-run", "--session-dir", str(run), "--status", "completed"],
+                                                       self.environment, self.root)
+                            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                            current = staff.by_id(owner.id)
+                            assert current is not None
+                            self.assertEqual(current.run, staff.OpenRun(run))
+                        if scenario == "release interrupted":
+                            with (patch.object(staff, "clear_run", side_effect=InterruptedError("release interrupted")),
+                                  self.assertRaisesRegex(InterruptedError, "release interrupted")):
+                                _ = self.fixture.finish(row.name)
+                            self.assertTrue(completion().finished)
+                            self.assertTrue(completion().recording_done)
+                            current = staff.by_id(owner.id)
+                            assert current is not None
+                            self.assertEqual(current.run, staff.OpenRun(run))
+                        expected = turn_end.TurnOutcome.IGNORED if scenario == "release interrupted" else turn_end.TurnOutcome.DONE
+                        self.assertEqual(self.fixture.finish(row.name), expected)
                 if scenario != "unit":
                     self.assertTrue(completion().recording_done)
                     self.assertTrue(completion().finished)
