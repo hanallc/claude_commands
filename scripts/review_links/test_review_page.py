@@ -3101,8 +3101,8 @@ window.fetch=async(url,options)=>{
   form.requestSubmit(form.querySelector('[value="question"]'));
   if(!form.dataset.sending) throw new Error('The Question follow-up did not start.');
   await saved;
-  check(form.querySelector('[data-send-status]').textContent==='Saved: question sent',
-   'The Question follow-up saves before the next index arrives.');
+  const status=form.querySelector('[data-send-status]');
+  check(status.textContent==='' && status.hidden,'The saved Question follow-up leaves the status empty and hidden.');
   check(rows()[0]?.dataset.key===remaining,'The other Question stays visible.');
   checkCounts(1);
   check(chip('show','Waiting').querySelector('b').textContent==='0',

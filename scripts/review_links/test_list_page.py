@@ -360,6 +360,7 @@ class ListPageTests(unittest.TestCase):
             + "# whole: 1..1440\nlater_soon_minutes=60\n"
             + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
             + "later_week_day=Monday\nlater_week_time=09:00\n"
+            + "# whole: 1..60\npark_time_step_minutes=15\n"
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
             + "# whole: 1..300\npage_request_timeout_seconds=15\n"
             + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
