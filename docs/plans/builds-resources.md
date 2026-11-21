@@ -3075,6 +3075,16 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - Module test: 368 tests pass with both layouts.
 - Blind review: 6 findings; 2 fixed in the row; 4 go to the next phase (growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`).
 
+### Phase 142b — Mac clippy fixes, part 2 (item 142)  · status: todo
+**Source:** builds 2026-11-21 08:49 EST; List item 142, producer bob. verify handed it over at 08:50. Base: 43h tip `736dd5f62` (branch `verify-cargo-token-3`); merge the new 43h tip once. Work order: verify `phases/fix_steps/part2_work_order.md`; interfaces: verify `phases/44u/contract.md` sections 2, 5.3, 6.
+
+#### Work Order
+1. Verify captures one `CallerLintPolicy` (new `scripts/lint/caller_lint_policy.py`) and passes it with `--caller-lint-policy-file` to every remote lint step: held lint, clippy --fix, the post-fix judgment (43z F009).
+2. A skipped check is a `skipped_checks` entry and never a reusable pass (`runner_result.py`: `ResultWord` skipped, `UsableRunnerResult.skipped_checks`, decoded once in `read_result`).
+3. One Clippy pass limit and progress rule in `invoke.sh`; Verify keeps host formatting and admission.
+4. A Mac fix runs only in rewrite mode, for a repairable finding in the held path.
+5. Busy fallback releases the Mac attempt at placement, reservation and runner return.
+
 ### Phase 173 — No test depends on a live tuned value (item 149)  · status: in progress
 **Source:** List item 149, producer bob, go 2026-11-19 17:06 EST through builds. Base main b4e705f34. Same class as the 2026-11-16 order ("fix the class, not the instance").
 
@@ -3102,7 +3112,7 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - `settings.json`: `permissions.additionalDirectories` and `sandbox.filesystem.allowWrite` name `~/worktrees` beside `~/rust`.
 - Read-only review: 0 findings. On main `168cedb541` as `24e9e2013` (bb12).
 
-### Phase 180 — AWS local folder removal under the item 152 rules  · status: in progress
+### Phase 180 — AWS local folder removal under the item 152 rules  · status: done
 **Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Survey rows in phases/178/survey_reply.txt (180 rows). aws gets the lines first (sent 2026-11-20 10:3x).
 
 #### Work Order
@@ -3121,7 +3131,7 @@ Each removal below is off until the bubblewrap proof is on main and nate gives h
 4. Phase 180: `gpu_size_trial.py:460` `new_trial` keeps earlier trial folders. At the re-arm it removes them again, with a marker file check that prepare writes (aws, 2026-11-20 10:15 EST; bob, 10:16 EST).
 5. The masked timers: disk-floor, tmp sweep, folder-audit, transcript-retention, tmpfiles-clean.
 
-### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: in progress
+### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: done
 **Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Every tool that removes folders calls one guard. It refuses a path not below a declared "can be made again" root, a folder with an unknown maker, and a root taken from a computed parent.
 
 #### Work Order
@@ -3168,3 +3178,40 @@ Work Order:
 - The worker turn-end hook puts each kept folder in its completion details, because the native hook child discards stderr.
 - The Mac fixture uses a private `HOME`, `XDG_CONFIG_HOME` and `SCRATCH_VISIBLE_ROOT`. The gate fixture keeps natest 385's tmpfs parent and `pin_gate_root` with 181's private Git environment.
 - Row tests: 57 modules, both layouts, 114 of 114 green. Reviews: 3 closure reviews, 2 fixes and 1 rebase.
+- Fix 2, `e918e5312` in batch bb181f on main `cfa095c714`: the close hook fixture renames its status file with Python `os.replace`. Under zsh the fixture PATH has no `mv`, so the bb15 Mac gate test waited until the module limit.
+
+### Phase 182 — The AWS cost history backup (item 165)  · status: in progress
+**Source:** builds, 2026-11-20 11:44 EST (List item 165, producer bob). Plan accepted 11:47 EST with three conditions: no secret file in the backup, config keys for the paths, the interval and the Mac folder, and the nixos timer text goes to builds.
+
+- `scripts/backup/state_backup.py run` copies the approved files under `~/.local/state/build-targets/aws` to the Mac folder `~/backups/natedev/aws-state`, only when a file changed. A secret pattern in any file refuses the run. The Mac checks the sha256 of each copy.
+- `restore` unpacks one copy into an empty scratch folder only. Nothing deletes a copy.
+- One alert on a failed run. The nixos timer text is in `docs/as-built/state-backup.md`; it goes to builds with the hash.
+- Until the timer is live, one manual copy each day.
+
+### Phase 183 — A failed crate checkout check keeps the removal notice (phase 174 F027)  · status: in progress
+**Source:** phase 174 closure review F027, moved to a follow-up by the builds landing rule (2026-11-20 17:04 EST). builds 18:27 and 18:34 EST: take F027 while the merges run.
+
+- `crate_run.py` `complete_run` saves `removal_reported` before `worktrees.remove_git_checkout` checks the checkout. A failed check then suppresses the next notice.
+- The order becomes: check, save, then print. A failed check saves nothing, so the next run reports again.
+- The phase stacks on the phase 174 commit. It moves onto main with phase 174.
+
+### Phase 184 — Mac gate close follow-ups (181m F005, F006, F007)  · status: done
+**Source:** phase 181m fix reviews, 2026-11-20 22:19 EST. builds 22:31 EST: take F005, F006 and F007 as one phase on top of `376413140` while bb15 merges.
+
+- F005: with no Mac close script, the fallback reports removed only when the checkout is gone on the Mac.
+- F006: a natedev pass that already looks at its Mac mirrors unregisters a Mac gate checkout that the Mac confirms is gone.
+- F007: the old-result removed paths unregister once; the receipt keeps only kept folders.
+- No automatic deletion, no timer and no config change (item 152).
+
+### Phase 143r — Item 143 restack: merge main into phases 174 and 183  · status: todo
+**Source:** builds, 2026-11-20 23:21 EST: the 143 hash (174 and 183) goes in the batch after bb16.
+
+- One merge of main `aacad65c6` into `f86816c9b`. It resolves the conflicts in `add_unit.py`, `test_verify_doc_checkout.py` and `test_slot_order.py`.
+- The commit holds the bb15 rows 178 and 181 under it, so it lands after bb15.
+
+### Phase 185 — The lint copy close proves its claim on disk (item 152 live issue)  · status: in progress
+**Source:** builds, 2026-11-21 09:00 EST: run 20261121T084352-3507509-bef1 started on the old `verify.sh` and failed on the new `return-copy` (`--allocation-id` required).
+
+- `return-copy` without `--allocation-id` (a caller from before the update) returns the changes and keeps the copy for the manual list.
+- Close removes a copy when the caller gives the allocation id that the copy's claim wrote. The in-process claim list goes: the verify helper drops loaded modules on a tree update, so every live copy leaked (about 325 MB each).
+- `drop-copy` takes `--allocation-id`; `verify.sh` passes it.
