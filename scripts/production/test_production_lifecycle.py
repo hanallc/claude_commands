@@ -261,7 +261,8 @@ class LifecycleTests(LifecycleFixture):
         super().setUp()
         self.env["GATE_TEST_HOST"] = remote.local_machine()
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
-        _ = self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": self.env["SHOWRUNNER_STATE_DIR"]}))
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {"SHOWRUNNER_STATE_DIR": self.env["SHOWRUNNER_STATE_DIR"]})))
         with mock.patch.dict(os.environ, self.env):
             _ = production_admission.capture_rollout_inventory([self.owner_id()])
 
