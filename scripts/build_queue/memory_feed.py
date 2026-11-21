@@ -815,7 +815,7 @@ def job_notes(job: StepJobReading, names: StepNames, *, step: str = "",
         return {}
     notes: RowQueueNotes = {"about": about}
     if isinstance(job, StepJob):
-        notes["changes"] = names.changes(job)
+        notes["changes"] = f"{job.branch} branch" if job.step == "integrate" and job.branch else names.changes(job)
     return notes
 
 

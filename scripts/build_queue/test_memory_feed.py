@@ -2762,6 +2762,7 @@ process.stdout.write(JSON.stringify({
             row, = [row for row in rows if row.get("kind") == "cloud"]
             self.assertEqual(row["name"], "showrunner integrate")
             self.assertEqual(row.get("about"), "Runs a merge or test job")
+            self.assertEqual(row.get("changes"), "sdlc branch")
 
     def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
         page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))

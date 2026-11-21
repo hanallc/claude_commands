@@ -1898,53 +1898,45 @@ PROMOTION_TRACKED_CHECK = ("import json, os, subprocess, sys, tempfile\nfrom pat
 
 
 @dataclass(frozen=True)
-class RecordedPush:
-    """The gate's exact local commit and the source and base that produced it."""
+class RecordedPromotion:
+    """The commit that a promotion can push again."""
 
-    base: str
     commit: str
-    source_commit: str
 
 
 @dataclass(frozen=True)
-class NoRecordedPush:
+class NoRecordedPromotion:
     pass
 
 
-def push_record_path(repo: Path, operation: str, source: str) -> Path:
+def promotion_record_path(repo: Path, branch: str) -> Path:
     directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
-    identity = json.dumps([str(repo.resolve()), operation, source]).encode()
+    identity = json.dumps([str(repo.resolve()), "promotion", branch]).encode()
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
 
-def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
+def read_promotion_record(path: Path) -> RecordedPromotion | NoRecordedPromotion:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return NoRecordedPush()
+        return NoRecordedPromotion()
     except (OSError, ValueError) as error:
         raise GateRefused(f"push recovery record {path}: {error}") from error
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
-        hashes = [fields.get(key) for key in ("base", "commit", "source_commit")]
-        if all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{40,64}", item) for item in hashes):
-            return RecordedPush(*(cast(str, item) for item in hashes))
+        commit = fields.get("commit")
+        base = fields.get("base")
+        if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40,64}", commit)
+                and isinstance(base, str) and re.fullmatch(r"[0-9a-f]{40,64}", base)
+                and fields.get("source_commit") == commit):
+            return RecordedPromotion(commit)
     raise GateRefused(f"invalid push recovery record: {path}")
 
 
-def write_push_record(path: Path, record: RecordedPush) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Publish one complete record before changing refs or attempting a push.
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump({"base": record.base, "commit": record.commit,
-                       "source_commit": record.source_commit}, output)
-            output.flush()
-            os.fsync(output.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+def write_promotion_record(path: Path, previous_main: str, commit: str) -> None:
+    # Older gates read the same promotion record.
+    write_text_atomic(path, json.dumps({"base": previous_main, "commit": commit, "source_commit": commit}),
+                      new_file_mode=0o600)
 
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
@@ -1960,12 +1952,11 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         fetch_branches(main_repo, "main", args.merge_branch)
         head = checked_git(main_repo, "rev-parse", "HEAD")
         origin = checked_git(main_repo, "rev-parse", "origin/main")
-        path = push_record_path(main_repo, "promotion", args.merge_branch)
+        path = promotion_record_path(main_repo, args.merge_branch)
         target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
-            record = read_push_record(path)
-            if (not isinstance(record, RecordedPush) or head != record.commit
-                    or record.source_commit != record.commit
+            record = read_promotion_record(path)
+            if (not isinstance(record, RecordedPromotion) or head != record.commit
                     or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
                     or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
@@ -1976,7 +1967,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             raise GateRefused(conflict)
         if refusal := live_state_refusal(main_repo, target):
             raise GateRefused(refusal)
-        write_push_record(path, RecordedPush(origin, target, target))
+        write_promotion_record(path, origin, target)
         try:
             waiting_rows.move_to(main_repo, target)
         except (OSError, UnicodeError) as error:

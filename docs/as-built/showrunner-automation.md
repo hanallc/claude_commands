@@ -501,16 +501,14 @@ Each local Promote checkout must exist before the command pushes.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
 - **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
   It uses the shared runner with affected-module selection.
-- **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
-  The gate runs all test modules under a memory governor.
-  Basedpyright runs only with `--nightly`.
-  Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
+- **The `~/.claude` repo's own gate.** `scripts/production/merge_checkpoint.py` manages the merge and uses the gate result to decide whether to publish it.
+  `scripts/production/merge_gate.py --tests-only` runs the tests under a memory governor.
+  `--nightly` also runs basedpyright.
+  The gate sorts test paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
   After the parallel pass, up to eight failed test modules run once more, alone.
-  Runner-killed jobs do not run again.
-  The final results decide rollback or push.
-  A signal also causes rollback.
-  `--promote` sends the green merge to `~/.claude` main and the Mac.
+  Jobs that exceed the time limit do not run again.
+  `--promote-only` advances `~/.claude` main and the Mac to a published merge branch.
   See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
 
 The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst` (one feature-log proposal per change-review row; `docs/as-built/feature-log.md`), then `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into. A change for the user to check is never an open question: it goes on the change review list, and `<CloseChangeReview/>` takes the user's verdict for every production, with feature-log calls only where the project closes out by change review (Hana and `~/.claude`).

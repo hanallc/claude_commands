@@ -22,6 +22,7 @@ from scripts.lib.process_start import Zombie
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.production import merge_gate, merge_gate_suites_test_support
+from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -89,6 +90,78 @@ class MergeGateSignalsTests(GateSuitesFixture):
         self.write(folder / "module-output", "unfinished")
         recovery.folders.append(str(folder))
         return folder
+
+    def rollback_record(self, head: str) -> merge_gate.GateRecovery:
+        directory = merge_gate.gate_run_directory(self.checkout)
+        directory.mkdir(parents=True, exist_ok=True)
+        return merge_gate.GateRecovery(directory / "dead-owner.json", str(self.checkout),
+                                       os.getpid(), "ended-owner", rollback=self.base,
+                                       rollback_head=head, rollback_source=self.checkpoint)
+
+    def test_saved_rollback_refuses_an_unrelated_head(self) -> None:
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", self.checkpoint)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.checkout / "later.txt", "unrelated commit\n")
+        unrelated = self.commit(self.checkout, "Add an unrelated commit")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            recovery = self.rollback_record(merged)
+            recovery.save()
+            with self.assertRaisesRegex(GateRefused, "differs from the recorded merge"):
+                merge_gate.recover_gate_directory(recovery.path.parent)
+        self.assertTrue(recovery.path.is_file())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), unrelated)
+        self.assertEqual((self.checkout / "later.txt").read_text(), "unrelated commit\n")
+        self.assert_not_pushed()
+
+    def test_saved_rollback_aborts_an_in_progress_merge_and_stops_its_hook(self) -> None:
+        ready = self.state / "merge-hook-ready"
+        pending = ready.with_suffix(".tmp")
+        hook = self.checkout / ".git/hooks/prepare-commit-msg"
+        self.write(hook, f"#!{sys.executable}\nimport os, signal\nfrom pathlib import Path\n"
+                   + f"Path({str(pending)!r}).write_text(str(os.getpid()))\n"
+                   + f"os.replace({str(pending)!r}, {str(ready)!r})\nsignal.pause()\n")
+        hook.chmod(0o755)
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-commit", self.checkpoint)
+        with subprocess.Popen(["git", "commit", "--no-edit"], cwd=self.checkout, env=self.environment,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True) as process:
+            try:
+                wait_until(ready.exists, self.state, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
+                self.assertTrue(ready.is_file(), "the merge hook did not start")
+                hook_pid = int(ready.read_text())
+                self.assertEqual(self.git(self.checkout, "rev-parse", "MERGE_HEAD"), self.checkpoint)
+                with mock.patch.dict(os.environ, self.environment, clear=True):
+                    recovery = self.rollback_record(self.base)
+                    recovery.add_group(process.pid)
+                    self.assertIn(process.pid, recovery.groups)
+                    merge_gate.recover_gate_directory(recovery.path.parent)
+                self.assertNotEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                self.assert_process_stopped(hook_pid)
+            finally:
+                if process.poll() is None:
+                    send_process_group(process.pid, signal.SIGKILL)
+        self.assertFalse(recovery.path.exists())
+        self.assertFalse((self.checkout / ".git/MERGE_HEAD").exists())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
+    def test_saved_rollback_restores_tracked_edits_before_reset(self) -> None:
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", self.checkpoint)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        tracked = self.checkout / "unit.txt"
+        self.write(tracked, "staged edit\n")
+        _ = self.git(self.checkout, "add", "unit.txt")
+        self.write(tracked, "worktree edit\n")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            recovery = self.rollback_record(merged)
+            recovery.save()
+            merge_gate.recover_gate_directory(recovery.path.parent)
+        self.assertFalse(recovery.path.exists())
+        self.assertFalse(tracked.exists())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
 
     def test_recovery_kills_a_term_ignoring_member_after_its_leader_ends(self) -> None:
         self.supply_jobserver(b"Q")

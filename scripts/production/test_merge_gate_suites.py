@@ -10,6 +10,7 @@ import os
 import sys
 import signal
 import resource
+import re
 import time
 import subprocess
 import select
@@ -563,8 +564,17 @@ class ChildImports(unittest.TestCase):
         caller_log = self.root / "caller-buildlog"
         self.write(caller_log / "keep", "caller log")
         self.environment["BUILDLOG_DIR"] = str(caller_log)
-        result = self.run_gate("--tests-only")
+        with self.sampling_module_memory({}):
+            result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        starts = [row for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(len({row["pid"] for row in starts}), self.module_count)
+        self.assertEqual(len({row["tmpdir"] for row in starts}), self.module_count)
+        peak = re.search(r"peak memory: ([\d.]+) GiB", result.stdout)
+        self.assertIsNotNone(peak, result.stdout)
+        assert peak is not None
+        self.assertGreater(float(peak.group(1)), 0)
         rows = [cast(dict[str, str], json.loads(line))
                 for line in (self.state / "buildlogs.jsonl").read_text().splitlines()]
         self.assertEqual(len(rows), self.module_count)

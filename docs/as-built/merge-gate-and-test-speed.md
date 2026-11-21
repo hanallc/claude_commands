@@ -231,7 +231,8 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 
 ## What it is
 
-`scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
+`scripts/production/merge_checkpoint.py` manages checkpoint merges and publication.
+It calls `scripts/production/merge_gate.py --tests-only` to test the merged checkout.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
 Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
@@ -240,7 +241,7 @@ A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or
 A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
 Python files are not callers in this rule.
 Merge gates and nightly runs use all modules.
-Merge and tests-only runs skip basedpyright.
+`--tests-only` skips basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
 A clean tree with a recorded full pass on this host reuses its test modules.
@@ -256,9 +257,9 @@ Timing records retain test execution and interpreter startup costs; they exclude
 Other platforms retain the single-process runner.
 A SIGKILL of the parent prevents this cleanup.
 The module time limit sends SIGTERM first, so the cleanup runs.
-On success, the gate pushes the merge branch.
-With `--promote`, it also advances `~/.claude` main and the Mac.
-On failure, it undoes the merge and prints the failed suites' output.
+The gate reports the test result and prints the output for failed suites.
+The checkpoint command uses the result to decide whether to publish or undo the merge.
+`--promote-only` advances `~/.claude` main and the Mac to a published merge branch.
 
 **Build-hold guard tests.** `scripts/hooks/test_build_hold_guard.py` calls the real Python hook entry point in-process for command parsing and hold decisions, restoring stdin, environment and import paths for each call. `build_hold_guard_test_support.py` copies the existing hold fixture's class seed into a private case directory at the same path for each test. Real subprocess tests retain the shell front's no-Python fast paths, byte-for-byte stdin/output/status relay, lazy imports, malformed input, and shell-to-reader integration. No production hook or hold decision is replaced, and no clock or wait budget is shortened.
 
@@ -322,7 +323,7 @@ A red module runs once more alone, as in the gate.
 The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
 `--module` without `--tests-only` is refused.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
-`--production` defaults to the calling showrunner's production, read from its update timer.
+The gate reads the calling showrunner's production from staff when the caller omits `--production`.
 The gate uses the production to locate the change-review list after promotion.
 After the last promotion step, it adds rows only for merges on `origin/main`.
 It prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
@@ -517,7 +518,8 @@ The trial text table shows CPU use percent for each size and run.
 The admission, scheduling caches, and rerun rules below apply to `SharedMachine`.
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
-- Before any job starts it refuses (and the merge rolls back) if the test list is empty or `/dev/shm` is not writable. The nightly runner also requires the `scripts` folder.
+- The gate refuses an empty test list or a `/dev/shm` folder that it cannot write to.
+  The nightly runner also requires the `scripts` folder.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
   Targeted tests use step `targeted-test` through the same reservation path.

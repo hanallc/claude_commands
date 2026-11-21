@@ -9,6 +9,7 @@ import unittest
 import json
 import io
 import os
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate, staff
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
@@ -41,6 +42,64 @@ class MergeGatePromotionTests(MergeGateFixture):
             assert owner is not None
             _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         return review, doc
+
+    def publish_review_checkpoint(self) -> tuple[Path, staff.StaffId, staff.StaffId]:
+        review, doc = self.review_list()
+        self.checkpoint = self.checkpoint_commit("checkpoint(fixture): review row\n\n"
+            + "Change-Review: Review fixture | Read | The fixture appears | image 012345abcdef")
+        _ = self.publish_for_promotion(checkpoint_merge=True)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        history = {"UNIT_HISTORY_DIR": str(self.state / "unit-history")}
+        self.environment.update(history)
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            runner = staff.snapshot().by_doc(remote.local_machine(), doc)
+            assert runner is not None
+            producer = fixture_member("unit", name="fixture", parent=runner.id)
+            with mock.patch.dict(os.environ, history):
+                change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer.id))
+        self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
+        return review, producer.id, runner.id
+
+    def test_promote_only_uses_the_calling_showrunners_production(self) -> None:
+        review, producer, production = self.publish_review_checkpoint()
+        result = self.run_promote_only(callers_production=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Change review: 1 row(s) added to {review}: C8", result.stdout)
+        old, published = change_review.pending(review)
+        self.assertEqual(old["Change"], "old")
+        self.assertEqual(published["Change"], "Review fixture")
+        self.assertEqual(published["Producer"], producer)
+        self.assertEqual(published["Production"], production)
+
+    def test_promote_only_keeps_producer_and_production_with_or_without_checkout(self) -> None:
+        review, producer, production = self.publish_review_checkpoint()
+        original = review.read_text(encoding="utf-8")
+        merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
+        for explicit_checkout in (True, False):
+            with self.subTest(explicit_checkout=explicit_checkout):
+                self.write(review, original)
+                result = self.run_promote_only("--production", "fixture-showrunner",
+                                               explicit_checkout=explicit_checkout)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                old, published = change_review.pending(review)
+                self.assertEqual(old["Change"], "old")
+                self.assertEqual(published["Change"], "Review fixture")
+                self.assertEqual(published["Merged"].split(" · ")[1], merged)
+                self.assertEqual(published["Producer"], producer)
+                self.assertEqual(published["Production"], production)
+
+    def test_promote_only_uses_the_user_date_when_utc_has_the_next_date(self) -> None:
+        review, _, _ = self.publish_review_checkpoint()
+        instant = datetime(2026, 11, 4, 1, tzinfo=UTC)
+
+        def now(zone: tzinfo | None = None) -> datetime:
+            return instant.astimezone(zone) if zone is not None else instant.replace(tzinfo=None)
+
+        self.environment["USER_ZONE"] = "America/New_York"
+        with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)):
+            result = self.run_promote_only("--production", "fixture-showrunner", own_process=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03 20:00")
 
     def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
         review, _ = self.review_list()

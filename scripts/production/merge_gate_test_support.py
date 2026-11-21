@@ -117,15 +117,6 @@ if name == "ssh":
     raise SystemExit(0)
 if name == "suite-python":
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-if name == "style_sync.py":
-    import subprocess
-    args = sys.argv[1:]
-    repo = args[args.index("--repo-dir") + 1]
-    branch = args[args.index("--branch") + 1]
-    observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
-                              capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
-    (state / "notified-tip").write_text(observed)
-    raise SystemExit(1 if (state / "notify-fails").exists() else 0)
 if name == "send.py":
     if (state / "send-fails").exists():
         print("fixture message failed", file=sys.stderr)
@@ -227,14 +218,10 @@ class FixtureTest(unittest.TestCase):
         if (state / "leak-child").exists() and suite == "hooks":
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=(state / "detached-child").exists())
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             (state / "child-pid.tmp").write_text(str(child.pid))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "child-pid.tmp", state / "child-pid")
-        if (state / "modify-tracked").exists() and suite == "hooks":
-            Path("unit.txt").write_text("gate debris\\n")
-            self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
             (state / "module-held.tmp").write_text(str(os.getpgrp()))
             # Publish by rename: a reader must never see the file empty.
@@ -475,7 +462,6 @@ class MergeGateFixture(unittest.TestCase):
             "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
             "BUILD_TARGETS_STATE_DIR": str(self.state / "build-targets"),
             "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
-            "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
@@ -639,7 +625,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run", "send.py"):
+        for name in ("basedpyright", "uv", "ssh", "suite-python", "systemd-run", "send.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -729,13 +715,19 @@ class MergeGateFixture(unittest.TestCase):
                    + "raise SystemExit(entry.main(sys.argv[1:]))")
         return [str(SCRIPT.parents[1] / "lib/py"), "-c", source]
 
-    def run_promote_only(self, *extra: str, explicit_checkout: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_promote_only(self, *extra: str, explicit_checkout: bool = True,
+                         callers_production: bool = False, own_process: bool = True) -> subprocess.CompletedProcess[str]:
+        arguments = [*(["--checkout", str(self.checkout)] if explicit_checkout else []),
+                     "--merge-branch", "integration", "--promote-only", "--main-repo", str(self.main),
+                     "--ssh", str(self.bin / "ssh")]
+        if not callers_production and "--production" not in extra:
+            arguments.extend(("--production", "quiet"))
+        arguments.extend(extra)
+        if not own_process:
+            return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
+                              self.environment, self.root, production_state=True)
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT),
-             *(["--repo", str(self.checkout)] if explicit_checkout else []), "--merge-branch", "integration",
-             "--promote-only", "--main-repo", str(self.main),
-             "--ssh", str(self.bin / "ssh"),
-             *([] if "--production" in extra else ["--production", "quiet"]), *extra],
+            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), *arguments],
             cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
