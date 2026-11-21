@@ -538,6 +538,8 @@ The browser refreshes the index and shows a conflict reason above the table.
 The refresh keeps the selected filters.
 The reason stays visible if the refresh removes the card.
 After a save, the server reads and publishes the saved record if it can.
+When it publishes one card, it records the delivery file stamp before reading the delivery.
+The next Review refresh checks that stamp for a delivery failure.
 If publication fails, the server retains the current snapshot and requests a full rebuild.
 The store write determines success, so the server returns HTTP 200 and runs delivery after either publication result.
 A Change verdict uses the current staff assignment to select the production and the recipients.
@@ -1241,11 +1243,13 @@ After an unconfirmed directory sync, the writer checks the stored record under t
 If the record holds the request, the server reports that it saved the action.
 The List sender uses the shared `change_page` retry and alert helpers.
 A successful send appends the same request ID with the sent state.
-Exhausted tries alert the item owner's showrunner.
-The request becomes alerted only when at least one showrunner receives the alert.
-Failed alerts leave the request pending for repeated POSTs and startup recovery.
-An alerted request shows “not sent; <showrunner> told” until morty writes the item again.
-The server startup hook retries pending List requests separately from change and question recovery.
+A final send failure starts an alert to the item owner's showrunner.
+The request stays pending while the alert can retry.
+The worker records the final delivery failure and the alert recipient's staff ID.
+The List uses that ID to check the receipt and show the recipient's current name.
+Older entries store a name. The List checks for a confirmed receipt for the same request.
+The startup scan reads pending List requests.
+The server retry worker retries feedback and records its final result with the saved request ID.
 A repeated POST retries a pending request without adding another pending log entry.
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
@@ -1364,8 +1368,18 @@ A `Feedback:` line follows when the user wrote text.
 Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
 A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
-When no try reaches the owner, the server answers 503 and writes nothing.
-The card goes back in its place with one line: **Not sent: <reason>**.
+The server saves the action, feedback text, key, and answer snapshot in one write.
+The server reads the receipt before it builds a message for transport.
+The signed form identifies the receipt without a read of the image record.
+Recovery reads the files it needs before it changes a file.
+A read error keeps recovery scheduled. A final receipt still supplies the reply.
+If the receipt does not confirm delivery, the server answers 503 and the card returns with a failure line.
+The server retry worker uses the saved key for pending feedback, including after restart.
+The startup scan reads older answer snapshots with or without a delivery receipt.
+It can complete confirmed receipts and verify the key for an approval with no feedback text.
+Older requests without saved feedback text need the same text from a repeated POST before they can send.
+A confirmed send hides the image only if the owner has given no new question answer.
+A final failure leaves the image visible.
 An agent deletes an image with this command:
 
 ```sh

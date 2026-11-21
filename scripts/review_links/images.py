@@ -6,13 +6,16 @@ import hashlib
 import hmac
 import html
 import json
+import re
 import secrets
 import shutil
+import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Set
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
@@ -21,7 +24,7 @@ from urllib.parse import parse_qs
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production.delivery_state import QuestionSendState
-from scripts.production import staff
+from scripts.production import delivery_state, staff
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, review_link
@@ -30,6 +33,8 @@ PAGE_NAME = "images.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
 LOCK = image_store.LOCK
 SENDER = Path(__file__).stem
+FEEDBACK_PREFIX = ".review-link-feedback-"
+FEEDBACK_FILE = re.compile(re.escape(FEEDBACK_PREFIX) + r"([0-9a-f]{64})(?:\.(?:pending|json))?")
 # Each answer button and the first line of the message that it sends to the owner.
 ANSWERS = {"approved": "your image is approved.", "not approved": "your image is not approved.",
            "feedback": "feedback on your image."}
@@ -56,6 +61,14 @@ class ImageReview:
 
 class AnswerNotSent(Exception):
     """No try reached the owner; the image stays on the page."""
+
+
+class FeedbackUnavailable(OSError):
+    """Keep a known final result when a later file cannot be read."""
+
+    def __init__(self, error: Exception, final: change_page.QuestionProgress | None = None) -> None:
+        super().__init__(str(error))
+        self.final: change_page.QuestionProgress | None = final
 
 
 def images_root(root: Path) -> Path:
@@ -162,6 +175,10 @@ def request_token(token: str, identity: str) -> str:
     return hmac.new(token.encode(), ("image:" + identity).encode(), hashlib.sha256).hexdigest()
 
 
+def feedback_source_token(token: str, identity: str, registered_at: str) -> str:
+    return registered_at + ":" + request_token(token, identity + ":" + registered_at)
+
+
 def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
     """Return the card's owner text, name and kind, and the group panel's owner text, the name alone."""
     member = record.by_id(staff.StaffId(identity))
@@ -202,6 +219,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
+    feedback_source = html.escape(feedback_source_token(token, record["id"], record["registered_at"]), quote=True)
     closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
                        '<button type="submit" name="action" value="not approved">Not Approved</button>'
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
@@ -219,6 +237,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
             + f'<input type="hidden" name="feedback_round" value="{round_id}">'
+            + f'<input type="hidden" name="feedback_source" value="{feedback_source}">'
             + f'<label for="feedback-{record["id"]}">Feedback</label>'
             + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
             + page_frame.review_action_groups(closing_buttons, returning_buttons)
@@ -264,13 +283,15 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     """Save a question for deferred delivery; keep feedback and delete actions as before."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
-    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round"} or any(
+    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round",
+                                               "feedback_source"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
-    expected = request_token(console_token(root), identity)
+    token = console_token(root)
+    expected = request_token(token, identity)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
         raise question_record.AnswerRefused("the image token does not match this page")
     action = fields.get("action", ["delete"])[0]
@@ -280,7 +301,15 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
-        send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
+        registered_at = None
+        if "feedback_source" in fields:
+            source = fields["feedback_source"][0]
+            registered_at, _, _signature = source.rpartition(":")
+            expected_source = feedback_source_token(token, identity, registered_at)
+            if not secrets.compare_digest(source.encode(), expected_source.encode()):
+                raise question_record.AnswerRefused("the feedback source does not match this page")
+        send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id, status=status,
+                    registered_at=registered_at)
         return change_page.NoMessageDelivery()
     with file_lock.exclusive(images_root(root) / LOCK):
         try:
@@ -336,56 +365,289 @@ def answered_question_ids(record: image_store.ImageRecord) -> set[str]:
     return {question["question_id"] for question in record.get("questions", []) if question["answer"] is not None}
 
 
-def feedback_round(answered: set[str]) -> str:
+def feedback_round(answered: Set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(answered)).encode()).hexdigest()
 
 
-def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None) -> None:
-    """Hide the image only if no question received an answer after the first submission."""
-    if answer == "feedback" and not feedback:
+def feedback_key(record: image_store.ImageRecord, folder: Path, answer: str, feedback: str,
+                 round_id: str | None) -> str:
+    return feedback_key_for_source(folder, record["registered_at"], answer, feedback, round_id)
+
+
+def feedback_key_for_source(folder: Path, registered_at: str, answer: str, feedback: str,
+                            round_id: str | None) -> str:
+    parts = [registered_at, answer, feedback]
+    if round_id is not None:
+        parts.append(round_id)
+    return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts))
+
+
+@dataclass(frozen=True)
+class ImageFeedback:
+    key: str
+    owner: str
+    registered_at: str
+    answered: frozenset[str]
+    action: str
+    text: str
+
+    def save(self, path: Path) -> None:
+        fields = {"key": self.key, "owner": self.owner, "registered_at": self.registered_at,
+                  "answered": sorted(self.answered), "action": self.action, "text": self.text}
+        atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
+
+
+def read_feedback_request(path: Path, key: str) -> ImageFeedback | None:
+    try:
+        fields = delivery_state.read_fields(path)
+    except FileNotFoundError:
+        return None
+    owner, registered = fields.get("owner"), fields.get("registered_at")
+    answered, action, text = fields.get("answered"), fields.get("action"), fields.get("text")
+    if (fields.get("key") != key or not isinstance(owner, str) or not isinstance(registered, str)
+            or not isinstance(answered, list)
+            or not all(isinstance(value, str) for value in cast(list[object], answered))
+            or not isinstance(action, str) or action not in ANSWERS or not isinstance(text, str)
+            or (action == "feedback" and not text.strip())):
+        raise ValueError("Invalid saved Images feedback.")
+    return ImageFeedback(key, owner, registered, frozenset(cast(list[str], answered)), action, text)
+
+
+def legacy_feedback_snapshot(path: Path) -> frozenset[str] | None:
+    try:
+        return frozenset(path.with_suffix("").read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return None
+
+
+def legacy_feedback_action(record: image_store.ImageRecord, folder: Path, key: str,
+                           previously_answered: frozenset[str]) -> str | None:
+    """Use the key to verify an approval with no feedback text."""
+    for round_id in (None, feedback_round(previously_answered)):
+        for answer in ("approved", "not approved"):
+            if feedback_key(record, folder, answer, "", round_id) == key:
+                return answer
+    return None
+
+
+def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None,
+                status: change_page.DeliveryStatus | None = None, registered_at: str | None = None) -> None:
+    """Report success only when the receipt confirms delivery."""
+    if answer not in ANSWERS:
+        raise question_record.AnswerRefused("use the form on this page")
+    if answer == "feedback" and not feedback.strip():
         raise question_record.AnswerRefused("enter feedback")
+    status = change_page.DeliveryStatus(root) if status is None else status
     directory = images_root(root)
     folder = directory / identity
-    lock = directory / LOCK
+    owner = ""
+    if registered_at is None:
+        with file_lock.exclusive(directory / LOCK):
+            try:
+                record = image_store.read_record(folder)
+            except (OSError, ValueError) as error:
+                if isinstance(error, FileNotFoundError) and not folder.exists():
+                    raise question_record.AnswerRefused(f"no image {identity}") from error
+                key = feedback_key_for_source(folder, "", answer, feedback, round_id)
+                lookup = folder / (FEEDBACK_PREFIX + key.removeprefix("review:") + ".lookup")
+                status.report_recovery_error(lookup, error, f"Images feedback {identity}")
+                retry = change_page.PageFeedbackRetry(partial(retry_feedback_lookup, status, identity, answer,
+                                                              feedback, round_id))
+                status.defer_question(lookup, retry)
+                raise FeedbackUnavailable(error) from error
+            owner, registered_at = record["owner"], record["registered_at"]
+    key = feedback_key_for_source(folder, registered_at, answer, feedback, round_id)
+    path = folder / (FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+    request = ImageFeedback(key, owner, registered_at, frozenset(), answer, feedback)
+    progress = deliver_saved_feedback(status, path, request, round_id=round_id)
+    if progress is None or progress.state is not change_page.QuestionDeliveryState.CONFIRMED:
+        raise AnswerNotSent((progress.error if progress else "") or "The sender did not confirm delivery.")
+
+
+def retry_feedback_lookup(status: change_page.DeliveryStatus, identity: str, answer: str, feedback: str,
+                          round_id: str | None) -> None:
+    try:
+        send_answer(status.root, identity, answer, feedback, round_id=round_id, status=status)
+    except (AnswerNotSent, FeedbackUnavailable, question_record.AnswerRefused):
+        pass
+
+
+def defer_feedback(status: change_page.DeliveryStatus, path: Path, request: ImageFeedback | None = None, *,
+                   round_id: str | None = None, error: Exception | None = None) -> None:
+    if error is not None:
+        status.report_recovery_error(path, error, f"Images feedback {path.parent.name}")
+    status.defer_question(path, change_page.PageFeedbackRetry(partial(recover_feedback, status, path, request,
+                                                                      round_id=round_id)),
+                          keep_existing=request is None)
+
+
+def recover_feedback(status: change_page.DeliveryStatus, path: Path, request: ImageFeedback | None = None, *,
+                     round_id: str | None = None) -> None:
+    try:
+        _ = deliver_saved_feedback(status, path, request, round_id=round_id)
+    except (OSError, ValueError):
+        # Delivery already handled the retry.
+        pass
+
+
+def deliver_saved_feedback(status: change_page.DeliveryStatus, path: Path, request: ImageFeedback | None = None, *,
+                           round_id: str | None = None) -> change_page.QuestionProgress | None:
+    """Use one path for live delivery and recovery of the same request."""
+    path = path.with_suffix(".pending")
+    try:
+        progress = advance_feedback(path, request, round_id=round_id)
+    except FeedbackUnavailable as error:
+        defer_feedback(status, path, request, round_id=round_id, error=error)
+        if error.final is not None:
+            return error.final
+        raise
+    except question_record.AnswerRefused:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        defer_feedback(status, path, request, round_id=round_id, error=error)
+        raise FeedbackUnavailable(error) from error
+    if progress is not None and progress.state.pending:
+        defer_feedback(status, path)
+    else:
+        status.forget_deferred_question(path)
+    return progress
+
+
+@dataclass(frozen=True)
+class FeedbackFiles:
+    progress: change_page.QuestionProgress | None
+    request: ImageFeedback | None
+    answered: frozenset[str] | None
+    record: image_store.ImageRecord | None
+
+
+def read_feedback_files(path: Path, key: str, *, need_image: bool = False,
+                        previous: change_page.QuestionProgress | None = None) -> FeedbackFiles:
+    """Read the files needed for the next step under the Images lock."""
+    progress = previous
+    try:
+        current = change_page.read_page_feedback_progress(path.with_suffix(".json"), key)
+        if current is None and previous is not None:
+            raise ValueError("The saved Images feedback receipt is missing.")
+        progress = current
+        saved = read_feedback_request(path, key)
+        answered = saved.answered if saved is not None else legacy_feedback_snapshot(path)
+        record = None
+        if answered is not None or (progress.state.pending if progress is not None else need_image):
+            try:
+                record = image_store.read_record(path.parent)
+            except FileNotFoundError:
+                if path.parent.exists():
+                    raise
+        if saved is not None and record is not None and (saved.owner, saved.registered_at) != (
+                record["owner"], record["registered_at"]):
+            raise ValueError("The saved Images feedback has a different source.")
+    except (OSError, ValueError) as error:
+        final = progress if progress is not None and not progress.state.pending else None
+        raise FeedbackUnavailable(error, final) from error
+    return FeedbackFiles(progress, saved, answered, record)
+
+
+def finish_feedback(path: Path, progress: change_page.QuestionProgress, files: FeedbackFiles) -> None:
+    record, answered = files.record, files.answered
+    if (progress.state is change_page.QuestionDeliveryState.CONFIRMED and record is not None
+            and answered is not None and "feedback_at" not in record and not answered_question_ids(record) - answered):
+        record["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+        image_store.write_record(path.parent, record)
+    path.unlink(missing_ok=True)
+
+
+def advance_feedback(path: Path, request: ImageFeedback | None, *,
+                     round_id: str | None) -> change_page.QuestionProgress | None:
+    match = FEEDBACK_FILE.fullmatch(path.name)
+    assert match is not None
+    folder = path.parent
+    lock = folder.parent / LOCK
+    key = "review:" + match[1]
+    receipt = path.with_suffix(".json")
     with file_lock.exclusive(lock):
-        try:
-            record = image_store.read_record(folder)
-        except (OSError, ValueError) as error:
-            raise question_record.AnswerRefused(f"no image {identity}") from error
-        parts = [record["registered_at"], answer, feedback]
-        if round_id is not None:
-            parts.append(round_id)
-        attempt = json.dumps(parts)
-        key = change_page.review_delivery_key(folder / image_store.RECORD, identity, attempt)
-        snapshot = folder / (".review-link-feedback-" + key.removeprefix("review:"))
-        try:
-            previously_answered = set(snapshot.read_text(encoding="utf-8").splitlines())
-        except FileNotFoundError:
-            previously_answered = answered_question_ids(record)
-            if round_id is not None and round_id != feedback_round(previously_answered):
-                raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
-            atomic_file.write_text_atomic(snapshot, "".join(f"{item}\n" for item in sorted(previously_answered)),
-                                          new_file_mode=0o600)
-        else:
-            # A prior attempt can leave the file visible after a failed directory sync.
+        files = read_feedback_files(path, key, need_image=request is not None)
+        progress, saved, answered, record = files.progress, files.request, files.answered, files.record
+        if progress is not None and progress.expire() != progress:
+            with change_page.sender_claim(receipt.with_suffix(".lock")) as claimed:
+                if not claimed:
+                    return progress
+                try:
+                    progress = change_page.read_page_feedback_progress(receipt, key)
+                except (OSError, ValueError) as error:
+                    raise FeedbackUnavailable(error) from error
+                if progress is not None and (expired := progress.expire()) != progress:
+                    change_page.write_feedback_progress(receipt, expired)
+                    progress = expired
+        if progress is not None and not progress.state.pending:
+            finish_feedback(path, progress, files)
+            return progress
+        if record is None:
+            if request is not None:
+                raise question_record.AnswerRefused(f"no image {folder.name}")
+            return None
+        if answered is None and request is None:
+            return progress
+        owner, registered = record["owner"], record["registered_at"]
+        if saved is None and request is not None:
+            if request.registered_at != registered or (request.owner and request.owner != owner):
+                raise question_record.AnswerRefused("The image changed. Review the image and try again.")
+            if answered is None:
+                answered = frozenset(answered_question_ids(record))
+                if round_id is not None and round_id != feedback_round(answered):
+                    raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
+            saved = replace(request, owner=owner, answered=answered)
+            saved.save(path)
+        elif saved is not None:
+            # Sync a request that may have survived an unconfirmed directory sync.
             atomic_file.sync_folder(folder)
-    owner = staff.StaffId(record["owner"])
-    progress = change_page.deliver_page_feedback(snapshot.with_suffix(".json"), key, owner,
-                                                answer_message(record, answer, feedback), sender=SENDER)
-    if progress.state is not change_page.QuestionDeliveryState.CONFIRMED:
-        raise AnswerNotSent(progress.error or "The sender did not confirm delivery.")
-    with file_lock.exclusive(lock):
+        assert answered is not None
+
+    action = saved.action if saved is not None else legacy_feedback_action(record, folder, key, answered)
+    if action is None:
+        raise ValueError("The legacy Images request has no saved feedback text.")
+    message = partial(answer_message, record, action, saved.text if saved is not None else "")
+    progress = change_page.deliver_page_feedback(receipt, key, staff.StaffId(owner), message, sender=SENDER)
+    if not progress.state.pending:
+        with file_lock.exclusive(lock):
+            files = read_feedback_files(path, key, previous=progress)
+            current = files.record
+            progress = files.progress or progress
+            if not progress.state.pending and (
+                    current is None or (current["owner"], current["registered_at"]) == (owner, registered)):
+                finish_feedback(path, progress, files)
+    return progress
+
+
+def defer_feedback_scan(status: change_page.DeliveryStatus, path: Path, error: Exception) -> None:
+    status.report_recovery_error(path, error, "Images feedback")
+    status.defer_question(images_root(status.root), change_page.PageFeedbackRetry(partial(recover_pending, status)))
+
+
+def recover_pending(status: change_page.DeliveryStatus) -> None:
+    """Read saved Images feedback and pass it to the server retry worker."""
+    folder = images_root(status.root)
+    try:
+        directories = tuple(folder.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        defer_feedback_scan(status, folder, error)
+        return
+    for directory in directories:
+        if not image_store.IDENTITY.fullmatch(directory.name) or directory.is_symlink():
+            continue
         try:
-            current = image_store.read_record(folder)
-        except (OSError, ValueError):
-            # The owner deleted the image while the message was on its way.
-            return
-        if current["registered_at"] != record["registered_at"] or current["owner"] != owner:
-            return
-        if answered_question_ids(current) - previously_answered:
-            return
-        current["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
-        image_store.write_record(folder, current)
+            paths = tuple(directory.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            defer_feedback_scan(status, directory, error)
+            continue
+        requests = {path.with_suffix(".pending") for path in paths
+                    if FEEDBACK_FILE.fullmatch(path.name) and not path.is_symlink()}
+        for path in requests:
+            defer_feedback(status, path)
 
 
 # At 1108px and wider, the page fills the frame inside its 32px gutters, and the

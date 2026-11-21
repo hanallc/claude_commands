@@ -605,9 +605,50 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
         entry, sections + questions + form, today, names, unread_answers, secret)
 
 
+def feedback_alert_notice(status: change_page.DeliveryStatus, entry: ListRecord,
+                          feedback: the_list.PageFeedback, names: staff_names.StaffNames) -> str:
+    if not feedback.alerted_to:
+        return "Feedback failed. No showrunner for the alert."
+    item = entry.item
+    source = the_list.folder(entry.keeper) / f"{item.id}.md"
+    key = change_page.review_delivery_key(source, item.id, feedback.request, purpose=f"alert:{entry.keeper}")
+    page = change_page.ReviewPage(source, source.parent, (item.id,), "")
+    try:
+        alerts = [alert for alert in status.closeout_fields(page, item.id).get("pending_alerts", [])
+                  if alert.get("key") == key]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        status.report_recovery_error(status.closeout_path(page, item.id), error, f"List feedback {item.id}")
+        return "Feedback failed. The alert is unverified."
+    identity = staff.StaffId(feedback.alerted_to)
+    recipient = names.members.by_id(identity)
+    receipt_states = {alert.get("state") for alert in alerts if alert["recipient"] == identity}
+    saved_staff_id = recipient is not None or bool(receipt_states)
+    if not saved_staff_id:
+        try:
+            _ = staff.native_id(identity)
+        except staff.StaffRefused:
+            pass
+        else:
+            saved_staff_id = True
+    if not saved_staff_id:
+        confirmed = [alert for alert in alerts if alert.get("state") == change_page.QuestionDeliveryState.CONFIRMED]
+        if confirmed:
+            receipt_states = {change_page.QuestionDeliveryState.CONFIRMED}
+            if len(confirmed) == 1:
+                identity = confirmed[0]["recipient"]
+                recipient = names.members.by_id(identity)
+    name = names.html(identity, recipient.name) if recipient is not None else names.html(feedback.alerted_to)
+    if receipt_states == {change_page.QuestionDeliveryState.FAILED}:
+        return "Feedback failed. Alert for " + name + " failed."
+    if (saved_staff_id or alerts) and change_page.QuestionDeliveryState.CONFIRMED not in receipt_states:
+        return "Feedback failed. Alert for " + name + " is unverified."
+    return "Feedback failed. " + name + " received the alert."
+
+
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, parked: bool, open_question: bool,
-              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str]) -> str:
+              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str],
+              status: change_page.DeliveryStatus) -> str:
     item = entry.item
     owner = owner_name(names.members, item.owner)
     producer = owner_name(names.members, item.producer)
@@ -658,8 +699,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
         notice = "sent to " + names.html("morty")
         if feedback.state == "alerted":
-            notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
-                      else "not sent; no showrunner for alert")
+            notice = feedback_alert_notice(status, entry, feedback, names)
         update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     overdue = due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
@@ -879,17 +919,21 @@ def deliver(submission: ListActionSubmission) -> None:
             return feedback
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != delivery.keeper)
         failure = change_page.DeliveryFailure(delivery.keeper, progress.error)
-        reached = change_page.alert_delivery_failures([failure], 1, status=delivery.status,
+        alert = change_page.alert_delivery_failures([failure], 1, status=delivery.status,
             source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
-        return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
+        if alert.pending:
+            retry_paths.append(path)
+            return feedback
+        target = owners[0].id if owners else ""
+        return replace(feedback, state="alerted", alerted_to=target)
     try:
         the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
     except (OSError, ValueError) as error:
         retry_paths.append(path)
         delivery.status.report_recovery_error(path, error, f"List feedback {delivery.identity}")
     for retry in retry_paths:
-        delivery.status.defer_question(retry, change_page.ListFeedbackRetry(partial(deliver, delivery)))
+        delivery.status.defer_question(retry, change_page.PageFeedbackRetry(partial(deliver, delivery)))
 
 
 def recover_questions(status: change_page.DeliveryStatus) -> None:
@@ -906,7 +950,7 @@ def recover_questions(status: change_page.DeliveryStatus) -> None:
 def recover_pending(status: change_page.DeliveryStatus | None = None) -> None:
     """Retry each saved request and schedule another read after a source error."""
     status = change_page.DeliveryStatus(review_link.review_root()) if status is None else status
-    retry = change_page.ListFeedbackRetry(partial(recover_pending, status))
+    retry = change_page.PageFeedbackRetry(partial(recover_pending, status))
 
     def defer_scan(path: Path, error: Exception) -> None:
         status.report_recovery_error(path, error, f"List feedback source {path}")
@@ -1040,7 +1084,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         rows.append(
             item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                      open_question=open_question, visibility=visibility, unread_answers=unread_answers))
+                      open_question=open_question, visibility=visibility, unread_answers=unread_answers, status=status))
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]

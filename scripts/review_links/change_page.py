@@ -1220,11 +1220,11 @@ class UnreadableDeliveryRecord:
 
 
 @dataclass(frozen=True)
-class ListFeedbackRetry:
+class PageFeedbackRetry:
     deliver: Callable[[], None]
 
 
-type DeferredQuestion = MessageDelivery | UnreadableDeliveryRecord | ListFeedbackRetry | None
+type DeferredQuestion = MessageDelivery | UnreadableDeliveryRecord | PageFeedbackRetry | None
 
 
 class QuestionDeliveryState(StrEnum):
@@ -1378,9 +1378,9 @@ class DeliveryStatus:
     def recovery_paths(self) -> frozenset[Path]:
         return self.read_view().paths - self.pending_migrations()
 
-    def defer_question(self, path: Path, delivery: DeferredQuestion = None) -> None:
+    def defer_question(self, path: Path, delivery: DeferredQuestion = None, *, keep_existing: bool = False) -> None:
         with self.deferred_delivery_lock:
-            if isinstance(delivery, UnreadableDeliveryRecord):
+            if keep_existing or isinstance(delivery, UnreadableDeliveryRecord):
                 _ = self.deferred_questions.setdefault(path, delivery)
             else:
                 self.deferred_questions[path] = delivery
@@ -2842,27 +2842,44 @@ def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = 
     return "review:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
-def deliver_page_feedback(path: Path, key: str, recipient: staff.StaffId, message: str, *,
+def read_page_feedback_progress(path: Path, key: str) -> QuestionProgress | None:
+    try:
+        progress = read_question_progress(read_delivery_object(path))
+    except FileNotFoundError:
+        return None
+    if (progress.attempt, progress.question_id) != (key, key):
+        raise ValueError("The feedback receipt has a different key.")
+    if progress.state in (QuestionDeliveryState.ANSWERED, QuestionDeliveryState.CLOSED):
+        raise ValueError("Invalid feedback delivery state.")
+    return progress
+
+
+def deliver_page_feedback(path: Path, key: str, recipient: staff.StaffId,
+                          message: str | Callable[[], str], *,
                           sender: str = SENDER) -> QuestionProgress:
     """Keep a receipt for one saved List or Images action."""
-    progress = QuestionProgress(key, key, time.time())
     with sender_claim(path.with_suffix(".lock")) as claimed:
+        saved = read_page_feedback_progress(path, key)
+        progress = saved if saved is not None else QuestionProgress(key, key, time.time())
         if not claimed:
             return progress
-        try:
-            progress = read_question_progress(read_delivery_object(path))
-            if progress.attempt != key:
-                raise ValueError("The feedback receipt has a different key.")
-        except FileNotFoundError:
+        if saved is None:
             progress, error = progress.start_budget()
             if error:
                 progress = progress.fail(error)
             write_feedback_progress(path, progress)
         result = progress.expire()
         if result.state is QuestionDeliveryState.NOT_STARTED:
-            result, _ = attempt_question_send(progress, partial(send_review_question, recipient, message, key,
-                                                                  sender=sender),
-                started=lambda: write_feedback_progress(path, begin_question_send(progress)))
+            try:
+                body = message() if callable(message) else message
+            except conf.Unusable as error:
+                result = progress.fail(" ".join(str(error).splitlines()))
+            else:
+                result = progress.expire()
+                if result.state is QuestionDeliveryState.NOT_STARTED:
+                    result, _ = attempt_question_send(progress, partial(send_review_question, recipient, body, key,
+                                                                          sender=sender),
+                        started=lambda: write_feedback_progress(path, begin_question_send(progress)))
         if result != progress:
             write_feedback_progress(path, result)
         return result
@@ -3570,23 +3587,26 @@ def delivery_failure_alert(failure: DeliveryFailure, tries: int, source: Path, r
 
 def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, status: DeliveryStatus,
                             source: Path, row: str, message: str, recipients: tuple[staff.StaffId, ...],
-                            attempt: str, title: str = "Change review delivery needs attention") -> bool:
+                            attempt: str, title: str = "Change review delivery needs attention") -> QuestionDeliveryState:
     page = ReviewPage(source, source.parent, (row,), "")
     delivery = MessageDelivery(page, row, (), message, attempt)
     alerts = pending_delivery_alerts(delivery, failures, tries, recipients, title=title)
     if not alerts:
         for failure in failures:
             print(f"review-links delivery {row}: {failure.error}; no separate showrunner for the alert", file=sys.stderr)
-        return False
+        return QuestionDeliveryState.FAILED
     path = status.closeout_path(page, row)
     with status.locked():
         status.store_pending_alerts(delivery, alerts)
     status.send_pending_alerts(path)
     keys = {(alert.get("key"), alert["recipient"]) for alert in alerts}
     with status.locked():
-        return any(alert.get("state") == QuestionDeliveryState.CONFIRMED
-                   and (alert.get("key"), alert["recipient"]) in keys
-                   for alert in status.closeout_fields(page, row).get("pending_alerts", []))
+        states = {QuestionDeliveryState(alert.get("state", QuestionDeliveryState.NOT_STARTED))
+                  for alert in status.closeout_fields(page, row).get("pending_alerts", [])
+                  if (alert.get("key"), alert["recipient"]) in keys}
+    if QuestionDeliveryState.CONFIRMED in states:
+        return QuestionDeliveryState.CONFIRMED
+    return QuestionDeliveryState.NOT_STARTED if any(state.pending for state in states) else QuestionDeliveryState.FAILED
 
 
 
@@ -4429,7 +4449,7 @@ def expire_saved_questions(status: DeliveryStatus, paths: Iterable[Path], *,
     for path in paths:
         delivery = retries[path] if retries is not None else UnreadableDeliveryRecord()
         try:
-            if isinstance(delivery, ListFeedbackRetry) or path.is_symlink():
+            if isinstance(delivery, PageFeedbackRetry) or path.is_symlink():
                 continue
             fields = read_recovery_delivery(status, path)
             if "question_attempt" in fields:
@@ -4502,7 +4522,7 @@ def recover_deferred_questions(status: DeliveryStatus) -> None:
         try:
             if delivery is None:
                 recover_page_question(status, path, read_question_attempt(path))
-            elif isinstance(delivery, ListFeedbackRetry):
+            elif isinstance(delivery, PageFeedbackRetry):
                 delivery.deliver()
             elif isinstance(delivery, UnreadableDeliveryRecord):
                 fields = read_recovery_delivery(status, path)
@@ -4517,7 +4537,7 @@ def recover_deferred_questions(status: DeliveryStatus) -> None:
             else:
                 deliver(delivery, status)
         except Exception as error:
-            if (not isinstance(delivery, ListFeedbackRetry) and isinstance(error, FileNotFoundError)
+            if (not isinstance(delivery, PageFeedbackRetry) and isinstance(error, FileNotFoundError)
                     and cast(object, error.filename) == str(path)):
                 continue
             _defer_question_error(status, path, path.name, error, delivery=delivery)

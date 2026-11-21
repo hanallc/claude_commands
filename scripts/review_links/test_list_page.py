@@ -5792,9 +5792,9 @@ window.fetch=async(path,options={})=>{
         cases: tuple[tuple[the_list.PageFeedback, str, tuple[str, ...]], ...] = (
             (the_list.PageFeedback("request", "Words"), "sent to morty", ("morty",)),
             (the_list.PageFeedback("request", "Words", "sent"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "not sent; sdlc told", ("sdlc",)),
-            (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "not sent; <unknown> told", ()),
-            (the_list.PageFeedback("request", "Words", "alerted"), "not sent; no showrunner for alert", ()),
+            (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "Feedback failed. sdlc received the alert.", ("sdlc",)),
+            (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "Feedback failed. <unknown> received the alert.", ()),
+            (the_list.PageFeedback("request", "Words", "alerted"), "Feedback failed. No showrunner for the alert.", ()),
         )
         for feedback, text, colored in cases:
             with (self.subTest(state=feedback.state, recipient=feedback.alerted_to),
@@ -6051,10 +6051,10 @@ window.fetch=async(_path,options={})=>{
             self.assertEqual(send.call_count, 2)
             alerted = the_list.load(MORTY.id, item.id)
             latest = tuple(the_list.feedback_requests(alerted).values())[-1]
-            self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
-            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
+            self.assertEqual((latest.state, latest.alerted_to), ("alerted", OWNER.id))
+            self.assertNotIn("sdlc received the alert", without_role_colors(list_page.render(root).decode()))
             self.assertEqual(the_list.mark_read(MORTY.id, item.id, source="morty"), alerted)
-            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
+            self.assertNotIn("sdlc received the alert", without_role_colors(list_page.render(root).decode()))
         self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
 
     def test_failed_list_feedback_defers_its_alert_on_the_live_status(self) -> None:
@@ -6077,11 +6077,104 @@ window.fetch=async(_path,options={})=>{
             self.assertTrue(status.has_deferred_alerts())
             status.recover_deferred_alerts()
             self.assertFalse(status.has_deferred_alerts())
-            list_page.recover_pending(status)
+            change_page.recover_deferred_questions(status)
         self.assertEqual([recipient for recipient, _ in attempts], [MORTY.id, OWNER.id, OWNER.id])
         self.assertEqual(attempts[1], attempts[2])
         saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
-        self.assertEqual((saved.state, saved.alerted_to), ("alerted", "sdlc"))
+        self.assertEqual((saved.state, saved.alerted_to), ("alerted", OWNER.id))
+        renamed = replace(OWNER, name="renamed-showrunner")
+        members = staff.snapshot()
+        renamed_members = replace(members, rows=tuple(renamed if row.id == OWNER.id else row for row in members.rows))
+        with patch.object(staff, "snapshot", return_value=renamed_members):
+            body = without_role_colors(list_page.render(root).decode())
+        self.assertIn("renamed-showrunner received the alert.", body)
+
+    def test_failed_list_alert_saves_the_showrunner_id(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Report an alert failure")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        with (patch.object(change_page, "send_to_staff",
+                           side_effect=change_page.QuestionSendStopped("The route refused the message.")) as send,
+              redirect_stderr(io.StringIO())):
+            list_page.deliver(list_page.submit(root, urlencode(fields), status))
+        self.assertEqual([call.args[0] for call in send.call_args_list], [MORTY.id, OWNER.id])
+        saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
+        self.assertEqual((saved.state, saved.alerted_to), ("alerted", OWNER.id))
+        body = without_role_colors(list_page.render(root).decode())
+        self.assertIn("Alert for " + OWNER.name + " failed.", body)
+        self.assertNotIn("No showrunner for the alert.", body)
+
+    def test_legacy_list_alert_uses_its_confirmed_receipt_after_a_rename(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Report a legacy alert")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        _ = list_page.submit(root, urlencode(fields), status)
+        request = fields["request"]
+        the_list.deliver_feedback(MORTY.id, item.id, request,
+                                  lambda _item, feedback: replace(feedback, state="alerted", alerted_to=OWNER.name))
+        source = the_list.folder(MORTY.id) / f"{item.id}.md"
+        page = change_page.ReviewPage(source, source.parent, (item.id,), "")
+        delivery = change_page.MessageDelivery(page, item.id, (), "", request)
+        key = change_page.review_delivery_key(source, item.id, request, purpose=f"alert:{MORTY.id}")
+        alert: change_page.PendingDeliveryAlert = {"recipient": OWNER.id, "message": "List feedback needs attention",
+            "key": key, "state": change_page.QuestionDeliveryState.CONFIRMED}
+        with status.locked():
+            status.store_pending_alerts(delivery, (alert,))
+        members = staff.snapshot()
+        renamed = {OWNER.id: "renamed-showrunner", OTHER.id: OWNER.name}
+        renamed_members = replace(members, rows=tuple(replace(row, name=renamed[row.id]) if row.id in renamed else row
+                                                      for row in members.rows))
+        with patch.object(staff, "snapshot", return_value=renamed_members):
+            body = without_role_colors(list_page.render(root).decode())
+        self.assertIn("renamed-showrunner received the alert.", body)
+        self.assertNotIn("is unverified.", body)
+
+    def test_legacy_list_alert_keeps_its_name_with_two_confirmed_receipts(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Report a legacy alert after a routing change")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        _ = list_page.submit(root, urlencode(fields), status)
+        request = fields["request"]
+        the_list.deliver_feedback(MORTY.id, item.id, request,
+                                  lambda _item, feedback: replace(feedback, state="alerted", alerted_to="saved-showrunner"))
+        source = the_list.folder(MORTY.id) / f"{item.id}.md"
+        page = change_page.ReviewPage(source, source.parent, (item.id,), "")
+        delivery = change_page.MessageDelivery(page, item.id, (), "", request)
+        key = change_page.review_delivery_key(source, item.id, request, purpose=f"alert:{MORTY.id}")
+        alerts: tuple[change_page.PendingDeliveryAlert, ...] = tuple(
+            {"recipient": runner.id, "message": "List feedback needs attention", "key": key,
+             "state": change_page.QuestionDeliveryState.CONFIRMED} for runner in (OTHER, OWNER))
+        with status.locked():
+            status.store_pending_alerts(delivery, alerts)
+        body = without_role_colors(list_page.render(root).decode())
+        self.assertIn("saved-showrunner received the alert.", body)
+        self.assertNotIn(OTHER.name + " received the alert.", body)
+        self.assertNotIn(OWNER.name + " received the alert.", body)
+
+    def test_list_alert_uses_only_the_current_recipients_receipt(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Report a failure after a routing change")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        source = the_list.folder(MORTY.id) / f"{item.id}.md"
+        page = change_page.ReviewPage(source, source.parent, (item.id,), "")
+        key = change_page.review_delivery_key(source, item.id, fields["request"], purpose=f"alert:{MORTY.id}")
+        old_alert: change_page.PendingDeliveryAlert = {"recipient": staff.StaffId("former-showrunner"),
+            "message": "Previously sent alert", "key": key, "state": change_page.QuestionDeliveryState.CONFIRMED}
+        delivery = change_page.MessageDelivery(page, item.id, (), "", fields["request"])
+        with status.locked():
+            status.store_pending_alerts(delivery, (old_alert,))
+        with (patch.object(change_page, "send_to_staff",
+                           side_effect=change_page.QuestionSendStopped("The current route refused the message.")) as send,
+              redirect_stderr(io.StringIO())):
+            list_page.deliver(list_page.submit(root, urlencode(fields), status))
+        self.assertEqual([call.args[0] for call in send.call_args_list], [MORTY.id, OWNER.id])
+        body = without_role_colors(list_page.render(root).decode())
+        self.assertIn("Alert for " + OWNER.name + " failed.", body)
+        self.assertNotIn(OWNER.name + " received the alert.", body)
 
     def test_list_feedback_retries_a_temporary_failure_without_a_new_submission(self) -> None:
         root = self.root / "reviews"

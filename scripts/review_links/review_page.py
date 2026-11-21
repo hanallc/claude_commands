@@ -255,16 +255,18 @@ def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: c
         row = source.row['#']
         page = change_page.ReviewPage(source.path, source.path.parent, (row,), '')
         question = source.slots.question
-    elif item.state == ReviewState.WAITING and isinstance(
-            source, (review_items.QuestionSource, review_items.InvestigationSource,
-                     review_items.ProposalSource, review_items.EfficiencySource)):
-        page = review_actions.delivery_page(item, status)
-        row = page.rows[0]
+    elif isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource,
+                             review_items.InvestigationSource, review_items.ProposalSource,
+                             review_items.EfficiencySource)):
+        path, row = review_actions.delivery_source(item)
+        page = change_page.ReviewPage(path, path.parent, (row,), '')
         question = None
     else:
         return
     sources.extend((status.closeout_path(page, row), status.path(page, row)))
     if question is None:
+        if item.state != ReviewState.WAITING or isinstance(source, review_items.UnownedQuestionSource):
+            return
         question = status.slots(page, row).question
     if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
         return
@@ -583,11 +585,16 @@ class ReviewSnapshotCache:
         """Replace or remove one record while serving the previous version to readers."""
         if members is None:
             members = staff.snapshot()
+        previous = current.records[key]
+        stamps: dict[Path, FileStamp] | None = None
+        if isinstance(previous.source, review_items.ChangeSource):
+            path = change_routing.delivery_path(self.root, previous.source.path, previous.source.row['#'])
+            stamps = {path: source_stamp(path)}
         try:
-            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(self.root, current.records[key], members)
+            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(self.root, previous, members)
         except (FileNotFoundError, review_items.ReviewRecordMissing):
             item = ReviewRecordNotPublished()
-        return self.publish_item(current, key, item, members), item
+        return self.publish_item(current, key, item, members, stamps=stamps), item
 
     def create_submission(self, request: new_item_dialog.NewItemRequest) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
@@ -661,15 +668,18 @@ class ReviewSnapshotCache:
             if isinstance(previous_origin, new_item_dialog.ReviewSubmission):
                 _ = submission_keys.pop(previous_origin.request_id, None)
         names = staff_names.StaffNames(members)
+        delivery_sources = ReviewSourceStamps()
         if isinstance(item, ReviewRecordNotPublished) or item.state == ReviewState.DONE:
             _ = records.pop(key, None)
             entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = key
         else:
             item = review_items.normalize_times(item, current.zone)
+            retain_question_delivery(item, assets, change_page.DeliveryStatus(self.root), delivery_sources)
             retain_asset(item, assets)
             if (stamps is not None and current.records.get(key) == item and members == current.members
                     and key not in current.unavailable_cards
+                    and delivery_sources.before_read.keys() <= current.source_stamps.keys()
                     and all(assets.get(asset) == current.assets.get(asset) for asset in asset_keys)):
                 return current
             records[key] = item
@@ -684,8 +694,9 @@ class ReviewSnapshotCache:
                 entries.append(updated_entry)
             record_version = repr((item, tuple(assets.get(asset) for asset in asset_keys)))
         version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
+        delivery_stamps = {path: stamp for path, stamp in delivery_sources.before_read.items() if path != self.root}
         fresh = pack_snapshot(replace(current, version=version, members=members, names=names, records=records, assets=assets, entries=entries,
-                                      source_stamps={**current.source_stamps, **stamps} if stamps is not None else current.source_stamps,
+                                      source_stamps={**current.source_stamps, **delivery_stamps, **(stamps or {})},
                                       unavailable_cards=current.unavailable_cards-{key, previous_key},
                                       submission_keys=submission_keys),
                               index_json(entries), started)

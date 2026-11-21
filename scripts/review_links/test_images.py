@@ -28,7 +28,7 @@ from scripts.message import send_result
 from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.review_links.test_page_question import FakeQuestionTransport, confirmed_schema_two, expire_saved_question, question_outcome, saved_progress
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
+from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, review_link, serve
 from scripts.review_links import question_record
 
 SEND_MESSAGE = change_page.send_message
@@ -515,6 +515,7 @@ class ImagesTests(ImagesFixture):
         card = images.card(record, "token", staff.snapshot(), 3)
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
+        source = images.feedback_source_token("token", record["id"], record["registered_at"])
         self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
             + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
@@ -525,6 +526,7 @@ class ImagesTests(ImagesFixture):
             + f'<form method="post" data-image-form><input type="hidden" name="image" value="{record['id']}">'
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<input type="hidden" name="feedback_round" value="{images.feedback_round(set())}">'
+            + f'<input type="hidden" name="feedback_source" value="{source}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
             + '<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
@@ -754,6 +756,309 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(len(keys), 2)
         self.assertNotEqual(keys[0], keys[1])
         self.assertEqual(len(self.sent), 2)
+
+    def test_saved_image_feedback_retries_on_the_server_worker_after_restart(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        with patch.object(change_page, "send_to_staff", side_effect=[
+                change_page.QuestionNotStarted("The route is unavailable."), None]) as send:
+            with self.assertRaises(images.AnswerNotSent):
+                self.submit(body)
+            self.assertNotIn("feedback_at", image_store.read_record(folder))
+            self.assertTrue(self.status.has_deferred_questions())
+            restarted = change_page.DeliveryStatus(self.root)
+            images.recover_pending(restarted)
+            self.assertTrue(restarted.has_deferred_questions())
+            change_page.recover_deferred_questions(restarted)
+            self.assertFalse(restarted.has_deferred_questions())
+            images.recover_pending(restarted)
+            change_page.recover_deferred_questions(restarted)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[0], send.call_args_list[1])
+        self.assertIn("feedback_at", image_store.read_record(folder))
+
+    def test_feedback_request_write_failure_retries_with_its_text_and_snapshot(self) -> None:
+        record = self.register()
+        self.ask(record)
+        images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
+        folder = images.images_root(self.root) / record["id"]
+        words = "Check the gate."
+        round_id = images.feedback_round({"Q1"})
+        key = images.feedback_key(record, folder, "feedback", words, round_id)
+        path = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+        body = urlencode({"image": record["id"], "action": "feedback", "feedback": words, "feedback_round": round_id,
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        with (patch.object(atomic_file, "write_text_atomic",
+                           side_effect=atomic_file.AtomicPublicationFailed("The request write failed.")) as write,
+              patch.object(change_page, "send_to_staff") as send, redirect_stderr(StringIO()),
+              self.assertRaisesRegex(OSError, "The request write failed.")):
+            self.submit(body)
+        write.assert_called_once()
+        send.assert_not_called()
+        self.assertEqual(list(folder.glob(images.FEEDBACK_PREFIX + "*")), [])
+        self.assertTrue(self.status.has_deferred_questions())
+
+        def confirm(recipient: staff.StaffId, sender: str, message: str, *, key: str, question: bool) -> None:
+            self.assertEqual((recipient, sender, question), (self.owner_id(), images.SENDER, True))
+            self.assertIn("Feedback: " + words, message)
+            saved = delivery_state.read_fields(path)
+            self.assertEqual((saved["key"], saved["text"], saved["answered"]), (key, words, ["Q1"]))
+            self.assertFalse(path.with_suffix("").exists())
+
+        with patch.object(change_page, "send_to_staff", side_effect=confirm) as send:
+            change_page.recover_deferred_questions(self.status)
+        send.assert_called_once()
+        self.assertIn("feedback_at", image_store.read_record(folder))
+        self.assertFalse(self.status.has_deferred_questions())
+
+    def test_startup_scan_preserves_feedback_text_in_a_queued_retry(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        words = "Check the gate."
+        key = images.feedback_key(record, folder, "feedback", words, None)
+        snapshot = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:"))
+        _ = snapshot.write_text("")
+        body = urlencode({"image": record["id"], "action": "feedback", "feedback": words,
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        with (patch.object(atomic_file, "write_text_atomic",
+                           side_effect=atomic_file.AtomicPublicationFailed("The request write failed.")),
+              redirect_stderr(StringIO()), self.assertRaisesRegex(OSError, "The request write failed.")):
+            self.submit(body)
+        self.assertFalse(snapshot.with_suffix(".pending").exists())
+        self.assertTrue(self.status.has_deferred_questions())
+        images.recover_pending(self.status)
+        with patch.object(change_page, "send_to_staff", return_value=None) as send:
+            change_page.recover_deferred_questions(self.status)
+        send.assert_called_once_with(record["owner"], images.SENDER,
+                                     images.answer_message(record, "feedback", words), key=key, question=True)
+        self.assertIn("feedback_at", image_store.read_record(folder))
+        self.assertFalse(self.status.has_deferred_questions())
+
+    def test_link_lookup_timeout_leaves_a_receipt_that_recovery_can_expire(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        key = images.feedback_key(record, folder, "approved", "", None)
+        path = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+        receipt = path.with_suffix(".json")
+        body = urlencode({"image": record["id"], "action": "approved",
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        with (patch.object(review_link, "link_host", side_effect=subprocess.TimeoutExpired("tailscale", 1)) as host,
+              patch.object(change_page, "send_to_staff") as send, redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(OSError, "tailscale"):
+                self.submit(body)
+            saved = change_page.read_page_feedback_progress(receipt, key)
+            assert saved is not None
+            self.assertEqual(saved.state, change_page.QuestionDeliveryState.NOT_STARTED)
+            assert saved.deadline is not None
+            restarted = change_page.DeliveryStatus(self.root)
+            with patch("time.time", return_value=saved.deadline + 1):
+                images.recover_pending(restarted)
+                change_page.recover_deferred_questions(restarted)
+        host.assert_called_once_with()
+        send.assert_not_called()
+        failed = change_page.read_page_feedback_progress(receipt, key)
+        assert failed is not None
+        self.assertEqual(failed.state, change_page.QuestionDeliveryState.FAILED)
+        self.assertFalse(path.exists())
+        self.assertFalse(restarted.has_deferred_questions())
+        self.assertNotIn("feedback_at", image_store.read_record(folder))
+
+    def test_feedback_refuses_a_form_when_an_answer_arrives_before_the_save(self) -> None:
+        record = self.register()
+        self.ask(record)
+        folder = images.images_root(self.root) / record["id"]
+        body = urlencode({"image": record["id"], "action": "approved", "feedback_round": images.feedback_round(set()),
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        deliver = images.deliver_saved_feedback
+
+        def answer_first(status: change_page.DeliveryStatus, path: Path, request: images.ImageFeedback | None, *,
+                         round_id: str | None) -> change_page.QuestionProgress | None:
+            images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
+            return deliver(status, path, request, round_id=round_id)
+
+        with (patch.object(images, "deliver_saved_feedback", side_effect=answer_first),
+              patch.object(change_page, "send_to_staff") as send,
+              self.assertRaisesRegex(question_record.AnswerRefused, "The image has a new answer")):
+            self.submit(body)
+        send.assert_not_called()
+        self.assertEqual(list(folder.glob(images.FEEDBACK_PREFIX + "*")), [])
+        self.assertNotIn("feedback_at", image_store.read_record(folder))
+        self.assertIn("The gate passed.", images.render(self.status).decode())
+
+    def test_confirmed_legacy_feedback_recovers_without_a_link_host(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        key = images.feedback_key(record, folder, "approved", "", None)
+        snapshot = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:"))
+        _ = snapshot.write_text("")
+        progress = change_page.QuestionProgress(key, key, datetime.now(UTC).timestamp(),
+                                                state=change_page.QuestionDeliveryState.CONFIRMED)
+        change_page.write_feedback_progress(snapshot.with_suffix(".json"), progress)
+        with (patch.object(review_link, "link_host",
+                           side_effect=subprocess.TimeoutExpired("tailscale", 1)) as host,
+              patch.object(change_page, "send_to_staff") as send):
+            images.recover_pending(self.status)
+            change_page.recover_deferred_questions(self.status)
+            self.submit(urlencode({"image": record["id"], "action": "approved",
+                "token": images.request_token(images.console_token(self.root), record["id"])}))
+        host.assert_not_called()
+        send.assert_not_called()
+        self.assertIn("feedback_at", image_store.read_record(folder))
+        self.assertFalse(self.status.has_deferred_questions())
+
+    def test_startup_recovers_legacy_image_feedback_receipts_with_snapshots(self) -> None:
+        for action, words, state in (
+                ("approved", "", None),
+                ("approved", "", change_page.QuestionDeliveryState.NOT_STARTED),
+                ("feedback", "Check the gate.", change_page.QuestionDeliveryState.NOT_STARTED),
+                ("feedback", "Check the gate.", change_page.QuestionDeliveryState.CONFIRMED)):
+            with self.subTest(action=action, state=state):
+                record = self.register()
+                folder = images.images_root(self.root) / record["id"]
+                round_id = images.feedback_round(set())
+                attempt = json.dumps([record["registered_at"], action, words, round_id])
+                key = change_page.review_delivery_key(folder / image_store.RECORD, record["id"], attempt)
+                snapshot = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:"))
+                _ = snapshot.write_text("")
+                if state is not None:
+                    change_page.write_feedback_progress(snapshot.with_suffix(".json"),
+                        change_page.QuestionProgress(key, key, datetime.now(UTC).timestamp(), state=state))
+                status = change_page.DeliveryStatus(self.root)
+
+                with patch.object(change_page, "send_to_staff", return_value=None) as send:
+                    images.recover_pending(status)
+                    self.assertTrue(status.has_deferred_questions())
+                    change_page.recover_deferred_questions(status)
+                can_retry = action == "approved"
+                if can_retry:
+                    send.assert_called_once_with(record["owner"], images.SENDER,
+                                                 images.answer_message(record, action, words), key=key, question=True)
+                else:
+                    send.assert_not_called()
+                can_finish = can_retry or state is change_page.QuestionDeliveryState.CONFIRMED
+                self.assertEqual(status.has_deferred_questions(), not can_finish)
+                self.assertEqual("feedback_at" in image_store.read_record(folder), can_finish)
+
+    def test_legacy_snapshot_waits_for_the_original_text_without_a_deadline(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        words = "Check the gate."
+        key = images.feedback_key(record, folder, "feedback", words, None)
+        snapshot = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:"))
+        _ = snapshot.write_text("")
+        receipt = snapshot.with_suffix(".json")
+        now = datetime.now(UTC).timestamp()
+        body = urlencode({"image": record["id"], "action": "feedback", "feedback": words,
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        with (patch.object(change_page, "send_to_staff", return_value=None) as send, redirect_stderr(StringIO())):
+            with patch("time.time", return_value=now):
+                images.recover_pending(self.status)
+                change_page.recover_deferred_questions(self.status)
+            self.assertFalse(receipt.exists())
+            with patch("time.time", return_value=now + 86_401):
+                change_page.recover_deferred_questions(self.status)
+                self.assertFalse(receipt.exists())
+                send.assert_not_called()
+                self.submit(body)
+        send.assert_called_once_with(record["owner"], images.SENDER,
+                                     images.answer_message(record, "feedback", words), key=key, question=True)
+        saved = change_page.read_page_feedback_progress(receipt, key)
+        assert saved is not None
+        self.assertEqual(saved.state, change_page.QuestionDeliveryState.CONFIRMED)
+        self.assertIn("feedback_at", image_store.read_record(folder))
+
+    def test_startup_expires_a_legacy_feedback_receipt_without_its_text(self) -> None:
+        for state in (change_page.QuestionDeliveryState.UNKNOWN, change_page.QuestionDeliveryState.NOT_STARTED):
+            with self.subTest(state=state):
+                record = self.register()
+                folder = images.images_root(self.root) / record["id"]
+                key = images.feedback_key(record, folder, "feedback", "Check the gate.", None)
+                snapshot = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:"))
+                _ = snapshot.write_text("")
+                receipt = snapshot.with_suffix(".json")
+                now = datetime.now(UTC).timestamp()
+                progress = change_page.QuestionProgress(key, key, now - 5, deadline=now - 1, state=state)
+                change_page.write_feedback_progress(receipt, progress)
+                status = change_page.DeliveryStatus(self.root)
+                with (patch.object(images, "legacy_feedback_action") as action,
+                      patch.object(images, "answer_message") as message,
+                      patch.object(change_page, "send_to_staff") as send):
+                    images.recover_pending(status)
+                    change_page.recover_deferred_questions(status)
+                action.assert_not_called()
+                message.assert_not_called()
+                send.assert_not_called()
+                saved = change_page.read_page_feedback_progress(receipt, key)
+                assert saved is not None
+                self.assertEqual((saved.state, saved.error), (change_page.QuestionDeliveryState.FAILED,
+                                                             change_page.QUESTION_RECOVERY_EXPIRED))
+                self.assertFalse(status.has_deferred_questions())
+                self.assertNotIn("feedback_at", image_store.read_record(folder))
+
+    def test_recovery_keeps_an_unreadable_feedback_request_past_its_deadline(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        words = "Check the gate."
+        key = images.feedback_key(record, folder, "feedback", words, None)
+        path = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+        request = images.ImageFeedback(key, record["owner"], record["registered_at"], frozenset(), "feedback", words)
+        request.save(path)
+        receipt = path.with_suffix(".json")
+        now = datetime.now(UTC).timestamp()
+        progress = change_page.QuestionProgress(key, key, now - 5, deadline=now - 1,
+                                                state=change_page.QuestionDeliveryState.UNKNOWN)
+        change_page.write_feedback_progress(receipt, progress)
+        status = change_page.DeliveryStatus(self.root)
+        error = "Cannot read the feedback request."
+        with (patch.object(images, "answer_message") as message, patch.object(change_page, "send_to_staff") as send):
+            with (patch.object(images, "read_feedback_request", side_effect=OSError(error)),
+                  redirect_stderr(StringIO()) as output):
+                images.recover_pending(status)
+                for _ in range(2):
+                    change_page.recover_deferred_questions(status)
+                    self.assertTrue(status.has_deferred_questions())
+                    self.assertTrue(path.is_file())
+                    self.assertEqual(change_page.read_page_feedback_progress(receipt, key), progress)
+            self.assertEqual(output.getvalue().count(error), 1)
+            self.assertEqual(images.read_feedback_request(path, key), request)
+            change_page.recover_deferred_questions(status)
+        message.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(change_page.read_page_feedback_progress(receipt, key), progress.expire())
+        self.assertFalse(path.exists())
+        self.assertFalse(status.has_deferred_questions())
+
+    def test_recovery_keeps_feedback_when_the_image_record_is_unreadable(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        key = images.feedback_key(record, folder, "approved", "", None)
+        path = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+        request = images.ImageFeedback(key, record["owner"], record["registered_at"], frozenset(), "approved", "")
+        request.save(path)
+        receipt = path.with_suffix(".json")
+        now = datetime.now(UTC).timestamp()
+        progress = change_page.QuestionProgress(key, key, now - 5, deadline=now - 1,
+                                                state=change_page.QuestionDeliveryState.UNKNOWN)
+        change_page.write_feedback_progress(receipt, progress)
+        error = "Cannot read the image record."
+        with (patch.object(images, "answer_message") as message, patch.object(change_page, "send_to_staff") as send):
+            with (patch.object(image_store, "read_record", side_effect=OSError(error)),
+                  redirect_stderr(StringIO()) as output):
+                images.recover_pending(self.status)
+                for _ in range(2):
+                    change_page.recover_deferred_questions(self.status)
+                    self.assertTrue(self.status.has_deferred_questions())
+                    self.assertEqual(images.read_feedback_request(path, key), request)
+                    self.assertEqual(change_page.read_page_feedback_progress(receipt, key), progress)
+            self.assertEqual(output.getvalue().count(error), 1)
+            change_page.recover_deferred_questions(self.status)
+        message.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(change_page.read_page_feedback_progress(receipt, key), progress.expire())
+        self.assertFalse(path.exists())
+        self.assertFalse(self.status.has_deferred_questions())
 
     def test_saved_receipt_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()
@@ -1867,6 +2172,83 @@ class ImagesServerTests(ImagesFixture):
         self.assertEqual((status, cast(dict[str, str], json.loads(answer))), (200, {"state": "done"}))
         self.assertEqual(len(self.sent), 1)
         self.assertNotIn(record["id"], self.http("GET", images.PAGE_PATH)[2].decode())
+
+    def test_server_reports_the_worker_refusal_after_it_removes_the_request(self) -> None:
+        record = self.register()
+        token = images.request_token(images.console_token(self.root), record["id"])
+        body = urlencode({"image": record["id"], "token": token, "feedback": "Too dark.", "action": "feedback"})
+        deliver = images.deliver_saved_feedback
+
+        def finish_first(status: change_page.DeliveryStatus, path: Path, request: images.ImageFeedback | None, *,
+                         round_id: str | None) -> change_page.QuestionProgress | None:
+            # Run the worker's delivery before the POST reads the result.
+            progress = deliver(status, path, request, round_id=round_id)
+            assert progress is not None
+            self.assertEqual(progress.state, change_page.QuestionDeliveryState.FAILED)
+            self.assertFalse(path.exists())
+            return deliver(status, path, request, round_id=round_id)
+
+        with (patch.object(images, "deliver_saved_feedback", side_effect=finish_first),
+              patch.object(change_page, "send_to_staff", side_effect=change_page.QuestionSendStopped("Refused.")) as send):
+            status, _, answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual((status, cast(dict[str, str], json.loads(answer))),
+                         (503, {"reason": "the owner did not get the message (Refused.). Try again."}))
+        send.assert_called_once()
+        self.assertIn(record["id"], self.http("GET", images.PAGE_PATH)[2].decode())
+
+    def test_server_reports_an_unusable_link_setting_as_a_final_failure(self) -> None:
+        record = self.register()
+        folder = images.images_root(self.root) / record["id"]
+        key = images.feedback_key(record, folder, "approved", "", None)
+        path = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+        body = urlencode({"image": record["id"], "action": "approved",
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        reason = "The image link setting is unusable."
+        with (patch.object(review_link, "link_host", side_effect=conf.Unusable(reason)) as host,
+              patch.object(change_page, "send_to_staff") as send):
+            status, _, answer = self.http("POST", images.PAGE_PATH, body)
+            saved = change_page.read_page_feedback_progress(path.with_suffix(".json"), key)
+            assert saved is not None
+            self.assertEqual((saved.state, saved.error), (change_page.QuestionDeliveryState.FAILED, reason))
+            self.assertFalse(path.exists())
+            restarted = change_page.DeliveryStatus(self.root)
+            images.recover_pending(restarted)
+            change_page.recover_deferred_questions(restarted)
+            self.assertFalse(restarted.has_deferred_questions())
+            repeated, _, repeated_answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual((status, repeated, repeated_answer), (503, 503, answer))
+        self.assertEqual(json.loads(answer), {"reason": f"the owner did not get the message ({reason}). Try again."})
+        host.assert_called_once_with()
+        send.assert_not_called()
+        self.assertNotIn("feedback_at", image_store.read_record(folder))
+
+    def test_server_reports_a_saved_failure_when_cleanup_files_are_unreadable(self) -> None:
+        files = ((images, "read_feedback_request"), (image_store, "read_record"))
+        for module, read in files:
+            with self.subTest(read=read):
+                record = self.register()
+                folder = images.images_root(self.root) / record["id"]
+                key = images.feedback_key(record, folder, "approved", "", None)
+                path = folder / (images.FEEDBACK_PREFIX + key.removeprefix("review:") + ".pending")
+                request = images.ImageFeedback(key, record["owner"], record["registered_at"], frozenset(), "approved", "")
+                request.save(path)
+                receipt = path.with_suffix(".json")
+                reason = "The sender refused this feedback."
+                progress = change_page.QuestionProgress(key, key, datetime.now(UTC).timestamp()).fail(reason)
+                change_page.write_feedback_progress(receipt, progress)
+                token = images.console_token(self.root)
+                body = urlencode({"image": record["id"], "action": "approved", "token": images.request_token(token, record["id"]),
+                    "feedback_source": images.feedback_source_token(token, record["id"], record["registered_at"])})
+                with (patch.object(module, read, side_effect=OSError("Read failed.")),
+                      patch.object(images, "answer_message") as message, patch.object(change_page, "send_to_staff") as send):
+                    status, _, answer = self.http("POST", images.PAGE_PATH, body)
+                    self.assertTrue(path.exists())
+                self.assertEqual(status, 503)
+                self.assertEqual(json.loads(answer), {"reason": f"the owner did not get the message ({reason}). Try again."})
+                message.assert_not_called()
+                send.assert_not_called()
+                self.assertEqual(change_page.read_page_feedback_progress(receipt, key), progress)
+                self.assertNotIn("feedback_at", image_store.read_record(folder))
 
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()

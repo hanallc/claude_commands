@@ -1348,6 +1348,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except images.AnswerNotSent as error:
             self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
             return
+        except images.FeedbackUnavailable:
+            self.json_response(503, {"reason": "The image could not be changed. Try again."})
+            return
         except ValueError as error:
             self.browser_failure(400, "Use the form on this page.", error)
             return
@@ -1551,6 +1554,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
+        recover_images = images.recover_pending
         self.delivery_status.startup_recovery_pending.set()
         change_page.migrate_question_deliveries(self.delivery_status)
 
@@ -1559,6 +1563,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 recover_changes(self.delivery_status)
             finally:
                 self.delivery_status.startup_recovery_pending.clear()
+            recover_images(self.delivery_status)
             recover_list(self.delivery_status)
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()

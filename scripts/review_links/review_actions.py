@@ -83,8 +83,8 @@ def log_superseded(item: review_items.ReviewItem, words: str, *,
         update_registration.append_log(scope, f'Review {item.id}: '+words, None, False)
 
 
-def delivery_page(item: review_items.ReviewItem, status: change_page.DeliveryStatus) -> change_page.ReviewPage:
-    """Find the existing delivery record and preserve its recovery fields."""
+def delivery_source(item: review_items.ReviewItem) -> tuple[Path, str]:
+    """Find the native source and row that identify the delivery."""
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource, review_items.ProposalSource)):
         path = source.record.path
@@ -96,6 +96,12 @@ def delivery_page(item: review_items.ReviewItem, status: change_page.DeliverySta
         assert isinstance(source, review_items.EfficiencySource)
         path = efficiency_reviews.path(source.path)
         row = decision_store.efficiency_identity(item)
+    return path, row
+
+
+def delivery_page(item: review_items.ReviewItem, status: change_page.DeliveryStatus) -> change_page.ReviewPage:
+    """Find the existing delivery record and preserve its recovery fields."""
+    path, row = delivery_source(item)
     return status.metadata_page(change_page.ReviewPage(path, path.parent, (row,), ''))
 
 

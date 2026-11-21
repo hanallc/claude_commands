@@ -200,6 +200,26 @@ class ReviewPageTests(unittest.TestCase):
         return new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-{kind}-{recipient}', kind, recipient,
                                               f'Check the {kind} record.', new_item_dialog.NoEvidence())
 
+    def test_incrementally_published_card_refreshes_its_delivery_failure(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        request = self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        created = cache.create_submission(request)
+        snapshot = cache.get()
+        asset = "question-delivery:" + created.key
+        self.assertNotIn(asset, snapshot.assets)
+        source = created.saved.path
+        row = source.stem
+        page = change_page.ReviewPage(source, source.parent, (row,), "")
+        path = self.status.path(page, row)
+        self.assertEqual(snapshot.source_stamps[path], review_page.source_stamp(path))
+        question = change_page.OpenQuestion(created.saved.reply_token, request.words, change_page.NoDelivery())
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(), question)
+        progress = change_page.QuestionProgress("attempt", question.question_id, time.time()).fail("Refused.")
+        with self.status.locked():
+            self.status.write_slots(page, row, slots, question_progress=progress)
+        self.assertIn("Question not delivered.", cache.get().assets[asset])
+
     def test_sent_rows_keep_native_types_and_return_to_open(self) -> None:
         owner = self.ready_submission_recipient()
         doc = self.fixture.temporary / 'producer.md'
