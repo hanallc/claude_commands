@@ -1335,7 +1335,7 @@ _dispatch_reads: ContextVar[DispatchReads | ReadDispatches] = ContextVar("dispat
 
 @contextmanager
 def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path], *,
-                   expected_states: Collection[Path] = ()) -> Generator[None]:
+                   expected_states: Collection[Path] = ()) -> Generator[DispatchReads]:
     """Share history reads within one command, without retaining them afterward."""
     states: dict[Path, dict[str, object] | DispatchHistoryUnknown] = {}
     for run in runs:
@@ -1348,9 +1348,10 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path], *,
                 states[path] = DispatchHistoryUnknown(str(error))
         except (OSError, UnicodeError) as error:
             states[path] = DispatchHistoryUnknown(f"{path}: {error}")
-    token = _dispatch_reads.set(DispatchReads(record, states, {}))
+    reads = DispatchReads(record, states, {})
+    token = _dispatch_reads.set(reads)
     try:
-        yield
+        yield reads
     finally:
         _dispatch_reads.reset(token)
 
@@ -1368,14 +1369,17 @@ def _dispatch_state_paths() -> set[Path]:
 
 def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded | DispatchHistoryUnknown:
     """Read the newest open or finished dispatch across the staff parent's runs."""
-    from scripts.direct import phase_reservation
-
+    try:
+        linked = recorded_dispatch_run(worker_id)
+    except (OSError, ValueError) as error:
+        return DispatchHistoryUnknown(str(error))
+    if isinstance(linked, BrokenDispatchRunLink):
+        return DispatchHistoryUnknown(f"{linked.path}: the linked recorder state is unavailable")
     reads = _dispatch_reads.get()
     if isinstance(reads, ReadDispatches):
         try:
             membership = staff.local_snapshot()
             paths = _dispatch_state_paths()
-            linked = recorded_dispatch_run(worker_id)
         except (OSError, ValueError) as error:
             return DispatchHistoryUnknown(str(error))
         if isinstance(linked, RecordedDispatchRun):
@@ -1387,8 +1391,15 @@ def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchReco
         parent = membership.parent_of(member) if member is not None else None
         if parent is not None and isinstance(parent.run, staff.OpenRun):
             runs.add(parent.run.path)
-        with dispatch_reads(membership, sorted(runs), expected_states=paths):
-            return last_dispatch(worker_id)
+        with dispatch_reads(membership, sorted(runs), expected_states=paths) as current:
+            return _latest_dispatch(worker_id, current)
+    return _latest_dispatch(worker_id, reads)
+
+
+def _latest_dispatch(worker_id: staff.StaffId, reads: DispatchReads
+                     ) -> RecordedDispatch | NoDispatchRecorded | DispatchHistoryUnknown:
+    from scripts.direct import phase_reservation
+
     membership = reads.record
     worker = membership.by_id(worker_id)
     if worker is None or worker.kind != "worker":
@@ -2461,6 +2472,11 @@ class DispatchRunNotRecorded(Enum):
     MISSING = "the worker has no dispatch state link"
 
 
+@dataclass(frozen=True)
+class BrokenDispatchRunLink:
+    path: Path
+
+
 def _dispatch_state_links() -> Path:
     return staff.record_path().parent / "dispatches"
 
@@ -2469,11 +2485,15 @@ def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
     return _dispatch_state_links() / str(worker_id)
 
 
-def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | DispatchRunNotRecorded:
-    """Find the existing pass state without searching the run root."""
+def recorded_dispatch_run(worker_id: staff.StaffId
+                          ) -> RecordedDispatchRun | DispatchRunNotRecorded | BrokenDispatchRunLink:
+    """Find the linked pass state without searching the run root."""
+    link = _dispatch_state_link(worker_id)
     try:
-        path = _dispatch_state_link(worker_id).resolve(strict=True)
+        path = link.resolve(strict=True)
     except FileNotFoundError:
+        if link.exists(follow_symlinks=False):
+            return BrokenDispatchRunLink(link)
         return DispatchRunNotRecorded.MISSING
     return RecordedDispatchRun(path.parent)
 

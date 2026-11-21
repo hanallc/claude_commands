@@ -1166,23 +1166,13 @@ def resume_context(runs: Path, worker: str) -> str:
     return "\n".join(lines)
 
 
-def _start_refusal(run: Path, caller: Caller) -> str:
+def _start_refusal(run: Path) -> str:
     path = run / unit_runs.STATE_FILE
     try:
         state = recorder_state.read_state(path)
     except FileNotFoundError:
         if path.exists(follow_symlinks=False):
             return "the recorder state is unavailable"
-        membership = staff.initial_snapshot()
-        if isinstance(caller, DirectorCaller):
-            owner = membership.by_id(caller.staff_id)
-        elif isinstance(caller, PaneCaller):
-            member = membership.by_id(caller.staff_id)
-            owner = membership.parent_of(member) if member is not None else None
-        else:
-            owner = None
-        if owner is None or not unit_runs.points_to_run(owner, run):
-            return "the run has no recorder state or matching owner pointer"
     except (OSError, ValueError, recorder_state.OldRecorderState) as error:
         return str(error)
     else:
@@ -1228,7 +1218,7 @@ def command_start(args: argparse.Namespace) -> int:
     try:
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
-            if refusal := _start_refusal(Path(session_dir), caller):
+            if refusal := _start_refusal(Path(session_dir)):
                 print(f"detached_runs: {session_dir}: {refusal}", file=sys.stderr)
                 return 2
             if isinstance(caller, NotDetachedWorker) or isinstance(caller, DirectorCaller) and not reference:
