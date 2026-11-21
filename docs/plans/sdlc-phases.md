@@ -1850,6 +1850,25 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 **Order:** after the item 154 combined branch merges to main, and before the cargo-liner move on Dec 1. Item 154 claims publication coverage for integration productions only.
 
+### Phase 105 — Item 154 follow-up: run end defects that exist on main  · status: todo
+**Depends on:** phases 100–103
+
+#### Work Order
+
+**Goal:** close the run end defects that the phase 103 reviews found and that exist on main at e332b0e70b. The phase 103 review (pass 9) showed that the item 154 branch is at least as safe as main for each case.
+**Spec:**
+1. Interrupted pass cleanup can lose its retry: when the worker goes idle after deferred cleanup, the sweep can clear the pointer (main: `progress_history.py:7313,7794-7797`). Phase 103 F023.
+2. A shared detached stop sends only a notice and never runs the cleanup callback (main: `turn_end.py:245-254`, `detached_runs.py:747-749`). Phase 103 F025.
+3. Run end misses a live early reviewer, because the early reviewer starts before its pass record exists (main: `review.sh:339-357`).
+4. A generic completion action can end a shared run (main: `assign.py:375-385,718-722`).
+**Files:** `progress_history.py`, `turn_end.py`, `detached_runs.py`, `review.sh`, `assign.py`, and their tests.
+**Tests:** rows in the existing tables of `test_astra_review.py`, `test_detached_runs.py` and `test_turn_end.py`, one for each spec item.
+**Acceptance gate:** as phase 100.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** after the item 154 combined branch merges to main.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
