@@ -330,6 +330,152 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.receipts(), [])
 
+    def test_conflict_cleanup_precedes_origin_checks_and_stop_reporting(self) -> None:
+        cases = (
+            ("origin outage", "fresh"),
+            ("origin outage", "resumed after gate"),
+            ("origin moves", "fresh"),
+            ("abort fails", "fresh"),
+            ("no reset remains", "resumed after push"),
+            ("origin and result writes fail", "resumed after gate"),
+        )
+        for fault, route in cases:
+            with self.subTest(fault=fault, route=route):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                start = self.git("rev-parse", "HEAD")
+                alpha = self.checkpoint()
+                beta = self.beta_checkpoint("src/beta.txt", "beta conflict\n")
+                rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
+                if route != "fresh":
+                    with (patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
+                          self.assertRaises(KeyboardInterrupt)):
+                        _ = self.land_batch(rows)
+                    if route == "resumed after push":
+                        _ = self.git("push", "origin", "production")
+                        start = self.git("rev-parse", "HEAD")
+                main = self.push_main_change("src/beta.txt", "main conflict\n")
+                late_main = route == "resumed after gate"
+                if late_main:
+                    _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
+                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                with patch.dict("os.environ", self.env):
+                    results = land_runs.results_path()
+                if fault == "origin and result writes fail":
+                    results.parent.mkdir(parents=True)
+                    _ = results.write_bytes(b"\xff\n")
+
+                git = merge_checkpoint.git
+                conflict_tips: list[str] = []
+                cleanup: list[str] = []
+
+                def git_with_fault(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                    if (late_main and args == ("fetch", "origin", "+refs/heads/main:refs/remotes/origin/main")
+                            and self.events("checkpoint-test")):
+                        _ = self.git("update-ref", "refs/heads/main", main, cwd=self.origin)
+                    if conflict_tips:
+                        if args == ("merge", "--abort"):
+                            cleanup.append("abort")
+                            if fault == "abort fails":
+                                return subprocess.CompletedProcess(args, 1, "", "fixture abort failed")
+                        elif args == ("ls-remote", "origin", "refs/heads/production"):
+                            cleanup.append("origin query")
+                        elif args[:2] == ("reset", "--keep"):
+                            cleanup.append("reset")
+                    result = git(checkout, *args)
+                    if args == ("merge", "--no-ff", "-m", "Merge origin/main into production", main):
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        conflict_tips.append(self.git("rev-parse", "HEAD"))
+                        if fault == "origin moves":
+                            _ = self.git("update-ref", "refs/heads/production", main, cwd=self.origin)
+                        elif fault != "abort fails":
+                            _ = self.git("remote", "set-url", "origin", str(self.root / "unavailable-origin"))
+                    return result
+
+                with patch.object(merge_checkpoint, "git", git_with_fault):
+                    result = self.land_batch(rows)
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.events("checkpoint-test"), [[]] if late_main else [])
+                self.assertEqual("batch: resume" in result.stdout, route != "fresh")
+                self.assertEqual(conflict_tips, [self.git("rev-parse", "HEAD")])
+                conflict = "origin/main conflicts: src/beta.txt"
+                self.assertIn(f"push: held — {conflict}", result.stdout)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+                for notice in notices:
+                    self.assertIn(conflict, notice)
+                self.assertEqual((self.checkout / ".git/MERGE_HEAD").exists(), fault == "abort fails")
+                if fault == "no reset remains":
+                    self.assertEqual(conflict_tips, [start])
+                    self.assertEqual(cleanup, ["abort"])
+                    self.assertNotIn("rollback failed:", result.stdout)
+                    continue
+                self.assertNotEqual(conflict_tips, [start])
+                before, _, warning = result.stdout.partition("rollback failed:")
+                self.assertIn(notices[-1], before)
+                if fault == "abort fails":
+                    self.assertEqual(cleanup, ["abort"])
+                    self.assertIn("fixture abort failed", warning)
+                else:
+                    self.assertEqual(cleanup, ["abort", "origin query"])
+                    expected = "origin moved; cannot reset the batch" if fault == "origin moves" else "unavailable-origin"
+                    self.assertIn(expected, warning)
+                if fault == "origin and result writes fail":
+                    self.assertEqual(warning.count("land result: not recorded"), 2)
+                    self.assertIn("alpha phase 2", warning)
+                    self.assertIn("beta phase 2", warning)
+                    self.assertEqual(results.read_bytes(), b"\xff\n")
+
+    def test_failed_gate_can_reset_to_a_newly_published_start_tip(self) -> None:
+        for publish_start in (True, False):
+            with self.subTest(publish_start=publish_start):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                _ = self.git("commit", "--allow-empty", "-m", "Local maintenance")
+                start = self.git("rev-parse", "HEAD")
+                _ = self.git("fetch", str(self.checkout), "refs/heads/production", cwd=self.other)
+                published = start if publish_start else self.git(
+                    "commit-tree", f"{start}^{{tree}}", "-p", start, "-m", "Another maintenance commit", cwd=self.other)
+                alpha = self.checkpoint()
+                beta = self.beta_checkpoint("src/beta.txt", "beta change\n")
+                beta_row = self.batch_line("beta", "2", beta)
+                self.executable(self.bin / "checkpoint-test", STUB + f'''
+import subprocess
+tested_tip = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=TEST_HANG_GUARD_SECS)
+(state / "tested-tip").write_text(tested_tip.strip())
+subprocess.run(["git", "-C", {str(self.other)!r}, "push", "origin", {f"{published}:refs/heads/production"!r}],
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+raise SystemExit(1)
+''')
+
+                result = self.land_batch([self.batch_line("alpha", "2", alpha), beta_row])
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.events("checkpoint-test"), [[]])
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+                self.assertIn("red: failed — merge test 1 failed", result.stdout)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+                for notice in notices:
+                    self.assertIn("this row's tests include a red step; repair merge test 1", notice)
+                if publish_start:
+                    self.assertNotIn("rollback failed:", result.stdout)
+                    self.assert_rolled_back(start)
+                    self.executable(self.bin / "checkpoint-test", STUB)
+                    next_batch = self.land_batch([beta_row])
+                    self.assertEqual(next_batch.returncode, 0, next_batch.stdout + next_batch.stderr)
+                    self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), beta)
+                else:
+                    before, _, warning = result.stdout.partition("rollback failed:")
+                    self.assertIn(notices[-1], before)
+                    self.assertIn("origin moved; cannot reset the batch", warning)
+                    self.assertEqual(self.git("rev-parse", "HEAD"), (self.state / "tested-tip").read_text())
+                    self.assertEqual([self.git("rev-parse", ref) for ref in ("HEAD^1^2", "HEAD^2")], [alpha, beta])
+                    self.assertTrue(self.batch_record().exists())
+
     def batch_record(self) -> Path:
         return Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "checkpoint-batches/production"))
 

@@ -877,15 +877,16 @@ def undo_failed_push(production: ProductionDocument, old_origin: str, before_mer
     checkout = production.checkout
     if git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
         _ = good(git(checkout, "merge", "--abort"), "push")
-    if old_origin and not push_origin_unchanged(production, old_origin):
+    if old_origin and not push_origin_matches(production, old_origin):
         return False
     _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
     return True
 
 
-def push_origin_unchanged(production: ProductionDocument, published_tip: str) -> bool:
+def push_origin_matches(production: ProductionDocument, *accepted_tips: str) -> bool:
     remote = good(git(production.checkout, "ls-remote", "origin", f"refs/heads/{production.merge_branch}"), "push")
-    return remote.split()[:1] == [published_tip]
+    fields = remote.split(maxsplit=1)
+    return bool(fields) and fields[0] in accepted_tips
 
 
 def merge_main(production: ProductionDocument, *, batch_stop_owns_rollback: bool = False) -> None:
@@ -1828,17 +1829,16 @@ def reset_batch(rollback: ResetBatchCheckout) -> None:
     if head != rollback.expected_tip:
         raise checkpoint_gate.Stop("red", "failed", f"HEAD moved from {rollback.expected_tip}",
                                    "the showrunner will inspect the merge branch")
-    abort_merge = (not rollback.merge_in_progress_at_start
-                   and git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0)
-    if not abort_merge and head == rollback.start_tip:
+    if (not rollback.merge_in_progress_at_start
+            and git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0):
+        _ = good(git(checkout, "merge", "--abort"), "merge")
+        head = good(git(checkout, "rev-parse", "HEAD"), "merge")
+    if head == rollback.start_tip:
         return
-    if not push_origin_unchanged(production, rollback.published_tip):
+    if not push_origin_matches(production, rollback.published_tip, rollback.start_tip):
         raise checkpoint_gate.Stop("push", "failed", "origin moved; cannot reset the batch",
                                    "the showrunner will inspect the merge branch")
-    if abort_merge:
-        _ = good(git(checkout, "merge", "--abort"), "merge")
-    if head != rollback.start_tip:
-        undo_unpushed_merge(production, rollback.expected_tip, rollback.start_tip)
+    undo_unpushed_merge(production, rollback.expected_tip, rollback.start_tip)
 
 
 class BatchStopNotice(NamedTuple):

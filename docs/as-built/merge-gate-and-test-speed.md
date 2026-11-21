@@ -774,10 +774,12 @@ If command selection failed for a row, report unknown changed paths and include 
 The batch stops at the first failed test command.
 The next queued item can proceed after the batch exits.
 Before publication, the shared stop attempts to restore the starting tip.
-The stop refuses the reset if HEAD differs from the expected tip or if origin has moved.
+The stop checks HEAD before it changes the checkout.
+It aborts a merge that the batch attempt started before it queries origin.
+If abort fails or HEAD is already at the starting tip, the stop skips the query and the reset.
+The reset requires origin to match the recorded published tip or the starting tip.
 The stop sends every notice before it writes result records.
 Rollback and result-record errors appear after the notices.
-Reset aborts an unfinished merge only when no merge was unfinished at batch start.
 An earlier unfinished merge and its staged edits remain unchanged.
 Each run starts a fresh shared test log. Tests after main moves append to the same log.
 Publication rollback checks the live origin before it restores the tip.
