@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import subprocess
 from threading import Event
+import time
 from typing import cast, override
 from unittest import mock
 import unittest
@@ -661,7 +662,7 @@ class LedgerTests(CostFixture):
         rows = (('absent', ''), ('incomplete', launch), ('complete', launch + '\n'))
         # The second bill covers the day an open instance can run beyond its original booking.
         bills = (('none', (), terminated_at, '.82', '.82'), ('first', first, terminated_at, '.90', '.50'),
-                 ('second', second, following_day, '19.70', '.50'))
+                 ('second', second, following_day, '5.30', '.50'))
         cases: list[tuple[str, ledger.GateReservation | dict[str, object], str, Sequence[ledger.ChargeRead],
                           int, str, str]] = []
         for outcome, (row_label, row), (bill_label, readings, now, unlogged, logged) in product(states, rows, bills):
@@ -690,6 +691,34 @@ class LedgerTests(CostFixture):
              following_day, '.90', '.82'),
         ))
 
+        prior_start = self.start - 86400
+        expires = self.start + 4500
+        booking_rate = ledger.BoxRate(Decimal('.40'), 'fixture booking')
+        new_rates = (('2026-01-15', booking_rate),)
+        new_booking = replace(booking, at=self.start, expires=expires, rate=booking_rate,
+                              usd_per_hour=booking_rate.usd_per_hour, allowance_usd=Decimal(0), day_rates=new_rates)
+        new_termination = ledger.GateTerminated(self.start + 2700, 'i-fixture')
+        logged = json.dumps({'attempt': booking.attempt, 'time': self.start, 'instance_type': booking.instance_type,
+                             'region': booking.region, 'result': 'launched'}) + '\n'
+        shapes = (
+            ('released', replace(new_booking, state=ledger.GateAbsent(new_termination.at)), '', '.10', '.10'),
+            ('cleanup', replace(new_booking, state=new_termination), '', '.70', '.25'),
+            ('marked-cleanup', replace(new_booking, state=new_termination,
+                launch_pricing=ledger.GateLaunchPricing.BOOKING_UNTIL_LOGGED), logged.rstrip('\n'), '.70', '.60'),
+            ('recovered-running', replace(new_booking, state=ledger.GateRunning('i-fixture')), '', '1.10', '.60'),
+            ('recovered-running-without-rate', replace(new_booking, state=ledger.GateRunning('i-fixture'),
+                rate=ledger.BoxRate(Decimal(0), 'not priced'), day_rates=()), '', '1.10', '.60'),
+            ('before-launch-log', replace(new_booking, state=ledger.GateLaunchPending(booked_day_rates=new_rates)),
+             logged.rstrip('\n'), '1.10', '.60'),
+            ('complete-launch-log', replace(new_booking, state=ledger.GateRunning('i-fixture')), logged, '1.10', '.35'),
+        )
+        for label, reservation, row, raised, lowered in shapes:
+            for direction, hours, amount in (('raised', '.125', raised), ('lowered', '.5', lowered)):
+                price_bill = ledger.ChargeRead('2026-01-14', self.start, prior_start, self.start, Decimal('.10'),
+                    Decimal(0), Decimal(0), (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge',
+                        Decimal('.10'), Decimal(hours), 'Hrs'),), False)
+                cases.append((label + '-' + direction, reservation, row, (price_bill,), expires, amount, amount))
+
         for name, reservation, row, readings, now, expected_cap, expected_guard in cases:
             with self.subTest(case=name):
                 self.replace('cost_explorer_unchanged_reads', '2' if any(bill.provisional for bill in readings) else '1')
@@ -710,12 +739,27 @@ class LedgerTests(CostFixture):
                     charges = book.directory / 'charges'
                     charges.mkdir()
                     for bill in readings:
-                        _ = (charges / f'{bill.day}.json').write_text(json.dumps(ledger.charge_record(bill)))
+                        path = charges / f'{bill.day}.json'
+                        if name == 'recovered-running-lowered':
+                            high = replace(bill, usage_types=(replace(bill.usage_types[0], quantity=Decimal('.125')),))
+                            _ = path.write_text(json.dumps(ledger.charge_record(high)))
+                            accounting = ledger.GateLaunchAccounting(0, (booking.region,), 0)
+                            with mock.patch.object(time, 'time', return_value=now):
+                                book.refresh_gate_prices(lock_timeout_s=1, accounting=accounting)
+                            saved, = book.read_snapshot().gate_reservations
+                            self.assertEqual(saved.rate.usd_per_hour, Decimal('.80'))
+                            self.assertEqual(saved.booked_compute_rates, new_rates)
+                            book = ledger.CostLedger(book.directory)
+                        _ = path.write_text(json.dumps(ledger.charge_record(bill)))
 
                 amount = Decimal(expected_cap)
                 complete_days = book.read_complete_day_amounts(policy, now)
-                days = ledger.gate_spend_days(book.priced_snapshot(now), policy, book.read_bills(), now,
-                                              reserve=True, complete_days=complete_days)
+                snapshot = book.priced_snapshot(now)
+                if name.endswith(('-raised', '-lowered')):
+                    rate = Decimal('.80') if name.endswith('-raised') else Decimal('.20')
+                    self.assertEqual(snapshot.gate_reservations[0].rate.usd_per_hour, rate)
+                days = ledger.gate_spend_days(snapshot, policy, book.read_bills(), now, reserve=True,
+                                              complete_days=complete_days)
                 self.assertEqual(sum((day.usd for day in days), Decimal(0)), amount)
                 self.assertEqual(book.accrued_cost(self.settings, now, window='month').limit_count, Decimal(expected_guard))
                 proposal = ledger.GateReservation('next', now, now + 60, Decimal(0), Decimal(0), region=booking.region)
