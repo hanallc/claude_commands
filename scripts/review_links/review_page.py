@@ -547,9 +547,6 @@ class ReviewSnapshotCache:
             self._wake.set()
         self._thread.start()
 
-    def _after_snapshot_update(self, _snapshot: ReviewSnapshot, /) -> None:
-        """Run background work after the worker publishes a snapshot."""
-
     def get(self) -> ReviewSnapshot:
         with self._condition:
             if isinstance(self._snapshot, SnapshotUnavailable) and self._thread.is_alive():
@@ -795,7 +792,6 @@ class ReviewSnapshotCache:
                     self._condition.notify_all()
                 checked = time.monotonic()
                 last_failure = None
-                self._after_snapshot_update(fresh)
             except Exception as error:
                 failure = ' '.join(str(error).splitlines())
                 if failure != last_failure:

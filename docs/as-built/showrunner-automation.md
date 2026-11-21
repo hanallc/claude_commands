@@ -565,7 +565,9 @@ The Added line preserves initial field values, including state, ETA, next step, 
 Quoted log values preserve line endings as JSON escapes.
 
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
-Parking sets a time without changing the state.
+Parking stores a time or a delivery condition and keeps the current item state.
+The List ends a delivery park automatically when the producer sets the item state to Delivered.
+Linked changes supply review information on the List.
 The List hides an item with unanswered questions while each send is pending or successful.
 If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
@@ -589,7 +591,8 @@ An empty optional time removes that time.
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
 2. Preserve an existing item number with `add --number <n>`.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
-4. Park or unpark an item with `park --id L<n> --until <time-or-empty> --source <source>`.
+4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
+   Use a time or `delivered` to park. Use an empty condition to unpark.
 5. Close an item with `close --id L<n> --words <closing words> --source <source>`.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
@@ -647,7 +650,7 @@ Update and park refuse Closed items until reopen restores them.
 The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
-Future parked items and Closed items remain hidden by default.
+Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
