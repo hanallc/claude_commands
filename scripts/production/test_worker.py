@@ -22,6 +22,7 @@ import unittest
 from unittest.mock import call, patch
 from uuid import UUID
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents import pane_record
 from scripts.herdr import herdr_types, pane_launch
@@ -328,11 +329,9 @@ class WorkerCommandTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = pane_fixtures.WorkerPaneTests("runTest")
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, pane_fixtures.WorkerPaneTests("runTest"))
         _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
         self.fixture.world.binary = "/nonexistent/herdr"
-        self.addCleanup(self.fixture.doCleanups)
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
@@ -2171,9 +2170,8 @@ class WorkerCommandTests(unittest.TestCase):
 
         for exited in (False, True):
             with self.subTest(exited=exited):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     config = case.fixture.root / "conf/direct.conf"
                     atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
                     opened = case.opened()
@@ -2201,12 +2199,9 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertIs(case.dispatch(), worker.DispatchSubmission.SUBMITTED)
                     case.assertEqual(len(case.agent.submitted), 1)
                     case.assertEqual(case.agent.row(case.agent.submitted[-1][0]).current_session, opened.row.current_session)
-                finally:
-                    case.doCleanups()
 
-        with self.subTest(delivery="delayed transcript"):
-            case = WorkerCommandTests("runTest")
-            case.setUp()
+        with self.subTest(delivery="delayed transcript"), ExitStack() as cleanup:
+            case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
             opened = case.opened()
             case.agent.defer_prompt_transcript = True
             config = case.fixture.root / "conf/direct.conf"
@@ -2225,7 +2220,6 @@ class WorkerCommandTests(unittest.TestCase):
                 case.assertIsInstance(case.receipt(), worker.DispatchSubmitted)
             finally:
                 delivery.join()
-                case.doCleanups()
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
         opened = self.opened()
@@ -2773,9 +2767,8 @@ class WorkerCommandTests(unittest.TestCase):
         for failure in failures:
             for existing in (False, True, "closed"):
                 with self.subTest(failure=failure, existing=existing):
-                    case = WorkerCommandTests("runTest")
-                    case.setUp()
-                    try:
+                    with ExitStack() as cleanup:
+                        case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                         if existing:
                             opened = case.opened()
                             if existing == "closed":
@@ -2838,15 +2831,12 @@ class WorkerCommandTests(unittest.TestCase):
                             case.assertEqual(staff.find(kind="worker", parent=case.fixture.parent.id), [])
                             case.assertEqual(len(case.fixture.world.closed), 1)
                         case.assertNotIn("cleanup failed", errors.getvalue())
-                    finally:
-                        case.doCleanups()
 
     def test_failed_dispatch_closes_its_new_pane_with_a_named_target(self) -> None:
         for family in ("claude", "codex"):
             with self.subTest(family=family):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
                     rows: list[staff.StaffRow] = []
                     targets: list[str] = []
@@ -2876,8 +2866,6 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(len(case.fixture.world.closed), 1)
                     case.assertEqual(case.agent.submitted, [])
                     case.assertNotIn("cleanup failed", errors.getvalue())
-                finally:
-                    case.doCleanups()
 
     def test_dispatch_keeps_a_replacement_terminal_after_preparation_fails(self) -> None:
         def replace_terminal(*_arguments: object, **_options: object) -> str:
@@ -2898,9 +2886,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_dispatch_uses_saved_start_ownership_without_a_pane_read(self) -> None:
         for incomplete in (False, True):
             with self.subTest(incomplete=incomplete):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
                     arm = worker.arm_launch_cleanup
                     def launch(*arguments: object, **options: object) -> worker_panes.WorkerStart:
@@ -2921,15 +2908,12 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(len(case.fixture.world.closed), int(incomplete))
                     if incomplete:
                         case.assertIn("TEST startup failed", errors.getvalue())
-                finally:
-                    case.doCleanups()
 
     def test_failed_first_assignment_ends_only_its_new_team_panes(self) -> None:
         for failure in ("selection", "dispatch"):
             with self.subTest(failure=failure):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     with ExitStack() as patches, redirect_stderr(io.StringIO()) as errors:
                         if failure == "selection":
                             _ = patches.enter_context(patch.object(worker, "select_worker", return_value=worker_panes.StartRefused(
@@ -2945,16 +2929,13 @@ class WorkerCommandTests(unittest.TestCase):
                                                   if isinstance(destination, herdr.SplitPane)])
                     case.assertEqual(case.agent.submitted, [])
                     case.assertNotIn("cleanup failed", errors.getvalue())
-                finally:
-                    case.doCleanups()
 
     def test_failed_restore_before_submission_ends_only_its_new_pane(self) -> None:
         for existing, incomplete, refused in ((False, False, False), (True, False, False),
                                                (False, True, False), (False, False, True)):
             with self.subTest(existing=existing, incomplete=incomplete, refused=refused):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     opened = case.opened()
                     _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
                         worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -2991,8 +2972,6 @@ class WorkerCommandTests(unittest.TestCase):
                     else:
                         case.assertEqual(staff.by_id(opened.row.id), opened.row)
                         case.assertEqual(len(case.fixture.world.closed), closed + 1)
-                finally:
-                    case.doCleanups()
 
     def test_publication_failure_reports_that_its_new_pane_was_closed(self) -> None:
         with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
@@ -3244,9 +3223,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_first_standard_assignment_creates_the_default_team(self) -> None:
         for role, ready_hooks in (("impl", False), ("test", True)):
             with self.subTest(role=role, ready_hooks=ready_hooks):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     assignment_thread = current_thread()
                     hook_acquired = Event()
                     release_hook = Event()
@@ -3301,8 +3279,6 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(case.agent.row(case.agent.submitted[0][0]).name, role)
                     if ready_hooks:
                         case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
-                finally:
-                    case.doCleanups()
 
     def test_assignment_continues_after_a_default_split_interruption(self) -> None:
         row = self.fixture.worker("impl", family="codex")
