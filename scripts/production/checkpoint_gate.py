@@ -69,7 +69,7 @@ class RedCheckpointTests(Stop):
 AFFECTED_TESTS = "affected tests"
 
 
-class FilterResults(NamedTuple):
+class AffectedTestResults(NamedTuple):
     red: dict[str, str]
 
 
@@ -84,7 +84,7 @@ def log_filter(log: Path, state: str, count: int, detail: str) -> None:
     report(AFFECTED_TESTS, state, message)
 
 
-def run_affected_tests(repo: Path, names: Sequence[str]) -> FilterResults | FilterInconclusive:
+def run_affected_tests(repo: Path, names: Sequence[str]) -> AffectedTestResults | FilterInconclusive:
     """Use only complete test results as evidence for row removal."""
     try:
         run = merge_gate.run_filter_modules(repo, names)
@@ -114,13 +114,13 @@ def run_affected_tests(repo: Path, names: Sequence[str]) -> FilterResults | Filt
         if isinstance(times, (NoModuleTimes, TimingNotApplicable)):
             return FilterInconclusive(f"{name} has no test report")
         statuses = {test["status"] for test in times["tests"]}
-        if job.returncode == 0 and statuses <= {"pass", "skip"} and not (times["failures"] or times["errors"]):
+        if job.returncode == 0 and statuses <= {"pass", "skip", "expected_failure"} and not (times["failures"] or times["errors"]):
             continue
         if job.returncode == 1 and statuses & {"fail", "error", "unexpected_success"}:
             _ = red.setdefault(name, job.output)
         else:
             return FilterInconclusive(f"{name} has no test result that agrees with its exit status")
-    return FilterResults(red)
+    return AffectedTestResults(red)
 
 
 class CargoPackage(NamedTuple):
@@ -202,7 +202,15 @@ def runs_merge_gate(command: Sequence[str]) -> bool:
 
 
 def runs_full_merge_gate(command: Sequence[str]) -> bool:
-    return runs_merge_gate(command) and not any(word == "--module" or word.startswith("--module=") for word in command)
+    """Match the tests-only command that production documents use for every module."""
+    for index, word in enumerate(command):
+        if Path(word).name == "merge_gate.py":
+            arguments = command[index + 1:]
+            return "--tests-only" in arguments and not any(
+                option.split("=", 1)[0] in {"--module", "--promote-only", "--nightly", "--help", "-h", "--"}
+                for option in arguments
+            )
+    return False
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:

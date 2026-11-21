@@ -97,6 +97,11 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             **red_times, "failures": 0, "tests": [{"test": "test_fixture", "s": 0, "status": "pass"}],
         }
         green = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "", times=green_times)
+        expected_failure_times: ModuleTimes = {
+            **green_times, "tests": [{"test": "test_fixture", "s": 0, "status": "expected_failure"}],
+        }
+        expected_failure = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "",
+                                                    times=expected_failure_times)
         no_report = merge_gate.GateJobResult("production", "test_fixture.py", 0, 0, "")
         refused = merge_gate.GateJobResult("production", "test_fixture.py", 1, 0, "runner refused",
                                            times=green_times)
@@ -107,6 +112,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         cases = (
             ("test failure", merge_gate.GateRun((red,), 0, 0), frozenset({module})),
             ("green", merge_gate.GateRun((green,), 0, 0), frozenset[str]()),
+            ("expected failure", merge_gate.GateRun((expected_failure,), 0, 0), frozenset[str]()),
             ("missing", merge_gate.GateRun((), 0, 0),
              checkpoint_gate.FilterInconclusive("the runner did not report a fresh result for each selected module")),
             ("refused", merge_gate.GateRun((refused,), 0, 0),
@@ -126,8 +132,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             with self.subTest(case=case), patch.object(merge_gate, "run_filter_modules", return_value=run) as run_modules:
                 result = checkpoint_gate.run_affected_tests(self.checkout, (module,))
                 if isinstance(expected, frozenset):
-                    self.assertIsInstance(result, checkpoint_gate.FilterResults)
-                    assert isinstance(result, checkpoint_gate.FilterResults)
+                    self.assertIsInstance(result, checkpoint_gate.AffectedTestResults)
+                    assert isinstance(result, checkpoint_gate.AffectedTestResults)
                     self.assertEqual(frozenset(result.red), expected)
                 else:
                     self.assertEqual(result, expected)

@@ -85,7 +85,7 @@ from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
-from scripts.build_queue import progress_profile
+from scripts.build_queue import progress_profile, step_estimator
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
@@ -548,15 +548,24 @@ def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
 @contextmanager
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
                      type_dirs: Sequence[str] = (),
-                     mode: SuiteMode = SuiteMode.MERGE_GATE) -> Generator[QueuePlace]:
+                     mode: SuiteMode = SuiteMode.MERGE_GATE,
+                     selection: AllModules | SelectedModules = ALL_MODULES) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     try:
-        program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
-        with queue_place(program, repo,
-                         before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
+        before_check = AdmissionHoldCheck(hold.wait_until_free, hold.admits)
+        if isinstance(selection, NamedModules):
+            first = step_estimator.memory_config().program_first_peaks.get(mode.value)
+            if first is None:
+                raise GateRefused(f"program_first_peak_gib.{mode.value} is missing in build_admission.conf")
+            sizing = admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
+            reservation = queue_place("merge-gate-filter", repo, sizing=sizing, before_check=before_check)
+        else:
+            program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
+            reservation = queue_place(program, repo, before_check=before_check)
+        with reservation as place:
             yield place
-    except QueuePlaceRefused as error:
+    except (QueuePlaceRefused, conf.Unusable) as error:
         raise GateRefused(str(error)) from error
 
 
@@ -1725,7 +1734,8 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
+          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode, selection=selected)
+           if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()

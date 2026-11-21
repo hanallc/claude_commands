@@ -155,6 +155,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                         self.assertFalse(marker.exists())
                     self.assert_gate_released()
             self.assertEqual(len(self.gate_history()), 2)
+            self.assertEqual([row["step"] for row in self.gate_history()], ["merge-gate-filter"] * 2)
             record.assert_not_called()
 
     @gate_suites("hooks", "lib", "message")

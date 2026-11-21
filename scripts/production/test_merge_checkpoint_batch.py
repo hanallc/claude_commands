@@ -8,6 +8,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import unittest
 from typing import final
 from unittest.mock import patch
@@ -88,6 +89,7 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
             ("test edits tree", ("batch",), "inconclusive", "the test changed the checkout"),
             ("base probe edits tree", ("batch", "batch", "base"), "inconclusive", "the test changed the checkout"),
             ("unsafe reset", ("batch",), "cancelled", "safe reset cannot remove"),
+            ("promote-only gate", (), "skipped", "no merge gate command for the full inventory"),
             ("named-only gate", (), "skipped", "no merge gate command for the full inventory"),
             ("named-only gate with equals", (), "skipped", "no merge gate command for the full inventory"),
             ("red green red", ("third", "third", "base", "batch", "batch"), "red", "1 selected"),
@@ -97,11 +99,14 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
-                gate_args = {
-                    "named-only gate": ("--module", module),
-                    "named-only gate with equals": (f"--module={module}",),
+                restricted_args = {
+                    "promote-only gate": ("--promote-only", "--merge-branch", "production"),
+                    "named-only gate": ("--tests-only", "--module", module),
+                    "named-only gate with equals": ("--tests-only", f"--module={module}"),
                 }.get(case, ())
-                gate_command = shlex.join(("merge_gate.py", *gate_args))
+                gate_args = ("--checkout", ".", *(restricted_args or ("--tests-only",)))
+                gate_command = shlex.join(("env", "HERDR_BIN=/nonexistent/herdr", sys.executable,
+                                           str(self.bin / "merge_gate.py"), *gate_args))
                 self.production_doc(merge_tests_line=f"- **Merge tests:** `{gate_command}`")
                 self.executable(self.bin / "merge_gate.py", STUB + """
 assert Path("src/beta.txt").read_text() != "filter edit\\n", "the full gate saw an edit from the filter"
@@ -186,7 +191,7 @@ assert Path("src/beta.txt").read_text() != "filter edit\\n", "the full gate saw 
                 first_paths = tuple(sorted(("src/alpha.txt", "src/alpha-marker.txt", renamed)))
                 all_paths = tuple(sorted((*first_paths, "src/beta.txt")))
                 removed_beta = case == "confirmed red"
-                if gate_args:
+                if restricted_args:
                     expected_maps = []
                 elif removed_beta:
                     expected_maps = [all_paths, first_paths]

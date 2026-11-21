@@ -1811,7 +1811,21 @@ def restore_filter_tip(checkout: Path, expected_head: str, test_tip: str, log: P
     return FilterCheckout.RESTORED if changes else FilterCheckout.CLEAN
 
 
-def prefix_verdict(result: checkpoint_gate.FilterResults | checkpoint_gate.FilterInconclusive) -> PrefixVerdict:
+def run_filter_and_restore(checkout: Path, expected_head: str, test_tip: str, log: Path, count: int,
+                           run: Callable[[], checkpoint_gate.AffectedTestResults | checkpoint_gate.FilterInconclusive]
+                           ) -> checkpoint_gate.AffectedTestResults | checkpoint_gate.FilterInconclusive:
+    try:
+        result = run()
+    finally:
+        restored = restore_filter_tip(checkout, expected_head, test_tip, log)
+    if restored is FilterCheckout.RESTORED:
+        result = checkpoint_gate.FilterInconclusive("the test changed the checkout")
+    if isinstance(result, checkpoint_gate.FilterInconclusive):
+        checkpoint_gate.log_filter(log, "inconclusive", count, result.reason)
+    return result
+
+
+def prefix_verdict(result: checkpoint_gate.AffectedTestResults | checkpoint_gate.FilterInconclusive) -> PrefixVerdict:
     if isinstance(result, checkpoint_gate.FilterInconclusive):
         return PrefixVerdict.INCONCLUSIVE
     return PrefixVerdict.RED if result.red else PrefixVerdict.GREEN
@@ -1821,35 +1835,37 @@ def confirm_affected_red(production: ProductionDocument, items: tuple[MergedBatc
                          start_tip: str, test_tip: str, main: PinnedMain, names: frozenset[str],
                          log: Path) -> None:
     checkout = production.checkout
-    results: dict[tuple[str, str], checkpoint_gate.FilterResults | checkpoint_gate.FilterInconclusive] = {}
+    results: dict[tuple[str, str], checkpoint_gate.AffectedTestResults | checkpoint_gate.FilterInconclusive] = {}
     confirmed: dict[int, dict[str, str]] = {}
 
-    def probe(head: str, name: str) -> checkpoint_gate.FilterResults | checkpoint_gate.FilterInconclusive:
+    def probe(head: str, name: str) -> checkpoint_gate.AffectedTestResults | checkpoint_gate.FilterInconclusive:
         tree = filter_tree(checkout, test_tip, log)
         if isinstance(tree, checkpoint_gate.FilterInconclusive):
             raise unsafe_filter_reset(log, tree.reason)
         expected_head = test_tip
-        try:
-            if head != test_tip:
-                try:
-                    _ = good(git(checkout, "reset", "--keep", head), "bisect")
-                    expected_head = head
-                    merge_main_commit(production, main.commit)
-                except checkpoint_gate.Stop as error:
-                    checkpoint_gate.log_filter(log, "inconclusive", 1, error.detail)
-                    return checkpoint_gate.FilterInconclusive(error.detail)
-                expected_head = good(git(checkout, "rev-parse", "HEAD"), "bisect")
+        if head != test_tip:
+            try:
+                checkout_prefix(production, head, main.commit)
+            except checkpoint_gate.Stop as error:
+                current = good(git(checkout, "rev-parse", "HEAD"), "bisect")
+                if current not in (test_tip, head):
+                    raise unsafe_filter_reset(log, error.detail) from error
+                _ = restore_filter_tip(checkout, current, test_tip, log)
+                checkpoint_gate.log_filter(log, "inconclusive", 1, error.detail)
+                return checkpoint_gate.FilterInconclusive(error.detail)
+            expected_head = good(git(checkout, "rev-parse", "HEAD"), "bisect")
+            try:
                 tree = filter_tree(checkout, expected_head, log)
                 if isinstance(tree, checkpoint_gate.FilterInconclusive):
                     raise unsafe_filter_reset(log, tree.reason)
-            key = (tree.tree, name)
-            result = results[key] if key in results else checkpoint_gate.run_affected_tests(checkout, (name,))
-        finally:
-            restored = restore_filter_tip(checkout, expected_head, test_tip, log)
-        if restored is FilterCheckout.RESTORED:
-            result = checkpoint_gate.FilterInconclusive("the test changed the checkout")
-        if isinstance(result, checkpoint_gate.FilterInconclusive):
-            checkpoint_gate.log_filter(log, "inconclusive", 1, result.reason)
+            except BaseException:
+                _ = restore_filter_tip(checkout, expected_head, test_tip, log)
+                raise
+        key = (tree.tree, name)
+        result = run_filter_and_restore(
+            checkout, expected_head, test_tip, log, 1,
+            lambda: results[key] if key in results else checkpoint_gate.run_affected_tests(checkout, (name,)),
+        )
         results[key] = result
         return result
 
@@ -1865,7 +1881,7 @@ def confirm_affected_red(production: ProductionDocument, items: tuple[MergedBatc
             continue
         previous = items[found.position - 1].merge_head if found.position else start_tip
         boundary = probe(found.merge_head, name)
-        if (isinstance(boundary, checkpoint_gate.FilterResults) and name in boundary.red
+        if (isinstance(boundary, checkpoint_gate.AffectedTestResults) and name in boundary.red
                 and prefix_verdict(probe(previous, name)) is PrefixVerdict.GREEN):
             confirmed.setdefault(found.position, {})[name] = boundary.red[name]
         else:
@@ -1910,15 +1926,11 @@ def filter_batch(production: ProductionDocument, items: tuple[MergedBatchItem, .
     tree = filter_tree(checkout, test_tip, log)
     if isinstance(tree, checkpoint_gate.FilterInconclusive):
         raise unsafe_filter_reset(log, tree.reason)
-    try:
-        result = checkpoint_gate.run_affected_tests(checkout, names)
-    finally:
-        restored = restore_filter_tip(checkout, test_tip, test_tip, log)
-    if restored is FilterCheckout.RESTORED:
-        result = checkpoint_gate.FilterInconclusive("the test changed the checkout")
+    result = run_filter_and_restore(checkout, test_tip, test_tip, log, len(names),
+                                    lambda: checkpoint_gate.run_affected_tests(checkout, names))
     if isinstance(result, checkpoint_gate.FilterInconclusive):
-        checkpoint_gate.log_filter(log, "inconclusive", len(names), result.reason)
-    elif result.red:
+        return
+    if result.red:
         checkpoint_gate.log_filter(log, "red", len(names), ", ".join(sorted(result.red)))
         confirm_affected_red(production, items, start_tip, test_tip, main, frozenset(result.red), log)
     else:
