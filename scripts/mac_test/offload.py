@@ -11,7 +11,7 @@ import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
-from enum import Enum, StrEnum
+from enum import Enum
 from functools import partial
 from importlib import import_module
 import fcntl
@@ -39,6 +39,7 @@ from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
+from scripts.mac_test.claim_state import WAIT_CLAIM_CHECK_PREFIX, WaitClaimCheck, claim_worktree_path
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records, placement
 else:
@@ -735,34 +736,6 @@ class MacClaimNotConfirmed:
     reason: MacDeclineReason
     stdout: str
     stderr: str
-
-
-def claim_worktree_path(worktree: str) -> Path:
-    """Resolve a claim's worktree path before use or comparison."""
-    return Path(worktree).resolve()
-
-
-WAIT_CLAIM_CHECK_PREFIX = "cannot adopt the Mac claim: "
-
-
-class WaitClaimCheck(StrEnum):
-    RUNNER_START = "runner pid start"
-    NO_RESERVATION = "no reservation"
-    RESERVATION_COUNT = "reservation count"
-    SCOPE = "scope"
-    PID = "pid"
-    IDENTITY = "identity"
-    SESSION = "submitting session"
-    REMOTE_HOST = "remote host"
-    OWNER_START = "proc_start"
-    WORKTREE = "worktree"
-    REMOTE_MISSING = "remote missing"
-    BLOCK_STATE = "block state"
-    LEASED_SLOT = "leased slot"
-
-    @property
-    def diagnostic(self) -> str:
-        return WAIT_CLAIM_CHECK_PREFIX + self.value
 
 
 class NoWaitClaimCheck:
@@ -3374,6 +3347,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         _ = release_claim(controller, request.target)
         if isinstance(request.placement, AssignedOffloadRequest):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        claim_from_wait = False
         claim = claim_for_run(controller, config, request, repository, tuple(leases))
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))

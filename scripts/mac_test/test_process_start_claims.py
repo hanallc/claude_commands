@@ -1,7 +1,7 @@
 """Use the same Darwin start identity for claim adoption and PID reuse."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import io
@@ -112,6 +112,45 @@ class ClaimProcessStartTests(unittest.TestCase):
                     adopted, = mac_test.read_claims(paths)
                     self.assertEqual(claim_state.claim_identity(adopted.record), claim_state.claim_identity(reserved.record))
                     self.assertEqual((adopted.record["pid"], adopted.record["proc_start"]), (42, "42000"))
+                    self.assertEqual(adopted.record["worktree"], canonical)
+
+    def test_saved_relative_worktree_cannot_be_adopted_from_another_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            first, second = root / "first", root / "second"
+            first.mkdir()
+            second.mkdir()
+            scope = mac_test.RepositoryScope("hana")
+            session = OwningSession("fixture-session")
+
+            def read_start(pid: int) -> identity.ProcessStart:
+                return identity.Started(str(pid * 1000))
+
+            with (mock.patch.object(mac_test, "target_claim_scope", return_value=scope),
+                  mock.patch.object(identity, "process_start", side_effect=read_start),
+                  redirect_stdout(io.StringIO())):
+                for reservation_root, runner_root in ((first, second), (second, first)):
+                    with self.subTest(reservation_root=reservation_root, runner_root=runner_root):
+                        paths = mac_test.StatePaths(root / f"provider-{reservation_root.name}")
+                        reserve = mac_test.CliArguments()
+                        reserve.pid, reserve.worktree = 41, "."
+                        reserve.claim_id, reserve.episode, reserve.attempt = "claim-a", "episode-a", "attempt-a"
+                        with chdir(reservation_root):
+                            self.assertEqual(mac_test.command_claim(reserve, paths, watch_claim=False, session=session), 0)
+                        held, = mac_test.read_claims(paths)
+                        self.assertEqual(held.record["worktree"], str(reservation_root))
+                        mac_test.write_json(held.path, {**held.record, "worktree": "."})
+                        before = held.path.read_bytes()
+
+                        adopt = mac_test.CliArguments()
+                        adopt.pid, adopt.from_pid, adopt.worktree, adopt.remote = 42, 41, ".", "fixture-mac"
+                        adopt.claim_id, adopt.episode, adopt.attempt = reserve.claim_id, reserve.episode, reserve.attempt
+                        errors = io.StringIO()
+                        with chdir(runner_root), redirect_stderr(errors):
+                            status = mac_test.command_claim(adopt, paths, watch_claim=False, session=session)
+                        self.assertEqual(status, 12, errors.getvalue())
+                        self.assertEqual(errors.getvalue(), "cannot adopt the Mac claim: worktree\n")
+                        self.assertEqual(held.path.read_bytes(), before)
 
     def test_adoption_refusal_names_the_failed_check_without_changing_the_reservation(self) -> None:
         checks = ("runner pid start", "no reservation", "reservation count", "scope", "pid", "identity",

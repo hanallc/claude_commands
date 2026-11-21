@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import fields, replace
 import io
 from pathlib import Path
@@ -511,6 +511,32 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
 
+    def test_fresh_claim_refusal_after_cleanup_does_not_report_failed_adoption(self) -> None:
+        controller = offload.ProcessController()
+        config = eligibility.read_config(self.settings)
+        admission = offload.MacClaimFromWait(41, claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a"),
+                                             NoOwningSession())
+        request = offload.OffloadRequest(self.root, "hana", "call", offload.NO_RESULT_FILE, (),
+                                         owner="verify", holder_session="fixture-session",
+                                         placement=offload.DirectOffloadRequest(), admission=admission)
+        fresh_error = "state unreadable: fixture block\n"
+        refusal = offload.read_claim_answer(offload.CommandOutput(12, "", fresh_error))
+        result_path = self.root / "result"
+        with (ExitStack() as lease,
+              mock.patch.object(offload, "claim_for_run", side_effect=(offload.TakenOverMacClaim("fixture-mac"), refusal)) as claim,
+              mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
+              mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), False, {1: lease})
+            self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
+
+        self.assertEqual(claim.call_args_list, [mock.call(controller, config, request, HANA, (1,)),
+            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,))])
+        release.assert_called_once_with(controller, request.target)
+        self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (state)\n")
+        self.assertEqual(errors.getvalue(), fresh_error)
+        self.assertEqual(result_path.read_text().splitlines()[:2], ["mac=declined", "reason=state"])
+
     def test_mac_summary_write_failure_preserves_the_published_result(self) -> None:
         def place(request: offload.OffloadRequest, *_arguments: object) -> offload.OffloadRequest:
             return request
@@ -930,7 +956,7 @@ class BusyHolderTests(unittest.TestCase):
         unknown = "cannot adopt the Mac claim: unknown check\n"
         cases = (
             (12, "state", "", offload.NoWaitClaimCheck),
-            (11, "busy", "cannot adopt the Mac claim: leased slot\n", offload.WaitClaimCheck.LEASED_SLOT),
+            (11, "busy", "cannot adopt the Mac claim: leased slot\n", claim_state.WaitClaimCheck.LEASED_SLOT),
         )
         for status, reason, diagnostic, check in cases:
             with self.subTest(status=status):
@@ -939,7 +965,7 @@ class BusyHolderTests(unittest.TestCase):
                 assert isinstance(result, offload.MacClaimChildRefusal)
                 self.assertEqual((result.status, result.reason), (status, reason))
                 self.assertEqual((result.stdout, result.stderr), (output, unknown))
-                if isinstance(check, offload.WaitClaimCheck):
+                if isinstance(check, claim_state.WaitClaimCheck):
                     self.assertIs(result.check, check)
                 else:
                     self.assertIsInstance(result.check, check)
