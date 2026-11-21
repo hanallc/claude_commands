@@ -37,7 +37,7 @@ from scripts.lib.git_test_support import fixture_git_environment, write_fixture_
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
 from scripts.buildlog import index
@@ -480,7 +480,7 @@ class MergeGateFixture(unittest.TestCase):
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.
-            "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
+            "NOTIFIER_STATE_DIR": str(home / "notifier"), **build_fixture_sessions("fixture-showrunner"),
         }
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
             _ = self.environment.pop(key, None)

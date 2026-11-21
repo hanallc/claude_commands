@@ -333,7 +333,9 @@ successful release in <CheckpointCommit/>, and after <ShrinkCommit/>,
    `git merge-base --is-ancestor origin/<branch> HEAD` fails, do not push. The
    note is `push skipped: origin/<branch> has commits this branch lacks`.
 3. **Push.** `git push -u origin <branch>`; on the default branch,
-   `git push origin HEAD:refs/heads/direct/<plan-slug>`. Never force. Run
+   `git push origin HEAD:refs/heads/direct/<plan-slug>`. Never force any push.
+   After a hash goes to the showrunner, never amend, rebase or force-push that
+   branch; put a later change in a new commit on top. Run
    each step as its own command, never joined to another with `;` or `&&`:
    the allow list covers `git push` alone, and a joined line goes to the
    auto-mode classifier as a whole.

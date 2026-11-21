@@ -132,14 +132,14 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, Builds, Disks, Images, List and Review, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List and Review.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
 A page whose `main` has the `page-wide` class uses the full pane width instead; the Builds page is the only one.
 The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
-The title, status line and content use the same centered column on all seven pages.
+The title, status line and content use the same centered column on all console pages.
 Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
@@ -250,7 +250,7 @@ Older browser folders still accept answers that a page posts to them.
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
-The entries are Accounts, AWS, Builds, Disks, Images, List and Review.
+AWS Machines follows AWS in the navigation.
 The configuration has no Changes, Investigations or Questions entries or age limits.
 The console renders every configured entry without a skip rule for Review.
 The URL value has the form `python:<module>:<function>`.
@@ -271,6 +271,48 @@ The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
 The AWS entry calls `aws_page.page_url`.
 That function returns the AWS page URL without publishing the page.
+The AWS Machines entry calls `machines_page.page_url`.
+The function returns the URL for `machines.html` in `aws_page.output_folder()`.
+The entry shows **Not available** until the publisher writes that file.
+`serve.published_console_page` identifies the published path as `aws_machines`.
+The server adds the shared page owner control for the configured AWS Machines owner.
+The AWS Machines entry uses the Lucide `server` icon.
+
+A page includes `__PAGE_SETTING_CONTROLS__` once in its head.
+`page_frame.template` replaces that slot with the style and script from `setting_controls.py`.
+The page renders these controls with the following functions.
+
+1. `slider` takes the label, bounds, step, chosen value, live value, decimal places and an optional live note.
+   `pageSettingControls.connectSlider(root)` connects the native range input to the display.
+   Read `value` for the choice or `live` for the saved value.
+   Use `setValue(value)`, `setLive(value, note)` and `format(value)` to update or display a value.
+   Use `input` to listen for the native range input events.
+2. `amount_box` takes the text before and after the USD field, its minimum, step and value.
+   Read or write the field through `valueAsNumber`.
+   Listen for its native `change` event to apply the amount to the slider.
+3. `go_button` takes the button label and the page and key for the setting.
+   Call `pageSettingControls.connectGo(root, slider, amount, describe)` with the slider and the amount input.
+   Return `newValue`, `monthlyChange` in USD, and an optional `liveNote` from `describe`.
+   Go uses the slider live value as the old value in each confirmation.
+   The Go button shows the confirmation line before Confirm can send the choice.
+   Cancel closes the confirmation. Confirm disables the controls while the server saves.
+   Go updates the Now mark from the live value in the reply.
+   A successful save with a live value emits `setting-saved` with `detail.value`.
+   A refusal or failure shows one line below Go and keeps the proposed value.
+   Use `setLabel(label)` to update the button and `cancelConfirmation()` to close an obsolete confirmation.
+
+Go reads the request token from `GET /console/tune`.
+`POST /console/tune` accepts the fields `page`, `key`, `value`, and `token`.
+The POST requires a same-origin Origin header and the current request token.
+`console_tune.SETTINGS` registers allowed page and key pairs with the target document, range and step.
+The server validates exact decimal steps from the minimum.
+It refuses pairs absent from the table.
+The AWS Machines page uses `aws_machines` in this table and in the POST.
+The frame leaves the table empty for a page to register its settings.
+The route calls `tune.py` with the page and Go button in the reason and user words.
+It returns Saved with HTTP 200, Refused with HTTP 400, or SaveFailed with HTTP 503.
+Each result includes `live_value` from a fresh configuration read.
+An unavailable live value is `null`.
 
 The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
@@ -678,15 +720,24 @@ The mark is `waiting` after Ask question and `done` after Approve or Send feedba
 
 Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
-The server keeps the last good page and its render times under one lock.
+The server keeps the last good page, its completion time, its render times, and its usage store revision under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
-A later request returns the kept page at once and starts one background render.
-A request during a render returns the kept page and starts no second render.
+The server records the usage store file metadata before it starts each render.
+File absence is a revision.
+A request returns the kept page at once if its revision matches the store and its age is at most `page_refresh_seconds`.
+It starts a background render if no render is in progress.
+A request for an older page can share an active render if its revision still matches the store when the render ends.
+A request for a changed store uses the first render that starts after it reads the store revision.
+Requests can share that render and use its result if the store changes again during the render.
+The next request checks the store revision again.
+The server reads `page_refresh_seconds` from `config/review_links.conf` when it checks the page age.
+If the server cannot read this setting, it returns the last good page with a read error.
+It returns 503 if it has no good page.
 Only requests start renders.
 The child keeps the status read's stderr capture away from the server's request log.
 `accounts_page_seconds` in `config/review_links.conf` limits each render.
 A failed or late first render gives 503 with **The Accounts page is not available.**
-A failed background render keeps the last good page and writes one line to stderr.
+A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
@@ -1762,6 +1813,14 @@ It exits with status 0 when the folder disappears.
 
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
+
+The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+These requests require a single `Host` header for the server's bound address and port.
+The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
+On port 80, the server also accepts either host without a port.
+If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
+A Go change (`POST /console/tune`) must supply `Origin` and the token.
+The server returns 403 when the host or origin check fails.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
