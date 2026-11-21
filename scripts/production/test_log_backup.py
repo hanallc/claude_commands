@@ -63,8 +63,8 @@ class LogBackupTests(unittest.TestCase):
                             expected = {path.name: path.read_bytes() for path in legacy.iterdir()}
                             self.assertEqual({path.name: path.read_bytes() for path in migrated.iterdir()}, expected)
                         _ = document.write_text(f"> **Status: PRODUCTION — {status}.**\n"
-                                                f"- **Showrunner checkout:** `{root}`\n"
-                                                "- **Merge branch:** `integration`\n- **Log:** `LOG.md`\n")
+                                                + f"- **Showrunner checkout:** `{root}`\n"
+                                                + "- **Merge branch:** `integration`\n- **Log:** `LOG.md`\n")
                         _ = log.write_text(stage)
                         result = subprocess.run(["zsh", str(check), owner.id], capture_output=True, text=True,
                                                 env={**os.environ, "XDG_STATE_HOME": str(root)},
