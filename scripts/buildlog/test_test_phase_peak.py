@@ -117,7 +117,7 @@ class TestPhasePeakTests(unittest.TestCase):
             HOME=str(self.recovery.fixture.base), BUILDLOG_PROC=str(timeline.proc),
             BUILDLOG_SYNC="1", BUILDLOG_OFF="0", LINT_INVOKE_SOURCED="",
             TEST_PHASE_RECORDER=str(Path(record.__file__).resolve()),
-            CODEX_THREAD_ID="original-step-worker", BUILDLOG_CALLER=caller,
+            **self.recovery.runner_sessions, BUILDLOG_CALLER=caller,
             BUILDLOG_CALL_ID="original-phase-call", USER_ZONE="UTC", TZ="UTC",
         )
 

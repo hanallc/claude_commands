@@ -140,7 +140,8 @@ def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, polic
 
 def _resume_destination(move: WorkerMove, decision: WorkerResume,
                         hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
-    state, source, role, policy = decision.state, decision.source, decision.role, decision.policy
+    state, source, role = decision.state, decision.source, decision.role
+    policy = decision.policy
     terminal = state.terminal if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) else ""
     common = _request(move, source, terminal)
     began = time.monotonic()
@@ -151,6 +152,13 @@ def _resume_destination(move: WorkerMove, decision: WorkerResume,
         fresh = _observe(move)
         if not stopped or not isinstance(fresh, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
             reason = "anomaly: stop did not prove the worker stopped"
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
+            return accounts.SessionMoveRefused(move.row.id, reason)
+        try:
+            policy = _own_policy(move, role)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            recovery = _recover_source(move, source, role, decision.policy, hold)
+            reason = f"anomaly: worker launch settings are unreadable: {error}; {recovery}"
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
             return accounts.SessionMoveRefused(move.row.id, reason)
     result = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,

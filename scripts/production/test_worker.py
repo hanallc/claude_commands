@@ -344,9 +344,17 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         atomic_file.write_text_atomic(config.with_name("send.conf"),
-                                      (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+            "# range: 0.001..\nwaits_review_seconds=1\n"
+            + "# range: 0.001..\ndelivery_timeout=5\n"
+            + "# range: 0.001..\nkill_grace=1\n"
+            + "# range: 0.001..\ncaller_margin_seconds=2\n"
+            + "# range: 0.001..\nremote_transport_seconds=2\n"
+            + "# one of: on, off\nreview_hold=off\n")
         atomic_file.write_text_atomic(config.with_name("scratch.conf"),
-                                      (Path(__file__).resolve().parents[2] / "config/scratch.conf").read_text())
+            "# whole: 1..\nsuffix_length=6\n"
+            + "# whole: 1..\nrecord_lock_attempts=3\n"
+            + "# whole: 1..\nrepo_depth=3\n"
+            + "repo_skip=target node_modules .git\n")
         root = self.fixture.root
         (root / "worker-tmp").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -440,12 +448,19 @@ class WorkerCommandTests(unittest.TestCase):
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
 
-    def test_restore_reaps_detached_orphans_once_before_resuming(self) -> None:
+    def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
+        config = self.fixture.root / "conf"
+        atomic_file.write_text_atomic(config / "detached_runs.conf",
+            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
+            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
+            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
+        atomic_file.write_text_atomic(config / "postmaster.conf",
+            "# range: 0.001..\nwait_seconds=1\n"
+            + "# range: 0.001..\nclaim_grace_seconds=1\n")
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
             prompt=self.prompt, kind="impl", lens="")
-        _ = self.fixture.world.stop(opened.row, self.fixture.world)
         folder = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         folder.mkdir()
         path = folder / "orphan.json"
@@ -456,23 +471,34 @@ class WorkerCommandTests(unittest.TestCase):
             "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
         }
         atomic_file.write_text_atomic(path, json.dumps(run))
+        return opened, path, run
+
+    def test_restore_reaps_detached_orphans_once_before_resuming(self) -> None:
+        opened, path, run = self.start_orphaned_worker_run()
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        folder = path.parent
+        delivery = send.PaneTextDelivered("sent", f"worker {opened.row.name} at fixture pane")
 
         def resume(_row: staff.StaffRow, _active: progress_history.ActiveDispatch) -> worker.ExitCode:
             saved = cast(dict[str, object], json.loads(path.read_text()))
             self.assertEqual(saved["status"], "finished")
             return worker.ExitCode.OK
 
-        with (patch.object(detached_runs, "deliver", return_value="private fixture") as deliver,
+        with (patch.object(send, "deliver_worker_text", return_value=delivery),
+              patch.object(detached_runs, "deliver", wraps=detached_runs.deliver) as deliver,
               patch.object(detached_runs, "reap_orphans", wraps=detached_runs.reap_orphans) as reap,
               patch.object(unit_runs, "held", return_value=[str(self.run_dir)] * 2),
               patch.object(worker, "_resume_launcher", side_effect=resume)):
             for attempt in range(2):
                 with self.subTest(attempt=attempt):
                     code, output, errors = self.command("restore")
-                    self.assertEqual((code, errors), (0, ""))
+                    self.assertEqual((code, errors), (0, ""), errors)
                     self.assertEqual(output.count("reaped detached run orphan"), int(attempt == 0))
             deliver.assert_called_once()
             self.assertEqual(reap.call_args_list, [call(str(self.run_dir))] * 2)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], f"sent: {delivery.detail}")
+        self.assertIn("delivered_at", saved)
 
         sibling = self.opened("review", "review")
         for selection, selected in (("selected", frozenset({opened.row.id})),
@@ -487,7 +513,7 @@ class WorkerCommandTests(unittest.TestCase):
                     "log": str(folder / f"{identity}.log")}))
             sibling_before = paths[sibling.row.name].read_bytes()
             with (self.subTest(selection=selection),
-                  patch.object(detached_runs, "deliver", return_value="private fixture"),
+                  patch.object(send, "deliver_worker_text", return_value=delivery),
                   patch.object(detached_runs, "reap_orphans", wraps=detached_runs.reap_orphans) as reap,
                   patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
                   redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
@@ -497,6 +523,45 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(status, "finished" if opened.row.id in selected else "running")
                 self.assertEqual(reap.call_args_list,
                                  [call(str(self.run_dir), opened.row.name)] if selected == frozenset({opened.row.id}) else [])
+
+    def test_restore_retries_orphan_result_deferred_before_input(self) -> None:
+        opened, path, _ = self.start_orphaned_worker_run()
+        world = self.fixture.world
+        run = world.run
+        pane = world.locations[opened.pane]
+        pane["agent_status"] = "working"
+
+        def record_input(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:3] == ("agent", "prompt", opened.pane):
+                self.assertIn("Detached run: orphan", arguments[3].splitlines())
+                self.agent.append(opened.pane, "user", arguments[3])
+                pane["agent_status"] = "working"
+            return result
+
+        with (patch.object(world, "run", side_effect=record_input),
+              patch.object(detached_runs, "deliver", wraps=detached_runs.deliver) as deliver,
+              patch.object(unit_runs, "held", return_value=[str(self.run_dir)]),
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
+            code, _, errors = self.command("restore")
+            self.assertEqual((code, errors), (0, ""), errors)
+            deliver.assert_called_once()
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["delivery"], detached_runs.DEFERRED_WORKER_RESULT + "worker is working")
+            self.assertIs(saved["completion_pending"], True)
+            self.assertNotIn("delivered_at", saved)
+
+            pane["agent_status"] = "idle"
+            code, _, errors = self.command("restore")
+            self.assertEqual((code, errors), (0, ""), errors)
+            self.assertEqual(deliver.call_count, 2)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["delivery"], f"sent: worker {opened.row.name} at {opened.pane}")
+            self.assertIn("delivered_at", saved)
+
+            code, _, errors = self.command("restore")
+            self.assertEqual((code, errors), (0, ""), errors)
+            self.assertEqual(deliver.call_count, 2)
 
     def test_restore_lists_finished_results_newest_first(self) -> None:
         for launcher in ("explicit", "assign"):
@@ -4477,16 +4542,31 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(opened.pane, self.fixture.world.foreground)
 
     def test_restore_uses_the_known_row_role_without_history(self) -> None:
-        opened = self.opened()
-        _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl"))
-        _ = self.fixture.world.stop(opened.row, self.fixture.world)
-        active = progress_history.ActiveDispatch("saved-pass", ("assign.sh",))
-        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
-              patch.object(progress_history, "active_dispatch", return_value=active),
-              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
-            code, _output, errors = self.command("restore")
-        self.assertEqual(code, 0, errors)
-        self.assertEqual(len(self.fixture.world.launches), 2)
+        for family, name in (("codex", "impl"), ("claude", "claude-impl")):
+            with self.subTest(family=family):
+                _ = write_registry(self.fixture.root / "conf/models.conf", {
+                    "assignments": {"direct": family}, "direct.claude": {"impl": "sonnet:high"},
+                })
+                opened = self.opened(name)
+                _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl"))
+                if family == "claude":
+                    source = worker_admission.transcript_source(opened.row, staff.ClaudeBackend())
+                    atomic_file.write_text_atomic(source, json.dumps({"type": "assistant", "effort": "xhigh",
+                        "message": {"model": "claude-opus-5-5", "content": [{"type": "text", "text": "Ready."}]}}) + "\n")
+                _ = self.fixture.world.stop(opened.row, self.fixture.world)
+                active = progress_history.ActiveDispatch("saved-pass", ("assign.sh",))
+                launches = len(self.fixture.world.launches)
+                with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
+                      patch.object(progress_history, "active_dispatch", return_value=active),
+                      patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
+                    code, _output, errors = self.command("restore")
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(len(self.fixture.world.launches), launches + 1)
+                if family == "claude":
+                    _, arguments, _ = self.fixture.world.requests[-1]
+                    self.assertEqual(arguments[:2], ["--resume", opened.row.current_session])
+                    self.assertEqual(arguments[arguments.index("--model") + 1], "claude-opus-5-5")
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], "xhigh")
 
     def test_restore_reports_the_unavailable_role_and_continues_other_workers(self) -> None:
         missing = self.opened("impl")

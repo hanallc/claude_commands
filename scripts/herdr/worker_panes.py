@@ -31,7 +31,7 @@ from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
+from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -1111,8 +1111,20 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     return arguments + _turn_end_arguments(settings.kind)
 
 
+def _claude_worker_settings(settings: models_registry.LaunchSettings,
+                            preferred: pane_record.ClaudeTurnSettings | pane_record.NoClaudeTurn
+                            | pane_record.ClaudeResumeSettings) -> models_registry.LaunchSettings:
+    resume = pane_record.claude_resume_settings(preferred,
+        fallback=pane_record.ClaudeResumeSettings(settings.model, settings.effort))
+    return settings._replace(model=resume.model, effort=resume.effort)
+
+
 def kept_settings(settings: models_registry.LaunchSettings, arguments: Sequence[str]) -> models_registry.LaunchSettings:
-    """Keep the model, effort and tier that a saved launch passed; a launch without a model keeps the given settings."""
+    """Keep the saved launch settings and use the role for missing Claude flags."""
+    if settings.kind == "claude":
+        saved = pane_record.parse_claude_flags(arguments).values
+        return _claude_worker_settings(settings, pane_record.ClaudeResumeSettings(
+            saved.get("--model", ""), saved.get("--effort", "")))
     recorded = {"--model": "", "--effort": "", "model_reasoning_effort": "", "service_tier": ""}
     for flag, value in zip(arguments, arguments[1:]):
         name, _, setting = value.partition("=") if flag == "-c" else (flag, "", value)
@@ -1540,7 +1552,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             launch_evidence = fresh
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
-        arguments = launch_arguments(policy, identity, directory)
+        resume_policy = policy
+        if (identity and row is not None and keep_model and policy.settings.kind == "claude"
+                and row.role == staff.KnownWorkerRole(role)):
+            homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
+            if target_home := environment.get("CLAUDE_CONFIG_DIR"):
+                homes.append(Path(target_home))
+            turn = pane_record.claude_turn_settings(identity, *homes)
+            resume_policy = replace(policy, settings=_claude_worker_settings(policy.settings, turn))
+        arguments = launch_arguments(resume_policy, identity, directory)
         def launch_at(selected: herdr.SplitPane | herdr.ExistingPane) -> herdr.AgentLaunched:
             return launch(client.session, selected, prepared, policy.settings.kind,
                 arguments, herdr.NoOpeningPrompt(),

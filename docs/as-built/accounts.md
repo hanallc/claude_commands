@@ -207,6 +207,12 @@ Account moves use the shared stop and resume API.
 Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 Each attempt has its own move ID and cause.
 A session proved live on the target writes nothing.
+A failed live source read stops the move before it records a source or sends a signal.
+The stop checks that the live source PID and process start time still match.
+A Claude target needs a real account directory and a matching local sign-in.
+A refresh token needs a future `refreshTokenExpiresAt`.
+If only an access token is present, it needs a future `expiresAt`.
+The watcher checks the sign-in when it selects a target and again before it changes the group account.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 The batch stops the available members before it resumes them.
 Each session resumes its own conversation on the target account.
@@ -366,9 +372,12 @@ Normal recovery takes about two to three minutes plus reading, restoration, and 
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
 A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
-`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
-`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
-So a change of the role's assigned family never moves a worker to another family.
+The move reads the role settings for the worker's current family through `worker_panes.launch_policy(role, family)`.
+After the stop, `pane_moves._own_policy` reads the latest real Claude assistant turn for the model and effort.
+The launch record or role supplies missing settings. A turn without effort keeps the fallback effort.
+An explicit unit resume `--model` overrides the model.
+For Codex, `worker_panes.kept_settings` keeps the saved model, effort, and service tier.
+The destination and rollback use the same policy.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
