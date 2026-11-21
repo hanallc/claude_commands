@@ -1835,17 +1835,20 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 #### Work Order
 
-**Goal:** close two defects that exist on main before item 154 and that the phase 102 review found in round 4.
+**Goal:** close the legacy direct-main publication defects that exist on main before item 154. The phase 102 reviews found them in rounds 4 and 5. Only cargo-liner uses a `main` merge branch, until its move on Dec 1.
 **Spec:**
-1. A legacy `merge_gate.py --merge-branch main --promote` pushes to `origin/main` before `promote` checks the CI verdict (`merge_gate.py:2242,2246`). Check the verdict of the exact commit before the push. The phase 102 round 4 promotion operation should already cover this route; verify it, and fix it if it does not.
-2. The direct gate fixture in `test_merge_gate.py:557` adds its environment over the caller's environment and keeps inherited `GIT_DIR` and `GIT_WORK_TREE`. Use the shared helper in `scripts/lib/git_test_support.py`.
-**Files:** `merge_gate.py`, `test_merge_gate.py`.
+1. A legacy `merge_gate.py --merge-branch main --promote` pushes to `origin/main` before `promote` checks the CI verdict (`merge_gate.py:2242,2246`). Check the verdict of the exact commit before the push. Phase 102 keeps the old legacy direct-main route; it does not cover this case.
+2. A legacy direct-main candidate gets no verdict through the supported CI commands, because both read the configured branch (`ci_points.py:146,235`, `merge_gate.py:2232,2286`). Phase 102 F017; see its Astra round 5 review, item 1.
+3. Legacy single checkpoint, batch and handoff merge into local `main` before the CI check (`merge_checkpoint.py:795,1130,1635,1856,2327`). Phase 102 F018; Astra round 5 item 2 lists every route.
+4. A wrapped lifecycle retry, and the first wrap, push a commit that no CI verdict checked (`production_lifecycle.py:1082,1193,1203`; `open` at `:695,706`). Phase 102 F022; Astra round 5 item 4.
+5. The direct gate fixture in `test_merge_gate.py:557` adds its environment over the caller's environment and keeps inherited `GIT_DIR` and `GIT_WORK_TREE`. Use the shared helper in `scripts/lib/git_test_support.py`.
+**Files:** `merge_gate.py`, `merge_checkpoint.py`, `ci_points.py`, `production_lifecycle.py`, and their tests.
 **Tests:** a row in the existing legacy promotion table that refuses an unchecked commit before any push; the direct gate test leaves the caller's repository unchanged with `GIT_DIR` set.
 **Acceptance gate:** as phase 100.
 
 **Workers:** 1 writer, 1 reviewer.
 
-**Order:** before the item 154 combined branch merges to main; item 154 claims full publication coverage only after spec 1 passes.
+**Order:** after the item 154 combined branch merges to main, and before the cargo-liner move on Dec 1. Item 154 claims publication coverage for integration productions only.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
