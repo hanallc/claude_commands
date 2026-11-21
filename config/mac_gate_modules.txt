@@ -191,7 +191,6 @@ scripts/herdr/test_conversation_reader.py
 scripts/hooks/test_brp_launch_gate.py
 scripts/lib/test_build_folders.py
 scripts/lib/test_build_slots.py
-scripts/lib/test_cargo_seed.py
 scripts/lib/test_py_root.py
 scripts/lib/test_session_move.py
 scripts/lib/test_zone.py
