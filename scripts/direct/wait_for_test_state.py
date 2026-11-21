@@ -17,6 +17,7 @@ from typing import Protocol
 
 from scripts.direct.local_release_wait import RELEASE_CHANGES, IntervalReleasePolling, local_release_waiter
 from scripts.lib import inotify
+from scripts.lib.process_supervisor import ManagedProcess
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -29,12 +30,17 @@ def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = TEST
                *, processes: Sequence[ObservedProcess] = (),
                watch_writes: bool = False) -> None:
     deadline = time.monotonic() + timeout
-    descriptors: list[int] = []
+    pidfds: list[int] = []
+    status_polls: dict[int, Callable[[], int | None]] = {}
     poll_processes = False
     try:
         for process in processes:
+            if isinstance(process, ManagedProcess):
+                if process.returncode is None:
+                    status_polls[process.status_descriptor] = process.poll
+                continue
             try:
-                descriptors.append(os.pidfd_open(process.pid))
+                pidfds.append(os.pidfd_open(process.pid))
             except ProcessLookupError:
                 # The predicate observes the already-exited child below.
                 pass
@@ -58,19 +64,22 @@ def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = TEST
                 if isinstance(events, IntervalReleasePolling) or poll_processes:
                     events.wait(min(0.01, remaining))
                 else:
-                    readable, _, _ = select.select([events.descriptor, *descriptors], [], [], remaining)
+                    readable, _, _ = select.select([events.descriptor, *pidfds, *status_polls], [], [], remaining)
                     if not readable:
                         raise TimeoutError(f"fixture state never became ready under {directory}")
                     if events.descriptor in readable:
                         events.wait(0)  # Drain queued directory events before re-arming.
-                    for descriptor in descriptors[:]:
-                        if descriptor in readable:
-                            # An exited process stays readable; observe it once,
-                            # then let a predicate awaiting other state keep blocking.
-                            descriptors.remove(descriptor)
+                    for descriptor in readable:
+                        if descriptor in pidfds:
+                            # A pidfd stays readable after exit. Close it after the first wake.
+                            pidfds.remove(descriptor)
                             os.close(descriptor)
+                        elif (poll_status := status_polls.get(descriptor)) is not None:
+                            # Keep watching until the guardian reports an exit status.
+                            if poll_status() is not None:
+                                del status_polls[descriptor]
     finally:
-        for descriptor in descriptors:
+        for descriptor in pidfds:
             os.close(descriptor)
 
 

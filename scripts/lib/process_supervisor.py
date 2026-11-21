@@ -113,6 +113,11 @@ class ManagedProcess[Output: (str, bytes)]:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    @property
+    def status_descriptor(self) -> int:
+        """Return the status descriptor while the process owns it."""
+        return self._status.descriptor
+
     def wait(self, timeout: float | None = None) -> int:
         if self.returncode is None:
             try:

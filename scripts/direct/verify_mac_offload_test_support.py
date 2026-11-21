@@ -1457,10 +1457,14 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> ManagedProcess[str]:
+        command = self.prepare_verify(*arguments, extra=extra)
+        environment = {**self.environment, **(extra or {})}
+        # Mark the verify workload and its descendants.
+        runner_state = environment.pop("TEST_RUNNER_STATE")
         return self.enterContext(launch_process(
-            self.prepare_verify(*arguments, extra=extra),
+            ["env", f"TEST_RUNNER_STATE={runner_state}", *command],
             cwd=self.root,
-            env={**self.environment, **(extra or {})},
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1597,7 +1601,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         return cast(RoutingRecord, json.loads(records[-1]))
 
     def child_marker(self) -> str:
-        """The environment entry every process this test starts inherits."""
+        """Return the environment entry that marks the verify workload."""
         return f"TEST_RUNNER_STATE={self.runner_state}"
 
     def stop_verify(self, process: subprocess.Popen[str] | ManagedProcess[str]) -> None:
