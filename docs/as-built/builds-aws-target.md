@@ -1141,6 +1141,7 @@ The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
+If the account settings are missing, the buildlog report says that AWS spend is unavailable.
 `spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again

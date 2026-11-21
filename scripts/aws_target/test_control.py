@@ -142,10 +142,6 @@ region_transfer_usd={"us-west-1":0.00015}
     def snapshot(self) -> int:
         return aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock, notify=self.notify)
 
-    def initialize_page_ledger(self) -> None:
-        with ledger.CostLedger(self.state).transaction():
-            pass
-
     def deploy_gate_zones(self) -> None:
         _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
             {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in self.regions
@@ -696,7 +692,6 @@ region_transfer_usd={"us-west-1":0.00015}
                 self.assertEqual(evidence.box_seconds(size, region, ('merge-gate',)), ([Decimal(time) for time in times], source))
 
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
-        self.initialize_page_ledger()
         self.assertEqual(self.snapshot(), 0)
         folder = self.root / 'page'
         with (mock.patch.object(aws_page, 'output_folder', return_value=folder),
@@ -743,7 +738,6 @@ region_transfer_usd={"us-west-1":0.00015}
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_page_status_uses_the_real_aws_loader(self) -> None:
-        self.initialize_page_ledger()
         _ = self.snapshot()
         folder = self.root / 'page'
         page = aws_page.publish(self.state, int(self.clock.now), folder, settings_path=self.settings)
@@ -782,7 +776,6 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(gone, {'unavailable': 'AWS spend unavailable: ledger unreadable.', 'tiles': [], 'forecast': '', 'refused_bills': []})
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
-        self.initialize_page_ledger()
         folder = self.root / 'page'
         cell = 'a</script><b>'
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)

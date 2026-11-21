@@ -7,7 +7,9 @@ except FileNotFoundError:
 
 import argparse
 from collections import defaultdict
-from collections.abc import Sequence, Set
+from collections.abc import Generator, Sequence, Set
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -27,6 +29,7 @@ from scripts.aws_target import cloud_gate, config as aws_config, console_help, l
 from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.file_lock import LockResult
 from scripts.review_links import review_link
 
 PAGE_NAME = ledger.SPEND_PAGE_SOURCE.name
@@ -685,6 +688,22 @@ def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, starte
             .replace('__AWS_GATE_TIME_DATA__', json.dumps(gate_time_data).replace('</', '<\\/')))
 
 
+@contextmanager
+def _page_publication_lock(folder: Path) -> Generator[LockResult]:
+    """Serialize page replacement with or without an account ledger."""
+    folder.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield LockResult.BUSY
+        else:
+            yield LockResult.ACQUIRED
+    finally:
+        os.close(descriptor)
+
+
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Replace the page while the captured sources and the page revision match."""
     started = time.perf_counter()
@@ -705,16 +724,19 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
             if isinstance(verified, ledger.SpendEvidenceUnavailable):
                 reason = verified.reason
                 continue
-            current = published_revision(page_path)
-            if current != before:
-                continue
-            if isinstance(current, PublishedPageRevision) and (
-                current.at > evidence.at or (attempt > 0 and (current.at, current.source_digest) == (evidence.at, digest))
-            ):
+            with _page_publication_lock(folder) as publication:
+                if publication is LockResult.BUSY:
+                    reason = 'Another publisher holds the AWS page folder lock.'
+                    continue
+                current = published_revision(page_path)
+                if current != before:
+                    continue
+                if isinstance(current, PublishedPageRevision) and (
+                    current.at > evidence.at or (attempt > 0 and (current.at, current.source_digest) == (evidence.at, digest))
+                ):
+                    return page_path
+                write_text_atomic(page_path, page + f'\n<!-- aws-spend-revision {evidence.at} {digest} -->\n', new_file_mode=0o644)
                 return page_path
-            folder.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(page_path, page + f'\n<!-- aws-spend-revision {evidence.at} {digest} -->\n', new_file_mode=0o644)
-            return page_path
     if isinstance(published_revision(page_path), PageAbsent):
         raise PagePublicationDeferred(reason)
     return page_path

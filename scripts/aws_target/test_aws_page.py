@@ -1,15 +1,18 @@
 """Check the published AWS table and quota case instructions."""
 
 from collections.abc import Mapping
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from html import unescape
+from io import StringIO
 import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 from typing import cast, override
 import unittest
 from unittest import mock
@@ -20,6 +23,7 @@ from scripts.aws_target import (
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED
+from scripts.build_targets import target_config
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -684,14 +688,81 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
         self.assertEqual(len(renders), 3)
         self.assertEqual(path.read_bytes(), earlier)
 
-    def test_failed_first_capture_creates_no_page_or_lock(self) -> None:
+    def publish_configured(self, directory: Path) -> int:
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+              mock.patch.object(aws_page, 'output_folder', return_value=self.folder),
+              mock.patch.object(time, 'time', return_value=self.midnight)):
+            return aws_page.publish_configured()
+
+    def test_configured_publisher_accepts_an_empty_state_directory(self) -> None:
         empty = self.root / 'empty-state'
         empty.mkdir()
-        destination = self.root / 'first-page'
-        with self.assertRaises(aws_page.PagePublicationDeferred):
-            _ = aws_page.publish(empty, self.midnight, destination, settings_path=self.settings)
-        self.assertFalse(destination.exists())
+        self.assertEqual(self.publish_configured(empty), 0)
+        data = self.published_data((self.folder / aws_page.PAGE_NAME).read_text())
+        self.assert_spend_tiles(data, '—', '—', '—')
+        self.assertEqual(data['hours_note'], 'No billed hours: the cost ledger is not readable.')
         self.assertEqual(list(empty.iterdir()), [])
+
+    def test_configured_publisher_defers_for_a_ledger_without_its_lock(self) -> None:
+        unlocked = self.root / 'unlocked-state'
+        unlocked.mkdir()
+        ledger_path = ledger.CostLedger(unlocked).path
+        _ = ledger_path.write_bytes(self.book.path.read_bytes())
+        with redirect_stderr(StringIO()) as errors:
+            self.assertEqual(self.publish_configured(unlocked), 1)
+        self.assertIn('account evidence exists without its lock', errors.getvalue())
+        self.assertFalse(self.folder.exists())
+        self.assertEqual(list(unlocked.iterdir()), [ledger_path])
+
+    def test_configured_publisher_accepts_a_price_snapshot_without_a_ledger(self) -> None:
+        prices = self.root / 'price-state'
+        prices.mkdir()
+        _ = (prices / 'spot-prices.lock').write_text(str(self.midnight))
+        ledger.write_spot_prices(prices, (
+            ledger.RegionalSpotPrice('us-east-1', 'us-east-1a', 'm7a.8xlarge', Decimal('.25'), self.midnight),
+        ))
+        self.assertEqual(self.publish_configured(prices), 0)
+        data = self.published_data((self.folder / aws_page.PAGE_NAME).read_text())
+        self.assert_spend_tiles(data, '—', '—', '—')
+        standard = data['prices'][0]
+        self.assertEqual(standard['values'][0][standard['headers'].index('m7a.8xlarge')], .25)
+        self.assertEqual(sorted(path.name for path in prices.iterdir()), [ledger.SPOT_PRICE_FILE, 'spot-prices.lock'])
+
+    def test_page_folder_lock_serializes_publication_without_a_ledger(self) -> None:
+        empty = self.root / 'empty-state'
+        empty.mkdir()
+        self.assertEqual(self.publish_configured(empty), 0)
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
+        at = self.midnight + 1
+
+        def try_second_publication(destination: Path, source: str, *, new_file_mode: int | None = None) -> None:
+            with mock.patch.object(aws_page, 'write_text_atomic') as second_write:
+                _ = aws_page.publish(empty, at + 1, self.folder, settings_path=self.settings)
+            second_write.assert_not_called()
+            self.assertEqual(path.read_bytes(), earlier)
+            write_text_atomic(destination, source, new_file_mode=new_file_mode)
+
+        with mock.patch.object(aws_page, 'write_text_atomic', side_effect=try_second_publication):
+            _ = aws_page.publish(empty, at, self.folder, settings_path=self.settings)
+        self.assertEqual(self.published_data(path.read_text())['read_at'], at)
+        self.assertEqual(list(empty.iterdir()), [])
+
+    def test_page_recaptures_when_the_first_ledger_appears_during_rendering(self) -> None:
+        book = ledger.CostLedger(self.root / 'new-ledger')
+        quota_help = aws_page.quota_help
+
+        def write_first_ledger() -> str:
+            if not book.path.exists():
+                book.record_inventory(ledger.ResourceInventory(
+                    self.midnight - 3600, (), 'fixture inventory', builder_removed=True))
+            return quota_help()
+
+        with mock.patch.object(aws_page, 'quota_help', side_effect=write_first_ledger) as rendered:
+            self.assertEqual(self.publish_configured(book.directory), 0)
+        self.assertEqual(rendered.call_count, 2)
+        data = self.published_data((self.folder / aws_page.PAGE_NAME).read_text())
+        self.assertEqual(data['spend']['tiles'][1]['usd'], '$0.00')
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")

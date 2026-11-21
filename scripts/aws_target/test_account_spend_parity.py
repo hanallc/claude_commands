@@ -996,7 +996,7 @@ print(floor.day, floor.usd, decision.reason)
                                                                   'No priced evidence supports the estimate'),))
         self.assertEqual(result.months, ())
         with ledger.verify_spend_revision(directory, evidence) as revision:
-            self.assertEqual(revision, ledger.SpendEvidenceUnavailable('page publication requires the existing cost ledger lock'))
+            self.assertIsInstance(revision, ledger.SpendRevisionVerified)
         self.assertFalse(directory.exists())
 
     def test_utc_spend_uses_the_watch_and_the_unsettled_maximum(self) -> None:

@@ -347,10 +347,12 @@ def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run
         if evidence is None:
             checks = run_cost.hours_checks(ledger.CostLedger(directory), start, end, home, builder, scope,
                                            max_ratio, bill_policy=run_cost.ValidateBillsAt(now))
-        else:
+        elif evidence.has_saved_ledger:
             readings = run_cost.readings_in_window(evidence.validated_bills, start, end)
             daily = run_cost.day_hours_from(evidence.state, readings, start, end, home, builder, scope, max_ratio)
             checks = run_cost.sum_hours_checks(daily, max_ratio)
+        else:
+            raise ledger.LedgerUnavailable('the cost ledger is absent')
     except ledger.LedgerUnavailable:
         return BilledHoursTable(title, ('type', *regions), frozenset(), (), 'columns',
                                 active_regions_by_size={}, note='No billed hours: the cost ledger is not readable.', reserved_by_region={})

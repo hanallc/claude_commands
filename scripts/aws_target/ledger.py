@@ -3014,7 +3014,7 @@ class SpendEvidenceUnavailable:
 
 @dataclass(frozen=True)
 class SpendRevisionVerified:
-    """The publication locks hold and the sources match the captured revision."""
+    """The existing source locks hold and the sources match the captured revision."""
 
 
 @dataclass(frozen=True)
@@ -3059,6 +3059,10 @@ class SpendEvidenceAt:
     _spot_document: str
     _deployment_document: str
     placement_scores: tuple[SpotPlacementReading, ...]
+
+    @property
+    def has_saved_ledger(self) -> bool:
+        return not isinstance(self._ledger_document, SpendFileAbsent)
 
     @property
     def state(self) -> LedgerEvidence:
@@ -3352,9 +3356,7 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
               _spend_file_lock(book.launch_history_path, fcntl.LOCK_SH) as launch_lock):
             sources = _spend_source_paths(book, now, account_path, purpose)
             if isinstance(ledger_lock, SpendFileAbsent) and (
-                    book.path.exists() or sources.bills or sources.journal or any(
-                        (directory / name).exists() for name in (SPOT_PRICE_FILE, GATE_DEPLOYMENT_FILE, SPOT_PLACEMENT_FILE))
-                    or not isinstance(launch_lock, SpendFileAbsent)):
+                    book.path.exists() or sources.bills or sources.journal or not isinstance(launch_lock, SpendFileAbsent)):
                 raise LedgerUnavailable('account evidence exists without its lock')
             launches = _spend_launches(launch_lock, now)
             journal = remote.hana_start_journal(tuple(remote.read_record(path) for path in sources.journal))
@@ -3425,19 +3427,19 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
 @contextmanager
 def verify_spend_revision(directory: Path, evidence: SpendEvidenceAt
                           ) -> Generator[SpendRevisionVerified | SpendEvidenceUnavailable]:
-    """Keep the publication locks through the caller's page replacement."""
+    """Keep existing source locks through the caller's page replacement."""
     book = CostLedger(directory)
+    ledger_lock_path = directory / 'cost-ledger.lock'
     with ExitStack() as locks:
         try:
-            ledger_lock = locks.enter_context(_spend_file_lock(directory / 'cost-ledger.lock', fcntl.LOCK_EX))
-            if isinstance(ledger_lock, SpendFileAbsent):
-                raise LedgerUnavailable('page publication requires the existing cost ledger lock')
+            ledger_lock = locks.enter_context(_spend_file_lock(ledger_lock_path, fcntl.LOCK_EX))
             launch_lock = locks.enter_context(_spend_file_lock(book.launch_history_path, fcntl.LOCK_SH))
             purpose = (SpendCapturePurpose.PAGE_PUBLICATION if isinstance(evidence.page_inputs, SpendPageInputs)
                        else SpendCapturePurpose.REPORT)
             current = _spend_source_paths(book, evidence.at, evidence.account_configuration.source, purpose)
             if (current.revision.sources != evidence.revision.sources
                     or not _spend_configurations_match(evidence.revision.configurations)
+                    or (isinstance(ledger_lock, SpendFileAbsent) and ledger_lock_path.exists())
                     or (isinstance(launch_lock, SpendFileAbsent) and book.launch_history_path.exists())):
                 raise LedgerUnavailable('spend sources changed before publication')
             result = SpendRevisionVerified()
