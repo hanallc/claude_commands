@@ -1074,3 +1074,25 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   2. The kept test fails without the report of each row and passes with it.
   3. Each `test_merge_checkpoint*.py` module passes; basedpyright zero errors and warnings on changed files.
   4. A deletion change runs the full gate at the merge.
+
+### Phase 418 — each merge batch runs in its own temporary worktree  · status: todo
+**Depends on:** Phase 417
+**Blocked by:** tonight's Mac work (builds, 2026-11-21 17:46)
+
+#### Work Order
+- **Goal:** a merge batch rollback never changes operator state. builds approved this on 2026-11-21 at 17:46 after a design check (`/tmp/claude/astra/20261121T223908Z-990209/review.md`) listed operator state that the rollback in the shared checkout can change, on main as well.
+- **Spec:**
+  1. `merge_checkpoint.py` runs each batch (merges, gate, publication, rollback) in a new temporary worktree at the batch start tip. Make that worktree through the build-folder maker of resources item 143. No operator works in it.
+  2. Rollback and conflict cleanup act only in that worktree. Remove the ownership checks that only protect a shared checkout (open-operation checks, index and HEAD checks for operator edits) when the temporary worktree makes them dead.
+  3. Records stay outside the worktree, where they are now. Recovery of an interrupted batch reads them and makes a new temporary worktree; it never reuses a leftover one.
+  4. The worktree goes away at batch end on every path (pass, red, conflict, crash recovery). A leftover from a crash is removed at the next batch start.
+  5. Cost per batch, measured on natedev 2026-11-21: about 0.8 s wall and 0.2 CPU s to add and remove one worktree; about 64 MB disk while the batch runs.
+- **Files:** `scripts/production/merge_checkpoint.py`; `scripts/production/checkpoint_gate.py`; `scripts/production/test_merge_checkpoint*.py`; the item 143 build-folder maker (caller only); `docs/as-built/merge-gate-and-test-speed.md`.
+- **Workers:** 1 writer.
+  - impl: all; the batch code and its tests do not split.
+- **Constraints from prior phases:** Phase 417 gives one shared stop path with a fixed cleanup order and ownership checks for the shared checkout; this phase replaces those checks where the temporary worktree makes them dead.
+- **Acceptance gate:**
+  1. A test opens an operator merge, a staged file and a paused rebase in the main checkout during a failing batch; all stay unchanged.
+  2. No temporary worktree remains after pass, red, conflict and recovery tests.
+  3. Each `test_merge_checkpoint*.py` module passes; basedpyright zero errors and warnings on changed files.
+  4. The full gate runs at the merge.
