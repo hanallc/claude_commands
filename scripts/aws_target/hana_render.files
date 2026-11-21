@@ -78,6 +78,7 @@ scripts/lib/user_zone.py
 scripts/lint/build_shape.py
 scripts/lint/memory_admit.py
 scripts/mac_test/abandoned_sessions.py
+scripts/mac_test/cargo_timings.py
 scripts/mac_test/claim_state.py
 scripts/mac_test/floor_claims.py
 scripts/mac_test/linux_runner.py

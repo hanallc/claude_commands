@@ -26,6 +26,7 @@ from unittest import mock
 
 from scripts.aws_target import cloud_gate, gpu_size_trial as trial, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, largest_gate_vcpus
+from scripts.aws_target.control_test_support import write_prepared_gpu_manifest
 from scripts.aws_target.ledger_test_support import (
     CostFixture, install_aws_fixture_settings, override_fixture_settings,
 )
@@ -1395,12 +1396,14 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             _ = (self.folder / name).write_text('fixture ' + name)
         (self.folder / 'cargo-home').mkdir()
         trial.write_json(self.folder / 'inventory.json', {'tests': [{'binary': 'fixture', 'test': 'test'}]})
-        manifest: dict[str, object] = {'schema': 2, 'toolchain_source': 'nix', 'state': 'prepared', 'trial': 'stable-fixture-trial', 'commit': 'a' * 40,
-            'system': '/nix/store/fixture-system', 'toolchain': '/nix/store/fixture-rust',
-            'limits': {'limit_usd': str(limits.limit_usd), 'spot_max_usd_per_hour': {key: str(value) for key, value in prices.items()}},
-            'sha256': {name: trial.digest(path) for path in self.folder.iterdir() if path.is_file()
-                       for name in (path.name,)}}
-        trial.write_json(self.folder / 'manifest.json', manifest)
+        manifest = write_prepared_gpu_manifest(
+            self.folder, (path for path in self.folder.iterdir() if path.is_file()),
+            trial_id='stable-fixture-trial', commit='a' * 40,
+            trial_fields={
+                'system': '/nix/store/fixture-system', 'toolchain': '/nix/store/fixture-rust',
+                'limits': {'limit_usd': str(limits.limit_usd),
+                           'spot_max_usd_per_hour': {key: str(value) for key, value in prices.items()}},
+            })
         self.fake = FakeGpuAws(manifest, tuple(prices), region)
         api = AwsCli('fixture-scaler', 'us-east-1', 5, trial.gpu_aws_executor(self.fake.execute))
         self.book = ledger.CostLedger(self.state)

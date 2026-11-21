@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -20,7 +20,7 @@ from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
-from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.control_test_support import TestClock, write_prepared_gpu_manifest
 from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
@@ -724,6 +724,14 @@ class HanaGpuPlacementTests(CostFixture):
             self.assertEqual((repo, commit, request.arguments, launch.trial),
                              (self.root, 'captured', command[3:], claim_id))
             if refuse_start:
+                def prepare(_repo: Path, _commit: str, folder: Path,
+                            mode: gpu_size_trial.HanaGpuNextestRequest) -> None:
+                    source = folder / 'source.tar'
+                    _ = source.write_bytes(b'fixture source')
+                    _ = write_prepared_gpu_manifest(
+                        folder, (source,), trial_id=folder.name, commit='a' * 40,
+                        trial_fields={'tree': 'b' * 40, 'hana_nextest': asdict(mode)})
+
                 def refuse(_folder: Path, _directory: Path, _settings: Path,
                            _execute: Callable[[Sequence[str]], int], *, assigned: bool) -> int:
                     self.assertTrue(assigned)
@@ -731,7 +739,7 @@ class HanaGpuPlacementTests(CostFixture):
                     self.assertFalse(gpu_size_trial.assigned_gpu_cleanup_pending(claim_id))
                     return 1
 
-                with (mock.patch.object(gpu_size_trial, 'prepare_locked'),
+                with (mock.patch.object(gpu_size_trial, 'prepare_locked', new=prepare),
                       mock.patch.object(gpu_size_trial, 'start_service', new=refuse)):
                     return real_run(repo, commit, request, launch=launch)
             launch.before_service()
@@ -883,6 +891,10 @@ class HanaGpuPlacementTests(CostFixture):
                 self.assertEqual(report.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
                 self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
                 self.assertEqual(report.path, expected)
+                trial = self.trials / execution_identity.assigned_claim_id(
+                    self.assignment.episode, self.assignment.attempt)
+                self.assertTrue((trial / 'inputs-removed.json').is_file())
+                self.assertFalse((trial / 'source.tar').exists())
                 result = read_result(self.root / 'gpu-result', status, False)
                 assert isinstance(result, UsableRunnerResult)
                 self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))

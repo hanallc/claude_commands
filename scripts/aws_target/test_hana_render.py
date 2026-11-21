@@ -286,6 +286,7 @@ class HanaRenderTests(unittest.TestCase):
                 + 'from scripts.aws_target import hana_runner, hana_protocol; '
                 + 'from scripts.build_queue import slot_wait; '
                 + 'from scripts.lib import build_slots, git_rescue; '
+                + 'from scripts.mac_test import linux_runner; '
                 + 'assert not any(name in sys.modules for name in '
                 + '("scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", "scripts.aws_target.hana_box", '
                 + '"scripts.aws_target.hana_placement", "scripts.buildlog.transfer_bytes"))',
