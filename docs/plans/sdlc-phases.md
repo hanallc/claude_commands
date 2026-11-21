@@ -1869,6 +1869,25 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 **Order:** after the item 154 combined branch merges to main.
 
+### Phase 106 — Item 154 follow-up: publication checks pin the remote SHA  · status: todo
+**Depends on:** phases 100–103
+
+#### Work Order
+
+**Goal:** publication and promotion checks use one captured remote SHA, never a shared remote-tracking ref that another fetch can change. The phase 102 Astra round 7 review found this. The same reads exist on main at e332b0e70b (for example `merge_gate.py:2000,2002,2011`), and `main_sync.py:224` writes `origin/main` without `main_push_lock`.
+**Spec:**
+1. Use the remote snapshot helper that phase 102 adds to `scripts/lib/land_main.py`: capture each advertised SHA once and pass it through each check.
+2. Change the promotion reads (`merge_gate.py:2035,2036,2238`), the checkpoint reads (`merge_checkpoint.py:89,1147,1166`) and the lifecycle reads (`production_lifecycle.py:795,819`).
+3. Change the inherited reads that Astra round 7 item 4 lists: `main_publish.py`, `merge_checkpoint.py`, `merge_gate.py`, `production_lifecycle.py`, `push_direct.sh`, `fast_track.py` and `branch_page.py`. Pin the SHA across each operation.
+4. Keep the reads that already check a captured SHA (`merge_checkpoint.py:449`, `main_sync.py:217`).
+**Files:** the files in spec items 2 and 3, and their tests.
+**Tests:** a row in the existing promotion and checkpoint tables in which a controlled fetch moves `origin/main` between the capture and the check; the check uses the captured SHA.
+**Acceptance gate:** as phase 100.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** after the item 154 combined branch merges to main.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
