@@ -276,6 +276,9 @@ try {
             const bar = waiting.querySelector('.waitb')?.getBoundingClientRect();
             const table = document.querySelector('.walk-table').getBoundingClientRect();
             const bounds = note?.getBoundingClientRect();
+            const text = document.createRange();
+            text.selectNodeContents(note);
+            const textRight = text.getBoundingClientRect().right;
             const left = Math.floor(running.getBoundingClientRect().left) - 8;
             const row = waiting.getBoundingClientRect();
             return {
@@ -285,7 +288,8 @@ try {
               fits:note && note.scrollWidth <= note.clientWidth,
               inGap:bounds && bounds.left >= waiting.querySelector('.row-label').getBoundingClientRect().right
                 && bounds.right <= (bar?.left ?? table.left) + 1,
-              pointer:{x:Math.floor((bounds.right+table.left)/2),y:Math.floor(row.bottom-4)},
+              textRight,
+              pointer:{x:Math.floor((textRight+table.left)/2),y:Math.floor(row.bottom-4)},
               clip:{x:left,top:Math.floor(running.getBoundingClientRect().top+scrollY)-6,
                 bottom:Math.ceil(row.bottom+scrollY)+6,width:innerWidth-2*left}
             };
@@ -299,14 +303,15 @@ try {
             const tip = document.querySelector('#tip.on');
             const fields = [...tip.querySelectorAll('dt')].filter(cell=>['Waits for','Reason'].includes(cell.textContent));
             const bounds = tip.getBoundingClientRect();
-            const note = document.querySelector('.wrow.wait .wait-note').getBoundingClientRect();
             const table = document.querySelector('.walk-table').getBoundingClientRect();
             return {causes:fields.map(cell=>[cell.textContent,cell.nextElementSibling.textContent]),
-              text:tip.innerText,top:Math.floor(bounds.top+scrollY)-6,bottom:Math.ceil(bounds.bottom+scrollY)+6,
-              fits:bounds.left>=note.right && bounds.right<=table.left && tip.scrollWidth<=tip.clientWidth};
+              text:tip.innerText,left:bounds.left,right:bounds.right,tableLeft:table.left,
+              top:Math.floor(bounds.top+scrollY)-6,bottom:Math.ceil(bounds.bottom+scrollY)+6,
+              fits:tip.scrollWidth<=tip.clientWidth};
           })()`);
           assert.deepEqual(tooltip.causes,[['Reason',reason]]);
-          assert.ok(tooltip.fits,tooltip.text);
+          assert.ok(tooltip.fits && tooltip.left>=result.textRight && tooltip.right<=tooltip.tableLeft,
+            JSON.stringify({textRight:result.textRight,tooltip}));
           const {x, width, top, bottom} = result.clip;
           const y = Math.min(top,tooltip.top);
           const clip = {x,y,width,height:Math.max(bottom,tooltip.bottom)-y,scale:1};
