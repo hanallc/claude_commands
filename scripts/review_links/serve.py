@@ -43,7 +43,7 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
 from scripts.lib.file_lock import exclusive
-from scripts.production import change_routing, change_review, staff, the_list
+from scripts.production import change_routing, change_review, staff
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
@@ -1825,44 +1825,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         return "text/plain; charset=utf-8"
 
 
-def release_delivery_parks(root: Path, snapshot: review_page.ReviewSnapshot) -> None:
-    """Use published changes to find parks that can be checked and released."""
-    now = the_list.now()
-    ready = {key: change for key, change in snapshot.records.items()
-             if isinstance(change.source, review_items.ChangeSource)
-             and key not in snapshot.unavailable_cards and change.for_you(now)}
-    if not ready:
-        return
-    for entry in list_page.records():
-        park = the_list.delivery_park_event(entry.item)
-        if not isinstance(park, the_list.DeliveryParkEvent):
-            continue
-        for key in entry.item.reviews:
-            change = ready.get(key)
-            if change is None or not isinstance(change.source, review_items.ChangeSource):
-                continue
-            try:
-                result = release_park_for_change(root, snapshot.members, entry, park, change, change.source)
-            except (OSError, ValueError, change_review.ChangeReviewError) as error:
-                print(f"review-links List delivery park {entry.key}: {error}", file=sys.stderr)
-                continue
-            if result is the_list.DeliveryParkRelease.RELEASED:
-                break
-
-
-def release_park_for_change(root: Path, members: staff.StaffSnapshot, entry: list_page.ListRecord,
-                            park: the_list.DeliveryParkEvent, change: review_items.ReviewItem,
-                            source: review_items.ChangeSource) -> the_list.DeliveryParkRelease:
-    def change_ready() -> bool:
-        try:
-            return review_items.read_current(root, change, members).for_you(the_list.now())
-        except review_items.ReviewRecordMissing:
-            return False
-
-    return the_list.unpark_for_delivered_change(entry.keeper, entry.item.id, park, change.key,
-                                               review_root=root, review_list=source.path, change_ready=change_ready)
-
-
 class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
     def linked_records(self) -> list_page.ImmediateReviewRecords:
         """Return the published records without waiting for a build."""
@@ -1871,13 +1833,6 @@ class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
         if isinstance(snapshot, review_page.SnapshotUnavailable):
             return list_page.LinkedReviewRead.FROM_DISK
         return snapshot.records
-
-    @override
-    def _after_snapshot_update(self, snapshot: review_page.ReviewSnapshot, /) -> None:
-        try:
-            release_delivery_parks(self.root, snapshot)
-        except (OSError, ValueError) as error:
-            print(f"review-links List delivery parks: {error}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
