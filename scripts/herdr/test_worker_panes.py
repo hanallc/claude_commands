@@ -1190,6 +1190,24 @@ class WorkerPaneTests(StaffTestCase):
     def prompts(self) -> list[tuple[str, ...]]:
         return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]
 
+    @contextmanager
+    def record_codex_prompt(self, row: staff.StaffRow, pane: str) -> Generator[None]:
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        source = worker_admission.transcript_source(row, backend)
+        run = self.world.run
+
+        def submit(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:3] == ("agent", "prompt", pane):
+                entry = {"type": "event_msg", "payload": {"type": "user_message", "message": arguments[3]}}
+                with source.open("a", encoding="utf-8") as stream:
+                    _ = stream.write(json.dumps(entry) + "\n")
+            return result
+
+        with patch.object(self.world, "run", side_effect=submit):
+            yield
+
     def test_dispatch_holder_starts_its_worker_and_keeps_other_operations_out(self) -> None:
         row = self.worker(family="codex")
         self.world.add(row, "w1:p1", live=False)
@@ -3838,11 +3856,13 @@ class WorkerPaneTests(StaffTestCase):
         self.world.processes[pid] = replace(process, identity=herdr.LaunchArgument(row.current_session))
         read = self.world.result
         record = staff.snapshot()
-        body = "Detached run: fixture-run\nRun finished: fixture checks"
         fifo = self.root / "grandchild-stdin"
         os.mkfifo(fifo)
         for exiting in (False, True):
             with self.subTest(exiting=exiting):
+                marker = f"Detached run: fixture-run-{exiting}"
+                body = marker + "\nRun finished: fixture checks"
+                receipt = send.WorkerResultReceipt(marker)
                 # The intermediate process is outside the reported foreground group.
                 fake_unit_host.process(os.environ, child, pid, ["sh"], {})
                 fake_unit_host.process(os.environ, grandchild, child, [] if exiting else ["python3"], {})
@@ -3868,11 +3888,12 @@ class WorkerPaneTests(StaffTestCase):
 
                 with (patch.object(self.world, "result", side_effect=result),
                       patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt,
-                      patch.object(send, "delivery_timeout", return_value=1.0),
+                      self.record_codex_prompt(row, pane),
                       patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
                       redirect_stderr(io.StringIO()) as errors):
                     states = {state.row.id: state for state in worker_panes.observe(self.parent.id, record)}
-                    delivery = send.deliver_worker_text(row, record, body, sender="detached-runs", timeout=1)
+                    delivery = send.deliver_worker_text(row, record, body, sender="detached-runs",
+                                                        timeout=1, receipt=receipt)
 
                 self.assertIsInstance(states[row.id], worker_panes.OpenWorker)
                 self.assertIsInstance(states[absent.id], worker_panes.ClosedWorker)
@@ -3907,13 +3928,15 @@ class WorkerPaneTests(StaffTestCase):
             return reply
 
         record = staff.snapshot()
-        body = "Detached run: fixture-run\nRun finished: fixture checks"
+        marker = "Detached run: fixture-run"
+        body = marker + "\nRun finished: fixture checks"
+        receipt = send.WorkerResultReceipt(marker)
         with (patch.object(self.world, "result", side_effect=result),
-              patch.object(send, "delivery_timeout", return_value=1.0),
               patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
               redirect_stderr(io.StringIO())):
             scan = self.world.scan_row_panes(record, [self.world.locations[pane]])
-            delivery = send.deliver_worker_text(claude, record, body, sender="detached-runs", timeout=1)
+            delivery = send.deliver_worker_text(claude, record, body, sender="detached-runs",
+                                                timeout=1, receipt=receipt)
 
         self.assertEqual(self.prompts(), [])
         self.assertNotIn(claude.id, scan.found)
@@ -3980,7 +4003,6 @@ class WorkerPaneTests(StaffTestCase):
         shell_stat = self.world.process_root / str(shell) / "stat"
         fifo = self.root / "tool-stdin"
         os.mkfifo(fifo)
-        body = "Detached run: fixture-run\nRun finished: fixture checks"
         read = self.world.result
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)
@@ -3996,6 +4018,9 @@ class WorkerPaneTests(StaffTestCase):
                                        ("unreadable", "editor", False), ("pipe", "claude", False),
                                        ("exited", "editor", False)):
             with self.subTest(stdin=stdin, draft=draft):
+                marker = f"Detached run: fixture-run-{stdin}-{draft}"
+                body = marker + "\nRun finished: fixture checks"
+                receipt = send.WorkerResultReceipt(marker)
                 fake_unit_host.process(os.environ, child, pid, [program, "private-argument"], {})
                 fd = self.world.process_root / str(child) / "fd" / "0"
                 fd.parent.mkdir(exist_ok=True)
@@ -4024,33 +4049,30 @@ class WorkerPaneTests(StaffTestCase):
                 self.world.commands.clear()
                 with (patch.object(self.world, "result", side_effect=result),
                       patch.object(herdr, "native_process", side_effect=native),
-                      patch.object(send, "delivery_timeout", return_value=1.0),
+                      self.record_codex_prompt(row, pane),
                       patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
                       redirect_stderr(io.StringIO()) as errors, ExitStack() as fixture):
                     if draft:
                         _ = fixture.enter_context(patch.object(self.world, "composer",
                             return_value=herdr.ComposerInput("Keep this draft.")))
                     states = {state.row.id: state for state in worker_panes.observe(self.parent.id, record)}
-                    delivery = send.deliver_worker_text(row, record, body, sender="detached-runs", timeout=1)
+                    delivery = send.deliver_worker_text(row, record, body, sender="detached-runs",
+                                                        timeout=1, receipt=receipt)
 
                 self.assertIsInstance(states[row.id], worker_panes.OpenWorker)
                 self.assertIsInstance(states[absent.id], worker_panes.ClosedWorker)
                 self.assertEqual(errors.getvalue(), "")
+                holder.assert_not_called()
                 if stdin in ("pipe", "exited"):
                     self.assertIsInstance(delivery, send.PaneTextDelivered)
                     self.assertEqual(len(self.prompts()), 1)
                     self.assertEqual(self.prompts()[0][:3], ("agent", "prompt", pane))
                     self.assertIn(body, self.prompts()[0][3])
-                    holder.assert_not_called()
                 else:
                     self.assertEqual(self.prompts(), [])
-                    self.assertEqual(delivery, send.Result("sent", "fixture holder"))
-                    holder.assert_called_once()
-                    options = cast(send.Options, holder.call_args.args[0])
-                    self.assertEqual(options.to, f"session:{self.parent.current_session}")
                     reason = ("terminal held by editor" if stdin == "tty" else
                               "terminal may be held by editor because its stdin is unavailable")
-                    self.assertEqual(send.body_text(options), f"Worker {row.name}: anomaly: {reason}\n{body}")
+                    self.assertEqual(delivery, send.WorkerResultNotSubmitted("retry", f"anomaly: {reason}"))
 
     def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")

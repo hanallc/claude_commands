@@ -2224,7 +2224,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.world.add(foreign, "w2:p7", workspace="w2", tab="w2:t2")
         self.agent.questions["w2:p7"] = "Which output format must I use?"
         self.assertEqual(self.command("answer", foreign.name, "--text", "Use Markdown."),
-                         (worker.ExitCode.REFUSED, "", "foreign: no worker staff row\n"))
+                         (worker.ExitCode.REFUSED, "", "foreign: no worker staff row. Use assign.sh for new work.\n"))
         self.assertEqual(len(self.agent.answers), 2)
 
     def test_answer_refuses_without_an_accepted_pass(self) -> None:

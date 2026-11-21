@@ -533,18 +533,30 @@ class WorkerNotObserved(Enum):
     CURRENT = "the worker has no observation"
 
 
-def observe_selected(parent: StaffId, record: staff.StaffSnapshot, names: Sequence[WorkerName]) -> list[WorkerPane]:
+class SharedServer(Enum):
+    CONFIGURED = "use the configured shared Herdr server"
+
+
+@dataclass(frozen=True)
+class ObservedServer:
+    client: herdr.Herdr
+
+
+def observe_selected(parent: StaffId, record: staff.StaffSnapshot, names: Sequence[WorkerName], *,
+                     server: SharedServer | ObservedServer = SharedServer.CONFIGURED) -> list[WorkerPane]:
     """Judge the requested rows from one complete identity scan."""
     selection = SelectedWorkers(frozenset(name.value for name in names))
-    return _evidence(parent, record, _client(), selection=selection).states
+    client = server.client if isinstance(server, ObservedServer) else _client()
+    return _evidence(parent, record, client, selection=selection).states
 
 
-def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot) -> WorkerPane | WorkerNotObserved:
+def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot, *,
+                   server: SharedServer | ObservedServer = SharedServer.CONFIGURED) -> WorkerPane | WorkerNotObserved:
     """Read all pane identities and judge the selected worker."""
     current = record.by_id(row.id)
     if current is None:
         return WorkerNotObserved.CURRENT
-    states = observe_selected(parent, record, [WorkerName.parse(current.name)])
+    states = observe_selected(parent, record, [WorkerName.parse(current.name)], server=server)
     return next((state for state in states if state.row.id == current.id), WorkerNotObserved.CURRENT)
 
 

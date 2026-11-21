@@ -874,9 +874,14 @@ class QueuedStaffRecipient:
     session_id: str
 
 
+class SharedServerScan(Enum):
+    WORKER = "scan the shared Herdr server for the worker"
+
+
 @dataclass(frozen=True)
 class PaneWorkerRecipient:
     row: staff.StaffRow
+    place: HerdrPlace | SharedServerScan = SharedServerScan.WORKER
 
 
 SessionRecipient = ClaudeRecipient | CodexSessionRecipient | CodexPaneRecipient
@@ -3088,6 +3093,15 @@ def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.Roster
     )]
 
 
+def _worker_recipient(to: str, row: staff.StaffRow, entries: list[roster.RosterEntry]) -> PaneWorkerRecipient:
+    reported = [entry for entry in _staff_transport_matches(row, entries) if isinstance(entry.pane, HerdrPlace)]
+    if len(reported) > 1:
+        _ambiguous_name(to, reported)
+    if reported and isinstance(place := reported[0].pane, HerdrPlace):
+        return PaneWorkerRecipient(row, place)
+    return PaneWorkerRecipient(row, SharedServerScan.WORKER)
+
+
 def _native_address_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
     from scripts.message import roster
 
@@ -3213,7 +3227,7 @@ def resolve_recipient(
             holder = membership.parent_of(member)
             if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
                                        or holder.worktree.machine == roster.remote.local_machine()):
-                return PaneWorkerRecipient(member)
+                return _worker_recipient(to, member, observed.entries)
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -3231,6 +3245,10 @@ def resolve_recipient(
         problems = result.problems
         if isinstance(result, RecipientMatches) and result.entries:
             route = _matched_recipient(to, result.entries, result.destination)
+            if isinstance(route, CodexPaneRecipient):
+                owner = membership.by_current_session(route.thread_id)
+                if owner is not None and owner.kind == "worker":
+                    return _worker_recipient(to, owner, result.entries)
             if (isinstance(route, RemoteDelivery) and route.selected_conversation
                     and isinstance(member, staff.StaffRow)):
                 return RemoteDelivery(route.host, staff_queue_key(member.id))
@@ -4182,6 +4200,12 @@ def deliver_codex(
             return Result("failed", current.reason)
     if isinstance(recipient, CodexPaneRecipient):
         try:
+            membership = staff.authority_snapshot()
+            owner = membership.by_current_session(recipient.thread_id)
+            if owner is not None and owner.kind == "worker":
+                return deliver_worker_text(owner, membership, text, sender=message.sender, timeout=timeout,
+                                           selection=selection, observed_place=recipient.place)
+            # Senders learn a worker thread ID after staff publishes its row.
             _prompt_pane(recipient.place, text, target=recipient.thread_id, timeout=timeout)
             return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
         except (herdr_types.HerdrFailure, OSError) as error:
@@ -4992,11 +5016,71 @@ class OrdinaryWorkerMessage(Enum):
     SEND = "send a message without a detached run receipt"
 
 
+def _blocked_worker_refusal(place: HerdrPlace | SharedServerScan) -> str:
+    from scripts.herdr import herdr
+
+    with suppress(OSError, UnicodeError):
+        if isinstance(place, SharedServerScan) or place.session == herdr.shared_session():
+            return "worker is blocked. Use worker.py answer."
+    return "worker is blocked"
+
+
+def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str, *, timeout: float,
+                           selection: RecipientSelection | NoFixedStaffLookup,
+                           observed_place: HerdrPlace | SharedServerScan) -> Result:
+    from scripts.direct import recorder_state
+    from scripts.herdr import herdr, worker_panes
+    from scripts.production import worker
+
+    ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
+    submission: herdr.TrackedPromptSubmission | None = None
+    try:
+        server = (worker_panes.ObservedServer(herdr.Herdr(observed_place.session))
+                  if isinstance(observed_place, HerdrPlace) else worker_panes.SharedServer.CONFIGURED)
+        with worker.worker_answer(parent, staff.WorkerName.parse(row.name), text,
+                                  identity=worker.ExpectedWorker(row), server=server) as checked:
+            if isinstance(checked, worker.WorkerAnswerRefused):
+                return Result("refused", checked.detail(row.name))
+            state = checked.worker
+            if isinstance(observed_place, HerdrPlace) and state.pane != observed_place.pane:
+                return Result("refused", f"{row.name}: the worker pane changed before delivery")
+            if state.status is herdr.AgentStatus.BLOCKED:
+                return Result("refused", f"{row.name}: {_blocked_worker_refusal(observed_place)}")
+            if state.status not in ordinary_states:
+                return Result("refused", worker.WorkerAnswerRefused(f"worker is {state.status.value}").detail(row.name))
+            if isinstance(selection, FixedStaffLookup):
+                current = _current_staff_session(selection, ExpectedStaffSession(row.current_session))
+                if isinstance(current, RecipientLookupFailed):
+                    return Result("failed", current.reason)
+
+            def check_message_status() -> None:
+                status = client.readiness(state.pane)["agent_status"]
+                if status is herdr.AgentStatus.BLOCKED:
+                    raise herdr_types.HerdrFailure(_blocked_worker_refusal(observed_place))
+                if status not in ordinary_states:
+                    raise herdr_types.HerdrFailure(f"worker is {status.value}")
+
+            submission = herdr.TrackedPromptSubmission(check_message_status)
+            client = server.client if isinstance(server, worker_panes.ObservedServer) else herdr.Herdr(herdr.shared_session())
+            client.prompt(state.pane, checked.text, target=str(state.row.current_session),
+                          proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=submission)
+            return PaneTextDelivered("sent", f"worker {row.name} at {state.pane}")
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError,
+            staff.StaffRefused, recorder_state.OldRecorderState) as error:
+        if submission is None:
+            return Result("refused", worker.WorkerAnswerRefused(one_line(str(error))).detail(row.name))
+        if submission.may_have_submitted:
+            return WorkerMessageUnconfirmed("failed", f"worker message delivery unconfirmed: {error}. "
+                                            + "The message may already have arrived. Do not resend it.")
+        return Result("failed", str(error))
+
+
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True) -> Result:
+                        review_text: str = "", allow_holder_fallback: bool = True,
+                        observed_place: HerdrPlace | SharedServerScan = SharedServerScan.WORKER) -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5004,44 +5088,34 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     holder = membership.parent_of(worker)
     worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
     if holder is None:
+        if isinstance(observed_place, HerdrPlace):
+            return Result("refused", f"{worker.name}: worker holder is unavailable")
         return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
-    if not reason:
+    if isinstance(observed_place, HerdrPlace) and isinstance(receipt, OrdinaryWorkerMessage):
+        return _deliver_worker_answer(holder.id, worker, review_text or text, timeout=timeout,
+                                      selection=selection, observed_place=observed_place)
+    if not reason or isinstance(receipt, OrdinaryWorkerMessage):
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
+            if isinstance(receipt, OrdinaryWorkerMessage):
+                if state.status is herdr.AgentStatus.BLOCKED:
+                    return Result("refused", f"{worker.name}: {_blocked_worker_refusal(SharedServerScan.WORKER)}")
+                return _deliver_worker_answer(holder.id, worker, review_text or text, timeout=timeout,
+                                              selection=selection, observed_place=SharedServerScan.WORKER)
             attempting_input = False
-            ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
             def require_idle() -> None:
                 nonlocal attempting_input
                 readiness = prompt_client.readiness(state.pane)
                 if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
                     raise herdr_types.HerdrFailure("worker is not ready for input")
-                assert isinstance(receipt, WorkerResultReceipt)
                 _ = receipt.before_input()
                 attempting_input = True
 
-            def check_message_status() -> None:
-                status = prompt_client.readiness(state.pane)["agent_status"]
-                if status not in ordinary_states:
-                    raise herdr_types.HerdrFailure(f"worker is {status.value}")
-
-            submission = herdr.TrackedPromptSubmission(check_message_status)
-
-            if isinstance(receipt, WorkerResultReceipt):
-                wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
-                can_prompt = state.status.idle or wait_for_idle
-                on_submission = require_idle
-            else:
-                wait_for_idle = False
-                can_prompt = state.status in ordinary_states
-                on_submission = submission
-
-            if can_prompt:
-                ordinary_address = (isinstance(receipt, OrdinaryWorkerMessage)
-                                    and not isinstance(selection, FixedStaffLookup))
-                prepared_client = None if ordinary_address else herdr.Herdr(herdr.shared_session())
+            wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
+            if state.status.idle or wait_for_idle:
+                prompt_client = herdr.Herdr(herdr.shared_session())
                 try:
-                    prompt_client = prepared_client if prepared_client is not None else herdr.Herdr(herdr.shared_session())
                     if wait_for_idle:
                         _ = prompt_client.wait_turn_end(state.pane, int(timeout * 1000))
                     if isinstance(selection, FixedStaffLookup):
@@ -5049,35 +5123,23 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         if isinstance(current, RecipientLookupFailed):
                             return Result("failed", current.reason)
                     prompt_client.prompt(state.pane, review_text or text, target=str(worker.current_session),
-                                         proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=on_submission)
-                    if isinstance(receipt, OrdinaryWorkerMessage):
-                        return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                                         proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=require_idle)
+                except (herdr_types.HerdrFailure, OSError) as error:
                     reason = str(error)
-                    if isinstance(receipt, OrdinaryWorkerMessage):
-                        if submission.may_have_submitted:
-                            return WorkerMessageUnconfirmed("failed",
-                                f"worker message delivery unconfirmed: {reason}. "
-                                + "The message may already have arrived. Do not resend it.")
-                    elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
-                        launch_error = error.__cause__ if isinstance(error, herdr_types.HerdrFailure) else error
-                        if (not attempting_input or isinstance(error, herdr.HerdrLaunchRefused)
-                                or isinstance(launch_error, OSError)
-                                and prepared_client is not None
-                                and cast(object, launch_error.filename) == prepared_client.binary):
-                            return WorkerResultNotSubmitted("retry", reason)
-                    else:
-                        raise
-                if isinstance(receipt, WorkerResultReceipt):
-                    try:
-                        if receipt.received(worker, membership):
-                            return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                    except (OSError, ValueError) as error:
-                        reason = f"worker transcript is unavailable: {error}"
-                    return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
+                    launch_error = error.__cause__ if isinstance(error, herdr_types.HerdrFailure) else error
+                    if (not attempting_input or isinstance(error, herdr.HerdrLaunchRefused)
+                            or isinstance(launch_error, OSError)
+                            and cast(object, launch_error.filename) == prompt_client.binary):
+                        return WorkerResultNotSubmitted("retry", reason)
+                try:
+                    if receipt.received(worker, membership):
+                        return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+                except (OSError, ValueError) as error:
+                    reason = f"worker transcript is unavailable: {error}"
+                return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"
-                if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
+                if state.status != herdr.AgentStatus.BLOCKED:
                     return Result("retry", reason)
         elif state is None:
             reason = "worker observation is unavailable"
@@ -5363,14 +5425,15 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             if batch_only:
                 result = deliver_worker_text(route.row, membership, agent_text(transport_message),
                                              sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                             allow_holder_fallback=False)
+                                             allow_holder_fallback=False, observed_place=route.place)
             elif transport_message.review_batch:
                 result = deliver_worker_text(route.row, membership, agent_text(message),
                                              sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                             review_text=agent_text(transport_message))
+                                             review_text=agent_text(transport_message), observed_place=route.place)
             else:
                 result = deliver_worker_text(route.row, membership, agent_text(message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection)
+                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
+                                             observed_place=route.place)
         else:
             claude_started = time.monotonic()
             def relay_and_queue(relay_message: Message, timeout: float) -> Result:
