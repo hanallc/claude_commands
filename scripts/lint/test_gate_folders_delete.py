@@ -1,7 +1,8 @@
-"""Test legacy gate deletion with private folders, locks, and Git worktrees."""
+"""Test manual gate review with private folders, locks, and Git worktrees."""
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import io
 import os
 from contextlib import ExitStack, redirect_stdout
@@ -11,11 +12,15 @@ import subprocess
 import sys
 import tempfile
 from typing import override
+from unittest import mock
 import unittest
 
 from scripts.lint import gate_folders_delete
 from scripts.lint.sweep import gib
-from scripts.lib import scratch
+from scripts.lib import removal_guard, scratch
+from scripts.lib.git_test_support import fixture_git_environment
+
+GATE_RECORD = '{"owner":"fixture","repo":"repository","commit":"' + "1" * 40 + '"}\n'
 
 
 class GateFoldersDeleteTests(unittest.TestCase):
@@ -27,6 +32,18 @@ class GateFoldersDeleteTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.gates = self.root / "gates"
         self.gates.mkdir()
+        home = self.root / "home"
+        config = self.root / "config"
+        home.mkdir()
+        config.mkdir()
+        environment = fixture_git_environment(self.root)
+        environment.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"), "CONF_DIR": str(config)})
+        self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
+        top = self.root / "build"
+        top.mkdir()
+        _ = (config / "build_folders.conf").write_text(
+            f"removal.path_templates={top}/<repo>/<unit>/<short>\nroots.workspace={self.root / 'workspaces'}\n"
+            + f"roots.build={top}\n")
 
     def git(self, folder: Path, *arguments: str) -> str:
         result = subprocess.run(
@@ -49,7 +66,7 @@ class GateFoldersDeleteTests(unittest.TestCase):
         folder = self.gates / "repository" / name
         (folder / "target").mkdir(parents=True)
         _ = (folder / "target" / "output").write_bytes(b"generated output")
-        _ = (folder / ".gate.json").write_text('{"fixture": true}\n')
+        _ = (folder / ".gate.json").write_text(GATE_RECORD)
         return folder
 
     def linked_checkout(self, gate: Path) -> tuple[Path, Path]:
@@ -67,24 +84,36 @@ class GateFoldersDeleteTests(unittest.TestCase):
             _ = gate_folders_delete.delete_gate_folders(self.gates, dry_run=dry_run)
         return output.getvalue().splitlines()
 
-    def test_a_free_gate_and_empty_repository_folders_are_deleted(self) -> None:
+    def assert_manual_gate(self, lines: list[str], gate: Path) -> None:
+        [plan] = [Path(line.removeprefix("removal list: ")) for line in lines if line.startswith("removal list: ")]
+        data = plan.read_bytes()
+        rows = [removal_guard.ListedEntry.parse(line) for line in data.decode().splitlines()]
+        self.assertIn(gate, [row.path for row in rows])
+        output = io.StringIO()
+        top = self.root / "build"
+        guard = removal_guard.read(build_top=top, mount_reader=lambda: (Path("/"), top),
+                                   names=removal_guard.KnownNames(frozenset(), frozenset()))
+        with mock.patch.object(removal_guard, "read", return_value=guard), redirect_stdout(output):
+            self.assertEqual(removal_guard.remove_list(plan, hashlib.sha256(data).hexdigest()), 0)
+        self.assertIn(f"kept {str(gate)!r}", output.getvalue())
+        self.assertTrue(gate.is_dir())
+
+    def test_a_free_gate_is_listed_and_empty_repositories_stay(self) -> None:
         gate = self.gate()
         (self.gates / "checkout").mkdir()
         (self.gates / "reload").mkdir()
-        size = len(b"generated output") + len(b'{"fixture": true}\n')
+        size = len(b"generated output") + len(GATE_RECORD.encode())
         lines = self.delete()
-        self.assertIn(f"deleted {gate}: {gib(size)}", lines)
-        self.assertIn(f"deleted {gate.parent}: {gib(0)}", lines)
-        self.assertIn(f"deleted {self.gates / 'checkout'}: {gib(0)}", lines)
-        self.assertIn(f"deleted {self.gates / 'reload'}: {gib(0)}", lines)
-        self.assertEqual(list(self.gates.iterdir()), [])
+        self.assertIn(f"review {gate}: {gib(size)}", lines)
+        reason = removal_guard.RefusalReason.UNKNOWN_MAKER.value
+        self.assertIn(f"kept {self.gates / 'checkout'}: {reason}", lines)
+        self.assertIn(f"kept {self.gates / 'reload'}: {reason}", lines)
+        self.assert_manual_gate(lines, gate)
 
-    @unittest.skipIf(os.geteuid() == 0, "Root can remove folders despite the fixture's read-only permissions.")
-    def test_an_empty_repository_removal_error_does_not_stop_later_gate_deletion(self) -> None:
+    def test_a_read_only_review_root_keeps_its_gates(self) -> None:
         blocked = self.gates / "aaa-empty"
         blocked.mkdir()
         gate = self.gate()
-        self.addCleanup(self.gates.chmod, 0o755)
         self.gates.chmod(0o555)
         try:
             lines = self.delete()
@@ -92,8 +121,7 @@ class GateFoldersDeleteTests(unittest.TestCase):
             self.gates.chmod(0o755)
         self.assertTrue(any(line.startswith(f"kept {blocked}: ") for line in lines), lines)
         self.assertEqual(list(blocked.iterdir()), [])
-        self.assertTrue(any(line.startswith(f"deleted {gate}: ") for line in lines), lines)
-        self.assertEqual(list(gate.parent.iterdir()), [])
+        self.assert_manual_gate(lines, gate)
 
     def test_a_held_busy_mark_keeps_its_gate_until_released(self) -> None:
         gate = self.gate()
@@ -102,43 +130,22 @@ class GateFoldersDeleteTests(unittest.TestCase):
             lines = self.delete()
             self.assertIn(f"kept {gate}: busy", lines)
             self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
-        _ = self.delete()
-        self.assertEqual(list(self.gates.iterdir()), [])
+        self.assert_manual_gate(self.delete(), gate)
 
-    def test_a_linked_worktree_edit_is_rescued_in_the_source_before_deletion(self) -> None:
+    def test_a_linked_worktree_edit_and_its_refs_stay(self) -> None:
         gate = self.gate()
         source, checkout = self.linked_checkout(gate)
-        edits = {checkout: "edited source\n"}
-        for relative in ("nested/second", "nested/deeper/third"):
-            linked = gate / relative
-            linked.parent.mkdir(parents=True, exist_ok=True)
-            _ = self.git(source, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
-            edits[linked] = f"edited {linked.name}\n"
-            _ = (linked / "source.txt").write_text(edits[linked])
-            (linked / "target").mkdir()
-            _ = (linked / "target" / "output").write_bytes(b"generated nested output")
-        lines = self.delete()
-        self.assertEqual(list(self.gates.iterdir()), [])
-        refs = self.git(source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
-        self.assertEqual(len(refs), len(edits))
-        for linked, text in edits.items():
-            with self.subTest(checkout=linked):
-                matching = [ref for ref in refs if ref.startswith(f"refs/rescue/{linked.name}-")]
-                self.assertEqual(len(matching), 1)
-                ref, = matching
-                self.assertRegex(ref, rf"^refs/rescue/{linked.name}-\d{{8}}T\d{{12}}Z$")
-                self.assertEqual(self.git(source, "show", f"{ref}:source.txt"), text)
-                self.assertNotIn("target/output", self.git(source, "ls-tree", "-r", "--name-only", ref).splitlines())
-        self.assertTrue(any(line.startswith(f"deleted {gate}: ") for line in lines))
-        worktrees = self.git(source, "worktree", "list", "--porcelain").splitlines()
-        self.assertEqual([line for line in worktrees if line.startswith("worktree ")], [f"worktree {source}"])
+        worktrees = self.git(source, "worktree", "list", "--porcelain")
+        self.assert_manual_gate(self.delete(), gate)
+        self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname)", "refs/rescue/"), "")
+        self.assertEqual(self.git(source, "worktree", "list", "--porcelain"), worktrees)
+        self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
 
-    def test_a_real_rescue_failure_keeps_the_gate_and_its_edits(self) -> None:
+    def test_a_missing_source_keeps_the_gate_and_its_edits(self) -> None:
         gate = self.gate()
         source, checkout = self.linked_checkout(gate)
         shutil.rmtree(source)
-        lines = self.delete()
-        self.assertTrue(any(line.startswith(f"kept {gate}: rescue failed: ") for line in lines), lines)
+        self.assert_manual_gate(self.delete(), gate)
         self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
         self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
 
@@ -157,6 +164,23 @@ class GateFoldersDeleteTests(unittest.TestCase):
                 self.assertEqual((repository / "source.txt").read_text(), "unsaved repository source\n")
                 self.assertEqual(self.git(repository, "show", "HEAD:source.txt"), "original source\n")
 
+    def test_a_case_alias_of_git_metadata_keeps_the_gate(self) -> None:
+        gate = self.gate()
+        git = gate / ".GIT"
+        git.mkdir()
+        self.assertIn(f"kept {gate}: repository", self.delete())
+        self.assertTrue(git.is_dir())
+
+    def test_a_regular_file_alias_of_git_metadata_keeps_the_gate(self) -> None:
+        gate = self.gate()
+        marker = gate / ".GIT"
+        contents = "gitdir: missing-metadata\n"
+        _ = marker.write_text(contents)
+        lines = self.delete()
+        self.assertIn(f"kept {gate}: repository", lines)
+        self.assertFalse(any(line.startswith(f"review {gate}: ") for line in lines), lines)
+        self.assertEqual(marker.read_text(), contents)
+
     def test_a_dry_run_prints_decisions_without_changing_files_or_refs(self) -> None:
         gate = self.gate()
         source, checkout = self.linked_checkout(gate)
@@ -170,33 +194,50 @@ class GateFoldersDeleteTests(unittest.TestCase):
                  for path in self.gates.rglob("*")}
         self.assertEqual(after, before)
         self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
-        self.assertTrue(any(line.startswith(f"would delete {gate}: ") for line in lines))
-        self.assertIn(f"would delete {empty}: {gib(0)}", lines)
+        self.assertTrue(any(line.startswith(f"review {gate}: ") for line in lines))
+        self.assertIn(f"kept {empty}: {removal_guard.RefusalReason.UNKNOWN_MAKER.value}", lines)
         self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
 
-    def test_main_exit_status_reports_gate_errors(self) -> None:
-        for case, expected_status in (("free", 0), ("busy", 0), ("rescue-failure", 1)):
+    def test_main_exits_zero_when_a_gate_stays(self) -> None:
+        for case in ("free", "busy", "missing-source"):
             with self.subTest(case=case), ExitStack() as contexts:
                 gate = self.gate(case)
                 if case == "busy":
                     busy = contexts.enter_context((gate / scratch.BUSY).open("w"))
                     fcntl.flock(busy, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                elif case == "rescue-failure":
+                elif case == "missing-source":
                     source = self.linked_checkout(gate)[0]
                     shutil.rmtree(source)
                 result = subprocess.run(
                     [sys.executable, gate_folders_delete.__file__, "--root", str(self.gates)],
                     capture_output=True, text=True, check=False, timeout=20)
-                self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 if case == "free":
-                    size = len(b"generated output") + len(b'{"fixture": true}\n')
-                    self.assertIn(f"deleted {gate}: {gib(size)}", result.stdout.splitlines())
+                    size = len(b"generated output") + len(GATE_RECORD.encode())
+                    self.assertIn(f"review {gate}: {gib(size)}", result.stdout.splitlines())
                 elif case == "busy":
                     self.assertIn(f"kept {gate}: busy", result.stdout.splitlines())
                     self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
                 else:
-                    self.assertIn(f"kept {gate}: rescue failed: ", result.stdout)
+                    self.assertIn(f"review {gate}: ", result.stdout)
                     self.assertEqual((gate / "checkout" / "source.txt").read_text(), "edited source\n")
+
+    def test_a_home_root_keeps_top_level_folders_and_files(self) -> None:
+        home = Path.home()
+        candidate = home / "repository" / "gate"
+        candidate.mkdir(parents=True)
+        marker = candidate / ".gate.json"
+        _ = marker.write_text(GATE_RECORD)
+        top_file = home / "notes"
+        _ = top_file.write_text("keep")
+        before = sorted(home.rglob("*"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            decisions = gate_folders_delete.delete_gate_folders(home)
+        self.assertEqual(before, sorted(home.rglob("*")))
+        [refusal] = [row.refusal for row in decisions if isinstance(row, gate_folders_delete.KeptByGuard)]
+        self.assertEqual(refusal.reason, removal_guard.RefusalReason.INVALID_ROOT)
+        self.assertIn(f"kept {home}: ", output.getvalue())
 
     def test_remote_mirrors_dot_folders_and_root_files_are_kept(self) -> None:
         entries = {".remote-mirrors": "mirror record", ".claude": "private state", ".other": "other state"}

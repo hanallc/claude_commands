@@ -520,7 +520,28 @@ if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final && " ${VERIFY_QUERY_ARGS[*]} " == *" 
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_START_DIR/final_pass.py" query "$VERIFY_START_DIR/verify.sh" "$SAVED_TREE"
 fi
+# A fresh index reads the working files without flags from the real index.
+prepared_copy_matches_index() (
+    local repo=$1 expected=${2:-} indexed working git_dir temporary
+    indexed=$(git -C "$repo" write-tree) || return
+    [[ -z "$expected" || "$indexed" == "$expected" ]] || return 1
+    git_dir=$(git -C "$repo" rev-parse --absolute-git-dir) || return
+    temporary=$(mktemp -d "$git_dir/verify-index.XXXXXX") || return
+    trap 'rm -f -- "$temporary/index" "$temporary/index.lock"; rmdir -- "$temporary"' EXIT
+    export GIT_INDEX_FILE="$temporary/index"
+    local -a index_git=(git -C "$repo" -c core.sparseCheckout=false -c core.splitIndex=false)
+    "${index_git[@]}" read-tree "$indexed" || return
+    "${index_git[@]}" add -A -- . || return
+    working=$("${index_git[@]}" write-tree) || return
+    [[ "$working" == "$indexed" ]]
+)
+
 VERIFY_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" ]] &&
+        ! prepared_copy_matches_index "$VERIFY_REPO_ROOT" 2>/dev/null; then
+    printf '%s\n' 'verify.sh: the prepared copy has edits outside the index. Stage or commit them first.' >&2
+    exit 2
+fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
     exit 2
@@ -598,19 +619,41 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry name
-    local names=()
-    local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
-        has_input=1
+        set -- 1 "$@"
+    else
+        set -- 0 "$@"
+    fi
+    if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
+        if [[ "$2" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$2" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
+            export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
+        fi
+        # Read caller values before local variables can replace them.
+        if [[ ! -v verify_helper_names && ! -v verify_helper_name && ! -v verify_helper_environment ]] &&
+                compgen -V verify_helper_names -e 2>/dev/null; then
+            verify_helper_environment=()
+            for verify_helper_name in "${verify_helper_names[@]}"; do
+                [[ -v "$verify_helper_name" && "${!verify_helper_name@a}" != *[aA]* ]] || continue
+                verify_helper_environment+=("$verify_helper_name=${!verify_helper_name}")
+            done
+            verify_helper_environment+=("")
+        else
+            # Bash opens the stream before it declares the array.
+            {
+                local -a verify_helper_environment=()
+                mapfile -d '' -t verify_helper_environment
+            } < <(command env -0 && printf '\0')
+        fi
+    fi
+    local input="" has_input=$1 status output errors entry
+    local forwarded=()
+    shift
+    if [[ "$has_input" == 1 ]]; then
         input="$(cat; printf '\001')"
         input="${input%$'\001'}"
     fi
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
-        if [[ "$1" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$1" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
-            export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
-        fi
         if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
             # The empty list's NUL terminator does not represent an environment entry.
             while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do
@@ -618,11 +661,16 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
+        # An incomplete environment must not reach the request pipe.
+        if [[ ${#verify_helper_environment[@]} -gt 0 && -z "${verify_helper_environment[-1]}" ]] &&
+                lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            for name in "${names[@]}"; do
-                [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
-                printf '%s=%s\0' "$name" "${!name}"
+            for entry in "${verify_helper_environment[@]}"; do
+                # Match Bash's exported variables. Skip function entries and the external command's _.
+                case "${entry%%=*}" in
+                    ''|_|[0-9]*|*[!a-zA-Z0-9_]*) continue ;;
+                esac
+                printf '%s\0' "$entry"
             done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
@@ -712,6 +760,10 @@ LINT_QUEUE_PLACEMENT=1
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$BUILD_HELPER_ROOT/build_targets/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$BUILD_HELPER_ROOT/direct/local_release_wait.py}"
 STEP_RECORD_SCRIPT="$BUILD_HELPER_ROOT/direct/step_record.py"
+# Finish records that read a copy before its lease ends.
+if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" || "${COPIES_STEP_SOURCE:-}" == "$VERIFY_REPO_ROOT" ]]; then
+    BUILDLOG_SYNC=1
+fi
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
@@ -869,8 +921,7 @@ run_step() {
     fi
     local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
-    local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD="" VERIFY_SLOT_CAPACITY_FILE=""
-    local slot_deadline=""
+    local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD=""
     if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
         build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
         return 2
@@ -905,7 +956,6 @@ run_step() {
                 "$(git rev-parse --show-toplevel)" == "$COPIES_STEP_SOURCE" ]]; then
             VERIFY_SLOT_SOURCE=$COPIES_STEP_SOURCE
         fi
-        if [[ -n "$VERIFY_SLOT_SOURCE" ]]; then VERIFY_SLOT_CAPACITY_FILE="$step_log.slot-full"; fi
     fi
     attempt=1
     while :; do
@@ -960,15 +1010,6 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
-        if [[ -s "$VERIFY_SLOT_CAPACITY_FILE" ]]; then
-            status=0
-            if [[ -z "$slot_deadline" ]]; then slot_deadline=$(< "$VERIFY_SLOT_CAPACITY_FILE"); fi
-            rm -f -- "$VERIFY_SLOT_CAPACITY_FILE"
-            wait_for_step_folder "$slot_deadline" || status=$?
-            if (( status != 0 )); then rm -f "$step_log"; return "$status"; fi
-            : > "$step_log"
-            continue
-        fi
         if [[ -n "$VERIFY_SLOT_SOURCE" && "${CMD:-}" != doc ]]; then
             VERIFY_SLOT_EXECUTED_TREE=$VERIFY_SLOT_TREE
         fi
@@ -2230,7 +2271,8 @@ LINT_MAC_FIX=0
 MAC_FIX_RESULT=""
 # The local lint fix pass runs on a private copy in a repository that cargo-berth
 # configures (lint_copy_begin). LINT_COPY_MODE is empty until the first pass asks.
-LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET=""
+LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET="" LINT_COPY_REPO=""
+LINT_COPY_ALLOCATION=""
 LINT_COPY_ARGS=()
 
 forward_mac_runner_signal() {
@@ -3044,34 +3086,6 @@ take_local_placement() {
     if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
     export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
     export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-}
-
-wait_for_step_folder() {
-    local deadline=$1 status=0
-    release_token || return $?
-    if [[ ! -f "$VERIFY_SLOT_CAPACITY_FILE.memory-released" ]]; then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-            --pid "$PLACEMENT_OWNER_PID" --reason "could not release memory before the folder wait" >/dev/null || true
-        build_check_record_failure 'could not release memory before the folder wait'
-        return 2
-    fi
-    rm -f -- "$VERIFY_SLOT_CAPACITY_FILE.memory-released"
-    step_state waiting_hold
-    "$PY" "$STEP_COPIES_SCRIPT" wait-slot --repo "$VERIFY_SLOT_SOURCE" --step "$CMD" \
-        --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE" --deadline "$deadline" --pid "$$" &
-    HOLD_WAITER_PID=$!
-    wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID=""
-    if (( status != 0 )); then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-            --pid "$PLACEMENT_OWNER_PID" --reason "the folder wait ended" >/dev/null || return $?
-        return "$status"
-    fi
-    # Closing the attempt allows the same episode to ask for memory again.
-    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" finish-step --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-        --status 75 --reason "repository slot capacity" >/dev/null || return $?
-    unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
-    PLACEMENT_OUTCOME=retry
 }
 
 route_test() {
@@ -4006,7 +4020,6 @@ sys.exit(shell_status(subprocess.call(command)))
 # Preserve the shared invocation policy (including systemd scopes and its
 # fallback), changing only the command it launches while this token is held.
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
-eval "$(declare -f buildlog_release_memory | sed '1s/buildlog_release_memory/buildlog_release_step_only/')"
 eval "$(declare -f buildlog_write_step | sed '1s/buildlog_write_step/buildlog_write_worktree_step/')"
 
 buildlog_write_step() {
@@ -4022,17 +4035,6 @@ buildlog_write_step() {
         "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
-buildlog_release_memory() {
-    if [[ ! -s "${VERIFY_SLOT_CAPACITY_FILE:-/nonexistent}" ]]; then
-        buildlog_release_step_only "$@"
-        return
-    fi
-    # Keep the assignment current until the wait ends. This prevents a new grant.
-    if verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" release-step-memory \
-            --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" >/dev/null; then
-        : > "$VERIFY_SLOT_CAPACITY_FILE.memory-released"
-    fi
-}
 renew_token() {
     local status=0
     bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
@@ -4084,7 +4086,7 @@ stop_token_renewer() {
 buildlog_exec() {
     if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]] && buildlog_step_compiles "$@"; then
         set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
-            --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" -- "$@"
+            --step "$CMD" -- "$@"
     fi
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
         local TOKEN_RENEWER_PID="" step_status=0
@@ -4107,7 +4109,6 @@ buildlog_exec() {
 # run_once releases the reservation and sampler before this call.
 buildlog_retry_unstarted_step() {
     BUILDLOG_RETRY_STEP=0
-    if [[ -s "${VERIFY_SLOT_CAPACITY_FILE:-/nonexistent}" ]]; then return 75; fi
     [[ -s "$HOLD_WAIT_DIR/token-lost" ]] || return 0
     rm -f "$HOLD_WAIT_DIR/token-lost"
     # shellcheck disable=SC2034 # invoke.sh reads this callback result.
@@ -4415,14 +4416,22 @@ lint_copy_begin() {
     [[ "${LINT_COPY_MODE:-}" != in-place ]] || return 0
     local answer manifest
     load_metadata
+    LINT_COPY_REPO="$(git rev-parse --show-toplevel)" || exit 2
     answer="$(verify_helper --stdin "$FIX_RETURN_SCRIPT" copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --owner "$$" <<< "$GATE_METADATA")" || exit 2
+        --repo-root "$LINT_COPY_REPO" --owner "$$" <<< "$GATE_METADATA")" || exit 2
     if [[ "$answer" == in-place ]]; then
         LINT_COPY_MODE=in-place
         return 0
     fi
     LINT_COPY_MODE=copy
-    { read -r _; read -r LINT_COPY_DIR; read -r LINT_COPY_TREE; read -r manifest; read -r LINT_COPY_TARGET; } <<< "$answer"
+    {
+        read -r _
+        read -r LINT_COPY_DIR
+        read -r LINT_COPY_TREE
+        read -r manifest
+        read -r LINT_COPY_TARGET
+        read -r LINT_COPY_ALLOCATION
+    } <<< "$answer"
     LINT_COPY_ARGS=(--manifest-path "$manifest")
 }
 
@@ -4438,15 +4447,15 @@ lint_rewrite() {
     "$@" "${LINT_COPY_ARGS[@]}"
 }
 
-# Write the held changes of the copy into the worktree and delete the copy.
+# Write the held changes into the worktree and close the lint copy.
 # A fixed path that no reservation holds fails the pass.
 lint_copy_return() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    local folder="$LINT_COPY_DIR" status
-    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    local folder="$LINT_COPY_DIR" allocation_id="$LINT_COPY_ALLOCATION" status
+    LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_ALLOCATION=""
     LINT_COPY_ARGS=()
     verify_helper "$FIX_RETURN_SCRIPT" return-copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --folder "$folder" || {
+        --repo-root "$LINT_COPY_REPO" --folder "$folder" --allocation-id "$allocation_id" || {
         status=$?
         LINT_FIX_INCOMPLETE=1
         return "$status"
@@ -4455,9 +4464,10 @@ lint_copy_return() {
 
 lint_copy_drop() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    rm -rf -- "$LINT_COPY_DIR"
-    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    local folder="$LINT_COPY_DIR"
+    LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_ALLOCATION=""
     LINT_COPY_ARGS=()
+    verify_helper "$FIX_RETURN_SCRIPT" drop-copy --repo-root "$LINT_COPY_REPO" --folder "$folder" || true
 }
 
 # The clippy fix loop stops when its tree stops changing: the copy or the worktree.
@@ -4822,17 +4832,18 @@ case "$CMD" in
         DOC_COPY_LEASE_FD=""
         DOC_SOURCE_KEY=""
         if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
-            if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
-                DOC_TREE=$(doc_tree)
-            else
-                DOC_SOURCE=$(doc_tree source)
-                read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
-            fi
+            DOC_SOURCE=$(doc_tree source)
+            read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
         fi
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
         LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]] &&
+                ! prepared_copy_matches_index "$DOC_REPO_TOP" "$DOC_TREE" 2>/dev/null; then
+            printf '%s\n' 'verify.sh: the prepared copy changed during the build. No doc pass was recorded.' >&2
+            exit "$TREE_CHANGED_STATUS"
+        fi
         doc_record
         ;;
     example)

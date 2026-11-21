@@ -20,6 +20,13 @@ Applies to every session when coding and reviewing code. `/unit:direct` imports 
 - when the user says "launch", just launch the app directly — don't try to shut down first. The user has already shut it down.
 - when the user says "relaunch", shut down the app first, then launch it.
 
+## images on the other machine
+- An image on the other machine is readable. Never tell the user that you cannot read it.
+- On natedev, copy a Mac image to a fixed name: `scp 'mac:<path>' <scratch>/shot.png`. On the Mac, use `natedev:<path>` the same way.
+- Put single quotes around the remote path. Screenshot names have spaces.
+- Make a large image smaller before you read it: `magick <scratch>/shot.png -resize 50% <scratch>/shot-small.png`.
+- Read the copy with the Read tool.
+
 ## links in session output
 - Write each link as the full URL in plain text, for example http://100.103.14.30:8765/3be7ed/mock.html.
 - Never write a Markdown link or a wikilink. The user's terminal cannot open them.

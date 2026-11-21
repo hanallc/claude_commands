@@ -208,6 +208,7 @@ def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
 MAC_BUSY_STATUS = 78
 RUNS = ".local/state/mac-queue/runs"
 RECEIPTS = ".local/state/mac-queue/receipts"
+MAC_GATE_SCRIPT = Path("scripts/mac_test/mac_gate.py")
 
 
 class SavedRun(TypedDict):
@@ -256,7 +257,8 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
             if record.exists():
                 saved = cast(SavedRun, json.loads(record.read_text()))
                 try:
-                    status = run_callback(saved["lifecycle_script"], "cleanup", directory / "argv.json",
+                    script, phase = ended_run_callback(saved["lifecycle_script"])
+                    status = run_callback(str(script), phase, directory / "argv.json",
                                           saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
                 except OSError as error:
                     print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
@@ -268,6 +270,17 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
             shutil.rmtree(directory, ignore_errors=True)
         finally:
             os.close(descriptor)
+
+
+def ended_run_callback(saved_script: str) -> tuple[Path, str]:
+    """Select an installed callback for a known script name."""
+    installed = Path.home() / ".claude"
+    name = Path(saved_script).name
+    if name == MAC_GATE_SCRIPT.name:
+        return installed / MAC_GATE_SCRIPT, "cleanup-ended"
+    if name == "mac_run.sh":
+        return installed / "scripts/production/mac_run.sh", "cleanup"
+    return Path(saved_script), "cleanup"
 
 
 class Arguments(argparse.Namespace):
@@ -423,6 +436,7 @@ def caller_watch(caller: int) -> Generator[None]:
     pid = os.getpid()
     if os.getpgrp() != pid:
         raise ValueError("the Mac queue must own its process group")
+    queue_thread = threading.get_ident()
     reader, writer = os.pipe()
     closing = threading.Event()
     failed = threading.Event()
@@ -452,8 +466,8 @@ def caller_watch(caller: int) -> Generator[None]:
                     if status != CALLER_EXITED:
                         print(f"mac queue: caller watch ended unexpectedly ({status})", file=sys.stderr, flush=True)
                         failed.set()
-                    # Let the queue reap prepare and obtain the remote cleanup result.
-                    os.kill(pid, signal.SIGINT)
+                    # Wake the queue thread if it is blocked reading SSH output.
+                    signal.pthread_kill(queue_thread, signal.SIGINT)
 
                 supervisor = threading.Thread(target=monitor, daemon=True)
                 supervisor.start()
