@@ -31,7 +31,7 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, cast, final, get_args
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, assert_never, cast, final, get_args
 from urllib.parse import quote
 
 
@@ -251,11 +251,24 @@ class KnownMacJob:
     what: str
 
 
+class MirrorBusyCheck(Enum):
+    """The mirror check that reported a busy refusal."""
+
+    LEASE = "mirror lease"
+    PROCESS = "mirror process check"
+    UNREPORTED = ""
+
+    @property
+    def suffix(self) -> str:
+        return f" ({self.value})" if self.value else ""
+
+
 @dataclass(frozen=True)
 class RecordedMirrorSession:
     """The last session recorded in the mirror."""
 
     session: str
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
 
 @dataclass(frozen=True)
@@ -267,16 +280,10 @@ class LostRunLeftovers:
 class UnreadableMacHolder:
     """The Mac holder cannot be read."""
 
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
+
 
 MacHolder = KnownMacJob | RecordedMirrorSession | LostRunLeftovers | UnreadableMacHolder
-
-
-class MirrorBusyCheck(Enum):
-    """The mirror check that reported a busy refusal."""
-
-    UNREPORTED = ""
-    LEASE = "mirror lease"
-    PROCESS = "mirror process check"
 
 
 @dataclass(frozen=True)
@@ -285,7 +292,6 @@ class BusyMacDecline:
 
     holder: MacHolder
     seconds: float
-    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
     @property
     def reason(self) -> Literal["busy"]:
@@ -297,12 +303,38 @@ def claim_holder(stdout: str) -> MacHolder:
     return KnownMacJob(match.group(1)) if match is not None else UnreadableMacHolder()
 
 
+_MIRROR_SESSION_PREFIX = "last recorded mirror session "
+_LEFTOVERS_HOLDER_VALUE = "leftovers"
+_UNREADABLE_HOLDER_VALUE = "unreadable"
+
+
 def holder_value(holder: MacHolder) -> str:
-    if isinstance(holder, KnownMacJob):
-        return holder.what
-    if isinstance(holder, RecordedMirrorSession):
-        return f"last recorded mirror session {holder.session}"
-    return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
+    match holder:
+        case KnownMacJob(what=what):
+            return what
+        case RecordedMirrorSession(session=session, mirror_check=check):
+            return f"{_MIRROR_SESSION_PREFIX}{session}{check.suffix}"
+        case LostRunLeftovers():
+            return _LEFTOVERS_HOLDER_VALUE
+        case UnreadableMacHolder(mirror_check=check):
+            return _UNREADABLE_HOLDER_VALUE + check.suffix
+        case _:
+            assert_never(holder)
+
+
+def holder_from_value(value: str) -> MacHolder:
+    if value == _LEFTOVERS_HOLDER_VALUE:
+        return LostRunLeftovers()
+    for check in MirrorBusyCheck:
+        suffix = check.suffix
+        if suffix and not value.endswith(suffix):
+            continue
+        text = value.removesuffix(suffix)
+        if text == _UNREADABLE_HOLDER_VALUE:
+            return UnreadableMacHolder(check)
+        if text.startswith(_MIRROR_SESSION_PREFIX) and (session := text.removeprefix(_MIRROR_SESSION_PREFIX)):
+            return RecordedMirrorSession(session, check)
+    return KnownMacJob(value)
 
 
 @dataclass(frozen=True)
@@ -848,7 +880,6 @@ class MirrorBusyRefusal:
     """A receiver or runner could not acquire the mirror."""
 
     holder: RecordedMirrorSession | UnreadableMacHolder
-    mirror_check: MirrorBusyCheck
 
 
 @dataclass(frozen=True)
@@ -1367,9 +1398,7 @@ def write_result(
     if isinstance(destination, ResultFile):
         holder_line = ""
         if isinstance(result, BusyMacDecline):
-            check = result.mirror_check.value
-            suffix = f" ({check})" if check else ""
-            holder_line = f"holder={holder_value(result.holder)}{suffix}\n"
+            holder_line = f"holder={holder_value(result.holder)}\n"
         linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
         prefix = f"outcome={mac}\ntarget={target}" if linux else f"mac={mac}"
         details = ""
@@ -1405,8 +1434,9 @@ def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
     if match is None:
         return NoMirrorBusyRefusal()
     session = (match["session"] or "").strip()
-    holder = RecordedMirrorSession(session) if session and session != "unreadable" else UnreadableMacHolder()
-    return MirrorBusyRefusal(holder, MirrorBusyCheck(match["check"] or ""))
+    check = MirrorBusyCheck(match["check"] or "")
+    holder = RecordedMirrorSession(session, check) if session and session != "unreadable" else UnreadableMacHolder(check)
+    return MirrorBusyRefusal(holder)
 
 
 def write_backoff(until: float, target: str = "mac") -> None:
@@ -2748,7 +2778,7 @@ def claimed_run(
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
-            return BusyMacDecline(remote_status.holder, elapsed_seconds(started), remote_status.mirror_check)
+            return BusyMacDecline(remote_status.holder, elapsed_seconds(started))
         if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
@@ -3311,7 +3341,7 @@ def run_offload(
                 refusal = mirror_busy_refusal(result.detail)
                 if isinstance(refusal, MirrorBusyRefusal):
                     write_mirror_busy(config, repository.name, request.target)
-                    return BusyMacDecline(refusal.holder, result.seconds, refusal.mirror_check)
+                    return BusyMacDecline(refusal.holder, result.seconds)
             return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
