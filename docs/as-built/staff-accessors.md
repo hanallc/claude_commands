@@ -375,6 +375,14 @@ The shared pane launch builder uses `set_home`.
 |---|---|---|---|
 | `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/hierarchy.rs`) | the user, 2026-11-04 |
 
+The `flock` process holds `mac-copy.lock` while SSH sends the staff record.
+The shell opens the record after `flock` acquires the lock.
+If the copier exits first, `flock` keeps the lock until its command ends.
+At the standard remote time limit, `timeout` sends SIGKILL to SSH so `flock` releases the lock.
+
+After a timeout, a remote rename that paused on the Mac can still run and replace a newer copy.
+The Mac can apply that rename without a revision check.
+
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
 
 `Herdr.codex_client_session` reads the current thread for a bare Codex pane from its tab's staff row.
