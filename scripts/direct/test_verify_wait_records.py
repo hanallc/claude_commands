@@ -725,7 +725,7 @@ from scripts.build_queue.admission_test_support import FakeClock
 clock = FakeClock()
 clock.epoch = float(Path(os.environ["FIXTURE_CLOCK"]).read_text())
 
-def answer(request, _on_wait):
+def answer(request, _on_wait, *, report_refusal):
     clock.advance(3)
     return wire.PlacementWait(request.episode, request.since, 1, ())
 
@@ -799,7 +799,9 @@ run cargo check -p "$PKG"
             self.assertEqual(request.since, entered - 30)
             self.assertEqual(records.read_placement_waits(call_id), ())
 
-            def call_service(request: wire.Request, _on_wait: Callable[[wire.Wait], None]) -> wire.Reply:
+            def call_service(request: wire.Request, _on_wait: Callable[[wire.Wait], None],
+                             *, report_refusal: bool) -> wire.Reply:
+                _ = report_refusal
                 if fixture.clock.now() == entered + 5:
                     fixture.clock.advance(1)
                 reply, = fixture.connect(request).replies()

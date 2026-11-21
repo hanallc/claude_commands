@@ -5,7 +5,6 @@ import tempfile
 import unittest
 import io
 import json
-import tempfile
 from contextlib import redirect_stdout
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime

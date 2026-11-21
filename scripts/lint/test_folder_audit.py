@@ -578,8 +578,8 @@ class FolderAuditTests(unittest.TestCase):
         candidate = folder(self.temp / "candidate", 8)
         protected = folder(self.home / "nixos", 8)
 
-        def swap(*, lint_settings: conf.ConfigRead) -> None:
-            del lint_settings
+        def swap(*, lint_settings: conf.ConfigRead, scratch_settings: conf.ConfigRead) -> None:
+            del lint_settings, scratch_settings
             _ = candidate.rename(self.root / "former-candidate")
             candidate.symlink_to(protected, target_is_directory=True)
 
@@ -1117,9 +1117,10 @@ class FolderAuditTests(unittest.TestCase):
         _ = record.write_text(json.dumps({"path": str(path), "sources": []}))
         finish = scratch.finish_removal
 
-        def replace_source(source: Path, *, cargo_cleaned: bool) -> None:
+        def replace_source(source: Path, *, cargo_cleaned: bool,
+                           scratch_settings: conf.ConfigRead) -> None:
             _ = folder(source)
-            finish(source, cargo_cleaned=cargo_cleaned)
+            finish(source, cargo_cleaned=cargo_cleaned, scratch_settings=scratch_settings)
 
         with (unittest.mock.patch.object(scratch, "finish_removal", side_effect=replace_source),
               unittest.mock.patch.object(scratch, "remove_marked") as remove,

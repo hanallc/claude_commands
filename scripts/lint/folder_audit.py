@@ -423,7 +423,8 @@ def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue
             try:
                 pending = read_pending_prune(record)
                 if not os.path.lexists(pending.removed_path):
-                    scratch.remove_marked(pending.removed_path, scratch_settings=scratch_settings)
+                    # The remover checks Cargo output before it deletes the source.
+                    scratch.finish_removal(pending.removed_path, cargo_cleaned=True, scratch_settings=scratch_settings)
                     finish_pending_prune(record, pending, scratch_settings=scratch_settings)
             except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
                 print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)

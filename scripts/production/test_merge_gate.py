@@ -21,7 +21,7 @@ from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production.test_change_review import ProducerFixture
 
@@ -46,7 +46,9 @@ class MergeGateTests(MergeGateFixture):
         exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
         exclude = exclude if exclude.is_absolute() else self.unit / exclude
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
-        runner = recorded_showrunner("fixture-showrunner", doc)
+        runner = fixture_member("showrunner", name="fixture-showrunner", runtime_id=staff.caller_identity(),
+                                doc=staff.LiveDoc(remote.local_machine(), doc))
+        self.environment.update(build_fixture_sessions(runner.current_session))
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
         unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id

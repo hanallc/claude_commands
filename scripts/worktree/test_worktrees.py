@@ -98,9 +98,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
+        holds = self.root / "scratch-holds.json"
+        _ = holds.write_text("{}\n")
         self.environment = {
             **config_environment(self.root / "settings"),
             "HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
+            scratch.HOLDS_ENV: str(holds),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "WORKTREES_STATE_DIR": str(self.state),
             "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
@@ -404,11 +407,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
             directory.mkdir()
             _ = (directory / "contents").write_text(directory.name)
         no_peers: list[str] = []
-        scratch.atomic_record(mark, [
-            {"workspace_root": str(tree), "target_directory": str(tree / "target"),
-             "build_directory": str(directory), "other_checkouts": no_peers}
-            for directory in (override, outside)
-        ])
+        with patch.dict(os.environ, self.environment):
+            scratch.atomic_record(mark, [
+                {"workspace_root": str(tree), "target_directory": str(tree / "target"),
+                 "build_directory": str(directory), "other_checkouts": no_peers}
+                for directory in (override, outside)
+            ])
 
         self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
         self.assertFalse(default.exists())

@@ -189,9 +189,12 @@ class ScratchTests(unittest.TestCase):
     def external_cargo_output(self, checkout: Path, *, workspace: Path | None = None,
                               build: Path | None = None) -> cargo_output.CargoOutputRoots:
         workspace = checkout if workspace is None else workspace
+        build_root = self.base / "build"
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf",
+                                 f"roots.build={build_root}\n")
         target = self.base / "external-target"
         target.mkdir()
-        build = self.base / "external-build" if build is None else build
+        build = build_root / "external-build" if build is None else build
         build.mkdir(parents=True)
         _ = (build / "output").write_text("build result")
         roots = cargo_output.CargoOutputRoots(workspace, target, build)
@@ -224,7 +227,7 @@ class ScratchTests(unittest.TestCase):
         checkout = scratch.new(task, "checkout")
         workspace = checkout / "workspace"
         workspace.mkdir()
-        build = (self.base / "mirror").joinpath(*workspace.parts[1:])
+        build = (self.base / "build" / "mirror").joinpath(*workspace.parts[1:])
         _ = self.external_cargo_output(checkout, workspace=workspace, build=build)
         sibling = build.parent / "other-output"
         _ = sibling.write_text("keep this build")

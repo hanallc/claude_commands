@@ -908,7 +908,9 @@ class IdleTests(TmpSweepCase):
         return destination, hidden
 
     def test_cargo_cleanup_keeps_a_held_source_moved_out_of_its_output_root(self) -> None:
-        build = self.tmp.parent / "external-build"
+        build_root = self.tmp.parent / "build"
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf", f"roots.build={build_root}\n")
+        build = build_root / "external-build"
         source = write(build / "loose" / "note", "source data").parent
         _ = write(build / "output", "build data")
         checkout = self.tmp / "checkout"

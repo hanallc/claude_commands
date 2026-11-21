@@ -540,14 +540,7 @@ BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
 run_verify_wait_recorder() {
-    local descriptor entry log
-    # The recorder can outlive the build. Release its inherited leases first.
-    for entry in /proc/self/fd/[0-9]*; do
-        descriptor=${entry##*/}
-        if [[ "$descriptor" =~ ^[0-9]+$ ]] && (( descriptor > 2 )); then
-            exec {descriptor}>&-
-        fi
-    done
+    local log
     if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
         log="${UNIT_DETACHED_RECORD%.json}.log"
     else

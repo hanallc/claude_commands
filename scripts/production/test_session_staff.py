@@ -11,9 +11,9 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from scripts.lib import unit_runs
+from scripts.lib import process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.message import process_table
+from scripts.message import process_table, sessions
 from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, fixture_session, unit_membership
 from scripts.herdr import herdr, pane_launch
@@ -54,8 +54,9 @@ class StatusDiscoveryTests(StaffTestCase):
         )
         before = self.staff_state()
         for state, rows, row, expected, anomaly in cases:
-            with self.subTest(state=state), labels.anomalies() as lines:
-                self.assertEqual(labels.worker_directory(staff.StaffSnapshot(rows), row.id), expected)
+            with self.subTest(state=state):
+                with labels.anomalies() as lines:
+                    self.assertEqual(labels.worker_directory(staff.StaffSnapshot(rows), row.id), expected)
                 self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
         self.assertEqual(self.staff_state(), before)
 
@@ -401,6 +402,52 @@ class StatusDiscoveryTests(StaffTestCase):
         with redirect_stderr(errors):
             labels.report_anomaly("session record is unreadable", pid=294399)
         self.assertEqual(errors.getvalue(), "anomaly: session record is unreadable\n")
+
+    def test_exit_report_does_not_hide_a_later_holder_failure(self) -> None:
+        holder_pid, exited_pid = 3276803, 3276804
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()) as read,
+              labels.anomalies() as lines):
+            labels.report_anomaly(herdr.process_exit_reason(exited_pid), pid=holder_pid, exited_pid=exited_pid)
+            labels.report_anomaly("session record is unreadable", pid=holder_pid)
+        read.assert_called_once_with(exited_pid)
+        self.assertEqual(lines, [f"anomaly: pid {holder_pid}: session record is unreadable"])
+
+    def test_report_checks_only_the_pid_named_in_an_exit_reason(self) -> None:
+        from scripts.production import unit_lookup
+
+        foreground_pid, holder_pid = 3276803, 3276804
+        place = labels.Place("agents", "w16:p437")
+        info = {"foreground_processes": [{"pid": foreground_pid, "argv": ["claude"]}]}
+        holder = herdr.HerdrProcess(holder_pid, place, {}, "claude", "")
+        exit_reason = herdr.process_exit_reason(foreground_pid)
+        denied = f"pid {foreground_pid}: permission denied"
+        exit_failure = herdr.NativeRegistryChanging(exit_reason)
+        cases = (
+            (exit_failure, process_start.Gone(), True, (foreground_pid,), False),
+            (exit_failure, process_start.Started("test"), True, (foreground_pid,), True),
+            (exit_failure, process_start.Unreadable("permission denied"), True, (foreground_pid,), True),
+            (exit_failure, process_start.Gone(), False, (foreground_pid,), False),
+            (PermissionError(denied), process_start.Started("test"), True, (), True),
+        )
+        for failure, start, has_holder, probes, visible in cases:
+            with self.subTest(reason=str(failure), start=type(start).__name__, has_holder=has_holder):
+                holders = [holder] if has_holder else []
+                starts = {foreground_pid: start, holder_pid: process_start.Gone()}
+                with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+                      mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+                      mock.patch.object(herdr.Herdr, "result", return_value={"process_info": info}),
+                      mock.patch.object(herdr, "herdr_processes", return_value=holders),
+                      mock.patch.object(herdr, "native_process", side_effect=failure),
+                      mock.patch.object(process_start, "process_start", side_effect=starts.__getitem__) as read,
+                      labels.anomalies() as lines):
+                    observed = unit_lookup.observed_session_labels(registry=sessions.RegistryRead((), ()))
+                    _ = labels.group_labeled_sessions(
+                        observed, record=staff.StaffSnapshot(()), sources=labels.MemberSources(()))
+                    read.assert_not_called()
+                self.assertEqual(read.call_args_list, [mock.call(pid) for pid in probes])
+                prefix = f"pid {holder_pid}: " if has_holder else ""
+                line = f"anomaly: {prefix}{labels.place_text(place)}: cannot assign the pane to a unit: {failure}"
+                self.assertEqual(lines, [line] if visible else [])
 
     def test_two_orphan_processes_have_separate_lines(self) -> None:
         row = replace(unit_membership("show", "unit"), parent=staff.StaffRoot())
