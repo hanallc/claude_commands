@@ -2729,6 +2729,7 @@ class RemoteTests(HanaShotTest):
 
         self.assertNotEqual(process.returncode, 0, stderr)
         self.assertIn("KeyboardInterrupt", stderr)
+        self.assertEqual(self.timing_lines()[-1]["exit_code"], 130)
         self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
             "AlwaysOnTop", "AlwaysOnBottom",
         ])

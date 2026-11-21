@@ -3340,6 +3340,11 @@ def main(argv: list[str]) -> int:
         exit_code = 1
         if invocation is not None and not invocation.failures:
             invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
+    except KeyboardInterrupt:
+        exit_code = 130
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, "interrupted (Ctrl-C)"))
+        raise
     except Exception as exc:
         if invocation is not None:
             invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, f"{type(exc).__name__}: {exc}"))
