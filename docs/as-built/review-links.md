@@ -644,6 +644,8 @@ The linked parked card stays visible while its details are open, including after
 A successful action that closes the linked card removes its target from the address.
 Back restores the List search text, scroll position, and surviving open rows for that history entry.
 The List saves the search text that is in the box when the user clicks the link.
+When the browser leaves a marked List entry, the List saves the current open rows and scroll position after restoration.
+If the frame skips restoration, the List saves the place only when the user opens a row, closes a row, or scrolls.
 The List removes stale filters after it restores the open rows.
 The browser tab keeps at most eight return records for up to one hour.
 Repeated Back navigation can use the same record until it expires or the tab removes it.

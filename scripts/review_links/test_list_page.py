@@ -121,6 +121,9 @@ class ListPageTests(unittest.TestCase):
         with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
             reviews.append(missing)
             listing = list_page.render(self.root / "reviews")
+            remaining = [entry for entry in list_page.records() if entry.key != f"{MORTY.id}/{item.id}"]
+            with patch.object(list_page, "records", return_value=remaining):
+                refreshed_listing = list_page.render(self.root / "reviews")
             _ = reviews.pop()
             review = {show: review_page.render(self.root / "reviews", show=show)
                       for show in ("open", "Waiting", "Done", "all")}
@@ -133,6 +136,7 @@ class ListPageTests(unittest.TestCase):
         probe = r'''<script>
 const listUrl=LIST_URL,keys=KEYS,ownerId=OWNER_ID,otherId=OTHER_ID;
 const params=new URLSearchParams(location.search),proof=params.get('proof'),returnWords=params.get('pending') || '';
+const forwardPlace=params.has('forward-place');
 let finished=false,inspected=false;
 const frames=win=>new Promise(done=>win.requestAnimationFrame(()=>win.requestAnimationFrame(done)));
 const nav=name=>document.querySelector('[data-page="'+name+'"]');
@@ -198,7 +202,10 @@ async function inspect(frame){
   if(doc.querySelector('[data-list]')){
    ids(doc);
    const row=doc.querySelector('[data-number="111"]');
-   check(!row.hidden && !row.querySelector('[data-detail]').hidden,'List item 111 is open');
+   const returns=Number(sessionStorage.getItem('list-returns') || 0);
+   const removed=forwardPlace && returns===3;
+   if(removed) check(!row,'Back uses the List without item 111');
+   else check(row && !row.hidden && !row.querySelector('[data-detail]').hidden,'List item 111 is open');
    if(proof==='list'){await finish();return;}
    const win=doc.defaultView;
    if(stage===0 && !proof){
@@ -212,25 +219,60 @@ async function inspect(frame){
     const outer=new URL(location.href);outer.searchParams.set('at.list',stale.pathname+stale.hash);
     history.replaceState(history.state,'',outer);
     win.history.scrollRestoration='manual';
-    win.scrollTo({top:120,behavior:'instant'});
+    win.scrollTo({top:forwardPlace ? 270 : 120,behavior:'instant'});
     sessionStorage.setItem('list-top',String(win.scrollY));
     check(win.scrollY>0,'the List has a scroll position to restore');
    }
    if(stage===1 && !proof){
     await frames(win);
     const restored=new URLSearchParams(win.location.hash.slice(1));
-    check(!restored.has('producer') && restored.get('item')===row.dataset.key,'Back normalizes the stale List filter and keeps the source');
-    check(!doc.querySelector('[data-number="15"] [data-detail]').hidden,'Back restores the extra open List row');
-    check(Math.abs(win.scrollY-Number(sessionStorage.getItem('list-top')))<=1,
-      'Back restores the List scroll from '+sessionStorage.getItem('list-top')+' to '+win.scrollY);
+    const extra=doc.querySelector('[data-number="15"]'),replacement=doc.querySelector('[data-number="14"]');
+    if(forwardPlace && returns===2){
+     check(replacement.querySelector('[data-detail]').hidden,'Reload starts with the saved replacement row closed');
+     const refreshed=new Promise(resolve=>{
+      const observer=new win.MutationObserver(()=>{
+       if(!doc.querySelector('[data-number="111"]')){observer.disconnect();resolve();}
+      });
+      observer.observe(doc.querySelector('main'),{childList:true});
+     });
+     const response=await fetch('/remove-list-item',{method:'POST',body:''});
+     if(!response.ok) throw new Error('The fixture could not remove item 111.');
+     win.postMessage('console-shown',location.origin);
+     await refreshed;
+     await frames(win);
+     sessionStorage.setItem('list-returns','3');
+     history.forward();return;
+    }
+    const edited=forwardPlace && returns>0;
+    const savedTop=edited ? 420 : Number(sessionStorage.getItem('list-top'));
+    const top=removed ? Math.min(savedTop,doc.scrollingElement.scrollHeight-win.innerHeight) : savedTop;
+    const openItem=removed ? replacement : row;
+    check(!restored.has('producer') && restored.get('item')===openItem.dataset.key,
+      'Back clears the stale List filter and selects the first saved row that still exists');
+    check(extra.querySelector('[data-detail]').hidden===edited,'Back restores the extra row to its last state');
+    if(forwardPlace)
+     check(replacement.querySelector('[data-detail]').hidden!==edited,'Back restores the replacement row to its last state');
+    check(Math.abs(win.scrollY-top)<=1,'Back restores List scroll to '+top+', got '+win.scrollY);
     check(doc.querySelector('#list-search').value===returnWords,'Back restores words typed just before the link click');
-    const returns=Number(sessionStorage.getItem('list-returns') || 0)+1;
-    sessionStorage.setItem('list-returns',String(returns));
-    if(returns===1){
+    sessionStorage.setItem('list-returns',String(returns+1));
+    if(returns===0){
+     if(forwardPlace){
+      extra.querySelector('.list-toggle').click();
+      replacement.querySelector('.list-toggle').click();
+      await frames(win);
+      win.scrollTo({top:420,behavior:'instant'});
+      check(extra.querySelector('[data-detail]').hidden && !replacement.querySelector('[data-detail]').hidden,
+        'The two rows change before Forward');
+      check(win.scrollY===420,'The List scrolls to 420 before Forward');
+     }
      doc.body.dataset.firstReturn='';
      history.forward();return;
     }
-    check(!doc.body.hasAttribute('data-first-return'),'the second Back loads a new List document');
+    check(!doc.body.hasAttribute('data-first-return'),'Back loads a new List document');
+    if(forwardPlace){
+     if(returns===1){location.reload();return;}
+     await finish();return;
+    }
     await configureReview('open','Unlinked review');
    }
    const source=stage===keys.length+1 ? doc.querySelector('[data-number="112"]') : row;
@@ -248,7 +290,7 @@ async function inspect(frame){
    }
    if(link) link.click();else await finish();
   }else if(doc.querySelector('[data-review]')){
-   if(stage===1 && sessionStorage.getItem('list-returns')==='1'){history.back();return;}
+   if(stage===1 && ['1','3'].includes(sessionStorage.getItem('list-returns'))){history.back();return;}
    ids(doc);
    const visibleRows=()=>[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
    const visible=visibleRows();
@@ -371,11 +413,12 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
         shell = shell.replace('</body>', probe + '</body>')
         output = Path(os.environ.get("LISTLINKS_PROOF_DIR", str(self.root)))
         output.mkdir(parents=True, exist_ok=True)
-        for shot in ("clicks", "reduced", "review", "list"):
+        for shot in ("clicks", "reduced", "forward-place", "review", "list"):
             with self.subTest(shot=shot):
                 results: list[list[str]] = []
                 complete = threading.Event()
                 later_saved = threading.Event()
+                list_item_removed = threading.Event()
 
                 class Probe(BaseHTTPRequestHandler):
                     def do_GET(self) -> None:
@@ -385,7 +428,8 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
                             _ = complete.wait(30)
                         show = parse_qs(route.query).get("show", ["open"])[0]
                         review_pages = parked_review if later_saved.is_set() else review
-                        body = (listing if path == list_page.PAGE_PATH else review_pages[show] if path == review_page.PAGE_PATH
+                        list_body = refreshed_listing if list_item_removed.is_set() else listing
+                        body = (list_body if path == list_page.PAGE_PATH else review_pages[show] if path == review_page.PAGE_PATH
                                 else b'{}' if path.endswith('.json') else shell.encode())
                         self.send_response(200)
                         self.send_header('Cache-Control', 'no-store')
@@ -405,6 +449,8 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
                             self.end_headers()
                             _ = self.wfile.write(b'{"answer":"parked"}')
                             return
+                        if self.path == '/remove-list-item':
+                            list_item_removed.set()
                         if self.path == '/results':
                             results.append(cast(list[str], json.loads(body)))
                             complete.set()
@@ -425,12 +471,14 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
                             + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n'
                             + f'user_pref("ui.prefersReducedMotion", {int(shot == "reduced")});\n')
                         destination = list_url + ('&pending=i' if shot == 'reduced' else '')
+                        if shot == 'forward-place':
+                            destination += '&forward-place=1'
                         if shot == 'review':
                             destination = '/console/' + console.place_query('review', review_page.PAGE_PATH + '?show=all#'
                                 + urlencode([('key', key) for key in linked_keys] + [('item', reviews[1].key)]))
                         url = f'http://127.0.0.1:{server.server_port}' + destination
                         command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
-                        if shot in ('clicks', 'reduced'):
+                        if shot in ('clicks', 'reduced', 'forward-place'):
                             with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
                                 try:
                                     self.assertTrue(complete.wait(35), "The browser must report its click results")

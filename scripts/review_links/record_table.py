@@ -473,7 +473,9 @@ function bind(){
   const key=new URLSearchParams(link.hash.slice(1)).get('item');
   if(!key) return;
   event.preventDefault();
+  const wasOpen=opened.has(key);
   jump(key);
+  if(!wasOpen && opened.has(key)) options.rowToggled?.();
  });
  filterSelection('owner').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changeFilter();});
  filterSelection('show').bind(value=>{if(value===show) return;show=value;changeFilter();});
@@ -490,6 +492,7 @@ function bind(){
   const key=row.parentElement.dataset.key;
   linkedItem='';
   if(opened.has(key)) opened.delete(key);else {if(options.single) opened.clear();opened.add(key);}
+  options.rowToggled?.();
   apply(true,{animate:true});
  }));
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{

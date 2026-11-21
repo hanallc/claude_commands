@@ -545,7 +545,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
-let saving=0;
+let saving=0,listPlaceEdited=false;
 const drafts=new Map();
 function matchesWords(data,search){
  if(!search) return true;
@@ -569,7 +569,13 @@ function syncUnread(item,form,unread){
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
 }
-const tableView=createRecordTable({content:()=>content,
+function noteListPlaceEdit(){listPlaceEdited=true;}
+function ignoreListScrollUntilPaint(){
+ // A refresh can move the scroll position as it replaces the rows.
+ removeEventListener('scroll',noteListPlaceEdit);
+ requestAnimationFrame(()=>addEventListener('scroll',noteListPlaceEdit));
+}
+const tableView=createRecordTable({content:()=>content,rowToggled:noteListPlaceEdit,
  shows:['open','needs-me','unread','done','parked','closed','all'],
  filters:['state','producer'],
  missingItem:key=>{
@@ -694,6 +700,7 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
  const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
+ ignoreListScrollUntilPaint();
  content.replaceWith(fresh);content=fresh;bind();apply(false);
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
@@ -701,6 +708,7 @@ async function refresh(_supersede=false,current=()=>true){
 }
 const listReturnParam='list-return',listReturnsKey='console.list.review-returns';
 const maxListReturns=8,maxOpenRows=128,maxRowKeyLength=128,listReturnAge=60*60*1000;
+const listFrame=window.frameElement,returnDocument=listFrame?.ownerDocument || document;
 function reviewDestination(link){
  const destination=new URL(link.href),target=new URL(destination.searchParams.get('at.review'),location.href);
  const jump=new URLSearchParams(target.hash.slice(1)).get('jump');
@@ -738,14 +746,17 @@ function writeListReturns(records){
  if(records.length) sessionStorage.setItem(listReturnsKey,JSON.stringify(records));
  else sessionStorage.removeItem(listReturnsKey);
 }
+function writeListReturn(id,records){
+ const opened=[...tableView.opened].filter(key=>key.length<=maxRowKeyLength).slice(0,maxOpenRows);
+ const retained=records.filter(record=>record.id!==id);
+ writeListReturns([...retained,{id,saved:Date.now(),opened,top:scrollY}].slice(-maxListReturns));
+}
 function saveListReturn(){
  tableView.saveDeparturePlace();
  const outer=new URL(parent.location.href),prior=outer.searchParams.get(listReturnParam);
  const records=listReturns();
  const id=records.some(record=>record.id===prior) ? prior : Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-');
- const opened=[...tableView.opened].filter(key=>key.length<=maxRowKeyLength).slice(0,maxOpenRows);
- const retained=records.filter(record=>record.id!==id);
- writeListReturns([...retained,{id,saved:Date.now(),opened,top:scrollY}].slice(-maxListReturns));
+ writeListReturn(id,records);
  outer.searchParams.set(listReturnParam,id);
  if(parent!==window) outer.searchParams.set('at.list',location.pathname+location.search+location.hash);
  parent.history.replaceState(parent.history.state,'',outer);
@@ -760,8 +771,11 @@ function prepareReviewLink(event){
  }catch(_){}
 }
 for(const event of ['click','auxclick','contextmenu','focusin']) document.addEventListener(event,prepareReviewLink);
+function listReturnId(){
+ return new URL(returnDocument.URL).searchParams.get(listReturnParam);
+}
 function listReturnForEntry(){
- const outer=new URL(parent.location.href),id=outer.searchParams.get(listReturnParam);
+ const id=listReturnId();
  if(!id) return;
  try{
   const records=listReturns();
@@ -774,16 +788,30 @@ function restoreListRows(record){
  tableView.opened.clear();
  for(const key of record.opened) if(surviving.has(key)) tableView.opened.add(key);
 }
+let listReturnRestored=false;
 function restoreListScroll(top){
- requestAnimationFrame(()=>requestAnimationFrame(()=>scrollTo({top,behavior:'instant'})));
+ requestAnimationFrame(()=>requestAnimationFrame(()=>{
+  ignoreListScrollUntilPaint();
+  scrollTo({top,behavior:'instant'});
+  listReturnRestored=true;
+ }));
 }
 place();
 const listReturn=parent.performance.getEntriesByType('navigation')[0]?.type==='back_forward' ? listReturnForEntry() : undefined;
 if(listReturn) restoreListRows(listReturn);
 bind();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
 if(listReturn) restoreListScroll(listReturn.top);
+addEventListener('pagehide',()=>{
+ if(listFrame?.hidden || (!listReturnRestored && !listPlaceEdited)) return;
+ try{
+  const id=listReturnId();
+  if(!id) return;
+  const records=listReturns();
+  if(records.some(record=>record.id===id)) writeListReturn(id,records);
+ }catch(_){}
+});
 addEventListener('pageshow',event=>{
- if(!event.persisted) return;
+ if(!event.persisted){ignoreListScrollUntilPaint();return;}
  const record=listReturnForEntry();
  if(!record) return;
  place();restoreListRows(record);
