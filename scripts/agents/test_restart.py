@@ -657,13 +657,22 @@ class RecordedResumeTests(RestartTestCase):
                 self.assertEqual(arguments, expected)
 
     def test_claude_resume_keeps_model_plugins_and_one_current_name(self) -> None:
-        for recorded_name in ("recorded-name", ""):
-            with self.subTest(recorded_name=recorded_name):
+        home = Path(self.enterContext(tempfile.TemporaryDirectory())) / "claude account"
+        for recorded_name, turn_model, effort in (("recorded-name", "", ""), ("", "", ""),
+                                                 ("recorded-name", "claude-opus-5-5", "high")):
+            with self.subTest(recorded_name=recorded_name, turn_model=turn_model):
                 entry = self.entry("claude", "claude-model")
                 entry["name"] = recorded_name
+                entry["config_dir"] = str(home)
+                if turn_model:
+                    write_text_atomic(home / "projects/prior/current-id.jsonl",
+                        json.dumps({"type": "assistant", "message": {"model": turn_model}, "effort": effort}) + "\n")
                 arguments = self.resumed_arguments(entry)
                 expected = ["--resume", "current-id", "-n", "current-name", "--remote-control", "current-name"]
-                expected.extend(("--model", "claude-model", "--plugin-dir", "/plugins/first",
+                expected.extend(("--model", turn_model or "claude-model"))
+                if effort:
+                    expected.extend(("--effort", effort))
+                expected.extend(("--plugin-dir", "/plugins/first",
                                  "--plugin-dir", "/plugins/second plugin", "--settings", '{"disableAgentView": true}'))
                 self.assertEqual(arguments, expected)
                 names = [arguments[index + 1] for index, value in enumerate(arguments) if value in ("-n", "--name")]
