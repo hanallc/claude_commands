@@ -30,7 +30,8 @@ from scripts.production.issues import Issue, PROPOSAL_TAG, source_paths
 from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
 from scripts.production.proposal_issue import REVIEW_MARK_FIELD, review_log, review_mark
 from scripts.production.production_doc import production_field, Refusal
-from scripts.review_links import efficiency_reviews, new_item_dialog, review_events, review_later, review_submissions
+from scripts.for_you.action import ActionStore
+from scripts.review_links import efficiency_reviews, for_you, new_item_dialog, review_events, review_later, review_submissions
 from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
@@ -125,6 +126,7 @@ class ReviewType(StrEnum):
     EFFICIENCY = 'efficiency'
     BUG = 'bug'
     RESPONSE = 'response'
+    FOR_YOU = 'for-you'
 
 
 class ReviewState(StrEnum):
@@ -134,7 +136,7 @@ class ReviewState(StrEnum):
     DONE = 'Done'
 
 
-REVIEW_TYPES = tuple(ReviewType)
+REVIEW_TYPES = tuple(kind for kind in ReviewType if kind != ReviewType.FOR_YOU)
 QUESTION_TYPES = (ReviewType.QUESTION, ReviewType.RESPONSE)
 INVESTIGATION_TYPES = (ReviewType.INVESTIGATION, ReviewType.BUG)
 REVIEW_STATES = tuple(ReviewState)
@@ -272,8 +274,13 @@ class EfficiencySource:
     line: str
 
 
+@dataclass(frozen=True)
+class ForYouSource:
+    row: for_you.ForYouRow
+
+
 type ReviewSource = (ChangeSource | QuestionSource | UnownedQuestionSource | InvestigationSource
-                     | ProposalSource | ProposalLedgerSource | EfficiencySource)
+                     | ProposalSource | ProposalLedgerSource | EfficiencySource | ForYouSource)
 
 
 @dataclass(frozen=True)
@@ -312,6 +319,8 @@ def source_path(item: ReviewItem) -> Path:
     source = item.source
     if isinstance(source, (ProposalSource, QuestionSource, UnownedQuestionSource)):
         return source.record.path
+    if isinstance(source, ForYouSource):
+        return ActionStore().folder
     return source.path
 
 
@@ -386,6 +395,21 @@ def owner_for(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.St
 def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
     member = members.by_id(identity)
     return member.name if member is not None else str(identity)
+
+
+def for_you_item(row: for_you.ForYouRow, members: staff.StaffSnapshot) -> ReviewItem:
+    """Place one action in the shared Review table."""
+    requester = row.requester_reference or row.requested_by
+    member = members.by_member_reference(requester) if requester else None
+    owner = member.id if member is not None else staff.StaffId(row.requested_by or 'Not recorded')
+    state = {'open': ReviewState.OPEN, 'done': ReviewState.DONE,
+             'withdrawn': ReviewState.DONE, 'unknown': ReviewState.WAITING}[row.status]
+    filed = moment(row.created_at) if row.created_at else datetime.fromtimestamp(0, user_zone())
+    updated = moment(row.updated_at) if row.updated_at else filed
+    actions = ('done',) if row.status == 'open' and row.completion == 'manual' else ()
+    identity = row.key[:15] if row.kind == 'action' else row.key
+    return ReviewItem(row.key, identity, ReviewType.FOR_YOU, owner, owner, row.title, state,
+                      ReviewTimes(filed, updated), (), actions, ForYouSource(row))
 
 
 def change_state(row: dict[str, str], slots: delivery_state.DeliverySlots) -> ReviewState:
@@ -1145,6 +1169,16 @@ class ReviewRecordMissing(ReviewRecordChanged):
 def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> ReviewItem:
     """Reread the exact record. Use the snapshot owner for an Efficiency ledger."""
     source = item.source
+    if isinstance(source, ForYouSource):
+        if source.row.kind == 'action':
+            record = ActionStore().get(item.key)
+            requester = next((member.name for member in members.rows
+                              if record.requested_by in (member.id, member.current_session)), record.requested_by)
+            return for_you_item(for_you.action_row(record, requester), members)
+        for row in for_you.read(members=members).rows:
+            if row.key == item.key:
+                return for_you_item(row, members)
+        raise ReviewRecordMissing('This item is no longer on the list.')
     prerequisite = Path(item.queue_after) if isinstance(source, ProposalSource) and item.queue_after else None
     selection = ExactReviewRecord(source_path(item), item.key, item.owner, prerequisite)
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:

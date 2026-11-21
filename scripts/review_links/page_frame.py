@@ -160,6 +160,13 @@ def template(source: str, text: str, page: str) -> str:
             .replace("__PAGE_SETTING_CONTROLS__", setting_controls.ASSETS))
 
 
+CONSOLE_READY_SCRIPT = """(() => {
+ const ready = () => window.frameElement?.dispatchEvent(new Event('console-document-ready'));
+ document.addEventListener('DOMContentLoaded', ready, {once:true});
+ addEventListener('pageshow', event => { if (event.persisted) ready(); });
+})();"""
+
+
 REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
  const line=page.querySelector('[data-page-status]');
  if(!line || !line.dataset.readAt) throw new Error('The page has no data time.');
@@ -274,6 +281,11 @@ CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\
 def code_block_html(block: re.Match[str]) -> str:
     """Build a code block with the shared copy button."""
     text = block[1] if block[1] is not None else block[2]
+    return copy_code_block(text)
+
+
+def copy_code_block(text: str) -> str:
+    """Show plain text with the shared copy button."""
     return ('<div class="code-block"><pre><code>' + html.escape(text)
             + '</code></pre>' + COPY_BUTTON + '</div>')
 

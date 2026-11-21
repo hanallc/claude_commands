@@ -724,8 +724,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                              'delivery_pending':delivery})
                     return None
                 elif 'index' in fields:
-                    content = snapshot.index_response()
-                    self.review_response(content, 'application/json; charset=utf-8',snapshot.payload_gzip)
+                    response = snapshot.full_index if fields.get('for-you') == ['1'] else snapshot.legacy_index
+                    self.review_response(response.body, 'application/json; charset=utf-8', response.gzip_body)
                     return None
                 else:
                     content = snapshot.render(show=fields.get('show',['open'])[0])
