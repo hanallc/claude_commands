@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
 from io import BytesIO, StringIO
@@ -38,7 +39,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 
-from scripts.aws_target import aws_page
+from scripts.aws_target import aws_page, machines_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
@@ -51,11 +52,12 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, review_submissions
+from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.whoami import usage_store
 
 
 ROLE_COLOR_CONFIG = (
@@ -130,6 +132,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -385,6 +388,51 @@ class ReviewLinksServerTests(unittest.TestCase):
             with patch.object(review_submissions, 'submit', side_effect=OSError('The native store is unavailable.')):
                 self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
             self.assertEqual(cache.get().records, {})
+
+    def test_new_item_options_refuse_an_unpublished_host(self) -> None:
+        host = f"other.invalid:{self.port}"
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": ""})):
+            reply = self.new_item_http(headers={"Host": host, "Origin": f"http://{host}"})
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (403, {"error": "Open the New item dialog from Review."}))
+
+    def test_new_item_options_accept_the_bound_and_published_hosts_on_the_serving_port(self) -> None:
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": "console.invalid."})):
+            for host in (self.server.bound_address, "console.invalid"):
+                with self.subTest(host=host):
+                    authority = f"{host}:{self.port}"
+                    reply = self.new_item_http(headers={"Host": authority, "Origin": f"http://{authority}"})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(cast(dict[str, object], json.loads(reply.body))["token"], self.server.new_item_token)
+                    wrong_port = f"{host}:0"
+                    self.assertEqual(self.new_item_http(headers={"Host": wrong_port}).status, 403)
+                    self.assertEqual(self.new_item_http(headers={"Host": host}).status, 403)
+
+    def test_new_item_options_accept_bare_hosts_on_port_80(self) -> None:
+        with (patch.object(self.server, "server_port", 80),
+              patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": "console.invalid."})):
+            for host in (self.server.bound_address, "console.invalid"):
+                with self.subTest(host=host):
+                    reply = self.new_item_http(headers={"Host": host, "Origin": f"http://{host}"})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(cast(dict[str, object], json.loads(reply.body))["token"], self.server.new_item_token)
+
+    def test_new_item_options_require_a_host(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True)):
+            connection.putrequest("GET", review_page.NEW_ITEM_PATH, skip_host=True)
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())),
+                             (403, {"error": "Open the New item dialog from Review."}))
 
     def test_owner_options_resolve_the_recipient_and_review_reuses_its_dialog(self) -> None:
         case = self.review_fixture()
@@ -1112,6 +1160,19 @@ class ReviewLinksServerTests(unittest.TestCase):
                               f"http://127.0.0.1:{self.port}/console/review.html#owner=builds",
                               new_item_dialog.PageViewport(1280, 800, True), 1.5, (), (), "Owner builds", screenshot))
         return case.root / "page-states", cache, request
+
+    def test_only_the_published_aws_machines_path_matches_the_console_page(self) -> None:
+        output = self.root / "AWS reports"
+        output.mkdir()
+        leaf = machines_page.PAGE_NAME
+        _ = (output / leaf).write_text("<h1>AWS Machines</h1>", encoding="utf-8")
+        _ = write_config_fixture(conf.path("aws_page"), f"output_folder={output}\n")
+        self.assertEqual(serve.published_console_page(self.root, f"/AWS reports/{leaf}"), "aws_machines")
+        self.assertEqual(serve.capture_page_key(self.root, f"/AWS%20reports/{leaf}"), "aws_machines")
+        self.assertEqual(self.request(f"/AWS%20reports/{leaf}").body, b"<h1>AWS Machines</h1>")
+        for path in (f"/{leaf}", f"/elsewhere/{leaf}", "/AWS reports/other.html"):
+            with self.subTest(path=path):
+                self.assertEqual(serve.published_console_page(self.root, path), "")
 
     def test_bug_captures_the_encoded_aws_page_path(self) -> None:
         from scripts.review_links.review_link import snapshot_url
@@ -2993,13 +3054,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path).status, 404)
 
-    def post(self, path: str, body: str) -> tuple[int, bytes]:
+    def post(self, path: str, body: str, *, origin: str = "", headers: Mapping[str, str] | None = None) -> tuple[int, bytes]:
         review_post = path == review_page.PAGE_PATH
         if review_post:
             self.review_post_done.clear()
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+            sent = {"Content-Type": "application/x-www-form-urlencoded"}
+            if origin:
+                sent["Origin"] = origin
+            connection.request("POST", path, body, {**sent, **(headers or {})})
             response = connection.getresponse()
             content = response.read()
             if review_post:
@@ -3240,94 +3304,39 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     _ = serve.old_console_link(self.root, path)
 
-    def test_list_get_does_not_release_a_ready_delivery_park(self) -> None:
-        with patch.object(serve, "release_delivery_parks"):
-            case = self.review_fixture(changes=1)
-            change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
-            self.assertTrue(change.for_you(the_list.now()))
-            keeper = staff.StaffId(str(uuid4()))
-            morty = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
-            members = staff.StaffSnapshot((*staff.snapshot().rows, morty))
-            with patch.object(staff, "snapshot", return_value=members):
-                item = the_list.add(morty.id, "Leave the park to the owner", owner=change.owner, source="morty", changes={})
-                _ = the_list.link(morty.id, item.id, (change.key,), source="morty")
-                parked = the_list.park(morty.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
-                with patch.object(the_list, "_save", side_effect=OSError("The List store is read-only.")) as save:
-                    reply = self.request(list_page.PAGE_PATH)
-                self.assertEqual(reply.status, 200)
-                self.assertIn(b"Parked until delivered", reply.body)
-                save.assert_not_called()
-                self.assertEqual(the_list.load(morty.id, item.id), parked)
-
-    def test_delivery_park_scan_keeps_serving_and_retries_after_a_malformed_review_list(self) -> None:
+    def test_snapshot_update_keeps_a_delivery_park_with_a_ready_change(self) -> None:
         self.server.review_cache.close()
         case = self.review_fixture(changes=1)
-        change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
-        self.assertTrue(change.for_you(the_list.now()))
-        keeper = staff.StaffId(str(uuid4()))
-        morty = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
-        members = staff.StaffSnapshot((*staff.snapshot().rows, morty))
-        listing = case.fixture.review_list
-        original = listing.read_bytes()
-        entered, finish_check = threading.Event(), threading.Event()
-        read_current = review_items.read_current
+        keeper = fixture_member("producer", name="morty").id
+        cache = serve.ConsoleReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        before = cache.get()
+        change = next(item for item in before.records.values() if item.type == review_items.ReviewType.CHANGE)
+        item = the_list.add(keeper, "Finish the remaining work", owner=change.owner, source="morty",
+                            changes={"state": the_list.ItemState.WORKING})
+        _ = the_list.link(keeper, item.id, (change.key,), source="morty")
+        parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
 
-        def check(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot) -> review_items.ReviewItem:
-            entered.set()
-            if not finish_check.wait(TEST_HANG_GUARD_SECS):
-                raise TimeoutError("The test did not finish the release check.")
-            return read_current(root, item, members)
+        cache.invalidate()
+        cache.start()
+        cache.synchronize()
 
-        with (patch.object(staff, "snapshot", return_value=members),
-              patch.object(serve, "loaded_module_stamps", return_value={}),
-              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
-              patch.object(review_items, "read_current", side_effect=check),
-              patch.object(change_page, "send_question", return_value=question_outcome()),
-              redirect_stderr(StringIO()) as errors, ExitStack() as running):
-            item = the_list.add(keeper, "Release after the list is repaired", owner=change.owner, source="morty", changes={})
-            _ = the_list.link(keeper, item.id, (change.key,), source="morty")
-            status = change_page.DeliveryStatus(case.root)
-            question = "Which check passed?"
-            asked = the_list.ask_question(keeper, item.id, the_list.PageRequest("ask", "question", question), status)
-            change_page.deliver(asked, status)
-            parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
-            server = running.enter_context(
-                serve.ReviewLinksServer(("127.0.0.1", 0), case.root, initialize_review=True))
-            self.port = server.server_port
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-            thread.start()
-            _ = running.callback(thread.join, TEST_HANG_GUARD_SECS)
-            _ = running.callback(server.shutdown)
-            try:
-                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
-                reply = self.request(list_page.PAGE_PATH)
-                self.assertEqual(reply.status, 200)
-                self.assertIn(b"Parked until delivered", reply.body)
-                self.assertIn(b'data-waiting-for-answer="true"', reply.body)
-                self.assertIn(question.encode(), reply.body)
-                self.assertEqual(self.request(review_page.PAGE_PATH).status, 200)
-                _ = listing.write_text("# Malformed change review\n")
-            finally:
-                finish_check.set()
-            server.review_cache.synchronize()
-            self.assertIn("review-links List delivery park", errors.getvalue())
-            self.assertEqual(the_list.load(keeper, item.id), parked)
-            self.assertEqual(self.request(review_page.PAGE_PATH).status, 200)
-            _ = listing.write_bytes(original)
-            server.review_cache.invalidate()
-            server.review_cache.synchronize()
-            saved = the_list.load(keeper, item.id)
-            self.assertEqual(saved.log[-1].what,
-                             the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(change.key)))
-            self.assertEqual(len(saved.log), len(parked.log) + 1)
+        after = cache.get()
+        self.assertIsNot(after, before)
+        self.assertNotIn(change.key, after.unavailable_cards)
+        self.assertTrue(after.records[change.key].for_you(the_list.now()))
+        saved = the_list.load(keeper, item.id)
+        self.assertIs(saved.state, the_list.ItemState.WORKING)
+        self.assertIs(saved.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        self.assertEqual(saved, parked)
 
     def test_delivery_park_retries_after_list_ask_and_busy_review_locks(self) -> None:
         self.server.review_cache.close()
         case = self.review_fixture(changes=1)
         change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
         keeper = staff.StaffId(str(uuid4()))
-        item = the_list.add(keeper, "Release after Ask", owner=change.owner, source="morty", changes={})
+        item = the_list.add(keeper, "Keep the park after Ask", owner=change.owner, source="morty",
+                            changes={"state": the_list.ItemState.WORKING})
         _ = the_list.link(keeper, item.id, (change.key,), source="morty")
         parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         list_locked, finish_ask = threading.Event(), threading.Event()
@@ -3352,10 +3361,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertTrue(list_locked.wait(TEST_HANG_GUARD_SECS))
                 server = running.enter_context(
                     serve.ReviewLinksServer(("127.0.0.1", 0), case.root, initialize_review=True))
-                server.review_cache.synchronize()
+                snapshot = server.review_cache.get()
+                self.assertIn(change.key, snapshot.records)
                 self.assertEqual(the_list.load(keeper, item.id), parked)
                 with change_review.review_delivery_lock(case.root, wait=False) as lock:
                     self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+                self.assertFalse(asked.done(), "Ask must still be paused.")
             finally:
                 finish_ask.set()
             change_page.deliver(asked.result(timeout=TEST_HANG_GUARD_SECS), status)
@@ -3379,13 +3390,14 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             server.review_cache.invalidate()
             server.review_cache.synchronize()
-            released = the_list.load(keeper, item.id)
-            events = [entry.what for entry in released.log if isinstance(entry.what, the_list.UnparkedForDelivery)]
-            self.assertEqual(events, [the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(change.key))])
-            self.assertEqual(released.questions, pending.questions)
+            self.assertEqual(the_list.load(keeper, item.id), pending)
+            delivered = the_list.update(keeper, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(delivered.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
+            self.assertEqual(delivered.questions, pending.questions)
             server.review_cache.invalidate()
             server.review_cache.synchronize()
-            self.assertEqual(the_list.load(keeper, item.id), released)
+            self.assertEqual(the_list.load(keeper, item.id), delivered)
 
     def test_list_feedback_saves_before_delivery_and_recovers_at_server_start(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
@@ -4171,6 +4183,88 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
             clear.assert_called_once_with("producers", next_moves.FIRST_GROUP_POSITION)
 
+    def test_accounts_color_rejects_an_unpublished_host_before_tune(self) -> None:
+        configuration = self.root.parent / "config"
+        configuration.mkdir()
+        _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+        tune = Mock(return_value=subprocess.CompletedProcess((), 0, "", ""))
+        body = "key=role.worker&value=%23af875f"
+        host = f"other.invalid:{self.port}"
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration), "REVIEW_LINKS_HOST": ""}),
+              patch.object(accounts_page, "subprocess", Mock(wraps=subprocess, run=tune))):
+            status, _ = self.post(accounts_page.PAGE_PATH, body, headers={"Host": host, "Origin": f"http://{host}"})
+            self.assertEqual(status, 403)
+            tune.assert_not_called()
+            status, content = self.post(accounts_page.PAGE_PATH, body)
+            self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
+            tune.assert_called_once()
+
+    def test_console_tune_requires_the_origin_and_token(self) -> None:
+        key = "faster_box_max_cost_ratio"
+        setting = console_tune.TunableSetting("console_tune_test", "AWS Machines",
+            Decimal("1.00"), Decimal("3.00"), Decimal("0.05"))
+        origin = f"http://127.0.0.1:{self.port}"
+        form = {"page": "aws_machines", "key": key, "value": "1.50"}
+        with (patch.dict(console_tune.SETTINGS, {("aws_machines", key): setting}, clear=True),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console_tune, "run") as publish):
+            token_reply = self.request(console_tune.PAGE_PATH)
+            self.assertEqual(token_reply.status, 200)
+            token = cast(dict[str, str], json.loads(token_reply.body))["token"]
+            self.assertEqual(token, self.server.new_item_token)
+            for sent_origin, fields in (
+                ("", {**form, "token": token}),
+                ("http://wrong.invalid", {**form, "token": token}),
+                (origin, form),
+                (origin, {**form, "token": "wrong"}),
+            ):
+                with self.subTest(origin=sent_origin, includes_token="token" in fields):
+                    status, _ = self.post(console_tune.PAGE_PATH, urlencode(fields), origin=sent_origin)
+                    self.assertEqual(status, 403)
+            publish.assert_not_called()
+
+    def test_console_tune_reports_live_value_after_publish_failure_and_refusal(self) -> None:
+        key = "faster_box_max_cost_ratio"
+        document = "console_tune_test"
+        config = conf.path(document)
+        self.addCleanup(config.unlink, missing_ok=True)
+        _ = config.write_text(f"{key}=1.00\n", encoding="utf-8")
+        setting = console_tune.TunableSetting(document, "AWS Machines", Decimal("1.00"), Decimal("3.00"), Decimal("0.05"))
+        origin = f"http://127.0.0.1:{self.port}"
+        token = self.server.new_item_token
+
+        def fail_after_change(*_args: object, **_options: object) -> subprocess.CompletedProcess[str]:
+            _ = config.write_text(f"{key}=1.50\n", encoding="utf-8")
+            return subprocess.CompletedProcess(["tune"], 2, stderr="two lines\nThe setting stays live.\n")
+
+        with (patch.dict(console_tune.SETTINGS, {("aws_machines", key): setting}, clear=True),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console_tune, "run", side_effect=fail_after_change) as publish):
+            for page, field, value, reason, live in (
+                ("aws", key, "1.50", "This page cannot change that setting.", None),
+                ("aws_machines", "other", "1.50", "This page cannot change that setting.", None),
+                ("aws_machines", key, "3.05", "Enter a value from 1.00 to 3.00.", "1.00"),
+                ("aws_machines", key, "1.52", "Use steps of 0.05 from 1.00.", "1.00"),
+                ("aws_machines", key, "NaN", "Enter a decimal number.", "1.00"),
+            ):
+                with self.subTest(page=page, field=field, value=value):
+                    form = urlencode({"page": page, "key": field, "value": value, "token": token})
+                    status, body = self.post(console_tune.PAGE_PATH, form, origin=origin)
+                    self.assertEqual((status, json.loads(body)), (400, {"reason": reason, "live_value": live}))
+            publish.assert_not_called()
+            form = urlencode({"page": "aws_machines", "key": key, "value": "1.50", "token": token})
+            status, body = self.post(console_tune.PAGE_PATH, form, origin=origin)
+            self.assertEqual((status, json.loads(body)), (503, {"reason": "The setting stays live.", "live_value": "1.50"}))
+            publish.assert_called_once_with((*accounts_page.TUNE, document, key, "1.50",
+                "--why", "The user confirmed the change with Go on the AWS Machines page.",
+                "--user-words", f"{key} set to 1.50 with Go on the AWS Machines page"),
+                capture_output=True, text=True, check=False)
+            publish.side_effect = None
+            publish.return_value = subprocess.CompletedProcess(["tune"], 0)
+            status, body = self.post(console_tune.PAGE_PATH, form, origin=origin)
+            self.assertEqual((status, json.loads(body)), (200, {"state": "saved", "live_value": "1.50"}))
+
     def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
         with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("staff file absent")),
               redirect_stderr(StringIO()) as error):
@@ -4259,15 +4353,260 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if fail:
                     self.assertEqual(errors.getvalue(), "review-links accounts: no stored data\n")
 
+    def test_accounts_request_waits_for_a_new_render_when_cached_page_is_old(self) -> None:
+        cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"old page", .5, 100))):
+            self.assertEqual(cache.get(), b"old page")
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new page", .5, 200)) as render):
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(reply, b"new page")
+            render.assert_called_once_with()
+
+    def test_accounts_request_refreshes_in_background_within_current_configured_period(self) -> None:
+        cache = serve.AccountsPageCache()
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings, "page_refresh_seconds=37\n")
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"first page", .5, 100)
+            self.assertEqual(cache.get(), b"first page")
+            clock.return_value = 130
+            render.return_value = accounts_page.AccountsRender(b"second page", .5, 130)
+            self.assertEqual(cache.get(), b"first page")
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(cache.page, b"second page")
+            self.assertEqual(render.call_count, 2)
+            _ = write_config_fixture(settings, "page_refresh_seconds=15\n")
+            clock.return_value = 160
+            render.return_value = accounts_page.AccountsRender(b"third page", .5, 160)
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(reply, b"third page")
+            self.assertEqual(render.call_count, 3)
+
+    def test_old_accounts_requests_share_the_running_background_render(self) -> None:
+        entered, release, waiters_entered = threading.Event(), threading.Event(), threading.Event()
+        waiters: set[str] = set()
+
+        class WaiterCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("old-accounts-request"):
+                    waiters.add(name)
+                    if len(waiters) == 2:
+                        waiters_entered.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=WaiterCondition())
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(b"new page", .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        requests = [threading.Thread(target=request, name=f"old-accounts-request-{index}") for index in range(2)]
+        with (patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"old page", .5, 100)
+            self.assertEqual(cache.get(), b"old page")
+            render.reset_mock()
+            render.side_effect = render_page
+            try:
+                self.assertEqual(cache.get(), b"old page")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                clock.return_value = 101 + refresh
+                for reader in requests:
+                    reader.start()
+                self.assertTrue(waiters_entered.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                for reader in requests:
+                    if reader.ident is not None:
+                        reader.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"new page", b"new page"])
+            render.assert_called_once_with()
+
+    def test_old_accounts_request_keeps_last_good_page_when_the_new_render_fails(self) -> None:
+        cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("fixture render failure")),
+              redirect_stderr(StringIO())):
+            failed = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+        self.assertEqual(failed, good.replace(b'data-page-facts', b'data-page-facts data-read-error="The Accounts render failed."'))
+        self.assertEqual(cache.page, good)
+        self.assertEqual(tuple(cache.recent_times), (.25,))
+
+    def test_accounts_requests_share_a_new_render_after_the_store_changes_during_a_render(self) -> None:
+        entered, release, requests_entered = threading.Event(), threading.Event(), threading.Event()
+        readers: set[str] = set()
+
+        class ReaderCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("accounts-new-usage-"):
+                    readers.add(name)
+                    if len(readers) == 2:
+                        requests_entered.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=ReaderCondition())
+        store = usage_store.store_file()
+        _ = store.write_bytes(b"11%")
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            usage = store.read_bytes()
+            if usage == b"11%":
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(usage, .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        requests = [threading.Thread(target=request, name=f"accounts-new-usage-{index}") for index in range(2)]
+        with (patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"11%", .5, 100)
+            self.assertEqual(cache.get(), b"11%")
+            render.side_effect = render_page
+            try:
+                self.assertEqual(cache.get(), b"11%")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                updated = store.with_suffix(".new")
+                _ = updated.write_bytes(b"10%")
+                _ = updated.replace(store)
+                clock.return_value = 101 + refresh
+                for reader in requests:
+                    reader.start()
+                self.assertTrue(requests_entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertEqual(render.call_count, 2)
+            finally:
+                release.set()
+                for reader in requests:
+                    if reader.ident is not None:
+                        reader.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"10%", b"10%"])
+            self.assertEqual(render.call_count, 3)
+
+    def test_accounts_request_returns_after_one_new_render_during_repeated_store_updates(self) -> None:
+        entered, release, request_waiting = threading.Event(), threading.Event(), threading.Event()
+
+        class ReaderCondition(threading.Condition):
+            @override
+            def wait(self, timeout: float | None = None) -> bool:
+                request_waiting.set()
+                return super().wait(timeout)
+
+        cache = serve.AccountsPageCache(condition=ReaderCondition())
+        store = usage_store.store_file()
+        _ = store.write_bytes(b"1")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            usage = store.read_bytes()
+            if usage < b"4":
+                updated = store.with_suffix(".new")
+                _ = updated.write_bytes(str(int(usage) + 1).encode())
+                _ = updated.replace(store)
+            if usage == b"1":
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(usage, .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        with patch.object(accounts_page, "render_with_facts") as render:
+            render.return_value = accounts_page.AccountsRender(b"1", .5, 100)
+            self.assertEqual(cache.get(), b"1")
+            render.side_effect = render_page
+            reader = threading.Thread(target=request)
+            try:
+                self.assertEqual(cache.get(), b"1")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                reader.start()
+                self.assertTrue(request_waiting.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                if reader.ident is not None:
+                    reader.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"2"])
+            self.assertEqual(render.call_count, 3)
+            self.assertEqual(cache.get(), b"3")
+            self.assertEqual(store.read_bytes(), b"4")
+            self.assertEqual(render.call_count, 4)
+
+    def test_accounts_route_keeps_last_good_page_when_refresh_setting_is_unreadable(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings)
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(accounts_page, "render_with_facts", return_value=first) as render,
+              redirect_stderr(StringIO())):
+            good = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(good.status, 200)
+            settings.unlink()
+            failed = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(failed.status, 200)
+            self.assertIn(b'data-read-error="The Accounts refresh setting could not be read."', failed.body)
+            self.assertIn(b'data-read-at="100.000000"', failed.body)
+            self.assertIn(b'>board</p>', failed.body)
+
+            self.server.accounts_cache = serve.AccountsPageCache()
+            first_failure = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(first_failure.status, 503)
+            render.assert_called_once_with()
+
     def test_accounts_cached_http_response_carries_a_render_failure_then_recovers(self) -> None:
         cache = serve.AccountsPageCache()
         first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
-        with patch.object(accounts_page, "render_with_facts", return_value=first):
-            good = cache.replace()
-        with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
               redirect_stderr(StringIO())):
-            _ = cache.replace()
-        with patch.object(threading.Thread, "start"):
             failed = cache.get()
         self.assertIn(b'data-read-error="The Accounts render failed."', failed)
         self.assertIn(b'data-read-at="100.000000"', failed)
@@ -4278,8 +4617,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             response = self.request(accounts_page.PAGE_PATH)
         self.assertEqual(response.status, 200)
         self.assertEqual(response.body, failed)
-        with patch.object(accounts_page, "render_with_facts", return_value=first):
-            recovered = cache.replace()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            recovered = cache.get()
         self.assertNotIn(b'data-read-error', recovered)
 
     def test_accounts_first_request_waits_for_its_render(self) -> None:
@@ -4314,9 +4654,12 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_accounts_cache_keeps_only_the_last_ten_successful_render_times(self) -> None:
         cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
         for seconds in range(1, 13):
-            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds+100)):
-                _ = cache.replace()
+            with (patch.object(time, "monotonic", return_value=seconds * (refresh + 1)),
+                  patch.object(accounts_page, "render_with_facts",
+                               return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds + 100))):
+                _ = cache.get()
         self.assertEqual(tuple(cache.recent_times), tuple(range(3, 13)))
         self.assertIn(b'data-render-seconds="12.000000"', cache.page)
         self.assertIn(b'data-read-at="112.000000"', cache.page)

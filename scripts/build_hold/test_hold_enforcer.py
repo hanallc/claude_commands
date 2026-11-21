@@ -294,11 +294,12 @@ class HoldEnforcerTests(unittest.TestCase):
     def table(self) -> dict[int, build_hold.AuditProcess]:
         return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
 
-    def write_detached_run(self, path: Path, *, command_started: bool) -> None:
+    def write_detached_run(self, path: Path, *, command_started: bool, command: list[str] | None = None) -> None:
         record: detached_runs.RunRecord = {
             "run_id": path.stem, "status": "running", "session_dir": str(self.root),
             "worker": "gate-owner", "staff_id": "", "label": "fixture gate",
-            "command": ["bash", "verify.sh", "check"], "log": str(path.with_suffix(".log")),
+            "command": command if command is not None else ["bash", "verify.sh", "check"],
+            "log": str(path.with_suffix(".log")),
             "started_at": 100.0, "pid": 100, "director_dir": "", "done_message_file": "",
         }
         if command_started:
@@ -873,6 +874,46 @@ class HoldEnforcerTests(unittest.TestCase):
                 if label == "lone Codex":
                     self.assertEqual(self.rows()[-1]["session"], "t1")
 
+    def test_hold_stop_records_the_exit_for_a_scoped_detached_run(self) -> None:
+        runs = self.root / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir()
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        gate = ["bash", "verify.sh", "check"]
+        scoped_command = ["systemd-run", "--user", "--scope", "--", *gate]
+        _ = self.process(10, "bash", parent=100, argv=tuple(gate), session="gate-owner")
+        for exit_code in (143, 0):
+            with self.subTest(exit_code=exit_code):
+                record = runs / f"scoped-run-{exit_code}.json"
+                self.write_detached_run(record, command_started=True, command=scoped_command)
+                _ = self.process(100, "python3", start=10_000,
+                                 argv=("python3", "detached_runs.py", "supervise", str(record)))
+                table = self.table()
+
+                def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
+                    self.assertEqual(command, scoped_command)
+                    signals: list[tuple[int, int]] = []
+                    waiting = hold_enforcer.WaitingRun(table[10], OwningSession("gate-owner"))
+                    stop = hold_enforcer.stop_waiting_run(
+                        waiting, holder, table, self.proc,
+                        signal_group=lambda pid, signum: signals.append((pid, signum)),
+                        signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                    )
+                    self.assertIsInstance(stop, hold_enforcer.StoppedRun)
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    return exit_code
+
+                with (isolated_staff_file(self.root / "staff.json", {}),
+                      mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+                      mock.patch.object(detached_runs, "_run", side_effect=run),
+                      mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
+                    self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
+
+                saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+                self.assertEqual((saved["status"], saved.get("exit_code")), ("finished", exit_code))
+                self.assertEqual(saved.get("stop_reason"), "stopped for timed test; run again after the release")
+                result = detached_runs.result_text(saved, detached_runs.command_result(saved))
+                self.assertIn(f"Result: STOPPED (exit {exit_code})", result)
+
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
         table = self.table()
@@ -1157,7 +1198,7 @@ class HoldEnforcerTests(unittest.TestCase):
         (cargo / "cwd").symlink_to("/dev/shm/mac-idle-suite-123/tmp456")
         _ = self.process(30, "claude", start=100, session="claude-session")
         _ = self.process(31, "python3", parent=30, argv=("python3", "-m", "unittest", "scripts.agents.codex_test_support"))
-        _ = self.process(40, "python3", argv=("python3", "-m", "unittest", "scripts.production.test_merge_gate"),
+        _ = self.process(40, "python3", argv=("python3", "-m", "unittest", "scripts.production.test_gate"),
                          environment={"CLAUDE_CODE_SESSION_ID": "detached-session"})
         decisions = {item.process.identity.pid: item for item in self.decisions()}
         self.assertEqual(set(decisions), {20, 21, 31, 40})
@@ -1187,8 +1228,15 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertTrue(all(row["action"] == "stopped" for row in self.rows()))
 
     def test_merge_gate_entry_points_wait_but_mentions_do_not_protect_tests(self) -> None:
+        for name in ("cloud_gate.py", "gate_box.py"):
+            with self.subTest(name=name):
+                _ = self.process(30, "python3", argv=("python3", f"/tree/{name}"), session="other")
+                self.assertEqual(self.decisions(), ())
         for argv in (
             ("/tree/merge_gate.py", "--tests-only"),
+            ("/tree/gate.py", "--tests-only"),
+            ("python3", "-u", "/tree/gate.py", "--affected"),
+            ("python3", "-m", "scripts.production.gate", "--tests-only"),
             ("python3", "-u", "/tree/merge_gate.py", "--promote-only"),
             ("python3", "-m", "scripts.production.merge_gate", "--tests-only"),
         ):
@@ -1371,6 +1419,14 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(detailed, {(10, "cmdline"), (10, "environ"), (20, "cmdline"),
                                     (20, "environ"), (30, "environ")})
         self.assertEqual(table[30].environment, {})
+        for command, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(command=command):
+                _ = self.process(40, command, argv=(command, "--tests-only"))
+                detailed.clear()
+                with mock.patch.object(Path, "read_bytes", read):
+                    _ = self.table()
+                self.assertEqual((40, "cmdline") in detailed, expected)
+
 
     def test_other_uid_and_enforcer_ancestors_are_never_stopped(self) -> None:
         _ = self.process(10, "python3", argv=("python3", "-m", "unittest"))

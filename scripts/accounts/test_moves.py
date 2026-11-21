@@ -17,6 +17,7 @@ from typing import Literal, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, moves, pane_moves, role_map, worker_names
 from scripts.herdr import herdr, worker_panes
 from scripts.lib.atomic_file import write_text_atomic
@@ -720,6 +721,7 @@ class WorkerGroupPendingTests(StaffTestCase):
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
         create_claude_account("claude1", "claude@example.invalid")
+        write_claude_move_credentials(accounts.account_dir("claude1"))
         notes = note_file.notes_dir()
         _ = (notes / note_file.note_name("codex1")).write_text("---\nlogin: codex@example.invalid\n---\n")
         binary = self.root / "bin"

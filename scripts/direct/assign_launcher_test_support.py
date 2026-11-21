@@ -76,6 +76,7 @@ names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
 roots.gate=/dev/shm
+roots.build=~/build
 roots.scratch=~/scratch
 roots.copies=~/copies
 roots.workspace=~/worktrees
@@ -298,7 +299,7 @@ class AssignLauncherFixture(unittest.TestCase):
             environment = cast(dict[str, str], options.get("env", os.environ.copy()))
             if path == ROOT / "scripts/production/worker.py" and Path(command[0]).resolve() == ROOT / "scripts/lib/py":
                 result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:], environment, self.project)
-            elif path == ROOT / "scripts/direct/progress_history.py":
+            elif path in (ROOT / "scripts/direct/progress_history.py", ROOT / "scripts/direct/pass_record.py"):
                 result = invoke_recorder(command[2:], environment, self.project)
             else:
                 return original(command, **options)

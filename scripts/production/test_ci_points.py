@@ -31,6 +31,9 @@ from scripts.lib.fork_test_support import ForkChild, ForkChildren
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("ci_points.py")
 LIFECYCLE = SCRIPT.with_name("production_lifecycle.py")
+PUSH_REPO = "github.com/example/example"
+PUSH_URL = f"git@{PUSH_REPO.replace('/', ':', 1)}.git"
+PUSH_URL_443 = "ssh://git@ssh.github.com:443/example/example.git"
 STUB = '''#!__PYTHON__
 import fcntl
 import json
@@ -55,6 +58,33 @@ if name in ("send.py", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "no
     raise SystemExit(0)
 raise SystemExit(99)
 '''
+WORKFLOW_PARSER_STUB = r'''#!__PYTHON__
+import json
+import os
+from pathlib import Path
+import sys
+
+state = Path(os.environ["CI_POINTS_TEST_STATE"])
+source = sys.stdin.read()
+with (state / "workflow-sources.jsonl").open("a", encoding="utf-8") as output:
+    output.write(json.dumps(source) + "\n")
+try:
+    print(json.dumps(json.loads(source)))
+except json.JSONDecodeError:
+    sys.exit("Invalid workflow syntax")
+'''
+GIT_SSH_STUB = '''#!__PYTHON__
+import os
+import shlex
+import sys
+
+host, request = sys.argv[-2:]
+command, path = shlex.split(request)
+if (host not in ("git@github.com", "git@ssh.github.com") or path.lstrip("/") != "example/example.git"
+        or command not in ("git-receive-pack", "git-upload-pack")):
+    sys.exit("Unexpected Git SSH request")
+os.execvp(command, [command, os.environ["CI_POINTS_TEST_ORIGIN"]])
+'''
 GH_STUB = r'''#!/bin/bash
 set -euo pipefail
 state=${CI_POINTS_TEST_STATE:?}
@@ -73,6 +103,53 @@ if [[ ${1:-} == repo && ${2:-} == view ]]; then
     else
         printf 'example/example\n'
     fi
+    exit 0
+fi
+if [[ ${1:-} == api && " $* " == *'/actions/workflows?'* ]]; then
+    [[ " $* " == *' --hostname github.com '* && " $* " == *' repos/example/example/actions/workflows?'* ]]
+    if [[ "${CI_POINTS_TEST_REGISTRATION_ERROR:-}" == true ]]; then
+        printf 'Could not list workflow registrations\n' >&2
+        exit 9
+    fi
+    jq -r "${@: -1}" "$state/registered-workflows.json"
+    exit 0
+fi
+if [[ ${GH_REPO:-} == github.com/fork/other && " $* " != *' --repo github.com/example/example '* ]]; then
+    printf 'GitHub selected the fork\n' >&2
+    exit 9
+fi
+if [[ ${1:-} == workflow && ${2:-} == run ]]; then
+    [[ $# == 8 && $3 == --repo && $4 == github.com/example/example && $5 == --ref && $6 == production && $7 == -- ]]
+    sha=$(git ls-remote origin "refs/heads/$6" | cut -f1)
+    jq -cn --arg sha "$sha" --arg workflow "$8" --arg branch "$6" '
+        [{databaseId:124, headSha:$sha, workflow:$workflow, headBranch:$branch,
+          status:"queued", conclusion:"", createdAt:"2026-10-30T00:01:00Z"}]' > "$state/dispatched-runs.json"
+    if [[ -f "$state/delay-dispatch" ]]; then
+        mv "$state/delay-dispatch" "$state/hide-dispatch-once"
+    fi
+    exit 0
+fi
+if [[ ${1:-} == run && ${2:-} == list && " $* " == *' --event workflow_dispatch '* ]]; then
+    [[ " $* " == *' --limit 100 --json databaseId,status,conclusion,createdAt,headSha '* ]]
+    branch= sha= workflow=
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch) branch=$2; shift ;;
+            --commit) sha=$2; shift ;;
+            --workflow) workflow=$2; shift ;;
+        esac
+        shift
+    done
+    listings=("$state/dispatch-runs.json")
+    if [[ -f "$state/hide-dispatch-once" ]]; then
+        rm "$state/hide-dispatch-once"
+    else
+        listings+=("$state/dispatched-runs.json")
+    fi
+    jq -cs --arg branch "$branch" --arg sha "$sha" --arg workflow "$workflow" '
+        add | map(select(($branch == "" or .headBranch == $branch) and
+                        ($sha == "" or (.querySha // .headSha) == $sha) and
+                        ($workflow == "" or .workflow == $workflow)))' "${listings[@]}"
     exit 0
 fi
 if [[ ${1:-} == run && ${2:-} == list && " $* " == *' databaseId,createdAt '* ]]; then
@@ -105,11 +182,16 @@ if [ "$1" = --publish-only ]; then
     exit 0
 fi
 printf '=== CI HANDOFF TO AGENT ===\\n'
-printf 'repo: example/example\\n'
+printf 'repo: %s\\n' "$CI_PUSH_REPO"
 printf 'sha: %s\\n' "$2"
 printf 'run_id: 123\\n'
 exit 0
 '''
+
+
+def workflow_source(events: object, job_name: str = "Test Suite") -> str:
+    job = {"name": job_name, "runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}
+    return json.dumps({"on": events, "jobs": {"checks": job}}) + "\n"
 
 
 class ValidationObservation(TypedDict):
@@ -190,6 +272,12 @@ class CiPointsTests(unittest.TestCase):
         for name in ("review_regime.py", "gh", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
             self.stub(self.bin / name)
+        parser = self.bin / "uv"
+        self.write(parser, WORKFLOW_PARSER_STUB.replace("__PYTHON__", sys.executable))
+        parser.chmod(0o755)
+        git_ssh = self.bin / "fixture-git-ssh"
+        self.write(git_ssh, GIT_SSH_STUB.replace("__PYTHON__", sys.executable))
+        git_ssh.chmod(0o755)
         for path in (self.bin / "validate_and_push.sh",
                      self.home / ".claude/scripts/validate_and_push/validate_and_push.sh"):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +289,9 @@ class CiPointsTests(unittest.TestCase):
             self.stub(self.home / relative)
         self.env = {**os.environ, **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
+                    "XDG_CACHE_HOME": str(self.home / ".cache"),
+                    "GIT_SSH_COMMAND": shlex.quote(str(git_ssh)), "GIT_SSH_VARIANT": "ssh",
+                    "CI_POINTS_TEST_ORIGIN": str(self.origin), "GH_REPO": PUSH_REPO,
                     "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -211,9 +302,11 @@ class CiPointsTests(unittest.TestCase):
         _ = self.git("config", "user.name", "CI Points Test")
         _ = self.git("config", "user.email", "ci-points@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
+        _ = self.git("remote", "set-url", "--push", "origin", PUSH_URL)
         self.write(self.checkout / "README.md", "base\n")
         self.write(self.checkout / "Cargo.toml", "[workspace]\n")
-        _ = self.git("add", "README.md", "Cargo.toml")
+        self.write(self.checkout / ".github/workflows/ci.yml", workflow_source("push"))
+        _ = self.git("add", "README.md", "Cargo.toml", ".github/workflows/ci.yml")
         _ = self.git("commit", "-m", "initial")
         _ = self.git("push", "-u", "origin", "main")
         _ = self.git("switch", "-c", "production")
@@ -230,6 +323,11 @@ class CiPointsTests(unittest.TestCase):
                                worktree=staff.PresentWorktree("natedev", self.checkout))
         _ = self.git("push", "-u", "origin", "production")
         self.ci_result(self.git("rev-parse", "HEAD"))
+        self.write(self.stub_state / "registered-workflows.json", json.dumps({
+            "workflows": [{"path": ".github/workflows/ci.yml", "state": "active"}],
+        }))
+        self.write(self.stub_state / "dispatch-runs.json", "[]\n")
+        self.write(self.stub_state / "dispatched-runs.json", "[]\n")
 
     def stub(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -432,8 +530,123 @@ PY
         self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
 
+    def test_ci_start_selects_a_trigger_from_the_committed_workflow(self) -> None:
+        directory = self.checkout / ".github/workflows"
+        parser_log = self.stub_state / "workflow-sources.jsonl"
+        self.fixed_commit_validation()
+        cases: tuple[tuple[str, dict[str, object], str, str | dict[str, str]], ...] = (
+            ("push", {"ci.yml": {"push": {"branches": ["*", "!prod*", "production"]},
+                                 "workflow_dispatch": {}}}, "push", "active"),
+            ("dispatch", {"ci.yml": {"push": {"branches-ignore": ["prod**"]},
+                                     "workflow_dispatch": {}}}, "ci.yml", "active"),
+            ("refuse", {"ci.yml": {"push": {"branches": ["main", "init/**"]}}}, "no trigger", "active"),
+            ("paths", {"ci.yml": {"push": {"branches": ["production"], "paths": ["src/**"]},
+                                  "workflow_dispatch": {}}}, "ci.yml", "active"),
+            ("paths-ignore", {"ci.yml": {"push": {"branches": ["production"], "paths-ignore": ["docs/**"]},
+                                         "workflow_dispatch": {}}}, "ci.yml", "active"),
+            ("unregistered", {"ci.yml": "workflow_dispatch"}, "no registration", "missing"),
+            ("disabled", {"ci.yml": "workflow_dispatch"}, "no registration", "disabled_manually"),
+            ("unregistered push", {"branch-only.yml": "push"}, "push:branch-only.yml", "missing"),
+            ("push before dispatch", {"branch-only.yml": "push", "build.yml": "workflow_dispatch"},
+             "push:branch-only.yml", {"build.yml": "active"}),
+            ("ambiguous push before dispatch", {"branch-only.yml": "push", "build.yml": "workflow_dispatch",
+                                                 "ci.yml": "push"},
+             "ambiguous push", {"build.yml": "active", "ci.yml": "active"}),
+            ("disabled push", {"ci.yml": "push"}, "inactive push", "disabled_manually"),
+            ("registration query error", {"ci.yml": "push"}, "query error", "active"),
+            ("secondary", {"ci.yml": "pull_request", "build.yml": "workflow_dispatch"}, "build.yml", "active"),
+            ("malformed", {"aux.yml": None, "build.yml": "workflow_dispatch"}, "build.yml", "active"),
+            ("lint push", {"ci.yml": "workflow_dispatch", "lint.yml": "push"}, "ci.yml", "active"),
+            ("fork override", {"ci.yml": "workflow_dispatch"}, "ci.yml", "active"),
+            ("disabled first", {"a.yml": "push", "z.yml": "push"}, "push:z.yml",
+             {"a.yml": "disabled_manually", "z.yml": "active"}),
+            ("ssh over 443", {"ci.yml": "workflow_dispatch"}, "ci.yml", "active"),
+        )
+        registration_errors = {
+            "no registration": "no active CI workflow registration for .github/workflows/ci.yml",
+            "inactive push": "inactive push CI workflow registration for .github/workflows/ci.yml",
+            "query error": "stderr: Could not list workflow registrations",
+            "ambiguous push": (
+                "multiple push workflows can start CI for production. "
+                + "Candidates are .github/workflows/branch-only.yml, .github/workflows/build.yml, "
+                + ".github/workflows/ci.yml"
+            ),
+        }
+        for case, workflows, expected, registration in cases:
+            with self.subTest(trigger=case):
+                _ = self.git("rm", "-rf", ".github/workflows")
+                sources = {name: ("on: [\n" if events is None else
+                                  workflow_source(events, "Lint" if name == "lint.yml" else "Test Suite"))
+                           for name, events in workflows.items()}
+                for name, source in sources.items():
+                    self.write(directory / name, source)
+                _ = self.git("add", str(directory))
+                _ = self.git("commit", "--allow-empty", "-m", f"Set CI trigger for {case}")
+                tip = self.git("rev-parse", "HEAD")
+                for name in workflows:
+                    self.write(directory / name, workflow_source("pull_request"))
+                states = dict.fromkeys(workflows, registration) if isinstance(registration, str) else registration
+                registrations = [{"path": f".github/workflows/{name}", "state": state}
+                                 for name, state in states.items() if state != "missing"]
+                self.write(self.stub_state / "registered-workflows.json", json.dumps({"workflows": registrations}))
+                self.write(parser_log, "")
+                calls_before = len(self.calls("gh"))
+                attempts = self.stub_state / "validation-attempts.jsonl"
+                previous = attempts.read_text() if attempts.is_file() else ""
+                self.env["GH_REPO"] = "github.com/fork/other" if case == "fork override" else PUSH_REPO
+                self.env["CI_POINTS_TEST_REGISTRATION_ERROR"] = str(expected == "query error").lower()
+                if case == "ssh over 443":
+                    _ = self.git("remote", "set-url", "--push", "origin", PUSH_URL_443)
+
+                result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+                calls = self.calls("gh")[calls_before:]
+                self.assertEqual([json.loads(line) for line in parser_log.read_text().splitlines()],
+                                 [sources[name] for name in sorted(sources)])
+                if case == "malformed":
+                    self.assertIn("cannot use .github/workflows/aux.yml", result.stderr)
+                    self.assertIn("Invalid workflow syntax", result.stderr)
+                if expected == "no trigger":
+                    self.assert_step(result, "ci start", False)
+                    self.assertEqual(result.stdout.splitlines(), [
+                        "ci start: failed — .github/workflows/ci.yml: no push trigger for production and no workflow_dispatch",
+                    ])
+                    self.assertEqual(attempts.read_text(), previous)
+                    self.assertEqual(calls, [])
+                    continue
+                if expected in registration_errors:
+                    self.assert_step(result, "ci start", False)
+                    self.assertEqual(result.stdout.splitlines(), [
+                        f"ci start: failed — {registration_errors[expected]}",
+                    ])
+                    self.assertEqual(attempts.read_text(), previous)
+                    self.assertEqual([call[0] for call in calls], ["api"])
+                    continue
+                self.assert_step(result, "ci start", True)
+                run = ci_points.read_run(self.state)
+                self.assertEqual(run.tip, tip)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+                if case in ("fork override", "ssh over 443"):
+                    self.assertEqual(run.repo, PUSH_REPO)
+                if case == "ssh over 443":
+                    self.assertEqual(self.validation_observation()["push_origin"], PUSH_URL_443)
+                if expected == "push" or expected.startswith("push:"):
+                    workflow = expected.partition(":")[2] or "ci.yml"
+                    self.assertFalse(any(call[:2] == ["workflow", "run"] for call in calls))
+                    self.assertTrue(any("--commit" in call and tip in call and workflow in call
+                                        and "push" in call for call in calls))
+                else:
+                    dispatch = ["workflow", "run", "--repo", PUSH_REPO, "--ref", "production", "--", expected]
+                    self.assertIn(dispatch, calls)
+                    discovery = [index for index, call in enumerate(calls) if "--commit" in call]
+                    self.assertEqual(len(discovery), 2)
+                    self.assertLess(discovery[0], calls.index(dispatch))
+                    self.assertLess(calls.index(dispatch), discovery[1])
+                    self.assertTrue(all("workflow_dispatch" in calls[index] for index in discovery))
+                    self.assertEqual(run.run_id, "124")
+
     def test_validation_keeps_the_standing_git_configuration_clean(self) -> None:
-        push_origin = self.origin.as_uri()
+        push_origin = f"ssh://git@{PUSH_REPO}.git"
         _ = self.git("remote", "set-url", "--push", "origin", push_origin)
         self.fixed_commit_validation()
         original = self.git("config", "--local", "--list").splitlines()
@@ -499,7 +712,7 @@ PY
         attempts = [cast(ValidationObservation, json.loads(line)) for line in
                     (self.stub_state / "validation-attempts.jsonl").read_text().splitlines()]
         self.assertEqual([(attempt["initial"], attempt["validated"]) for attempt in attempts],
-                         [(initial, fixed), (fixed, fixed)])
+                         [(initial, fixed)])
         self.assertEqual(self.git("rev-list", f"{initial}..production").splitlines(), [fixed])
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
@@ -513,6 +726,100 @@ PY
         self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
         self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
         self.assertTrue(Path(attempts[0]["cache"]).is_dir())
+
+        validation = self.stub_state / "validation-attempts.jsonl"
+        with self.subTest(trigger="push"):
+            self.write(self.stub_state / "fail-handoff", "fail\n")
+            _ = self.git("commit", "--allow-empty", "-m", "A new merge tip for push")
+            tip = self.git("rev-parse", "HEAD")
+            self.fixed_commit_validation()
+            before = len(self.calls("gh"))
+            attempts_before = validation.read_text().splitlines()
+
+            failed = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+            self.assert_step(failed, "ci start", False)
+            self.assertIn("validation did not provide a CI run", failed.stdout)
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+            saved_attempts = validation.read_text().splitlines()
+            self.assertEqual(len(saved_attempts), len(attempts_before) + 1)
+
+            retried = self.start_point()
+
+            self.assertEqual(validation.read_text().splitlines(), saved_attempts)
+            self.assertIn(f"validated {tip}; no push; following {tip}", retried.stdout)
+            self.assertEqual(ci_points.read_run(self.state).tip, tip)
+            follow = [call for call in self.calls("gh")[before:] if "--commit" in call]
+            self.assertEqual(len(follow), 2)
+            self.assertTrue(all(tip in call for call in follow))
+
+        workflow = ".github/workflows/ci.yml"
+        self.write(self.checkout / workflow, workflow_source("workflow_dispatch"))
+        _ = self.git("add", workflow)
+        self.write(self.bin / "sleep", "#!/bin/sh\nexit 0\n")
+        (self.bin / "sleep").chmod(0o755)
+        older = "2026-10-29T00:00:00Z"
+        newer = "2026-10-30T00:00:00Z"
+        success = (120, "completed", "success", older)
+        failure = (122, "completed", "failure", newer)
+        cases = (
+            ("newer unfinished", (success, (121, "queued", "", newer),
+                                  (122, "in_progress", "", newer), (123, "queued", "", older)), "122", 0),
+            ("reused success", ((121, "completed", "failure", older),
+                                (120, "completed", "success", newer)), "120", 0),
+            ("failed", (failure, success), "124", 1),
+            ("cancelled", (success, (121, "completed", "cancelled", older)), "124", 1),
+            ("deleted", (success,), "124", 1),
+            ("delayed visibility", (success, failure), "124", 1),
+            ("other branch", (success,), "124", 1),
+            ("wrong head", (success,), "124", 1),
+        )
+        for case, listed_runs, expected_id, expected_dispatches in cases:
+            with self.subTest(trigger="workflow_dispatch", case=case):
+                _ = self.git("commit", "--allow-empty", "-m", f"A new merge tip for {case}")
+                tip = self.git("rev-parse", "HEAD")
+                attempts_before = validation.read_text().splitlines()
+                records: list[dict[str, object]] = [
+                    {"databaseId": run_id, "status": status, "conclusion": conclusion,
+                     "createdAt": created_at, "headSha": tip, "workflow": "ci.yml",
+                     "headBranch": "release" if case == "other branch" else "production"}
+                    for run_id, status, conclusion, created_at in listed_runs
+                ]
+                if case == "wrong head":
+                    records[0].update(headSha="wrong-head", querySha=tip)
+                listings = self.stub_state / "dispatch-runs.json"
+                self.write(listings, json.dumps(records))
+                if case == "deleted":
+                    _ = self.start_point()
+                    self.assertEqual(ci_points.read_run(self.state).run_id, "120")
+                    self.write(listings, "[]\n")
+                if case == "delayed visibility":
+                    self.write(self.stub_state / "delay-dispatch", "delay the first listing\n")
+                before = len(self.calls("gh"))
+
+                _ = self.start_point()
+
+                self.assertEqual(ci_points.read_run(self.state).run_id, expected_id)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+                saved_attempts = validation.read_text().splitlines()
+                self.assertEqual(len(saved_attempts), len(attempts_before) + 1)
+                if case == "delayed visibility":
+                    listings_before_retry = [call for call in self.calls("gh")[before:] if "--commit" in call]
+                    self.assertEqual(len(listings_before_retry), 3)
+
+                retried = self.start_point()
+
+                self.assertEqual(validation.read_text().splitlines(), saved_attempts)
+                self.assertIn(f"validated {tip}; no push; following {tip}", retried.stdout)
+                run = ci_points.read_run(self.state)
+                self.assertEqual(run.tip, tip)
+                self.assertEqual(run.run_id, expected_id)
+                calls = self.calls("gh")[before:]
+                follow = [call for call in calls if "--commit" in call]
+                self.assertTrue(all(tip in call for call in follow))
+                dispatches = [call for call in calls if call[:2] == ["workflow", "run"]]
+                dispatch = ["workflow", "run", "--repo", PUSH_REPO, "--ref", "production", "--", "ci.yml"]
+                self.assertEqual(dispatches, [dispatch] * expected_dispatches)
 
     def test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -531,7 +838,7 @@ PY
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertFalse(self.calls("gh"))
+        self.assertEqual([call[0] for call in self.calls("gh")], ["api"])
         self.assertTrue(self.validation_observation()["slot_git"])
         self.assertTrue(Path(self.validation_observation()["directory"]).exists())
         self.assertEqual(build_folders.build_folder_state(Path(self.validation_observation()["directory"])), "free")
@@ -543,7 +850,7 @@ PY
         attempts = [cast(ValidationObservation, json.loads(line)) for line in
                     (self.stub_state / "validation-attempts.jsonl").read_text().splitlines()]
         self.assertEqual([(attempt["initial"], attempt["validated"]) for attempt in attempts],
-                         [(initial, fixed), (fixed, fixed)])
+                         [(initial, fixed)])
         self.assertEqual(self.git("rev-list", f"{initial}..production").splitlines(), [fixed])
         self.assertEqual(self.git("rev-parse", "production"), fixed)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
@@ -580,6 +887,9 @@ PY
         initial = self.git("rev-parse", "HEAD")
         self.fixed_commit_validation(fix_commit=True)
         with merge_lock(self.checkout, "example"):
+            _ = self.git("fetch", "origin", "main")
+            fetch_head = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"))
+            merge_fetch = fetch_head.read_bytes()
             process = subprocess.Popen(
                 [sys.executable, str(SCRIPT), "ci", "start", "--production", "example",
                  "--state-dir", str(self.state)],
@@ -601,6 +911,7 @@ PY
                 self.assertEqual(self.git("rev-parse", "production"), initial)
                 self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
                 self.assertFalse((self.stub_state / "pushes").exists())
+                self.assertEqual(fetch_head.read_bytes(), merge_fetch)
                 merged = self.merge(1)
             except BaseException:
                 if process.poll() is None:
@@ -795,18 +1106,17 @@ PY
         self.assertEqual(len(calls), 1)
         publication = (self.stub_state / "publish-calls").read_text().splitlines()
         self.assertEqual(publication, [f"true|--publish-only {tip}",
-                                       f"true|--follow-published {tip} contained"])
+                                       f"true|--follow-published {tip} contained ci.yml push"])
         plain = self.start_point()
         self.assert_step(plain, "ci start", True)
-        calls = (self.stub_state / "validate-calls").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 2)
+        self.assertEqual((self.stub_state / "validate-calls").read_text(encoding="utf-8").splitlines(), calls)
         publication += [f"false|--publish-only {tip}",
-                        f"false|--follow-published {tip} contained"]
+                        f"false|--follow-published {tip} contained ci.yml push"]
         self.assertEqual((self.stub_state / "publish-calls").read_text().splitlines(), publication)
         skipped = self.run_ci("ci", "start", "--state-dir", str(self.state), "--no-ci", "--cancel-prior")
         self.assertEqual(skipped.returncode, 0, skipped.stdout + skipped.stderr)
         self.assertEqual(skipped.stdout.strip(), "ci start: ok — skipped: no CI")
-        self.assertEqual(len((self.stub_state / "validate-calls").read_text().splitlines()), 2)
+        self.assertEqual((self.stub_state / "validate-calls").read_text().splitlines(), calls)
         self.assertEqual((self.stub_state / "publish-calls").read_text().splitlines(), publication)
 
     def test_validation_failure_names_the_failed_check_when_stderr_only_reports_memory_waits(self) -> None:

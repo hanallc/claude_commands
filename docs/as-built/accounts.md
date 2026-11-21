@@ -49,6 +49,31 @@ The agent-notes job runs these parts in separate processes:
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
 
+## Claude quota expiry pushes
+
+Natedev sends the Claude low quota and expiry pushes.
+The quota check uses saved weekly readings from `~/.local/state/agent-notes/readings.jsonl`.
+It divides the remaining percentage by the weighted use rate from `run_out.py`.
+It adds that duration to the time of the reading.
+The newest reading must be within the rate code's maximum gap.
+An in-use Claude account qualifies only if the forecast falls before its weekly reset and within the configured lead time.
+The lead time check uses a strict limit.
+Both pushes use the same scheduled move coverage rule.
+Role history removes consumed entries from coverage.
+The phone push title names the account and the estimated time in the user's zone, such as `claude3 runs out Sun 11-22 07:00 EST`.
+Its action is `Type /agents move <role> <account>`, and it has no body.
+
+`config/showrunners.conf` sets `claude_expiry.alert_hours=12` and `claude_expiry.repeat_hours=2`.
+Both settings require whole numbers from 1 to 168, including host overrides.
+The quota check skips expiry pushes during silence and saves no attempt.
+The first quota check after silence uses the current forecast.
+Before sending, the check saves the attempt and its weekly reset under `claude_expiry`.
+The repeat interval starts at the attempt time.
+A clear send failure removes the attempt so the next check can retry.
+An unconfirmed result keeps the attempt until the repeat interval ends.
+Changes to the forecast or scheduled coverage keep the attempt for that weekly window.
+The expiry template needs a current approval and uses the approved text without live review.
+
 ## Preventive login reminders
 
 The `Part.LOGINS` timer part calls `login_sittings.run` in its own child process.
@@ -207,6 +232,12 @@ Account moves use the shared stop and resume API.
 Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 Each attempt has its own move ID and cause.
 A session proved live on the target writes nothing.
+A failed live source read stops the move before it records a source or sends a signal.
+The stop checks that the live source PID and process start time still match.
+A Claude target needs a real account directory and a matching local sign-in.
+A refresh token needs a future `refreshTokenExpiresAt`.
+If only an access token is present, it needs a future `expiresAt`.
+The watcher checks the sign-in when it selects a target and again before it changes the group account.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 The batch stops the available members before it resumes them.
 Each session resumes its own conversation on the target account.
@@ -366,9 +397,12 @@ Normal recovery takes about two to three minutes plus reading, restoration, and 
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
 A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
-`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
-`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
-So a change of the role's assigned family never moves a worker to another family.
+The move reads the role settings for the worker's current family through `worker_panes.launch_policy(role, family)`.
+After the stop, `pane_moves._own_policy` reads the latest real Claude assistant turn for the model and effort.
+The launch record or role supplies missing settings. A turn without effort keeps the fallback effort.
+An explicit unit resume `--model` overrides the model.
+For Codex, `worker_panes.kept_settings` keeps the saved model, effort, and service tier.
+The destination and rollback use the same policy.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
@@ -447,7 +481,8 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
-The `board` is `accounts.status_board()`: the table the console Accounts page draws.
+The `board` comes from `accounts.status_board()`.
+The console uses its cells to build the Accounts and Roles tables.
 `accounts.models_board()` groups the same role counts by full model ID and effort.
 The reader finds the Claude transcript by session ID across project folders.
 Claude model and effort come from the latest real assistant message.
@@ -517,33 +552,37 @@ After the weekly reset, a low reading in the new window can show an alert again.
 If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
 The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
 If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
-Each named header on the Accounts page has a sort control.
-The first selection sets the order for that column.
+The Accounts table has one row per account.
+It shows the weekly quota, reading status, reset, and credits.
+The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
+The page starts its forecast from the displayed weekly reading.
+It excludes history before the current weekly window or the last refill.
+It shows the hourly rate for Claude and Codex when recent history gives a rate.
+If the rate is missing, both forecast cells show a dash with an explanation.
+If the quota lasts until the reset, the run-out cell shows a dash with that explanation.
+The page shows forecast times in the user's time zone.
 
-1. Account sorts by label and then by role order.
-2. Left sorts by the full quota value, least first, then by account and role order.
-3. Role sorts by role name and then by account.
-4. Next sorts by the target account name.
-5. Busy, idle, paused, exited, and total sort by count, largest first.
-6. Resets sorts by the reset time, soonest first.
-7. Credits sorts by the full balance, largest first. An unlimited balance comes first.
-8. Enabled puts accounts with credits enabled first.
-
-The role order is units, showrunners, workers, producers, spare, and no role.
-The default sort uses account order.
-Missing values stay last in both directions.
-Next cells without a target stay last in both directions.
-Blank enabled cells also stay last in both directions.
-Clicking the selected header reverses its order.
-Enter performs the same action on a focused header.
-Each sort arrow uses the gap beside its label without adding column width.
-`account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
-The browser moves the existing rows and restores the account details for each consecutive account run.
+The Roles table has one row per role.
+It lists each account under its role and places selected accounts first.
+Each account keeps its own next move and counts.
 The total row stays last.
-Sorting preserves the total values.
-Browser storage keeps each viewer's choice through refreshes and page visits.
+
+The Models table groups session counts by model ID and effort.
+
+Each named header has a sort control.
+The Accounts table starts in account order. The Roles table starts in role order.
+The quota, rate, run-out time, and reset sort from the smallest or earliest value.
+Credits sort from the largest balance. An unlimited balance comes first.
+Enabled accounts come first when you sort by the credits setting.
+The next column sorts by target account.
+Role counts sort by the sum for the role, largest first.
+Missing values stay last in both directions.
+Select the active header again to reverse the order.
+Press Enter or Space to sort by a focused header.
+The sort arrow uses the gap beside its label.
+Browser storage keeps the sort for each table through refreshes and page visits.
 A failed storage read or an unknown saved column uses the default sort.
-Failed storage writes keep the current choice for the open page.
+A failed storage write keeps the current choice for the open page.
 The shipped value of `role.producer` is `pink`.
 `role_colors` reads the current settings for the Accounts board and the console name renderer.
 `staff_role_color` maps a staff row through those keys and `account_color`.
@@ -570,11 +609,11 @@ A peer commit with the saved value and no order still needs a commit that record
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
-The Accounts page adds a `next` column after the role color swatch.
-Each next cell belongs to its role row and moves with that row when sorted.
+The Roles table shows each next move beside its account.
+Sorting moves the whole role row with its next moves.
 A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
 A selected Codex workers line shows its first target, or `auto`, without a button.
-Other lines show a minus icon; the total cell stays empty.
+Other assignments show a minus icon. The total cell stays empty.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
 One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
 Off the role-map host, first targets are unavailable.
@@ -621,9 +660,11 @@ Codex producers retain their workers move group.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
-The cache keeps each machine's counts separate and rejects copies older than ten minutes.
+The cache keeps each machine's counts separate and uses the `usage_stale_minutes` age limit from `config/accounts.conf`.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
-The board sums available machine counts and identifies an unavailable peer.
+The board sums available machine counts.
+It shows the time and age of usable Mac counts after a failed fetch or once the copy is one minute old.
+It reports the peer as unavailable when no usable copy exists.
 
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.
