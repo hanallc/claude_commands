@@ -23,8 +23,6 @@ from scripts.style import declarations
 from scripts.style import refill_facts
 from scripts.style import style_footprint
 from scripts.style import style_proposals
-from scripts.style import bulk_run
-from scripts.style import bulk_rename
 
 from scripts.style.ledger_test_support import (LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT, TWIN, TRAIT_METHOD)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -32,7 +30,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class StyleLedgerSitesTests(LedgerTestCase):
-    def test_judging_checkpoint_keeps_the_base_coordinate_and_bulk_rename(self) -> None:
+    def test_judging_checkpoint_keeps_the_base_coordinate(self) -> None:
         ledger, finding, base, checkpoint = self.site_with_comment_checkpoint()
         parsed_files: list[ref[declarations.DeclaredFile]] = []
         parse = declarations.read_declarations
@@ -87,8 +85,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
         assert isinstance(evidence, style_ledger.UnchangedSite)
         self.assertEqual((evidence.path, evidence.line), (PARENT_FILE, 2))
         self.assertEqual(evidence.anchor, style_ledger.FindingAnchor(base, PARENT_FILE, 1))
-        self.assertIsInstance(bulk_run.current_rename(ledger, finding, checkpoint, bulk_run.RenameSources(), self.repo),
-                              bulk_rename.RenameFinding)
 
     def test_base_anchored_finding_follows_another_later_line_move(self) -> None:
         ledger, finding, base, _ = self.site_with_comment_checkpoint()
@@ -101,8 +97,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
         _ = ledger.follow_declarations((finding.finding_id,), tip, lambda _: True)
         followed, = ledger.named_held((finding.finding_id,))
         self.assertEqual((followed.line, followed.follow), (3, style_ledger.FollowedDeclaration(PARENT_FILE, 1, tip)))
-        self.assertIsInstance(bulk_run.current_rename(ledger, followed, tip, bulk_run.RenameSources(), self.repo),
-                              bulk_rename.RenameFinding)
 
     def test_followed_duplicate_parameter_text_uses_its_owner_and_last_follow_path(self) -> None:
         source = "fn first(\n    old: usize,\n) -> usize { old }\nfn second(\n    old: usize,\n) -> usize { old }\n"
@@ -111,10 +105,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         _ = ledger.follow_declarations((finding.finding_id,), tip, lambda _: True)
         followed, = ledger.named_held((finding.finding_id,))
         self.assertEqual((followed.path, followed.line), (MOVED_FILE, 3))
-        result = bulk_run.current_finding(ledger, followed, tip, bulk_run.RenameSources(), self.repo)
-        self.assertIsInstance(result, style_ledger.HeldFinding)
-        assert isinstance(result, style_ledger.HeldFinding)
-        self.assertEqual((result.path, result.line), (MOVED_FILE, 3))
+        self.assertEqual((followed.path, followed.line), (MOVED_FILE, 3))
         evidence = ledger.finding_site(followed, tip)
         self.assertIsInstance(evidence, style_ledger.UnchangedSite)
         assert isinstance(evidence, style_ledger.UnchangedSite)
@@ -129,8 +120,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
                 evidence = ledger.finding_site(finding, tip)
                 self.assertIsInstance(evidence, style_ledger.NeedsJudgment)
                 assert isinstance(evidence, style_ledger.NeedsJudgment)
-                self.assertEqual(bulk_run.current_finding(ledger, finding, tip, bulk_run.RenameSources(), self.repo),
-                                 bulk_rename.Refusal(finding.finding_id, "changed since judged: " + evidence.reason))
 
     def legacy_anchor(self, source: str, checkpoint_source: str, text: str, line: int = 2
                       ) -> tuple[style_ledger.Ledger, style_ledger.HeldFinding, str, str]:
@@ -225,16 +214,13 @@ class StyleLedgerSitesTests(LedgerTestCase):
         filed, = ledger.named_held((finding.finding_id,))
         self.assertEqual(filed.state, style_ledger.Filed(self.root / "untracked.md"))
 
-    def test_untracked_changed_bytes_under_another_owner_never_prove_a_bulk_rename(self) -> None:
+    def test_untracked_changed_bytes_under_another_owner_lack_a_source_anchor(self) -> None:
         ledger = self.ledger()
         rule = self.rule("names")
         _ = self.commit_tip(ledger, {PARENT_FILE: "fn first() {\n    let old = 791;\n}\n"})
         finding = ledger.hold(rule, PARENT_FILE, 2, "let old = 791;", "rename", "old", "fresh",
                               self.blob(rule), "outside")
         tip = self.commit_tip(ledger, {PARENT_FILE: "fn second() {\n    let old = 900;\n}\n"})
-        self.assertEqual(bulk_run.current_rename(ledger, finding, tip, bulk_run.RenameSources(), self.repo),
-                         bulk_rename.Refusal(finding.finding_id,
-                                             "changed since judged: no judging ticket for source anchor"))
         self.assertEqual(ledger.finding_site(finding, tip),
                          style_ledger.FilingEligibleWithoutHistory(PARENT_FILE, 2))
         self.assertTrue(style_proposals.judged_at_current_file(ledger, finding, tip))

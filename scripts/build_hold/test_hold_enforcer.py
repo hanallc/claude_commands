@@ -1256,7 +1256,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertTrue(all(isinstance(item, hold_enforcer.WouldStopBuild) for item in self.decisions()))
 
     def test_session_owned_headless_rust_analyzer_stops_after_twelve_hour_parent(self) -> None:
-        _ = self.process(10, "python3", start=100, argv=("python3", "scripts/style/bulk_rename.py", "--all"), session="rename")
+        _ = self.process(10, "python3", start=100, argv=("python3", "scripts/fixture.py"), session="rename")
         _ = self.process(20, "rust-analyzer", parent=10)
         decision, = self.decisions()
         self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)

@@ -2677,7 +2677,7 @@ MIGRATIONS = {
     23: """
         ALTER TABLE processed_tips ADD COLUMN reason TEXT NOT NULL DEFAULT 'linted';
     """,
-    # Findings a bulk rename batch released to ordinary tickets, with the refusal reason (bulk_rename.py).
+    # Record each released finding and its refusal reason.
     24: """
         CREATE TABLE IF NOT EXISTS bulk_refusals (
             finding_id TEXT NOT NULL, ticket TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
