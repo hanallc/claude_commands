@@ -91,6 +91,20 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
+### Build filesystem space
+
+The natedev service reads `free_floor_gib` from the `[disk]` section of `build_admission.conf` each pass.
+The service measures available space at the configured `roots.slot_cargo` path once per pass.
+If space is below the floor or the reading fails, new local steps wait in order.
+Running steps continue.
+Eligible remote steps can start on a remote target.
+The Builds page and the queue head alert show the measured GiB and the floor or the read error.
+Older clients read the disk wait as a wait behind the build space floor.
+Waiters can refresh expired estimates during the hold.
+The next pass can start local steps when a successful reading reaches the floor.
+A missing floor leaves the space check disabled.
+If a reading fails, the service logs the error.
+
 ### Placement status
 
 `PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.
@@ -130,7 +144,7 @@ Local placements release their reader subscriptions when their reservations end.
 `AdmitRequest.place` defaults to `LocalPlace()`.
 This tree supplies the queue API and the cloud progress file.
 The aws route integration belongs to a separate tree.
-That route calls this API with `CloudPlace("aws")` for a `merge-gate` or `targeted-test` step.
+That route calls this API with `CloudPlace("aws")` for a `gate` or `test-affected` step.
 The route process owns the reservation.
 The service releases the cloud slot when that process ends.
 An explicit release also ends the reservation.
@@ -544,7 +558,7 @@ Queue views continue to use the service.
 ### Queue lifecycle and calibration
 
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
-The same record holds Cargo, `targeted-test`, and `merge-gate` steps.
+The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
@@ -618,7 +632,7 @@ The existing unreachable limit still applies until a valid reply arrives.
 
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
-The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+The merge gate reads `program_first_peak_gib.gate` at use; its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
@@ -630,7 +644,7 @@ The gate reports its first need as a fallback and explains any matching anonymou
 The queue model reads the step names once from `config/build_steps.conf`.
 Renderers use its `StepNames` value without file reads.
 Other sentences read the step names when they need the text.
-The Builds page uses the configured step name, including `targeted test` for `targeted-test`.
+The Builds page uses the configured step name, including `test affected` for `test-affected`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -1032,20 +1046,24 @@ The sender prints each send outcome header to the journal.
 `build_queue/head_stall.py` watches for a stalled queue head. `buildlog sample` runs it each minute on natedev.
 It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
 The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
-The head must wait at least that long. At least one step must hold memory.
+The head must wait at least that long. A step must hold memory or a disk space hold must block local work.
 The last admission or step start with a memory need above zero must also be at least that old.
-Merge gates and targeted tests start with a memory need of zero.
+Gates and targeted tests start with a memory need of zero.
 The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
 
-The watch sends one alert per stall to each of the Builds session and the Builds producer.
+The watch sends one alert per stall to the Builds session and the producer in `head_stall_alert_producer_id`.
+If the producer ID is invalid or unavailable, the watch sends only to the Builds session.
 The alert names the head and lists each holder's time since admission, memory promise, and memory use.
 It adds a note when an incomplete sccache scan can make the use values too low.
+For a disk space hold, the alert gives the reason for the hold.
 The stall key is the most recent admission or step start with a memory need above zero.
 A head change keeps the same key. A new admission or step start ends the stall.
 The sender uses the stall key to keep one queued copy per recipient.
 The watch accepts `SENT`, `SKIPPED`, `QUEUED`, and `KEPT` as delivery outcomes.
-After each accepted send, the watch records the recipient and stall key in `~/.local/state/buildlog/head_stall.json`.
-An old shared key counts for `builds` only.
+The watch holds a lock while it reads receipts, sends alerts, and saves each accepted send in `~/.local/state/buildlog/head_stall.json`.
+A legacy shared receipt applies to `builds` only.
+A legacy producer receipt applies only to the rollout staff ID. A receipt for that staff ID takes precedence.
+The watch sends no alerts if it cannot read the receipts.
 If a state write fails, the watch continues to the next recipient and reports one write error after the sends.
 If the stall continues, the watch retries each unaccepted send the next minute.
 
@@ -2160,7 +2178,7 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 ### Progress memory profiles
 
 Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
-Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
+Without history, they use `program_first_peak_gib.gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need.
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.

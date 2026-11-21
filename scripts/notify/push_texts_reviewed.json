@@ -490,6 +490,35 @@
       "time": "2026-11-06T06:23:34.421590-05:00"
     }
   },
+  "quota.claude_expiry": {
+    "forecast": {
+      "objections": [
+        {
+          "quote": "claude3 runs out",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "claude3 runs out Sun 11-22 07:00 EST",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Type /agents move <role> <account>",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "<role> <account>",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "claude3 runs out Sun 11-22 07:00 EST",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain session 2026-11-21 14:59 EST: yes i approve it (the text he dictated at 14:50 EST); reviewer: claude-opus-5-5",
+      "sha256": "964b14fafa06f30bad3cfe02fea2d0a5870a639315a97f6d4f33270220561ea6",
+      "time": "2026-11-21T15:02:51.944273-05:00"
+    }
+  },
   "quota.claude_next_move": {
     "uncovered_empty": {
       "reviewer": "opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",

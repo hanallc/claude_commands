@@ -79,7 +79,9 @@ The per-call message uses `context_usage.conf`.
 `agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
 Both callers read the value when they use it.
 
-## merge_gate.conf
+## gate.conf
+
+`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
 
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.
@@ -880,3 +882,10 @@ All boxes use signed links to the home bucket.
 The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.8xlarge candidates.
 `down` removes regional stacks and copied images.
 `remove-images` changes the home image and keeps regional stacks and copied images.
+
+The gate uses `gate` and `test-affected` as step names.
+`gate.py --affected` runs the affected modules.
+`build_steps.conf` defines `names.gate`, `names.test-affected`, and `prose.gate`.
+Its owner keys are `owned.gate`, `owned.test-affected`, and `owned.showrunner-gate`.
+`build_admission.conf` defines `program_first_peak_gib.gate` and `program_first_peak_gib.test-affected`.
+It also defines `peak_hold_seconds.gate` and `peak_hold_seconds.test-affected`.

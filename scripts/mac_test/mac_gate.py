@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -32,15 +32,10 @@ from scripts.copies import copies
 from scripts.lib import build_folders, conf, copy_record, process_group, scratch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.affected_modules import GraphError
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.test_times import gate_record
-
-if TYPE_CHECKING:
-    from scripts.production.gate_routes import (
-        MacGateCancellation, MacGateExcludeFileMissing, MacGateExclusions,
-    )
 
 MODULE_LIST = Path('config/mac_gate_modules.txt')
 MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
@@ -74,22 +69,20 @@ class UseCallerProcessLifetime:
 USE_CALLER_PROCESS_LIFETIME = UseCallerProcessLifetime()
 
 
-def read_modules(repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing:
+def read_modules(repo: Path) -> gate.MacGateExclusions | gate.MacGateExcludeFileMissing:
     """Return excluded test paths in the tested checkout."""
-    from scripts.production.gate_routes import MacGateExcludeFileMissing, MacGateExclusions
-
     try:
         entries = {line for row in (repo / MODULE_LIST).read_text().splitlines()
                    if (line := row.partition('#')[0].strip())}
     except FileNotFoundError:
-        return MacGateExcludeFileMissing()
+        return gate.MacGateExcludeFileMissing()
     if not entries:
-        return MacGateExclusions(())
+        return gate.MacGateExclusions(())
     tracked_paths = set(gate.checked_git(repo, 'ls-files', '-z', '--cached', '--others',
                                         '--exclude-standard', '--', 'scripts').split('\0'))
     excluded = entries & tracked_paths
-    return MacGateExclusions(tuple(name for _, path in discover_test_modules(repo)
-                                   if (name := path.relative_to(repo).as_posix()) in excluded))
+    return gate.MacGateExclusions(tuple(name for _, path in discover_test_modules(repo)
+                                        if (name := path.relative_to(repo).as_posix()) in excluded))
 
 
 def attempt_name(folder: Path) -> str:
@@ -118,6 +111,33 @@ def live_groups(groups: set[int]) -> set[int]:
     output = subprocess.check_output(['ps', '-axo', 'pgid=,stat='], text=True, timeout=5)
     rows = (line.split() for line in output.splitlines())
     return {int(group) for group, state in rows if int(group) in groups and not state.startswith('Z')}
+
+
+def stop_inline_checkout(repo: Path) -> None:
+    """Stop users of an inline checkout from before the guest journal."""
+    if repo.is_symlink():
+        raise GateRefused('The Mac gate checkout is a symbolic link')
+    if not repo.is_dir():
+        return
+    from scripts.lint import folder_audit
+
+    def users() -> set[int]:
+        uses = folder_audit.process_uses([repo])
+        if isinstance(uses, folder_audit.ProcessUsesUnavailable):
+            raise GateRefused('Cannot check for test processes on the Mac')
+        return {pid for path, pid, _ in uses.paths if pid > 1 and pid != os.getpid()
+                and Path(path).is_relative_to(repo)}
+
+    processes = {pid: process_start(pid) for pid in users()}
+    if not processes:
+        return
+    for pid in users() & processes.keys():
+        identity = processes[pid]
+        if isinstance(identity, Started) and process_start(pid) == identity:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    if users():
+        raise GateRefused('Test processes still use the Mac checkout')
 
 
 def stop_guest(folder: Path, deadline: float) -> None:
@@ -172,14 +192,27 @@ def read_checkout(folder: Path) -> Path:
     return path
 
 
-def stop_checkout(folder: Path) -> CheckoutCleanup:
+def saved_checkout_status(checkout: Path | None) -> CheckoutCleanup:
+    if checkout is not None:
+        try:
+            _ = checkout.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return CheckoutCleanup.RETAINED
+    return CheckoutCleanup.REMOVED
+
+
+def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutCleanup:
     root = (Path.home() / REMOTE_ROOT).resolve()
     if folder.resolve() != root / attempt_name(folder):
         raise GateRefused('The folder is outside the Mac gate state directory')
+    if saved_checkout is not None and not saved_checkout.is_absolute():
+        raise GateRefused('The saved Mac checkout path is not absolute')
     try:
         lock = (folder / 'cleanup.lock').open('a')
     except FileNotFoundError:
-        return CheckoutCleanup.REMOVED
+        return saved_checkout_status(saved_checkout)
     with lock:
         grace = conf.read('mac_gate').number('terminate_grace_seconds')
         deadline = time.monotonic() + admission_records.read_memory_config().program_stop_seconds + grace
@@ -192,7 +225,8 @@ def stop_checkout(folder: Path) -> CheckoutCleanup:
                     raise GateRefused('The Mac gate cleanup lock is held') from None
                 time.sleep(0.05)
         if not folder.exists():
-            return CheckoutCleanup.REMOVED
+            return saved_checkout_status(saved_checkout)
+        stop_inline_checkout(folder.resolve() / 'repo')
         checkout_file = folder / 'checkout.json'
         receipt = folder / 'task-ended.json'
         cleanup_paths: dict[str, object]
@@ -237,6 +271,7 @@ def stop_checkout(folder: Path) -> CheckoutCleanup:
                 outcome = CheckoutCleanup.RETAINED
         if outcome is CheckoutCleanup.REMOVED:
             shutil.rmtree(folder)
+            return saved_checkout_status(saved_checkout)
         return outcome
 
 
@@ -299,16 +334,24 @@ def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
     root = '"$HOME"/' + shlex.quote(remote)
-    runner = f'/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py" {root}/mac_gate.py'
+    python = '/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py"'
+    runner = f'{python} {root}/mac_gate.py'
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
-    if phase == 'cleanup':
+    if phase in ('cleanup', 'cleanup-ended'):
         try:
             checkout = checkout_file.read_text()
         except FileNotFoundError:
             checkout = ''
-        cleanup = checkout_cleanup_command(root, runner, checkout)
+        if phase == 'cleanup-ended':
+            from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
+
+            cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
+            if Path(checkout).is_absolute():
+                cleanup += ' ' + shlex.join(['--checkout', checkout])
+        else:
+            cleanup = checkout_cleanup_command(root, runner, checkout)
         result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
         outcome = result.stdout.strip()
         if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
@@ -421,15 +464,13 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
 
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                selected: gate.AllModules | gate.TreeSelection,
-               cancellation: MacGateCancellation | UseCallerProcessLifetime,
+               cancellation: gate.MacGateCancellation | UseCallerProcessLifetime,
                ) -> MacGateResult | str:
     """Wait for a Mac placement in queue order and run the assigned modules."""
-    from scripts.production.gate_routes import MacGateCancellation
-
     try:
         repo = repo.resolve()
         with ExitStack() as cleanup:
-            if isinstance(cancellation, MacGateCancellation):
+            if isinstance(cancellation, gate.MacGateCancellation):
                 caller = os.dup(cancellation.caller_fd)
             else:
                 caller, lifetime = os.pipe()
@@ -493,7 +534,7 @@ def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: boo
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
           selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
-          cancellation: MacGateCancellation | UseCallerProcessLifetime = USE_CALLER_PROCESS_LIFETIME) -> gate.GateRun | str:
+          cancellation: gate.MacGateCancellation | UseCallerProcessLifetime = USE_CALLER_PROCESS_LIFETIME) -> gate.GateRun | str:
     """Return the observed module results or a reason to run them on natedev."""
     outcome = run_remote(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                          selected=selected, cancellation=cancellation)
@@ -557,6 +598,7 @@ def write_modules(repo: Path, mac_result: Path, natedev_record: Path) -> None:
 class Arguments(argparse.Namespace):
     action: str = ''
     folder: Path = Path()
+    checkout: Path | None = None
     full: str = ''
     argv_file: Path = Path()
     repo: Path = Path()
@@ -578,7 +620,7 @@ def main() -> int:
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
     _ = writer.add_argument('natedev_record', type=Path)
-    for phase in ('prepare', 'cleanup'):
+    for phase in ('prepare', 'cleanup', 'cleanup-ended'):
         callback = commands.add_parser(phase)
         _ = callback.add_argument('argv_file', type=Path)
         _ = callback.add_argument('folder', type=Path)
@@ -592,10 +634,12 @@ def main() -> int:
         guest = commands.add_parser(phase)
         _ = guest.add_argument('folder', type=Path)
         _ = guest.add_argument('full', choices=('0', '1'))
-    _ = commands.add_parser('stop').add_argument('folder', type=Path)
+    stop = commands.add_parser('stop')
+    _ = stop.add_argument('folder', type=Path)
+    _ = stop.add_argument('--checkout', type=Path)
     args = parser.parse_args(namespace=Arguments())
     try:
-        if args.action in ('prepare', 'cleanup'):
+        if args.action in ('prepare', 'cleanup', 'cleanup-ended'):
             return lifecycle(args.action, args.argv_file, args.folder, args.full)
         if args.action == 'clone':
             path = clone_checkout(args.folder, args.owner, args.repository, args.session)
@@ -605,11 +649,11 @@ def main() -> int:
         elif args.action == 'guest':
             print(RESULT_PREFIX + json.dumps(run_guest(args.folder, full=args.full == '1')), flush=True)
         elif args.action == 'stop':
-            print(stop_checkout(args.folder))
+            print(stop_checkout(args.folder, args.checkout))
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.MERGE_GATE, full=True,
+            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
                                 module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):

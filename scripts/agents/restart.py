@@ -1383,11 +1383,15 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                             if staff.StaffId(member) not in blocked_workers])
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
+    restarted: set[Path] = set()
+
     def record_start(holder: staff.StaffRow, disposition: RestartDisposition) -> None:
         members = members_by_holder[holder.id]
         if disposition in (RestartDisposition.HELD, RestartDisposition.REMOVED):
             return
         started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
+        if disposition is RestartDisposition.STARTED and isinstance(holder.worktree, staff.PresentWorktree):
+            restarted.add(holder.worktree.path)
 
     failed_starts: list[FailedHolderStart] = []
     if holders:
@@ -1432,6 +1436,16 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             _ = client.sort_tabs()
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    if restarted:
+        from scripts.worktree import worktrees
+
+        try:
+            scope = worktrees.RestartedWorktrees(frozenset(path.resolve() for path in restarted))
+            for link in worktrees.old_worktree_links(remove_unused=True, scope=scope):
+                if link.removed:
+                    print(f"restart: removed old worktree link {link.old}")
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktrees.Refused) as error:
+            print(f"restart: kept old worktree links: {_error_reason(error)}", file=sys.stderr)
     resume_checks.report()
     return exit_code
 

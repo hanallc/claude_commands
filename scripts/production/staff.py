@@ -653,15 +653,18 @@ class StaffSnapshot:
 
     def by_worktree(self, machine: str, path: Path) -> StaffRow | None:
         """A producer's worktree is its launch folder and owns no path."""
-        matches = [row for row in self.rows if row.kind != "producer" and isinstance(row.worktree, PresentWorktree)
-                   and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
-        return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
+        resolved = path.expanduser().resolve()
+        matches = [(row, folder) for row in self.rows if row.kind != "producer"
+                   and isinstance(row.worktree, PresentWorktree) and row.worktree.machine == machine
+                   and resolved.is_relative_to(folder := row.worktree.path.resolve())]
+        return max(matches, key=lambda match: len(match[1].parts))[0] if matches else None
 
     def unit_by_worktree(self, machine: str, path: Path) -> StaffRow | None:
         """A path that a live unit holds belongs to that unit; the newest row wins within each state."""
+        resolved = path.expanduser().resolve()
         matches = [row for row in reversed(self.rows) if row.kind == "unit"
                    and isinstance(row.worktree, (PresentWorktree, RemovedWorktree))
-                   and row.worktree.machine == machine and row.worktree.path == path]
+                   and row.worktree.machine == machine and row.worktree.path.resolve() == resolved]
         return next((row for row in matches if isinstance(row.worktree, PresentWorktree)),
                     next(iter(matches), None))
 
@@ -1319,8 +1322,10 @@ def _found_backends(rows: Sequence[StaffRow],
     if running is None:
         running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
                    if any(identity not in codex_sessions for identity in wanted.values()) else frozenset())
-    for current, identity in wanted.items():
-        if identity not in codex_sessions and (current in running or bool(sessions.transcript_locations(current))):
+    claude_candidates = {current: identity for current, identity in wanted.items() if identity not in codex_sessions}
+    transcripts = sessions.transcript_session_ids(claude_candidates.keys() - running)
+    for current, identity in claude_candidates.items():
+        if current in running or current in transcripts:
             found[identity] = ClaudeBackend()
     return found
 
@@ -1849,6 +1854,56 @@ def _normalized_rename_path(path: Path) -> Path:
     return Path(os.path.normpath("/" + str(path).lstrip("/")))
 
 
+def _resolve_rename_paths(machine: str, paths: tuple[Path, ...]) -> dict[Path, RenamePathTrace]:
+    from scripts.agents import remote
+
+    alias = remote.machine_alias(machine)
+    if isinstance(alias, remote.MachineAlias) and alias.alias != remote.this_machine():
+        result = _remote(["resolve-rename-paths"], input_text=json.dumps(list(map(str, paths))), machine=alias.alias)
+        traces = _rename_path_traces(result)
+        if len(traces) != len(paths):
+            raise StaffUnreadable("invalid resolved producer rename path count")
+    elif machine == remote.local_machine() or isinstance(alias, remote.MachineAlias):
+        traces = [_trace_rename_path(path) for path in paths]
+    else:
+        raise StaffRefused(f"{machine}: unknown producer rename machine")
+    return dict(zip(paths, traces, strict=True))
+
+
+def require_no_producer_rename_paths(machine: str, paths: Sequence[Path]) -> None:
+    """Check at the staff authority before moving or modifying these paths."""
+    from scripts.agents import remote
+
+    if not is_owner():
+        reply = _remote(["producer-rename", "check-paths", "--", machine], input_text=json.dumps(list(map(str, paths))))
+        if reply is not None:
+            raise StaffUnreadable("invalid producer rename response")
+        return
+    plan = _read_producer_rename()
+    if plan is None:
+        return
+    alias = remote.machine_alias(machine)
+
+    def same_machine(other: str) -> bool:
+        return other == machine or isinstance(alias, remote.MachineAlias) and remote.machine_alias(other) == alias
+
+    reserved: set[Path] = set(plan.paths) if same_machine(worktree_machine(plan.before)) else set()
+    reserved.update(location.path for row in (plan.before, plan.after) for location in (row.worktree, row.doc)
+                    if isinstance(location, (PresentWorktree, RemovedWorktree, LiveDoc, WrappedDoc))
+                    and same_machine(location.machine))
+    if not reserved:
+        return
+    traces = _resolve_rename_paths(machine, tuple(dict.fromkeys((*sorted(reserved), *paths))))
+    roots = {root for path in reserved for root in (_normalized_rename_path(path), traces[path].destination)}
+    for path in paths:
+        trace = traces[path]
+        endpoints = (_normalized_rename_path(path), trace.destination)
+        traversed = (*trace.prefixes, *endpoints)
+        if any(any(candidate.is_relative_to(root) for candidate in traversed)
+               or any(root.is_relative_to(endpoint) for endpoint in endpoints) for root in roots):
+            raise StaffRefused(f"{path}: {plan.before.name} has a producer rename reservation")
+
+
 def _moved_producer_doc(doc: LiveDoc | WrappedDoc, source: Path, destination: Path,
                         trace: RenamePathTrace) -> LiveDoc | WrappedDoc:
     if trace.destination.is_relative_to(source):
@@ -1881,17 +1936,7 @@ def _rename_path_user(plan: ProducerRename, rows: Sequence[StaffRow]) -> StaffRo
     if not locations:
         return None
     paths = tuple(dict.fromkeys((*plan.paths, *(location.path for _, location in locations))))
-    if isinstance(alias, remote.MachineAlias) and alias.alias != remote.this_machine():
-        result = _remote(["resolve-rename-paths"], input_text=json.dumps(list(map(str, paths))), machine=alias.alias)
-        resolved = _rename_path_traces(result)
-        if len(resolved) != len(paths):
-            raise StaffUnreadable("invalid resolved producer rename path count")
-    elif machine == remote.local_machine() or isinstance(alias, remote.MachineAlias):
-        resolved = [_trace_rename_path(path) for path in paths]
-    else:
-        raise StaffRefused(f"{machine}: unknown producer rename machine")
-
-    by_path = dict(zip(paths, resolved, strict=True))
+    by_path = _resolve_rename_paths(machine, paths)
     reserved = {path for original in plan.paths
                 for path in (_normalized_rename_path(original), by_path[original].destination)}
     before, after = plan.before.worktree, plan.after.worktree
@@ -2866,7 +2911,7 @@ def _parser() -> argparse.ArgumentParser:
     resolve_paths = verbs.add_parser("resolve-rename-paths", help=argparse.SUPPRESS)
     _ = resolve_paths.add_argument("--json", action="store_true")
     reservation = verbs.add_parser("producer-rename", help=argparse.SUPPRESS)
-    _ = reservation.add_argument("rename_action", choices=("claim", "release", "check"))
+    _ = reservation.add_argument("rename_action", choices=("claim", "release", "check", "check-paths"))
     _ = reservation.add_argument("target")
     _ = reservation.add_argument("--operation", default="")
     _ = reservation.add_argument("--json", action="store_true")
@@ -3021,6 +3066,8 @@ def _main(arguments: _Arguments) -> int:
             reserve_producer_rename(plan)
         elif arguments.rename_action == "release":
             release_producer_rename(arguments.target)
+        elif arguments.rename_action == "check-paths":
+            require_no_producer_rename_paths(arguments.target, _checked_rename_paths(_decode(sys.stdin.read())))
         else:
             require_no_producer_rename(StaffId(arguments.target), operation=arguments.operation)
         print("null")

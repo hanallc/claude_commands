@@ -36,6 +36,21 @@
   },
   {
     "path": "docs/plans/builds-natest.md",
+    "line": "**Owner:** natest writes; sdlc owns (gate rename plan chunk 3; user go via morty and builds 11-16 13:50 EST, including the config file rename).",
+    "reason": "Keep the recorded approval attribution."
+  },
+  {
+    "path": "docs/plans/builds-natest.md",
+    "line": "**Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). The user chose the names 11-16 17:23 (\"Name 1 D Name 2 gate-box\"), relayed by morty and builds. The one-off rewrite of the stored records is the next phase.",
+    "reason": "Keep the recorded decision attribution."
+  },
+  {
+    "path": "docs/plans/builds-natest.md",
+    "line": "**Owner:** natest writes; sdlc owns scripts/production (gate rename plan chunk 1; user go via morty and builds 11-16 13:50 EST). builds gave natest the matcher edits in build_queue and build_hold (11-16 ~13:55 EST).",
+    "reason": "Keep the recorded approval attribution."
+  },
+  {
+    "path": "docs/plans/builds-natest.md",
     "line": "- Checkpoint `b69fac85d`. Read-only answers to item 80 A, B and C; report at `phases/179/gate_size_questions.md`. A: 338 of 414 slow verify tests start the full `verify.sh` (496 launches); at least 32 tests need the real process path. B: no full-folder `coverage_overlap.py` run exists; `scripts/direct` would cost about 2,545 CPU s and 52 serial minutes (estimate). C: a gate with only tests below 0.5 s keeps 604 of 757 modules, about 1,408 CPU s and 60 s wall (estimate; measured full gate 4,827 CPU s, 204 s). dwight: 5 of 43 failed trees (about 12%, a low estimate) fail only on slow tests.",
     "reason": "Keep the recorded attribution. Base line 3175."
   },
@@ -416,103 +431,18 @@
   },
   {
     "path": "scripts/build_queue/head_stall.py",
-    "line": "    # An old key covers builds only. It cannot confirm delivery to bob.",
-    "reason": "Keep the frozen Builds watcher until its rollout. Base line 233."
-  },
-  {
-    "path": "scripts/build_queue/head_stall.py",
-    "line": "ALERT_RECIPIENTS: tuple[AlertRecipient, ...] = (\"builds\", \"bob\")",
-    "reason": "Keep the frozen Builds watcher until its rollout. Base line 30."
-  },
-  {
-    "path": "scripts/build_queue/head_stall.py",
-    "line": "type AlertRecipient = Literal[\"builds\", \"bob\"]",
-    "reason": "Keep the frozen Builds watcher until its rollout. Base line 29."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "                self.assertEqual(self.sent_recipients(), [\"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 372."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        (builds, builds_message), (bob, bob_message) = self.sent[2:]",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 339."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual([command[command.index(\"--to\") + 1] for command, _ in self.sent], [\"builds\", \"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 325."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(attempts, [[\"builds\"], [\"builds\", \"bob\"]])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 405."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(bob, [*builds[:recipient], \"bob\", *builds[recipient + 1:]])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 342."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(bob_message, builds_message)",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 344."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(json.loads(self.paths.state.read_text())[\"alerted\"], {\"builds\": last_start, \"bob\": last_start})",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 354."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(json.loads(self.paths.state.read_text())[\"alerted\"], {\"builds\": last_start, \"bob\": last_start})",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 383."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(self.sent_recipients(), [\"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 382."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(self.sent_recipients(), [\"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 385."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\", \"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 285."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\", \"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 304."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\", \"builds\", \"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 313."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "        self.assertEqual(self.sent_recipients(), [\"builds\", \"bob\"])",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 293."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "    def test_a_legacy_delivery_record_still_allows_bobs_first_alert(self) -> None:",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 377."
-  },
-  {
-    "path": "scripts/build_queue/test_head_stall.py",
-    "line": "    def test_four_heads_in_one_stall_alert_builds_and_bob_once(self) -> None:",
-    "reason": "Keep the frozen Builds fixture until its rollout. Base line 315."
+    "line": "LEGACY_RECEIPT = \"bob\"",
+    "reason": "Read receipts from before the staff ID rollout."
   },
   {
     "path": "scripts/message/test_morty_identity.py",
     "line": "from scripts.message import morty_identity as list_identity",
     "reason": "Keep the module path."
+  },
+  {
+    "path": "scripts/notify/push_texts_reviewed.json",
+    "line": "      \"reviewer\": \"user-spec: nate, brain session 2026-11-21 14:59 EST: yes i approve it (the text he dictated at 14:50 EST); reviewer: claude-opus-5-5\",",
+    "reason": "Keep the recorded push text approval."
   },
   {
     "path": "scripts/production/staff_sources.py",

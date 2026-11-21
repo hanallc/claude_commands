@@ -5814,7 +5814,7 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
     if "producers" not in groups:
         rows = tuple(replace(row, inherited_roles=("producers",)) if "producers" in row.selected_roles else row
                      for row in rows)
-    counts = _machine_role_counts(rows, now, account_config=account_config,
+    counts = _machine_role_counts(rows, now, zone=zone, account_config=account_config,
         claude_registry_unreadable=local_sessions.claude_registry_unreadable)
     rows = counts.rows
     session_inputs = (*session_inputs, str(_session_counts_cache()))
@@ -5850,6 +5850,7 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
         _observe_status_problem(problem)
     notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
     notes.extend(counts.problems)
+    notes.extend(counts.peer_count_notes)
     detail_lines: tuple[str, ...] = ()
     if detail:
         journal = moves.read_journal()
@@ -7082,6 +7083,14 @@ def _session_counts_failure() -> Path:
     return _session_counts_cache().with_name("peer_session_counts_failed.json")
 
 
+def _session_counts_failed_after(published_at_ns: int) -> bool:
+    """Compare local file times so peer clock differences do not hide a failure."""
+    try:
+        return _session_counts_failure().stat().st_mtime_ns > published_at_ns
+    except OSError:
+        return False
+
+
 def _fetch_session_counts() -> int:
     """Fetch the other machine's counts; a failed read keeps the last good copy for its age limit."""
     try:
@@ -7122,6 +7131,7 @@ class MachineRoleCounts:
     rows: tuple[StatusRow, ...]
     problems: tuple[str, ...]
     claude_registry_unreadable: bool
+    peer_count_notes: tuple[str, ...] = ()
 
     def __iter__(self) -> Generator[tuple[StatusRow, ...] | tuple[str, ...]]:
         """Keep two-value unpacking for existing callers."""
@@ -7142,14 +7152,18 @@ def _add_peer_model_names(groups: dict[SessionModel, ModelSessionNames], model: 
 def _machine_role_counts(
     rows: tuple[StatusRow, ...], now: datetime,
  *, claude_registry_unreadable: bool = False,
+ zone: tzinfo = timezone.utc,
  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MachineRoleCounts:
     account_config = read_account_settings(account_config)
     local, peer = _session_counts_machine(), remote.other_machine()
     peer_registry_unreadable = False
+    peer_count_notes: tuple[str, ...] = ()
     peer_models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
     peer_unknown_names: dict[str, dict[str, list[str]]] = {}
     try:
-        document = _decode_session_counts(_session_counts_cache().read_text(), peer)
+        with _session_counts_cache().open() as cache:
+            document = _decode_session_counts(cache.read(), peer)
+            published_at_ns = os.fstat(cache.fileno()).st_mtime_ns
         stamp = _stored_time(document["at"])
         if stamp is None or _reading_is_old(stamp, now, account_config=account_config):
             raise ValueError("old counts")
@@ -7157,11 +7171,17 @@ def _machine_role_counts(
         peer_registry_unreadable = document.get("claude_registry_unreadable", False)
         peer_models = document.get("models", {})
         peer_unknown_names = document.get("unknown_model_names", {})
-        available = True
     except (OSError, ValueError):
         peer_accounts = {}
-        available = False
-    _ = _start_session_counts_fetch()
+        stamp = None
+        published_at_ns = 0
+    fetch_started = _start_session_counts_fetch()
+    if peer == "mac" and stamp is not None:
+        age_minutes = max(0, (now - stamp) // timedelta(minutes=1))
+        if age_minutes or not fetch_started or _session_counts_failed_after(published_at_ns):
+            observed = stamp.astimezone(zone)
+            time_format = "%H:%M %Z" if observed.date() == now.astimezone(zone).date() else "%Y-%m-%d %H:%M %Z"
+            peer_count_notes = (f"{peer} counts from {observed:{time_format}}, {age_minutes} min old",)
     counted: list[StatusRow] = []
     for row in rows:
         local_unknown = row.tool == "claude" and claude_registry_unreadable
@@ -7169,7 +7189,7 @@ def _machine_role_counts(
             idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
             for role, count in zip(row.roles, row.role_counts) if isinstance(count, RoleSessionCounts) and not local_unknown}
         machines = {local: local_counts}
-        if available:
+        if stamp is not None:
             machines[peer] = peer_accounts.get(row.label, {})
         roles = tuple(dict.fromkeys((*row.roles, *(role for counts in machines.values() for role in counts))))
         if any(role != "spare" for role in roles):
@@ -7200,12 +7220,12 @@ def _machine_role_counts(
                 _add_peer_model_names(model_names.setdefault(role, {}), SessionModelUnknown(), peer, remainder, names)
         counted.append(replace(row, roles=roles, role_counts=tuple(combined),
                                role_counts_by_machine=machines, models_by_role=models, model_names_by_role=model_names))
-    problems = (() if available else (f"{peer} unavailable: counts are {local} only",))
+    problems = (() if stamp is not None else (f"{peer} unavailable: counts are {local} only",))
     unreadable = tuple(f"{machine}: Claude session registry unreadable. Claude session counts are unknown."
                        for machine, unread in ((local, claude_registry_unreadable), (peer, peer_registry_unreadable))
                        if unread)
     return MachineRoleCounts(tuple(counted), (*problems, *unreadable),
-                             claude_registry_unreadable or peer_registry_unreadable)
+                             claude_registry_unreadable or peer_registry_unreadable, peer_count_notes)
 
 
 def _role_count_text(row: StatusRow, role: str) -> str:

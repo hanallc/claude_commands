@@ -42,10 +42,10 @@ Stored references keep the staff id and resolve current staff facts when used.
 
 Each producer loads the common command and reads its job and current work from its README.
 
-| Staff name | Kind | Command | Job contract |
+| Role | Kind | Command | Job contract |
 |---|---|---|---|
 | List producer | `producer` | `/producer:produce`, then the List skill | Tracks the user's items and coordinates their showrunners. |
-| Vault producer | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items. |
+| Vault producer | `producer` | `/producer:produce` | Manages the user's Obsidian vault and the hanadocs vault. Produces List items for vault, security, and accounts work. |
 | Production producer | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
@@ -176,6 +176,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
 | `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/head_stall.py` | read | `native_id` validates the configured producer ID. |
 | `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
 | `scripts/build_queue/snapshot_codec.py` | read | StaffSnapshot, StaffId, by_id; resolves a stored caller staff id to its current name from the snapshot a reader supplies |
 | `scripts/direct/assign.py` | read | runtime_id |
@@ -184,6 +185,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
+| `scripts/direct/pass_record.py` | read | StaffRow, StaffSnapshot, StaffId, SessionHome, WorktreeUnfilled, ReportsTo, initial_snapshot, by_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_reviewers.py` | read | local_snapshot, find; clear_phase_review.sh runs it |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
@@ -267,8 +269,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/ci_points.py` | read | Production.owner.id |
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
-| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
@@ -352,6 +355,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
+| `scripts/style/crate_run.py` | read | local_snapshot, owner_of; worktree_names names the unit of a crate run |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
 | `scripts/style/selection_capture.py` | read | record_path copies staff.json into a capture |
 | `scripts/style/style_config.py` | read | StaffRow, StaffSnapshot.find, StaffSnapshot.parent_of, LiveDoc, WrappedDoc |
@@ -371,7 +375,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-227 accessor rows: 42 write, 184 read, 1 owner.
+231 accessor rows: 42 write, 188 read, 1 owner.
 
 ## Approved copies
 
