@@ -52,6 +52,7 @@ import math
 import os
 from pathlib import Path
 import re
+from secrets import token_hex
 import select
 import shlex
 import shutil
@@ -614,13 +615,15 @@ class GateRecovery:
     rollback: str = ""
     rollback_head: str = ""
     rollback_source: str = ""
+    finished: bool = False
 
     def save(self) -> None:
         write_text_atomic(self.path, json.dumps({
             "repo": self.repo, "pid": self.pid, "start": self.start,
             "groups": self.groups, "folders": self.folders,
             "tokens": [asdict(token) for token in self.tokens], "rollback": self.rollback,
-            "rollback_head": self.rollback_head, "rollback_source": self.rollback_source}) + "\n")
+            "rollback_head": self.rollback_head, "rollback_source": self.rollback_source,
+            "finished": self.finished}) + "\n")
 
     def add_group(self, pid: int) -> None:
         identity = process_start(pid)
@@ -639,7 +642,9 @@ class GateRecovery:
                              status.st_dev, status.st_ino, value.hex())
 
     def recover(self) -> None:
-        """Stop recorded groups before removing their folders and undoing the merge."""
+        """Stop recorded groups, return tokens, and undo the merge."""
+        if self.finished:
+            return
         stopping: set[int] = set()
         for pid, start in self.groups.items():
             identity = process_start(pid)
@@ -667,8 +672,8 @@ class GateRecovery:
                 process_group.send_process_group(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        # A dead leader can leave writers in its group. Wait before deleting their files.
-        for entry in Path("/proc").iterdir():
+        # A dead leader can leave writers in its group.
+        for entry in Path("/proc").iterdir() if stopping else ():
             if not entry.name.isdecimal():
                 continue
             try:
@@ -705,14 +710,7 @@ class GateRecovery:
                     if descriptor >= 0:
                         os.close(descriptor)
         for folder in self.folders:
-            path = Path(folder)
-            try:
-                if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)):
-                    raise GateRefused(f"gate recovery kept held folder {path}")
-            except FileNotFoundError:
-                pass
-        self.folders.clear()
-        self.save()
+            report_retained_gate_folder(folder, "the gate owner ended")
         if self.rollback:
             repo = Path(self.repo)
             with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
@@ -731,7 +729,19 @@ class GateRecovery:
                 self.rollback = ""
                 self.save()
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
-        self.path.unlink()
+        self.finish()
+
+    def finish(self) -> None:
+        """Keep the recovery record when it names retained folders."""
+        if self.folders:
+            self.finished = True
+            self.save()
+        else:
+            self.path.unlink(missing_ok=True)
+
+
+def report_retained_gate_folder(folder: str, reason: str) -> None:
+    print(f"kept for a manual removal list: {folder} (merge_gate, {reason})", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -767,6 +777,8 @@ def recover_gate_directory(directory: Path) -> None:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
             data = cast(dict[str, object], json.loads(path.read_text()))
+            if data.get("finished") is True:
+                continue
             pid, start = cast(int, data["pid"]), cast(str, data["start"])
             owner = process_start(pid)
             if isinstance(owner, Unreadable):
@@ -777,9 +789,11 @@ def recover_gate_directory(directory: Path) -> None:
             tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
                                     cast(int, token["inode"]), cast(str, token["value"]))
                       for token in cast(list[dict[str, object]], data["tokens"])]
+            folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
+                       for entry in cast(list[object], data["folders"])]
             recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
                                     {int(group): identity for group, identity in groups.items()},
-                                    cast(list[str], data["folders"]), tokens, cast(str, data["rollback"]),
+                                    folders, tokens, cast(str, data["rollback"]),
                                     cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
             active = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
@@ -815,7 +829,7 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
     with gate_operation_lock(repo) as descriptor:
         fcntl.flock(descriptor, fcntl.LOCK_SH)
         directory = gate_run_directory(repo)
-        path = directory / f"{os.getpid()}-{hashlib.sha256(identity.start.encode()).hexdigest()[:12]}.json"
+        path = directory / f"{os.getpid()}-{token_hex(12)}.json"
         recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
         recovery.save()
         token = ACTIVE_GATE_RECOVERY.set(recovery)
@@ -823,8 +837,8 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
             yield recovery
         finally:
             ACTIVE_GATE_RECOVERY.reset(token)
-            if not (recovery.groups or recovery.folders or recovery.tokens or recovery.rollback):
-                path.unlink(missing_ok=True)
+            if not (recovery.groups or recovery.tokens or recovery.rollback):
+                recovery.finish()
 
 
 @contextmanager
@@ -837,32 +851,52 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
     identity = process_start(os.getpid())
     if not isinstance(identity, Started):
         raise GateRefused("the gate has no readable process start")
-    with tempfile.TemporaryDirectory(prefix="merge-gate-recovery-", dir=parent) as folder:
-        directory = Path(folder)
+    directory = Path(tempfile.mkdtemp(prefix="merge-gate-recovery-", dir=parent))
+    recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
+    try:
         with (directory / "operation.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
-            recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
             recovery.save()
             token = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
                 yield recovery
             finally:
                 ACTIVE_GATE_RECOVERY.reset(token)
+    finally:
+        if recovery.folders:
+            if not (recovery.groups or recovery.tokens or recovery.rollback):
+                recovery.finish()
+        else:
+            shutil.rmtree(directory)
 
 
 @contextmanager
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
+            request = build_folders.UniqueBuildFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
+            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
             recovery.folders.append(str(folder))
             recovery.save()
         try:
             yield folder
         finally:
-            cleanup.close()
-            recovery.folders.remove(str(folder))
-            recovery.save()
+            try:
+                cleanup.close()
+            finally:
+                try:
+                    remaining = build_folders.temporary_allocation_entries(folder)
+                except OSError:
+                    report_retained_gate_folder(str(folder), "the gate could not confirm removal")
+                else:
+                    if folder in remaining:
+                        report_retained_gate_folder(str(folder), "the gate could not remove its folder")
+                    elif remaining:
+                        paths = ", ".join(map(str, remaining))
+                        report_retained_gate_folder(paths, "the gate could not remove its lease files")
+                    else:
+                        recovery.folders.remove(str(folder))
+                        recovery.save()
 
 
 def typecheck_venv_path() -> Path:
@@ -1075,7 +1109,9 @@ raise SystemExit(99)
         executable = tools / name
         _ = executable.write_text(script)
         executable.chmod(0o755)
-    return {**environment, "TMPDIR": str(root),
+    cargo = str(root / "target")
+    return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+            "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
@@ -1359,11 +1395,18 @@ def module_runner(repo: Path) -> Path:
 
 
 def gate_test_parent(tmpfs: Path) -> Path:
-    """The tmpfs parent that holds only the leased folders of merge gate test classes.
-
-    tmpfs (/dev/shm) is shared with other programs, so the sweep runs only on this parent.
-    """
+    """Return the parent of the merge gate test fixtures."""
     return tmpfs / "merge-gate-tests"
+
+
+def report_retained_gate_test_folders(tmpfs: Path) -> None:
+    try:
+        folders = sorted(gate_test_parent(tmpfs).iterdir())
+    except FileNotFoundError:
+        return
+    for folder in folders:
+        if not folder.is_symlink() and folder.is_dir():
+            report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -1405,8 +1448,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
-    # Remove the free test folders that a run ended by a signal left; a held folder costs one lock try.
-    build_folders.sweep_temporary_build_folders(gate_test_parent(tmpfs), wait=False)
+    report_retained_gate_test_folders(tmpfs)
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
@@ -2711,7 +2753,32 @@ def nightly_git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def _nightly_unit(args: GateArguments) -> str:
+    """Use the production's merge unit or the nightly role."""
+    if args.unit:
+        return copies.checked_owner(args.unit)
+    if not args.production:
+        raise GateRefused("nightly needs --unit or --production")
+    from scripts.production import showrunners, staff
+
+    record = staff.snapshot()
+    try:
+        owner = showrunners.owner_for(args.production, record)
+    except ValueError as error:
+        raise GateRefused(str(error)) from error
+    units = [unit for unit in record.find(kind="unit", parent=owner.id)
+             if unit.unit_type == staff.UnitDetails("merge")
+             and not isinstance(unit.worktree, staff.RemovedWorktree)
+             and not isinstance(unit.doc, staff.WrappedDoc)]
+    if not units:
+        return "nightly"
+    if len(units) > 1:
+        raise GateRefused(f"{owner.name}: the production record has multiple merge units. Pass --unit.")
+    return copies.checked_owner(str(units[0].id))
+
+
 def nightly(args: GateArguments) -> int:
+    unit = _nightly_unit(args)
     run: GateRun | NightlyRunState = NightlyRunState.NOT_STARTED
     result_sent = False
     try:
@@ -2721,7 +2788,7 @@ def nightly(args: GateArguments) -> int:
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
         owner = nightly_owner(args)
-        with copies.standing(owner, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
+        with copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
@@ -2964,29 +3031,26 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         return 1
 
 
-def _sweep_nightly_slots() -> None:
-    """Sweep both slot pools without changing the nightly result."""
+def _sweep_nightly_build_folders() -> None:
+    """Sweep unused build folders after the nightly run."""
     for machine in ("natedev", "Mac"):
         try:
             if machine == "natedev":
-                from scripts.lib import build_slots
+                from scripts.lint import sweep
 
-                build_slots.sweep_slots()
+                if sweep.main(["--unused-folders"]):
+                    raise RuntimeError("the build folder sweep failed")
             else:
-                settings = conf.read_or_repository("build_folders")
-                if not any(value for key, value in settings.values().items()
-                           if key == "roots.slots" or key.startswith("roots.slots.")):
-                    continue
                 scripts = Path(__file__).resolve().parents[1]
                 _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
                                     sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                    "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
                                     # The nightly runs from $HOME, which is not a repository; the queue refuses that as "repo".
                                     "--worktree", str(scripts.parent), "--", "/bin/zsh", "-c",
-                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
+                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
                                    check=True, capture_output=True, text=True)
         except (Exception, KeyboardInterrupt) as error:
-            detail = f"Nightly slot sweep on {machine} failed: " + " ".join(str(error).splitlines())
+            detail = f"Nightly build folder sweep on {machine} failed: " + " ".join(str(error).splitlines())
             if isinstance(error, subprocess.CalledProcessError):
                 # The queue prints its refusal on stdout and the Mac queue prints its heading on stderr.
                 detail += " " + " ".join((cast(str, error.stderr or "") + cast(str, error.stdout or "")).splitlines())
@@ -2997,7 +3061,7 @@ def _sweep_nightly_slots() -> None:
                 _ = subprocess.run(session_send.send_argv("--to", "builds", "--from", "nightly", "--text", detail),
                                    check=True, capture_output=True, text=True, timeout=send_budget.seconds())
             except (Exception, KeyboardInterrupt) as notice_error:
-                print(f"Nightly slot sweep on {machine}: notice failed: "
+                print(f"Nightly build folder sweep on {machine}: notice failed: "
                       + " ".join(str(notice_error).splitlines()), flush=True)
 
 
@@ -3040,6 +3104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--promote-only needs --merge-branch")
     if args.nightly and not args.merge_branch:
         parser.error("--nightly needs --merge-branch")
+    if args.nightly and not (args.unit or args.production):
+        parser.error("--nightly needs --unit or --production")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
     if args.modules and not args.tests_only:
@@ -3052,13 +3118,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tests_only:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
+        if args.nightly:
+            args.unit = _nightly_unit(args)
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
                 try:
                     return nightly(args)
                 finally:
-                    _sweep_nightly_slots()
+                    _sweep_nightly_build_folders()
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)

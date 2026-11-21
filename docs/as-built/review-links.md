@@ -132,14 +132,14 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, Builds, Disks, Images, List and Review, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List and Review.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
 A page whose `main` has the `page-wide` class uses the full pane width instead; the Builds page is the only one.
 The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
-The title, status line and content use the same centered column on all seven pages.
+The title, status line and content use the same centered column on all console pages.
 Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
@@ -250,7 +250,7 @@ Older browser folders still accept answers that a page posts to them.
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
-The entries are Accounts, AWS, Builds, Disks, Images, List and Review.
+AWS Machines follows AWS in the navigation.
 The configuration has no Changes, Investigations or Questions entries or age limits.
 The console renders every configured entry without a skip rule for Review.
 The URL value has the form `python:<module>:<function>`.
@@ -271,6 +271,48 @@ The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
 The AWS entry calls `aws_page.page_url`.
 That function returns the AWS page URL without publishing the page.
+The AWS Machines entry calls `machines_page.page_url`.
+The function returns the URL for `machines.html` in `aws_page.output_folder()`.
+The entry shows **Not available** until the publisher writes that file.
+`serve.published_console_page` identifies the published path as `aws_machines`.
+The server adds the shared page owner control for the configured AWS Machines owner.
+The AWS Machines entry uses the Lucide `server` icon.
+
+A page includes `__PAGE_SETTING_CONTROLS__` once in its head.
+`page_frame.template` replaces that slot with the style and script from `setting_controls.py`.
+The page renders these controls with the following functions.
+
+1. `slider` takes the label, bounds, step, chosen value, live value, decimal places and an optional live note.
+   `pageSettingControls.connectSlider(root)` connects the native range input to the display.
+   Read `value` for the choice or `live` for the saved value.
+   Use `setValue(value)`, `setLive(value, note)` and `format(value)` to update or display a value.
+   Use `input` to listen for the native range input events.
+2. `amount_box` takes the text before and after the USD field, its minimum, step and value.
+   Read or write the field through `valueAsNumber`.
+   Listen for its native `change` event to apply the amount to the slider.
+3. `go_button` takes the button label and the page and key for the setting.
+   Call `pageSettingControls.connectGo(root, slider, amount, describe)` with the slider and the amount input.
+   Return `newValue`, `monthlyChange` in USD, and an optional `liveNote` from `describe`.
+   Go uses the slider live value as the old value in each confirmation.
+   The Go button shows the confirmation line before Confirm can send the choice.
+   Cancel closes the confirmation. Confirm disables the controls while the server saves.
+   Go updates the Now mark from the live value in the reply.
+   A successful save with a live value emits `setting-saved` with `detail.value`.
+   A refusal or failure shows one line below Go and keeps the proposed value.
+   Use `setLabel(label)` to update the button and `cancelConfirmation()` to close an obsolete confirmation.
+
+Go reads the request token from `GET /console/tune`.
+`POST /console/tune` accepts the fields `page`, `key`, `value`, and `token`.
+The POST requires a same-origin Origin header and the current request token.
+`console_tune.SETTINGS` registers allowed page and key pairs with the target document, range and step.
+The server validates exact decimal steps from the minimum.
+It refuses pairs absent from the table.
+The AWS Machines page uses `aws_machines` in this table and in the POST.
+The frame leaves the table empty for a page to register its settings.
+The route calls `tune.py` with the page and Go button in the reason and user words.
+It returns Saved with HTTP 200, Refused with HTTP 400, or SaveFailed with HTTP 503.
+Each result includes `live_value` from a fresh configuration read.
+An unavailable live value is `null`.
 
 The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
@@ -832,7 +874,7 @@ Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
 All includes every open item, including parked items and Done items.
 The State cell shows the parking end time or delivery condition under the saved state.
-The Unread only switch shows and counts unread items and rows that stay open after an answer is read.
+The Unread only switch shows and counts unread items.
 Each chip count reflects the words box and the filters in the other rows.
 In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
@@ -1055,7 +1097,7 @@ Column sort buttons keep focus through refresh.
 A waiting row shows “The producer will answer.”
 The panel shows each open question with its asked time and the linked review cards.
 An actively parked waiting row shows the parking condition and Unpark.
-A waiting row with an unread delivery release shows Mark read.
+A waiting row with an unread answer or delivery release shows Mark read.
 The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
@@ -1085,20 +1127,14 @@ A signed Unpark request from an earlier page can clear parking while the item wa
 That request moves the item to Morty answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
-Opening an individual row with an unread answer uses the same signed read operation.
-The List sends this request after the text of each unread answer enters the viewport while the row is open.
-This rule also applies to direct links and to answers that appear in linked details after refresh.
-The tab and console frame must also be visible.
+Opening a row leaves its unread state and status chip unchanged.
+This rule also applies to direct links, refreshes, and reloads.
 A newer update stays unread if it arrives before the read saves.
-With Unread only on, the row can stay visible after this read.
-The row counts toward its matching Owner and Producer chips and the selected Show chip.
-Closing the row or changing Show ends this exception.
-Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
-The answer puts the item in Needs me until the user reads it.
-The item keeps its parking time.
+An unread answer puts an unparked item in Needs me.
+Park until moves the item to Parked and preserves its unread state.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
@@ -1153,19 +1189,10 @@ After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
 Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
-When morty records Delivered, the List writer clears this parking condition in the same write.
-The Review snapshot worker checks each snapshot after it publishes it.
-It checks linked change rows that the snapshot shows as ready for the user.
-Requests can use the published snapshot while the worker checks the parked items.
-The worker tries the List lock, the Review delivery lock, and the change list lock in that order.
-List Ask takes the List lock before the Review delivery lock.
-The worker skips a busy lock or unreadable change row and can retry after a later snapshot.
-List GET reads saved items and published question delivery records without the release locks.
-Console news reads the saved List records.
-The worker holds all three locks while it checks the current Review row and saves a release.
-The same parking event and link must still be current.
-The writer clears parking, sets Delivered, and marks the item unread.
-Both delivery signals save an Unparked event with the reason.
+The List ends this park automatically when the producer sets the item state to Delivered.
+The same write clears the park, marks the item unread, and records an Unparked event.
+Linked changes supply review information on the List.
+The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
 After Mark read, an open question returns the item to Morty answering.
 A dated park remains active until its time or an explicit Unpark.
@@ -1771,6 +1798,14 @@ It exits with status 0 when the folder disappears.
 
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
+
+The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+These requests require a single `Host` header for the server's bound address and port.
+The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
+On port 80, the server also accepts either host without a port.
+If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
+A Go change (`POST /console/tune`) must supply `Origin` and the token.
+The server returns 403 when the host or origin check fails.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.

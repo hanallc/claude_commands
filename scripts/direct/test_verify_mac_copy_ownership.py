@@ -18,7 +18,8 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders
 from scripts.lib.build_folders_test_support import tool_folders
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production import staff
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from unittest import mock
 
 
@@ -60,22 +61,25 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
             git = fixture.bin_directory / "git"
             git.unlink()
             git.symlink_to(real_git)
-            for arguments in (("init", "-qb", "main"), ("add", "Cargo.toml", "src"),
+            origin = fixture.root / "origin.git"
+            for arguments in (("init", "--bare", "-qb", "main", str(origin)),
+                              ("init", "-qb", "main"), ("add", "Cargo.toml", "src"),
                               ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                               "commit", "-qm", "Prepare the watcher fixture")):
+                               "commit", "-qm", "Prepare the watcher fixture"),
+                              ("remote", "add", "origin", str(origin)), ("push", "origin", "main")):
                 _ = subprocess.run([real_git, *arguments], cwd=fixture.root, env=fixture.environment,
                                    capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             launcher = fixture.root / "verify-copy.sh"
             copy_cli = VERIFY.parents[1] / "copies/copies.py"
             command = shlex.join((sys.executable, str(copy_cli), "run", "--repo", str(fixture.root),
-                                  "--commit", "HEAD", "--", "bash", "-c", 'exec bash "$VERIFY_SCRIPT" "$@"', "verify"))
+                                  "--commit", "HEAD", "--", "bash", str(fixture.verify_script)))
             fixture.write_executable(launcher, '#!/bin/bash\nexec ' + command + ' "$@"\n')
-            fixture.environment["VERIFY_SCRIPT"] = str(fixture.verify_script)
             fixture.verify_script = launcher
+            runner = staff.caller_identity()
             with mock.patch.dict(os.environ, fixture.environment), isolated_staff_file(fixture.root / "staff.json", {}):
                 parent = fixture_member("showrunner", name="builds")
-                worker = fixture_member("unit", name="mac-copy-test", parent=parent.id)
-            fixture.environment["CLAUDE_CODE_SESSION_ID"] = worker.current_session
+                worker = fixture_member("unit", name="mac-copy-test", parent=parent.id, runtime_id=runner)
+            fixture.environment.update(build_fixture_sessions(worker.current_session))
             self.check_natedev_copy_result(fixture, with_slot=True)
 
     def check_natedev_copy_result(self, fixture: VerifyMacOffloadFixture, *, with_slot: bool = False) -> None:
