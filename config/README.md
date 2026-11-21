@@ -679,9 +679,8 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
-recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
-roster.
+The zone reader ignores a production document's old `User zone` line.
+A time stored without an offset keeps its original zone.
 
 ## statusline.conf
 
