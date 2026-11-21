@@ -436,9 +436,9 @@ class GateWorker:
     def upload(self, bucket: str, key: str, path: Path) -> None:
         _ = self.api.call('put-object', '--bucket', bucket, '--key', key, '--body', str(path), service='s3api')
 
-    def download(self, bucket: str, key: str, path: Path) -> bool:
+    def download(self, bucket: str, key: str, path: Path, *, timeout_s: float | None = None) -> bool:
         try:
-            _ = self.api.call('get-object', '--bucket', bucket, '--key', key, str(path), service='s3api')
+            _ = self.api.call('get-object', '--bucket', bucket, '--key', key, str(path), service='s3api', timeout_s=timeout_s)
             return True
         except AwsServiceFailure as error:
             if error.code in ('404', 'NoSuchKey'):

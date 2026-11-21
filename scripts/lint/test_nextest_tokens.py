@@ -213,6 +213,14 @@ class BuildOnlyTests(unittest.TestCase):
                 self.assertEqual(tokens.build_selection([*given, "--workspace", "-E", "all()"]),
                                  ["--workspace", "-E", "all()"])
 
+    def test_only_the_compile_pass_receives_cargo_timings(self) -> None:
+        run = tokens.test_run((*HANA_RUN, "--timings", "--", "--timings"))
+        assert isinstance(run, tokens.SizedTestRun)
+        self.assertIn("--timings", run.build_only())
+        self.assertNotIn("--timings", run.list_selected()[:-2])
+        self.assertEqual(run.with_threads(8).count("--timings"), 1)
+        self.assertEqual(run.with_threads(8)[-2:], ["--", "--timings"])
+
     def test_build_options_and_filters_stay(self) -> None:
         kept = ["-p", "hana", "--lib", "--features=x", "--build-jobs", "4", "-P", "ci", "--release",
                 "--cargo-profile", "test", "--partition", "count:1/2", "--run-ignored", "all", "-E", "all()"]

@@ -17,13 +17,15 @@ import io
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
-from scripts.mac_test import eligibility, offload, mac_test, nextest_log
+from scripts.mac_test import cargo_timings, eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
-    ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
+    ACTIVITY_SELECTOR_STUB, assert_no_report_on_incomplete_timing_stream, install_nextest_log_writer,
+    replay_remote_run, write_shell,
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, test_hang_guard
+from scripts.buildlog import store
 
 
 MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
@@ -97,21 +99,72 @@ def nextest_settings(tail_bytes: str = "65536", summary_bytes: str = "1024") -> 
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
-    def stream_protocol(self, controller: offload.ProcessController, arguments: list[str]) -> offload.RemoteRunStatus:
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.dict(os.environ, shell_environment(Path(directory)), clear=True):
-                return controller.stream_mac_run(arguments)
+    def test_timing_report_requires_a_valid_location_and_final_status(self) -> None:
+        timing = cargo_timings.TimingRunToken.new()
+        record = timing.record_prefix()
+        location = "fixture:/tmp/cargo-timing-earlier.html"
+        for value, suffix, expected, expected_output in (
+            ("malformed", "", offload.ReportedMacStatus(42), ""),
+            ("fixture:/tmp/cargo-timing\x1b[1m.html", "", offload.ReportedMacStatus(42), ""),
+            ("bad host:/tmp/cargo-timing-earlier.html", "", offload.ReportedMacStatus(42), ""),
+            ("fixture:relative/cargo-timing-earlier.html", "", offload.ReportedMacStatus(42), ""),
+            (location, "more output\n", offload.MissingMacStatus("runner exited with status 0 without a final status"),
+             "mac_exit=42\nmore output\n"),
+            (location, "mac_exit=0\n", offload.ReportedMacStatus(0), "mac_exit=42\n"),
+        ):
+            with self.subTest(value=value, suffix=suffix):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = replay_remote_run(f"{record}{value}\nmac_exit=42\n{suffix}", 0, timing=timing)
+                self.assertEqual(result, expected)
+                self.assertEqual(output.getvalue(), expected_output if value == location else f"{record}{value}\n")
+
+    def test_timing_report_round_trips_a_host_name_with_an_underscore(self) -> None:
+        timing = cargo_timings.TimingRunToken.new()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "cargo-timing-fixture.html"
+            path.touch()
+            host = "build_host"
+            with mock.patch.object(store, "host_name", return_value=host):
+                record = cargo_timings.remote_report_line(timing, path)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = replay_remote_run(record + "mac_exit=42\n", 0, timing=timing)
+            self.assertEqual(result, offload.ReportedMacStatus(42))
+            self.assertIn(f"timings: {host}:{path}", output.getvalue().splitlines())
+
+    def test_untimed_output_clears_an_incomplete_status_before_a_timing_line(self) -> None:
+        token = cargo_timings.TimingRunToken.new()
+        for timing, prefix in (
+            (cargo_timings.UNTIMED_RUN, "timings: "),
+            (token, "timings: "),
+            (cargo_timings.UNTIMED_RUN, cargo_timings.REMOTE_TIMING_REPORT_PREFIX),
+            (token, cargo_timings.REMOTE_TIMING_REPORT_PREFIX),
+        ):
+            with self.subTest(timing=type(timing).__name__, prefix=prefix):
+                wire = f"mac_exit=0\n{prefix}fixture:/tmp/test-output.html\n"
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = replay_remote_run(wire, 255, timing=timing)
+                self.assertIsInstance(result, offload.MissingMacStatus)
+                self.assertEqual(output.getvalue(), wire)
+
+        report_line = f"{cargo_timings.REMOTE_TIMING_REPORT_PREFIX}fixture:/tmp/test-output.html\n"
+        for timing, intervening_line in ((cargo_timings.UNTIMED_RUN, ""), (token, "ordinary output\n")):
+            with self.subTest(timing=type(timing).__name__, intervening_line=intervening_line):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = replay_remote_run(report_line + intervening_line + "mac_exit=42\n", 0, timing=timing)
+                self.assertEqual(result, offload.ReportedMacStatus(42))
+                self.assertEqual(output.getvalue(), report_line + intervening_line)
 
     def test_status_marker_followed_by_ordinary_output_is_printed_and_not_a_result(self) -> None:
-        controller = offload.ProcessController()
         for marker in ("mac_exit=0", "mac_nextest_setup=failed"):
             with self.subTest(marker=marker):
                 text = f"{marker}\ntest still running\n"
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    answer = self.stream_protocol(controller, [
-                        "/bin/sh", "-c", 'printf "%s" "$1"; exit 255', "protocol", text,
-                    ])
+                    answer = replay_remote_run(text, 255)
                 self.assertIsInstance(answer, offload.MissingMacStatus)
                 self.assertEqual(output.getvalue(), text)
 
@@ -129,23 +182,16 @@ class MacCleanupProtocolTests(unittest.TestCase):
         for marker, ssh_status, expected in cases:
             with self.subTest(marker=marker, ssh_status=ssh_status):
                 output = io.StringIO()
-                controller = offload.ProcessController()
                 with redirect_stdout(output):
-                    answer = self.stream_protocol(controller, [
-                        "/bin/sh", "-c", 'printf "%s" "$1"; exit "$2"', "protocol",
-                        "test output\nmac_exit=42\n" + marker, str(ssh_status),
-                    ])
+                    answer = replay_remote_run("test output\nmac_exit=42\n" + marker, ssh_status)
                 self.assertEqual(answer, offload.ReportedMacStatus(42, expected))
                 trim_output = "mac_trim=status=0 elapsed_seconds=2 over_budget=yes\n" if marker.startswith("mac_trim=") else ""
                 self.assertEqual(output.getvalue(), "test output\n" + trim_output)
 
     def test_bare_success_confirms_cleanup_without_a_removal_line(self) -> None:
         output = io.StringIO()
-        controller = offload.ProcessController()
         with redirect_stdout(output):
-            answer = self.stream_protocol(controller, [
-                "/bin/sh", "-c", 'printf "mac_exit=0\\nmac_cleanup=0\\n"',
-            ])
+            answer = replay_remote_run("mac_exit=0\nmac_cleanup=0\n", 0)
             if not isinstance(answer, offload.ReportedMacStatus):
                 self.fail("The remote command did not report its status.")
             self.assertEqual(answer, offload.ReportedMacStatus(0, offload.CleanupRemovedWithoutFacts()))
@@ -278,8 +324,11 @@ exit "$CLEANUP_TEST_STATUS"
         budget_gib: str = "24",
         budget_values: tuple[tuple[str, str], ...] = (),
         trim: int | Literal["run"] = 0,
+        verb: eligibility.MacVerb = "nextest",
+        timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN,
     ) -> subprocess.CompletedProcess[str]:
-        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words,
+                                         owner="verify", holder_session="fixture-session", verb=verb)
         settings = self.root / "command-mac.conf"
         overrides = dict(budget_values)
         _ = settings.write_text(nextest_settings(overrides.get(nextest_log.TAIL_BYTES, "65536"),
@@ -294,7 +343,7 @@ exit "$CLEANUP_TEST_STATUS"
 
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
-            + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
+            + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"), timing=timing)
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
@@ -371,6 +420,95 @@ exit "$CLEANUP_TEST_STATUS"
                 self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
                 self.assertEqual(list(logs.iterdir()), [log])
                 log.unlink()
+
+    def test_nextest_reports_timings_even_when_the_failure_tail_omits_them(self) -> None:
+        _ = install_nextest_log_writer(self.home_directory)
+        path = self.home_directory / "custom target/cargo-timings/cargo-timing-20261120T000000Z.html"
+        path.parent.mkdir(parents=True)
+        missing = path.with_name("cargo-timing-missing.html")
+        stale = path.with_name("cargo-timing-earlier.html")
+        _ = stale.write_text("Earlier Cargo report")
+        output = (f"      \033[1mTiming\033[0m report saved to {path}\n"
+                  + f"Timing report saved to {missing}\n"
+                  + f"Timing report saved to {stale}\n" + "test output\n" * 100)
+        _ = (self.root / "nextest-out").write_text(output)
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        write_shell(lint, 'test "$1" = nextest && test "$2" = --timings || exit 98\n'
+                          + f'printf "%s\\n" "Cargo report" > {shlex.quote(str(path))}\n'
+                          + 'cat "$CLEANUP_TEST_DIR/nextest-out" >&2\nexit "$CLEANUP_TEST_STATUS"\n')
+        for status in (0, 42):
+            with self.subTest(status=status):
+                path.unlink(missing_ok=True)
+                timing = cargo_timings.TimingRunToken.new()
+                answer = self.run_remote(["/bin/sh"], status, ("--timings", f"--target-dir={path.parent.parent}"),
+                                         budget_values=((nextest_log.TAIL_BYTES, "32"),), timing=timing)
+                self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                prefix = f"{timing.record_prefix()}{store.host_name()}:"
+                self.assertEqual(answer.stdout.splitlines().count(f"{prefix}{path}"), 1)
+                self.assertNotIn(f"{prefix}{stale}", answer.stdout)
+                self.assertIn(f"mac_exit={status}\n", answer.stdout)
+                if status:
+                    self.assertNotIn("report saved to", answer.stdout)
+
+    def test_mac_without_a_timing_report_preserves_the_last_child_line(self) -> None:
+        _ = install_nextest_log_writer(self.home_directory)
+        _ = (self.mirror / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+        target = self.mirror / "custom target"
+        path = target / "cargo-timings/cargo-timing-missing.html"
+        child_line = f"{cargo_timings.REMOTE_TIMING_REPORT_PREFIX}{store.host_name()}:{path}"
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        write_shell(lint, 'export -p > "$CLEANUP_TEST_DIR/lint-environment"\n'
+                          + 'json_args "$@" > "$CLEANUP_TEST_DIR/lint-arguments.json"\n'
+                          + f"printf '%s' {shlex.quote(child_line)}\n"
+                          + 'exit "$CLEANUP_TEST_STATUS"\n')
+        for verb in ("nextest", "build"):
+            for status in (0, 42):
+                with self.subTest(verb=verb, status=status):
+                    timing = cargo_timings.TimingRunToken.new()
+                    answer = self.run_remote(["/bin/sh"], status, ("--timings", f"--target-dir={target}"),
+                                             verb=verb, timing=timing)
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    self.assertFalse(path.exists())
+                    self.assertNotIn(timing.value, (self.root / "lint-environment").read_text())
+                    self.assertNotIn(timing.value, (self.root / "lint-arguments.json").read_text())
+                    assert_no_report_on_incomplete_timing_stream(
+                        self, answer.stdout, status, offload.CleanupSkipped(), child_line, timing)
+
+    def test_mac_retains_timings_after_output_without_a_final_newline(self) -> None:
+        _ = install_nextest_log_writer(self.home_directory)
+        _ = (self.mirror / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+        target = self.mirror / "target"
+        path = target / "cargo-timings/cargo-timing-new.html"
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        write_shell(lint, f"printf '%s\n' 'Cargo report' > {shlex.quote(str(path))}\n"
+                          + "printf '%s' 'last Cargo output'\n"
+                          + 'exit "$CLEANUP_TEST_STATUS"\n')
+        for verb in ("nextest", "build"):
+            for status in (0, 42):
+                with self.subTest(verb=verb, status=status):
+                    path.parent.mkdir(parents=True)
+                    timing = cargo_timings.TimingRunToken.new()
+                    answer = self.run_remote(["/bin/sh"], status, ("--timings",), verb=verb, timing=timing)
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    lines = answer.stdout.splitlines()
+                    cleanup, = (line for line in lines if line.startswith("mac_cleanup=0 "))
+                    self.assertFalse(target.exists())
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = replay_remote_run(answer.stdout, answer.returncode, timing=timing)
+                    self.assertIn("last Cargo output", output.getvalue().splitlines())
+                    self.assertEqual(result, offload.ReportedMacStatus(
+                        status, offload.parse_cleanup(cleanup.removeprefix("mac_cleanup=")),
+                    ))
+                    prefix = f"{timing.record_prefix()}{store.host_name()}:"
+                    timing_lines = [line for line in lines if line.startswith(prefix)]
+                    self.assertEqual(len(timing_lines), 1, answer.stdout + answer.stderr)
+                    record, = timing_lines
+                    self.assertEqual(lines[lines.index(record) + 1], f"mac_exit={status}")
+                    self.assertEqual(Path(record.removeprefix(prefix)).read_text(), "Cargo report\n")
+                    display = cargo_timings.TIMING_REPORT_PREFIX + record.removeprefix(
+                        timing.record_prefix())
+                    self.assertEqual(output.getvalue().splitlines().count(display), 1)
 
     def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
         minutes = 3

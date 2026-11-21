@@ -137,7 +137,10 @@ buildlog_read_context() {
 buildlog_begin() {
     BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0 BUILDLOG_TEST_PHASE_FILE="" BUILDLOG_TARGET_FOLDER=""
     BUILDLOG_STEP_ARGV=("$@")
-    [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" ]] || return 0
+    if [[ "${BUILDLOG_OFF:-0}" == 1 || ! -f "$BUILDLOG_RECORD" ]]; then
+        if [[ "${VERIFY_TIMINGS[0]:-}" == --timings ]]; then buildlog_read_context ${1+"$@"}; fi
+        return 0
+    fi
     buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"

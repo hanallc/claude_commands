@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from scripts.buildlog import store
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
 
 
@@ -16,9 +17,35 @@ class VerifyTokenBuildTests(VerifyTokenWaitFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"binary: {self.root / 'target' / 'debug' / 'sample-app'}\n", result.stdout)
         self.assertNotIn("demo", result.stdout)
+        self.assertNotIn("timings:", result.stdout)
         self.assertEqual((self.root / "cargo-calls").read_text(), "build --workspace --bin sample-app\n")
         self.assertIn("claim: token cargo acquired", (self.root / "board" / "board.log").read_text())
         self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+
+    def test_build_reports_cargo_timings_after_success_or_failure(self) -> None:
+        environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]}])
+        path = self.root / "target/cargo-timings/cargo-timing-20261120T000000Z.html"
+        path.parent.mkdir(parents=True)
+        for status in (0, 101):
+            with self.subTest(status=status):
+                calls = self.root / "cargo-calls"
+                calls.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                result = self.build({**environment, "TEST_BUILD_STATUS": str(status),
+                                     "TEST_BUILD_TIMING_REPORT": str(path)}, "--timings")
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(calls.read_text(), "build --workspace --bin sample-app --timings\n")
+                self.assertEqual(result.stdout.splitlines().count(f"timings: {store.host_name()}:{path}"), 1)
+
+    def test_build_reports_timings_in_the_target_from_metadata(self) -> None:
+        target = self.root / "metadata target"
+        environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]}], target=target)
+        del environment["CARGO_TARGET_DIR"]
+        path = target / "cargo-timings/cargo-timing-new.html"
+        path.parent.mkdir(parents=True)
+        result = self.build({**environment, "TEST_BUILD_TIMING_REPORT": str(path)}, "--timings")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"timings: {store.host_name()}:{path}", result.stdout.splitlines())
 
     def test_build_of_an_example_turns_on_its_required_features(self) -> None:
         environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]},

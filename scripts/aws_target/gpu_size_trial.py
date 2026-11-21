@@ -9,7 +9,7 @@ import argparse
 import base64
 import inspect
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager, ExitStack, redirect_stdout
+from contextlib import contextmanager, ExitStack, redirect_stdout, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 from typing import cast, final
 from uuid import uuid4
@@ -34,7 +35,12 @@ from scripts.aws_target.aws_cli import AwsExecutor, aws_error_code, execute_comm
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus, spot_quota
 from scripts.aws_target.config import SpendingSettings, gate_deployment, read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
+from scripts.buildlog.store import host_name
 from scripts.lib import conf
+from scripts.mac_test.cargo_timings import (
+    STAMPED_TIMING_REPORT, ConfirmedTimingReport, NoTimingReport, TimingDirectorySnapshot,
+    format_timing_report, timing_files,
+)
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
 
@@ -71,6 +77,9 @@ PREPARED_NAMES = frozenset(('hana-tests.tar.zst', 'closure.export', 'source.tar'
     'gpu_trial_wrapper.py', 'machines', 'prepare.log'))
 RUN_INPUT_NAMES = ('hana-tests.tar.zst', 'closure.export', 'source.tar', 'payload.tar', 'cargo-home')
 GPU_TRIAL_ARTIFACT_PREFIX = 'artifacts/gpu-size-trial/'
+GPU_TIMING_REPORT = 'cargo-timing.html'
+GPU_TIMING_COPY_MAX_SECONDS = 60
+GPU_TIMING_COPY_NOT_KEPT = 'The Hana GPU timing report copy was not kept'
 GPU_TRIAL_REQUEST_PREFIX = 'requests/gpu-size-trial/'
 GPU_SPOT_FILTERS = ('Name=instance-lifecycle,Values=spot', 'Name=instance-state-name,Values=pending,running',
                     'Name=instance-type,Values=g*.*,vt*.*')
@@ -165,6 +174,28 @@ class HanaGpuNextestResult:
     exit_code: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class HanaGpuTimingCopy:
+    guest: str
+    path: str
+
+    def location(self) -> str:
+        return format_timing_report(ConfirmedTimingReport(host_name(), self.path)) + f' (copy of guest report from {self.guest})'
+
+
+@dataclass(frozen=True)
+class HanaGpuNextestResultWithTimingCopy(HanaGpuNextestResult):
+    timing_copy: HanaGpuTimingCopy
+
+
+@final
+class HanaGpuNoTestsWithTimingCopy(ValueError):
+    def __init__(self, timing_copy: HanaGpuTimingCopy) -> None:
+        self.reason = 'Cargo nextest selected no tests'
+        self.timing_copy = timing_copy
+        super().__init__(self.reason)
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -268,7 +299,8 @@ def check_nextest_pass(stdout: str, stderr: str, arguments: Sequence[str]) -> No
             raise ValueError('The Hana GPU result has no passing test for the filter ' + name)
 
 
-def nextest_result(document: dict[str, object], attempt: str, manifest: Mapping[str, object]) -> HanaGpuNextestResult:
+def nextest_result(document: dict[str, object], attempt: str, manifest: Mapping[str, object],
+                   box: Path) -> HanaGpuNextestResult:
     if document.get('status') != 'complete':
         raise ValueError('The Hana GPU run did not complete: ' + str(document.get('reason', 'unknown reason')))
     result = mapping(document['nextest'])
@@ -278,12 +310,20 @@ def nextest_result(document: dict[str, object], attempt: str, manifest: Mapping[
     code, stdout, stderr = result.get('exit_code'), result.get('stdout'), result.get('stderr')
     if not isinstance(code, int) or isinstance(code, bool) or not 0 <= code <= 255 or not isinstance(stdout, str) or not isinstance(stderr, str):
         raise ValueError('The Hana GPU result has an invalid exit status or output')
-    if code == 4:
-        raise ValueError('Cargo nextest selected no tests')
     if code == 0:
         arguments = string_list(mapping(manifest['hana_nextest'])['arguments'])
         check_nextest_pass(stdout, stderr, arguments)
-    return HanaGpuNextestResult(attempt, str(commit), str(tree), code, stdout, stderr)
+    host = result.get('timing_host')
+    fields = (attempt, str(commit), str(tree), code, stdout, stderr)
+    report = box / GPU_TIMING_REPORT
+    if isinstance(host, str) and re.fullmatch(r'[A-Za-z0-9_-]+', host) and report.is_file():
+        copy = HanaGpuTimingCopy(host, str(report))
+        if code == 4:
+            raise HanaGpuNoTestsWithTimingCopy(copy)
+        return HanaGpuNextestResultWithTimingCopy(*fields, copy)
+    if code == 4:
+        raise ValueError('Cargo nextest selected no tests')
+    return HanaGpuNextestResult(*fields)
 
 
 def required_vcpus(limits: TrialLimits) -> int:
@@ -1082,15 +1122,26 @@ def start_service(folder: Path, directory: Path, settings_path: Path,
         return execute(command)
 
 
+def nextest_build_options(arguments: Sequence[str]) -> Sequence[str]:
+    return arguments[:arguments.index('--')] if '--' in arguments else arguments
+
+
+@dataclass(frozen=True)
+class HanaGuestNextestRun:
+    result: dict[str, object]
+    report: Path | NoTimingReport
+
+
 def run_hana_nextest(root: Path, source: Path, manifest: dict[str, object], links: dict[str, object],
-                     environment: dict[str, str]) -> dict[str, object]:
+                     environment: dict[str, str]) -> HanaGuestNextestRun:
     _ = hardware_vulkan(checked(['vulkaninfo', '--summary'], source, environment=environment))
     arguments = string_list(mapping(manifest['hana_nextest'])['arguments'])
-    build_options = arguments[:arguments.index('--')] if '--' in arguments else arguments
+    build_options = nextest_build_options(arguments)
     locked = [] if '--locked' in build_options or '--frozen' in build_options else ['--locked']
     offline = [] if '--offline' in build_options or '--frozen' in build_options else ['--offline']
     target = root / 'target'
     target.mkdir()
+    before = TimingDirectorySnapshot.before_run(target) if '--timings' in build_options else NoTimingReport()
     environment.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_JOBS='8', NEXTEST_EXPERIMENTAL_LIBTEST_JSON='1')
     command = [environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'run', *locked, *offline,
                '--target-dir', str(target), '--no-tests', 'fail', '--color', 'never',
@@ -1099,13 +1150,25 @@ def run_hana_nextest(root: Path, source: Path, manifest: dict[str, object], link
         status = subprocess.run(command, cwd=source, env=environment, stdout=stdout, stderr=stderr).returncode
         if status < 0:
             raise ValueError(f'Cargo nextest stopped on signal {-status}')
-        if status == 4:
-            raise ValueError('Cargo nextest selected no tests')
         _ = stdout.seek(0)
         _ = stderr.seek(0)
-        return {'attempt': links['attempt'], 'commit': manifest['commit'], 'tree': manifest['tree'],
-                'exit_code': status, 'stdout': stdout.read().decode('utf-8', errors='replace'),
-                'stderr': stderr.read().decode('utf-8', errors='replace')}
+        output = stdout.read().decode('utf-8', errors='replace')
+        errors = stderr.read().decode('utf-8', errors='replace')
+    result: dict[str, object] = {'attempt': links['attempt'], 'commit': manifest['commit'], 'tree': manifest['tree'],
+                                 'exit_code': status, 'stdout': output, 'stderr': errors}
+    report = before.new_report() if isinstance(before, TimingDirectorySnapshot) else NoTimingReport()
+    if status == 4 and isinstance(report, NoTimingReport):
+        raise ValueError('Cargo nextest selected no tests')
+    return HanaGuestNextestRun(result, report)
+
+
+def guest_timing_copy_deadline(root: Path) -> int:
+    """Limit the optional transfer by the guest deadline and the upload budget."""
+    try:
+        stop_at = int((root / 'stop-at').read_text())
+    except (OSError, ValueError):
+        return 0
+    return min(stop_at, int(time.time()) + GPU_TIMING_COPY_MAX_SECONDS)
 
 
 GUEST = r'''
@@ -1138,6 +1201,8 @@ def publish(run):
 status = 'incomplete'
 reason = ''
 result = {}
+report = NoTimingReport()
+copy_until = 0
 try:
     setup = read_json(root / 'setup.json')
     setup['runner_start'] = time.time()
@@ -1163,7 +1228,13 @@ try:
     environment['CARGO_HOME'] = str(root / 'cargo-home')
     if 'hana_nextest' in manifest:
         verify_hana_nextest(source, version)
-        result['nextest'] = run_hana_nextest(root, source, manifest, links, environment)
+        run = run_hana_nextest(root, source, manifest, links, environment)
+        result['nextest'] = run.result
+        report = run.report
+        if isinstance(report, Path):
+            copy_until = guest_timing_copy_deadline(root)
+            if copy_until > time.time():
+                run.result.update(timing_host=host_name(), timing_copy_until=copy_until)
     else:
         measure_machine(root, str(links['instance_type']), source, environment, prefix=(), publish=publish, host=False)
     status = 'complete'
@@ -1174,15 +1245,32 @@ finally:
     write_json(finished, {'status': status, 'reason': reason,
                          'setup': read_json(root / 'setup.json'), 'finished': time.time(), **result})
     transfer('Upload GPU final result', '--max-time', '60', '-T', str(finished), str(links['finished']))
+
+if isinstance(report, Path):
+    remaining = int(copy_until - time.time())
+    if remaining > 0:
+        try:
+            transfer('Upload GPU timing report', '--max-time', str(remaining), '-T', str(report),
+                     str(links['timing_report']))
+        except (KeyError, ValueError):
+            print(GPU_TIMING_COPY_NOT_KEPT, file=sys.stderr)
+    else:
+        print(GPU_TIMING_COPY_NOT_KEPT, file=sys.stderr)
 '''
 
 
 def guest_program() -> str:
     functions = (mapping, read_json, write_json, digest, checked, hardware_vulkan, trial_environment, remove_path,
-                 archive_arguments, junit_config, no_publish, measure_machine, string_list, verify_hana_nextest, run_hana_nextest)
+                 archive_arguments, junit_config, no_publish, measure_machine, string_list, verify_hana_nextest,
+                 nextest_build_options, host_name, NoTimingReport, timing_files, TimingDirectorySnapshot,
+                 HanaGuestNextestRun, run_hana_nextest, guest_timing_copy_deadline)
     return ('from __future__ import annotations\n'
             + 'from pathlib import Path\nfrom collections.abc import Callable, Mapping, Sequence\n'
-            + 'from typing import cast\nimport hashlib, json, os, re, shlex, shutil, subprocess, sys, tarfile, time\n'
+            + 'from dataclasses import dataclass\nfrom typing import cast\n'
+            + 'import hashlib, json, os, re, shlex, shutil, socket, stat, subprocess, sys, tarfile, time\n'
+            + f'GPU_TIMING_COPY_MAX_SECONDS = {GPU_TIMING_COPY_MAX_SECONDS}\n'
+            + f'GPU_TIMING_COPY_NOT_KEPT = {GPU_TIMING_COPY_NOT_KEPT!r}\n'
+            + f'STAMPED_TIMING_REPORT = {STAMPED_TIMING_REPORT!r}\n'
             + '\n'.join(inspect.getsource(function) for function in functions) + GUEST)
 
 
@@ -1300,11 +1388,11 @@ class GpuSpotLaunch:
         }
 
 
-def gpu_object_exists(api: AwsCli, bucket: str, key: str) -> bool:
+def gpu_object_exists(api: AwsCli, bucket: str, key: str, *, timeout_s: float | None = None) -> bool:
     """List the exact object key."""
     # The exact key comes first in a general-purpose bucket's sorted response.
     reply = api.call('list-objects-v2', '--bucket', bucket, '--prefix', key,
-                     '--max-keys', '1', '--no-paginate', service='s3api')
+                     '--max-keys', '1', '--no-paginate', service='s3api', timeout_s=timeout_s)
     return any(row.get('Key') == key for row in ledger.rows({'Contents': reply.get('Contents', [])}, 'Contents'))
 
 
@@ -1538,8 +1626,11 @@ class GpuTrialWorker:
                  'finished': url('PUT', result_prefix + '/finished.json'),
                  'payload_sha256': str(online['payload_sha256']), 'closure_sha256': str(hashes['closure.export']),
                  'instance_type': str(request['instance_type']), 'started': str(request['started'])}
-        if isinstance(nextest_request(manifest), HanaGpuNextestRequest):
+        mode = nextest_request(manifest)
+        if isinstance(mode, HanaGpuNextestRequest):
             links['attempt'] = str(request['attempt'])
+            if '--timings' in nextest_build_options(mode.arguments):
+                links['timing_report'] = url('PUT', result_prefix + '/' + GPU_TIMING_REPORT)
         else:
             links.update(archive=url('GET', prefix + '/hana-tests.tar.zst'),
                          archive_sha256=str(hashes['hana-tests.tar.zst']),
@@ -1611,6 +1702,44 @@ class GpuTrialWorker:
                 self.gates.pause(min(poll_seconds, remaining))
         if not self.download_result(bucket, key, path):
             raise ValueError('The Hana GPU box reached its stop time without a result')
+
+    def retain_nextest_timing(self, box: Path, attempt: str, bucket: str, poll_seconds: int) -> None:
+        finished = box / 'finished.json'
+        report = box / GPU_TIMING_REPORT
+        if report.is_file() or not finished.is_file():
+            return
+        document = read_json(finished)
+        if document.get('status') != 'complete':
+            return
+        result = mapping(document['nextest'])
+        if result.get('attempt') != attempt or 'timing_host' not in result:
+            print(GPU_TIMING_COPY_NOT_KEPT, file=sys.stderr)
+            return
+        now = self.gates.clock()
+        deadline = result.get('timing_copy_until')
+        copy_until = min(deadline, now + GPU_TIMING_COPY_MAX_SECONDS) if type(deadline) is int else now
+        temporary = report.with_suffix('.partial')
+        key = f'{GPU_TRIAL_ARTIFACT_PREFIX}{attempt}/{GPU_TIMING_REPORT}'
+        try:
+            api = self.gates.api
+            while (remaining := copy_until - self.gates.clock()) > 0:
+                if gpu_object_exists(api, bucket, key, timeout_s=min(api.timeout_s, remaining)):
+                    remaining = copy_until - self.gates.clock()
+                    if remaining <= 0:
+                        break
+                    if (self.gates.download(bucket, key, temporary, timeout_s=min(api.timeout_s, remaining))
+                            and self.gates.clock() < copy_until):
+                        _ = temporary.replace(report)
+                        return
+                remaining = copy_until - self.gates.clock()
+                if remaining > 0:
+                    self.gates.pause(min(poll_seconds, remaining))
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+            pass
+        finally:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        print(GPU_TIMING_COPY_NOT_KEPT, file=sys.stderr)
 
     def execute(self, folder: Path, deployment: dict[str, object]) -> None:
         folder = host_trial_folder(folder)
@@ -1708,6 +1837,7 @@ class GpuTrialWorker:
                                    for size in cast(list[str], online['types'])}
             cloud_gate.save(path, online)
         online['bucket'] = deployment['bucket']
+        retain_timing = isinstance(mode, HanaGpuNextestRequest) and '--timings' in nextest_build_options(mode.arguments)
         self.gates.charges()
         self.artifacts(folder, online)
         trial_id = ledger.text(online, 'trial')
@@ -1734,8 +1864,13 @@ class GpuTrialWorker:
                             self.gates.book.resolve_gate(attempt, ledger.GateAbsent(int(self.gates.clock())))
                         cloud_gate.save(box / 'outcome.json', result)
                         continue
-                if not self.cleanup(folder):
-                    raise ValueError('The previous GPU box termination remains unconfirmed')
+                try:
+                    if retain_timing:
+                        poll_seconds = cloud_gate.settings().whole('gpu_size_trial_result_poll_s')
+                        self.retain_nextest_timing(box, attempt, ledger.text(online, 'bucket'), poll_seconds)
+                finally:
+                    if not self.cleanup(folder):
+                        raise ValueError('The previous GPU box termination remains unconfirmed')
                 if isinstance(mode, HanaGpuNextestRequest):
                     self.finish_nextest(folder, box, size, attempt, manifest)
                     return
@@ -1841,6 +1976,8 @@ class GpuTrialWorker:
                     self.gates.record_launch(request, size, str(subnet['zone']), 'launched')
                     if isinstance(mode, HanaGpuNextestRequest):
                         self.collect_nextest(box, request, online, poll_seconds)
+                        if retain_timing:
+                            self.retain_nextest_timing(box, attempt, ledger.text(online, 'bucket'), poll_seconds)
                     else:
                         self.collect(folder, box, request, online, poll_seconds)
             finally:
@@ -1857,7 +1994,11 @@ class GpuTrialWorker:
         result = box / 'finished.json'
         if not result.is_file():
             raise ValueError('The booked Hana GPU attempt has no result')
-        _ = nextest_result(read_json(result), attempt, manifest)
+        try:
+            _ = nextest_result(read_json(result), attempt, manifest, box)
+        except HanaGpuNoTestsWithTimingCopy:
+            # The caller reports the refusal with the retained file.
+            pass
         cloud_gate.save(folder / 'online-result.json', {'trial': manifest['trial'], 'status': 'complete',
                                                          'attempt': attempt, 'instance_type': size})
 
@@ -1958,7 +2099,7 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
             attempt = ledger.text(outcome, 'attempt')
             manifest = read_json(folder / 'manifest.json')
             box = gpu_box(folder, ledger.text(manifest, 'trial'), size, attempt)
-            return nextest_result(read_json(box / 'finished.json'), attempt, manifest)
+            return nextest_result(read_json(box / 'finished.json'), attempt, manifest, box)
         error = folder / 'run-error.json'
         if error.is_file():
             raise ValueError(ledger.text(read_json(error), 'reason'))
@@ -2008,6 +2149,8 @@ def main(arguments: Sequence[str]) -> int:
     except (OSError, ValueError, KeyError, subprocess.SubprocessError, GateRefused) as error:
         if command == 'nextest':
             print('Hana GPU infrastructure failure: ' + str(error), file=sys.stderr)
+            if isinstance(error, HanaGpuNoTestsWithTimingCopy):
+                print(error.timing_copy.location(), file=sys.stderr)
             return NEXTEST_INFRASTRUCTURE_EXIT
         print('GPU size trial refused: ' + str(error), file=sys.stderr)
         return 1

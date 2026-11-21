@@ -398,19 +398,23 @@ raise SystemExit(75)
 
         with mock.patch.object(self.admission.server, "handle_request", side_effect=close_placement):
             result = self.verify("test", "sample", "--test", "shader_variants", "--target", "hana-gpu")
+            timed = self.verify("test", "sample", "--timings", "--test", "shader_variants", "--target", "hana-gpu")
             check = self.verify("check", "sample", "--target", "hana-gpu")
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 2, output)
+        self.assertEqual(timed.returncode, 2, timed.stdout + timed.stderr)
         self.assertEqual(check.returncode, 2, check.stdout + check.stderr)
-        request, check_request = requests
+        request, timed_request, check_request = requests
         self.assertEqual(check_request.constraints.command, (
             "cargo", "check", "--workspace", "--lib", "--bins", "--features", "hana/dynamic_linking"))
         self.assertEqual(request.constraints.command, (
             "cargo", "nextest", "run", "--no-fail-fast", "--workspace", "--test", "shader_variants",
             "-E", "package(sample)"))
+        self.assertEqual(timed_request.constraints.command, (*request.constraints.command, "--timings"))
         candidate, = request.constraints.candidates
         self.assertEqual(candidate.destination.target, "hana-gpu")
         self.assertIsInstance(candidate.eligibility, placement.AllowedHost)
+        self.assertEqual(timed_request.constraints.candidates, request.constraints.candidates)
         self.assertEqual(output.count(f"verify.sh: target hana-gpu refused: {reason}\n"), 1, output)
         self.assertEqual(self.local_runs(), [])
 

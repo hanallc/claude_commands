@@ -37,6 +37,7 @@ from scripts.lib.dev_shell import (
     shell_key as shell_key,
 )
 from scripts.mac_test.abandoned_sessions import removal_script
+from scripts.mac_test import cargo_timings
 
 if TYPE_CHECKING:
     from scripts.copies import copies
@@ -555,7 +556,8 @@ def nextest_words_with_skip(
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
                    words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
                    test_environment: tuple[tuple[str, str], ...] = (),
-                   clear_environment: str = '') -> str:
+                   clear_environment: str = '', *,
+                   timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN) -> str:
     arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
@@ -565,6 +567,8 @@ def command_script(mirror: str, values: dict[str, str], repository: str, verb: s
         arguments.extend(['--env', name + '=' + value])
     if clear_environment:
         arguments.extend(['--clear-environment', clear_environment])
+    if isinstance(timing, cargo_timings.TimingRunToken):
+        arguments.append(timing.argument())
     arguments.extend(['--', *words])
     return shlex.join(arguments)
 
@@ -595,10 +599,12 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
         test_environment: tuple[tuple[str, str], ...] = (),
-        clear_environment: str = '') -> int:
+        clear_environment: str = '', *,
+        timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN) -> int:
     try:
         with slot_run(mirror):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity,
+                                test_environment, clear_environment, timing=timing)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -707,7 +713,8 @@ def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
         test_environment: tuple[tuple[str, str], ...] = (),
-        clear_environment: str = '') -> int:
+        clear_environment: str = '', *,
+        timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN) -> int:
     if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
         raise ValueError('unsupported remote verb')
     if verb == 'nextest':
@@ -778,6 +785,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     abandoned_sessions = (removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
                           if target == (mirror / 'target').resolve() else '')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
+    before = (cargo_timings.TimingDirectorySnapshot.before_run(target)
+              if isinstance(timing, cargo_timings.TimingRunToken) else cargo_timings.NoTimingReport())
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
@@ -800,9 +809,11 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         toolchain = toolchain_environment.read_text()
         if toolchain:
             environment['RUSTUP_TOOLCHAIN'] = toolchain
+    report = before.new_report() if isinstance(before, cargo_timings.TimingDirectorySnapshot) else before
     try:
         free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
         if free < floor:
+            report = cargo_timings.retain_report(report, target)
             if target.exists():
                 shutil.rmtree(target)
             cleanup = '0' if trim_build_folder(target, environment) == 0 else '1'
@@ -812,6 +823,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     except OSError:
         cleanup = '1'
     if step_started:
+        if isinstance(timing, cargo_timings.TimingRunToken):
+            print(cargo_timings.remote_report_line(timing, report), end='', flush=True)
         print(f'mac_exit={status}', flush=True)
     print(f'mac_cleanup={cleanup}', flush=True)
     return status
@@ -830,6 +843,7 @@ class RunnerArguments(argparse.Namespace):
         self.repo_identity: str = ''
         self.environment: list[str] = []
         self.clear_environment: str = ''
+        self.timing: cargo_timings.TimingRunToken | cargo_timings.UntimedRun = cargo_timings.UNTIMED_RUN
         self.words: list[str] = []
 
 
@@ -848,6 +862,7 @@ def main() -> int:
     _ = runner.add_argument('--repo-identity', default='')
     _ = runner.add_argument('--clear-environment', default='')
     _ = runner.add_argument('--env', dest='environment', action='append', default=[])
+    _ = runner.add_argument(cargo_timings.TIMING_TOKEN_OPTION, dest='timing', type=cargo_timings.TimingRunToken)
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -862,7 +877,7 @@ def main() -> int:
                arguments.call_id, arguments.tree_key, arguments.repo_identity,
                tuple((name, value) for entry in arguments.environment
                      for name, _, value in (entry.partition('='),)),
-               arguments.clear_environment)
+               arguments.clear_environment, timing=arguments.timing)
 
 
 if __name__ == '__main__':

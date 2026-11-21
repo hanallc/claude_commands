@@ -402,10 +402,10 @@ esac
                    path.parent, processes=(process,), watch_writes=True)
         self.assertIn(text, path.read_text(errors="replace"))
 
-    def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
+    def build_stub(self, targets: list[dict[str, object]], *, target: Path | None = None) -> dict[str, str]:
         """A cargo whose metadata lists `targets` for sample and whose build makes each bin and example."""
         metadata = json.dumps({"packages": [{"name": "sample", "targets": targets, "features": {}}],
-                               "target_directory": str(self.root / "target")})
+                               "target_directory": str(target or self.root / "target"), "workspace_root": str(self.root)})
         cargo = self.root / "stubs" / "cargo"
         _ = cargo.write_text("#!/bin/sh\n"
                              + 'if [ "$1" = metadata ]; then printf "%s\\n" "$TEST_METADATA"; exit 0; fi\n'
@@ -414,12 +414,19 @@ esac
                              + 'for word in "$@"; do case "$word" in --release) profile=release ;; esac; done\n'
                              + 'for word in "$@"; do\n'
                              + '    case "$kind" in\n'
-                             + '        bin) mkdir -p "$CARGO_TARGET_DIR/$profile"; : > "$CARGO_TARGET_DIR/$profile/$word"; chmod +x "$CARGO_TARGET_DIR/$profile/$word" ;;\n'
-                             + '        example) mkdir -p "$CARGO_TARGET_DIR/$profile/examples"; : > "$CARGO_TARGET_DIR/$profile/examples/$word"; chmod +x "$CARGO_TARGET_DIR/$profile/examples/$word" ;;\n'
+                             + '        bin) mkdir -p "$TEST_BUILD_TARGET/$profile"; : > "$TEST_BUILD_TARGET/$profile/$word"; chmod +x "$TEST_BUILD_TARGET/$profile/$word" ;;\n'
+                             + '        example) mkdir -p "$TEST_BUILD_TARGET/$profile/examples"; : > "$TEST_BUILD_TARGET/$profile/examples/$word"; chmod +x "$TEST_BUILD_TARGET/$profile/examples/$word" ;;\n'
                              + '    esac\n'
                              + '    case "$word" in --bin) kind=bin ;; --example) kind=example ;; *) kind="" ;; esac\n'
-                             + 'done\n')
-        return {**self.environment, "TEST_METADATA": metadata,
+                             + 'done\n'
+                             + 'for word in "$@"; do\n'
+                             + '    if [ "$word" = --timings ]; then\n'
+                             + '        printf "%s\\n" "Cargo report" > "$TEST_BUILD_TIMING_REPORT"\n'
+                             + '        printf "      Timing report saved to %s\\n" "$TEST_BUILD_TIMING_REPORT" >&2\n'
+                             + '    fi\n'
+                             + 'done\n'
+                             + 'exit "${TEST_BUILD_STATUS:-0}"\n')
+        return {**self.environment, "TEST_METADATA": metadata, "TEST_BUILD_TARGET": str(target or self.root / "target"),
                 "PLAN_DELEGATE_BOARD_DIR": str(self.root / "board"), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
 
     def build(self, environment: dict[str, str], *words: str) -> subprocess.CompletedProcess[str]:
