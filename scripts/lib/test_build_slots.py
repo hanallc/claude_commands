@@ -1,7 +1,7 @@
 """Repository slots retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 import io
@@ -14,15 +14,12 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 from typing import cast, override
 import unittest
 from unittest import mock
 
 from scripts.lib import build_folders, build_slots, copy_record, git_rescue, scratch
 from scripts.copies import copies
-from scripts.build_queue import admission_client, admission_protocol as wire, slot_wait
-from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
@@ -81,9 +78,9 @@ class BuildSlotsTests(unittest.TestCase):
                               env={**os.environ, "PYTHONPATH": str(checkout), "PYTHONSAFEPATH": "1"},
                               timeout=TEST_HANG_GUARD_SECS)
 
-    def run_arguments(self) -> tuple[str, ...]:
+    def run_arguments(self, unit: str = "queue") -> tuple[str, ...]:
         return ("run", "--source", str(self.source), "--commit", self.base,
-                "--showrunner", "builds", "--unit", "queue", "--work", "proof", "--purpose", "test", "--")
+                "--showrunner", "builds", "--unit", unit, "--work", "proof", "--purpose", "test", "--")
 
     def clone_source(self) -> tuple[Path, str]:
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
@@ -350,7 +347,6 @@ class BuildSlotsTests(unittest.TestCase):
         with self.assertRaises(build_slots.SlotsNotConfigured):
             with self.take():
                 self.fail("a slot was allocated without a configured root")
-        build_slots.sweep_slots()
 
         self.assertEqual(self.git(self.source, "worktree", "list", "--porcelain"), before)
         self.assertFalse(self.slot_root.exists())
@@ -368,7 +364,7 @@ class BuildSlotsTests(unittest.TestCase):
                 self.assertEqual(self.git(second.path, "rev-parse", "--path-format=absolute", "--git-common-dir"),
                                  str(self.source / ".git"))
 
-    def test_interrupted_creation_recovers_before_a_caller_gets_the_slot(self) -> None:
+    def test_interrupted_slot_creation_keeps_the_earlier_folder(self) -> None:
         probe = """import os, pathlib, subprocess, sys
 from unittest import mock
 from scripts.lib import build_folders, build_slots
@@ -387,29 +383,31 @@ def interrupt_checkout(argv, **options):
     return result
 patch = (mock.patch.object(build_folders.os, 'mkdir', side_effect=interrupt_mkdir) if stage == 'mkdir'
          else mock.patch.object(subprocess, 'run', side_effect=interrupt_checkout))
-with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='queue', work='proof', purpose='test'):
+selection = build_slots.ExactSlotRequest(int(path.name.rsplit('slot', 1)[1]))
+with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='queue', work='proof',
+                                  purpose='test', selection=selection):
     raise RuntimeError('the interruption did not occur')
 """
-        path = self.slot_root / "widget-slot1"
         checkout = Path(__file__).resolve().parents[2]
-        for stage in ("mkdir", "checkout"):
+        for number, stage in enumerate(("mkdir", "checkout"), start=1):
             with self.subTest(stage=stage):
+                path = self.slot_root / f"widget-slot{number}"
                 result = subprocess.run([sys.executable, "-c", probe, str(self.source), str(path), stage],
                                         cwd=checkout, env={**os.environ, "PYTHONPATH": str(checkout)},
                                         capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
                 if stage == "checkout":
                     _ = (path / "recovery.txt").write_text("work before recovery\n")
-                with self.take() as recovered:
-                    self.assertEqual(recovered.path, path)
+                with self.assertRaisesRegex(FileExistsError, "the slot checkout is incomplete"), build_slots.take_slot(
+                        self.source, self.base, showrunner="builds", unit="queue", work="proof", purpose="test",
+                        selection=build_slots.ExactSlotRequest(number)):
+                    self.fail("an incomplete slot was reused")
+                self.assertTrue(path.is_dir())
+                self.assertEqual(build_folders.build_folder_state(path), "free")
+                if stage == "checkout":
                     self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
                     self.assertEqual((path / "change.txt").read_text(), "first commit\n")
-                    if stage == "checkout":
-                        refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
-                        self.assertEqual(len(refs), 1)
-                        self.assertEqual(self.git(self.source, "show", refs[0] + ":recovery.txt"), "work before recovery")
-                _ = self.git(self.source, "worktree", "remove", str(path))
-                path.with_name(path.name + ".lease.json").unlink()
+                    self.assertEqual((path / "recovery.txt").read_text(), "work before recovery\n")
 
     def test_source_without_origin_uses_the_main_checkout_name(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
@@ -428,7 +426,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         _ = (path / "local.txt").write_text("local commit\n")
         tip = commit_repository(path, "private commit")
         _ = (path / "edit.txt").write_text("unfinished edit\n")
-        with self.assertRaisesRegex(ValueError, "different Git repository; retained"):
+        with self.assertRaisesRegex(FileExistsError, "the slot checkout is incomplete"):
             with self.take():
                 self.fail("an incomplete private repository became a slot")
         self.assertEqual(self.git(path, "rev-parse", "HEAD"), tip)
@@ -501,7 +499,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         self.assertEqual(self.git(self.source, "status", "--porcelain"), "?? target/")
 
     def test_rescue_failure_preserves_source_and_cargo_and_frees_the_lock(self) -> None:
-        for action in ("reset", "recovery", "sweep"):
+        for action in ("reset", "recovery"):
             with self.subTest(action=action):
                 with self.take() as slot:
                     path, cargo = slot.path, slot.cargo_dir
@@ -513,18 +511,14 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                     lease = self.lease(path)
                     lease["ready"] = False
                     _ = path.with_name(path.name + ".lease.json").write_text(json.dumps(lease))
-                output = io.StringIO()
                 error = git_rescue.RescueError(("git", "update-ref"), "fixture write failure")
-                with mock.patch.object(git_rescue, "rescue", side_effect=error):
-                    if action != "sweep":
-                        with self.assertRaises(git_rescue.RescueError):
-                            with self.take():
-                                self.fail("reset continued after a failed rescue")
-                    else:
-                        with redirect_stdout(output), redirect_stderr(output):
-                            build_slots.sweep_slots()
-                        self.assertEqual(len(output.getvalue().splitlines()), 1)
-                        self.assertIn("fixture write failure", output.getvalue())
+                expected_error = FileExistsError if action == "recovery" else git_rescue.RescueError
+                with mock.patch.object(git_rescue, "rescue", side_effect=error) as rescue:
+                    with self.assertRaises(expected_error):
+                        with self.take():
+                            self.fail("reset continued after a failed rescue")
+                    if action == "recovery":
+                        rescue.assert_not_called()
                 self.assertEqual((path / "change.txt").read_text(), "do not lose this edit\n")
                 self.assertEqual((cargo / "keep").read_text(), "cached output\n")
                 self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
@@ -601,54 +595,6 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         with self.take() as next_holder:
             self.assertEqual(next_holder.path, path)
 
-    def test_sweep_rescues_old_free_slots_but_keeps_held_slots(self) -> None:
-        with ExitStack() as holding:
-            with self.take() as first:
-                old_path, old_cargo = first.path, first.cargo_dir
-                _ = (old_path / "change.txt").write_text("old slot work\n")
-                old_cargo.mkdir(parents=True, exist_ok=True)
-                _ = (old_cargo / "cache").write_text("old cache\n")
-                held = holding.enter_context(self.take())
-                held.cargo_dir.mkdir(parents=True, exist_ok=True)
-                _ = (held.cargo_dir / "cache").write_text("held cache\n")
-            self.age_lease(old_path)
-            self.age_lease(held.path)
-
-            build_slots.sweep_slots()
-
-            self.assertFalse(old_path.exists())
-            self.assertFalse(old_cargo.exists())
-            self.assertTrue(held.path.is_dir())
-            self.assertEqual((held.cargo_dir / "cache").read_text(), "held cache\n")
-        self.assertNotIn(str(old_path), self.git(self.source, "worktree", "list", "--porcelain"))
-        refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
-        self.assertTrue(any(self.git(self.source, "show", ref + ":change.txt") == "old slot work" for ref in refs))
-
-    def test_sweep_deletes_oversized_cargo_once_and_keeps_the_source(self) -> None:
-        with self.take() as slot:
-            path, cargo = slot.path, slot.cargo_dir
-            cargo.mkdir(parents=True, exist_ok=True)
-            _ = (cargo / "cache").write_bytes(b"x" * 256)
-        with self.take() as reused:
-            self.assertEqual(reused.path, path)
-            self.assertEqual((cargo / "cache").stat().st_size, 256)
-        source_stat = (path / "same.txt").stat()
-        _ = write_config_fixture(self.settings,
-                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=64\n")
-        result = self.command("sweep")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(cargo.exists())
-        self.assertEqual((path / "same.txt").read_text(), "unchanged\n")
-        self.assertEqual((path / "same.txt").stat().st_ino, source_stat.st_ino)
-        self.assertEqual(len(result.stdout.splitlines()), 1)
-        self.assertRegex(result.stdout, r"slots: widget-slot1 was .+ GiB, over its .+ GiB limit; its build output is deleted\.")
-        repeated = io.StringIO()
-        with redirect_stdout(repeated):
-            build_slots.sweep_slots()
-        self.assertEqual(repeated.getvalue(), "")
-        self.assertTrue(path.is_dir())
-
     def test_take_deletes_oversized_output_after_rescue_and_retains_source_times(self) -> None:
         with self.take() as slot:
             path, cargo = slot.path, slot.cargo_dir
@@ -674,29 +620,19 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn("widget-slot1", output.getvalue())
 
-    def test_sweep_finishes_an_interrupted_delete_from_its_lease(self) -> None:
-        with self.take() as slot:
-            path, cargo = slot.path, slot.cargo_dir
-            _ = (cargo / "cache").write_text("cached output\n")
-        self.age_lease(path)
-        with mock.patch.object(shutil, "rmtree", side_effect=OSError("cargo removal stopped")):
-            with self.assertRaisesRegex(OSError, "cargo removal stopped"):
-                build_slots.sweep_slots()
-        self.assertFalse(path.exists())
-        self.assertEqual((cargo / "cache").read_text(), "cached output\n")
-        build_slots.sweep_slots()
-        self.assertFalse(cargo.exists())
-        self.assertFalse(path.with_name(path.name + ".lease.json").exists())
-        with self.take() as replacement:
-            self.assertEqual(replacement.path, path)
-            self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
-
     def test_run_gives_the_child_the_cargo_environment_and_lock_and_keeps_its_exit_code(self) -> None:
-        probe = """import fcntl, json, os, pathlib, sys
+        checkout = Path(__file__).resolve().parents[2]
+        probe = f"import sys\nsys.path.insert(0, {str(checkout)!r})\n" + """import fcntl, json, os, pathlib
+from scripts.lib import build_folders
 path = pathlib.Path.cwd()
 descriptor = int(os.environ['BUILD_FOLDER_LOCK_FD'])
+assert descriptor == int(os.environ[build_folders.NUMBERED_COPY_LOCK_ENV])
 lock = path.with_name(path.name + '.lock')
 assert os.path.samestat(os.fstat(descriptor), lock.stat())
+with build_folders.numbered_copy_use_lease(path) as child:
+    assert isinstance(child, build_folders.NumberedCopyUseLease)
+    assert child.source.path == path
+    assert os.path.samestat(os.fstat(child.pass_fds[0]), lock.stat())
 with lock.open('r+') as competing:
     try:
         fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -711,76 +647,11 @@ sys.exit(7)
 
         self.assertEqual(result.returncode, 7, result.stderr)
         report = cast(dict[str, object], json.loads(result.stdout))
-        self.assertEqual(report, {"path": str(self.slot_root / "widget-slot1"),
-                                  "cargo": str(self.cargo_root / "widget-slot1"), "held": True})
-        path = self.slot_root / "widget-slot1"
+        self.assertEqual(report, {"path": str(build_folders.copy_path("widget", "queue", 1)),
+                                  "cargo": str(build_folders.copy_path("widget", "queue", 1) / "target"), "held": True})
+        path = build_folders.copy_path("widget", "queue", 1)
         self.assertTrue(path.is_dir())
         self.assertEqual(build_folders.build_folder_state(path), "free")
-
-    def test_run_exits_75_at_the_maximum_without_starting_the_child(self) -> None:
-        _ = write_config_fixture(self.settings,
-                                 f"slots.{self.machine}.widget.max=1\n")
-        marker = self.root / "child-started"
-        original = dict(os.environ)
-        with AdmissionFixture() as fixture:
-            fixture.clock.epoch = time.time()
-
-            def expire_after_wait(reply: wire.Reply) -> wire.Reply:
-                if isinstance(reply, wire.RepositorySlotWaiting):
-                    fixture.clock.advance(60)
-                return reply
-
-            with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), \
-                    mock.patch.object(fixture.server, "reply_filter", side_effect=expire_after_wait), fixture.serving():
-                with self.take():
-                    result = self.command(*self.run_arguments(), sys.executable, "-c",
-                                          "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker))
-
-        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-        self.assertEqual(len((result.stdout + result.stderr).splitlines()), 2)
-        self.assertIn("widget", result.stdout + result.stderr)
-        self.assertFalse(marker.exists())
-
-    @unittest.skipUnless(sys.platform == "linux", "repository slot advice uses the Linux queue")
-    def test_false_ready_retries_the_same_wait_before_starting_work(self) -> None:
-        _ = private_slot_config(self.root, repository="widget", maximum=1)
-        position = build_slots.SlotQueuePosition("slot-wait", time.time())
-        requests: list[wire.RepositorySlotRequest] = []
-        work: list[Path] = []
-
-        with ExitStack() as holder:
-            held = holder.enter_context(self.take())
-
-            def advise(request: wire.RepositorySlotRequest) -> wire.RepositorySlotReady:
-                self.assertEqual(work, [])
-                requests.append(request)
-                self.assertLessEqual(len(requests), 2)
-                if len(requests) == 2:
-                    holder.close()
-                return wire.RepositorySlotReady()
-
-            with mock.patch.object(admission_client, "repository_slot", side_effect=advise):
-                with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
-                                           work="proof", purpose="test", queue_position=position) as slot:
-                    work.append(slot.path)
-
-        first, retry = requests
-        self.assertEqual(first.episode, position.episode)
-        self.assertEqual(first.since, position.since)
-        self.assertGreater(first.deadline, position.since)
-        self.assertEqual(retry, first)
-        self.assertEqual(work, [held.path])
-
-    def test_mac_capacity_wait_expires_without_an_admission_service(self) -> None:
-        _ = write_config_fixture(self.settings,
-            f"slots.{self.machine}.widget.max=1\n# range: 5e-324..\nslots.wait_seconds=0.01\n")
-        with self.take() as held, mock.patch.object(sys, "platform", "darwin"), redirect_stderr(io.StringIO()):
-            with self.assertRaises(slot_wait.SlotWaitExpired):
-                with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
-                                           work="proof", purpose="test"):
-                    self.fail("the held Mac slot was granted")
-            self.assertEqual(build_folders.build_folder_state(held.path), "held")
-        self.assertEqual(build_folders.build_folder_state(held.path), "free")
 
     @unittest.skipUnless(sys.platform == "linux", "descendant adoption requires Linux")
     def test_run_stops_a_detached_descendant_before_it_releases_the_slot(self) -> None:
@@ -796,8 +667,8 @@ print(child.pid, flush=True)
         try:
             with self.assertRaises(ProcessLookupError):
                 os.kill(descendant, 0)
-            with self.take() as reused:
-                self.assertEqual(reused.path, self.slot_root / "widget-slot1")
+            with build_slots.take_copy(self.source, "HEAD", showrunner="builds", unit="queue", work="proof", purpose="test") as reused:
+                self.assertEqual(reused.path, build_folders.copy_path("widget", "queue", 1))
         finally:
             try:
                 os.kill(descendant, signal.SIGKILL)
@@ -858,7 +729,6 @@ print(json.dumps({'descendant': child.pid, 'group': os.getpgrp(), 'held': held})
     @unittest.skipUnless(sys.platform == "linux", "the test adopts the orphaned Git process")
     def test_git_keeps_the_slot_locked_after_its_caller_dies(self) -> None:
         _ = adopt_descendants()
-        _ = write_config_fixture(self.settings, f"slots.{self.machine}.widget.max=1\n")
         real_git = shutil.which("git")
         assert real_git is not None
         binaries = self.root / "bin"
@@ -877,21 +747,20 @@ os.execv(os.environ['SLOT_REAL_GIT'], [os.environ['SLOT_REAL_GIT'], *arguments])
 """)
         fake.chmod(0o755)
         checkout = Path(__file__).resolve().parents[2]
-        path = self.slot_root / "widget-slot1"
-        for operation in ("worktree add", "checkout", "clean", "worktree remove"):
+        for operation in ("worktree add", "checkout", "clean"):
             with self.subTest(operation=operation):
+                unit = operation.replace(" ", "-")
+                path = build_folders.copy_path("widget", unit, 1)
                 if operation != "worktree add":
-                    with self.take() as slot:
-                        self.assertEqual(slot.path, path)
-                    if operation == "worktree remove":
-                        self.age_lease(path)
+                    with build_slots.take_copy(
+                            self.source, self.base, showrunner="builds", unit=unit, work="proof", purpose="test") as copy:
+                        self.assertEqual(copy.path, path)
                 address = f"slot-git-{os.getpid()}"
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
                     listener.settimeout(TEST_HANG_GUARD_SECS)
                     listener.bind("\0" + address)
                     listener.listen(1)
-                    arguments = (("sweep",) if operation == "worktree remove" else
-                                 (*self.run_arguments(), sys.executable, "-c", "pass"))
+                    arguments = (*self.run_arguments(unit), sys.executable, "-c", "pass")
                     process = subprocess.Popen([sys.executable, "-m", "scripts.lib.build_slots", *arguments],
                                                cwd=checkout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                                env={**os.environ, "PYTHONPATH": str(checkout),
@@ -908,9 +777,10 @@ os.execv(os.environ['SLOT_REAL_GIT'], [os.environ['SLOT_REAL_GIT'], *arguments])
                             _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
                             try:
                                 self.assertEqual(build_folders.build_folder_state(path), "held")
-                                with self.assertRaises(build_slots.SlotsFull):
-                                    with self.take():
-                                        self.fail("the slot was reused while Git still ran")
+                                with build_slots.take_copy(
+                                        self.source, self.base, showrunner="builds", unit=unit,
+                                        work="competing", purpose="test") as competing:
+                                    self.assertEqual(competing.number, 2)
                             finally:
                                 peer.sendall(b"x")
                                 _ = os.waitpid(git_pid, 0)
@@ -918,8 +788,7 @@ os.execv(os.environ['SLOT_REAL_GIT'], [os.environ['SLOT_REAL_GIT'], *arguments])
                         if process.poll() is None:
                             process.kill()
                         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                with self.take() as reused:
-                    self.assertEqual(reused.path, path)
+                self.assertEqual(build_folders.build_folder_state(path), "free")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ except FileNotFoundError:
 import argparse
 import hashlib
 import importlib
+import os
 import json
 import re
 import socket
@@ -56,8 +57,13 @@ class Runner(Protocol):
 
 
 def run_command(repo: Path, arguments: Sequence[str]) -> CommandResult:
-    result = (bulk.cargo_output(repo, arguments) if arguments and Path(arguments[0]).name == "cargo"
-              else subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get()))
+    if arguments and Path(arguments[0]).name == "cargo":
+        result = bulk.cargo_output(repo, arguments)
+    else:
+        leases = copies.COMMAND_LOCKS.get()
+        environment = {**os.environ, "COPIES_COMMAND_LEASE_FDS": ",".join(map(str, leases))}
+        result = subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False,
+                                pass_fds=leases, env=environment)
     return CommandResult(result.returncode, result.stdout, result.stderr)
 
 

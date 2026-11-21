@@ -358,7 +358,8 @@ class WaitingTests(unittest.TestCase):
 
     def assert_scratch_clean(self, worktrees: str, unit_tip: str, merge_tip: str,
                              local_refs: str, origin_refs: str) -> None:
-        slots = sorted(path for path in (self.root / "slots").glob("*-slot*") if path.is_dir())
+        parent = self.root / "build/origin/showrunner-example"
+        slots = [parent / str(number) for number, exists in build_folders.copy_numbers(parent).items() if exists]
         expected = worktrees.split("\n\n")
         for slot in slots:
             expected.append(f"worktree {slot}\nHEAD {self.git('rev-parse', 'HEAD', cwd=slot)}\ndetached")

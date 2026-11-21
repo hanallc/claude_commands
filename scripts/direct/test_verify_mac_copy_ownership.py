@@ -61,17 +61,19 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
             git = fixture.bin_directory / "git"
             git.unlink()
             git.symlink_to(real_git)
-            for arguments in (("init", "-qb", "main"), ("add", "Cargo.toml", "src"),
+            origin = fixture.root / "origin.git"
+            for arguments in (("init", "--bare", "-qb", "main", str(origin)),
+                              ("init", "-qb", "main"), ("add", "Cargo.toml", "src"),
                               ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                               "commit", "-qm", "Prepare the watcher fixture")):
+                               "commit", "-qm", "Prepare the watcher fixture"),
+                              ("remote", "add", "origin", str(origin)), ("push", "origin", "main")):
                 _ = subprocess.run([real_git, *arguments], cwd=fixture.root, env=fixture.environment,
                                    capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             launcher = fixture.root / "verify-copy.sh"
             copy_cli = VERIFY.parents[1] / "copies/copies.py"
             command = shlex.join((sys.executable, str(copy_cli), "run", "--repo", str(fixture.root),
-                                  "--commit", "HEAD", "--", "bash", "-c", 'exec bash "$VERIFY_SCRIPT" "$@"', "verify"))
+                                  "--commit", "HEAD", "--", "bash", str(fixture.verify_script)))
             fixture.write_executable(launcher, '#!/bin/bash\nexec ' + command + ' "$@"\n')
-            fixture.environment["VERIFY_SCRIPT"] = str(fixture.verify_script)
             fixture.verify_script = launcher
             runner = staff.caller_identity()
             with mock.patch.dict(os.environ, fixture.environment), isolated_staff_file(fixture.root / "staff.json", {}):

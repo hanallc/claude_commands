@@ -283,7 +283,7 @@ class SweepCase(unittest.TestCase):
 
     def declare_output_root(self, root: Path) -> None:
         host = socket.gethostname().partition(".")[0]
-        _ = write_config_fixture(conf.path("build_folders"), f"removal.forms.{host}={root}/<repo>/<unit>/<short> {root}/<repo>/ci/<number>\n")
+        _ = write_config_fixture(conf.path("build_folders"), f"removal.path_templates.{host}={root}/<repo>/<unit>/<short> {root}/<repo>/ci/<number>\n")
 
     def output_fixture(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.output_root))).resolve()
@@ -1809,8 +1809,8 @@ class FloorTests(SweepCase):
 
         settings = conf.read("lint")
         configured = (*settings.words("sweep_floor_roots"), str(copies.gates_root()))
-        for scratch, expected in (("/build/claude/scratch", (*configured, "/build/claude/scratch")),
-                                  ("/tmp/claude/scratch", configured)):
+        outside = "/separate/scratch"
+        for scratch, expected in ((outside, (*configured, outside)), ("/tmp/claude/scratch", configured)):
             with self.subTest(scratch=scratch), mock.patch.dict(os.environ, {copy_record.ROOT_ENV: scratch}):
                 self.assertEqual(sweep.floor_roots(lint_settings=settings), expected)
 
@@ -1982,6 +1982,32 @@ class FloorTests(SweepCase):
         self.assertEqual(saved.workspaces, (pairs[1],))
         self.assertEqual(set(saved.history), {pairs[0], pairs[2]})
 
+    def test_floor_sweep_keeps_an_unverified_slot_and_continues(self) -> None:
+        base = self.base()
+        unverified, _ = cargo_target(base, "unverified", APP, time.time() - DAY)
+        independent, _ = cargo_target(base, "independent", DEMO, time.time() - DAY)
+        leases = sweep.output_slot_leases
+        verified: set[str] = set()
+
+        def read_leases(path: str) -> tuple[sweep.SlotBuildOutput, ...]:
+            if path == str(unverified.parent):
+                raise PermissionError("fixture slot verification failed")
+            verified.add(path)
+            return leases(path)
+
+        errors = io.StringIO()
+        build_root = base / "build"
+        _ = write_config_fixture(conf.path("build_folders"),
+                                 f"roots.build={build_root}\nroots.build.natedev={build_root}\n")
+        with (mock.patch.object(sweep, "output_slot_leases", side_effect=read_leases),
+              redirect_stderr(errors)):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True, recorded=True)
+        self.assertEqual(status, 0, errors.getvalue())
+        self.assertTrue(unverified.is_dir())
+        self.assertIn(str(unverified.parent), errors.getvalue())
+        self.assertIn("cannot verify the slot lease", errors.getvalue())
+        self.assertIn(str(independent.parent), verified)
+
     def test_a_target_removed_during_shrink_does_not_fail_the_floor_pass(self) -> None:
         base = self.base()
         tree, _ = cargo_target(base, "idle", APP, time.time() - DAY)
@@ -1995,7 +2021,7 @@ class FloorTests(SweepCase):
         def remove_target(
             scan: sweep.Scan, total: int, budget: int, dry_run: bool,
             tree_targets: dict[str, str], trees: dict[str, list[str]],
-            busy: dict[str, sweep.TargetUse | sweep.LockHeld | sweep.BuildHoldTarget | sweep.NoRecordedEvidence],
+            busy: dict[str, sweep.FloorProtection],
             removal_order: sweep.RemovalOrder, planned_at: float, owners: sweep.TargetOwnerIndex, *,
             lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             policy: sweep.MacFloor | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -2034,7 +2060,7 @@ class FloorTests(SweepCase):
         def remove_other_target(
             scan: sweep.Scan, total: int, budget: int, dry_run: bool,
             tree_targets: dict[str, str], trees: dict[str, list[str]],
-            busy: dict[str, sweep.TargetUse | sweep.LockHeld | sweep.BuildHoldTarget | sweep.NoRecordedEvidence],
+            busy: dict[str, sweep.FloorProtection],
             removal_order: sweep.RemovalOrder, planned_at: float, owners: sweep.TargetOwnerIndex, *,
             lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             policy: sweep.MacFloor | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -3223,6 +3249,7 @@ class FloorTests(SweepCase):
                 base = self.base()
                 seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                                {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
+                _ = copies.git(seed.checkout, "remote", "set-url", "origin", "https://example.invalid/floor-test.git")
                 with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
                     with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                         target = ((checkout / "target").resolve() if location == "artifacts"
@@ -3251,6 +3278,7 @@ class FloorTests(SweepCase):
         base = self.base()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
+        _ = copies.git(seed.checkout, "remote", "set-url", "origin", "https://example.invalid/floor-test.git")
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = (checkout / "target").resolve()
@@ -3269,6 +3297,7 @@ class FloorTests(SweepCase):
         pool = copies.gates_root()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"Cargo.toml": "[workspace]\n", "source.txt": "standing source\n"})
+        _ = copies.git(seed.checkout, "remote", "set-url", "origin", "https://example.invalid/floor-test.git")
         discover = sweep.target_dirs
 
         def configured_targets(roots: Sequence[str], *, lint_settings: conf.ConfigRead,

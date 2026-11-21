@@ -1143,21 +1143,64 @@ class SlotBuildOutput:
         return str(self.checkout.with_name(self.checkout.name + ".lock"))
 
 
-def output_slot_leases(path: str) -> tuple[SlotBuildOutput, ...]:
+def output_slot_leases(
+    path: str, *, outputs: CargoOutputIndex | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> tuple[SlotBuildOutput, ...]:
     """Locate slot leases for direct output and recorded external output."""
-    settings = conf.read_or_repository("build_folders")
-    values = settings.values()
-    machine = store.host_name()
-    slot_value = values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
-    if not slot_value:
-        return ()
-    slots = Path(os.path.expandvars(slot_value)).expanduser().resolve()
-    cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser().resolve()
+    if isinstance(outputs, UseConfiguredValue):
+        outputs = OUTPUT_ROOTS.get()
     resolved = Path(path).resolve()
-    sources = (resolved, *(mapping.workspace_root.resolve() for mapping in OUTPUT_ROOTS.get().mappings_for(resolved)))
-    checkouts = {slots / source.relative_to(root).parts[0] for source in sources for root in (slots, cargo)
-                 if source != root and source.is_relative_to(root)}
+    sources = (resolved, *(mapping.workspace_root.resolve() for mapping in outputs.mappings_for(resolved)))
+    root = build_folders.build_root().resolve()
+    checkouts: set[Path] = set()
+    for source in sources:
+        if not source.is_relative_to(root):
+            continue
+        for candidate in (source, *source.parents):
+            if not candidate.is_relative_to(root):
+                break
+            form = build_folders.parse_form(candidate)
+            if isinstance(form, build_folders.UnverifiedFolderPath):
+                raise form.error
+            if isinstance(form, build_folders.BuildCopy):
+                checkouts.add(candidate)
     return tuple(SlotBuildOutput(checkout) for checkout in sorted(checkouts))
+
+
+@dataclass(frozen=True)
+class UnverifiedSlotLease:
+    """The target stays because the sweep cannot verify its slot lease."""
+
+    reason: str
+
+
+def report_unverified_slot(path: str, error: Exception) -> UnverifiedSlotLease:
+    reason = f"cannot verify the slot lease: {error}"
+    print(f"lint sweep: {path} kept: {reason}", file=sys.stderr)
+    return UnverifiedSlotLease(reason)
+
+
+def hold_trim_recovery_slots(roots: Sequence[str], guards: ExitStack,
+                             held_slots: Collection[SlotBuildOutput]) -> bool:
+    """Hold each slot lease before a paired trim retries deletion."""
+    current = OUTPUT_ROOTS.get()
+    saved = saved_cargo_output_roots()
+    outputs = CargoOutputIndex((*current.workspaces, *saved.workspaces, *saved.history))
+    held = set(held_slots)
+    for root in roots:
+        try:
+            if not outputs.mappings_for(Path(root).resolve()):
+                raise ValueError("no recorded Cargo output mapping for the saved trim")
+            for slot in output_slot_leases(root, outputs=outputs):
+                if slot not in held:
+                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
+                        print(f"lint sweep: busy slot lease; {root} left alone")
+                        return False
+                    held.add(slot)
+        except (OSError, RuntimeError, ValueError) as error:
+            _ = report_unverified_slot(root, error)
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -1523,7 +1566,7 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     return found
 
 
-def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence], sizes: dict[str, int],
+def floor_holders(busy: Mapping[str, FloorProtection], sizes: dict[str, int],
                   locks: str = PROC_LOCKS, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[FloorHolder]:
@@ -1533,6 +1576,9 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     holders: list[FloorHolder] = []
     for root, use in busy.items():
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
+            continue
+        if isinstance(use, UnverifiedSlotLease):
+            holders.append(FloorHolder(root, sizes.get(root, 0), None, use.reason, None))
             continue
         if isinstance(use, LockHeld):
             pid = lock_holder(use.lock, locks, lint_settings=lint_settings)
@@ -1852,6 +1898,17 @@ class UnconfirmedReclaim:
 
 
 @dataclass(frozen=True)
+class PairedTrimDeferred:
+    """The saved trim stays because one of its outputs is in use."""
+
+    roots: tuple[str, ...]
+
+
+class TrimMayProceed(Enum):
+    READY = "trim may proceed"
+
+
+@dataclass(frozen=True)
 class PendingUnlink:
     path: str
     device: int
@@ -1931,8 +1988,17 @@ class TrimTake:
             self.group_paths = []
         self.save()
 
-    def recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
+    def recover(
+        self, *, held_slots: Collection[SlotBuildOutput] = (),
+    ) -> ConfirmedDeletion | UnconfirmedReclaim | PairedTrimDeferred:
         """A missing or replaced name proves removal, never reclaimed blocks."""
+        with ExitStack() as guards:
+            if (len(self.output_roots) > 1 and self.stage == "deleting" and self.pending
+                    and not hold_trim_recovery_slots(self.output_roots, guards, held_slots)):
+                return PairedTrimDeferred(self.output_roots)
+            return self._recover()
+
+    def _recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
         paths: list[str] = []
         for entry in self.pending:
             try:
@@ -2060,10 +2126,11 @@ def trim_row_recorded(take: TrimTake) -> bool:
 @contextmanager
 def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
                      dry_run: bool, owners: TargetOwnerIndex, *,
-                     lint_settings: conf.ConfigRead, proc: str) -> Generator[dict[str, TargetUse | BuildHoldTarget]]:
-    """Keep the trim locked and report any users that block its recovery."""
+                     lint_settings: conf.ConfigRead, proc: str,
+                     held_slots: Collection[SlotBuildOutput] = ()) -> Generator[TrimMayProceed | PairedTrimDeferred]:
+    """Hold the trim lock and defer recovery while an output is in use."""
     if dry_run:
-        yield {}
+        yield TrimMayProceed.READY
         return
     target = os.path.abspath(target)
     path = trim_intent_path(target)
@@ -2079,11 +2146,13 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         if path.exists():
             unfinished = load_trim_for_recovery(path)
             if not isinstance(unfinished, DamagedTrimIntentSetAside):
-                uses = trim_output_uses(unfinished, lint_settings=lint_settings, proc=proc)
-                if uses:
-                    yield uses
+                if trim_output_uses(unfinished, lint_settings=lint_settings, proc=proc):
+                    yield PairedTrimDeferred(unfinished.output_roots)
                     return
-                _ = unfinished.recover()
+                recovery = unfinished.recover(held_slots=held_slots)
+                if isinstance(recovery, PairedTrimDeferred):
+                    yield recovery
+                    return
                 recovered = unfinished.publish()
                 if not recovered:
                     take = unfinished
@@ -2092,7 +2161,7 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         active.update({whole.target: take for whole in whole_targets})
         token = TRIM_TAKES.set(active)
         try:
-            yield {}
+            yield TrimMayProceed.READY
             # A failed append keeps its completed intent for the next invocation.
             if recovered and path.exists() and not take.publish():
                 return
@@ -2182,7 +2251,8 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                     if isinstance(locks, TargetLockBusy):
                         continue
                     try:
-                        _ = take.recover()
+                        if isinstance(take.recover(), PairedTrimDeferred):
+                            continue
                         if not take.publish():
                             continue
                     finally:
@@ -2881,7 +2951,7 @@ def group_unchanged(group: FloorTake) -> bool:
 def shrink_floor(
     scan: Scan, total: int, budget: int, dry_run: bool,
     tree_targets: dict[str, str], trees: dict[str, list[str]],
-    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence], removal_order: RemovalOrder,
+    busy: dict[str, FloorProtection], removal_order: RemovalOrder,
     planned_at: float, owners: TargetOwnerIndex,
 *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -2936,12 +3006,22 @@ def shrink_floor(
         with ExitStack() as guards:
             lock = scratch.judgment_lock
             blocked_pair = False
+            held_slots: set[SlotBuildOutput] = set()
             for paired in paired_roots:
-                for slot in output_slot_leases(paired):
+                try:
+                    slots = output_slot_leases(paired)
+                except (OSError, RuntimeError) as error:
+                    busy[paired] = report_unverified_slot(paired, error)
+                    blocked_pair = True
+                    break
+                for slot in slots:
+                    if slot in held_slots:
+                        continue
                     if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
                         busy[paired] = LockHeld(slot.lock)
                         blocked_pair = True
                         break
+                    held_slots.add(slot)
                 if blocked_pair:
                     break
                 if not guards.enter_context(lock(Path(paired))):
@@ -3909,6 +3989,9 @@ class BuildHoldTarget:
     holder: str
 
 
+FloorProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedSlotLease
+
+
 def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     proc: str = PROC_DIR,
@@ -4565,7 +4648,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     target_search: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: set[str] = set()
-    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
+    busy: dict[str, FloorProtection] = {}
     detail = ""
     mirror_leases = ExitStack()
     try:
@@ -4640,8 +4723,14 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
-            held_slots = [slot for slot in output_slot_leases(root)
-                          if build_folders.build_folder_state(slot.checkout) == "held"]
+            try:
+                held_slots = [slot for slot in output_slot_leases(root)
+                              if build_folders.build_folder_state(slot.checkout) == "held"]
+            except (OSError, RuntimeError) as error:
+                busy[root] = report_unverified_slot(root, error)
+                held_targets.add(root)
+                _ = known_trees.setdefault(root, [])
+                continue
             if held_slots:
                 busy[root] = LockHeld(held_slots[0].lock)
                 held_targets.add(root)
@@ -5180,9 +5269,80 @@ def rebuilds_main(argv: list[str]) -> int:
     return 0
 
 
+def _form_children(parent: Path) -> Iterator[Path]:
+    """List real child directories without following links."""
+    with os.scandir(parent) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                yield Path(entry.path)
+
+
+def _unused_form_paths(repo: Path) -> Iterator[tuple[Path, build_folders.FolderForm]]:
+    for entry in _form_children(repo):
+        if entry.name == "main":
+            paths = (entry,)
+        else:
+            paths = _form_children(entry)
+        for path in paths:
+            form = build_folders.parse_form(path)
+            if isinstance(form, (build_folders.WorktreeOutput, build_folders.BuildCopy,
+                                 build_folders.MainOutput, build_folders.CiOutput)):
+                yield path, form
+            elif isinstance(form, build_folders.UnverifiedFolderPath):
+                print(f"lint sweep: {path}: {form.error}", file=sys.stderr)
+
+
+def sweep_unused_folders(dry_run: bool, *, now: float, lint_settings: conf.ConfigRead) -> int:
+    """List expired build folders for review."""
+    _ = lint_settings
+    root = build_folders.build_root()
+    settings = conf.read_or_repository("build_folders")
+    cutoff = now - settings.whole("folders.unused_days") * 86400
+    plan = removal_guard.ListMode.PRINT_ONLY if dry_run else removal_guard.RemovalList(removal_guard.Tool.BUILD)
+    if not removal_guard.is_real_directory(root):
+        return 0
+    for record in build_folders.numbered_copy_records():
+        if isinstance(record, build_folders.NumberedCopyRemovalPending):
+            path = record.copy.path
+            print(f"kept for a manual removal list: {path} (sweep, saved numbered copy removal)")
+            if isinstance(plan, removal_guard.RemovalList):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "saved numbered copy removal")
+    for repo in sorted(root.iterdir()):
+        if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS or repo.name in removal_guard.LEGACY_TOP
+                or repo.name.startswith("old-") or not removal_guard.is_real_directory(repo)):
+            continue
+        for path, form in _unused_form_paths(repo):
+            if isinstance(form, build_folders.CiOutput) or not build_folders.expired_folder(path, cutoff=cutoff):
+                continue
+            print(f"kept for a manual removal list: {path} (sweep, expired build folder)")
+            if isinstance(plan, removal_guard.RemovalList):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "expired build folder")
+    if isinstance(plan, removal_guard.RemovalList):
+        plan.report()
+    return 0
+
+
+def switch_removal_list() -> int:
+    """List legacy build folders for the switch."""
+    root = build_folders.build_root()
+    plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
+    if removal_guard.is_real_directory(root):
+        for name in ("cargo", "paths", "slot", "hana-ci", "old-claude"):
+            path = root / name
+            if removal_guard.is_real_directory(path):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "legacy build folder at the switch")
+                print(f"kept for a manual removal list: {path} (sweep, legacy build folder at the switch)")
+    plan.report()
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv == ["--switch-removal-list"]:
+        return switch_removal_list()
     if argv and argv[0] == "rebuilds":
         return rebuilds_main(argv[1:])
+    if argv in (["--unused-folders"], ["--unused-folders", "--dry-run"]):
+        return sweep_unused_folders(len(argv) == 2, now=time.time(), lint_settings=conf.read("lint"))
     if "--dry-run" in argv:
         return assess(argv)
     plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
