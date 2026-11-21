@@ -1311,8 +1311,10 @@ def _found_backends(rows: Sequence[StaffRow],
     if running is None:
         running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
                    if any(identity not in codex_sessions for identity in wanted.values()) else frozenset())
-    for current, identity in wanted.items():
-        if identity not in codex_sessions and (current in running or bool(sessions.transcript_locations(current))):
+    claude_candidates = {current: identity for current, identity in wanted.items() if identity not in codex_sessions}
+    transcripts = sessions.transcript_session_ids(claude_candidates.keys() - running)
+    for current, identity in claude_candidates.items():
+        if current in running or current in transcripts:
             found[identity] = ClaudeBackend()
     return found
 

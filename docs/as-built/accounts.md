@@ -630,9 +630,11 @@ Codex producers retain their workers move group.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
-The cache keeps each machine's counts separate and rejects copies older than ten minutes.
+The cache keeps each machine's counts separate and uses the `usage_stale_minutes` age limit from `config/accounts.conf`.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
-The board sums available machine counts and identifies an unavailable peer.
+The board sums available machine counts.
+It shows the time and age of usable Mac counts after a failed fetch or once the copy is one minute old.
+It reports the peer as unavailable when no usable copy exists.
 
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.
