@@ -152,6 +152,48 @@ class ClaimProcessStartTests(unittest.TestCase):
                         self.assertEqual(errors.getvalue(), "cannot adopt the Mac claim: worktree\n")
                         self.assertEqual(held.path.read_bytes(), before)
 
+    def test_saved_relative_worktree_allows_retained_claim_cleanup_takeover(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = mac_test.StatePaths(root, "box", platform="linux")
+            scope = mac_test.RepositoryScope("hana", "repo-key", 2)
+            record: mac_test.RemoteJobClaim = {
+                "claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a",
+                "submitting_session": "old-session", "pid": 41, "proc_start": "41000",
+                "what": "nextest hana", "worktree": ".", "since": "2026-11-04T00:00:00+00:00",
+                "repo_name": scope.name, "repo_key": scope.key, "slot": scope.slot,
+                "remote_host": "fixture-box",
+            }
+            path = mac_test.claim_path(paths, scope)
+            path.parent.mkdir()
+            mac_test.write_json(path, record)
+            held, = mac_test.read_claims(paths)
+            args = mac_test.CliArguments()
+            args.pid, args.worktree = 42, str(root)
+            args.claim_id, args.episode, args.attempt = record["claim_id"], record["episode"], record["attempt"]
+            args.leased_slots = [scope.slot]
+            session = OwningSession("cleanup-session")
+
+            def read_start(pid: int) -> identity.ProcessStart:
+                return identity.Started("42000") if pid == args.pid else identity.Gone()
+
+            output = io.StringIO()
+            with (mock.patch.object(identity, "process_start", side_effect=read_start),
+                  mock.patch.object(mac_test, "target_claim_scope", return_value=scope),
+                  redirect_stdout(output)):
+                with mac_test.locked(paths.lock):
+                    result = mac_test.take_over_kept_claim(args, held, {**record}, session=session)
+                self.assertEqual(result, mac_test.ClaimFinished(13))
+                self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, session=session), 13)
+            self.assertEqual(output.getvalue().splitlines(), ["leftovers: fixture-box", "slot: 2"] * 2)
+            saved, = mac_test.read_claims(paths)
+            self.assertEqual(saved.scope, scope)
+            self.assertEqual(claim_state.claim_identity(saved.record), claim_state.claim_identity(record))
+            self.assertEqual((saved.record["pid"], saved.record["proc_start"]), (42, "42000"))
+            self.assertEqual(saved.record["submitting_session"], session.session_id)
+            self.assertIs(saved.record.get("cleanup_pending"), True)
+            self.assertEqual(saved.record["worktree"], ".")
+
     def test_adoption_refusal_names_the_failed_check_without_changing_the_reservation(self) -> None:
         checks = ("runner pid start", "no reservation", "reservation count", "scope", "pid", "identity",
                   "submitting session", "remote host", "proc_start", "worktree", "remote missing", "block state",

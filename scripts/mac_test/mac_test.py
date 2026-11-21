@@ -1799,9 +1799,7 @@ def print_claim_identity(args: CliArguments, record: RunRecord) -> None:
 
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
                          *, session: SubmittingSession) -> ClaimAttempt:
-    worktree = kept["worktree"]
-    if not Path(worktree).is_absolute():
-        return refuse_wait_claim(WaitClaimCheck.WORKTREE)
+    """Transfer cleanup ownership without granting permission to run."""
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -1810,7 +1808,9 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     kept["proc_start"] = proc_start.start
     kept["submitting_session"] = claim_state.session_id(session)
     kept["cleanup_pending"] = True
-    kept["worktree"] = str(claim_worktree_path(worktree))
+    worktree = kept["worktree"]
+    if Path(worktree).is_absolute():
+        kept["worktree"] = str(claim_worktree_path(worktree))
     if args.copy:
         kept["copy"] = True
     else:
@@ -1845,8 +1845,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
                 and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
-            if not Path(record["worktree"]).is_absolute():
-                return refuse_wait_claim(WaitClaimCheck.WORKTREE)
             print_claim_identity(args, record)
             print(f"leftovers: {record['remote_host']}")
             if "slot" in record:
