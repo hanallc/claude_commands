@@ -45,7 +45,7 @@ Each producer loads the common command and reads its job and current work from i
 | Staff name | Kind | Command | Job contract |
 |---|---|---|---|
 | `morty` | `producer` | `/producer:produce`, then `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
-| `brain` | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items. |
+| `brain` | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items for vault, security and accounts work. |
 | `dwight` | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
