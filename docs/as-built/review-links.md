@@ -521,7 +521,8 @@ A reply to a question or feedback sent from Open also returns the change to Open
 A works result moves the change to Done without a notice.
 Review removes the completed change.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
-The row window keeps the focused row mounted during scroll.
+The row window moves other rows around the focused row when the user scrolls.
+Each focus change mounts the adjacent rows before the next Tab or Shift+Tab.
 A refresh restores focus to the same control by row key.
 The browser keeps each pending save by key while the form leaves the window.
 Review and The List use Show chips.
@@ -575,6 +576,7 @@ A Review save reads the selected record and its sources.
 An Efficiency save checks the ledger in the production document retained for its row.
 An unreadable Proposal prerequisite leaves its relationship empty in both the snapshot and the save.
 The save checks the revision under the store's write lock.
+An exact Question save requires a revision check.
 The server returns HTTP 409 if the record is missing or its revision differs from the form revision.
 The browser refreshes the index and shows a conflict reason above the table.
 The refresh keeps the selected filters.

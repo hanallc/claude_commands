@@ -1088,8 +1088,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
                 update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, members))
             delivery, answer = change_browser.submit_question(
-                question, cast(change_page.QuestionOutcome, outcome), words, status, exact_record=True,
-                verify_revision=validate)
+                question, cast(change_page.QuestionOutcome, outcome), words, status,
+                save=change_browser.ExactQuestionSave(validate))
     elif isinstance(source, review_items.InvestigationSource):
         delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
     else:

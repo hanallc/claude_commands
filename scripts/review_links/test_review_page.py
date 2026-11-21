@@ -1851,7 +1851,25 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
             page = self.fixture.temporary / 'tab-review.html'
             _ = page.write_bytes(review_page.build_snapshot(self.root).render())
         with self.firefox_commands(page) as command:
-            for initial, expected, modifier in ((1, 2, ''), (2, 1, '\ue008')):
+            cross_window = command('WebDriver:ExecuteAsyncScript', args=[], script=r"""
+const done=arguments[0];
+const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+void (async()=>{
+ scrollTo(0,17000);
+ await frame();
+ const toggle=document.querySelectorAll('[data-list-item] .list-toggle')[10];
+ toggle.focus({preventScroll:true});
+ scrollTo(0,0);
+ await frame();
+ const focusedAbove=document.activeElement===toggle;
+ scrollTo(0,document.documentElement.scrollHeight);
+ await frame();
+ done([focusedAbove,document.activeElement===toggle]);
+})();
+""")
+            self.assertEqual(cross_window, {'value': [True, True]},
+                             'F087: focus stays on the same control across both scrollbar jumps.')
+            for initial, expected, modifier in ((1, 3, ''), (4, 2, '\ue008')):
                 with self.subTest(initial=initial, expected=expected):
                     _ = command('WebDriver:ExecuteAsyncScript', args=[initial], script=r"""
 const [number, done] = arguments;
@@ -1864,18 +1882,27 @@ function focusRow(){
  requestAnimationFrame(waitForBottom);
 }
 function waitForBottom(){
- if(row(400)) done();
+ if(row(400)){
+  window.resumeReviewFrames=window.requestAnimationFrame;
+  window.requestAnimationFrame=()=>0;
+  done();
+ }
  else requestAnimationFrame(waitForBottom);
 }
 requestAnimationFrame(focusRow);
 """)
                     keys = ([('keyDown', modifier)] if modifier else []) + [
-                        ('keyDown', '\ue004'), ('keyUp', '\ue004')] + ([('keyUp', modifier)] if modifier else [])
-                    _ = command('WebDriver:PerformActions', actions=[{'type':'key', 'id':'keyboard',
-                        'actions':[{'type':kind, 'value':key} for kind,key in keys]}])
+                        ('keyDown', '\ue004'), ('keyUp', '\ue004')]*2 + ([('keyUp', modifier)] if modifier else [])
+                    try:
+                        _ = command('WebDriver:PerformActions', actions=[{'type':'key', 'id':'keyboard',
+                            'actions':[{'type':kind, 'value':key} for kind,key in keys]}])
+                    finally:
+                        _ = command('WebDriver:ExecuteScript', args=[], script=
+                                    'window.requestAnimationFrame=window.resumeReviewFrames;')
                     focused = command('WebDriver:ExecuteScript', args=[], script=
                         'return document.activeElement.closest("[data-list-item]")?.dataset.key;')
-                    self.assertEqual(focused, {'value': f'page-owner/C{expected}'})
+                    self.assertEqual(focused, {'value': f'page-owner/C{expected}'},
+                                     'F088: two Tab presses before the next frame reach two adjacent rows.')
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_selected_chips_keep_text_contrast_on_hover_and_press(self) -> None:
