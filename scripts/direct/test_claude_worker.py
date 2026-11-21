@@ -14,6 +14,7 @@ import signal
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.helper_tree_test_support import copy_helpers
 
 from scripts.direct import worker_state
@@ -165,8 +166,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         models = write_registry(self.root / "models.conf")
         self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
+        config = self.root / "worker-config"
+        _ = write_config_fixture(config / "direct.conf", defaults=(
+            "# whole: 1..300\nCLAUDE_WORKER_REGISTER_WAIT_SECS=30\n"))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
-            "CONF_DIR": str(CHECKOUT / "config"), "UNIT_WORKER_POLL_SECS": "0",
+            "CONF_DIR": str(config), "UNIT_WORKER_POLL_SECS": "0",
+            "AGENT_NOTES_DIR": str(self.root / "notes"),
             "CLAUDE_BIN": str(backend), "CLAUDE_WORKER_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),

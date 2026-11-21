@@ -24,6 +24,9 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.config_test_support import SWEEP_SCAN_SETTINGS
 from scripts.lint.memory_test_support import config_environment
 
 
@@ -72,6 +75,7 @@ class EndResult(TypedDict):
 
 
 class WorktreeLifecycleTests(unittest.TestCase):
+    maxDiff: int | None = None
     root: Path = Path()
     home: Path = Path()
     origin: Path = Path()
@@ -87,7 +91,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="worktree-lifecycle-")))
         self.home = self.root / "home"
         self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree")
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"
@@ -98,8 +102,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
+        write_scratch_settings(self.root / "settings", self.root)
         self.environment = {
-            **config_environment(self.root / "settings"),
+            **config_environment(self.root / "settings", fixtures={
+                "build_folders.conf": workspace_folder_settings(self.root),
+                "lint.conf": SWEEP_SCAN_SETTINGS,
+            }),
             "HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "WORKTREES_STATE_DIR": str(self.state),

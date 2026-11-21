@@ -18,6 +18,7 @@ from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, RUNNER_STUB, VERIFY, VerifyMacOffloadFixture,
 )
 from scripts.direct.test_verify_result_environment import FIXED_ENVIRONMENT
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -226,7 +227,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
                                  **{name: "caller" for name in FIXED_ENVIRONMENT},
                                  "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
         _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         targets_file = self.root / "build_targets.conf"
         _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
             + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")

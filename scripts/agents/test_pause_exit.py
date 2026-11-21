@@ -5,9 +5,12 @@ import os
 import io
 import sys
 import subprocess
+import tempfile
 import time
+import unittest
 from dataclasses import replace
 from functools import cached_property
+from pathlib import Path
 from contextlib import redirect_stdout
 from typing import cast, final, override
 from unittest import mock
@@ -21,12 +24,18 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member, fixture_session
 from scripts.agents import restart_support, shutdown, stop_resume, remote
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
 from scripts.agents.stop_resume import stop as stop_session
 from scripts.agents.stop_results import ClaudeStartState, StopResult
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 def setUpModule() -> None:
     isolate_state_home()
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    write_machine_config(configuration)
+    _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(configuration))))
 
 
 @final
@@ -122,7 +131,7 @@ class PauseExitTests(StaffTestCase):
               mock.patch.object(stop_resume, "stop", wraps=stop_session)):
             preview = self.agents("stop", missing, "--dry-run")
             result = self.agents("stop", missing)
-        self.assertEqual((preview.returncode, preview.stdout), (result.returncode, result.stdout))
+        self.assertEqual((preview.returncode, preview.stdout), (result.returncode, result.stdout), result.stderr)
         self.assertEqual((preview.returncode, preview.stdout), (2, f"{missing}: no session on this machine\n"))
 
     def test_stop_by_name_stops_the_workers_listed_by_its_dry_run(self) -> None:

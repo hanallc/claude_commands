@@ -9,6 +9,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import land_main, main_push_lock
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from scripts.lib.rerun_test_support import SCRIPTS, ScriptRepositoryTestCase
 
 
@@ -16,6 +17,9 @@ class LandMainTests(ScriptRepositoryTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        configuration = self.root / "config"
+        write_push_lock_settings(configuration)
+        self.environment["CONF_DIR"] = str(configuration)
         self.seed()
         self.environment.update(TEST_HOOK_LOG=str(self.root / "hook-runs"),
                                 TEST_HOOK_FAIL=str(self.root / "hook-fails"))

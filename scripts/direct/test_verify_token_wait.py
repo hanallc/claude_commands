@@ -11,6 +11,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -102,14 +103,14 @@ trap observe_admission DEBUG
         _ = runner.write_text(routes.RUNNER)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
-        _ = write_config_fixture(self.root / "mac-settings", f"offload=on\nlinux_only.{self.root.name}=\n",
-                                 template="mac_test")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n",
+                                 defaults=MAC_RUN_SETTINGS)
         self.environment.update({
             "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_MAC_EVENTS": str(self.root / "mac-events"),
-            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "CONF_DIR": str(Path(self.root / "mac-settings").parent), "TEST_MAC_ALLOWED": "1",
+            "MAC_TEST_CONFIG": str(self.root / "mac_test.conf"), "CONF_DIR": str(Path(self.root / "mac_test.conf").parent), "TEST_MAC_ALLOWED": "1",
         })
         result = self.verify(self.environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

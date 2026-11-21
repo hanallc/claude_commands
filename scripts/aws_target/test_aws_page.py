@@ -19,9 +19,15 @@ from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import page_frame
+from scripts.review_links.test_page_frame import page_status_settings
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = (self.root / "console.conf").write_text(page_status_settings())
+
     def test_quota_help_is_closed_and_contains_the_ordered_steps_and_case_link(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
@@ -73,6 +79,7 @@ class PageCostFixture(ledger_test_support.CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = (self.root / "console.conf").write_text(page_status_settings())
         self.costs({'spend_pace_days': '3', 'run_cost_days': '5', 'billed_hours_gap_max_ratio': '0.2'})
         self.configure_gate("""
 regions=us-east-1

@@ -34,6 +34,7 @@ from scripts.lib import models_registry, process_start, unit_runs
 from scripts.message import sessions
 from scripts.whoami import quota_state
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
@@ -138,7 +139,7 @@ class PaneWorld(herdr.Herdr):
         write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
         write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
-        write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
+        write_script_prompt_fixture(config)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),

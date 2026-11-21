@@ -23,6 +23,7 @@ import time
 import unittest.mock
 from pathlib import Path
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.agents.test_support import SHUTDOWN_SETTINGS
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
@@ -34,16 +35,20 @@ from scripts.herdr import herdr
 from scripts.herdr import pane_launch
 from scripts.herdr import fake_herdr
 from scripts.message import codex_daemon
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline, session_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.message import sessions, session_records
 from scripts.message.sessions_test_support import copy_session_modules
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership, write_staff_settings,
+)
 
 GIT_BINARY = shutil.which("git") or "git"
 BASH_BINARY = shutil.which("bash") or "bash"
@@ -1141,7 +1146,10 @@ class PromptSubmissionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
+        configuration = self.root / "config"
+        write_script_prompt_fixture(configuration)
+        environment = {"CONF_DIR": str(configuration), "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment, clear=True)))
         self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
         self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
         self.path.parent.mkdir(parents=True)
@@ -4220,7 +4228,10 @@ class HerdrTests(unittest.TestCase):
         (self.root / "home/.claude/sessions").mkdir(parents=True)
         configuration = self.root / "fixture-config"
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "codex_daemon.conf", "agents_slice=app-agents.slice\n")
+        write_script_prompt_fixture(configuration)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_staff_settings(configuration / "staff.conf", producers=self.root / "producers")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             **environment,
             "HERDR_BIN": str(self.fake), "SYSTEMD_RUN": str(self.fake), "SYSTEMCTL": str(self.fake),
@@ -8227,7 +8238,7 @@ class RowTabTests(StaffTestCase):
 
     def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
         configuration = self.root / "configuration"
-        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
         proc = self.root / "proc"
         uptime = proc / "uptime"
         ticks = os.sysconf("SC_CLK_TCK")

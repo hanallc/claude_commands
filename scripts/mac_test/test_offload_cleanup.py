@@ -21,7 +21,7 @@ from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
 )
-from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent, nextest_settings
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, test_hang_guard
 
@@ -85,15 +85,6 @@ def shell_environment(root: Path) -> dict[str, str]:
         "LINT_SWEEP_DOC_INDEX_MIB": DOC_INDEX_MIB,
         "USER_ZONE": "UTC",
     }
-
-
-def nextest_settings(tail_bytes: str = "65536", summary_bytes: str = "1024") -> str:
-    return f"""\
-# whole: 1..
-{nextest_log.TAIL_BYTES}={tail_bytes}
-# whole: 1..1024
-{nextest_log.SUMMARY_BYTES}={summary_bytes}
-"""
 
 
 class MacCleanupProtocolTests(unittest.TestCase):

@@ -15,21 +15,72 @@ import subprocess
 import select
 from types import SimpleNamespace
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from collections.abc import Generator
 from unittest import mock
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, merge_gate, targeted_test
-from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib import process_group
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.lib import conf, process_group
 from scripts.test_times import gate_record
-from scripts.production.gate_modules import discover_test_modules, test_module_name
+from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        for configuration in (self.root, Path(self.environment["CONF_DIR"])):
+            seed_config_fixture_folder(configuration, SEND_TIMING_FIXTURES)
+
+    def test_gate_checks_shipped_configuration_when_present(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        without_config = self.root / "without-config"
+        without_config.mkdir()
+        with_config = self.root / "with-config"
+        self.write(with_config / "config/example.conf", "count=3\n")
+        result = merge_gate.GateRun((), 0, 0)
+        for repo in (without_config, with_config):
+            with (self.subTest(repo=repo.name),
+                  mock.patch.object(conf, "check_shipped") as check,
+                  mock.patch.object(cloud_gate, "route", return_value=result) as route):
+                self.assertIs(merge_gate.run_gate_suites(repo), result)
+                if repo == with_config:
+                    check.assert_called_once_with(repo / "config")
+                else:
+                    check.assert_not_called()
+                route.assert_called_once()
+
+    def test_gate_refuses_a_shipped_value_outside_its_limit(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        repo = self.root / "invalid-config"
+        self.write(repo / "config/example.conf", "# whole: 1..9\ncount=10\n")
+        with (mock.patch.object(cloud_gate, "route") as route,
+              self.assertRaises(GateRefused) as failure):
+            _ = merge_gate.run_gate_suites(repo)
+        self.assertEqual(str(failure.exception),
+                         "config/example.conf: count='10': outside range 1..9 (# whole: 1..9).")
+        route.assert_not_called()
+
+    def test_gate_refuses_an_invalid_shipped_console_owner(self) -> None:
+        from scripts.aws_target import cloud_gate
+        from scripts.review_links.test_page_frame import console_settings
+
+        repo = self.root / "invalid-console"
+        _ = write_config_fixture(repo / "config/console.conf", "page.aws.owner=invalid\n",
+                                 defaults=console_settings())
+        with (mock.patch.object(cloud_gate, "route") as route,
+              self.assertRaises(GateRefused) as failure):
+            _ = merge_gate.run_gate_suites(repo)
+        self.assertEqual(str(failure.exception), "config/console.conf: page.aws.owner: Expected a staff UUID.")
+        route.assert_not_called()
+
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
         # The queue admission wait comes before the time limit starts.
@@ -599,6 +650,10 @@ class ChildImports(unittest.TestCase):
         self.assert_not_pushed()
 
     def test_explicit_fetch_updates_refs_without_matching_remote_configuration(self) -> None:
+        self.write(self.unit / "scripts/build_queue/admission_service.py",
+                   "import sys\nraise SystemExit(sys.argv[1:] != ['state-check'])\n")
+        self.checkpoint = self.commit(self.unit, "Supply the configured state check")
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
         _ = self.git(self.checkout, "config", "--unset-all", "remote.origin.fetch")
         _ = self.git(self.checkout, "update-ref", "refs/remotes/origin/unit-phase", self.base)
         result = self.run_gate("--promote")

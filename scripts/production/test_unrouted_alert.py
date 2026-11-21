@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.production import change_routing, staff, unrouted_alert
+from scripts.production.change_review_test_support import write_change_review_settings
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.staff_test_support import fixture_member, production_staff_record
 
@@ -35,8 +36,7 @@ class UnroutedAlertTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
                                                "REVIEW_LINKS_ROOT": str(self.root / "links")}))
-        source_config = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-        _ = (self.root / "change_review.conf").write_text(source_config.read_text())
+        write_change_review_settings(self.root, self.root)
         self.config = self.root / "review_links.conf"
         _ = write_config_fixture(self.config, "unrouted_alert_recipient=alert-owner\nunrouted_alert_retry_seconds=60\n")
         self.row = {"#": "C8", "Change": "A broken producer"}

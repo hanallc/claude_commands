@@ -23,7 +23,6 @@ from scripts.buildlog import mac_outcome
 from scripts.buildlog import store
 
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.lint.memory_test_support import config_environment
 from scripts.buildlog.test_holds import hold_event, timed_hold_events, write_mac_block
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, step
 from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_work
@@ -61,7 +60,6 @@ class MacReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         point_root_at(self, self.root)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, config_environment(self.root.parent))))
         tools = rust_tool_path(self.root.parent / "tools")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": tools})))
         self.log = self.root / "natedev" / "2026-10.jsonl"

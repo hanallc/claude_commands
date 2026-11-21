@@ -20,6 +20,7 @@ from scripts.lib.git_exclude import ExcludeRefused
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff, unit_config as config
+from scripts.production.config_test_support import UNIT_PORT_SETTINGS
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.agents import remote
 from scripts.production.unit_config_test_support import UnitConfigFixture
@@ -32,7 +33,7 @@ class UnitPortSelectionTests(StaffTestCase):
     def test_default_port_refuses_a_reversed_range(self) -> None:
         atomic_file.write_text_atomic(self.root / "Cargo.toml", '[package]\nname = "hana"\n')
         settings = self.root / "production.conf"
-        _ = write_config_fixture(settings, "unit_port_first=15789\nunit_port_last=15720\n")
+        _ = write_config_fixture(settings, "unit_port_first=15789\nunit_port_last=15720\n", defaults=UNIT_PORT_SETTINGS)
         settings_read = conf.read(settings)
         with patch.object(conf, "read", return_value=settings_read):
             with self.assertRaises(config.ConfigRefused) as refused:
@@ -53,7 +54,7 @@ class UnitPortSelectionTests(StaffTestCase):
                 settings = self.root / "production.conf"
                 _ = write_config_fixture(settings, f"unit_port_first={number}\nunit_port_last={number}\n"
                     + f"mac_run_port={number if cause == 'mac' else 1}\n"
-                    + f"smoke_port={number if cause == 'smoke' else 2}\n")
+                    + f"smoke_port={number if cause == 'smoke' else 2}\n", defaults=UNIT_PORT_SETTINGS)
                 atomic_file.write_text_atomic(peer / ".unit.toml", 'plan = "plan.md"\nresponsibilities = []\n'
                     + (f"port = {number}\n" if cause == "recorded" else ""))
                 if cause not in ("bound", "full"):
@@ -80,6 +81,8 @@ class UnitPortCellTests(StaffTestCase):
             held.bind(("127.0.0.1", 0))
             held.listen()
             occupied = cast(tuple[str, int], held.getsockname())[1]
+            _ = write_config_fixture(root / "production.conf", defaults=UNIT_PORT_SETTINGS)
+            _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(root)})))
             for selected in (config.NoAppPort(), config.AppPort(8123)):
                 with self.subTest(selected=selected):
                     port = config.default_port(root, selected)

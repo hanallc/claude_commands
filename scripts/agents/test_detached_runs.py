@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
 
 import contextlib
 import fcntl
@@ -35,15 +35,19 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs, pane_record, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
+from scripts.agents.detached_runs_test_support import DETACHED_RUN_SETTINGS
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
+from scripts.direct.findings_test_support import STANDARD_CONFIG
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, sessions
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
+from scripts.message.session_send_test_support import POSTMASTER_SETTINGS, SEND_SETTINGS, SEND_TIMING_FIXTURES
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
@@ -110,9 +114,9 @@ class DetachedRunsTests(unittest.TestCase):
                                                         "BUILDLOG_SCOPE": "0"}))
         config = self.root / "config"
         config.mkdir()
-        for name in ("detached_runs", "send", "postmaster", "codex_daemon", "direct"):
-            _ = (config / f"{name}.conf").write_text(
-                (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
+        _ = write_config_fixture(config / "detached_runs.conf", defaults=DETACHED_RUN_SETTINGS)
+        seed_config_fixture_folder(config, SEND_TIMING_FIXTURES)
+        _ = write_config_fixture(config / "direct.conf", defaults=STANDARD_CONFIG)
         self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
@@ -455,7 +459,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(result_file.read_text(), str(start_folder))
 
     def test_start_refuses_at_the_live_run_limit_without_a_record_or_supervisor(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n", defaults="")
         paths = self.seat_runs(3)
         before = {path: path.read_bytes() for path in paths}
         with patch.object(subprocess, "Popen") as popen, \
@@ -476,7 +480,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertIn("more files in one run", err.getvalue())
 
     def test_a_finished_run_frees_a_place_for_the_next_start(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n", defaults="")
         paths = self.seat_runs(3)
         self.update_record(paths[0], status="finished", exit_code=0)
         popen, _ = self.start(["new-check"])
@@ -560,7 +564,7 @@ class DetachedRunsTests(unittest.TestCase):
     def test_start_completes_cancelled_run_after_releasing_start_lock(self) -> None:
         self.set_pass("active", 0)
         settings = self.root / "config/detached_runs.conf"
-        _ = write_config_fixture(settings, "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(settings, "LIVE_RUN_LIMIT=3\n", defaults="")
         original = settings.read_text()
         for outcome, expected in (("start", 0), ("twin", 0), ("limit", 4), ("unusable config", 2)):
             with self.subTest(outcome=outcome):
@@ -787,7 +791,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(self.run_files("director-done"), [])
 
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n", defaults="")
         self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         paths = self.seat_runs(3)
         self.update_record(paths[0], pid=DEAD_PID)
@@ -796,7 +800,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(json.loads(paths[0].read_text())["status"], "finished")
 
     def test_a_live_twin_still_wins_at_the_live_run_limit(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n", defaults="")
         paths = self.seat_runs(3)
         popen, output = self.start(["fixture", "1"])
         popen.assert_not_called()
@@ -819,7 +823,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 2)
 
     def test_another_seat_does_not_use_this_seats_live_run_places(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n", defaults="")
         paths = self.seat_runs(3)
         reviewer = self.record_worker("unit-review", fixture_runtime_id("another-seat-review"))
         popen, _ = self.start(["new-check"], to=reviewer.name)
@@ -1099,7 +1103,7 @@ sys.exit(1)
                       patch.object(subprocess, "run", return_value=output)):
                     self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
         record = self.root / "run folder/r1.json"
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "PROCESS_CHECK_SECONDS=7\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "PROCESS_CHECK_SECONDS=7\n", defaults="")
         for tail, matches in (("", True), (" backup.json", False)):
             with self.subTest(tail=tail):
                 output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
@@ -2119,7 +2123,7 @@ send.deliver_worker_text = fake_sender
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         _ = write_config_fixture(self.root / "config/detached_runs.conf",
-                                 "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n")
+                                 "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n", defaults="")
         limits = conf.read("detached_runs")
         line_chars = limits.whole("RESULT_LINE_CHARS")
         text_chars = limits.whole("RESULT_TEXT_CHARS")
@@ -2136,7 +2140,7 @@ send.deliver_worker_text = fake_sender
 
     def test_result_text_caps_the_total_size_including_the_header(self) -> None:
         config = self.root / "config/detached_runs.conf"
-        _ = write_config_fixture(config, "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n")
+        _ = write_config_fixture(config, "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n", defaults="")
         record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
         record["label"] = "verification " * 1_000
         _ = Path(record["log"]).write_text("line " * 1_000 + "\n" + ("x" * 5_000 + "\n") * 20 + "last line\n")
@@ -2148,7 +2152,7 @@ send.deliver_worker_text = fake_sender
         self.assertIn(f"Log: {record['log']}", text)
         self.assertTrue(text.endswith("\nlast line"))
 
-        _ = write_config_fixture(config, "RESULT_LINE_CHARS=100\nRESULT_TEXT_CHARS=1200\n")
+        _ = write_config_fixture(config, "RESULT_LINE_CHARS=100\nRESULT_TEXT_CHARS=1200\n", defaults="")
         text = detached_runs.result_text(record, detached_runs.CompletedCommand(1))
         self.assertLessEqual(len(text), 1_200)
         self.assertIn(f"{'x' * 100} [cut: {5_000 - 100} more characters]", text)
@@ -2201,14 +2205,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture = pane_support.WorkerPaneTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/New_York"})))
         self.inputs = []
         self.notices = []
         self.defer_transcript = False
         self.pending_transcripts = []
         config = self.fixture.root / "conf"
-        for name in ("detached_runs", "send", "postmaster", "codex_daemon"):
-            write_text_atomic(config / f"{name}.conf",
-                              (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
+        _ = write_config_fixture(config / "detached_runs.conf", defaults=DETACHED_RUN_SETTINGS)
+        write_text_atomic(config / "codex_daemon.conf", CODEX_DAEMON_SETTINGS)
+        write_text_atomic(config / "postmaster.conf", POSTMASTER_SETTINGS)
+        write_text_atomic(config / "send.conf", SEND_SETTINGS)
         for name, keys in (("send", {"delivery_timeout", "kill_grace", "remote_transport_seconds",
                                      "waits_review_seconds", "caller_margin_seconds"}),
                            ("postmaster", {"wait_seconds", "claim_grace_seconds", "poll_seconds"}),
@@ -4708,7 +4714,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
             saved = worker_lifecycle.read_json_object(path)
             self.assertEqual(saved.get("status"), "finished")
-            self.assertTrue(str(saved.get("delivery")).startswith("queued: "))
+            self.assertTrue(str(saved.get("delivery")).startswith("queued: "), saved.get("delivery"))
             self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
             queued, = send.read_queue(send.queue_path(destination))
             self.assertIn(f"Detached run: {record['run_id']}", queued["text"])

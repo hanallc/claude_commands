@@ -30,6 +30,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, override_fixture_settings, text_setting
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
@@ -40,17 +41,15 @@ from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.test_times.gate_record_test_support import gate_timing_settings
 
 
 def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
     override_fixture_settings(root / 'cloud_gate.conf',
         'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
         + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
-    _ = (root / 'test_times.conf').write_text(
-        f'# range: 0..\nSLOW_TEST_S={slow_test_s}\n'
-        + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
-        + '# whole: 1..\nTOP_RUNS=5\n')
+    _ = write_config_fixture(root / 'test_times.conf', gate_timing_settings(slow_test_s=slow_test_s), defaults="")
 
 
 @final
@@ -61,10 +60,7 @@ class GuestTests(unittest.TestCase):
         install_aws_fixture_settings(root)
         write_guest_config(root)
         _ = (root / 'merge_gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
-        _ = (root / 'buildlog.conf').write_text(
-            '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
-            + '# range: 0..\nINDEX_TOUCH_MINUTES=60\n'
-            + '# whole: 1..\nINDEX_SPILL_PAGES=65536\n')
+        _ = write_config_fixture(root / 'buildlog.conf', defaults=BUILDLOG_INDEX_SETTINGS)
         _ = (root / 'build_folders.conf').write_text(
             f'roots.system={root}\nroots.gate={root}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'

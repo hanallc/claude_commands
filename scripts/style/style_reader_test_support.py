@@ -11,6 +11,17 @@ from unittest.mock import patch
 from scripts.style import style_config
 
 
+def style_reader_settings(reader: style_config.ReaderSource = style_config.ReaderSource.PYTHON) -> str:
+    return f"""\
+# one of: python, rust
+reader={reader.value}
+# whole: 1..
+protocol=7
+# text:
+minimum_version=2.3.4
+"""
+
+
 @contextmanager
 def oracle_reader() -> Generator[Path]:
     """Select Python and provide an oracle for tests that explicitly select Rust."""

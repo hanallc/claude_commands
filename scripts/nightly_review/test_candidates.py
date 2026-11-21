@@ -28,6 +28,11 @@ from scripts.review_links import efficiency_reviews
 from scripts.lib import conf
 
 
+def write_nightly_state_fixture(configuration: Path, root: Path) -> None:
+    _ = write_config_fixture(configuration / "nightly_review.conf",
+                             defaults=f"state_directory={root / 'state'}\nstate_folder=nightly-review\n")
+
+
 def setUpModule() -> None:
     """The times these tests expect are Eastern; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
@@ -80,9 +85,9 @@ class CandidatesTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(staff, "caller_identity", return_value=""))
         configuration = self.root / "config"
         configuration.mkdir()
+        write_nightly_state_fixture(configuration, self.root)
         _ = write_config_fixture(configuration / "nightly_review.conf",
-                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
-                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n")
+                                 "# whole: 1..\ntitle_characters=90\n", defaults="")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.note = self.root / "nightly improvement list.md"
         with contextlib.ExitStack() as environment:
@@ -437,7 +442,7 @@ class CandidatesTests(unittest.TestCase):
     def test_empty_or_unset_note_path_uses_the_default_under_a_temporary_home(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         _ = write_config_fixture(self.root / "config/nightly_review.conf",
-            "note_path=~/rust/hanadocs/nightly improvement list.md\n")
+            "note_path=~/rust/hanadocs/nightly improvement list.md\n", defaults="")
         default = self.root / "rust" / "hanadocs" / "nightly improvement list.md"
         default.parent.mkdir(parents=True)
         for value in ("", None):
@@ -691,22 +696,11 @@ class NightlyReviewConfigTests(unittest.TestCase):
                 _ = settings.write_text("# whole: 1..\ntitle_characters=5\n")
                 self.assertEqual(candidates.escaped("A longer title", conf.read("nightly_review").whole("title_characters")), "A lo…")
 
-    def test_shipped_config_supplies_the_settings_used_by_nightly_review(self) -> None:
+    def test_state_root_uses_the_configured_directory_without_an_environment_override(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        path = folder / "nightly_review.conf"
-        _ = write_config_fixture(path)
-        settings = conf.read(path)
-        values = settings.values()
-        for key in ("state_directory", "state_folder", "sessions_directory", "review_modes", "note_path",
-                    "primary_showrunner_name", "command_path"):
-            with self.subTest(key=key):
-                self.assertEqual(settings.text(key), values[key])
-        for key in ("message_sample_rows", "title_characters"):
-            with self.subTest(key=key):
-                self.assertEqual(settings.whole(key), int(values[key]))
-        for key in ("sample_timeout_overhead_seconds", "message_history_hours"):
-            with self.subTest(key=key):
-                self.assertEqual(settings.number(key), float(values[key]))
+        write_nightly_state_fixture(folder, folder)
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(folder), "XDG_STATE_HOME": ""}):
+            self.assertEqual(candidates.state_root(), folder / "state/nightly-review")
 
 if __name__ == "__main__":
     _ = unittest.main()

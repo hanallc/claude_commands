@@ -206,8 +206,12 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, unit_membership,
+    StaffTestCase, fixture_runtime_id, unit_membership, write_staff_settings,
 )
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.build_slots_test_support import copy_fixture_settings
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class ObservedUnitLaunch:
@@ -321,6 +325,11 @@ class AddUnitTestCase(ShutdownTestCase):
         self.prompt = self.root / "home/.local/state/showrunner/build-followups/prompt.txt"
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)
+        copies = self.config.with_name("copies.conf")
+        _ = write_config_fixture(copies, defaults=copy_fixture_settings(self.root))
+        _ = write_config_fixture(self.config.with_name("build_folders.conf"), defaults=workspace_folder_settings(self.root))
+        write_script_prompt_fixture(self.config.parent)
+        staff_config = write_staff_settings(self.config.with_name("staff.conf"), producers=self.root / "producers")
         _ = (home / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
                         "projects": self.trusted_projects()}),
@@ -367,7 +376,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
-        self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        self.env.update(CONF_DIR=str(self.config.parent), STAFF_FILE=str(self.staff.staff_file),
+                        STAFF_CONFIG=str(staff_config), COPIES_CONFIG=str(copies))
         socket_path = Path(self.enterContext(short_socket_directory())) / "claude.sock"
         messaging = socket.socket(socket.AF_UNIX)
         self.addCleanup(messaging.close)

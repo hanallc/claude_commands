@@ -44,8 +44,9 @@ from scripts.production.staff_test_support import fixture_unit_location, recorde
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.message import send_budget, session_send
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.message.test_send_budget import write_configs
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -195,6 +196,7 @@ class StyleSyncTests(unittest.TestCase):
         for tool in ("mend", "clippy", "rustfmt"):
             _ = (rule_root / "rust" / f"{tool}.md").write_text(f"---\ntier: A\nmechanism: {tool}\n---\n# {tool}\n")
         environment = copies_environment(self.root)
+        seed_config_fixture_folder(Path(environment["CONF_DIR"]), SEND_TIMING_FIXTURES)
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
             "patterns.legacy-unique={purpose}{suffix}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

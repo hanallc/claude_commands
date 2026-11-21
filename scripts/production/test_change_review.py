@@ -35,12 +35,18 @@ from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
 from scripts.agents import remote
+from scripts.agents.test_support import write_machine_config
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
+from scripts.production.staff_test_support import (
+    fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit, write_staff_settings,
+)
 from scripts.production import showrunner_tree
 from scripts.production.change_review import Invisible, Malformed, Visible
 from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_ENDPOINT_SETTINGS,
     fixture_image, fixture_row_image, pictured_changes, pictured_publication, pictured_review_lines,
 )
 from scripts.review_links import image_store, review_events
@@ -89,7 +95,14 @@ def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
+    configuration = Path(folder.name) / "config"
+    write_machine_config(configuration)
+    _ = write_staff_settings(configuration / "staff.conf", producers=Path(folder.name) / "producers")
+    _ = write_config_fixture(configuration / "review_links.conf",
+                             defaults=REVIEW_ENDPOINT_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS)
+    write_scratch_settings(configuration, Path(folder.name))
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        **config_environment(configuration),
         "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name,
         "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
         "SHOWRUNNER_STATE_DIR": f"{folder.name}/showrunner-state",
@@ -169,7 +182,10 @@ class ProducerFixture(unittest.TestCase):
         self.repo.mkdir()
         self.doc = self.root / "top.md"
         self.listing = self.root / "change-review - top.md"
+        settings = write_staff_settings(self.root / "staff.conf", producers=self.root / "producers")
         self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
+            "STAFF_CONFIG": str(settings),
+            "USER_ZONE": "America/New_York",
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
             "NEXT_STATE_DIR": str(self.root / "next"), "UNIT_HISTORY_DIR": str(self.root / "history"),
             "GIT_AUTHOR_DATE": "2026-11-13T12:00:00Z", "GIT_COMMITTER_DATE": "2026-11-13T12:00:00Z"}))

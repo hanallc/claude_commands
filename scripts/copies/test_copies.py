@@ -32,7 +32,9 @@ from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.nix_env_test_support import nix_fixture_settings
 from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
 from scripts.mac_test import floor_claims, offload
@@ -153,24 +155,13 @@ prefixes.copies-index=copies-index-
 roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
 """ + f"roots.scratch={self.base / 'scratch'}\nroots.scratch.{host_name()}={self.base / 'scratch'}\n")
-        _ = write_config_fixture(configuration / "scratch.conf", f"""\
-default_life_seconds=86400
-record_lock_attempts=3
-repo_depth=3
-repo_skip=target node_modules .git
-suffix_length=6
-visible_root={home / 'rust/repro'}
-""")
-        _ = write_config_fixture(configuration / "nix_env.conf", """\
-command_timeout_seconds=600
-trusted_home_folders=rust worktrees
-trusted_home_prefix=.claude
-""")
+        write_scratch_settings(configuration, self.base, visible_root=home / "rust/repro")
+        _ = write_config_fixture(configuration / "nix_env.conf", defaults=nix_fixture_settings())
         _ = write_config_fixture(configuration / "lint.conf", f"""\
 folder_state_dir={home / '.local/state/folder-sweep'}
 sweep_max_tree_depth=3
 """)
-        _ = write_config_fixture(configuration / "build_steps.conf", "names.integrate=integrate\n")
+        _ = write_config_fixture(configuration / "build_steps.conf", defaults="names.integrate=integrate\n")
         _ = (configuration / "build_admission.conf").write_text("""\
 # whole: 1..
 cloud_gate_slots=16
@@ -721,7 +712,7 @@ source_check_seconds=1
         trusted = Path.home() / "rust"
         trusted.mkdir()
         config = Path(os.environ["CONF_DIR"]) / "nix_env.conf"
-        _ = write_config_fixture(config, "trusted_home_folders=rust\n")
+        _ = write_config_fixture(config, "trusted_home_folders=rust\n", defaults="")
         binaries = self.base / "bin"
         binaries.mkdir()
         direnv = binaries / "direnv"
@@ -786,7 +777,8 @@ source_check_seconds=1
     def test_ssh_copy_checks_envrc_against_the_prepared_merge(self) -> None:
         trusted = Path.home() / "rust"
         trusted.mkdir()
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "nix_env.conf", "trusted_home_folders=rust\n")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "nix_env.conf",
+                                 "trusted_home_folders=rust\n", defaults="")
         binaries = self.base / "bin"
         binaries.mkdir()
         direnv = binaries / "direnv"

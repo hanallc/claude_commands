@@ -6,6 +6,15 @@ from scripts.test_times import gate_record
 from scripts.test_times.gate_record import GateRun, ModuleTimes
 
 
+def gate_timing_settings(*, slow_test_s: float = 0.5, top_runs: int = 5, failure_log_kib: int = 64) -> str:
+    return (f"# range: 0..\nSLOW_TEST_S={slow_test_s}\n"
+            + f"# whole: 1..\nTOP_RUNS={top_runs}\n# whole: 1..\nGATE_FAILURE_LOG_KIB={failure_log_kib}\n")
+
+
+def nextest_timing_settings(seconds: float = 1.0) -> str:
+    return f"# range: 0..\nNEXTEST_SLOW_TEST_S={seconds}\n"
+
+
 def fixture_executions(run: gate_record.GateRun) -> list[gate_record.Execution]:
     """Supply executions for fixtures that already contain module rows."""
     return [gate_record.Execution(module["suite"], module["module"], module["wall_s"], module["cpu_s"],

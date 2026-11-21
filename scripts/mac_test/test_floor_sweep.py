@@ -18,6 +18,8 @@ from scripts.mac_test import eligibility, offload
 from scripts.lib import conf
 from scripts.lint import sweep
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS, MAC_SWEEP_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -37,8 +39,8 @@ class FloorSweepTests(unittest.TestCase):
             **config_environment(self.root), "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
         self.settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(self.settings, "host=mac\nfree_floor_gib=100\nfloor_sweep_timeout_s=9\n")
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(self.settings, "host=mac\nfree_floor_gib=100\nfloor_sweep_timeout_s=9\n", defaults=MAC_RUN_SETTINGS)
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=mac_target_settings())
         self.controller = offload.ProcessController()
         self.repository = eligibility.KnownRepository("hana")
         self.before = offload.ProbeSnapshot(50, "fake-mac")
@@ -85,7 +87,7 @@ class FloorSweepTests(unittest.TestCase):
 
     def test_sweep_uses_live_timeout_and_holds_no_claim_lock(self) -> None:
         config = eligibility.read_config(self.settings)
-        _ = write_config_fixture(self.settings, "floor_sweep_timeout_s=3\n")
+        _ = write_config_fixture(self.settings, "floor_sweep_timeout_s=3\n", defaults=MAC_RUN_SETTINGS)
         state = self.root / "state"
         state.mkdir()
 
@@ -125,7 +127,7 @@ class FloorSweepTests(unittest.TestCase):
     def test_offload_rejects_invalid_mirror_roots(self) -> None:
         for root in ("~//tmp", "~/", "/abs", "~/a/../b", "~/a b", "~/a/./b", "~/a/", "~/a//b", "~/a$b"):
             with self.subTest(root=root):
-                _ = write_config_fixture(self.settings, f"mirror_root={root}\n")
+                _ = write_config_fixture(self.settings, f"mirror_root={root}\n", defaults=MAC_RUN_SETTINGS)
                 with self.assertRaisesRegex(ValueError, "mirror_root"):
                     _ = offload.remote_mirror(self.repository)
 
@@ -133,14 +135,14 @@ class FloorSweepTests(unittest.TestCase):
         for root in ("~//tmp", "~/", "/abs", "~/a/../b", "~/a b", "~/a/./b", "~/a/", "~/a//b", "~/a$b"):
             with self.subTest(root=root):
                 _ = write_config_fixture(self.settings,
-                    f"mirror_root={root}\nsweep_floor_roots=/tmp ~/rust {root}\n")
+                    f"mirror_root={root}\nsweep_floor_roots=/tmp ~/rust {root}\n", defaults=MAC_RUN_SETTINGS)
                 with self.assertRaisesRegex(ValueError, "mirror_root"):
                     _ = sweep.mac_floor_settings(conf.read(self.settings))
 
     def test_selector_rejects_its_assignment_text_and_near_miss_paths(self) -> None:
         configured = "~/.fixture-mirrors"
         for root in (configured, "~/fixture-mirrors"):
-            _ = write_config_fixture(self.settings, f"mirror_root={root}\n")
+            _ = write_config_fixture(self.settings, f"mirror_root={root}\n", defaults=MAC_RUN_SETTINGS)
             relative = root.removeprefix("~/")
             near = relative.replace(".", "X", 1) if "." in relative else relative.replace("-", "X", 1)
             for scope in (offload.ALL_MIRRORS, self.repository):
@@ -215,12 +217,13 @@ select_leftovers
             if needle in path.read_text():
                 found.append(str(path.relative_to(repository)))
         self.assertEqual(found, [])
-        _ = write_config_fixture(self.settings, f"mirror_root=~/{needle}\n")
+        _ = write_config_fixture(self.settings, f"mirror_root=~/{needle}\n", defaults=MAC_RUN_SETTINGS)
         configured = conf.read(self.settings).text("mirror_root")
         self.assertEqual(configured, "~/" + needle)
         root = "~/fixture-mirrors"
         _ = write_config_fixture(self.settings,
-            f"mirror_root={root}\nsweep_floor_roots=/tmp ~/rust {root}\n")
+            f"mirror_root={root}\nsweep_floor_roots=/tmp ~/rust {root}\n",
+            defaults=MAC_RUN_SETTINGS + MAC_SWEEP_SETTINGS)
         self.assertEqual(offload.remote_mirror(self.repository), "fixture-mirrors/hana")
         self.assertIn("[f]ixture-mirrors/", offload.mirror_selector_script(offload.ALL_MIRRORS))
         _, roots = sweep.mac_floor_settings(conf.read(self.settings))

@@ -115,8 +115,9 @@ class AwsReportTests(MeasurementFixture):
     def test_report_renders_one_aws_section_without_target_registration(self) -> None:
         registry = self.root / "build_targets.conf"
         fixture = registry.read_text()
-        shipped = (Path(__file__).resolve().parents[2] / 'config/build_targets.conf').read_text()
-        for source, configuration in (('fixture', fixture), ('shipped', shipped)):
+        registered = (fixture.replace("targets=natedev,mac", "targets=hana-aws,natedev,mac")
+                      + "kind.hana-aws=ssh\nplatform.hana-aws=linux\nsettings.hana-aws=hana_aws.conf\n")
+        for source, configuration in (('unregistered', fixture), ('registered', registered)):
             with self.subTest(configuration=source):
                 _ = registry.write_text(configuration)
                 original = self.render()

@@ -1,8 +1,9 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
 
 from scripts.agents import remote
+from scripts.agents.test_support import write_machine_config
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
@@ -35,6 +36,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member,
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, worker_panes
 from scripts.message import process_table, roster
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.message.process_table import Process
 from scripts.message.sessions import SessionRecord, process_start
 from scripts.production.showrunners import Showrunner
@@ -640,7 +642,8 @@ class MessageTests(unittest.TestCase):
             "CONF_DIR": str(self.root / "config"),
         }
         configuration = self.root / "config"
-        _ = copy_config_fixture(SCRIPT.parents[2] / "config", configuration)
+        seed_config_fixture_folder(configuration, SEND_TIMING_FIXTURES)
+        write_machine_config(configuration)
         _ = write_config_fixture(configuration / "accounts.conf", "codex_credit_accounts=none\n")
         self.environment.update(fake_unit_host.environment(self.root))
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership

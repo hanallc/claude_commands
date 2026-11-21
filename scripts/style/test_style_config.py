@@ -14,6 +14,8 @@ from unittest import mock
 from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 from scripts.style import style_config
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.style.style_reader_test_support import style_reader_settings
 from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, style_staff_fixture, write_style_units
 from scripts.style.style_config import (
     ParentUnitRoute, StyleConfigError, StyleRepositoryConfig, StyleShowrunnerRoute, StyleUnitAssignment,
@@ -184,9 +186,7 @@ class StyleConfigTests(unittest.TestCase):
         config = self.root / "style_reader.conf"
         for reader in style_config.ReaderSource:
             with self.subTest(reader=reader), mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
-                _ = config.write_text(
-                    f"# one of: python, rust\nreader={reader.value}\n"
-                    + "# whole: 1..\nprotocol=7\n# text:\nminimum_version=2.3.4\n")
+                _ = write_config_fixture(config, f"reader={reader.value}\n", defaults=style_reader_settings())
                 self.assertEqual(style_config.refill_reader(), reader)
                 self.assertEqual(style_config.reader_protocol(), 7)
                 self.assertEqual(style_config.reader_minimum_version(), "2.3.4")

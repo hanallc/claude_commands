@@ -51,7 +51,7 @@ class ReadSlotsTests(unittest.TestCase):
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = config_environment(folder)
         _ = write_config_fixture(folder / "build_steps.conf",
-            "names.integrate=integrate\nowned.default={unit} {step}\nowned.integrate={unit} {step}\n")
+            defaults="names.integrate=integrate\nowned.default={unit} {step}\nowned.integrate={unit} {step}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
 
     def test_lease_names_keep_staff_references_separate_from_work_text(self) -> None:

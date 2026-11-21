@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest.mock import patch
 
 from scripts.lib import main_push_lock
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 
 
 class MainPushLockRecordTests(unittest.TestCase):
@@ -22,6 +25,9 @@ class MainPushLockRecordTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.checkout = Path(folder.name)
+        configuration = self.checkout / "config"
+        write_push_lock_settings(configuration)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = subprocess.run(["git", "init", "-q", str(self.checkout)], check=True, timeout=30)
         self.record = self.checkout / ".git" / main_push_lock.RECORD_NAME
 

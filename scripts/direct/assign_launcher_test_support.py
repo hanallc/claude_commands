@@ -15,44 +15,28 @@ from unittest.mock import patch
 
 from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
-from scripts.direct.findings_test_support import invoke_findings
+from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import process_table
+from scripts.message.session_send_test_support import SEND_SETTINGS
 from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import write_staff_settings
 from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
 
 ASSIGNMENT_SETTINGS = {
-    "direct": """\
-# whole: 1..
-MIN_REPAIR_BUDGET=3
-# range: 5e-324..
-REPAIR_ROUNDS_PER_FINDING=0.5
-# whole: 1..
-RUNAWAY_ROUNDS=5
-# whole: 1..
-MAX_FIX_ATTEMPTS=2
-# whole: 1..
-MAX_REOPENS=2
-# whole: 1..
-STALLED_ROUNDS=4
-# whole: 1..
-MAX_CONSECUTIVE_SAME_KIND_PASSES=4
-# whole: 1..
-MAX_REVIEW_CANCELLATIONS=1
+    "direct": (STANDARD_CONFIG.replace("STALLED_ROUNDS=2", "STALLED_ROUNDS=4")
+               .replace("MAX_CONSECUTIVE_SAME_KIND_PASSES=3", "MAX_CONSECUTIVE_SAME_KIND_PASSES=4")) + """\
 # whole: 1..
 UNIT_COMPACT_ABOVE_TOKENS=200000
-# whole: 1..
-ROUTING_FROM_ROUND=4
-# whole: 1..
-ASTRA_AFTER_FAILED_FIXES=2
 # range: 0.1..0.9
 WORKER_SPLIT_RATIO=0.667
 WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
@@ -106,33 +90,7 @@ record_lock_attempts=3
 # whole: 1..
 removal_remote_timeout_seconds=30
 """,
-    "send": """\
-# range: 0.001..
-waits_review_seconds=30
-# range: 0.001..
-delivery_timeout=40
-# range: 0.001..
-kill_grace=10
-# range: 0.001..
-caller_margin_seconds=15
-# range: 0.001..
-remote_transport_seconds=30
-""",
-    "staff": """\
-# range: 0.001..
-OPERATION_LOCK_SECONDS=30
-# range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/productions
-""",
-    "copies": """\
-remote_registry=~/.local/state/copies/remote-mirrors
-wait_seconds=1
-git_timeout_seconds=600
-guard_timeout_seconds=10
-guard_choice_limit=32
-""",
+    "send": SEND_SETTINGS,
     "lint": "style_review=off\n",
     "showrunners": """\
 # range: 0..100
@@ -191,6 +149,8 @@ def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subp
 def assignment_environment(bytecode_setting: str) -> Generator[None]:
     """Pin settings and use only the fixture's Git configuration."""
     config = Path(os.environ["CONF_DIR"])
+    _ = write_staff_settings(config / "staff.conf", producers=config / "producers")
+    _ = (config / "copies.conf").write_text(copy_fixture_settings(config))
     for stem, settings in ASSIGNMENT_SETTINGS.items():
         _ = (config / f"{stem}.conf").write_text(settings)
     cache = Path.home() / ".cache"

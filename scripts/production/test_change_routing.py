@@ -1,7 +1,9 @@
 """Check fixed producer routing and shared fixtures for the count readers."""
 from __future__ import annotations
 
-from scripts.production.change_review_test_support import pictured_changes
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_ENDPOINT_SETTINGS, pictured_changes, write_change_review_settings,
+)
 
 from scripts.agents import remote
 
@@ -16,6 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import conf
+from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
@@ -56,8 +59,9 @@ class StaffRoutingTests(unittest.TestCase):
         _ = doc.write_text("# Top")
         _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
-        _ = write_config_fixture(config / "review_links.conf", "unrouted_alert_recipient=top\n")
-        _ = write_config_fixture(config / "change_review.conf")
+        _ = write_config_fixture(config / "review_links.conf", "unrouted_alert_recipient=top\n",
+                                 defaults=REVIEW_DELIVERY_SETTINGS)
+        write_change_review_settings(config, self.root)
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         return doc
 
@@ -551,12 +555,11 @@ class StaffRoutingTests(unittest.TestCase):
             root = Path(directory)
             config = root / "config"
             config.mkdir()
+            write_change_review_settings(config, root)
             config_env = config_environment(config)
-            _ = write_config_fixture(config / "scratch.conf",
-                                     f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
-            settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-            _ = (config / "change_review.conf").write_text(settings.read_text())
-            _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
+            write_scratch_settings(config, root)
+            _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n",
+                                     defaults=REVIEW_ENDPOINT_SETTINGS + REVIEW_DELIVERY_SETTINGS)
             environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
                            "REVIEW_LINKS_ROOT": str(root / "links"),
                            "NEXT_STATE_DIR": str(root / "next"), "FEATURE_LOG_VAULT": str(root / "vault")}
@@ -622,9 +625,11 @@ class MergeWriterRoutingTests(ProducerFixture):
 
 
 class ChangeReviewConfigTests(unittest.TestCase):
-    def test_shipped_config_has_a_review_links_directory(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-        self.assertIsInstance(conf.read(path).origin("review_links_directory", str), conf.UsableLiveValue)
+    def test_fixture_config_has_a_private_review_links_directory(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_change_review_settings(root, root)
+        setting = conf.read(root / "change_review.conf").origin("review_links_directory", str)
+        self.assertEqual(setting, conf.UsableLiveValue(str(root / "links")))
 
     def test_delivery_root_reads_the_folder_setting_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -638,7 +643,6 @@ class ChangeReviewConfigTests(unittest.TestCase):
 
     def test_config_reads_explicit_fixture_values(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        path = folder / "change_review.conf"
-        _ = write_config_fixture(path, f"lists_directory={folder / 'lists'}\n")
+        write_change_review_settings(folder, folder)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
             self.assertEqual(change_routing.configured_lists_directory(), folder / "lists")

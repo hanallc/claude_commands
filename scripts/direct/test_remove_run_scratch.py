@@ -15,6 +15,7 @@ from contextlib import redirect_stderr
 from typing import override
 from unittest import mock
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.direct import remove_run_scratch, workers
 from scripts.lib import scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -30,6 +31,8 @@ class RemoveRunScratchTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ, {
+            **copies_environment(root), "SCRATCH_VISIBLE_ROOT": str(root / "repro")}))
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
         owner = fixture_member("showrunner", name="demo")
         self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id

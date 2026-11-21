@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from scripts.agents.test_support import write_machine_config
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
+from scripts.lint.memory_test_support import config_environment, seed_config_fixture_folder, write_config_fixture
 
 from scripts.agents import remote
 from scripts.herdr import herdr_types
@@ -33,7 +34,9 @@ from unittest.mock import Mock, call, patch
 from urllib.parse import parse_qs
 
 from scripts.accounts import accounts, moves, role_map, worker_names
+from scripts.accounts.home_test_support import ACCOUNT_HOME_SETTINGS, ACCOUNT_STATUS_SETTINGS, ACCOUNT_WORKER_MODE_SETTINGS
 from scripts.accounts.move_test_support import write_claude_move_credentials
+from scripts.production.config_test_support import PROMPT_ALERT_SETTINGS
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 from scripts.agents import producer_transfer, restart, stop_resume, stop_results
@@ -46,18 +49,21 @@ from scripts.agents.stop_results import SourceReleased, SourceReleaseUnknown
 from scripts.agents.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch, worker_admission
 from scripts.lib.resume_message import ClaudeChildResume
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file, write_staff_settings,
+)
 from scripts.usage import agents_log
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.agents import pane_record, shutdown
 from scripts.message import codex_daemon, session_records, sessions
 from scripts.message import sessions as runtime_sessions
-from scripts.notify import pushover
+from scripts.notify import pushover, review
 from scripts.notify.push_texts import RenderedPush, render
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.agents.test_pane_restore import FakeClient, fixture_launch_transcript
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
@@ -127,8 +133,6 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
     try:
         case.setUp()
         world = ProducerAdmissionWorld(case, kind)
-        staff_configuration = case.root / "configuration/staff.conf"
-        _ = write_config_fixture(staff_configuration, f"PRODUCER_FOLDER_ROOT={world.folder.parent}\n")
         configuration = case.root / "configuration/models.conf"
         _ = write_registry(configuration, {"producers": {"dwight": kind + (":opus:high" if kind == "claude" else ":gpt-test:high")}}, update=True)
         result = case.client.result
@@ -238,8 +242,7 @@ class WorkerResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
-        atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf", SHUTDOWN_SETTINGS)
         opened = case.opened()
         _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -2604,10 +2607,13 @@ class StopResumeTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         configuration = self.root / "configuration"
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=workspace_folder_settings(configuration))
+        _ = write_staff_settings(configuration / "staff.conf", producers=self.root / "producer-documents")
+        seed_config_fixture_folder(configuration, {**SEND_TIMING_FIXTURES, "shutdown.conf": SHUTDOWN_SETTINGS,
+            "accounts.conf": ACCOUNT_HOME_SETTINGS + ACCOUNT_STATUS_SETTINGS + ACCOUNT_WORKER_MODE_SETTINGS,
+            "production.conf": PROMPT_ALERT_SETTINGS})
         write_machine_config(configuration)
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\nSTOP_GRACE_SECONDS=2\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "alpha": "claude:opus:max", "renamed-alpha": "claude:opus:max",
@@ -2633,6 +2639,7 @@ class StopResumeTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / ".codex"),
             "CLAUDE_CONFIG_DIR": str(self.root / ".claude3"),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "USER_ZONE": "America/New_York",
             "AGENT_NOTES_DIR": str(self.root / "notes"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
@@ -3140,8 +3147,7 @@ class StopResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
-        atomic_file.write_text_atomic(case.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        atomic_file.write_text_atomic(case.root / "conf/shutdown.conf", SHUTDOWN_SETTINGS)
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
                           current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
@@ -3213,10 +3219,18 @@ class StopResumeTests(unittest.TestCase):
             self.assertIsInstance(record["at"], (float, int))
 
     def drain_prompt_cancellations(self) -> None:
-        with (patch.object(showrunners, "load_settings", return_value={}),
+        settings = self.root / "configuration/stall_watch.conf"
+        _ = write_config_fixture(settings, defaults="""\
+delivery_reserve_seconds=10
+sender_batch_seconds=90
+sender_cleanup_seconds=2
+prompt_grace_seconds=120
+""")
+        with (patch.object(stall_watch, "WATCH_DEFAULTS", settings),
+              patch.dict(os.environ, {"STALL_WATCH_CONFIG": str(settings)}),
+              patch.object(showrunners, "load_settings", return_value={}),
               patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
               patch.object(stall_watch, "processes", return_value=[]),
-              patch.object(stall_watch, "prompt_grace_seconds", return_value=120),
               patch.object(unit_lookup, "read_run_states", return_value=unit_lookup.RunStates({}))):
             _ = stall_watch.tick(100)
 
@@ -5176,6 +5190,8 @@ class StopResumeTests(unittest.TestCase):
         attempts: list[str] = []
         posted: list[str] = []
         receipt = self.root / "push-receipt"
+        settings = self.root / "configuration/notify.conf"
+        _ = write_config_fixture(settings, defaults="REVIEW_TIMEOUT_SECONDS=60\n")
 
         def phone(_url: str, data: bytes) -> tuple[int, bytes]:
             posted.append(parse_qs(data.decode())["message"][0])
@@ -5212,7 +5228,8 @@ class StopResumeTests(unittest.TestCase):
         def fail(identity: str, **_options: object) -> stop_resume.ResumeFailed:
             return stop_resume.ResumeFailed(identity, "fixture start failed")
 
-        with (patch.object(staff, "initial_snapshot", return_value=record),
+        with (patch.object(review, "NOTIFY_CONFIG", settings),
+              patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(staff, "snapshot", return_value=record),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
               patch.object(stop_resume, "_stop", side_effect=stop_member) as stop,
@@ -5687,8 +5704,9 @@ class BuildWaitTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = self.root / "config"
         environment = config_environment(configuration)
+        write_machine_config(configuration)
         environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN="/nonexistent/herdr")
-        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

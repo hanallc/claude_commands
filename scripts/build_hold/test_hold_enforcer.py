@@ -26,7 +26,9 @@ from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_queue import admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
+from scripts.agents.detached_runs_test_support import DETACHED_RUN_SETTINGS
 from scripts.build_targets import target_config
+from scripts.build_targets.target_test_support import HOLD_TARGET_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
 from scripts.lib.atomic_file import write_text_atomic
@@ -68,9 +70,11 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = boot.write_text("test-boot\n")
         configuration = self.root / "config"
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
+        _ = write_config_fixture(configuration / "build_targets.conf", defaults=HOLD_TARGET_SETTINGS)
+        _ = write_config_fixture(configuration / "detached_runs.conf", defaults=DETACHED_RUN_SETTINGS)
         self.enterContext(mock.patch.dict(os.environ, {
             **environment,
+            "USER_ZONE": "America/New_York",
             "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILD_HOLD_ENFORCER_DIR": str(self.root / "enforcer"),

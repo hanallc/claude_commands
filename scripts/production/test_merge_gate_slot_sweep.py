@@ -14,6 +14,8 @@ from unittest import mock
 
 from scripts.lib import build_slots, scratch
 from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lint.memory_test_support import seed_config_fixture_folder
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
 
@@ -23,6 +25,7 @@ class NightlySlotSweepTests(unittest.TestCase):
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 config = private_slot_config(Path(temporary), repository="fixture")
+                seed_config_fixture_folder(config.settings.parent, SEND_TIMING_FIXTURES)
                 events: list[str] = []
                 notices: list[str] = []
 
@@ -63,6 +66,7 @@ class NightlySlotSweepTests(unittest.TestCase):
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 config = private_slot_config(Path(temporary), repository="fixture")
+                seed_config_fixture_folder(config.settings.parent, SEND_TIMING_FIXTURES)
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:

@@ -21,6 +21,7 @@ from unittest import mock
 
 from scripts.buildlog import ci, cli
 from scripts.buildlog import index
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS, BUILDLOG_TARGET_SETTINGS
 from scripts.buildlog import health
 from scripts.buildlog import record
 from scripts.buildlog import rust_release
@@ -29,7 +30,7 @@ from scripts.buildlog import store
 from scripts.buildlog import sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 def setUpModule() -> None:
@@ -46,8 +47,10 @@ class SyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = write_config_fixture(Path(temporary) / "build_targets.conf", defaults=BUILDLOG_TARGET_SETTINGS)
         _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
         point_root_at(self, self.root)
+        _ = write_config_fixture(Path(temporary) / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
         self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(Path(temporary)),
             "HOME": temporary, "BUILDLOG_PEER": "test-mac",

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lint.memory_test_support import config_environment
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -161,8 +163,12 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(source.parent / relative, destination)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    copy_runtime(root)
-    copy_runtime(root / ".claude")
+    for checkout in (root, root / ".claude"):
+        copy_runtime(checkout)
+        configuration = checkout / "config"
+        configuration.mkdir(exist_ok=True)
+        retries = "session_retries.toml"
+        _ = shutil.copy2(source.parent / "config" / retries, configuration / retries)
     # The launcher fixtures do not contact a Codex catalog.
     for checkout in (root, root / ".claude"):
         catalog = checkout / "scripts/agents/sync_codex_catalog.sh"
@@ -191,6 +197,7 @@ def configure_launcher_fixture(launcher: Path) -> None:
 def launcher_environment(root: Path) -> dict[str, str]:
     """Isolate registry writes, Python discovery and worker identity for launchers."""
     environment = {name: value for name, value in os.environ.items() if not name.startswith("HERDR_")}
+    environment.update(config_environment(root, fixtures={"build_folders.conf": workspace_folder_settings(root)}))
     environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
                        UNIT_WORKER_POLL_SECS="0.01", UNIT_SYNC_WRITES="0",
                        TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),

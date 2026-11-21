@@ -1,5 +1,6 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
+from scripts.build_targets.target_test_support import mac_target_settings
 from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -5030,7 +5031,8 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
-        _ = write_config_fixture(self.root / 'build_targets.conf', 'targets=mac,natedev\n')
+        _ = write_config_fixture(self.root / 'build_targets.conf', defaults=mac_target_settings())
+        _ = write_config_fixture(self.root / 'mac_test.conf', defaults='')
         self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()

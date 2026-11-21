@@ -34,6 +34,7 @@ from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.mac_test.offload_test_support import split_mac_run_command
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_targets import targets
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -114,8 +115,8 @@ class RepositorySlotTests(unittest.TestCase):
         )
         for name in ("mac", "linux"):
             _ = write_config_fixture(self.root / f"{name}.conf", f"host=fake-{name}\n" + settings,
-                                     template="mac_test")
-        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmirror_root=~/.local/state/mac-test/test-mirror\n")
+                                     defaults=MAC_RUN_SETTINGS)
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmirror_root=~/.local/state/mac-test/test-mirror\n", defaults=MAC_RUN_SETTINGS)
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
@@ -603,7 +604,7 @@ class RepositorySlotTests(unittest.TestCase):
         identity = eligibility.KnownRepository("hana", "https://github.com/nate/hana")
         settings = self.root / "mac.conf"
         _ = write_config_fixture(settings, settings.read_text() + "mac_skip.hana=test(gpu)\n",
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         cases = (
             (("-E", "test(a)"), ("-E", "(test(a)) & not (test(gpu))")),
             (("--workspace",), ("--workspace",)),

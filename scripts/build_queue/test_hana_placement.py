@@ -33,6 +33,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
@@ -46,7 +47,7 @@ def hana_target(fixture: PlacementFixture) -> target_config.SshTarget:
 
 def hana_fallback_request(fixture: PlacementFixture, *, include_mac: bool = False) -> wire.PlacementRequest:
     target = hana_target(fixture)
-    _ = write_config_fixture(fixture.root / 'mac_test.conf', 'host=fixture-mac\n')
+    _ = write_config_fixture(fixture.root / 'mac_test.conf', 'host=fixture-mac\n', defaults=MAC_RUN_SETTINGS)
     _ = write_config_fixture(fixture.root / 'build_targets.conf',
         f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
         + f'settings.{target.name}={target.settings.name}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
@@ -630,8 +631,9 @@ class HanaQueueTests(unittest.TestCase):
             clock = TestClock()
             directory = fixture.root / 'hana-state'
             provider = FakeProvider(directory, clock)
-            controller = hana_box.HanaController(directory, fixture.root / 'aws_target.conf',
-                target.settings, provider, clock=clock)
+            account = fixture.root / 'aws_target.conf'
+            install_cost_settings(account)
+            controller = hana_box.HanaController(directory, account, target.settings, provider, clock=clock)
             book = ledger.CostLedger(directory)
             book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
             book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))

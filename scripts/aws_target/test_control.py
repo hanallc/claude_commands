@@ -18,7 +18,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, page_status_settings
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target import plan_identity, quota_requests
@@ -27,7 +27,10 @@ from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_s
 from scripts.buildlog import aws_report
 from scripts.lib import atomic_file, conf
 from scripts.message import send_budget
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.lint.memory_test_support import seed_config_fixture_folder
 from scripts.notify import push_texts
+from scripts.production.change_review_test_support import REVIEW_ENDPOINT_SETTINGS
 from scripts.review_links import console_theme, review_link
 
 
@@ -58,6 +61,10 @@ class ControlTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        seed_config_fixture_folder(self.root, {
+            "console.conf": page_status_settings(),
+            "review_links.conf": REVIEW_ENDPOINT_SETTINGS,
+        })
         self.clock = TestClock()
         self.calls = []
         self.failure = ''
@@ -1165,6 +1172,7 @@ class HoursCheckTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        seed_config_fixture_folder(self.root, SEND_TIMING_FIXTURES)
         self.configure('region=us-east-1\ninstance_type=m7a.4xlarge\n'
                        + '# whole: 1..\nrun_cost_days=7\n# whole: 1..\nprice_max_age_seconds=7200\n'
                        + '# range: 0.001..\nsnapshot_notification_timeout_s=5\n'

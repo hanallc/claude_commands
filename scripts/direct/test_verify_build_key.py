@@ -13,18 +13,12 @@ from typing import cast, override
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = write_config_fixture(self.config.with_name('direct.conf'),
-            'VERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG LC_ALL LC_COLLATE '
-            + 'LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT '
-            + 'LC_NAME LC_PAPER LC_TELEPHONE\nVERIFY_RESULT_ENV_PREFIXES=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n'
-            + 'VERIFY_TEST_FIXED_ENV=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n')
         (self.root / "bin/git").unlink()
         (self.root / ".git").rmdir()
         self.environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})

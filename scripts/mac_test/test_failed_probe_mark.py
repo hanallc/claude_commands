@@ -28,6 +28,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
 from scripts.lib.process_group import send_process_group
+from scripts.mac_test.config_test_support import MAC_CLAIM_SETTINGS, MAC_IDLE_SETTINGS, MAC_OFFLOAD_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import eligibility, mac_test, offload, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
@@ -47,7 +48,7 @@ class FailedProbeTests(OffloadCommandFixture):
         _ = write_config_fixture(self.linux_settings,
             "offload=on\nhost=fake-box\nkinds=test,check,lint,doc,build\nslots=1\nslots.hana=1\n"
             + "shell_timeout_s=2\nparity.rustc=fixture\nparity.nextest=fixture\n"
-            + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
+            + "parity.mend=fixture\nparity.scripts_commit=fixture\n", defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
@@ -230,7 +231,7 @@ class FailedProbeTests(OffloadCommandFixture):
             "session": None, "showrunner": None,
             "state": "active", "ci": "not_configured", "free_message": {"kind": "not_needed"}}))
         self.assertEqual(self.free(), "blocked")
-        _ = write_config_fixture(self.linux_settings, "offload=off\n", template="mac_test")
+        _ = write_config_fixture(self.linux_settings, "offload=off\n", defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
         self.assertEqual(self.free(), "off")
 
     def test_reach_error_prints_only_the_last_nonempty_stderr_line(self) -> None:
@@ -591,7 +592,7 @@ fi
         _ = (self.repository / "flake.nix").write_text("{ outputs = _: {}; }\n")
         _ = (self.repository / "flake.lock").write_text("{}\n")
         _ = write_config_fixture(self.linux_settings,
-            "shell_cache=.local/state/probe-shells\ndevshell=default\n", template="mac_test")
+            "shell_cache=.local/state/probe-shells\ndevshell=default\n", defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
         home = Path(self.environment["HOME"])
         _ = copy_helpers(home, *COPY_HELPERS)
         for name, program in {
@@ -637,7 +638,8 @@ raise SystemExit("Unexpected remote command: " + command)
 class StepRecoveryTests(VerifyLintScopeFixture):
     def test_each_compiling_lint_command_has_one_placement_episode(self) -> None:
         settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n")
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n",
+                                 defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
@@ -680,12 +682,13 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         self.assertEqual(list((self.root / "mac-state/claims").glob("*.json")), [])
 
     def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n",
+                                 defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
         _ = write_config_fixture(self.root / "linux.conf",
             "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\nslots=1\n"
             + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
             + "parity.rustc=fixture\nparity.nextest=fixture\nparity.mend=fixture\n"
-            + "parity.scripts_commit=fixture\n", template="mac_test")
+            + "parity.scripts_commit=fixture\n", defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")

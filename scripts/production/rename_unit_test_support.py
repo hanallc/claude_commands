@@ -19,8 +19,12 @@ from unittest import mock
 
 
 from scripts.herdr import fake_herdr
-from scripts.lint.memory_test_support import config_environment
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.config_test_support import RENAME_SETTINGS, UNIT_PORT_SETTINGS
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
 from scripts.production import staff, unit_config, fake_unit_host
@@ -34,6 +38,15 @@ from scripts.style import style_ledger
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 SLUG = "demo"
+
+
+
+def write_rename_session_settings(root: Path) -> None:
+    """Set private values for stopping and starting renamed sessions."""
+    _ = write_config_fixture(root / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+    _ = write_config_fixture(root / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
+    write_machine_config(root)
+    write_script_prompt_fixture(root)
 
 
 class UnitRenameFixture(StaffTestCase):
@@ -90,6 +103,8 @@ class UnitRenameFixture(StaffTestCase):
         self.doc = self.checkout / "docs/plans/demo-production.md"
         self.state = self.root / "state/showrunner"
         config = self.home / ".claude"
+        _ = write_config_fixture(self.root / "production.conf", defaults=RENAME_SETTINGS + UNIT_PORT_SETTINGS)
+        write_rename_session_settings(self.root)
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
             **config_environment(self.root),
@@ -364,6 +379,7 @@ class FolderRenameFixture(StaffTestCase):
         self.destination = self.source.with_name(f"cargo-liner-{self.new_name}")
         self.records = self.root / "launches"
         self.configuration = self.root / "production.conf"
+        write_rename_session_settings(self.root)
         self.env = {
             **config_environment(self.root),
             "HOME": str(self.home), "HERDR_BIN": "/nonexistent/herdr",
@@ -386,7 +402,7 @@ class FolderRenameFixture(StaffTestCase):
             worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
-        _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
+        _ = write_config_fixture(self.configuration, defaults=RENAME_SETTINGS + UNIT_PORT_SETTINGS)
         self.transcript("claude")
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:

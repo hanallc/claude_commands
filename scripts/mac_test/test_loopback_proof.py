@@ -16,6 +16,7 @@ from unittest import mock
 
 from scripts.lib import conf
 from scripts.build_queue import admission_records
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import loopback_proof
 
@@ -52,9 +53,23 @@ class LoopbackCleanupTests(unittest.TestCase):
         environment = {**os.environ, "HOME": str(home), "CLEANUP_STATUS": str(cleanup_status),
                        "CLEANUP_ARGUMENTS": str(arguments_file), "FAKE_SCRATCH_HOME": str(remote_home)}
         targets = root / "build_targets.conf"
-        _ = write_config_fixture(targets, "loopback.memory_gib=4\nloopback.host=fake-ssh\n")
+        _ = write_config_fixture(targets, defaults="""\
+loopback.host=fake-ssh
+loopback.port=
+loopback.known_hosts=
+# range: 1..60
+loopback.connect_timeout_s=6
+# range: 1..3600
+loopback.command_timeout_s=600
+loopback.free_floor_gib=1
+loopback.build_budget_gib=16
+loopback.target_budget_gib=1
+loopback.shell_timeout_s=120
+loopback.shell=default
+loopback.memory_gib=4
+""")
         mac = root / "mac_test.conf"
-        _ = write_config_fixture(mac)
+        _ = write_config_fixture(mac, defaults=MAC_RUN_SETTINGS)
         configurations = [conf.read(targets), conf.read(mac)]
         memory = mock.Mock(program_first_peaks={"cargo": 1}, policy=mock.Mock(safety_bytes=1))
         run = subprocess.run

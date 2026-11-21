@@ -16,6 +16,7 @@ from typing import override
 from unittest import mock
 
 from scripts.lib import mac_wake, main_publish
+from scripts.lib.live_settings_test_support import write_live_settings_fixture
 
 
 def _done(code: int) -> subprocess.CompletedProcess[str]:
@@ -31,6 +32,8 @@ class MacWakeTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("MAC_WAKE_PROGRAM", "ZONE_SSH")}
+        write_live_settings_fixture(self.root)
+        environment["CONF_DIR"] = str(self.root)
         environment["ZONE_STATE"] = str(self.root / "zone")
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         _ = self.enterContext(mock.patch.object(platform, "system", return_value="Linux"))

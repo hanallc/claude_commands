@@ -7,6 +7,7 @@ import json
 import unittest
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 from scripts.mac_test import claim_state, offload
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -19,7 +20,7 @@ class OffloadCommandTests(SeededCleanupFixture):
                 alternate = self.root / "alternate-settings.conf"
                 values = {**self.config, "host": "next-mac", "connect_timeout_s": "2"}
                 _ = write_config_fixture(alternate, "".join(f"{key}={value}\n" for key, value in values.items()),
-                                         template="mac_test")
+                                         defaults=MAC_RUN_SETTINGS)
                 settings = self.config_path if unacknowledged else alternate
                 assigned_options = tuple(self.assignment_options(self.repository, "nextest", settings, ()))
                 if unacknowledged:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.helper_tree_test_support import (
+    VERIFY_HELPERS, VERIFY_RESULT_SETTINGS, VERIFY_TOKEN_SETTINGS, copy_helpers, verify_test_environment,
+)
 
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
@@ -10,6 +12,8 @@ from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_to
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
+from scripts.build_targets.target_test_support import LOCAL_TARGET_SETTINGS
+from scripts.lint.config_test_support import LINT_TOOL_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
@@ -314,6 +318,9 @@ if __name__ == "__main__":
                 ],
             }],
         }
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=LOCAL_TARGET_SETTINGS)
+        _ = write_config_fixture(self.root / "direct.conf",
+                                 defaults=VERIFY_TOKEN_SETTINGS + VERIFY_RESULT_SETTINGS)
         self.environment = verify_test_environment()
         self.environment.update({
             # The fixture supplies its complete toolchain; Nix discovery is unrelated
@@ -430,7 +437,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         )
 
     def write_config(self, *, clippy: str) -> None:
-        _ = write_config_fixture(self.config, f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n")
+        _ = write_config_fixture(self.config, f"clippy={clippy}\n", defaults=LINT_TOOL_SETTINGS)
 
     def enable_cache(self) -> Path:
         session = self.root / "session"

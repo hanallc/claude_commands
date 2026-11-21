@@ -27,7 +27,9 @@ from scripts.build_queue import progress_profile as progress, step_estimator
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
-from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import (
+    admission_fixture_settings, admission_policy_fixture, fake_memory_readings, write_config_fixture,
+)
 from scripts.production.merge_gate_test_support import gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
@@ -167,7 +169,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
 
     def test_gate_reservation_refuses_unusable_config_before_default_sizing_admission(self) -> None:
         config = self.root / "invalid-config" / "build_admission.conf"
-        _ = write_config_fixture(config, "safety_gib=invalid")
+        _ = write_config_fixture(config, "safety_gib=invalid", defaults=admission_fixture_settings())
         diagnostics = io.StringIO()
         with mock.patch.dict(os.environ, {**self.environment, "CONF_DIR": str(config.parent)}), \
              mock.patch.object(step_estimator, "memory_config", wraps=step_estimator.memory_config) as read_config, \

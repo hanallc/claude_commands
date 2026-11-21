@@ -39,6 +39,8 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.buildlog import record, store
 from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest
+from scripts.build_targets.target_test_support import HOLD_TARGET_SETTINGS, mac_target_settings
+from scripts.mac_test.config_test_support import MAC_IDLE_SETTINGS, MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
@@ -157,6 +159,8 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                     f"targets=natedev,{target}\nkind.natedev=local\nplatform.natedev=linux\n"
                     + f"kind.{target}=ssh\nplatform.{target}={'linux' if target == 'aws' else 'macos'}\n"
                     + f"settings.{target}={'aws_target' if target == 'aws' else 'mac_test'}.conf\n")
+                if target == "mac":
+                    _ = write_config_fixture(configuration / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
                 claims = root / "mac-state" / "claims"
                 if present:
                     claims.mkdir(parents=True)
@@ -196,6 +200,8 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
         root = Path(directory)
         environment.update({**config_environment(root), "HOME": directory, "BUILDLOG_DIR": directory,
                             "MAC_TEST_STATE_DIR": str(root / "mac-state")})
+        _ = write_config_fixture(root / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
+        _ = write_config_fixture(root / "build_targets.conf", defaults=mac_target_settings())
         result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
             "import os,sys; from pathlib import Path; from scripts.build_targets import build_targets; "
             + "assert 'scripts.build_queue.admission_service' not in sys.modules; "
@@ -222,6 +228,7 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
         common = ["--repo-root", directory, "--kind", "test"]
         reservation = ["reserve", *common, "--pid", str(os.getpid()),
                        "--reservation-file", str(root / "reservation")]
+        _ = write_config_fixture(root / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
         cases = (
             ("bare-eligible", False, ["eligible", "--repo-root", directory], 0),
             ("kind-eligible", False, ["eligible", *common], 0),
@@ -349,7 +356,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_stale_mac_reading_prints_before_target_status(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(config.parent / "mac_test.conf", "stale_seconds=300\n")
+        _ = write_config_fixture(config.parent / "mac_test.conf", "stale_seconds=300\n", defaults=MAC_IDLE_SETTINGS)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(time, "time", return_value=NOW.timestamp()):
             code, output, errors = self.capture_status()
@@ -767,7 +774,7 @@ class EligibleCommandTests(IsolatedBuildTargetTest):
                                         ("linux_only.hana=hana\n", [], "linux_only"),
                                         ("", ["--local", "Linux filesystem required"], "Linux filesystem required")):
             with self.subTest(reason=reason):
-                _ = write_config_fixture(self.settings, settings, template="mac_test")
+                _ = write_config_fixture(self.settings, settings, defaults=MAC_RUN_SETTINGS)
                 if "linux_only.hana=" not in settings:
                     _ = self.settings.write_text("\n".join(line for line in self.settings.read_text().splitlines()
                         if not line.startswith("linux_only.hana=")) + "\n")
@@ -788,7 +795,8 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         config = self.write_config(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n"
+                                 + "linux_only..claude=\noffload_exclude..claude=doc\n", defaults=MAC_RUN_SETTINGS)
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nexclude=["crates/excluded"]\n')
         for directory, name in (("portable", "portable"), ("excluded", "linux-part")):
             member = self.root / "crates" / directory
@@ -850,7 +858,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
 
     def test_kind_table_keeps_target_order_settings_and_each_mac_decision(self) -> None:
         other_settings = self.settings.with_name("other.conf")
-        _ = write_config_fixture(other_settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
+        _ = write_config_fixture(other_settings, "offload=off\nlinux_only.hana=\n", defaults=MAC_RUN_SETTINGS)
         _ = self.write_config(
             "targets=natedev,other,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
@@ -918,7 +926,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         )
         for kind, configured, expected in cases:
             with self.subTest(kind=kind, configured=configured):
-                _ = write_config_fixture(self.settings, f"{key}\n", template="mac_test")
+                _ = write_config_fixture(self.settings, f"{key}\n", defaults=MAC_RUN_SETTINGS)
                 if not configured:
                     _ = self.settings.write_text("\n".join(
                         line for line in self.settings.read_text().splitlines() if not line.startswith(key)
@@ -952,7 +960,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")
         offload.write_backoff(time.time() + 60)
         self.assertEqual(self.kind_answer("doc"), "any_target\n")
-        _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", defaults=MAC_RUN_SETTINGS)
         self.assertEqual(self.kind_answer("lint"), "any_target\n")
 
     def test_temporary_mac_exclusions_keep_the_leave_route_available(self) -> None:
@@ -1026,7 +1034,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = write_config_fixture(self.root / "build_targets.conf", "hold_sender_timeout_seconds=30\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=HOLD_TARGET_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -1562,11 +1570,10 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                 self.sleeps = 0
                 run = self.root / label
                 configuration = self.root / ".claude/config"
-                _ = write_config_fixture(configuration / "build_targets.conf",
-                                         f"# range: 0.01..300\nhold_sender_timeout_seconds={timeout}\n")
-                if label == "unreadable-timeout":
-                    _ = (configuration / "build_targets.conf").write_text(
-                        "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+                settings = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+                if label != "unreadable-timeout":
+                    settings += f"# range: 0.01..300\nhold_sender_timeout_seconds={timeout}\n"
+                _ = (configuration / "build_targets.conf").write_text(settings)
                 sender = [sys.executable, "-c", (program or f"import sys; sys.stderr.write({send_error!r})")
                           + f"; raise SystemExit({send_status})"]
                 sender_arguments = mock.Mock(return_value=sender)
@@ -1591,7 +1598,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                      mock.patch.object(subprocess, "run", side_effect=REAL_SUBPROCESS_RUN if program else None,
                                        return_value=subprocess.CompletedProcess([], send_status, "", send_error)) as send:
                     code, output, errors = self.wait(session=claim_state.CALLING_SESSION)
-                self.assertEqual((code, output, self.sleeps), (0, "", 2))
+                self.assertEqual((code, output, self.sleeps), (0, "", 2), errors)
                 announcement = ("verify.sh: natedev is held by hana for render checks; waiting "
                                 + "(tests that can run on the Mac keep running there).\n")
                 if resolved:

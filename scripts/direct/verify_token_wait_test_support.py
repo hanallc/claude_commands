@@ -1,7 +1,9 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.helper_tree_test_support import (
+    VERIFY_HELPERS, VERIFY_RESULT_SETTINGS, VERIFY_TOKEN_SETTINGS, copy_helpers, verify_test_environment,
+)
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -9,6 +11,7 @@ from dataclasses import replace
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading, write_config_fixture
 
 
@@ -200,6 +203,8 @@ esac
             + '    read -r label available unit < "$BUILDLOG_MEMINFO"\n'
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
+        _ = write_config_fixture(self.root / "direct.conf",
+                                 defaults=VERIFY_TOKEN_SETTINGS + VERIFY_RESULT_SETTINGS)
         self.environment = {
             **verify_test_environment(),
             "UNIT_DETACHED_RUN": "1",
@@ -448,14 +453,14 @@ esac
         if wait_status == 75:
             _ = (self.root / "build_targets.conf").write_text(
                 "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
-            _ = write_config_fixture(self.root / "mac-settings",
-                f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            _ = write_config_fixture(self.root / "mac_test.conf",
+                f"offload=on\nlinux_only.{self.root.name}=\n", defaults=MAC_RUN_SETTINGS)
             from scripts.direct.verify_step_routes_test_support import RUNNER
 
             runner = self.root / "held-mac-runner.py"
             _ = runner.write_text(RUNNER)
-            self.environment.update({"MAC_TEST_CONFIG": str(self.root / "mac-settings"),
+            self.environment.update({"MAC_TEST_CONFIG": str(self.root / "mac_test.conf"),
                 "VERIFY_MAC_RUNNER": str(runner), "TEST_MAC_EVENTS": str(self.root / "mac-events")})
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:

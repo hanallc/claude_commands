@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.git_test_support import write_fixture_git_config
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.memory_test_support import config_environment, seed_config_fixture_folder, write_config_fixture
 
 
 @dataclass(frozen=True)
@@ -24,10 +26,25 @@ class SlotTestConfiguration:
     environment: Mapping[str, str]
 
 
+def copy_fixture_settings(root: Path, *, git_timeout_seconds: int = 600) -> str:
+    """Set the private mirror directory and the limits for copy commands."""
+    return f"""\
+remote_registry={root / 'remote-mirrors'}
+# range: 0.001..
+git_timeout_seconds={git_timeout_seconds}
+# range: 0.001..
+guard_timeout_seconds=10
+# whole: 1..
+guard_choice_limit=32
+owner.nightly=nightly
+owner.style=style
+owner.verify=verify
+"""
+
+
 def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
     """Set private slot and cargo roots for the host and the default."""
-    if not settings.exists():
-        _ = write_config_fixture(settings)
+    seed_config_fixture_folder(settings.parent, {settings.name: workspace_folder_settings(root)})
     lines = [line for line in settings.read_text().splitlines()
              if not line.startswith(("roots.slots", "roots.slot_cargo"))]
     lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={root / 'slots'}",
@@ -38,12 +55,14 @@ def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
 def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaultMaximum = 2,
                         default_maximum: int = 1, unused_days: int = 7) -> SlotTestConfiguration:
     """Give direct calls and child commands private roots without a caller session."""
-    environment = config_environment(root / "config")
-    settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
+    configuration = root / "config"
+    settings = configuration / "build_folders.conf"
+    write_scratch_settings(settings.parent, root)
     slots = root / "slots"
     cargo = root / "cargo"
     machine = host_name()
     write_private_slot_roots(settings, root, machine)
+    environment = config_environment(configuration)
     lines = [line for line in settings.read_text().splitlines()
              if not line.startswith(("roots.workspace", "roots.session", "slots.", "patterns.slot="))]
     lines.extend((f"roots.workspace={root / 'workspaces'}", f"roots.session={root / 'session'}",
@@ -54,10 +73,8 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
         lines.extend(("# whole: 1..", f"slots.{machine}.{repository}.max={maximum}"))
     _ = settings.write_text("\n".join(lines) + "\n")
     copies = settings.with_name("copies.conf")
-    copy_lines = [line for line in copies.read_text().splitlines()
-                  if not line.startswith("remote_registry=")]
-    copy_lines.append(f"remote_registry={root / 'remote-mirrors'}")
-    _ = copies.write_text("\n".join(copy_lines) + "\n")
+    _ = write_config_fixture(copies, f"remote_registry={root / 'remote-mirrors'}\n",
+                             defaults=copy_fixture_settings(root))
     git_config = write_fixture_git_config(root)
     environment.update({
         "COPIES_CONFIG": str(copies), "SCRATCH_ROOT": str(root / "scratch"),

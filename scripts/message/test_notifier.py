@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.production.production_doc import read_production
 from scripts.production.update_registration import scheduled_prompt
@@ -24,6 +25,7 @@ from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.agents.test_support import write_machine_config
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib import user_zone
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
@@ -52,6 +54,7 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(self.root / "user_zone.conf", "zone=America/New_York\n", defaults="")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"__ETC_ZSHENV_SOURCED": "1"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.owned = OwnedTestProcesses()
@@ -179,13 +182,11 @@ class NotifierTests(unittest.TestCase):
             "FAKE_SEND_RC": str(send_rc),
             "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
         })
+        config = environment.get("USER_ZONE_CONF") or str(self.root / "user_zone.conf")
+        environment["USER_ZONE_CONF"] = str(Path(config).absolute())
         if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
-            config = environment.get("USER_ZONE_CONF") or str(
-                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
-            if not Path(config).is_absolute():
-                config = str(Path.cwd() / config)
             try:
-                with mock.patch.object(user_zone, "CONF", config):
+                with mock.patch.object(user_zone, "CONF", environment["USER_ZONE_CONF"]):
                     zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
             except Exception:
                 # The shell ignores helper failures and uses the machine zone.
@@ -469,13 +470,20 @@ class NotifierTests(unittest.TestCase):
         _ = notifier.write_text(SCRIPT.read_text())
         source = SCRIPT.parents[1]
         _ = shutil.copyfile(source / "production/update_registration.py", scripts / "production/update_registration.py")
-        (scripts / "message/sessions.py").symlink_to(source / "message/sessions.py")
         template = self.root / "commands/showrunner/produce.md"
         template.parent.mkdir(parents=True)
         _ = template.write_text("The prompt:\n\n> \n>\n\n**A tick**\n")
         copy_runtime(self.root)
+        configuration = self.root / "config"
+        write_machine_config(configuration)
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
         python = scripts / "lib/py"
+        socket_answer = shlex.quote(str(self.socket_path))
+        target = shlex.quote("session:" + owner.id)
         wrapper = ("#!/bin/sh\n"
+                   + f'if [ "$2" = member-socket ] && [ "$3" = {target} ]; then\n'
+                   + f"    printf '%s\\n' {socket_answer}\n"
+                   + "    exit 0\nfi\n"
                    + f'exec {shlex.quote(str(source / "lib/py"))} "$@"\n')
         _ = python.write_text(wrapper)
         python.chmod(0o755)

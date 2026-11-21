@@ -1,6 +1,7 @@
 """Build complete runtime copies and Python tools inside test fixtures."""
 
 import ast
+from collections.abc import Mapping
 import importlib.util
 import os
 from functools import cache
@@ -9,6 +10,7 @@ import shutil
 import shlex
 import sys
 
+from scripts.lib.build_folders_test_support import temporary_folder_settings
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, inherited_paths
 
 
@@ -19,8 +21,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 def runtime_files() -> tuple[Path, ...]:
     """List runtime files without compiled files or unrelated test modules."""
     helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
-    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
-                 for path in sorted((SOURCE / folder).rglob("*"))
+    return tuple(path.relative_to(SOURCE) for path in sorted((SOURCE / "scripts").rglob("*"))
                  if path.is_file() and "__pycache__" not in path.parts
                  and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
 
@@ -36,15 +37,20 @@ def copy_with_bytecode(source: Path, destination: Path) -> None:
             _ = shutil.copy2(bytecode, target)
 
 
-def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
+def copy_runtime(checkout: Path) -> None:
     """Copy missing runtime files and keep the fixture's existing tools."""
     for relative in runtime_files():
-        if not configuration and relative.parts[0] == "config":
-            continue
         destination = checkout / relative
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
             copy_with_bytecode(SOURCE / relative, destination)
+
+
+def seed_test_configuration(checkout: Path, fixtures: Mapping[str, str]) -> None:
+    """Write explicit fixtures and preserve existing regular files."""
+    from scripts.lint.memory_test_support import seed_config_fixture_folder
+
+    seed_config_fixture_folder(checkout / "config", fixtures)
 
 
 def copy_startup(checkout: Path) -> None:
@@ -57,14 +63,20 @@ def copy_startup(checkout: Path) -> None:
         copy_with_bytecode(SOURCE / relative, destination)
 
 
-def copy_test_runner(checkout: Path) -> None:
+def copy_test_runner(checkout: Path, *, fixtures: Mapping[str, str] | None = None) -> None:
     """Install the test runner and its dependencies in a temporary checkout."""
     for relative in TEST_RUNNER_FILES:
+        if relative.startswith("config/"):
+            continue
         destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
             destination.unlink()
         copy_with_bytecode(SOURCE / relative, destination)
+    defaults = {"build_folders.conf": temporary_folder_settings(checkout)}
+    if fixtures is not None:
+        defaults.update(fixtures)
+    seed_test_configuration(checkout, defaults)
 
 
 def python_tool_source(source: str) -> str:

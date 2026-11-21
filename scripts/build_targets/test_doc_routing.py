@@ -6,6 +6,7 @@ from typing import final
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_doc_test_support import VerifyDocFixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 @final
@@ -18,6 +19,7 @@ class DefaultDocRoutingTests(VerifyDocFixture):
         _ = self.git("worktree", "add", "-qb", "doc-fixture", str(workspace))
         self.repo = workspace
         self.enable_held_mac_doc()
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload_exclude..claude=doc\n")
         (Path(self.environment["BUILD_HOLD_DIR"]) / "other").unlink()
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(registry.read_text().replace("targets=natedev,mac", "targets=mac,natedev"))

@@ -1,4 +1,4 @@
-"""Prevent tests from starting the real session sender."""
+"""Provide private sender settings and guard against real sends."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +6,51 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
+
+POSTMASTER_SETTINGS = """\
+# range: 0.001..
+wait_seconds=3.0
+# range: 0.001..
+claim_grace_seconds=15.0
+# range: 0.001..
+heartbeat_max_age_seconds=2.0
+# range: 0.001..
+poll_seconds=0.05
+"""
+
+SEND_SETTINGS = """\
+failed_lookup_owners=aws-spending-guard=builds
+# range: 0.001..
+waits_review_seconds=30
+# range: 0.001..
+delivery_timeout=40
+# range: 0.001..
+kill_grace=10
+# range: 0.001..
+user_cancel_timeout=30
+# range: 0.001..
+check_timeout=20
+# range: 0.001..
+caller_margin_seconds=15
+# range: 0.001..
+remote_transport_seconds=30
+# range: 0.001..
+decision_high_priority_window_seconds=1800
+# range: 0.001..
+main_sync_repeat_minutes=360
+# one of: on, off
+review_hold=off
+# range: 0.001..
+review_hold_idle_minutes=30
+"""
+
+SEND_TIMING_FIXTURES = {
+    "codex_daemon.conf": CODEX_DAEMON_SETTINGS,
+    "postmaster.conf": POSTMASTER_SETTINGS,
+    "send.conf": SEND_SETTINGS,
+}
 
 
 @dataclass(frozen=True)

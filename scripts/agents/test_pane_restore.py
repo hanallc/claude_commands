@@ -1,6 +1,9 @@
 from __future__ import annotations
-from scripts.agents.test_support import write_machine_config
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
+from scripts.production.config_test_support import RENAME_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
 
 import io
 import json
@@ -32,7 +35,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.agents import pane_record as restart_records
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, write_staff_settings
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_move
 
@@ -254,10 +257,13 @@ class PaneRestoreTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
         configuration = self.root / "configuration"
         configuration.mkdir()
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=workspace_folder_settings(configuration))
+        _ = write_config_fixture(configuration / "production.conf", defaults=RENAME_SETTINGS)
         write_machine_config(configuration)
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_staff_settings(configuration / "staff.conf", producers=self.root / "producers")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
         for pid in (123, 4242):
@@ -676,8 +682,12 @@ class RestoreStaffNamesTests(StaffTestCase):
         parent, unit, worker = self.tree()
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
         configuration = self.root / "configuration"
-        for config_source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / config_source.name)
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=workspace_folder_settings(configuration))
+        _ = write_config_fixture(configuration / "production.conf", defaults=RENAME_SETTINGS)
+        _ = write_staff_settings(configuration / "staff.conf", producers=self.root / "producers")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         (self.root / "run").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "UNIT_RUN_DIR": str(self.root / "run"),
@@ -946,8 +956,12 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
         configuration = self.root / "configuration"
         configuration.mkdir()
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=workspace_folder_settings(configuration))
+        _ = write_config_fixture(configuration / "production.conf", defaults=RENAME_SETTINGS)
+        _ = write_staff_settings(configuration / "staff.conf", producers=self.root / "producers")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         registry = write_registry(configuration / "models.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",

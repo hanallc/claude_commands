@@ -30,6 +30,7 @@ from scripts.production import staff
 from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.agents.remote import local_machine
+from scripts.agents.test_support import write_machine_config
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -57,6 +58,7 @@ class HerdrLaunchTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        write_machine_config(Path(self.env["CONF_DIR"]))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="fixture-server"))
         _ = self.enterContext(patch.object(herdr, "start_server"))
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
@@ -226,7 +228,7 @@ class HerdrLaunchTests(NixFixture):
               redirect_stdout(output), redirect_stderr(output)):
             client.configure_mock(**{"return_value.panes.return_value": []})
             result = herdr_sessions.main(["herdr_sessions.py", "start", "--name", "worker", "--cwd", str(self.work)])
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 0, output.getvalue())
         self.assertEqual(Path(cast(str | Path, ensure.call_args.args[0])), self.work)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn(reason, output.getvalue())

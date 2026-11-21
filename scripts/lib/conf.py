@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+from functools import cache
 import math
 import os
 from pathlib import Path
@@ -26,6 +27,10 @@ from scripts.lib import conf_reads
 
 if TYPE_CHECKING:
     from decimal import Decimal
+
+
+_VALUE_LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:")
+_SCHEMA_LIMIT_PREFIXES = (*_VALUE_LIMIT_PREFIXES, "# text:")
 
 
 _warning_sink: ContextVar[Callable[[str, bool], None] | None] = ContextVar("configuration_warning_sink", default=None)
@@ -180,7 +185,7 @@ class ConfigRead:
                     raise
                 return default, None
             bad = setting.value
-            if allow_blank and not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if allow_blank and not setting.value and not setting.limit.startswith(_VALUE_LIMIT_PREFIXES):
                 return convert(""), setting.value
             return _converted(setting, convert), setting.value
 
@@ -209,7 +214,7 @@ class ConfigRead:
         current_limit = ""
         if isinstance(self.settings, dict):
             current = self.settings.get(self.effective_key(key))
-            if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if current is not None and current.limit.startswith(_VALUE_LIMIT_PREFIXES):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
@@ -281,7 +286,7 @@ class ConfigRead:
                 setting = _setting(settings, key)
             except _MissingKey:
                 continue
-            if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if not setting.value and not setting.limit.startswith(_VALUE_LIMIT_PREFIXES):
                 result[key] = setting.value
                 continue
             try:
@@ -369,22 +374,39 @@ def path(file: str | Path) -> Path:
     return directory() / f"{file}.conf"
 
 
+def _repository_config_directory() -> Path:
+    return Path(__file__).resolve().parents[2] / "config"
+
+
 def _repository_path(stem: str) -> Path:
     """Return the repository configuration file for a validated stem."""
     conf_reads.record(stem)
-    return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
+    return _repository_config_directory() / f"{stem}.conf"
+
+
+def _section_settings(source: str) -> Iterator[tuple[str, str, Setting]]:
+    section = ""
+    previous = ""
+    for index, raw in enumerate(source.splitlines()):
+        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
+        if line.startswith("["):
+            section = line.removeprefix("[").removesuffix("]").strip()
+        elif line:
+            key, found, value = line.partition("=")
+            if found:
+                yield section, key.strip(), Setting(value.strip(), previous, index)
+        previous = raw.strip()
+
+
+def _flat_settings(source: str) -> Iterator[tuple[str, Setting]]:
+    """Read keys in file order without section names."""
+    return ((key, setting) for _, key, setting in _section_settings(source))
 
 
 def _parse(source: str) -> dict[str, Setting]:
     settings: dict[str, Setting] = {}
-    previous = ""
-    for index, raw in enumerate(source.splitlines()):
-        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
-        if line and not line.startswith("["):
-            key, separator, value = line.partition("=")
-            if separator:
-                _ = settings.setdefault(key.strip(), Setting(value.strip(), previous, index))
-        previous = raw.strip()
+    for key, setting in _flat_settings(source):
+        _ = settings.setdefault(key, setting)
     return settings
 
 
@@ -583,14 +605,110 @@ def check(file: str | Path, key: str, value: str) -> None:
         raise Unusable(f"{source}: {key}={value!r}: {error}") from error
 
 
+@dataclass(frozen=True)
+class DeferralRules:
+    window: int
+    phrases: dict[str, re.Pattern[str]]
+
+
+def parse_context_deferral(source: str) -> DeferralRules:
+    """Read and validate the Stop hook rules."""
+    groups: dict[str, list[str]] = {}
+    for raw in source.splitlines():
+        line = raw.partition("#")[0].strip()
+        if not line:
+            continue
+        kind, separator, value = line.partition(":")
+        value = value.strip()
+        if not separator or kind not in ("window", "action", "marker", "state", "later", "exclude") or not value:
+            raise ValueError("Invalid context deferral entry.")
+        groups.setdefault(kind, []).append(value)
+    if any(kind not in groups for kind in ("window", "action", "exclude")):
+        raise ValueError("Missing context deferral setting.")
+    windows = groups.pop("window")
+    if len(windows) != 1:
+        raise ValueError("Duplicate key window.")
+    window = int(windows[0])
+    if window <= 0:
+        raise ValueError("The context deferral window must be positive.")
+    return DeferralRules(window, {
+        kind: re.compile("|".join(f"(?:{value})" for value in values), re.IGNORECASE)
+        for kind, values in groups.items()
+    })
+
+
+@cache
+def shipped_keys(file: Path) -> frozenset[str]:
+    """Return the key names for a test that checks reader coverage."""
+    source = file.read_text(encoding="utf-8")
+    if file.name == "context_deferral.conf":
+        return frozenset(("window", *parse_context_deferral(source).phrases))
+    return frozenset(key for key, _ in _flat_settings(source))
+
+
+def _shipped_key_problems(file: Path, source: str, entries: list[tuple[str, Setting]]) -> Iterator[str]:
+    """Find duplicate keys with the reader's key scope."""
+    if file.name == "design_roles.conf":
+        from configparser import ConfigParser, Error
+
+        try:
+            ConfigParser().read_string(source, source=file.name)
+        except Error as error:
+            yield str(error)
+        return
+    if file.name == "models.conf":
+        from scripts.lib import registry_rows
+
+        keys = ((row.section, row.key) for row in registry_rows.records(source) if row.key)
+    else:
+        keys = (("", key) for key, _ in entries)
+    seen: set[tuple[str, str]] = set()
+    for section, key in keys:
+        entry = section, key
+        if entry in seen:
+            yield f"Duplicate key {key} in section {section}." if section else f"Duplicate key {key}."
+        seen.add(entry)
+
+
+def check_shipped(folder: Path) -> None:
+    """Check shipped configuration keys and values."""
+    errors: list[str] = []
+    for file in sorted(folder.rglob("*.conf")):
+        display = f"config/{file.relative_to(folder)}"
+        source = file.read_text(encoding="utf-8")
+        if file.name == "context_deferral.conf":
+            try:
+                _ = parse_context_deferral(source)
+            except (ValueError, re.error) as error:
+                errors.append(f"{display}: {error}")
+            continue
+        entries = list(_flat_settings(source))
+        errors.extend(f"{display}: {problem}" for problem in _shipped_key_problems(file, source, entries))
+        for key, setting in entries:
+            if file.name == "issue_score.conf" and not setting.limit.startswith(_VALUE_LIMIT_PREFIXES):
+                errors.append(f"{display}: {key}: Expected a # whole:, # range:, or # one of: limit.")
+            if (setting.limit.startswith(_SCHEMA_LIMIT_PREFIXES)
+                    or (file.name == "copies.conf" and key.startswith("allow."))):
+                try:
+                    _limits(setting.limit, setting.value)
+                except (ValueError, ArithmeticError) as error:
+                    limit = f" ({setting.limit})" if setting.limit.startswith(_SCHEMA_LIMIT_PREFIXES) else ""
+                    errors.append(f"{display}: {key}={setting.value!r}: {error}{limit}.")
+    if errors:
+        raise Unusable("\n".join(errors))
+
+
 def main(arguments: list[str] | None = None) -> int:
     args = sys.argv[1:] if arguments is None else arguments
-    if len(args) != 3 or args[0] != "get":
-        print("usage: conf.py get FILE KEY", file=sys.stderr)
-        return 2
     try:
-        print(read(args[1]).text(args[2]))
-    except Unusable as error:
+        if args == ["check-shipped"]:
+            check_shipped(_repository_config_directory())
+        elif len(args) == 3 and args[0] == "get":
+            print(read(args[1]).text(args[2]))
+        else:
+            print("usage: conf.py get FILE KEY | conf.py check-shipped", file=sys.stderr)
+            return 2
+    except (Unusable, OSError, UnicodeError) as error:
         print(str(error), file=sys.stderr)
         return 2
     return 0

@@ -15,8 +15,10 @@ from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, charge_readings, git_only, instant
 
 from scripts.buildlog import index, store
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.lib import conf
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 DAY = "2026-01-15"
@@ -65,6 +67,7 @@ class MeasurementFixture(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(self.root / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_TARGETS_CONFIG": str(self.root / "build_targets.conf"),

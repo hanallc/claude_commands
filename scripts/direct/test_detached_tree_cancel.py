@@ -12,6 +12,8 @@ from typing import Callable, cast
 from unittest.mock import patch
 
 from scripts.agents import detached_runs
+from scripts.agents.detached_runs_test_support import DETACHED_RUN_SETTINGS
+from scripts.lint.memory_test_support import seed_config_fixture_folder
 from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership,
@@ -22,6 +24,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 
 
 PRIVATE_DELIVERY = """import json, os, sys
@@ -55,6 +58,10 @@ def setUpModule() -> None:
 
 
 class DetachedTreeCancelTests(VerifyTreeCancelFixture):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.supervisors: dict[Path, subprocess.Popen[bytes] | subprocess.Popen[str]] = {}
+
     def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
         session = fixture.board
         session.mkdir(parents=True, exist_ok=True)
@@ -62,8 +69,12 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         native = fixture_runtime_id(identity)
         environment = {**fixture.environment, "CODEX_THREAD_ID": native,
                        "CLAUDE_CODE_SESSION_ID": "",
+                       "USER_ZONE": "America/New_York",
                        "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",
                        "DESIGN_ROLES_STATE": str(fixture.root / "roles")}
+        seed_config_fixture_folder(Path(environment["CONF_DIR"]), {
+            **SEND_TIMING_FIXTURES, "detached_runs.conf": DETACHED_RUN_SETTINGS,
+        })
         done_flags: list[str] = []
         if done_message:
             done = fixture.root / "done-message.txt"
@@ -74,10 +85,14 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         spawn = cast(Callable[..., subprocess.Popen[bytes] | subprocess.Popen[str]], subprocess.Popen)
 
         def capture(command: object, **options: object) -> subprocess.Popen[bytes] | subprocess.Popen[str]:
-            if isinstance(command, list) and cast(list[object], command)[1:3] == [str(wrapper), "supervise"]:
+            arguments = cast(list[str], command) if isinstance(command, list) else []
+            supervisor = arguments[1:3] == [str(wrapper), "supervise"]
+            if supervisor:
                 # The supervisor passes the runner session to Verify for the build hold.
                 options["env"] = {**os.environ, **build_sessions}
             process = spawn(command, **options)
+            if supervisor:
+                self.supervisors[Path(arguments[-1])] = process
             fixture.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
             return process
 
@@ -117,12 +132,18 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         return records[0]
 
     def finished_record(self, path: Path) -> detached_runs.RunRecord:
+        process = self.supervisors[path]
+
         def finished() -> bool:
-            return cast(dict[str, object], json.loads(path.read_text())).get("status") == "finished"
+            if cast(dict[str, object], json.loads(path.read_text())).get("status") == "finished":
+                return True
+            if process.poll() is not None:
+                self.fail(path.with_suffix(".log").read_text(errors="replace"))
+            return False
 
         # Directory events, not a status-file polling loop: completion replaces
         # the run record atomically after it has delivered the message.
-        wait_until(finished, path.parent, timeout=TEST_HANG_GUARD_SECS)
+        wait_until(finished, path.parent, processes=(process,))
         return cast(detached_runs.RunRecord, json.loads(path.read_text()))
 
     def inbox_path(self, fixture: VerifyTreeCancelFixture, identity: str) -> Path:

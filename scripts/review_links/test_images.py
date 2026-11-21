@@ -20,13 +20,16 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, console_settings
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_SERVER_SETTINGS, write_change_review_settings,
+)
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
@@ -49,12 +52,11 @@ class ImagesFixture(unittest.TestCase):
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="images-test-")))
         configuration = self.temporary / "config"
         configuration.mkdir()
-        _ = write_config_fixture(configuration / "change_review.conf")
-        _ = write_config_fixture(configuration / "console.conf",
-            "page.images.url=python:scripts.review_links.images:page_url\n"
-            + "page.images.items=python:scripts.review_links.images:waiting_images\n")
+        write_change_review_settings(configuration, self.temporary)
+        _ = write_config_fixture(configuration / "console.conf", defaults=console_settings())
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\n")
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\n",
+                                 defaults=REVIEW_SERVER_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS)
         self.root = self.temporary / "snapshots"
         self.status = change_page.DeliveryStatus(self.root)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

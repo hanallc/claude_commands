@@ -19,9 +19,10 @@ from xml.etree import ElementTree
 from typing import cast, override
 from unittest import mock
 
+from scripts.agents.test_support import write_machine_config
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, page_status_settings
 from scripts.disks import disks_page
 from scripts.production import staff
 from scripts.review_links import staff_names
@@ -76,8 +77,9 @@ class DisksPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
+        _ = (configuration / "console.conf").write_text(page_status_settings())
         # The page reads staff names, and staff reads the machine list.
-        _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
+        write_machine_config(configuration)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:

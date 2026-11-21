@@ -1,7 +1,7 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, page_status_settings
 from scripts.build_queue import admission_records, admission_service, placement
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
@@ -28,6 +28,7 @@ from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, parse
+from scripts.agents.test_support import write_machine_config
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -44,6 +45,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_slots, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import private_slot_config, write_private_slot_roots
+from scripts.production.change_review_test_support import write_change_review_settings
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
@@ -52,6 +54,7 @@ from scripts.production import staff
 from scripts.production.merge_gate import SuiteMode
 from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
+from scripts.mac_test.config_test_support import MAC_IDLE_SETTINGS
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
 
 REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
@@ -127,6 +130,50 @@ def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProc
         owner=f"leftover-{minutes}", activity=activity, pid=minutes)
     return admission_records.RunningStep("fixture", "fixture", f"leftover-{minutes}", "/fixture", 0,
                             memory, pid=minutes, started_at=started_at)
+
+
+GATE_STEP_SETTINGS = """\
+names.integrate=integrate
+names.test-all=test all
+names.test-modules=test named
+names.test-affected=test affected
+names.test-nightly=test nightly
+names.fast-track=fast track
+names.toolchain-trial=toolchain trial
+names.promote=promote
+names.ci=CI
+owned.default={unit} {step}
+owned.showrunner-default=showrunner {step}
+about.integrate=Merges the checkpoint into the {branch} branch, runs every test module, then pushes {branch}
+about.test-all=Runs every test module
+about.test-modules=Runs {modules} named test modules
+about.test-affected=Runs the test modules that the change affects
+about.test-nightly=Tests the {branch} branch each night and records a red result with its owner
+about.promote=Publishes the {branch} branch to main and the Mac
+about.gate-job=Runs a merge or test job
+changes.integrate={branch} branch
+changes.promote=main branch
+changes.default=no branch
+"""
+
+FEED_STEP_SETTINGS = GATE_STEP_SETTINGS + """\
+names.test=test
+names.merge-gate=merge gate
+names.targeted-test=targeted test
+owned.merge-gate={unit} merge
+owned.targeted-test={unit} targeted
+owned.ci-default=CI {step}
+owned.showrunner-merge-gate=showrunner merge
+about.verify-test=Runs the selected tests
+about.verify-final=Checks the workspace targets and runs the selected tests
+about.ci-bench=Runs the selected benchmarks for CI
+about.ci-nextest=Runs the selected tests for CI
+about.cargo-check=Checks that the selected targets compile
+about.cargo-nextest=Runs the selected tests
+about.compiler-cache=This cache stores compiled code for reuse
+about.unowned-processes=These processes run outside the queue
+about.repository-slot=Waits for a build slot
+"""
 
 
 class MemoryFeedTests(unittest.TestCase):
@@ -361,17 +408,11 @@ class MemoryFeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_machine_config(self.root)
         write_private_slot_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
-        _ = write_config_fixture(self.root / "build_steps.conf",
-            "changes.default=no branch\nchanges.integrate={branch} branch\n"
-            + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
-            + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
-            + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
-            + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")
-        self.configure()
+        self.configure(self.root)
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
         proc.mkdir()
@@ -389,6 +430,16 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
+        installed_version = memory_feed.installed_feed_code_version
+        default_code_root = memory_feed.page_arguments([]).code_root
+
+        def code_version(root: Path) -> str:
+            if root == default_code_root:
+                return "fixture-feed-code"
+            return installed_version(root)
+
+        _ = self.enterContext(mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", "fixture-feed-code"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "installed_feed_code_version", side_effect=code_version))
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
@@ -447,11 +498,36 @@ class MemoryFeedTests(unittest.TestCase):
                         memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=newer), notified)
                         self.assertEqual(send.call_count, 3)
 
-    def configure(self, *, seconds: float = 0.125) -> None:
-        _ = write_config_fixture(self.configuration,
-                                 f"output_folder={self.output}\n# range: 5e-324..\ninterval_seconds={seconds}\n"
-                                 + "history_days=7\nswap_rows=6\nreport_refresh_seconds=300\n"
-                                 + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
+    @staticmethod
+    def configure(root: Path, *, seconds: float = 0.125) -> None:
+        _ = write_config_fixture(root / "console.conf", defaults=page_status_settings())
+        _ = write_config_fixture(root / "build_steps.conf", defaults=FEED_STEP_SETTINGS)
+        _ = write_config_fixture(root / "memory_feed.conf", f"""\
+output_folder={root / 'page'}
+# range: 5e-324..
+interval_seconds={seconds}
+# whole: 1..3600
+mac_activity_refresh_seconds=30
+# whole: 1..90
+history_days=7
+# whole: 1..50
+swap_rows=6
+# whole: 1..50
+other_rows=6
+# whole: 5..3600
+token_dump_seconds=10
+stevie_program={root / 'stevie'}
+# whole: 30..3600
+report_refresh_seconds=300
+remote_memory_light=505868
+remote_memory_dark=b6c0d0
+machine_natedev_light=593090
+machine_natedev_dark=c7adf2
+machine_mac_light=466213
+machine_mac_dark=c3d98a
+machine_aws_light=774523
+machine_aws_dark=edb899
+""", defaults="")
 
     def expected_page(self, seconds: float = 0.125) -> str:
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
@@ -703,7 +779,7 @@ process.stdout.write(JSON.stringify({
 
     def test_step_descriptions_use_the_current_templates_and_recorded_work(self) -> None:
         path = self.root / "build_steps.conf"
-        _ = write_config_fixture(path, "about.verify-final=Runs the final checks and tests\n")
+        _ = write_config_fixture(path, "about.verify-final=Runs the final checks and tests\n", defaults="")
         names = read_step_names()
         verify = admission_records.VerifyCall("final", "verify final hana", 2, 2)
         notes = memory_feed.job_notes(memory_feed.NotGateStep(), names,
@@ -878,7 +954,7 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(memory_feed.mac_build_units((replace(build, session="unclaimed"),), (claim,)), {})
 
     def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
-        _ = write_config_fixture(self.configuration, "mac_activity_refresh_seconds=30\n")
+        _ = write_config_fixture(self.configuration, "mac_activity_refresh_seconds=30\n", defaults="")
         baseline = reservation_reading()
         now = baseline.explanation.now
         build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 120)
@@ -947,7 +1023,7 @@ process.stdout.write(JSON.stringify({
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
         self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10,
-                                                                   Path("/run/current-system/sw/bin/stevie")))
+                                                                   self.root / "stevie"))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()
@@ -1024,8 +1100,8 @@ process.stdout.write(JSON.stringify({
                 _ = memory_feed.page_url()
 
     def test_served_page_allows_same_origin_framing(self) -> None:
-        for name in ("review_links", "change_review"):
-            _ = write_config_fixture(self.root / f'{name}.conf')
+        write_change_review_settings(self.root, self.root)
+        _ = write_config_fixture(self.root / "review_links.conf", defaults=test_serve.SERVER_SETTINGS)
         server_fixture = test_serve.ReviewLinksServerTests()
         self.addCleanup(server_fixture.doCleanups)
         server_fixture.setUp()
@@ -1074,7 +1150,7 @@ process.stdout.write(JSON.stringify({
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
-                self.configure(seconds=seconds)
+                self.configure(self.root, seconds=seconds)
                 _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
@@ -1095,7 +1171,7 @@ process.stdout.write(JSON.stringify({
         self.output.mkdir()
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
-                self.configure(seconds=seconds)
+                self.configure(self.root, seconds=seconds)
                 _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
@@ -1242,8 +1318,8 @@ process.stdout.write(JSON.stringify({
     def test_mac_readings_follow_the_configured_refresh_window(self) -> None:
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
             with self.subTest(interval=interval):
-                self.configure()
-                _ = write_config_fixture(self.configuration, f"mac_activity_refresh_seconds={interval}\n")
+                self.configure(self.root)
+                _ = write_config_fixture(self.configuration, f"mac_activity_refresh_seconds={interval}\n", defaults="")
                 builds = iter((710001, 710002))
                 published: list[int] = []
 
@@ -1690,7 +1766,7 @@ process.stdout.write(JSON.stringify({
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
-                _ = write_config_fixture(installed / 'config/console.conf')
+                _ = write_config_fixture(installed / "config/console.conf", defaults=page_status_settings())
                 probe = textwrap.dedent("""
                     import builtins
                     import json
@@ -1874,6 +1950,7 @@ process.stdout.write(JSON.stringify({
         owner = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
         source = self.root / "repository"
         pool = private_slot_config(self.root / "slot-request", repository="hana")
+        self.configure(pool.settings.parent)
         runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "hana", staff.StaffRoot(),
                                current_session=staff.StaffId("runner-session"))
         member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
@@ -2012,7 +2089,7 @@ process.stdout.write(JSON.stringify({
     def test_blank_or_unrelated_configured_name_uses_the_verb(self) -> None:
         for text in ("", "umask"):
             with self.subTest(text=text):
-                _ = write_config_fixture(self.root / "build_steps.conf", f"names.test={text}\n")
+                _ = write_config_fixture(self.root / "build_steps.conf", f"names.test={text}\n", defaults="")
                 self.assertEqual(recorded_step("test", read_step_names()), "test")
 
     def test_unresolved_slot_owner_does_not_take_the_worktree_unit(self) -> None:
@@ -2038,7 +2115,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row["unit"], expected)
 
     def test_recorded_queue_rows_always_have_a_name(self) -> None:
-        _ = write_config_fixture(self.root / "build_steps.conf", "names.test=\n")
+        _ = write_config_fixture(self.root / "build_steps.conf", "names.test=\n", defaults="")
         make = parse.step_name(["make", "-f", "/fixture/Makefile"])
         bash = parse.step_name(["bash", "-c", ":"])
         cxx = parse.step_name(["c++", "/fixture/main.cpp"])
@@ -2259,6 +2336,7 @@ process.stdout.write(JSON.stringify({
     def test_direct_request_reason_reaches_the_waiter_page(self) -> None:
         for reason in ("", "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"):
             with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                self.configure(fixture.root)
                 _ = fixture.occupy_host()
                 original = fixture.request(step="check")
                 fixture.free(0)
@@ -2284,6 +2362,7 @@ process.stdout.write(JSON.stringify({
     def verify_call_page(self) -> memory_feed.MemoryPage:
         """Read the verify facts from admissions through the private service socket."""
         with AdmissionFixture() as fixture:
+            self.configure(fixture.root)
             facts = admission_records.VerifyCall("final", "verify final sample --local 'creates a Linux install'", 1, 2)
             run = fixture.run_owner()
             first = fixture.request(step="nextest", need=admission_records.GIB, run=run)
@@ -2331,6 +2410,7 @@ process.stdout.write(JSON.stringify({
         )
 
         with PlacementFixture() as fixture:
+            self.configure(fixture.root)
             facts = admission_records.VerifyCall("test", "verify test sample --no-cache", 1, 1)
             request = placement_request(fixture)
             request = replace(request, identity=replace(request.identity, step="nextest", verify=facts))
@@ -2567,7 +2647,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(memory_feed.wait_why(reason), expected)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n", defaults=MAC_IDLE_SETTINGS)
         _ = write_idle_config(self.root)
         reading = captured_reading()
         now = reading.explanation.now
@@ -2667,8 +2747,9 @@ process.stdout.write(JSON.stringify({
                       job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
                       ) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
-        config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
-        _ = shutil.copyfile(config, self.root / "build_steps.conf")
+        config = self.root / "build_steps.conf"
+        config.unlink(missing_ok=True)
+        _ = write_config_fixture(config, defaults=GATE_STEP_SETTINGS)
         base = with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110))
         running = replace(base.view.running[0], step=step, pid=running_pid, job=job)
         waiting = replace(base.view.waiting[0], step=step, job=job)
@@ -3415,6 +3496,7 @@ process.stdout.write(JSON.stringify({
         gib = admission_records.GIB
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
+                self.configure(fixture.root)
                 python = fixture.fixture_owner(700001, "100")
                 process = fixture.proc.path / str(python.pid)
                 _ = process.joinpath("comm").write_text("python3\n")
@@ -3485,6 +3567,7 @@ process.stdout.write(JSON.stringify({
         for registered, registered_use, unregistered_use, kept in (
                 ((), 0, 6, 0), ((700001,), 2, 4, 6), ((700001, 700002), 6, 0, 10)):
             with self.subTest(registered=registered), AdmissionFixture() as fixture:
+                self.configure(fixture.root)
                 fixture.configure(safety_gib=3)
                 owners: list[wire.Owner] = []
                 for pid, worker, used in ((700001, 700011, 2), (700002, 700012, 4)):

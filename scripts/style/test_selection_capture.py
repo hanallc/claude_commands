@@ -12,10 +12,12 @@ import sys
 from typing import cast, final, override
 from unittest.mock import patch
 
-from scripts.lib import conf
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
+from scripts.lib.checkout_test_support import seed_test_configuration
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit, write_staff_settings
 from scripts.style import refill_measure, selection_capture, style_config, style_ledger, style_reader
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
+from scripts.style.style_reader_test_support import style_reader_settings
 
 
 @final
@@ -32,12 +34,12 @@ class SelectionCaptureTests(StylePlanFixture):
         _ = reader.write_text("#!/bin/sh\nprintf 'cargo-style 2.3.4 protocol 7\\n'\n")
         reader.chmod(0o755)
         configuration = self.root / "capture-config"
-        configuration.mkdir()
-        for path in conf.directory().glob("*.conf"):
-            _ = shutil.copy2(path, configuration / path.name)
-        _ = (configuration / "style_reader.conf").write_text(
-            "# one of: python, rust\nreader=python\n# whole: 1..\nprotocol=7\n"
-            + "# text:\nminimum_version=2.3.4\n")
+        _ = config_environment(configuration)
+        reader_config = style_reader_settings()
+        _ = write_config_fixture(configuration / "style_reader.conf", defaults=reader_config)
+        seed_test_configuration(self.repo, {"style_reader.conf": reader_config})
+        _ = self.enterContext(patch.object(
+            selection_capture, "__file__", str(self.repo / "scripts/style/selection_capture.py")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "STYLE_READER_BINARY": str(reader)})))
         style_reader.reset_reader_cache()
@@ -167,12 +169,9 @@ class SelectionCaptureTests(StylePlanFixture):
 
         with self.subTest(input="staff configuration also in CONF_DIR"):
             config = self.root / "shared-config"
-            config.mkdir()
-            for path in conf.directory().glob("*.conf"):
-                _ = shutil.copy2(path, config / path.name)
-            staff_config = config / "staff.conf"
-            original_config = (Path(__file__).resolve().parents[2] / "config/staff.conf").read_text()
-            _ = staff_config.write_text(original_config)
+            _ = write_config_fixture(config / "style_reader.conf", defaults=style_reader_settings())
+            staff_config = write_staff_settings(config / "staff.conf", producers=self.root / "producers")
+            original_config = staff_config.read_text()
             with patch.dict(os.environ, {"CONF_DIR": str(config), "STAFF_CONFIG": str(staff_config)}):
                 captured = self.root / "staff-capture"
                 _ = selection_capture.capture(self.repo, self.database, "names", captured)

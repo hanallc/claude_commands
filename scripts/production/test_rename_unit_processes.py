@@ -27,7 +27,8 @@ from scripts.production.staff_test_support import (
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf, unit_runs
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production.config_test_support import RENAME_SETTINGS
 from scripts.agents.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
@@ -58,7 +59,9 @@ class RunProcessTests(StaffTestCase):
         _ = self.enterContext(isolated_parents())
         PARENTS["alpha"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, config_environment(self.root / "config")))
+        configuration = self.root / "config"
+        _ = write_config_fixture(configuration / "production.conf", defaults=RENAME_SETTINGS)
+        self.enterContext(mock.patch.dict(os.environ, config_environment(configuration)))
         self.unit_folder = self.root / "claude-demo-alpha"
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.unit_folder)

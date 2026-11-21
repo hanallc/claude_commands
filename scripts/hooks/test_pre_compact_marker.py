@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, override
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 HOOK = Path(__file__).with_name("pre-compact-marker.py")
@@ -29,8 +30,8 @@ class PreCompactMarkerTests(unittest.TestCase):
         self.folder = self.root / ".local/state/compaction"
         self.config = self.root / "config"
         self.config.mkdir()
-        source = HOOK.resolve().parents[2] / "config/compaction_marker.conf"
-        _ = (self.config / source.name).write_text(source.read_text())
+        _ = write_config_fixture(self.config / "compaction_marker.conf",
+                                 "# range: 0.001..\nretention_hours=24\n", defaults="")
 
     def run_hook(self, family: str, payload: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(HOOK), "--family", family], input=payload,

@@ -27,9 +27,12 @@ import unittest.mock
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.build_folders_test_support import temporary_folder_settings
+from scripts.lib.socket_test_support import SYSTEM_SOCKET_ROOT, short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS, MAC_SWEEP_SETTINGS
+from scripts.lint.config_test_support import FOLDER_AUDIT_SETTINGS, SWEEP_SCAN_SETTINGS, SWEEP_FLOOR_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import session_send
 
@@ -77,8 +80,11 @@ class FolderAuditTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        _ = write_config_fixture(configuration / "lint.conf",
+                                 defaults=FOLDER_AUDIT_SETTINGS + SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS)
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_folders.conf", "roots.system=/tmp\n")
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=temporary_folder_settings(SYSTEM_SOCKET_ROOT))
         _ = cast(object, self.enterContext(unittest.mock.patch.dict(os.environ, environment)))
         self.root = Path(self.enterContext(short_socket_directory())).resolve()
         self.home = self.root / "home"
@@ -144,11 +150,15 @@ class FolderAuditTests(unittest.TestCase):
                                                                 "HOME": str(self.home)}))
         for key in GIT_CHECKOUT_ENV:
             _ = os.environ.pop(key, None)
+        _ = write_config_fixture(self.root / "config/lint.conf",
+                                 defaults=FOLDER_AUDIT_SETTINGS + SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS)
         _ = write_config_fixture(self.root / "config/build_folders.conf",
             "patterns.legacy-unique={purpose}{suffix}\nnames.suffix_length=8\n"
             + "prefixes.verify-copy=verify-copy.{owner}.\nprefixes.verify-hold=verify-hold.{owner}.\n")
-        _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=2.5\n")
-        _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
+        _ = write_config_fixture(self.root / "config/hana_instances.conf",
+                                 defaults="# range: 0..\nclone_max_hours=2.5\n")
+        _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n",
+                                 defaults=MAC_OFFLOAD_SETTINGS + MAC_SWEEP_SETTINGS)
 
     def cargo_checkout(self) -> tuple[Path, Path]:
         checkout = self.root / "cargo-checkout"
@@ -468,7 +478,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertTrue(young.exists())
         self.assertTrue(ordinary.exists())
-        _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=1\n")
+        _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=1\n", defaults="")
         self.assertEqual(self.judge_clones([young])[young], folder_audit.REMOVED)
         self.assertFalse(young.exists())
 
@@ -641,8 +651,9 @@ class FolderAuditTests(unittest.TestCase):
         configuration = self.root / "config"
         _ = write_config_fixture(configuration / "lint.conf",
                                  "folder_min_age_seconds=43200\nfolder_remove_after_seconds=604800\n")
-        _ = write_config_fixture(configuration / "hana_instances.conf", "clone_max_hours=4\n")
-        _ = write_config_fixture(configuration / "mac_test.conf", "free_floor_gib=100\n")
+        _ = write_config_fixture(configuration / "hana_instances.conf", "clone_max_hours=4\n", defaults="")
+        _ = write_config_fixture(configuration / "mac_test.conf", "free_floor_gib=100\n",
+                                 defaults=MAC_OFFLOAD_SETTINGS + MAC_SWEEP_SETTINGS)
         source = folder(self.root / "nixos-source")
         git(source, "init", "-q")
         git(source, "add", "file")
@@ -686,7 +697,8 @@ class FolderAuditTests(unittest.TestCase):
         self.assertTrue(clone.exists())
         _ = self.judge_clones([clone], mac=True, free_space=9 * 1024**3)
         self.assertTrue(clone.exists())
-        _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=10\n")
+        _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=10\n",
+                                 defaults=MAC_OFFLOAD_SETTINGS + MAC_SWEEP_SETTINGS)
         outcomes = self.judge_clones([clone], mac=True, free_space=9 * 1024**3)
         self.assertEqual(outcomes[clone], folder_audit.REMOVED)
         self.assertFalse(clone.exists())

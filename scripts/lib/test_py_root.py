@@ -9,7 +9,10 @@ import tempfile
 import tarfile
 import unittest
 
+from scripts.lib.build_folders_test_support import temporary_folder_settings
+from scripts.lib.checkout_test_support import copy_test_runner, seed_test_configuration
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
 
 
 COPY_IMPORT_AUDIT = '''import json, os, sys
@@ -82,6 +85,34 @@ assert status == 0 and record['exit_code'] == 0, record
 
 
 class PythonRootTests(unittest.TestCase):
+    def test_runner_copy_replaces_config_file_and_folder_links(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        external = root / "external"
+        external.mkdir()
+        file = external / "build_folders.conf"
+        _ = file.write_text("external=unchanged\n")
+        checkout = root / "checkout"
+        settings = checkout / "config/build_folders.conf"
+        settings.parent.mkdir(parents=True)
+        settings.symlink_to(file)
+        nested = checkout / "config/nested"
+        nested.symlink_to(external, target_is_directory=True)
+        fixed = "# whole: 1..\nnames.suffix_length=4\n"
+        nested_settings = nested / "worker.conf"
+        nested_fixed = "# whole: 1..\nworkers=2\n"
+
+        copy_test_runner(checkout, fixtures={
+            file.name: fixed,
+            f"nested/{nested_settings.name}": nested_fixed,
+        })
+
+        self.assertFalse(settings.is_symlink())
+        self.assertFalse(nested.is_symlink())
+        self.assertEqual(settings.read_text(), fixed)
+        self.assertEqual(nested_settings.read_text(), nested_fixed)
+        self.assertEqual(list(external.iterdir()), [file])
+        self.assertEqual(file.read_text(), "external=unchanged\n")
+
     def checkout(self, root: Path, value: str) -> Path:
         library = root / "scripts/lib"
         library.mkdir(parents=True)
@@ -251,8 +282,7 @@ class PythonRootTests(unittest.TestCase):
             parent, child = base / "A", base / "B"
             for checkout in (parent, child):
                 _ = shutil.copytree(repository / "scripts", checkout / "scripts",
-                                    ignore=shutil.ignore_patterns("__pycache__"))
-                _ = shutil.copytree(repository / "config", checkout / "config")
+                                    ignore=shutil.ignore_patterns("__pycache__", "test_config"))
             probe = "import json, scripts; print(json.dumps(list(scripts.__path__)))"
             _ = (child / "scripts/startup_probe.py").write_text(probe + "\n")
             repeat = (
@@ -320,9 +350,17 @@ class PythonRootTests(unittest.TestCase):
             selected, other = base / "copy", base / "other"
             for checkout in (selected, other):
                 _ = shutil.copytree(repository / "scripts", checkout / "scripts",
-                                    ignore=shutil.ignore_patterns("__pycache__"))
+                                    ignore=shutil.ignore_patterns("__pycache__", "test_config"))
                 _ = (checkout / "scripts/build_targets/test_copy_imports.py").write_text(COPY_IMPORT_TEST)
-            _ = shutil.copytree(repository / "config", selected / "config")
+            gate = base / "gate"
+            gate.mkdir()
+            seed_test_configuration(selected, {
+                "build_admission.conf": ADMISSION_CONFIG_FIXTURE.read_text(),
+                "build_folders.conf": temporary_folder_settings(gate),
+                "merge_gate.conf": "# range: 0.001..\nGATE_TIME_LIMIT_FACTOR=2\n",
+                "scratch.conf": "# The fixture checkout has no copy record.\n",
+                "test_times.conf": "# whole: 1..\nTOP_RUNS=3\n# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n",
+            })
             wrapper = selected / "targeted_probe.py"
             _ = wrapper.write_text(COPY_TARGETED_RUN)
             detached = other / "detached_probe.py"
@@ -331,6 +369,8 @@ class PythonRootTests(unittest.TestCase):
                 **os.environ, "PYTHONPATH": os.pathsep.join((str(other), str(other), str(selected))),
                 "EXPECTED_CHECKOUT": str(selected), "CONF_DIR": str(selected / "config"),
                 "XDG_CACHE_HOME": str(base / "cache"), "BUILDLOG_SCOPE": "0",
+                "MERGE_GATE_STATE_DIR": str(base / "gate-state"), "BUILDLOG_DIR": str(base / "buildlog"),
+                "SCRATCH_ROOT": str(base / "scratch"), "SCRATCH_COPIES_ROOT": str(base / "copies"),
             }
             # The other copy has regular packages, which import before any namespace portion.
             # A namespace copy caught no startup break that this copy misses.

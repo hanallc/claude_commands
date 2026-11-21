@@ -42,6 +42,7 @@ from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog import index, store
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
@@ -55,7 +56,9 @@ from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, in
 from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
 from scripts.lib.build_steps import read_step_names
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message.unit_labels import OwnerRole, UnitLabels
+from scripts.test_times.gate_record_test_support import gate_timing_settings
 
 
 def service_environment(command: Sequence[str]) -> dict[str, str]:
@@ -339,8 +342,9 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        override_fixture_settings(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
-        override_fixture_settings(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
+        _ = write_config_fixture(self.root / "merge_gate.conf", defaults="# range: 1..\nGATE_TIME_LIMIT_FACTOR=2\n")
+        _ = write_config_fixture(self.root / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
+        _ = write_config_fixture(self.root / "test_times.conf", defaults=gate_timing_settings(top_runs=3, failure_log_kib=4))
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
         override_fixture_settings(self.root / 'cloud_gate.conf',
             '# one of: on, off\nenabled=on\n'
@@ -2816,6 +2820,9 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(self.root / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
+        _ = write_config_fixture(self.root / "test_times.conf", defaults=gate_timing_settings())
+        _ = write_config_fixture(self.root / "merge_gate.conf", defaults="# range: 1..\nGATE_TIME_LIMIT_FACTOR=5\n")
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
         override_fixture_settings(self.root / 'cloud_gate.conf',
@@ -3710,7 +3717,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
-        override_fixture_settings(self.root / 'build_steps.conf', 'owned.merge-gate={unit} merge\n')
+        _ = write_config_fixture(self.root / 'build_steps.conf', defaults='owned.merge-gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from scripts.production.change_review_test_support import registered_fixture_image
+from scripts.production.change_review_test_support import registered_fixture_image, write_change_review_settings
 
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -19,7 +20,6 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
-import shlex
 import sqlite3
 import subprocess
 import sys
@@ -35,12 +35,20 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.lib import build_folders
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
-from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.memory_test_support import (
+    config_environment, fake_memory_readings, install_admission_fixture, seed_config_fixture_folder, write_config_fixture,
+)
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
+from scripts.mac_test.offload_test_support import mac_queue_settings
 from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
+from scripts.test_times.gate_record_test_support import gate_timing_settings
 from scripts.buildlog import index
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
@@ -56,12 +64,18 @@ MERGE_GATE_TEST_SETTINGS = """# range: 1..
 GATE_TIME_LIMIT_FACTOR=100
 # whole: 0..
 memory_stop_reruns=1
+# text:
+landing_branches=main builds natedev sdlc
+"""
+NIGHTLY_RESULT_SETTINGS = """# one of: on, off
+nightly_result_push=on
+# whole: 1..
+nightly_result_modules=8
+# whole: 1..
+nightly_assign_minutes=30
 """
 # The fixture has no Mac placement. The client refuses it without contacting the queue.
-MAC_GATE_TEST_SETTINGS = (
-    "admission_client_command=" + shlex.join((sys.executable, "-c", "raise SystemExit(125)"))
-    + "\n# range: 5e-324..\nterminate_grace_seconds=3\n"
-)
+MAC_GATE_TEST_SETTINGS = mac_queue_settings((sys.executable, "-c", "raise SystemExit(125)"))
 
 
 def install_test_runner(checkout: Path) -> Path:
@@ -289,6 +303,10 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
     return cast(tuple[str, ...], getattr(method, "gate_test_suites", ("hooks",)))
 
 
+GATE_STEP_SETTINGS = "prose.merge-gate=the gate\n"
+LOCAL_GATE_SETTINGS = "# one of: on, off\nenabled=off\n"
+
+
 def pin_gate_root(configuration: Path, root: Path) -> None:
     """Keep the fixture gate on its private tmpfs path."""
     _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
@@ -335,7 +353,16 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = config_environment(directory)
-        pin_gate_root(directory / "build_folders.conf", Path("/dev/shm"))
+        install_admission_fixture(directory)
+        write_scratch_settings(directory, directory)
+        _ = write_config_fixture(directory / "build_steps.conf", defaults=GATE_STEP_SETTINGS)
+        _ = write_config_fixture(directory / "merge_gate.conf", defaults=MERGE_GATE_TEST_SETTINGS)
+        _ = write_config_fixture(directory / "cloud_gate.conf", defaults=LOCAL_GATE_SETTINGS)
+        write_push_lock_settings(directory)
+        folders = directory / "build_folders.conf"
+        _ = write_config_fixture(folders, defaults=workspace_folder_settings(directory))
+        pin_gate_root(folders, Path("/dev/shm"))
+        _ = write_config_fixture(directory / "test_times.conf", defaults=gate_timing_settings())
         return environment
 
     @classmethod
@@ -581,10 +608,22 @@ class MergeGateFixture(unittest.TestCase):
         copy_runtime(self.bin.parent)
         self.bin.mkdir()
         self.state.mkdir()
-        _ = write_config_fixture(self.root / "config/buildlog.conf")
+        _ = write_config_fixture(self.root / "config/buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
         for configuration in (self.root, Path(self.environment["CONF_DIR"])):
-            _ = write_config_fixture(configuration / "merge_gate.conf", MERGE_GATE_TEST_SETTINGS)
+            install_admission_fixture(configuration)
+            seed_config_fixture_folder(configuration, {
+                **SEND_TIMING_FIXTURES, "build_folders.conf": workspace_folder_settings(self.root),
+            })
+            write_scratch_settings(configuration, self.root)
+            write_push_lock_settings(configuration)
+            _ = write_config_fixture(configuration / "build_steps.conf", defaults=GATE_STEP_SETTINGS)
+            _ = write_config_fixture(configuration / "cloud_gate.conf", defaults=LOCAL_GATE_SETTINGS)
+            _ = write_config_fixture(configuration / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
+            _ = write_config_fixture(configuration / "merge_gate.conf",
+                                     defaults=MERGE_GATE_TEST_SETTINGS + NIGHTLY_RESULT_SETTINGS)
             self.write(configuration / "mac_gate.conf", MAC_GATE_TEST_SETTINGS)
+            write_change_review_settings(configuration, self.root)
+            _ = write_config_fixture(configuration / "test_times.conf", defaults=gate_timing_settings())
         # These tests prove gate behavior without a near deadline from their short jobs.
         history = Path(self.environment["BUILDLOG_DIR"])
         history.mkdir(parents=True, exist_ok=True)
@@ -785,7 +824,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def review_list(self) -> tuple[Path, Path]:
         """A change-review list holding C7, and the production doc that names it."""
-        review = Path(self.environment["HOME"]) / "rust/hanadocs/change-review/change-review - fixture-showrunner.md"
+        review = self.root / "lists/change-review - fixture-showrunner.md"
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"

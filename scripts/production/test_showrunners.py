@@ -791,17 +791,21 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
                 self.assertEqual(self.successful(*arguments, pane="w4:p1"), "")
         self.assertEqual((self.root / "herdr-responses.json").read_bytes(), before)
 
+    def configure_settings(self, recipient: staff.StaffId) -> None:
+        _ = write_config_fixture(self.config, defaults=(
+            "# range: 0..100\nthreshold_percent=2\n"
+            + "# range: 0..\nstall_minutes=5\n"
+            + f"faults_to={recipient}\nalways={recipient}\n"))
+
     def test_settings_read_each_file_change(self) -> None:
-        _ = write_config_fixture(self.config, "stall_minutes=5\n")
+        self.configure_settings(fixture_member("showrunner", name="director").id)
         self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 5)
-        _ = write_config_fixture(self.config, "stall_minutes=9\n")
+        _ = write_config_fixture(self.config, "stall_minutes=9\n", defaults="")
         self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 9)
 
     def test_settings_read_exact_staff_recipient_ids(self) -> None:
         row = fixture_member("showrunner", name="director")
-        _ = self.config.write_text("# range: 0..100\nthreshold_percent=2\n"
-                                   + "# range: 0..\nstall_minutes=5\n"
-                                   + f"faults_to={row.id}\nalways={row.id}\n")
+        self.configure_settings(row.id)
         settings = showrunners.load_settings_from(self.config)
         self.assertEqual(settings["always"], [str(row.id)])
         self.assertEqual(settings["faults_to"], str(row.id))

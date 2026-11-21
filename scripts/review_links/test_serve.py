@@ -1,8 +1,9 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import fixture_feed_code_settings, write_config_fixture
 
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.checkout_test_support import python_tool_source
 
 import fcntl
@@ -40,13 +41,20 @@ from uuid import uuid4
 
 from scripts.aws_target import aws_page
 from scripts.agents import remote
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.agents.test_support import write_machine_config
 from scripts.agents.remote import local_machine
-from scripts.build_queue import memory_feed
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
+from scripts.review_links.test_page_frame import console_settings
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, update_registration,
+)
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
+from scripts.production.change_review_test_support import (
+    REVIEW_ACCOUNT_SETTINGS, REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS,
+    REVIEW_REFRESH_SETTINGS, REVIEW_SERVER_SETTINGS, write_change_review_settings,
 )
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
@@ -59,12 +67,18 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami import usage_store
 
 
+with fixture_feed_code_settings():
+    from scripts.build_queue import memory_feed
+
+
 ROLE_COLOR_CONFIG = (
     "role.showrunner=#a379fd\n"
     "role.unit-director=#ffaf02\n"
     "role.producer=#90fe42\n"
     "role.worker=#ff0404\n"
 )
+SERVER_SETTINGS = (REVIEW_SERVER_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS
+                   + REVIEW_ACCOUNT_SETTINGS)
 
 
 @dataclass(frozen=True)
@@ -84,18 +98,15 @@ find_executable = shutil.which
 
 def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = write_config_fixture(configuration / "change_review.conf")
-    _ = write_config_fixture(configuration / "review_links.conf",
-        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n")
-    _ = write_config_fixture(configuration / "console.conf",
-        "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
-        + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
-        + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
-        + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
-    _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
+    write_change_review_settings(configuration, configuration)
+    _ = write_config_fixture(configuration / "production.conf", defaults=QUESTION_TITLE_SETTINGS)
+    _ = write_config_fixture(configuration / "review_links.conf", defaults=SERVER_SETTINGS)
+    _ = write_config_fixture(configuration / "console.conf", defaults=console_settings())
+    write_scratch_settings(configuration, configuration)
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
-        "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
+        "CONF_DIR": str(configuration), "SHOWRUNNER_STATE_DIR": str(configuration / "showrunner-state"),
+        "USER_ZONE": "America/New_York"})))
 
 
 @contextmanager
@@ -142,9 +153,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.outside = temporary / "outside.txt"
         _ = self.outside.write_text("outside the served root", encoding="utf-8")
         # The startup tests exercise code scans and recovery separately.
-        with (patch.object(serve, "loaded_module_stamps", return_value={}),
-              patch.object(change_page, "recover_pending"),
-              patch.object(list_page, "recover_pending")):
+        _ = self.enterContext(patch.object(serve, "loaded_module_stamps", return_value={}))
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        with patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"):
             server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
         server.review_cache.synchronize()
         self._server = server
@@ -184,6 +195,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         project = 'claude' if feature_project else None
         _ = case.enterContext(patch.object(feature_log, "project_of", return_value=project))
         case.fixture.set_up_review(changes=changes)
+        _ = write_config_fixture(conf.path("statusline"), defaults=ROLE_COLOR_CONFIG)
+        _ = write_config_fixture(conf.path("build_folders"), defaults=workspace_folder_settings(case.fixture.temporary))
         case.configure_review()
         return case
 
@@ -264,8 +277,8 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_post_discards_the_cached_staff_snapshot(self) -> None:
         configuration = self.root.parent / "cache-config"
         _ = shutil.copytree(conf.path("review_links").parent, configuration)
-        _ = write_config_fixture(configuration / "disks.conf", f"output_folder={self.root / 'disks'}\n")
-        _ = write_config_fixture(configuration / "memory_feed.conf", f"output_folder={self.root / 'builds'}\n")
+        _ = write_config_fixture(configuration / "disks.conf", defaults=f"output_folder={self.root / 'disks'}\n")
+        _ = write_config_fixture(configuration / "memory_feed.conf", defaults=f"output_folder={self.root / 'builds'}\n")
         complete = threading.Event()
         reads: list[staff.StaffSnapshot] = []
         during_post: list[tuple[int, int]] = []
@@ -845,7 +858,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         members = staff.local_snapshot()
         _ = staff.record_path().write_text(replace(members, rows=(remote_owner,)).encode())
         config = conf.path("console")
-        _ = write_config_fixture(conf.path("machines"))
+        write_machine_config(conf.path("machines").parent)
         _ = write_config_fixture(config, f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(kind, owner.id), page="review", request_id="r2-" + uuid4().hex)
@@ -1125,7 +1138,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("console"), f"page.aws.owner={request.recipient_id}\n")
         output = self.root / "AWS reports"
         output.mkdir()
-        _ = write_config_fixture(conf.path("aws_page"), f"output_folder={output}\n")
+        _ = write_config_fixture(conf.path("aws_page"), defaults=f"output_folder={output}\n")
         page = output / aws_page.PAGE_NAME
         _ = page.write_text("<!doctype html><html><head><title>AWS</title></head><body>AWS reports</body></html>")
         url = snapshot_url(self.root, page, host="127.0.0.1", port=self.port)
@@ -2805,8 +2818,6 @@ class ReviewLinksServerTests(unittest.TestCase):
             (question, 'answer'), (investigation_key, 'read'), (question, 'later')))
 
         _, efficiency = case.decisions()
-        config = Path(__file__).resolve().parents[2]/'config/nightly_review.conf'
-        _ = shutil.copyfile(config, case.fixture.temporary/'config/nightly_review.conf')
         self.assert_stale_review_actions(case, ((efficiency, 'approve'), (efficiency, 'decline')))
 
     def assert_stale_review_actions(self, case: test_review_page.ReviewPageTests,
@@ -3888,6 +3899,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertFalse(restarted.has_deferred_questions())
 
     def test_list_question_recovers_when_the_failure_cannot_be_recorded(self) -> None:
+        self.server.shutdown()
+        self.server.review_cache.close()
         keeper = staff.StaffId("fixture-morty")
         for fault in ("read", "write"):
             with self.subTest(fault=fault):
@@ -3913,7 +3926,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with (fault_patch, redirect_stderr(StringIO()) as errors,
                       patch.object(change_page, "send_question", return_value=question_outcome("refused")) as send):
                     change_page.deliver(delivery, status)
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
                 self.assertIn(str(failure), errors.getvalue())
                 self.assertTrue(status.has_deferred_questions())
                 self.assertFalse(status.question_jobs)
@@ -4279,7 +4292,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         cache = serve.AccountsPageCache()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings, "page_refresh_seconds=37\n")
+        _ = write_config_fixture(settings, "page_refresh_seconds=37\n", defaults=REVIEW_REFRESH_SETTINGS)
         with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
               patch.object(time, "monotonic", return_value=100) as clock,
               patch.object(accounts_page, "render_with_facts") as render):
@@ -4486,7 +4499,8 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_accounts_route_keeps_last_good_page_when_refresh_setting_is_unreadable(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings)
+        _ = write_config_fixture(settings, defaults=SERVER_SETTINGS)
+        _ = write_config_fixture(configuration / "console.conf", defaults=console_settings())
         first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
         with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
               patch.object(accounts_page, "render_with_facts", return_value=first) as render,
@@ -4778,7 +4792,7 @@ class SnapshotSweepTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-sweep-test-")))
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings, "snapshot_retention_seconds=604800\nsnapshot_sweep_seconds=3600\n")
+        _ = write_config_fixture(settings, defaults=REVIEW_SERVER_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_change_image_sweep_keeps_named_and_recent_images(self) -> None:
@@ -4914,6 +4928,7 @@ class SnapshotSweepTests(unittest.TestCase):
         with (patch.object(time, "time", return_value=now),
               patch.object(time, "monotonic", return_value=100.0) as elapsed,
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
               serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server):
             self.assertFalse(expired_at_start.exists())
             self.assertFalse(flat_at_start.exists())
@@ -5146,7 +5161,8 @@ class ServerCodeRestartTests(unittest.TestCase):
         _ = server_file.write_text("# The server uses this temporary checkout.\n")
         module_file = checkout / "review_restart_fixture.py"
         _ = module_file.write_text("VALUE = 'before'\n")
-        _ = write_config_fixture(checkout / "review_links.conf", "code_check_seconds=0.05\n")
+        _ = write_config_fixture(checkout / "review_links.conf", "code_check_seconds=0.05\n",
+                                 defaults=SERVER_SETTINGS)
         root = checkout / "snapshots"
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
@@ -5263,8 +5279,23 @@ class ServerStartupTests(unittest.TestCase):
         tailscale.chmod(0o755)
         other_store = temporary / "other-store"
         configuration = temporary / "config"
-        _ = shutil.copytree(checkout / "config", configuration)
-        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\n")
+        write_change_review_settings(configuration, temporary)
+        _ = write_config_fixture(configuration / "review_links.conf", defaults=SERVER_SETTINGS)
+        _ = write_config_fixture(configuration / "console.conf", defaults=f"""\
+page.list.owner={keeper}
+page.list.label=List
+page.list.title=The List
+page.list.url=python:scripts.review_links.list_page:page_url
+# range: 0.001..86400
+status.round_trip_limit_seconds=1
+# range: 0.001..86400
+status.render_limit_seconds=1
+# range: 0.001..86400
+status.reading_delay_seconds=1
+# range: 0.001..86400
+status.list.age_limit_seconds=45
+""")
+        _ = write_config_fixture(configuration / "scratch.conf", defaults="# whole: 1..\nrecord_lock_attempts=3\n")
         rebuild_cache = temporary / "rebuild-cache"
         _ = (configuration / "statusline.conf").write_text(f"rebuild.cache={rebuild_cache}\n")
         _ = rebuild_cache.write_text("rebuild mac\n0\n")
@@ -5428,10 +5459,10 @@ class ReviewLinksConfigTests(unittest.TestCase):
                 self.assertEqual(serve.sweep_snapshots(root, 50), 1)
                 self.assertFalse(snapshot.exists())
 
-    def test_shipped_config_supplies_the_settings_used_by_review_links(self) -> None:
+    def test_server_fixture_supplies_the_settings_used_by_review_links(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         path = folder / "review_links.conf"
-        _ = write_config_fixture(path)
+        _ = write_config_fixture(path, defaults=SERVER_SETTINGS)
         settings = conf.read(path)
         values = settings.values()
         self.assertEqual(settings.text("unrouted_alert_recipient"), values["unrouted_alert_recipient"])
