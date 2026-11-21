@@ -16,6 +16,8 @@ from scripts.astra import astra_roles
 from scripts.astra.design_role_test_support import HeldRolePaneCase
 from scripts.direct import assign, progress_history, recorder_state
 from scripts.production import staff, worker
+from scripts.production.production_doc import EnrolledPaths
+from scripts.production.staff_test_support import fixture_member
 from scripts.herdr import turn_end, worker_panes
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.assign_launcher_test_support import (
@@ -132,9 +134,27 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
             worker_name="impl", worker_id=opened.row.id, launcher_command=["implementation"],
             prompt=case.prompt, kind="impl", lens="")
-        for lens, style in (("adversary", False), ("contract", True)):
-            with self.subTest(lens=lens, style=style):
-                name = "models-review-" + lens
+        for lens, style, enrolled in (("adversary", False, False), ("contract", True, False),
+                                      ("contract", True, True)):
+            with self.subTest(lens=lens, style=style, enrolled=enrolled):
+                name = "models-review-" + lens + ("-enrolled" if enrolled else "")
+                environment = os.environ.copy()
+                if enrolled:
+                    integration = self.panes.root / "style-integration"
+                    integration.mkdir()
+                    enrolled_paths = EnrolledPaths(project, project / "production.md", project / "LOG.md",
+                                                  project / "notes", integration)
+                    owner = fixture_member("showrunner", name="style-showrunner",
+                                           doc=staff.LiveDoc("natedev", enrolled_paths.live_doc))
+                    owner = staff.set_run(owner.id, staff.OpenRun(case.run_dir))
+                    case.fixture.parent_id = owner.id
+                    self.panes.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
+                    state_path = case.run_dir / unit_runs.STATE_FILE
+                    state = read_object(state_path)
+                    state[unit_runs.OWNER_FIELD] = owner.id
+                    write_text_atomic(state_path, json.dumps(state))
+                    _ = self.enterContext(patch.object(worker_panes, "resolve_production_paths", return_value=enrolled_paths))
+                    environment["CODEX_THREAD_ID"] = owner.current_session
                 case.agent.final = ("<!-- phase-style-review:start -->\nStyle review: Pass\n"
                                     "<!-- phase-style-review:end -->\nAPPROVE")
                 arguments = ["--role", "review", "--to", name, "--lens", lens, "--pass", "1",
@@ -143,12 +163,40 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                 if style:
                     arguments += ["--style-since", baseline]
                 notices = len(case.agent.notices)
-                result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), project)
+                result = invoke_cli(assign, assign.main, arguments, environment, project)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 pane = case.agent.submitted[-1][0]
                 row = case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, case.run_dir)
                 assert isinstance(active, progress_history.ActiveDispatch)
+                if enrolled:
+                    phase_dir = case.run_dir / "phases/8"
+                    saved = read_object(phase_dir / "style_review_state.json")
+                    directory = Path(str(saved["input_directory"]))
+                    self.assertTrue(directory.is_relative_to(phase_dir))
+                    original = directory.with_name(directory.name + "-original")
+                    report = directory / "report.md"
+                    trees = (project, self.panes.root / "style-integration")
+                    for tree in trees:
+                        write_text_atomic(tree / report.name, "Keep the checkout report.\n")
+                    replace_file = os.replace
+
+                    def move_style_parent(source: str | Path, target: str | Path, *,
+                                          src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+                        if target == report.name:
+                            _ = directory.rename(original)
+                            directory.symlink_to(trees[1], target_is_directory=True)
+                        replace_file(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                    with patch.object(os, "replace", side_effect=move_style_parent):
+                        with self.assertRaises(OSError):
+                            _ = case.finish(name)
+                    self.assertTrue(directory.is_symlink())
+                    self.assertIn("Style review: Pass", (original / report.name).read_text())
+                    for tree in trees:
+                        self.assertEqual((tree / report.name).read_text(), "Keep the checkout report.\n")
+                    directory.unlink()
+                    _ = original.rename(directory)
                 for expected in (turn_end.TurnOutcome.DONE, turn_end.TurnOutcome.IGNORED):
                     self.assertEqual(case.finish(name), expected)
                     self.assertEqual(len(case.agent.notices), notices + 1)

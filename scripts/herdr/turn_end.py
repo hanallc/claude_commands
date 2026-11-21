@@ -1023,7 +1023,7 @@ def _handle_locked(event: WorkerEvent,
             event = replace(event, thread_id=str(row.current_session))
         run = worker_panes.worker_run(row, record=record)
         passed = worker_panes.worker_pass(row, run, record=record)
-        worker.CompletionArtifacts(parent, run).require_protected_status(passed)
+        worker.CompletionArtifacts(parent, run).validate_status(passed)
 
         instance = str(passed.get("instance_id", ""))
         delivery = progress_history.dispatch_delivery(passed)

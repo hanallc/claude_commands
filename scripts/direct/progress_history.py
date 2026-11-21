@@ -21,7 +21,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping
-from contextlib import contextmanager, redirect_stderr, suppress
+from contextlib import AbstractContextManager, contextmanager, redirect_stderr, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -29,7 +29,7 @@ from enum import Enum
 from functools import cache
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, NoReturn, Protocol, TypedDict, cast
+from typing import Literal, NoReturn, Protocol, TextIO, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_table, plan_history, recorder_state  # noqa: E402
@@ -395,7 +395,8 @@ def _session_dir(args: argparse.Namespace) -> Path:
     value = _arg_string(args, "session_dir")
     if not value:
         raise SystemExit("--session-dir is required")
-    return Path(value).expanduser().resolve()
+    path = Path(value).expanduser()
+    return path.resolve() if isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun) else path.absolute()
 
 
 def set_unit(session_dir: Path, production: str, unit: str) -> None:
@@ -403,7 +404,7 @@ def set_unit(session_dir: Path, production: str, unit: str) -> None:
     if any(not value or value in (".", "..") or "/" in value or "\\" in value
            for value in (production, unit)):
         raise ValueError("invalid production or unit identity")
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         state = _read_state(session_dir)
         _set_owner(state, production, unit)
@@ -447,6 +448,95 @@ def _refuse_old_state(session_dir: Path) -> None:
         _ = recorder_state.read_state(_state_path(session_dir))
 
 
+class RunArtifactWriter(Protocol):
+    @property
+    def run(self) -> Path: ...
+    @property
+    def protected(self) -> bool: ...
+    def append(self, path: Path) -> AbstractContextManager[TextIO]: ...
+    def read(self, path: Path) -> str: ...
+    def write(self, path: Path, text: str) -> None: ...
+    def unlink(self, path: Path) -> None: ...
+    def authorized_path(self, path: Path) -> Path: ...
+
+
+class RunArtifactFactory(Protocol):
+    def CompletionArtifacts(self, owner: staff.StaffRow, run: Path) -> RunArtifactWriter: ...
+
+
+class OrdinaryRecorderRun(Enum):
+    UNPROTECTED = "the run uses the unit or legacy recorder policy"
+
+
+_recorder_artifacts: ContextVar[RunArtifactWriter | OrdinaryRecorderRun] = ContextVar(
+    "recorder_artifacts", default=OrdinaryRecorderRun.UNPROTECTED)
+
+
+def _protected_recorder(session_dir: Path, *, director: str = "") -> RunArtifactWriter | OrdinaryRecorderRun:
+    record = staff.initial_snapshot()
+    runners = [row for row in record.find(kind="showrunner") if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))]
+    if not runners:
+        return OrdinaryRecorderRun.UNPROTECTED
+    owners = [row for row in runners if isinstance(row.run, staff.OpenRun)
+              and row.run.path.absolute() == session_dir.absolute()]
+    if len(owners) > 1:
+        raise OSError(f"{session_dir}: more than one showrunner owns the run")
+    if not owners and director:
+        caller = record.owner_of(director)
+        if caller is not None and caller.id in {row.id for row in runners}:
+            owners.append(caller)
+    if not owners:
+        try:
+            state = recorder_state.read_state(_state_path(session_dir))
+        except FileNotFoundError:
+            return OrdinaryRecorderRun.UNPROTECTED
+        owner = next((row for row in runners if row.id == state.get(unit_runs.OWNER_FIELD)), None)
+        if owner is None:
+            return OrdinaryRecorderRun.UNPROTECTED
+        owners.append(owner)
+    worker = cast(RunArtifactFactory, cast(object, import_module("scripts.production.worker")))
+    artifacts = worker.CompletionArtifacts(owners[0], session_dir)
+    return artifacts if artifacts.protected else OrdinaryRecorderRun.UNPROTECTED
+
+
+@contextmanager
+def _recorder_lock(session_dir: Path, *, create_run: bool = False, director: str = "") -> Generator[TextIO]:
+    artifacts = _protected_recorder(session_dir, director=director)
+    if isinstance(artifacts, OrdinaryRecorderRun):
+        if create_run:
+            session_dir.mkdir(parents=True, exist_ok=True)
+        with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as stream:
+            yield stream
+        return
+    token = _recorder_artifacts.set(artifacts)
+    try:
+        with artifacts.append(session_dir / ".progress_history.lock") as stream:
+            yield stream
+    finally:
+        _recorder_artifacts.reset(token)
+
+
+def _write_run_artifact(path: Path, text: str) -> None:
+    artifacts = _recorder_artifacts.get()
+    if isinstance(artifacts, OrdinaryRecorderRun):
+        write_text_atomic(path, text)
+    else:
+        artifacts.write(path, text)
+
+
+def _read_run_artifact(path: Path) -> str:
+    artifacts = _recorder_artifacts.get()
+    return path.read_text(encoding="utf-8") if isinstance(artifacts, OrdinaryRecorderRun) else artifacts.read(path)
+
+
+def _unlink_run_artifact(path: Path) -> None:
+    artifacts = _recorder_artifacts.get()
+    if isinstance(artifacts, OrdinaryRecorderRun):
+        path.unlink()
+    else:
+        artifacts.unlink(path)
+
+
 def _recorder_lock_path(session_dir: Path) -> Path:
     path = session_dir / ".progress_history.lock"
     if not path.exists():
@@ -469,7 +559,14 @@ def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
                 resolve_staff: bool = True, pass_agents: bool = True) -> dict[str, object]:
     path = _state_path(session_dir)
     try:
-        state = recorder_state.read_state(path)
+        if isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
+            state = recorder_state.read_state(path)
+        else:
+            value = _json_object(_read_run_artifact(path))
+            if value is None:
+                raise ValueError(f"Invalid progress state: {path}")
+            state = value
+            recorder_state.require_current_shape(path, state)
     except OSError as error:
         raise SystemExit(f"Unable to read progress state {path}: {error}") from error
     except ValueError as error:
@@ -492,7 +589,7 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
         "called_agent": {key: value for key, value in (_object_dict(passed.get("called_agent")) or {}).items()
                          if key not in ("family", "session_id")}
     } if passed.get("worker_id") else {})} for slot, passed in _pass_slots(state).items()}
-    write_text_atomic(
+    _write_run_artifact(
         _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
     )
 
@@ -558,9 +655,18 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
     if not history_file_value:
         raise SystemExit("Progress state has no history_file")
     history_file = Path(history_file_value)
-    history_file.parent.mkdir(parents=True, exist_ok=True)
+    artifacts = _recorder_artifacts.get()
+    if (not isinstance(artifacts, OrdinaryRecorderRun)
+            and history_file.is_relative_to(artifacts.run.absolute())):
+        output = artifacts.append(history_file)
+    else:
+        if (not isinstance(artifacts, OrdinaryRecorderRun)
+                and history_file not in (plan_history.run_events_path(artifacts.run), _external_wait_file())):
+            raise OSError(f"{history_file}: expected the history ledger for {artifacts.run.name}")
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        output = history_file.open("a", encoding="utf-8")
     line = json.dumps(_stored_fields(event), separators=(",", ":"), sort_keys=True) + "\n"
-    with history_file.open("a", encoding="utf-8") as handle:
+    with output as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
@@ -858,7 +964,8 @@ def _explicit_plan_timing(
         value = _iso_time(now)
         started_at = now
         source = "plan_run"
-    _persist_plan_project_start(plan_path, value)
+    if isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
+        _persist_plan_project_start(plan_path, value)
     return ProjectTiming(
         started_at=started_at,
         source=source,
@@ -1636,12 +1743,13 @@ def _start_phase(args: argparse.Namespace) -> None:
             + f"`### Phase {phase_id} — <title>  · status: todo` under ## Phases, then start it."
         )
     started_at = _optional_epoch(args, "started_at", "--started-at", now)
-    # A new instance gets its worktree and baselines from its first dispatch, not the run's working_dir.
-    try:
-        phase_reservation.reset_for_start(phase_dir, phase_id)
-        _ = phase_reservation.restore(phase_dir, phase_id)
-    except phase_reservation.StateRefused as refused:
-        raise SystemExit(str(refused)) from refused
+    # Unit phases reserve a worktree at dispatch. Showrunner reviews do not reserve a worktree.
+    if isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
+        try:
+            phase_reservation.reset_for_start(phase_dir, phase_id)
+            _ = phase_reservation.restore(phase_dir, phase_id)
+        except phase_reservation.StateRefused as refused:
+            raise SystemExit(str(refused)) from refused
     if not unit_runs.run_is_open(session_dir, record=record) or "status" in state:
         previous_status = _string(state.get("status"))
         _ = state.pop("status", None)
@@ -2027,7 +2135,7 @@ def _validate_dispatch_selection(state: dict[str, object], selection: DispatchSe
 
 def validate_dispatch_selection(session_dir: Path, selection: DispatchSelection) -> None:
     """Check a selected completed retry while holding the recorder lock."""
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         _validate_dispatch_selection(_read_state(session_dir), selection, selection.slot, selection.phase_id)
 
@@ -2092,6 +2200,9 @@ def _start_pass(args: argparse.Namespace,
     status_file = _optional_arg(args, "assign_status_file")
     if status_file:
         status_file = str(worker_artifact(Path(status_file), os.environ.get(TEAM_SLOT_ENV, team_slot), team_slot))
+        artifacts = _recorder_artifacts.get()
+        if not isinstance(artifacts, OrdinaryRecorderRun):
+            _ = artifacts.authorized_path(Path(status_file))
     if (active is not None and isinstance(match, MatchedDispatch)
             and (not getattr(args, "print_pass_id", False) or active.get("launcher_pid") == launcher_pid)):
         changed = inferred_owner or active.get("launcher_pid") != launcher_pid
@@ -2159,7 +2270,7 @@ def _start_pass(args: argparse.Namespace,
     event["team_slot"] = team_slot
     _append_event(state, event)
     if status_file:
-        write_text_atomic(Path(status_file), "running\n")
+        _write_run_artifact(Path(status_file), "running\n")
     if early_id:
         opened = _open_phase_named(state, _string(phase.get("id")))
         if opened is not None:
@@ -2274,8 +2385,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         new_pass_instance_id=new_pass_instance_id,
         assign_status_file=os.environ.get(ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else "",
     )
-    session_dir.mkdir(parents=True, exist_ok=True)
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir, create_run=True) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             instance_id = _start_pass(args, selection)
@@ -2288,7 +2398,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
     """Record completion for the exact open dispatch."""
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         passed = _open_passes(state).get(slot)
@@ -2335,7 +2445,7 @@ def assignment_launch_worker_id(run: Path, instance_id: uuid.UUID) -> staff.Staf
 def record_assignment_launch_exit(run: Path, instance_id: uuid.UUID, outcome: AssignmentLaunchExit,
                                   ) -> RecordedAssignmentLaunch | AssignmentLaunchNotRecorded:
     """Find the exact launch and record any failure under the recorder lock."""
-    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(run) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if not _state_path(run).is_file():
             return AssignmentLaunchNotRecorded.NO_PASS
@@ -2352,8 +2462,8 @@ def record_assignment_launch_exit(run: Path, instance_id: uuid.UUID, outcome: As
                 or passed.get("status") not in ("active", "refused", "error")
                 or isinstance(hook_completion(passed), HookCompletion)):
             return RecordedAssignmentLaunch(slot, failure_recorded=False)
-        if status_file := _string(passed.get("assign_status_file")):
-            write_text_atomic(Path(status_file), "error\n")
+        if status_file := dispatch_delivery(passed).actions.status_file:
+            _write_run_artifact(Path(status_file), "error\n")
         if outcome is AssignmentLaunchExit.CLOSE_FAILED_PASS:
             _ = _close_slot_pass(run, state, slot, "error", plan_history.now_epoch())
         return RecordedAssignmentLaunch(slot, failure_recorded=True)
@@ -2361,7 +2471,7 @@ def record_assignment_launch_exit(run: Path, instance_id: uuid.UUID, outcome: As
 
 def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: str) -> bool:
     """Check delivery confirmation under the recorder lock."""
-    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(run) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if not _state_path(run).is_file():
             return False
@@ -2372,7 +2482,7 @@ def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: st
 
 def confirm_assignment_submission(run: Path, instance_id: str, completion_id: str) -> None:
     """Confirm the delivery and restore running status for the open pass."""
-    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(run) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(run, resolve_staff=False)
         passes = _open_passes(state)
@@ -2382,13 +2492,17 @@ def confirm_assignment_submission(run: Path, instance_id: str, completion_id: st
         passed = passes[slot]
         if isinstance(hook_completion(passed), HookCompletion):
             return
+        status_file = dispatch_delivery(passed).actions.status_file
+        artifacts = _recorder_artifacts.get()
+        if status_file and not isinstance(artifacts, OrdinaryRecorderRun):
+            _ = artifacts.authorized_path(Path(status_file))
         confirmed = _string_list(passed.get("confirmed_delivery_ids"))
         if completion_id not in confirmed:
             passed["confirmed_delivery_ids"] = [*confirmed, completion_id]
             _write_state(run, state)
-        if status_file := _string(passed.get("assign_status_file")):
+        if status_file:
             try:
-                write_text_atomic(Path(status_file), "running\n")
+                _write_run_artifact(Path(status_file), "running\n")
             except OSError as error:
                 print(f"Unable to restore running status in {status_file}. {error}", file=sys.stderr)
 
@@ -2425,7 +2539,7 @@ class DispatchDelivery:
 
 def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object, *,
                      stopped_notice: bool = False) -> None:
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = _read_state(session_dir)
         changed = False
@@ -2464,7 +2578,8 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
         line=_string(fields.get("line")), completion_id=_string(fields.get("completion_id")),
         reply_file=_string(fields.get("reply_file")), early_ready=_string(fields.get("early_ready")),
         actions=CompletionActions(
-            summary_file=_string(actions.get("summary_file")), status_file=_string(actions.get("status_file")),
+            summary_file=_string(actions.get("summary_file")),
+            status_file=_string(passed.get("assign_status_file")) or _string(actions.get("status_file")),
             report_file=_string(actions.get("report_file")), style_directory=_string(actions.get("style_directory")),
             end_worker=actions.get("end_worker") is True, held_role=_string(actions.get("held_role")),
             resolve_fix=actions.get("resolve_fix") is True, review_pass=int(_number(actions.get("review_pass"), 1)),
@@ -2580,7 +2695,7 @@ class StopDispatchRefused(Enum):
 def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow,
                   director: staff.StaffId, *, run_id: str, reason: str) -> StoppedPassNotice | StopDispatchRefused:
     """Commit the stopped outcome, pass status, and notice in one state write."""
-    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(run) as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = _read_state(run)
         passed = _open_passes(state).get(slot)
@@ -2622,7 +2737,7 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
         return
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         record = staff.initial_snapshot()
         state = _read_state(session_dir, record=record)
@@ -2640,7 +2755,7 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
     """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
     if not _state_path(session_dir).is_file():
         return 0
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         slots = [slot for slot, passed in _open_passes(state).items() if passed.get("worker_id") == worker_id]
@@ -6786,7 +6901,7 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         kind = "WaitingForSupplier"
     else:
         return False
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         supplier = _turn_supplier(state, reason) if kind == "WaitingForSupplier" else _showrunner_supplier(state)
@@ -6796,7 +6911,7 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         supplier_fields = _supplier_fields(supplier)
         marker_path = session_dir / "turn_wait.json"
         try:
-            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+            marker = _json_object(_read_run_artifact(marker_path)) or {}
         except FileNotFoundError:
             marker = {}
         phases = recorder_state.open_phases(state)
@@ -6814,19 +6929,19 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             if previous.get("event_type") == "wait_started" and all(previous.get(key) == value for key, value in identity.items()):
                 return True
         if recovered is not None:
-            write_text_atomic(marker_path, json.dumps({**marker, "wait_id": recovered["wait_id"]}) + "\n")
+            _write_run_artifact(marker_path, json.dumps({**marker, "wait_id": recovered["wait_id"]}) + "\n")
             return True
         if previous is not None and previous.get("event_type") == "wait_started":
             _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
         if not declaration or matching:
             declaration = str(uuid.uuid4())
         marker = {**identity, "declaration_id": declaration}
-        write_text_atomic(marker_path, json.dumps(marker) + "\n")
+        _write_run_artifact(marker_path, json.dumps(marker) + "\n")
         args = argparse.Namespace(session_dir=str(session_dir), missing_reason="", kind=kind, reason=reason,
                                   owner_session=owner_session, unit="", expected_supplier=supplier_fields,
                                   declaration_id=declaration, director=len(phases) > 1)
         result = _record_wait(state, args)
-        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": result.wait_id}) + "\n")
+        _write_run_artifact(marker_path, json.dumps({**marker, "wait_id": result.wait_id}) + "\n")
     return True
 
 
@@ -6834,11 +6949,11 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
     """Finish only for typed input or a message from the recorded supplier."""
     if os.environ.get(PROBE_ENV) == "1" or not (session_dir / "turn_wait.json").exists():
         return
-    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+    with _recorder_lock(session_dir) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         marker_path = session_dir / "turn_wait.json"
         try:
-            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+            marker = _json_object(_read_run_artifact(marker_path)) or {}
         except FileNotFoundError:
             return
         if marker.get("owner_session") != owner_session:
@@ -6864,7 +6979,7 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
             return
         _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(wait.get("wait_id"))))
-        marker_path.unlink()
+        _unlink_run_artifact(marker_path)
 
 
 def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
@@ -7223,7 +7338,7 @@ def _finish_phase_with_wait_lock(
     _write_state(session_dir, state)
     # A completed phase's state that owns no reservation ends with it. Active and a pending
     # release stay: only the checkpoint and its confirmed release clear them.
-    if status == "completed":
+    if status == "completed" and isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
         phase_dir = phase_reservation.phase_directory(session_dir, _string(phase.get("id")))
         state_kind = _string(phase_reservation.read_state(phase_dir).get("kind"))
         if state_kind in phase_reservation.BOARD_STATES.values():
@@ -7781,11 +7896,12 @@ def _run_recorder_command(args: argparse.Namespace) -> None:
     if not session_text:
         _ = handler(args)
         return
-    session_dir = Path(session_text).expanduser().resolve()
-    session_dir.mkdir(parents=True, exist_ok=True)
+    session_dir = Path(session_text).expanduser().absolute()
     result: object = None
+    director = (_arg_string(args, "main_session_id") or staff.runtime_id()
+                if _arg_string(args, "command") == "start-run" else "")
     try:
-        with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
+        with _recorder_lock(session_dir, create_run=True, director=director) as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 result = handler(args)

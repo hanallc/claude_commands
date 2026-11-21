@@ -83,8 +83,9 @@ def review_role_refusal(owner: staff.StaffRow, role: WorkerRole | WorkerRoleUnav
 
 
 def review_run_refusal(owner: staff.StaffRow, run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
-    root = run.resolve()
-    if not isinstance(owner.run, staff.OpenRun) or root != owner.run.path.resolve() or not root.is_dir():
+    root = run.absolute()
+    if (not isinstance(owner.run, staff.OpenRun) or root != owner.run.path.absolute()
+            or ".." in root.parts or root.resolve() != root or not root.is_dir()):
         return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
     if any(root.is_relative_to(tree) or tree.is_relative_to(root) for tree in (paths.main, paths.integration)):
         return AdmissionRefused("the showrunner run directory overlaps a checkout")

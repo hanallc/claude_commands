@@ -7,8 +7,9 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 from collections.abc import Callable, Generator, Iterable
-from contextlib import ExitStack, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
@@ -24,7 +25,7 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
-from typing import Literal, Protocol, cast, final
+from typing import Literal, Protocol, TextIO, cast, final
 
 from scripts.agents import detached_runs, pane_record, worker_lifecycle
 from scripts.herdr import herdr_types, pane_launch
@@ -509,43 +510,29 @@ def _read_review_artifact(parent: int, path: Path) -> ExistingArtifact | Artifac
         return ExistingArtifact(source.read(), stat.S_IMODE(mode))
 
 
-def _write_review_artifact(path: Path, content: bytes) -> None:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    with ExitStack() as directories:
-        parent = os.open(path.anchor, flags)
-        _ = directories.callback(os.close, parent)
-        for folder in path.parts[1:-1]:
-            try:
-                child = os.open(folder, flags, dir_fd=parent)
-            except FileNotFoundError:
-                with suppress(FileExistsError):
-                    os.mkdir(folder, dir_fd=parent)
-                child = os.open(folder, flags, dir_fd=parent)
-            parent = child
-            _ = directories.callback(os.close, parent)
-        existing = _read_review_artifact(parent, path)
-        if isinstance(existing, ExistingArtifact) and existing.content == content:
-            return
-        temporary = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
-        try:
-            with os.fdopen(descriptor, "wb") as output:
-                if isinstance(existing, ExistingArtifact):
-                    os.fchmod(output.fileno(), existing.mode)
-                _ = output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-            if isinstance(existing, ArtifactAbsent):
-                os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
-                os.unlink(temporary, dir_fd=parent)
-            else:
-                if _read_review_artifact(parent, path) != existing:
-                    raise OSError(f"{path}: completion file changed before publication")
-                os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
-            os.fsync(parent)
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary, dir_fd=parent)
+def _write_review_artifact(parent: int, path: Path, content: bytes) -> None:
+    existing = _read_review_artifact(parent, path)
+    if isinstance(existing, ExistingArtifact) and existing.content == content:
+        return
+    temporary = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            if isinstance(existing, ExistingArtifact):
+                os.fchmod(output.fileno(), existing.mode)
+            _ = output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if isinstance(existing, ArtifactAbsent):
+            os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+        else:
+            if _read_review_artifact(parent, path) != existing:
+                raise OSError(f"{path}: completion file changed before publication")
+            os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent)
 
 
 def _read_ordinary_artifact(path: Path) -> ExistingArtifact | ArtifactAbsent:
@@ -588,13 +575,9 @@ class CompletionArtifacts:
             raise OSError("showrunner completion requires its staff document")
         return worker_panes.enrolled_worker_owner(self.owner)
 
-    def require_protected_status(self, passed: dict[str, object]) -> None:
-        if passed.get("assign_status_file") and isinstance(self.policy, EnrolledPaths):
-            raise OSError("the enrolled review has a recorder-owned status file")
-
-    def require_unit_style_output(self) -> None:
-        if isinstance(self.policy, EnrolledPaths):
-            raise OSError("send style review output to a unit")
+    @property
+    def protected(self) -> bool:
+        return isinstance(self.policy, EnrolledPaths)
 
     def authorized_path(self, path: Path) -> Path:
         policy = self.policy
@@ -604,15 +587,129 @@ class CompletionArtifacts:
             return path.absolute()
         return path
 
-    def write(self, path: Path, text: str) -> None:
-        destination = self.authorized_path(path)
-        if isinstance(self.policy, EnrolledPaths):
-            _write_review_artifact(destination, text.encode())
+    def validate_status(self, passed: dict[str, object]) -> None:
+        if destination := progress_history.dispatch_delivery(passed).actions.status_file:
+            _ = self.authorized_path(Path(destination))
+
+    @contextmanager
+    def _directory(self, path: Path, *, create: bool = False) -> Generator[int]:
+        """Open the recorded run first, then open each relative component."""
+        root = self.run.absolute()
+        path = path.absolute()
+        if ".." in path.parts or not path.is_relative_to(root):
+            raise OSError(f"{path}: the destination must stay in the recorded run")
+        policy = self.policy
+        if isinstance(policy, EnrolledPaths):
+            if refusal := worker_panes.review_run_refusal(self.owner, root, policy):
+                raise OSError(refusal.reason)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        with ExitStack() as descriptors:
+            parent = os.open(root.anchor, flags)
+            _ = descriptors.callback(os.close, parent)
+            for folder in root.parts[1:]:
+                parent = os.open(folder, flags, dir_fd=parent)
+                _ = descriptors.callback(os.close, parent)
+            for folder in path.relative_to(root).parts:
+                if create:
+                    with suppress(FileExistsError):
+                        os.mkdir(folder, dir_fd=parent)
+                parent = os.open(folder, flags, dir_fd=parent)
+                _ = descriptors.callback(os.close, parent)
+            yield parent
+
+    @contextmanager
+    def _parent(self, path: Path, *, create: bool = False) -> Generator[int]:
+        if ".." in path.parts or path.absolute() == self.run.absolute():
+            raise OSError(f"{path}: the destination must stay in the recorded run")
+        with self._directory(path.absolute().parent, create=create) as parent:
+            yield parent
+
+    def mkdir(self, path: Path) -> None:
+        if self.protected:
+            with self._directory(path, create=True):
+                pass
         else:
-            _write_ordinary_artifact(destination, text.encode())
+            path.mkdir(parents=True, exist_ok=True)
+
+    def new_directory(self, parent: Path, name: str) -> Path:
+        if not name or name in (".", "..") or Path(name).name != name:
+            raise ValueError(f"invalid artifact directory name: {name}")
+        with self._directory(parent, create=True) as directory:
+            os.mkdir(name, dir_fd=directory)
+        return parent / name
+
+    @contextmanager
+    def open_read(self, path: Path) -> Generator[TextIO]:
+        if not self.protected:
+            with path.open(encoding="utf-8") as stream:
+                yield stream
+            return
+        with self._parent(path) as parent:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            descriptor = os.open(path.name, flags, dir_fd=parent)
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise OSError(f"{path}: expected a regular completion file")
+                yield stream
+
+    def read(self, path: Path) -> str:
+        with self.open_read(path) as stream:
+            return stream.read()
+
+    def write(self, path: Path, text: str) -> None:
+        if self.protected:
+            with self._parent(path, create=True) as parent:
+                _write_review_artifact(parent, path, text.encode())
+        else:
+            _write_ordinary_artifact(path, text.encode())
+
+    @contextmanager
+    def append(self, path: Path) -> Generator[TextIO]:
+        if not self.protected:
+            with path.open("a", encoding="utf-8") as stream:
+                yield stream
+            return
+        with self._parent(path, create=True) as parent:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+            descriptor = os.open(path.name, flags, 0o666, dir_fd=parent)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+                status = os.fstat(stream.fileno())
+                if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                    raise OSError(f"{path}: expected an unshared regular completion file")
+                yield stream
+
+    @contextmanager
+    def lock(self, path: Path) -> Generator[TextIO]:
+        with self.append(path) as stream:
+            worker_lifecycle.acquire_flock(stream, mode=fcntl.LOCK_EX)
+            yield stream
+
+    def rename(self, source: Path, target: Path) -> None:
+        if not self.protected:
+            if source.is_file():
+                _ = source.replace(target)
+            return
+        with self._parent(source) as source_parent, self._parent(target) as target_parent:
+            before = _read_review_artifact(source_parent, source)
+            destination = _read_review_artifact(target_parent, target)
+            if isinstance(before, ArtifactAbsent):
+                return
+            if (_read_review_artifact(source_parent, source) != before
+                    or _read_review_artifact(target_parent, target) != destination):
+                raise OSError(f"{target}: an artifact changed before rename")
+            os.replace(source.name, target.name, src_dir_fd=source_parent, dst_dir_fd=target_parent)
+            os.fsync(source_parent)
+            os.fsync(target_parent)
+
+    def unlink(self, path: Path) -> None:
+        if self.protected:
+            with self._parent(path) as parent:
+                os.unlink(path.name, dir_fd=parent)
+        else:
+            path.unlink()
 
     def reply(self, path: Path, text: str) -> None:
-        if isinstance(self.policy, EnrolledPaths):
+        if self.protected:
             self.write(path, text.rstrip() + "\n")
         else:
             save_reply(path, text)
@@ -794,9 +891,7 @@ def _require_review_delivery(owner: staff.StaffRow, row: staff.StaffRow, run: Pa
                       if isinstance(value, str) and value)
     _ = _require_review_order(owner, worker_panes.dispatch_role(row), run, *artifacts, *_review_artifacts(delivery.actions))
     writer = CompletionArtifacts(owner, run)
-    writer.require_protected_status(passed)
-    if delivery.actions.style_directory:
-        writer.require_unit_style_output()
+    writer.validate_status(passed)
 
 
 def _require_running_review(owner: staff.StaffRow, client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
@@ -829,8 +924,6 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                  *(Path(value) for value in (record_status,) if value), *_review_artifacts(completion_actions))
     try:
         enrolled = isinstance(_require_review_order(owner, role, session_dir, *artifacts), EnrolledPaths)
-        if enrolled and completion_actions.style_directory:
-            raise OSError("send style review output to a unit")
     except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(error, file=sys.stderr)
         return ExitCode.REFUSED
@@ -1423,13 +1516,13 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                     refusal = worker_panes.StartRefusal.BUSY_ROLE_CHANGE
                     print(f"{refusal.value}: workers unavailable: {row.name}", file=sys.stderr)
                     return ExitCode.BUSY
-        if chosen.value != slot:
+        if chosen.value != slot and owner is not None:
+            writer = CompletionArtifacts(owner, session_dir)
             if completion_actions.status_file:
                 status = Path(completion_actions.status_file)
                 target = progress_history.worker_artifact(status, slot, chosen.value)
                 completion_actions = replace(completion_actions, status_file=str(target))
-                if status.is_file():
-                    _ = status.replace(target)
+                writer.rename(status, target)
             if completion_actions.summary_file:
                 target = progress_history.worker_artifact(Path(completion_actions.summary_file), slot, chosen.value)
                 completion_actions = replace(completion_actions, summary_file=str(target))

@@ -20,7 +20,7 @@ from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdo
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import call, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents import pane_record
@@ -3419,6 +3419,14 @@ class WorkerCommandTests(unittest.TestCase):
                     _ = protected.write_text("Keep the checkout file.\n")
                     directory.rmdir()
                     directory.symlink_to(target, target_is_directory=True)
+                    legacy_status = self.run_dir / f"{role}-legacy-status"
+                    if role == "review":
+                        current_state = cast(dict[str, object], json.loads(state_path.read_text()))
+                        slots = cast(dict[str, dict[str, object]], current_state["pass"])
+                        slot_pass = slots[role]
+                        slot_pass["assign_status_file"] = str(legacy_status)
+                        atomic_file.write_text_atomic(state_path, json.dumps(current_state))
+                        _ = legacy_status.write_text("running\n")
                     if role == "review":
                         with self.subTest(completion_writer="retry reply"):
                             turn_reply = target / "verdict_turn.md"
@@ -3439,11 +3447,12 @@ class WorkerCommandTests(unittest.TestCase):
                     reply = directory / "verdict.md"
                     self.assertIn("Design verdict: Confirm the selected panel.", reply.read_text())
                     self.assertIn(f"reply {reply}", self.agent.notices[-1])
+                    if role == "review":
+                        self.assertEqual(legacy_status.read_text(), "done\n")
 
             row = first
             passed = worker_panes.worker_pass(row, self.run_dir)
             reply = self.run_dir / "review" / "verdict.md"
-            guarded = worker.CompletionArtifacts(owner, self.run_dir)
             directories = (main, integration)
             baseline = {path / "verdict.md": (path / "verdict.md").read_bytes() for path in directories}
             for index, field in enumerate(("summary_file", "report_file", "status_file", "repeat status")):
@@ -3467,23 +3476,82 @@ class WorkerCommandTests(unittest.TestCase):
                                                       actions, reply, owner=owner)
                     self.assertEqual({path: path.read_bytes() for path in baseline}, baseline)
 
-            with self.subTest(completion_writer="parent changes after open"):
-                folder = self.run_dir / "replace-parent"
-                folder.mkdir()
-                path = folder / "verdict.md"
-                _ = path.write_text("Previous verdict.\n")
-                original = self.run_dir / "original-parent"
-                replace_file = os.replace
+            for writer in ("hook", "launcher", "recorder"):
+                for swap in ("before open", "after open"):
+                    with self.subTest(completion_writer=writer, swap=swap):
+                        folder = self.run_dir / f"{writer}-{swap.replace(' ', '-')}"
+                        folder.mkdir()
+                        original = self.run_dir / f"{folder.name}-original"
+                        path = folder / "requested_status"
+                        published = folder / f"{row.name}_status" if writer == "launcher" else path
+                        _ = path.write_text("Previous status.\n")
+                        checkout = main if swap == "before open" else integration
+                        existing = {tree / name: f"Keep {tree.name}/{name}.\n"
+                                    for tree in directories for name in {path.name, published.name}}
+                        for target, content in existing.items():
+                            _ = target.write_text(content)
+                        replace_file = os.replace
 
-                def swap_parent(source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int) -> None:
-                    _ = folder.rename(original)
-                    folder.symlink_to(main, target_is_directory=True)
-                    replace_file(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+                        def redirect() -> None:
+                            _ = folder.rename(original)
+                            folder.symlink_to(checkout, target_is_directory=True)
 
-                with patch.object(os, "replace", side_effect=swap_parent):
-                    guarded.write(path, "New verdict.\n")
-                self.assertEqual((original / path.name).read_text(), "New verdict.\n")
-                self.assertEqual({path: path.read_bytes() for path in baseline}, baseline)
+                        def replace_after_open(source: str | Path, destination: str | Path, *,
+                                               src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+                            if Path(destination).name == published.name:
+                                redirect()
+                            replace_file(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                        launch_id = uuid4()
+                        if writer == "recorder":
+                            with patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(path)}):
+                                _ = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8",
+                                    role="review", worker_name=row.name, worker_id=row.id,
+                                    launcher_command=["saved-launcher", str(launch_id)], prompt=self.prompt,
+                                    kind="assign", lens="", new_pass_instance_id=launch_id)
+                            _ = path.write_text("Previous status.\n")
+
+                        def publish() -> None:
+                            if writer == "launcher":
+                                with patch.object(worker, "dispatch", return_value=worker.DispatchSubmission.SUBMITTED):
+                                    self.assertIs(worker.assign(owner.id, "review", self.prompt, session_dir=self.run_dir,
+                                        slot="requested", name=row.name, phase="8", kind="assign", launcher_command=[],
+                                        completion_actions=progress_history.CompletionActions(status_file=str(path))),
+                                        worker.DispatchSubmission.SUBMITTED)
+                            elif writer == "recorder":
+                                result = progress_history.record_assignment_launch_exit(self.run_dir, launch_id,
+                                    progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS)
+                                self.assertEqual(result, progress_history.RecordedAssignmentLaunch(
+                                    row.name, failure_recorded=True))
+                            else:
+                                actions = progress_history.CompletionActions(status_file=str(path))
+                                _ = assign.complete_herdr(self.run_dir, row, {**passed, "kind": "astra"},
+                                                          actions, reply, owner=owner)
+
+                        if swap == "before open":
+                            redirect()
+                            if writer == "launcher":
+                                with redirect_stderr(io.StringIO()):
+                                    result = worker.assign(owner.id, "review", self.prompt, session_dir=self.run_dir,
+                                        slot="requested", name=row.name, phase="8", kind="assign", launcher_command=[],
+                                        completion_actions=progress_history.CompletionActions(status_file=str(path)))
+                                self.assertIs(result, worker.ExitCode.REFUSED)
+                            else:
+                                with self.assertRaises(OSError):
+                                    publish()
+                        else:
+                            with patch.object(os, "replace", side_effect=replace_after_open):
+                                publish()
+                            expected_text = {"launcher": "Previous status.\n", "recorder": "error\n", "hook": "done\n"}
+                            self.assertEqual((original / published.name).read_text(), expected_text[writer])
+                        self.assertEqual({target: target.read_text() for target in existing}, existing)
+                        folder.unlink()
+                        if writer == "recorder" and swap == "before open":
+                            _ = original.rename(folder)
+                            instance = str(launch_id)
+                            progress_history.confirm_assignment_submission(self.run_dir, instance, instance)
+                            self.assertTrue(progress_history.dispatch_submission_confirmed(self.run_dir, instance, instance))
+                            self.assertEqual(path.read_text(), "running\n")
 
             with self.subTest(completion_writer="dispatch error"):
                 folder = self.run_dir / "dispatch-error"
