@@ -23,6 +23,7 @@ from datetime import date, datetime
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
+from inspect import signature
 from io import StringIO
 from functools import cache
 from pathlib import Path
@@ -2142,6 +2143,24 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(len(self.messages), count + 1)
             self.assertIn("First answer", self.messages[-1][2])
             self.assertNotIn("Second answer", self.messages[-1][2])
+
+    def test_exact_question_save_requires_a_revision_check(self) -> None:
+        key = self.file_user_question("Check the selected question")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("fixture", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        scope = update_registration.question_scope(question.owner, staff.snapshot())
+        args = (scope, question, "answer", "Use the compact layout.")
+        with self.assertRaises(TypeError):
+            _ = signature(change_browser.save_question_record).bind(*args)
+
+        def refuse() -> object:
+            raise review_items.ReviewRecordChanged("The selected question changed.")
+
+        previous = question.record.path.read_bytes()
+        with self.assertRaises(review_items.ReviewRecordChanged):
+            change_browser.save_question_record(scope, question, "answer", args[3], refuse)
+        self.assertEqual(question.record.path.read_bytes(), previous)
 
     def test_failed_question_answer_alerts_the_tab_showrunner(self) -> None:
         producer = fixture_member("producer", name="bob")

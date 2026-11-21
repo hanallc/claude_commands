@@ -407,7 +407,8 @@ function drawWindow(){
  }
  const start=Math.max(0,locate(prefix,scrollY-origin)-8);
  const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,scrollY-origin+innerHeight)+9));
- const focused=document.activeElement?.closest('[data-list-item]')?.dataset.key || options.focusKey?.();
+ const focusedRow=document.activeElement?.closest('[data-list-item]');
+ const focused=focusedRow?.dataset.key || options.focusKey?.();
  const ranges=[[start,end],...motionRanges];
  for(const key of new Set([focused,opened.values().next().value,dialogItem?.dataset.key])){
   if(!key) continue;
@@ -421,23 +422,33 @@ function drawWindow(){
  for(const gap of windowGaps.splice(windows.length-1)) gap.remove();
  spacer(before,prefix[windows[0][0]]);
  spacer(after,prefix.at(-1)-prefix[windows.at(-1)[1]]);
- let cursor=before;
- const placeNode=node=>{
-  if(cursor.nextElementSibling!==node) cursor.after(node);
-  cursor=node;
- };
+ const nodes=[];
  for(const [position,[from,to]] of windows.entries()){
   if(position){
    const gap=windowGaps[position-1] ??= document.createElement('tbody');
    gap.setAttribute('data-window-gap','');
    spacer(gap,prefix[from]-prefix[windows[position-1][1]]);
-   placeNode(gap);
+   nodes.push(gap);
   }
   for(const {data,visible} of entries.slice(from,to)){
-   if(visible) placeNode(mount(data));
+   if(visible) nodes.push(mount(data));
    const motion=motions.get(data.key);
-   if(motion) placeNode(motion.spacer);
+   if(motion) nodes.push(motion.spacer);
   }
+ }
+ // Move the rows around the focused row to keep its focus.
+ const anchor=nodes.indexOf(focusedRow);
+ let next=focusedRow;
+ for(let i=anchor-1;i>=0;i--){
+  const node=nodes[i];
+  if(next.previousElementSibling!==node) next.before(node);
+  next=node;
+ }
+ let cursor=anchor<0 ? before : focusedRow;
+ for(let i=anchor+1;i<nodes.length;i++){
+  const node=nodes[i];
+  if(cursor.nextElementSibling!==node) cursor.after(node);
+  cursor=node;
  }
  syncItemDialog();
  showHiddenActionResults([...mounted.values()]);
@@ -671,6 +682,10 @@ function mount(data){
 if(options.mount){
  addEventListener('scroll',scheduleWindow,{passive:true});
  addEventListener('resize',()=>{measured.clear();scheduleWindow();});
+ content.addEventListener('focusin',event=>{
+  const row=event.target.closest('[data-list-item]');
+  if(row && !row.contains(event.relatedTarget)) drawWindow();
+ });
  content.addEventListener('focusout',scheduleWindow);
 }
 
