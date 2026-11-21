@@ -379,9 +379,10 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
         lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
         merge = merge_checkpoint.merge
 
-        def stop_after_first_merge(request: merge_checkpoint.MergeRequest) -> str:
+        def stop_after_first_merge(request: merge_checkpoint.MergeRequest, *,
+                                   batch_checkout: merge_checkpoint.ResetBatchCheckout) -> str:
             self.assertEqual(request.commit, first)
-            _ = merge(request)
+            _ = merge(request, batch_checkout=batch_checkout)
             raise KeyboardInterrupt
 
         with (patch.object(merge_checkpoint, "merge", side_effect=stop_after_first_merge),
@@ -689,10 +690,12 @@ raise SystemExit(1)
                     expected.insert(1, "send beta")
                     merge_checkpoint_row = merge_checkpoint.merge_checked_checkpoint
 
-                    def interrupt_after_alpha(request: merge_checkpoint.MergeRequest) -> merge_checkpoint.CheckedCheckpointMerge:
+                    def interrupt_after_alpha(
+                        request: merge_checkpoint.MergeRequest, *, batch_checkout: merge_checkpoint.ResetBatchCheckout,
+                    ) -> merge_checkpoint.CheckedCheckpointMerge:
                         if request.commit != alpha:
                             raise KeyboardInterrupt
-                        return merge_checkpoint_row(request)
+                        return merge_checkpoint_row(request, batch_checkout=batch_checkout)
 
                     with (patch.object(merge_checkpoint, "merge_checked_checkpoint", interrupt_after_alpha),
                           self.assertRaises(KeyboardInterrupt)):
@@ -767,27 +770,144 @@ raise SystemExit(1)
                     self.assertEqual(next_item.returncode, 0, next_item.stdout + next_item.stderr)
                     _ = self.assert_landed(start, [beta])
 
-    def test_fetch_failure_returns_each_current_row(self) -> None:
+    def test_resumed_batch_red_retest_uses_the_tested_tip_for_rollback(self) -> None:
+        for change in ("dirty file", "operator commit", "clean checkout"):
+            with self.subTest(change=change):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                start = self.git("rev-parse", "HEAD")
+                alpha = self.checkpoint()
+                beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+                rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
+                with (patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
+                      self.assertRaises(KeyboardInterrupt)):
+                    _ = self.land_batch(rows)
+                initial_tip = self.git("rev-parse", "HEAD")
+                main = self.push_main_change("main-retest.txt", "changes that require a retest\n")
+                _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
+                self.executable(self.bin / "checkpoint-test", STUB + f'''
+import subprocess
+if not Path("main-retest.txt").exists():
+    subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "origin", "main"],
+                   check=True, timeout=TEST_HANG_GUARD_SECS)
+    raise SystemExit(0)
+tested_tip = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=TEST_HANG_GUARD_SECS)
+(state / "retest-tip").write_text(tested_tip.strip())
+if {change!r} == "dirty file":
+    Path("main-retest.txt").write_text("operator edit\\n")
+elif {change!r} == "operator commit":
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "Operator commit"],
+                   check=True, timeout=TEST_HANG_GUARD_SECS)
+raise SystemExit(1)
+''')
+
+                result = self.land_batch(rows)
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.events("checkpoint-test"), [[], []])
+                tested_tip = (self.state / "retest-tip").read_text()
+                self.assertNotEqual(tested_tip, initial_tip)
+                self.assertEqual(self.git("rev-parse", f"{tested_tip}^2"), main)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+                self.assertIn("red: failed — merge test 1 failed", result.stdout)
+                for notice in notices:
+                    self.assertIn("this row's tests include a red step; repair merge test 1", notice)
+                    self.assertIn(str(self.state / f"merge_{alpha[:7]}_test.log"), notice)
+                if change == "clean checkout":
+                    self.assertNotIn("rollback failed:", result.stdout)
+                    self.assert_rolled_back(start)
+                    continue
+                warning = result.stdout.split("rollback failed:", 1)
+                self.assertEqual(len(warning), 2, result.stdout)
+                self.assertIn(notices[-1], warning[0])
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+                if change == "dirty file":
+                    self.assertIn("main-retest.txt", warning[1])
+                    self.assertEqual(self.git("rev-parse", "HEAD"), tested_tip)
+                    self.assertEqual((self.checkout / "main-retest.txt").read_text(), "operator edit\n")
+                else:
+                    self.assertIn(f"HEAD moved from {tested_tip}", warning[1])
+                    self.assertEqual(self.git("show", "-s", "--format=%s", "HEAD"), "Operator commit")
+                    self.assertEqual(self.git("rev-parse", "HEAD^"), tested_tip)
+
+    def test_resumed_batch_captures_pending_attribution_before_the_gate(self) -> None:
         start = self.git("rev-parse", "HEAD")
-        alpha = self.checkpoint()
-        beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
-        self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
-        with patch.dict("os.environ", self.env):
-            results = land_runs.results_path()
-        results.parent.mkdir(parents=True)
-        _ = results.write_bytes(b"\xff\n")
-        _ = self.git("remote", "set-url", "origin", str(self.root / "missing-origin"))
-        result = self.land_batch([self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)])
+        manifest = "crates/alpha-proof/Cargo.toml"
+        alpha = self.checkpoint(manifest, '[package]\nname = "alpha-proof"\n')
+        later = self.checkpoint("src/later.txt", "change outside the package\n")
+        beta = self.beta_checkpoint("crates/damaged/src/lib.rs", "pub fn beta() {}\n")
+        rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta),
+                self.batch_line("alpha", "3", later)]
+        merge_checkpoint_row = merge_checkpoint.merge_checked_checkpoint
+
+        def interrupt_after_alpha(
+            request: merge_checkpoint.MergeRequest, *, batch_checkout: merge_checkpoint.ResetBatchCheckout,
+        ) -> merge_checkpoint.CheckedCheckpointMerge:
+            if request.commit != alpha:
+                raise KeyboardInterrupt
+            return merge_checkpoint_row(request, batch_checkout=batch_checkout)
+
+        with (patch.object(merge_checkpoint, "merge_checked_checkpoint", interrupt_after_alpha),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.land_batch(rows)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
+        self.write(self.checkout, "crates/damaged/Cargo.toml", "[package]\n")
+        self.executable(self.bin / "verify.sh", STUB + '''
+Path("Cargo.toml").write_text("[package]\\n")
+raise SystemExit(1)
+''')
+
+        result = self.land_batch(rows)
+
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]])
         notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
-        self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
-        for notice in notices:
-            self.assertIn("fetch failed", notice)
-            self.assertIn("send this checkpoint again when origin is available", notice)
-        self.assertEqual(result.stdout.count("land result: not recorded"), 2)
-        self.assertLess(result.stdout.index(notices[-1]), result.stdout.index("land result: not recorded"))
-        self.assertEqual(self.git("rev-parse", "HEAD"), start)
-        self.assertFalse(self.batch_record().exists())
+        self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta", "send alpha"])
+        self.assertIn(f"phase 2 ({alpha[:12]}): this row's tests include a red step", notices[0])
+        self.assertIn(f"phase 2 ({beta[:12]}): changed paths unknown: 'name'", notices[1])
+        self.assertIn(f"phase 3 ({later[:12]}): this row's tests include no reported red step", notices[2])
+        self.assertIn("rollback failed:", result.stdout)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+
+    def test_fetch_failure_returns_each_current_row_without_writing_results(self) -> None:
+        for saved_results in ("landed row", "invalid log"):
+            with self.subTest(saved_results=saved_results):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                alpha = self.checkpoint()
+                beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                with patch.dict("os.environ", self.env):
+                    results = land_runs.results_path()
+                alpha_row = self.batch_line("alpha", "2", alpha)
+                if saved_results == "landed row":
+                    landed = self.land_batch([alpha_row])
+                    self.assertEqual(landed.returncode, 0, landed.stdout + landed.stderr)
+                    with patch.dict("os.environ", self.env):
+                        self.assertTrue(land_runs.last_results()[alpha]["landed"])
+                        self.assertNotIn(beta, land_runs.last_results())
+                else:
+                    results.parent.mkdir(parents=True)
+                    _ = results.write_bytes(b"\xff\n")
+                before = results.read_bytes()
+                start = self.git("rev-parse", "HEAD")
+                _ = self.git("remote", "set-url", "origin", str(self.root / "missing-origin"))
+
+                result = self.land_batch([alpha_row, self.batch_line("beta", "2", beta)])
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+                for notice in notices:
+                    self.assertIn("fetch failed", notice)
+                    self.assertIn("send this checkpoint again when origin is available", notice)
+                self.assertEqual(results.read_bytes(), before)
+                self.assertNotIn("land result: not recorded", result.stdout)
+                self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                self.assertFalse(self.batch_record().exists())
 
     def test_single_checkpoint_succeeds_when_the_completion_marker_fails(self) -> None:
         alpha = self.checkpoint(content="alpha change\n")

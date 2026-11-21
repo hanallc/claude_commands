@@ -734,6 +734,7 @@ A batch can contain one item.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
 2. Fetch the merge branch and the unit branches from origin.
    If the merge branch fetch fails, ask each current requester to send the checkpoint again when origin is available.
+   Leave existing results unchanged when this fetch fails.
    Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
    Resolve every item to a commit before writing the record or starting a merge.
    Refuse the batch and name the item if it cannot resolve to a commit.
@@ -752,7 +753,7 @@ A batch can contain one item.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
 A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
-A red test or main conflict returns every pending item in the resumed batch.
+A stop during test preparation, a red test, or a main conflict returns every pending item in the resumed batch.
 A published merge with a promotion marker keeps its completed result.
 For other stops, the existing resume rules apply.
 
@@ -765,11 +766,16 @@ Review-list publication, style notification, checkout announcement, and Mac prom
 Each merge retains its own review ownership and completion record.
 
 A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
+Before each gate run, record the tested tip and each row's selected commands in memory.
+For attribution, compare a merged row with its merge's first parent.
+Compare an unmerged row with the destination tip before preparation.
 A red report names the failed test step and says whether the row selects it.
+If command selection failed for a row, report unknown changed paths and include the error.
 The batch stops at the first failed test command.
 The next queued item can proceed after the batch exits.
-Before publication, the stop path attempts to restore the starting tip before it sends notices.
-It sends every notice before it writes result records.
+Before publication, the shared stop attempts to restore the starting tip.
+The stop refuses the reset if HEAD differs from the expected tip or if origin has moved.
+The stop sends every notice before it writes result records.
 Rollback and result-record errors appear after the notices.
 Reset aborts an unfinished merge only when no merge was unfinished at batch start.
 An earlier unfinished merge and its staged edits remain unchanged.
