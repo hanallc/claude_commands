@@ -439,9 +439,16 @@ def fetch_origin_heads(checkout: Path, *flags: str) -> str:
 def on_origin(request: MergeRequest) -> str | None:
     """Find an origin branch holding the checkpoint, trying the unit branch first."""
     checkout = request.production.checkout
-    if (fetch_origin_unit_branch(checkout, request.unit.branch)
-            and git(checkout, "merge-base", "--is-ancestor", request.commit, "FETCH_HEAD").returncode == 0):
-        return f"origin/{request.unit.branch}"
+    try:
+        unit_tip = land_main.remote_branch_commit(checkout, "origin", request.unit.branch)
+    except land_main.RemoteBranchMissing:
+        pass
+    except land_main.LandError as error:
+        raise checkpoint_gate.Stop("ancestry", "failed", str(error),
+                                   "the showrunner will inspect the failed command") from error
+    else:
+        if git(checkout, "merge-base", "--is-ancestor", request.commit, unit_tip).returncode == 0:
+            return f"origin/{request.unit.branch}"
     fetched = fetch_origin_heads(checkout, "--porcelain", "--verbose")
     advertised = {fields[2]: fields[1] for line in fetched.splitlines()
                   if line[:1] in (" ", "+", "*", "=") and len(fields := line[1:].split()) == 3

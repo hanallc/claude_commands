@@ -22,6 +22,7 @@ from enum import Enum, auto
 import hashlib
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -40,6 +41,10 @@ class LandError(RuntimeError):
 
 class NotFastForward(LandError):
     """Origin has commits absent from the requested commit."""
+
+
+class RemoteBranchMissing(LandError):
+    """The remote does not advertise the requested branch."""
 
 
 @dataclass(frozen=True)
@@ -94,30 +99,64 @@ class NoTimeLimit:
 UNLIMITED_GIT = NoTimeLimit()
 
 
+def run_git(checkout: Path, *arguments: str,
+            time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(["git", "-C", str(checkout), *arguments],
+                              capture_output=True, text=True, check=False,
+                              timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
+    except subprocess.TimeoutExpired as error:
+        details = "; ".join(output.decode(errors="replace").strip()
+                            for output in (error.stderr, error.stdout) if output)
+        raise LandError(f"timed out after {error.timeout:g} seconds; {details}") from error
+
+
+def git_output(result: subprocess.CompletedProcess[str], operation: str) -> str:
+    if result.returncode:
+        raise LandError((result.stderr or result.stdout).strip() or f"git {operation}: exit {result.returncode}")
+    return result.stdout
+
+
+def checked_git(checkout: Path, *arguments: str,
+                time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> str:
+    return git_output(run_git(checkout, *arguments, time_limit=time_limit), arguments[0]).strip()
+
+
+def remote_branch_commit(checkout: Path, remote: str, branch: str, *,
+                         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> str:
+    """Fetch and return the exact commit that the remote advertises for the branch."""
+    # The snapshot protects against fetches in this checkout.
+    # Another clone can still publish a different commit after ls-remote.
+    ref = f"refs/heads/{branch}"
+    query = run_git(checkout, "ls-remote", "--refs", "--", remote, ref, time_limit=time_limit)
+    advertised = git_output(query, "ls-remote").splitlines()
+    if not advertised:
+        raise RemoteBranchMissing(f"{remote} does not advertise {ref}")
+    sha, _, advertised_ref = advertised[0].partition("\t")
+    if len(advertised) != 1 or advertised_ref != ref or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        raise LandError(f"{remote}: expected one full commit SHA for {ref}")
+    _ = checked_git(checkout, "fetch", "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
+                    "--", remote, sha, time_limit=time_limit)
+    resolved = checked_git(checkout, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}",
+                           time_limit=time_limit)
+    if resolved != sha:
+        raise LandError(f"{remote}: {sha} for {ref} is not a commit")
+    return sha
+
+
 def land(checkout: Path, commit: str, branch: str = "main", *,
          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
          retry_source: Path | None = None) -> Landed:
     """Push only a fast-forward and run any pending default-branch hook."""
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(["git", "-C", str(checkout), *arguments],
-                                  capture_output=True, text=True, check=False,
-                                  timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
-        except subprocess.TimeoutExpired as error:
-            details = "; ".join(output.decode(errors="replace").strip()
-                                for output in (error.stderr, error.stdout) if output)
-            raise LandError(f"timed out after {error.timeout:g} seconds; {details}") from error
+        return run_git(checkout, *arguments, time_limit=time_limit)
 
     def checked(*arguments: str) -> str:
-        result = git(*arguments)
-        if result.returncode:
-            raise LandError((result.stderr or result.stdout).strip() or f"git {arguments[0]}: exit {result.returncode}")
-        return result.stdout.strip()
+        return checked_git(checkout, *arguments, time_limit=time_limit)
 
     with main_push_lock.main_push_lock(checkout):
         sha = checked("rev-parse", "--verify", f"{commit}^{{commit}}")
-        _ = checked("fetch", "origin", branch)
-        origin = checked("rev-parse", "FETCH_HEAD")
+        origin = remote_branch_commit(checkout, "origin", branch, time_limit=time_limit)
         pushed: Pushed | AlreadyLanded
         if origin == sha:
             pushed = AlreadyLanded()
@@ -164,13 +203,6 @@ def run_hook(root: Path, hook: Path, record: Path, sha: str, branch: str,
     except OSError:
         return HookFailed(1, rerun)
     return HookDone()
-
-
-def checked_git(source: Path, *arguments: str) -> str:
-    result = subprocess.run(["git", "-C", str(source), *arguments], capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise LandError((result.stderr or result.stdout).strip() or f"git {arguments[0]}: exit {result.returncode}")
-    return result.stdout.strip()
 
 
 class CommitOrder(Enum):
@@ -223,8 +255,7 @@ def exact_hook_checkout(source: Path, sha: str, *, hook_digest: str = "") -> Gen
 
 def retry_hook(source: Path, sha: str, branch: str, hook_digest: str) -> HookAbsent | HookDone | HookSkipped | HookFailed:
     with main_push_lock.main_push_lock(source):
-        _ = checked_git(source, "fetch", "origin", f"refs/heads/{branch}")
-        published = checked_git(source, "rev-parse", "--verify", "FETCH_HEAD")
+        published = remote_branch_commit(source, "origin", branch)
         order = commit_order(source, published, sha)
         if order == CommitOrder.REQUESTED_ANCESTOR:
             raise LandError(f"origin/{branch} has a newer publication {published}; hook retry for {sha} refused")

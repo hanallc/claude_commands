@@ -957,7 +957,7 @@ class LifecycleTests(LifecycleFixture):
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
-        for hook_state in ("done", "equal pending", "newer pending", "newer completion"):
+        for hook_state in ("done", "equal pending", "newer pending", "newer completion", "intervening fetch"):
             with self.subTest(installed="newer integration commit", hook=hook_state):
                 base = self.git("rev-parse", "HEAD", cwd=destination)
                 earlier = self.git("commit-tree", "HEAD^{tree}", "-p", base, "-m", "Requested promotion")
@@ -987,9 +987,10 @@ class LifecycleTests(LifecycleFixture):
                 self.assertIn("post-push hook: failed (exit 9)", failure)
                 retry_command = failure.split("rerun: ", 1)[1]
                 self.assertIn(f"LANDED_SHA={earlier}", retry_command)
+                retry_env = self.env
 
                 def retry() -> subprocess.CompletedProcess[str]:
-                    return subprocess.run(["bash", "-c", retry_command], cwd=self.checkout, env=self.env,
+                    return subprocess.run(["bash", "-c", retry_command], cwd=self.checkout, env=retry_env,
                                           capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
                 if hook_state == "equal pending":
@@ -1006,7 +1007,7 @@ class LifecycleTests(LifecycleFixture):
                     continue
 
                 record = destination / ".git/post-push-completed"
-                if hook_state == "newer pending":
+                if hook_state in ("newer pending", "intervening fetch"):
                     with mock.patch.dict(os.environ, self.env, clear=True):
                         landed = land_main.land(destination, later)
                     self.assertIsInstance(landed.hook, land_main.HookFailed)
@@ -1016,9 +1017,32 @@ class LifecycleTests(LifecycleFixture):
                     # Simulate the completion record left by a remote rewind.
                     _ = record.write_text(later + "\n", encoding="utf-8")
                     refusal = f"the hook completion record has a newer commit {later}"
+
+                fetch_marker = self.root / "intervening-fetch" / "fetched"
+                if hook_state == "intervening fetch":
+                    real_git = shutil.which("git", path=self.env["PATH"])
+                    if real_git is None:
+                        self.fail("Git is missing from the fixture PATH")
+                    shim = fetch_marker.with_name("git")
+                    self.write(shim, '''#!/bin/sh
+"$FIXTURE_GIT" "$@" || exit $?
+if [ "$1" = -C ] && [ "$2" = "$FIXTURE_DESTINATION" ] && [ "$3" = fetch ]; then
+    "$FIXTURE_GIT" -C "$2" fetch --quiet origin "$FIXTURE_EARLIER" || exit $?
+    touch "$FIXTURE_FETCH_MARKER"
+fi
+''')
+                    shim.chmod(0o755)
+                    retry_env = {
+                        **self.env, "PATH": str(shim.parent) + os.pathsep + self.env["PATH"],
+                        "FIXTURE_GIT": real_git, "FIXTURE_DESTINATION": str(destination),
+                        "FIXTURE_EARLIER": earlier, "FIXTURE_FETCH_MARKER": str(fetch_marker),
+                    }
                 hold.unlink()
                 before = runs.read_bytes(), record.read_bytes()
                 refused = retry()
+                if hook_state == "intervening fetch":
+                    self.assertTrue(fetch_marker.exists())
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), later)
                 self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
                 self.assertIn(refusal, refused.stderr)
                 self.assertEqual((runs.read_bytes(), record.read_bytes()), before)

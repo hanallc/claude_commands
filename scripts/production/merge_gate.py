@@ -2040,7 +2040,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
                     or git(source, "merge-base", "--is-ancestor", origin, head).returncode
                     or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
-        if git(source, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
+        if git(source, "merge-base", "--is-ancestor", origin, target).returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
         if refusal := live_file_refusal(source, target):
             raise GateRefused(refusal)
