@@ -20,6 +20,8 @@ The unit word names the unit. Use a unit word for only one active unit. A new un
 
 A short name is one nonempty path component. It must contain a character other than an ASCII digit. The tool refuses `.`, `..`, slashes, and NUL characters. A short name must be free within its repo and unit. A copy number is a positive decimal integer without leading zeroes.
 
+A new unit or style production uses `worktree` as its main short name. The branch is `<unit>-worktree`.
+
 ## Worktree commands
 
 - `worktrees.py make <repo word> <unit> <short-name>` creates the source, the output link, and the worktree record.
@@ -42,7 +44,7 @@ A short name is one nonempty path component. It must contain a character other t
 
 Without a list row, migration uses a known unit word in the old folder name first. It then tries the worktree record and staff data. The commit subject supplies the last choice. The tool strips leading repo and production names from a subject's unit slug. A repo word alone cannot identify the unit.
 
-Migration derives the short name by removing known repo, checkout, machine, production, and unit words from the old folder name. It uses `director` if the result is empty. For a result made of digits, it tries the branch name with the same words removed. It adds `p` if the name still contains only digits. It keeps checkouts with no proved unit or with conflicting destinations.
+Migration derives the short name by removing known repo, checkout, machine, production, and unit words from the old folder name. It uses `worktree` if the result is empty. For a result made of digits, it tries the branch name with the same words removed. It adds `p` if the name still contains only digits. It keeps checkouts with no proved unit or with conflicting destinations.
 
 Migration keeps the showrunner checkouts until Nate answers question 4. This includes the Hana merge checkout and showrunner checkouts recorded in archived production documents. It keeps the user's `~/worktrees/nate_style-message-clarity` checkout. Tool-owned checkouts, such as Claude Code worktrees and temporary gate checkouts, stay with their tools.
 

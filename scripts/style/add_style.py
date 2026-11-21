@@ -100,7 +100,8 @@ class NoStyleProduction:
 
     @property
     def checkout(self) -> Path:
-        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name, "production")
+        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name,
+                                           worktrees.UNIT_WORKTREE_NAME)
 
     @property
     def doc(self) -> Path:
@@ -174,10 +175,23 @@ def _request(name: str) -> StyleProduction:
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
+    checkout, doc = standing.checkout, standing.doc
+    if isinstance(standing, StandingStyleProduction):
+        merge_branch = production_field(doc.read_text().splitlines(), "Merge branch")
+    else:
+        merge_branch = f"{name}-{worktrees.UNIT_WORKTREE_NAME}"
+        legacy_branch = "style/" + branch_point.replace("/", "-")
+        if not worktrees.has_branch(repository, merge_branch):
+            legacy_checkout = checkout.with_name("production")
+            legacy_exists = worktrees.has_branch(repository, legacy_branch)
+            if (legacy_exists and worktrees.registered_checkout(legacy_checkout, repository, legacy_branch)
+                    or worktrees.pending_checkout(legacy_checkout, repository, legacy_branch)):
+                checkout, doc = legacy_checkout, legacy_checkout / "docs" / doc.name
+                merge_branch = legacy_branch
+            elif legacy_exists:
+                merge_branch = legacy_branch
     return StyleProduction(
-        parent, repository, name, branch_point, branch_tip,
-        "style/" + branch_point.replace("/", "-"), standing.checkout,
-        standing.doc, proposals,
+        parent, repository, name, branch_point, branch_tip, merge_branch, checkout, doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
     )
 
@@ -407,7 +421,7 @@ def main(argv: list[str]) -> int:
         branch = (build_folders.ExistingWorktreeBranch(style.merge_branch)
                   if worktrees.has_branch(style.repository, style.merge_branch)
                   else build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip))
-        layout = worktrees.output_record(build_folders.repo_word(style.repository), style.name, "production")
+        layout = worktrees.unit_checkout_output(style.checkout, build_folders.repo_word(style.repository), style.name)
         _ = worktrees.create_checkout(style.checkout, style.repository, branch, layout, owner=style.name,
                                       allow_empty=True, allow_existing=True)
         if existing:

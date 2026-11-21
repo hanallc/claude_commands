@@ -262,7 +262,13 @@ It reads the retained finding's kind to select the duplicate kind.
 ### Bootstrap: `add_style.py` and the production format
 
 - `add_style.py --production <showrunner name> --model <m> --effort <e> [--pilot <unit>[=<crate>,...]]... [--check]`, run by the repo's main showrunner (`commands/showrunner/add_style.md`).
-- `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; showrunner name `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
+- `_request` reads the repository, branch point, and Proposals field from the parent document.
+  It finds the main checkout with `--git-common-dir`.
+  A new style production uses `~/worktrees/<repo>/<repo>-style/worktree` and branch `<repo>-style-worktree`.
+  Its document is `docs/<repo>-style-production.md` in that checkout.
+  An existing style production keeps the branch in its document.
+  A retry can finish a checkout that still uses the old `production` short name.
+  A missing Proposals field causes a refusal.
 - `standing_style_production(repo_dir)` returns `StandingStyleProduction` or `NoStyleProduction`.
   The record holds `checkout`, `doc`, `name` and `branch_point`.
   It finds style showrunner documents and parent documents with configured direct units.

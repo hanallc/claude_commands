@@ -347,7 +347,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertIn("legacy-proof | staff row | live-unit", dry.stdout)
         self.assertIn(f"move {by_branch} -> {self.trees}/origin/fixture-unit/phase-45 |", dry.stdout)
         self.assertIn(f"move {digits} -> {self.trees}/origin/fixture-unit/p47 |", dry.stdout)
-        self.assertIn(f"move {empty} -> {self.trees}/origin/fixture-unit/director |", dry.stdout)
+        self.assertIn(f"move {empty} -> {self.trees}/origin/fixture-unit/worktree |", dry.stdout)
         for shared in (repeated, duplicate):
             self.assertIn(f"keep {shared}: short name shared by multiple worktrees", dry.stdout)
             self.assertNotIn(f"move {shared} ->", dry.stdout)
@@ -458,7 +458,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = self.git(self.repository, "remote", "set-url", "origin", "git@fixture:owner/claude_commands.git")
         _ = self.git(main, "remote", "set-url", "origin", "git@fixture:owner/claude_commands.git")
         names = (
-            ("claude_commands-Nates-MacBook-Pro-2023-fixture-unit", "init/claude-fixture-unit", "director"),
+            ("claude_commands-Nates-MacBook-Pro-2023-fixture-unit", "init/claude-fixture-unit", "worktree"),
             ("claude-natedev-fixture-unit-aws", "fixture-unit-other", "aws"),
             ("claude-fixture-unit-25", "init/claude_commands-Nates-MacBook-Pro-2023-fixture-unit-phase-25", "phase-25"),
             ("claude-old-fixture-unit-review", "old-fixture-unit-review", "review"),
@@ -496,7 +496,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertIn(f"keep {wrapped}: showrunner checkout awaits question 4; archived production wrapped",
                       result.stdout)
         self.assertIn(f"keep {repo_unit}: unit unknown", result.stdout)
-        self.assertIn(f"move {status} -> {self.trees}/claude/statusline-role/director | statusline-role | director "
+        self.assertIn(f"move {status} -> {self.trees}/claude/statusline-role/worktree | statusline-role | worktree "
                       + "| commit subject | retired-unit", result.stdout)
         self.assertIn(f"keep {unknown}: unit unknown", result.stdout)
         self.assertIn(f"move {fallback} -> {self.trees}/foreign/other/fixture-unit-example | other "
