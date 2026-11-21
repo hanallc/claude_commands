@@ -73,7 +73,7 @@ SCENARIOS = {
     'test_deploy_recover.DeploymentRecoveryTests': (
         'test_creates_both_records_from_live_stack_values',),
     'test_hana_setup.HanaSetupTests': (
-        'test_fallback_network_recovers_approval_and_checks_the_deployed_subnet',
+        'test_resume_restores_missing_parameters_after_a_fallback_launch',
         'test_root_replacement_installs_the_scaler_policy_before_starting',
         'test_root_replacement_replays_the_token_and_polls_the_returned_task_id',
         'test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop',
