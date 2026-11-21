@@ -1664,8 +1664,8 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
     return directory / f"{pid}-{start_time}-{admitted_ns}"
 
 
-def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
-    return identity.get("unit") or identity["session_name"] or Path(identity["folder"]).name or str(pid)
+def waiter_unit_name(identity: WaiterIdentity) -> str:
+    return codec.wait_line_name(identity.get("unit", ""), identity["session_name"], identity["folder"], "")
 
 
 class QueueIdentityReader:
@@ -1687,7 +1687,7 @@ class QueueIdentityReader:
 
     def identity(self, pid: int, row: dict[str, object]) -> WaiterIdentity:
         session = str(row.get("session_id", ""))
-        name = str(row.get("session_name", ""))
+        name = codec.public_queue_text(row.get("session_name"))
         folder = str(row.get("folder") or row.get("worktree") or "")
         step = str(row.get("step", ""))
         owner = self.processes.get(pid)
@@ -1705,7 +1705,7 @@ class QueueIdentityReader:
                 self.environments[current] = environment_values(self.proc / str(current) / "environ", SESSION_KEYS)
             env = self.environments[current]
             session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
-            name = name or env.get("CLAUDE_SESSION_NAME", "")
+            name = name or codec.public_queue_text(env.get("CLAUDE_SESSION_NAME"))
             current = self.processes[current].parent
         if not step:
             try:
@@ -1714,7 +1714,8 @@ class QueueIdentityReader:
                 step = verb
             except OSError:
                 step = "build"
-        return {"session_id": session, "session_name": name or self.names.get(session, ""), "step": step, "folder": folder}
+        return {"session_id": session, "session_name": name or codec.public_queue_text(self.names.get(session)),
+                "step": step, "folder": folder}
 
 
 def queue_order_reason(decision: AdmissionDecision, identities: QueueIdentities) -> BehindHead | ReadyForAdmission:
@@ -1723,7 +1724,7 @@ def queue_order_reason(decision: AdmissionDecision, identities: QueueIdentities)
         return ReadyForAdmission()
     waiter = hold.waiter
     identity = identities.identity(waiter["pid"], cast(dict[str, object], cast(object, waiter)))
-    name = waiter_unit_name(identity, waiter["pid"])
+    name = waiter_unit_name(identity)
     return BehindHead(name, waiter["since"], identity["session_id"])
 
 
@@ -1798,7 +1799,8 @@ def ended_step_slot(row: Reservation, ended_at: float,
     facts = records.EndedStepFacts(job.step if isinstance(job, StepJob) else identity["step"] or absent,
         row.get("package") or waiter.get("package") or PackageNotRecorded(),
         step_project(waiter.get("repository_name", ""), row["repo"]) or absent,
-        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()), job=job)
+        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()), job=job,
+        caller_name=identity["session_name"] or absent)
     return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), row["need"],
                             ended_at + policy.timing.slot_gap_seconds, facts)
 
@@ -2384,7 +2386,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            run=row.get("build_run", NoLiveBuildRun()),
                            package=row["package"] if "package" in row else PackageNotRecorded(),
                            job=row.get("job", GATE_JOB_NOT_RECORDED),
-                           route=records.waiter_route(row))
+                           route=records.waiter_route(row), ci_runner=row.get("ci_runner", ""))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
@@ -2719,6 +2721,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                                    project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"]),
                                    package=row["package"] if "package" in row else PackageNotRecorded(),
                                    job=row.get("job", GATE_JOB_NOT_RECORDED),
+                                   ci_runner=row.get("queue_waiter", {}).get("ci_runner", ""),
                                    route=(records.waiter_route(row["queue_waiter"]) if "queue_waiter" in row
                                           else ANY_ELIGIBLE_TARGET)))
         rows.append(row)
@@ -2735,7 +2738,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
             continue
         running.append(RunningStep(
             activity.session_id if isinstance(activity, ScopeProcesses) else "",
-            activity.session_name if isinstance(activity, ScopeProcesses) else "",
+            activity.session_name if isinstance(activity, ScopeProcesses) else value.owner,
             "between steps" if isinstance(activity, ScopeProcesses) and isinstance(activity.run, LiveBuildRun) else "unowned",
             activity.folder if isinstance(activity, ScopeProcesses) else value.cgroup, 0, value,
             pid=value.pid,

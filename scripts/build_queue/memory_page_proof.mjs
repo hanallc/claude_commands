@@ -1474,7 +1474,7 @@ try {
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['','hana','']);
+            assert.deepEqual(macLabels.map(row=>row.repository),['unregistered session','hana','unregistered session']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -1518,6 +1518,7 @@ try {
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
             delete absentRun.caller;
+            delete absentRun.owner_text;
             await show(absent);
             const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
               owner:document.querySelector('.wrow[data-run] .owner').textContent,
@@ -1903,12 +1904,41 @@ try {
               return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
                 waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
             })()`);
-            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
             if (comparisonImages) comparisons.push({version,...names});
           }
+          await show(readings.caller_selection);
+          const work = await evaluate(`(() => {
+            const rows = [];
+            for (const [kind, data] of [['row', latest.walk], ['wait', latest.waiters]]) {
+              for (const row of data) {
+                const key = kind + ':' + row.key;
+                const cell = document.querySelector('tr[data-tip="' + key + '"] .step');
+                const chart = document.querySelector('.wrow[data-tip="' + key + '"]');
+                const hover = document.createElement('div');
+                hover.innerHTML = tooltipHtml(key, latest);
+                rows.push([row.pid, cell.textContent, chart.querySelector('.name').textContent,
+                  chart.querySelector('.owner').textContent, hover.querySelector('dt.title').textContent]);
+              }
+            }
+            return {reserved:latest.reserved, rows};
+          })()`);
+          assert.equal(work.reserved, 11);
+          assert.deepEqual(work.rows, [
+            [700001, 'recorded cloud', 'recorded cloud', 'recorded cloud', 'recorded cloud'],
+            [50, 'CI nextest', 'CI nextest', 'hana CI', 'hana CI'],
+            [301, 'held caller', 'held caller', 'held caller', 'held caller'],
+            [302, 'unregistered session', 'unregistered session', 'unregistered session', 'unregistered session'],
+            [304, 'hana nextest', 'hana nextest', 'unregistered session', 'hana nextest'],
+            [200, 'recorded local', 'recorded local', 'recorded local', 'recorded local'],
+            [700002, 'recorded cloud', 'recorded cloud', 'recorded cloud', 'recorded cloud'],
+            [303, 'recorded slot', 'recorded slot', 'recorded slot', 'recorded slot'],
+          ]);
+          await capture('resolved-work-names','#walk');
+          comparisons.push({version:'caller-selection',...work});
         }
         if (consoleComparison) {
           assert.ok(beforePage,'The console comparison needs the previous page.');

@@ -317,11 +317,19 @@ class ProtocolTests(unittest.TestCase):
             line = json.dumps(encoded) + "\n"
             self.assertEqual(wire.parse_reply(line), reply)
             granted = admitted_reply()
-            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            exchange = Exchange(line.encode())
+            transport = ScriptedTransport(fixture.clock, exchange)
             waits: list[wire.Wait] = []
-            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
-                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
-                result = client.admit(request, waits.append, lambda: request)
+
+            def receive_wait(wait: wire.Wait) -> None:
+                waits.append(wait)
+                exchange.events.append(wire.encode_reply(granted).encode())
+
+            with (mock.patch.object(client, "CLOCK", fixture.clock),
+                  mock.patch.object(socket, "socket", side_effect=transport.socket),
+                  mock.patch.object(client, "DefaultSelector", side_effect=transport.selector),
+                  redirect_stderr(io.StringIO())):
+                result = client.admit(request, receive_wait, lambda: request)
             self.assertEqual(waits, [reply])
             self.assertEqual(result, granted)
             self.assertEqual(len(transport.requests), 1)
