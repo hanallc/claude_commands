@@ -66,7 +66,7 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
 # The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
-from scripts.production.merge_gate import process_memory_mib, test_module_environment
+from scripts.production.gate import process_memory_mib, test_module_environment
 
 
 def paired_trial():
@@ -236,9 +236,8 @@ GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
-transfer_retries = {BOX_CURL_RETRY!r} if (
-    gate_request.get('task') != 'paired' and gate_request.get('mode') in ('merge-gate', 'targeted-test')
-) else ()
+# The controller validates the suite mode before it sends the request.
+transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
 ''' + r'''secret_file = root / 'transfer-secrets'
 try:
     descriptor = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -717,7 +716,6 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
-    # start time: loaded only to encode a completed gate
     from dataclasses import asdict
 
     from scripts.production import gate_routes
@@ -751,7 +749,6 @@ def encode_run(run: object) -> dict[str, object]:
 
 def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
-    # start time: loaded only to decode a completed gate
     from scripts.aws_target import ledger
     from scripts.production import gate_routes
     from scripts.test_times import gate_record
@@ -808,7 +805,6 @@ def decode_run(value: object) -> GateRun:
 
 def execution_records(value: GateRun) -> list[gate_record.Execution]:
     """Keep every attempt's output for the gate record writer."""
-    # start time: loaded only to record a completed gate
     from scripts.test_times import gate_record
 
     return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
@@ -819,15 +815,16 @@ def execution_records(value: GateRun) -> list[gate_record.Execution]:
 
 def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected", "subset"]:
     """Classify a record from the assignment."""
+    from scripts.production.gate_routes import SuiteMode
+
     if split:
         return "subset"
-    return "affected" if mode == "targeted-test" else "full"
+    return "affected" if SuiteMode.step(mode) == SuiteMode.TARGETED.value else "full"
 
 
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
                       started: float, ended: float, mode: str, *, split: bool = False) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
-    # start time: loaded only to record a completed gate
     from scripts.buildlog import record, store
     from scripts.production import gate_routes
     from scripts.test_times import gate_record
@@ -845,7 +842,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': gate_routes.SuiteMode.step(mode),
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}

@@ -17,6 +17,7 @@ from typing import Literal, cast
 from scripts.aws_target import cloud_gate, ledger, price_days, run_cost
 from scripts.aws_target.aws_target import read_snapshot, snapshot_failures
 from scripts.lib import build_steps, conf
+from scripts.production.gate_routes import SuiteMode
 
 
 _WEEKS_PER_YEAR = 52
@@ -24,7 +25,7 @@ _MONTHS_PER_YEAR = 12
 _HOURS_IN_SECONDS = 3600
 _DAYS_PER_WEEK = 7
 _RULE_OFF = Decimal(1)
-_WORKLOADS = ('merge-gate', 'targeted-test', 'test-affected')
+_WORKLOADS = run_cost.KINDS
 _SAVED_PRICE_AUTH_FAILURE = re.compile(
     r'\b(?:AuthFailure|ExpiredToken(?:Exception)?|InvalidClientTokenId|UnrecognizedClientException)\b'
     + r'|unable to locate credentials', re.IGNORECASE)
@@ -255,11 +256,10 @@ def _workload(row: dict[str, object]) -> str:
     if isinstance(job, dict):
         step = cast(dict[str, object], job).get('step')
         if isinstance(step, str) and step:
-            return step
+            return SuiteMode.step(step)
     mode = row.get('mode')
-    if mode == 'gate':
-        return 'merge-gate'
-    return mode if isinstance(mode, str) and mode in _WORKLOADS else ''
+    step = SuiteMode.step(mode) if isinstance(mode, str) else ''
+    return step if step in _WORKLOADS else ''
 
 
 def _saved_prices(directory: Path, now: int, days: int) -> _SavedPrices:
@@ -443,7 +443,6 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
     home = configuration.account.text('region')
     gate = configuration.gate
     types = gate.words('instance_types')
-    run_mode = 'targeted-test' if mode == 'test-affected' else mode
     concurrency = _concurrent_starts(intervals)
     quota_assumption = Decimal(gate.whole('spot_quota_request_vcpus'))
     small_sample_checks = configuration.page.whole('machines.small_sample_checks')
@@ -453,7 +452,7 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
         size, region = interval.machine.instance_type, interval.machine.region
         seconds = Decimal(interval.end - interval.start)
         samples[interval.machine].append(seconds)
-        runs.append(run_cost.FinishedGateRun(size, region, run_mode, interval.finished_at.date().isoformat(),
+        runs.append(run_cost.FinishedGateRun(size, region, mode, interval.finished_at.date().isoformat(),
                                             Decimal(0), seconds))
     evidence = run_cost.evidence_from_runs(runs, rows, start, end, home)
     pricing = run_cost.GateRunPricing.from_config(gate, evidence, home, (mode,))

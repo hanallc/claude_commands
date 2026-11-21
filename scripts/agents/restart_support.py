@@ -92,7 +92,7 @@ def _deliver_message(
                 return MessageQueued(kind="queued", reason=detail)
             case "retry":
                 raise RuntimeError(f"send to {recipient} needs a retry: {detail}")
-            case "failed" | "refused" | "held" | "pending":
+            case "failed" | "refused" | "held" | "pending" | "closed" | "absent":
                 pass
     if isinstance(outcome, send_result.UnconfirmedSendOutcome):
         return MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome")

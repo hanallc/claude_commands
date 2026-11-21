@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import fcntl
+from functools import partial
 import json
 from pathlib import Path
 import re
@@ -413,10 +414,11 @@ def read_snapshot_quota_requests(regions: tuple[str, ...], timeout: float,
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
              notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
-             force: bool = False) -> int:
+             force: bool = False, allow_aws_unavailable: bool = False) -> int:
     """Replace successful regional reads and preserve failed regional reads.
 
-    force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
+    Use force to read early without moving the refresh interval.
+    Use allow_aws_unavailable to accept AWS read failures."""
     configuration = conf.read(settings_path)
     values = conf.read_or_repository('cloud_gate')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
@@ -442,6 +444,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
         failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
+        aws_unavailable = False
         read_prices: list[ledger.RegionalSpotPrice] = []
         for region in regions:
             read_name = 'price'
@@ -472,7 +475,10 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 reason = admin_secrets.redact(' '.join(error_line.split()))[:reason_limit]
                 print(f'aws_target: snapshot {region} {read_name} unavailable: {type(error).__name__}: {reason}', file=sys.stderr)
                 failures[region] = SnapshotFailure(region, now, read_name, type(error).__name__, reason)
-                status = 1
+                if isinstance(error, AwsUnavailable):
+                    aws_unavailable = True
+                else:
+                    status = 1
         current_failures = tuple(failures[region] for region in regions if region in failures)
         output: dict[str, object] = {'prices': prices, 'regions': readings, 'failures': [
             dict(region=row.region, at=row.at, read=row.read, error=row.error, reason=row.reason)
@@ -516,7 +522,9 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             _ = lock.seek(0)
             _ = lock.truncate()
             _ = lock.write(str(now))
-        return status
+        if aws_unavailable and allow_aws_unavailable:
+            print('aws_target: AWS not available', file=sys.stderr)
+        return status or int(aws_unavailable and not allow_aws_unavailable)
 
 
 USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})
@@ -638,13 +646,17 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
     return 0
 
 
-def hourly(settings_path: Path, directory: Path) -> int:
+def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool = False) -> int:
     """Read prices and placement scores and check billed hours."""
     status = 0
-    for label, operation in (('price snapshot', snapshot), ('hours-gap check', hours_gap_notices)):
+    read_prices = partial(snapshot, allow_aws_unavailable=True) if allow_aws_unavailable else snapshot
+    for label, operation in (('price snapshot', read_prices), ('hours-gap check', hours_gap_notices)):
         try:
             status = max(status, operation(settings_path, directory))
         except Exception as error:
+            if allow_aws_unavailable and isinstance(error, AwsUnavailable):
+                print(f'aws_target: {label}: AWS not available', file=sys.stderr)
+                continue
             print(f'aws_target: {label} failed: {type(error).__name__}', file=sys.stderr)
             status = max(status, 1)
     try:

@@ -19,13 +19,13 @@ from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
-from scripts.production import change_review, merge_gate, staff
+from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
 )
-from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
@@ -68,7 +68,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                                   copy_commit=commit, target_mode="none", seed_source="", borrows_from="")
         observed: list[Path] = []
 
-        def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+        def suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
             self.assertEqual(repo, checkout)
             with scratch.busy_path(repo).open("a") as contender:
                 with self.assertRaises(BlockingIOError):
@@ -77,7 +77,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             observed.append(repo)
             raise GateRefused("injected suite stop")
 
-        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+        with mock.patch.object(gate, "run_suites", side_effect=suites):
             result = self.run_gate("--tests-only", "--checkout", str(checkout))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("injected suite stop", result.stderr)
@@ -91,17 +91,17 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:
         observed: list[str] = []
 
-        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
             observed.append(os.environ[admission_records.BUILDLOG_UNIT])
-            return merge_gate.GateRun((), 0, 0, tests_reused=True)
+            return gate.GateRun((), 0, 0, tests_reused=True)
 
-        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+        with mock.patch.object(gate, "run_suites", side_effect=suites):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, ["fixture"])
 
     def test_checkpoint_restores_the_unit_after_success_and_failure(self) -> None:
-        checkpoint = merge_gate.merge_checkpoint
+        checkpoint = gate.merge_checkpoint
         for previous in (None, "previous"):
             for outcome in ("pass", "red", "exception"):
                 with self.subTest(previous=previous, outcome=outcome):
@@ -111,36 +111,36 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         self.environment[admission_records.BUILDLOG_UNIT] = previous
                     restored: list[str | None] = []
 
-                    def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+                    def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
                         self.assertEqual(os.environ.get(admission_records.BUILDLOG_UNIT), "fixture")
                         if outcome == "exception":
                             raise GateRefused("injected suite failure")
-                        return merge_gate.GateRun(
-                            (merge_gate.GateJobResult("hooks", "test_first.py", int(outcome == "red"), 0, "fixture"),),
+                        return gate.GateRun(
+                            (gate.GateJobResult("hooks", "test_first.py", int(outcome == "red"), 0, "fixture"),),
                             0, 0, tests_reused=True)
 
-                    def merge(arguments: merge_gate.GateArguments) -> int:
+                    def merge(arguments: gate.GateArguments) -> int:
                         self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
                             return checkpoint(arguments)
                         finally:
                             restored.append(os.environ.get(admission_records.BUILDLOG_UNIT))
 
-                    with mock.patch.object(merge_gate, "run_suites", side_effect=suites), \
-                         mock.patch.object(merge_gate, "merge_checkpoint", side_effect=merge):
+                    with mock.patch.object(gate, "run_suites", side_effect=suites), \
+                         mock.patch.object(gate, "merge_checkpoint", side_effect=merge):
                         result = self.run_gate()
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
                     self.assertEqual(restored, [previous])
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
-        checked = merge_gate.checked_git
+        checked = gate.checked_git
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
                 raise GateRefused("injected stop before push")
             return checked(repo, *arguments)
 
-        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -158,14 +158,14 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(self.checkout / "published.txt", "published code\n")
         published = self.commit(self.checkout, "published non-doc change")
         _ = self.git(self.checkout, "push", "origin", "integration")
-        checked = merge_gate.checked_git
+        checked = gate.checked_git
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
                 raise GateRefused("injected stop before push")
             return checked(repo, *arguments)
 
-        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -181,14 +181,14 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
 
     def test_checkpoint_retry_refuses_a_recorded_merge_for_another_checkpoint(self) -> None:
-        checked = merge_gate.checked_git
+        checked = gate.checked_git
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
                 raise GateRefused("injected push failure")
             return checked(repo, *arguments)
 
-        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
             stopped = self.run_gate()
         self.assertIn("injected push failure", stopped.stderr)
         merged = self.git(self.checkout, "rev-parse", "HEAD")
@@ -209,7 +209,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.pass_records()[0]["suites"], ["folder_from_the_checkout"])
 
     def test_module_folders_are_removed_after_success_and_preparation_error(self) -> None:
-        prepare = merge_gate.test_module_environment
+        prepare = gate.test_module_environment
         for fails in (False, True):
             with self.subTest(raises=fails):
                 folders: list[Path] = []
@@ -223,7 +223,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
                     return prepared
 
-                with mock.patch.object(merge_gate, "test_module_environment", side_effect=prepare_module):
+                with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
                     if fails:
                         with self.assertRaisesRegex(RuntimeError, "module preparation failed"):
                             _ = self.run_gate("--tests-only", "--full")
@@ -252,7 +252,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                               [[runner, str(folder), nested.name]
                                for folder in (nested.parent, nested.parent.parent)] * 2)
         self.assertTrue(all(call["cwd"] == str(self.checkout) for call in launches))
-        timings = merge_gate.read_measures(self.state / "runner" / "module_seconds.json")
+        timings = gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
 
@@ -533,10 +533,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
 
     def test_notification_value_error_keeps_the_completed_merge_successful(self) -> None:
-        original_notify = merge_gate.notify_style
+        original_notify = gate.notify_style
 
         def malformed_notification(repo: Path, branch: str, tip: str) -> None:
-            with mock.patch("scripts.production.merge_gate.subprocess.run",
+            with mock.patch("scripts.production.gate.subprocess.run",
                             side_effect=ValueError("invalid production")):
                 original_notify(repo, branch, tip)
 
@@ -548,9 +548,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-            merge_gate, "notify_style", side_effect=malformed_notification,
+            gate, "notify_style", side_effect=malformed_notification,
         ), redirect_stdout(output):
-            code = merge_gate.main(arguments)
+            code = gate.main(arguments)
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn("style sync: invalid production", output.getvalue())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
@@ -570,7 +570,7 @@ class MergeGateProducerTests(ProducerFixture):
 
     def test_record_changes_writes_the_checkpoint_units_staff_id(self) -> None:
         merged = self.merge()
-        merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
+        gate.record_changes(self.repo, self.listing, self.doc, "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
         assert isinstance(self.unit.parent, staff.ReportsTo)
         self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.parent.id)
@@ -580,7 +580,7 @@ class MergeGateProducerTests(ProducerFixture):
             _ = self.listing.unlink()
             record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.unit.id))
             with mock.patch.object(staff, "snapshot", return_value=record):
-                merge_gate.record_changes(self.repo, self.listing, self.doc, "main",
+                gate.record_changes(self.repo, self.listing, self.doc, "main",
                     known_producer=change_review.KnownMergeProducer(merged, self.unit.id))
             self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
             self.assertEqual(self.listing.read_bytes(), before)
@@ -590,7 +590,7 @@ class MergeGateProducerTests(ProducerFixture):
         output = io.StringIO()
         with (mock.patch.object(staff, "snapshot", return_value=record), redirect_stdout(output)):
             _ = self.merge()
-            merge_gate.record_changes(self.repo, self.listing, self.doc,
+            gate.record_changes(self.repo, self.listing, self.doc,
                                       "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]

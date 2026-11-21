@@ -1219,7 +1219,7 @@ The user approved the combined table on 2026-11-18.
    A ban icon with the title `Not sold here` identifies a type that the region does not sell.
    Unavailable values show a dash with the reason where known.
 4. The Runs chips show when Cost per gate is on.
-   Merge gates, Targeted runs, and Both select the Gate estimates and the run tables.
+   Gates, Targeted runs, and Both select the Gate estimates and the run tables.
    The choice also selects the refused and launched tables.
    The billed hours table does not depend on the run choice.
    The run tables omit Spot price and estimate because the Prices and quotas card shows them.
