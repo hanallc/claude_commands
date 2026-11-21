@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass
+from enum import StrEnum
 import fcntl
 import json
 import os
@@ -45,6 +46,10 @@ if TYPE_CHECKING:
 MODULE_LIST = Path('config/mac_gate_modules.txt')
 MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
 REMOTE_ROOT = '.local/state/mac-gate'
+CHECKOUT_NAME = 'mac-gate'
+ATTEMPT_PREFIX = CHECKOUT_NAME + '-'
+ATTEMPT_PATTERN = rf'{ATTEMPT_PREFIX}[A-Za-z0-9_]+'
+CHECKOUT_TASK_PREFIX = 'gate:'
 RESULT_PREFIX = 'mac_gate_result='
 TESTS_STARTED_PREFIX = 'mac_gate_tests_started='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
@@ -61,6 +66,11 @@ class MacGateTimes:
 
 class MacGateTimeout(GateRefused):
     """The Mac queue wait or test run reached its bound."""
+
+
+class CheckoutCleanup(StrEnum):
+    REMOVED = 'mac_gate_cleaned'
+    RETAINED = 'mac_gate_retained'
 
 
 @dataclass(frozen=True)
@@ -97,10 +107,15 @@ def read_modules(repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing:
 
 def attempt_name(folder: Path) -> str:
     attempt = folder.name
-    suffix = attempt.removeprefix('mac-gate-')
-    if suffix == attempt or not suffix.isascii() or not suffix.replace('_', 'a').isalnum():
+    if re.fullmatch(ATTEMPT_PATTERN, attempt) is None:
         raise GateRefused('Invalid Mac gate attempt')
     return attempt
+
+
+def is_mac_gate_checkout(mirror: copies.RemoteMirror) -> bool:
+    # A record without a task goes through the manual removal list.
+    return (mirror.task.startswith(CHECKOUT_TASK_PREFIX)
+            and re.fullmatch(ATTEMPT_PATTERN, mirror.task.removeprefix(CHECKOUT_TASK_PREFIX)) is not None)
 
 
 def running_owner(pid: int, start: str) -> bool:
@@ -159,7 +174,7 @@ def stop_guest(folder: Path, deadline: float) -> None:
 
 
 def checkout_task(folder: Path) -> str:
-    return 'gate:' + attempt_name(folder)
+    return CHECKOUT_TASK_PREFIX + attempt_name(folder)
 
 
 def read_checkout(folder: Path) -> Path:
@@ -170,14 +185,14 @@ def read_checkout(folder: Path) -> Path:
     return path
 
 
-def stop_checkout(folder: Path) -> None:
+def stop_checkout(folder: Path) -> CheckoutCleanup:
     root = (Path.home() / REMOTE_ROOT).resolve()
     if folder.resolve() != root / attempt_name(folder):
         raise GateRefused('The folder is outside the Mac gate state directory')
     try:
         lock = (folder / 'cleanup.lock').open('a')
     except FileNotFoundError:
-        return
+        return CheckoutCleanup.REMOVED
     with lock:
         grace = conf.read('mac_gate').number('terminate_grace_seconds')
         deadline = time.monotonic() + admission_records.read_memory_config().program_stop_seconds + grace
@@ -190,15 +205,52 @@ def stop_checkout(folder: Path) -> None:
                     raise GateRefused('The Mac gate cleanup lock is held') from None
                 time.sleep(0.05)
         if not folder.exists():
-            return
-        stop_guest(folder, deadline)
-        paths: set[Path] = {read_checkout(folder)} if (folder / 'checkout.json').exists() else set()
-        ended = scratch.end(checkout_task(folder))
-        if ended.kept:
-            raise GateRefused(f'The Mac kept {ended.kept[0].path}: {ended.kept[0].reason}')
-        for path in paths.union(ended):
-            copies.unregister_remote('localhost', str(path))
-        shutil.rmtree(folder)
+            return CheckoutCleanup.REMOVED
+        checkout_file = folder / 'checkout.json'
+        receipt = folder / 'task-ended.json'
+        cleanup_paths: dict[str, object]
+        try:
+            cleanup_paths = cloud_gate.read(receipt)
+        except FileNotFoundError:
+            stop_guest(folder, deadline)
+            # Until Mac promotion, scratch.end can return removed paths and a separate kept list.
+            ended = cast(Sequence[Path | scratch.KeptFolder], scratch.end(checkout_task(folder)))
+            legacy_kept = cast(Sequence[scratch.KeptFolder], getattr(ended, 'kept', ()))
+            for entry in legacy_kept:
+                print(f'kept for a manual removal list: {entry.path} (scratch, {entry.reason})', file=sys.stderr)
+            cleanup_paths = {str(entry.path): entry.reason for entry in (*ended, *legacy_kept)
+                             if isinstance(entry, scratch.KeptFolder)}
+            removed = {entry for entry in ended if isinstance(entry, Path)}
+            checkout = read_checkout(folder) if removed and checkout_file.exists() else None
+            for path in sorted(removed):
+                if not path.is_absolute():
+                    raise GateRefused('The Mac removed folder path is not absolute')
+                if str(path) in cleanup_paths:
+                    continue
+                try:
+                    _ = path.lstat()
+                except FileNotFoundError:
+                    copies.unregister_remote('localhost', str(path))
+                    if path == checkout:
+                        checkout_file.unlink()
+                else:
+                    cleanup_paths[str(path)] = 'the folder is still present'
+            cloud_gate.save(receipt, cleanup_paths)
+        paths: set[Path] = {read_checkout(folder)} if checkout_file.exists() else set()
+        paths.update(Path(name) for name in cleanup_paths)
+        outcome = CheckoutCleanup.REMOVED
+        for path in sorted(paths):
+            if not path.is_absolute():
+                raise GateRefused('The Mac retained folder path is not absolute')
+            try:
+                _ = path.lstat()
+            except FileNotFoundError:
+                copies.unregister_remote('localhost', str(path))
+            else:
+                outcome = CheckoutCleanup.RETAINED
+        if outcome is CheckoutCleanup.REMOVED:
+            shutil.rmtree(folder)
+        return outcome
 
 
 def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> Path:
@@ -209,7 +261,7 @@ def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> P
         # Leave the lock with copies if the SSH command ends during clone setup.
         output = subprocess.check_output([
             str(scripts / 'lib/py'), str(scripts / 'copies/copies.py'), 'clone', str(scripts.parent),
-            '--task', checkout_task(folder), '--name', 'mac-gate', '--owner', owner,
+            '--task', checkout_task(folder), '--name', CHECKOUT_NAME, '--owner', owner,
             '--repository', repository, '--session', session,
         ], text=True, pass_fds=(lock.fileno(),))
         path = Path(output.strip().splitlines()[-1]) if output.strip() else Path()
@@ -248,6 +300,15 @@ def checkout_bundle(ssh: list[str], checkout: str, repo: Path, folder: Path,
     return [bundle]
 
 
+def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
+    fallback = f'printf "{CheckoutCleanup.RETAINED}\\n"'
+    if Path(checkout).is_absolute():
+        probe = copies.path_missing_command(checkout)
+        fallback = f'if {probe}; then printf "{CheckoutCleanup.REMOVED}\\n"; else {fallback}; fi'
+    return (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
+            f'else rm -rf -- {root} && {fallback}; fi')
+
+
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
     root = '"$HOME"/' + shlex.quote(remote)
@@ -255,17 +316,22 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
-    cleanup = (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
-               f'else rm -rf -- {root}; fi')
     if phase == 'cleanup':
-        result = subprocess.run([*ssh, cleanup + ' && printf "mac_gate_cleaned\n"'],
-                                capture_output=True, text=True, check=False)
-        if result.returncode or result.stdout.strip() != 'mac_gate_cleaned':
+        try:
+            checkout = checkout_file.read_text()
+        except FileNotFoundError:
+            checkout = ''
+        cleanup = checkout_cleanup_command(root, runner, checkout)
+        result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
+        outcome = result.stdout.strip()
+        if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
             detail = ' '.join(result.stderr.split()) or 'The Mac did not confirm checkout cleanup'
             print(f'{CLEANUP_ERROR_PREFIX}{folder.name}:{detail}', flush=True)
             return 1
-        if checkout_file.exists():
-            copies.unregister_remote(host, checkout_file.read_text())
+        if result.stderr:
+            print(result.stderr, end='', file=sys.stderr)
+        if outcome == CheckoutCleanup.REMOVED and Path(checkout).is_absolute():
+            copies.unregister_remote(host, checkout)
         return 0
 
     request = cloud_gate.read(folder / 'request.json')
@@ -281,16 +347,18 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
         raise GateRefused('Could not create the Mac gate state folder')
     _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(Path(__file__).resolve()),
                         f'{host}:{remote}/mac_gate.py.new'], check=True)
-    _ = argv_file.with_suffix('.json.close').write_text(cleanup)
     clone = f'mv -- {root}/mac_gate.py.new {root}/mac_gate.py && {runner} clone {root} '
     response = subprocess.check_output([*ssh, clone + shlex.join([owner, repository, session])], text=True)
     checkout = response.strip().removeprefix('mac_gate_checkout=')
     if not response.startswith('mac_gate_checkout=') or not Path(checkout).is_absolute() or '\n' in checkout:
         raise GateRefused('The Mac did not confirm the gate checkout')
     write_text_atomic(checkout_file, checkout)
-    mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session)
+    _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, runner, checkout))
+    mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
+                                 task=checkout_task(folder))
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
     copies.register_remote(mirror)
+    copies.reconcile_remote_mirrors(host, is_mac_gate_checkout)
     files.extend(checkout_bundle(ssh, checkout, local_repo, folder, request))
     _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', *map(str, files), f'{host}:{remote}/'], check=True)
     _ = argv_file.write_text(json.dumps(['/bin/zsh', '-c', f'exec {runner} stage {root} {full}']))
@@ -334,6 +402,8 @@ def record_guest(folder: Path, repo: Path) -> Generator[None]:
     recovery = MacGateRecovery(folder / 'run.json', str(repo.resolve()), pid, owner.start)
     with (folder / 'cleanup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if (folder / 'task-ended.json').exists():
+            raise GateRefused('The Mac gate checkout task has ended')
         recovery.save()
     recovery_token = gate.ACTIVE_GATE_RECOVERY.set(recovery)
     try:
@@ -446,7 +516,7 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             cancelled.register(caller, select.POLLIN)
             if cancelled.poll(0):
                 return 'The Mac gate was cancelled'
-            folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='mac-gate-')))
+            folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix=ATTEMPT_PREFIX)))
             request = cloud_gate.prepare_request(repo, folder, mode, module_time_limit_s, selected=selected)
             cloud_gate.save(folder / 'request.json', request)
             _ = (folder / 'local-repo').write_text(str(repo))
@@ -623,8 +693,7 @@ def main() -> int:
         elif args.action == 'guest':
             print(RESULT_PREFIX + json.dumps(run_guest(args.folder, full=args.full == '1')), flush=True)
         elif args.action == 'stop':
-            if args.folder.exists():
-                stop_checkout(args.folder)
+            print(stop_checkout(args.folder))
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
