@@ -1227,7 +1227,7 @@ class LifecycleTests(LifecycleFixture):
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             staff_bytes = self.staff.staff_file.read_bytes()
-            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled"):
+            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled", "protected SSH origin"):
                 with self.subTest(landed=landed):
                     shutil.rmtree(self.root)
                     _ = shutil.copytree(snapshot, self.root)
@@ -1244,6 +1244,42 @@ class LifecycleTests(LifecycleFixture):
                         _ = self.git("cherry-pick", "--no-commit", alpha)
                         _ = self.git("commit", "-m", "Copy alpha patch")
                     _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
+                    if landed == "protected SSH origin":
+                        _ = self.git("push", "origin", "production")
+                        peer = self.root / "peer"
+                        _ = self.git("clone", "-qb", "alpha-branch", str(self.origin), str(peer), cwd=self.root)
+                        document = peer / "peer-production.md"
+                        self.write(document,
+                                   f"- **Showrunner checkout:** `{peer}`\n- **Merge branch:** `alpha-branch`\n")
+                        with mock.patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}):
+                            peer_host = remote.other_machine()
+                        _ = fixture_member("showrunner", name="peer", doc=staff.LiveDoc(peer_host, document))
+                        _ = self.git("remote", "set-url", "--push", "origin", "ssh://remote-alias:2222/srv/origin.git",
+                                     cwd=peer)
+                        _ = self.git("remote", "set-url", "--push", "origin", "git@local-alias:/srv/origin.git")
+                        self.env["GIT_ALLOW_PROTOCOL"] = "file"
+                        self.write(self.root / "bin/ssh", "#!/bin/sh\n"
+                                   + 'if [ "$1" = -G ]; then\n'
+                                   + '    for alias do :; done\n'
+                                   + '    case "$alias" in local-alias|remote-alias) ;; *) exit 255;; esac\n'
+                                   + '    printf "hostname git.fixture.invalid\\nport 2222\\n"\n'
+                                   + '    exit 0\n'
+                                   + 'fi\n'
+                                   + f'[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = {peer_host} ] || exit 255\n'
+                                   + 'exec sh -c "$4"\n')
+                        paths = (self.doc, self.log, self.staff.staff_file,
+                                 self.alpha / ".unit.toml", self.beta / ".unit.toml")
+                        before = tuple(path.read_bytes() for path in paths)
+                        local_refs = self.git("show-ref")
+                        origin_refs = self.git("show-ref", cwd=self.origin)
+                        with mock.patch.object(unit_config, "park", side_effect=AssertionError("park protected unit")):
+                            result = self.run_lifecycle("wrap", "--no-ci")
+                        self.assert_step(result, "held")
+                        self.assertIn("alpha: protected production origin branch alpha-branch", result.stdout)
+                        self.assertEqual(tuple(path.read_bytes() for path in paths), before)
+                        self.assertEqual(self.git("show-ref"), local_refs)
+                        self.assertEqual(self.git("show-ref", cwd=self.origin), origin_refs)
+                        continue
                     if landed == "enrolled":
                         _ = self.git("push", "origin", "production")
                         live, integration = self.enroll_document()

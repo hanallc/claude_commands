@@ -200,6 +200,21 @@ class MainSyncTests(unittest.TestCase):
                 self.assertTrue(new_tip)
                 self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(), [new_tip, new_tip])
 
+        with self.subTest(race="origin replaces an unmerged tip"):
+            local = git(self.checkout, "rev-parse", "HEAD")
+            replaced = self.commit("replaced")
+            _ = git(self.checkout, "fetch", "-q", "origin")
+            self.assertEqual(git(self.checkout, "rev-parse", "origin/main"), replaced)
+            _ = git(self.writer, "reset", "--hard", local)
+            _ = (self.writer / "replacement").write_text("new origin tip")
+            _ = git(self.writer, "add", "replacement")
+            _ = git(self.writer, "commit", "-qm", "Replace the unmerged tip")
+            replacement = git(self.writer, "rev-parse", "HEAD")
+            _ = git(self.writer, "push", "--force", "origin", "HEAD:main")
+            self.assertEqual(main_sync.sync(self.checkout).state, main_sync.ADVANCED)
+            self.assertEqual(git(self.checkout, "rev-parse", "HEAD", "origin/main").splitlines(),
+                             [replacement, replacement])
+
     def test_claude_sync_restores_the_accepted_save_when_head_is_current(self) -> None:
         (self.writer / "config").mkdir()
         _ = (self.writer / "config/example.conf").write_text("# whole: 1..\namount=2\n")
@@ -401,6 +416,7 @@ class MainSyncTests(unittest.TestCase):
     def test_a_credential_probe_timeout_uses_the_cold_advice(self) -> None:
         results = [subprocess.CompletedProcess(["git"], 0, "main\n", ""),
                    subprocess.CompletedProcess(["git"], 0, str(self.checkout / ".git"), ""),
+                   subprocess.CompletedProcess(["git"], 1, "", ""),
                    subprocess.CompletedProcess(["git"], 1, "", "fetch refused"),
                    subprocess.CompletedProcess(["git"], 0, "", "")]
         with (unittest.mock.patch.object(main_sync, "_git", side_effect=results),

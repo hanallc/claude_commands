@@ -28,7 +28,9 @@ class DeletionRerunTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        staff_file = self.root / "staff.json"
+        _ = staff_file.write_text('{"schema": 2, "rows": []}')
+        self.enterContext(isolated_staff_file(staff_file, {}))
         self.enterContext(patch.dict(os.environ, {
             **fixture_git_environment(self.root), "HOME": str(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
             "WORKTREES_STATE_DIR": str(self.root / "worktrees-state"),
@@ -78,11 +80,23 @@ class DeletionRerunTests(unittest.TestCase):
         binaries = self.root / "bin"
         binaries.mkdir()
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
+                                                 "GIT_ALLOW_PROTOCOL": "file",
                                                  "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}))
         other_host = remote.other_machine()
         ssh = binaries / "ssh"
         _ = ssh.write_text("#!/bin/sh\n"
+                           + 'if [ "$1" = -G ]; then\n'
+                           + '    for alias do :; done\n'
+                           + '    case "$alias" in\n'
+                           + '        candidate|registered) printf "hostname git.fixture.invalid\\nport 2222\\n";;\n'
+                           + '        *) exit 255;;\n'
+                           + '    esac\n'
+                           + '    exit 0\n'
+                           + 'fi\n'
                            + f'[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = {other_host} ] || exit 255\n'
+                           + 'case "$4" in\n'
+                           + f'  *" origin-path "*) printf "%s\\n" {shlex.quote(str(other_origin.resolve()))}; exit 0;;\n'
+                           + 'esac\n'
                            + 'exec sh -c "$4"\n')
         ssh.chmod(0o755)
 
@@ -92,33 +106,51 @@ class DeletionRerunTests(unittest.TestCase):
 
         pattern = ("for-each-ref", "--format=%(refname) %(objectname)")
         refs = tuple(git(folder, *pattern) for folder in (repo, clone, origin))
-        for host, checkout, worktree, confirmed, protected in (
-                (local, repo, tree, False, True),
-                (local, repo, tree, True, True),
-                (local, clone, clone_tree, False, True),
-                (local, clone, clone_tree, True, True),
-                (other_host, clone, clone_tree, False, True),
-                (other_host, clone, clone_tree, True, True),
-                (other_host, other_repo, other_tree, True, False)):
-            with self.subTest(host=host, checkout=checkout, confirmed=confirmed):
+        staff_file = self.root / "staff.json"
+        for case, checkout, worktree, confirmed, refusal in (
+                ("local worktree", repo, tree, False, "protected production"),
+                ("confirmed local worktree", repo, tree, True, "protected production"),
+                ("local clone", clone, clone_tree, False, "protected production"),
+                ("confirmed local clone", clone, clone_tree, True, "protected production"),
+                ("SSH aliases", clone, clone_tree, False, "protected production"),
+                ("confirmed SSH aliases", clone, clone_tree, True, "protected production"),
+                ("unknown SSH alias", clone, clone_tree, True, "cannot resolve SSH origin"),
+                ("missing staff record", clone, clone_tree, True, "cannot read the staff record"),
+                ("same file path on separate hosts", other_repo, other_tree, True, "")):
+            with self.subTest(case=case):
+                aliases = "SSH alias" in case
+                host = other_host if aliases or not refusal else local
                 _ = staff.set_doc(owner.id, staff.LiveDoc(host, doc))
+                if aliases:
+                    _ = git(repo, "remote", "set-url", "--push", "origin", "ssh://registered:2222/srv/repo.git")
+                    alias = "unknown" if case == "unknown SSH alias" else "candidate"
+                    _ = git(clone, "remote", "set-url", "--push", "origin", f"git@{alias}:/srv/repo.git")
+                else:
+                    _ = git(repo, "remote", "set-url", "--push", "origin", str(origin))
+                    _ = git(clone, "remote", "set-url", "--push", "origin", origin.as_uri())
+                staff_bytes = staff_file.read_bytes()
+                if case == "missing staff record":
+                    staff_file.unlink()
                 validation = attempt(checkout, worktree, "worktree_delete_validation.sh")
-                self.assertEqual(validation.returncode, int(protected), validation.stdout + validation.stderr)
+                kept = bool(refusal)
+                self.assertEqual(validation.returncode, int(kept), validation.stdout + validation.stderr)
                 if confirmed:
                     result = attempt(checkout, worktree, "record_confirmation.sh", "integration")
                     self.assertEqual(result.returncode, 0, result.stderr)
                 nonces = {path: path.read_bytes() for path in self.nonce_dir.glob("*")}
                 result = attempt(checkout, worktree, "perform_deletion.sh", "integration")
-                self.assertEqual(result.returncode, int(protected), result.stdout + result.stderr)
-                self.assertEqual(worktree.is_dir(), protected)
-                if protected:
-                    self.assertIn("protected production", validation.stdout)
-                    self.assertIn("protected production", result.stderr)
+                self.assertEqual(result.returncode, int(kept), result.stdout + result.stderr)
+                self.assertEqual(worktree.is_dir(), kept)
+                if refusal:
+                    self.assertIn(refusal, validation.stdout)
+                    self.assertIn(refusal, result.stderr)
                     self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
                 else:
                     self.assertEqual(git(checkout, "branch", "--list", "integration"), "")
                     self.assertEqual(git(other_origin, "branch", "--list", "integration"), "")
                 self.assertEqual(tuple(git(folder, *pattern) for folder in (repo, clone, origin)), refs)
+                if case == "missing staff record":
+                    _ = staff_file.write_bytes(staff_bytes)
 
     def test_confirmed_removal_releases_the_pair_when_the_lock_is_free(self) -> None:
         scripts = self.scripts

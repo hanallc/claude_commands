@@ -34,7 +34,9 @@ class GateFoldersDeleteTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {
             **fixture_git_environment(self.root), "HOME": str(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
         }, clear=True))
-        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        staff_file = self.root / "staff.json"
+        _ = staff_file.write_text('{"schema": 2, "rows": []}')
+        self.enterContext(isolated_staff_file(staff_file, {}))
         self.gates = self.root / "gates"
         self.gates.mkdir()
 

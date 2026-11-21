@@ -203,6 +203,9 @@ def sync(checkout: Path) -> Outcome:
         path_lock = live_paths_lock_file(checkout)
         with exclusive(path_lock):
             waiting_rows.restore_live(checkout)
+            before_fetch = _git(checkout, "rev-parse", "--verify", "--quiet", TRACKING_REF)
+            if before_fetch.returncode not in (0, 1):
+                return Outcome("fetch-failed", _first_line(before_fetch))
         fetched = _git(checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-prune", "--refmap=",
                        "origin", f"refs/heads/main:{fetch_ref}",
                        timeout=FETCH_TIMEOUT_SECONDS)
@@ -229,13 +232,19 @@ def sync(checkout: Path) -> Outcome:
             if old_tip and old_tip != tip:
                 ancestor = _git(checkout, "merge-base", "--is-ancestor", old_tip, tip)
                 if ancestor.returncode == 1:
-                    return Outcome("diverged", f"{TRACKING_REF} cannot fast-forward to the fetched tip {tip}")
-                if ancestor.returncode:
+                    if old_tip != before_fetch.stdout.strip():
+                        return Outcome("diverged", f"{TRACKING_REF} changed during the fetch")
+                    older = _git(checkout, "merge-base", "--is-ancestor", tip, old_tip)
+                    if older.returncode == 0:
+                        return Outcome("diverged", f"{TRACKING_REF} is ahead of the fetched tip {tip}")
+                    if older.returncode != 1:
+                        return Outcome("fetch-failed", _first_line(older))
+                elif ancestor.returncode:
                     return Outcome("fetch-failed", _first_line(ancestor))
+            move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)
             tracked = _git(checkout, "update-ref", TRACKING_REF, tip, old_tip or "0" * len(tip))
             if tracked.returncode:
                 return Outcome("fetch-failed", _first_line(tracked))
-            move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)
             return _advance(checkout, move, pending)
     except waiting_rows.Diverged:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")

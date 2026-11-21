@@ -961,17 +961,11 @@ class PreparedWrapUnit(NamedTuple):
 
 
 def require_retirable_worktrees(production: Production, rows: tuple[UnitRow, ...]) -> None:
-    try:
-        protected = production_doc.protected_checkouts()
-    except production_doc.ProductionPathsError as error:
-        raise LifecycleStop("retire", "held", str(error)) from error
-    repository = git_files.at(production.checkout).common_dir
     for unit in rows:
-        path = unit.worktree.resolve()
-        for checkout in protected:
-            if checkout.path.is_relative_to(path) or (
-                    checkout.repository == repository and checkout.branch == unit.branch):
-                raise LifecycleStop("retire", "held", f"{unit.name}: protected integration checkout {checkout.path}")
+        try:
+            production_doc.require_removable_checkout(unit.worktree, production.checkout, unit.branch)
+        except production_doc.ProductionPathsError as error:
+            raise LifecycleStop("retire", "held", f"{unit.name}: {error}") from error
 
 
 def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tuple[PreparedWrapUnit, ...]:

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from stat import S_ISDIR
 from typing import NamedTuple, cast, override
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from scripts.agents import remote
@@ -420,22 +420,34 @@ def _registered_production_documents() -> tuple[staff.StaffRow, ...]:
     try:
         rows = staff.authority_snapshot().find(kind="showrunner")
         return tuple(row for row in rows if isinstance(row.doc, staff.LiveDoc))
-    except staff.StaffAbsent:
-        return ()
     except (OSError, ValueError, staff.StaffRefused) as error:
         raise ProductionPathsError(f"cannot read the staff record: {error}") from error
 
 
 def protected_checkouts() -> frozenset[ProtectedCheckout]:
     """Read the registered main and integration checkouts on this host."""
-    return _protected_checkouts(_registered_production_documents(), remote.local_machine())
+    return _protected_checkouts(_registered_production_documents())
 
 
-def _protected_checkouts(rows: tuple[staff.StaffRow, ...], machine: str) -> frozenset[ProtectedCheckout]:
+def _protection_host(machine: str) -> remote.MachineAlias | None:
+    local = remote.local_machine()
+    if machine.casefold() == local.casefold():
+        return None
+    try:
+        target = remote.machine_alias(machine)
+        current = remote.machine_alias(local)
+    except (OSError, ValueError) as error:
+        raise ProductionPathsError(f"cannot resolve staff machine {machine}: {error}") from error
+    if isinstance(target, remote.MachineNameRefused):
+        raise ProductionPathsError(target.reason)
+    return None if target == current else target
+
+
+def _protected_checkouts(rows: tuple[staff.StaffRow, ...]) -> frozenset[ProtectedCheckout]:
     protected: set[ProtectedCheckout] = set()
     for row in rows:
         assert isinstance(row.doc, staff.LiveDoc)
-        if row.doc.machine != machine:
+        if _protection_host(row.doc.machine) is not None:
             continue
         try:
             doc = row.doc.path.resolve()
@@ -470,6 +482,7 @@ def _protected_checkouts(rows: tuple[staff.StaffRow, ...], machine: str) -> froz
 
 @dataclass(frozen=True)
 class LocalOrigin:
+    machine: str
     path: Path
 
 
@@ -485,40 +498,104 @@ def _protection_command(host: remote.MachineAlias | None, *args: str) -> subproc
     return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, check=False)
 
 
-def _origins(checkout: Path, host: remote.MachineAlias | None = None) -> frozenset[LocalOrigin | NetworkOrigin]:
+_SCP_ORIGIN = re.compile(r"(?:(?P<user>[^@/\s:]+)@)?(?P<host>\[[^\]]+\]|[^:/\s@]+):(?P<path>.+)")
+_REMOTE_HELPER = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
+_SSH_CONFIG = r"""
+cd -- "$1" || exit 2
+shift
+[ -z "${GIT_SSH_COMMAND-}${GIT_SSH-}${GIT_SSH_VARIANT-}" ] || exit 2
+git config --get-regexp '^(core\.sshcommand|ssh\.variant)$' >/dev/null
+[ "$?" -eq 1 ] || exit 2
+exec ssh -G "$@"
+"""
+
+
+def _network_origin(url: str, checkout: Path, host: remote.MachineAlias | None) -> NetworkOrigin:
+    scp = _SCP_ORIGIN.fullmatch(url) if "://" not in url else None
+    if scp:
+        alias = scp["host"].strip("[]")
+        user = scp["user"] or ""
+        path = scp["path"]
+        if not path.startswith("/"):
+            path = "/~/" + path
+        port = None
+    else:
+        address = urlsplit(url)
+        if address.scheme in ("https", "http", "git") and address.hostname and address.path:
+            identity = remote_identity(url, str(checkout))
+            return NetworkOrigin(identity.lower() if identity.startswith("https://github.com/") else identity)
+        if address.scheme != "ssh" or not address.hostname or not address.path or address.query or address.fragment:
+            raise ProductionPathsError(f"{checkout}: cannot resolve an origin URL")
+        alias = address.hostname
+        user = unquote(address.username or "")
+        port = address.port
+        path = unquote(address.path)
+    repository_path = PurePosixPath(path)
+    if ".." in repository_path.parts:
+        raise ProductionPathsError(f"{checkout}: cannot resolve the SSH repository path")
+    path = repository_path.as_posix()
+    options = [*(("-l", user) if user else ()), *(("-p", str(port)) if port is not None else ())]
+    config = _protection_command(host, "sh", "-c", _SSH_CONFIG, "origin-ssh", str(checkout), *options, "--", alias)
+    fields = {parts[0]: parts[1] for line in config.stdout.splitlines()
+              if len(parts := line.split(maxsplit=1)) == 2}
+    server = fields.get("hostname", "").lower().rstrip(".")
+    service = fields.get("port", "")
+    if config.returncode or not server or not service.isdecimal() or not 0 < int(service) < 65536:
+        raise ProductionPathsError(f"{checkout}: cannot resolve SSH origin {alias}")
+    if server == alias.lower().rstrip("."):
+        # ssh -G accepts an undefined alias. Require a server name in that case.
+        lookup = _protection_command(host, "python3", "-c",
+                                     "import socket, sys; socket.getaddrinfo(sys.argv[1], None)", server)
+        if lookup.returncode:
+            raise ProductionPathsError(f"{checkout}: cannot resolve SSH origin {alias}")
+    if (server, service) in (("github.com", "22"), ("ssh.github.com", "443")):
+        return NetworkOrigin("https://github.com/" + path.removeprefix("/~/").lstrip("/").rstrip("/")
+                             .lower().removesuffix(".git"))
+    authority = f"[{server}]" if ":" in server else server
+    return NetworkOrigin(urlunsplit(("ssh", f"{authority}:{int(service)}", path.rstrip("/"), "", "")))
+
+
+def _origins(checkout: Path, host: remote.MachineAlias | None = None, *,
+             push_only: bool = False) -> frozenset[LocalOrigin | NetworkOrigin]:
     origins: set[LocalOrigin | NetworkOrigin] = set()
-    for options in ((), ("--push",)):
+    for options in ((("--push",),) if push_only else ((), ("--push",))):
         result = _protection_command(host, "git", "-C", str(checkout), "remote", "get-url", "--all",
                                      *options, "origin")
-        if result.returncode == 2 and not options:
+        if result.returncode == 2 and (push_only or not options):
             return frozenset()
         if result.returncode or not result.stdout.strip():
             raise ProductionPathsError(f"{checkout}: cannot read origin")
         for url in result.stdout.splitlines():
+            if _REMOTE_HELPER.match(url):
+                raise ProductionPathsError(f"{checkout}: cannot resolve an origin URL")
             location = urlsplit(url) if url.startswith("file://") else None
-            if location is not None or url.startswith(("/", ".", "~")) or (":" not in url):
+            if location is not None or ("://" not in url and not _SCP_ORIGIN.fullmatch(url)):
                 path = unquote(location.path) if location is not None else url
+                if location is not None and location.netloc not in ("", "localhost"):
+                    raise ProductionPathsError(f"{checkout}: cannot resolve the file origin")
                 if host is None:
-                    origins.add(LocalOrigin((checkout / Path(path).expanduser()).resolve()))
+                    origins.add(LocalOrigin(remote.local_machine().casefold(),
+                                            (checkout / Path(path).expanduser()).resolve(strict=True)))
                 else:
                     resolved = _protection_command(host, "sh", "-c",
                         'cd -- "$1" && cd -- "$2" && pwd -P', "origin-path", str(checkout), path)
                     if resolved.returncode or not Path(resolved.stdout.strip()).is_absolute():
                         raise ProductionPathsError(f"{host.alias}: cannot resolve the file origin for {checkout}")
-                    origins.add(LocalOrigin(Path(resolved.stdout.strip())))
+                    origins.add(LocalOrigin(host.alias, Path(resolved.stdout.strip())))
             else:
-                identity = remote_identity(url, str(checkout))
-                if identity.startswith("https://github.com/"):
-                    identity = identity.lower()
-                origins.add(NetworkOrigin(identity))
+                origins.add(_network_origin(url, checkout, host))
     return frozenset(origins)
 
 
-def _remote_branch_origins(row: staff.StaffRow, branch: str) -> frozenset[LocalOrigin | NetworkOrigin]:
+def _registered_origins(checkout: Path, host: remote.MachineAlias | None = None) -> frozenset[LocalOrigin | NetworkOrigin]:
+    origins = _origins(checkout, host)
+    if not origins:
+        raise ProductionPathsError(f"{checkout}: cannot resolve the registered origin")
+    return origins
+
+
+def _remote_branch_origins(row: staff.StaffRow, host: remote.MachineAlias, branch: str) -> frozenset[LocalOrigin | NetworkOrigin]:
     assert isinstance(row.doc, staff.LiveDoc)
-    host = remote.machine_alias(row.doc.machine)
-    if isinstance(host, remote.MachineNameRefused):
-        raise ProductionPathsError(host.reason)
     read = _protection_command(host, "cat", str(row.doc.path))
     if read.returncode:
         raise ProductionPathsError(f"{row.doc.machine}: cannot read {row.doc.path}")
@@ -533,9 +610,10 @@ def _remote_branch_origins(row: staff.StaffRow, branch: str) -> frozenset[LocalO
         if not Path(main).is_absolute():
             raise ProductionPathsError(f"{row.doc.path}: {MERGE_CHECKOUT_FIELD} must be absolute")
         if branch == "main":
-            return _origins(Path(main), host)
+            return _registered_origins(Path(main), host)
         if branch == protected_branch:
-            return _origins(Path(main), host) | _origins(Path(production_field(lines, "Showrunner checkout")), host)
+            return (_registered_origins(Path(main), host)
+                    | _registered_origins(Path(production_field(lines, "Showrunner checkout")), host))
         return frozenset()
     if merge_branch and branch != merge_branch:
         return frozenset()
@@ -552,16 +630,15 @@ def _remote_branch_origins(row: staff.StaffRow, branch: str) -> frozenset[LocalO
                 raise ProductionPathsError(f"{row.doc.machine}: cannot read the branch in {path}")
             if head.returncode or head.stdout.strip() != branch:
                 continue
-        origins.update(_origins(path, host))
+        origins.update(_registered_origins(path, host))
     return frozenset(origins)
 
 
 def require_removable_checkout(path: Path, repository: Path, branch: str) -> None:
     """Keep protected checkout paths and branches that removal can delete on origin."""
     try:
-        machine = remote.local_machine()
         rows = _registered_production_documents()
-        protected = _protected_checkouts(rows, machine)
+        protected = _protected_checkouts(rows)
         candidate = path.resolve()
         for checkout in protected:
             if checkout.path.is_relative_to(candidate):
@@ -569,15 +646,18 @@ def require_removable_checkout(path: Path, repository: Path, branch: str) -> Non
             if candidate.is_relative_to(checkout.path):
                 raise ProductionPathsError(f"{candidate}: inside protected production checkout {checkout.path}")
         matching = [checkout for checkout in protected if branch and checkout.branch == branch]
-        remote_rows = [row for row in rows if isinstance(row.doc, staff.LiveDoc) and row.doc.machine != machine]
-        if not branch or not (matching or remote_rows):
+        if not branch:
             return
         checkout = git_files.locate(repository)
         if any(keep.repository == checkout.common_dir for keep in matching):
             raise ProductionPathsError(f"{repository}: protected production branch {branch}")
-        origins = _origins(checkout.toplevel)
-        if origins and (any(origins & _origins(keep.path) for keep in matching)
-                        or any(origins & _remote_branch_origins(row, branch) for row in remote_rows)):
+        origins = _origins(checkout.toplevel, push_only=True)
+        if not origins:
+            return
+        remote_rows = [(row, host) for row in rows if isinstance(row.doc, staff.LiveDoc)
+                       and (host := _protection_host(row.doc.machine)) is not None]
+        if (any(origins & _registered_origins(keep.path) for keep in matching)
+                or any(origins & _remote_branch_origins(row, host, branch) for row, host in remote_rows)):
             raise ProductionPathsError(f"{repository}: protected production origin branch {branch}")
     except ProductionPathsError:
         raise
