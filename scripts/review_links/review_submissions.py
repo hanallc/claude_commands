@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -67,6 +67,43 @@ class NativeSubmissionDestination:
     @property
     def address(self) -> SubmissionAddress:
         return SubmissionAddress(self.kind, self.recipient_id, self.request_id)
+
+
+@dataclass(frozen=True)
+class MoveContentDigests:
+    """The digests of both copies when the move was planned."""
+
+    source: str
+    destination: str
+
+
+@dataclass(frozen=True)
+class MissingMoveDigests:
+    """The move journal lacks a digest for one or both copies."""
+
+
+@dataclass(frozen=True)
+class SubmissionMove(NativeSubmissionDestination):
+    """A native transfer that can resume before or after source removal."""
+
+    source: Path
+    source_owner: staff.StaffId
+    digests: MoveContentDigests | MissingMoveDigests
+
+
+@dataclass(frozen=True)
+class InitialDelivery:
+    """Request the first message after the native record exists."""
+
+    evidence_origin: str = ""
+
+
+@dataclass(frozen=True)
+class NoInitialDelivery:
+    """File the native record without scheduling its first message."""
+
+
+NO_INITIAL_DELIVERY = NoInitialDelivery()
 
 
 type NativeSubmittedRecord = update_registration.QuestionRecord | Issue | investigation.Investigation
@@ -187,15 +224,19 @@ def _validate_image(upload: _ImageUpload) -> None:
         raise SubmissionError("The pasted image does not match its type or exceeds the image limits.")
 
 
-def _request_folder(request_id: str) -> Path:
-    snapshot_root = review_link.review_root().resolve()
+def _attachment_root(snapshot_root: Path) -> Path:
+    snapshot_root = snapshot_root.resolve()
     configured = conf.read_or_repository("review_links").text("review_attachments_root")
     root = (snapshot_root.parent / Path(configured).expanduser()).resolve()
     if root.is_relative_to(snapshot_root) or root.is_relative_to(record_store.state_root().resolve()):
         raise OSError("The Review attachment root must be outside the snapshot and staff state roots.")
+    return root
+
+
+def _request_folder(request_id: str) -> Path:
     identity = read_request_id(request_id)
     draft = LEGACY_DRAFT_BINDING.fullmatch(identity)
-    return root / (draft[1] if draft else identity)
+    return _attachment_root(review_link.review_root()) / (draft[1] if draft else identity)
 
 
 def image_folder(item: SavedSubmission | ReviewSubmission) -> Path:
@@ -289,8 +330,21 @@ def _read_request_file(path: Path, request_id: str) -> RequestFile:
                         raise OSError(f"Cannot read the Review request file at {path}.") from error
                     if DRAFT_ID.fullmatch(request_id):
                         request_id = f"{request_id}-{kind}-{recipient}"
-                    return NativeSubmissionDestination(identity, kind, staff.StaffId(recipient), request_id,
-                                                       payload_hash, Path(native_path), Path(original_path), filing_owner)
+                    location = (identity, kind, staff.StaffId(recipient), request_id,
+                                payload_hash, Path(native_path), Path(original_path), filing_owner)
+                    if path.name == "move.json":
+                        source, source_owner = fields.get("source"), fields.get("source_owner")
+                        if not (isinstance(source, str) and Path(source).is_absolute() and isinstance(source_owner, str)):
+                            raise OSError(f"Cannot read the Review move at {path}.")
+                        former = staff.StaffId(source_owner)
+                        check_recipient_id(former)
+                        source_digest, destination_digest = fields.get("source_digest"), fields.get("destination_digest")
+                        digests = (MoveContentDigests(source_digest, destination_digest)
+                                   if isinstance(source_digest, str) and re.fullmatch(r"[0-9a-f]{64}", source_digest)
+                                   and isinstance(destination_digest, str) and re.fullmatch(r"[0-9a-f]{64}", destination_digest)
+                                   else MissingMoveDigests())
+                        return SubmissionMove(*location, Path(source), former, digests)
+                    return NativeSubmissionDestination(*location)
     raise OSError(f"Cannot read the Review request file at {path}.")
 
 
@@ -330,6 +384,10 @@ def _write_location(path: Path, destination: NativeSubmissionDestination) -> Non
               "original_path": str(destination.original_path), "payload_hash": destination.payload_hash}
     if destination.owner != destination.recipient_id:
         fields["owner"] = destination.owner
+    if isinstance(destination, SubmissionMove):
+        fields.update(source=str(destination.source), source_owner=destination.source_owner)
+        if path.name == "move.json" and isinstance(destination.digests, MoveContentDigests):
+            fields.update(source_digest=destination.digests.source, destination_digest=destination.digests.destination)
     _write_request_file(path, fields)
 
 
@@ -345,7 +403,10 @@ def _request_hint(address: SubmissionAddress, *, receipt_only: bool = False) -> 
         receipt = _read_request_file(folder / "receipt.json", folder.name)
         if receipt_only or not isinstance(receipt, NoRequestFile):
             return receipt
-        return _read_request_file(folder / "pending.json", folder.name)
+        pending = _read_request_file(folder / "pending.json", folder.name)
+        if not isinstance(pending, NoRequestFile):
+            return pending
+        return _read_request_file(folder / "moved.json", folder.name)
     except OSError as error:
         return UnreadableRequestFile(error)
 
@@ -360,6 +421,10 @@ class LocatedSubmission:
     destination: NativeSubmissionDestination
     details: ReviewSubmission
     record: NativeSubmittedRecord
+
+    def saved(self) -> SavedSubmission:
+        """Return the native record with its stable request location."""
+        return _saved_submission(self.destination, self.record)
 
 
 @dataclass(frozen=True)
@@ -762,6 +827,11 @@ def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
             == (saved.address, saved.id, saved.owner, saved.payload_hash))
 
 
+def _saved_submission(saved: NativeSubmissionDestination, record: NativeSubmittedRecord) -> SavedSubmission:
+    return SavedSubmission(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
+                           saved.path, saved.original_path, saved.owner, record)
+
+
 def _complete_receipt(folder: Path, saved: NativeSubmissionDestination,
                       hint: RequestFile, record: NativeSubmittedRecord, *, first_send: bool = False) -> SavedSubmission:
     """Complete the receipt before a retry can return the native result."""
@@ -773,16 +843,69 @@ def _complete_receipt(folder: Path, saved: NativeSubmissionDestination,
             else:
                 atomic_file.sync_folder(folder)
         else:
-            if hint != saved:
-                _write_location(folder / "pending.json", saved)
+            pending = folder / "pending.json"
+            if hint != saved or not pending.is_file():
+                _write_location(pending, saved)
             _publish_receipt(folder, saved)
     except OSError as error:
         if not first_send and not _has_receipt_for(saved):
             raise
         words = " ".join(str(error).splitlines())
         print(f"Review receipt for {saved.id}: {words}", file=sys.stderr)
-    return SavedSubmission(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
-                           saved.path, saved.original_path, saved.owner, record)
+    return _saved_submission(saved, record)
+
+
+def _stage_initial_delivery(folder: Path, address: SubmissionAddress,
+                            delivery: InitialDelivery | NoInitialDelivery) -> None:
+    if isinstance(delivery, InitialDelivery):
+        path = folder / "first-message.json"
+        if not path.exists():
+            _write_request_file(path, {"kind": address.kind, "request_id": address.request_id,
+                                       "evidence_origin": delivery.evidence_origin})
+        atomic_file.sync_folder(folder)
+
+
+@dataclass(frozen=True)
+class PendingInitialDelivery:
+    """The request and evidence origin saved before its native write."""
+
+    address: SubmissionAddress
+    evidence_origin: str
+
+
+def pending_initial_deliveries(root: Path) -> Iterator[PendingInitialDelivery]:
+    """Read the first messages that have no durable claim yet."""
+    for path in _attachment_root(root).glob("*/first-message.json"):
+        try:
+            fields = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+            kind = read_kind(fields["kind"])
+            request = read_request_id(fields["request_id"])
+            address = _request_address(kind, new_item_dialog.request_recipient(kind, request), request)
+            origin = fields["evidence_origin"]
+            if not isinstance(origin, str) or path.parent != _request_folder(request):
+                raise ValueError("Invalid first message.")
+            yield PendingInitialDelivery(address, origin)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"Review first message {path}: {error}", file=sys.stderr)
+
+
+def clear_initial_delivery(address: SubmissionAddress) -> None:
+    """Remove the pending marker after the delivery claim saves."""
+    folder = _request_folder(address.request_id)
+    try:
+        (folder / "first-message.json").unlink()
+        atomic_file.sync_folder(folder)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"Review first message {address.request_id}: {error}", file=sys.stderr)
+
+
+def pending_submission_moves(root: Path) -> Iterator[Path]:
+    """Find Review transfers that still need cleanup."""
+    return _attachment_root(root).glob("*/move.json")
 
 
 def _recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
@@ -1005,7 +1128,8 @@ def _prepare_request_folder(request_id: str) -> tuple[Path, bool]:
     return folder, False
 
 
-def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = None) -> SavedSubmission:
+def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = None,
+           initial_delivery: InitialDelivery | NoInitialDelivery = NO_INITIAL_DELIVERY) -> SavedSubmission:
     """Validate and file the item once in its native store."""
     check_recipient_id(request.recipient_id)
     request_id = read_request_id(request.request_id)
@@ -1038,9 +1162,10 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
                     found = locate_native_submission(address, hint, members=members)
                 except OSError:
                     found = NoNativeSubmission()
-                if isinstance(receipt, NativeSubmissionDestination) and isinstance(found, LocatedSubmission):
+                if (isinstance(receipt, NativeSubmissionDestination) and isinstance(found, LocatedSubmission)
+                        and found.destination == receipt):
                     _check_same_request(receipt, request, payload_hash)
-                    _check_same_request(found.destination, request, payload_hash)
+                    _stage_initial_delivery(folder, address, initial_delivery)
                     return _complete_receipt(folder, found.destination, receipt, found.record)
 
         locked = (_locked_draft_request(address, members, page=request.page, fingerprint=payload_hash,
@@ -1058,6 +1183,7 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
             if isinstance(located, LocatedSubmission):
                 saved = located.destination
                 _check_same_request(saved, request, payload_hash, draft=is_draft)
+                _stage_initial_delivery(folder, address, initial_delivery)
                 completed = _complete_receipt(folder, saved, hint, located.record)
                 return replace(completed, reused=True) if is_draft else completed
             if (folder / "receipt.json").is_file():
@@ -1093,6 +1219,7 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
                 saved = NativeSubmissionDestination(identity, kind, address.recipient_id, request_id, payload_hash, path, path,
                                                     recipient.id)
                 _write_location(pending_file, saved)
+                _stage_initial_delivery(folder, address, initial_delivery)
                 destinations[:] = [saved]
 
             record = _file(kind, recipient, title, words, details, members, destination, before_write)
@@ -1107,6 +1234,15 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
 def _request_address(kind: SubmissionKind, recipient_id: staff.StaffId, request_id: str) -> SubmissionAddress:
     require_request_binding(kind, recipient_id, request_id)
     return SubmissionAddress(kind, recipient_id, request_id)
+
+
+@contextmanager
+def submission_for_delivery(address: SubmissionAddress) -> Generator[LocatedSubmission | NoNativeSubmission]:
+    """Read the current native owner under the same locks as a move."""
+    with _locked_request(address) as lookup:
+        if isinstance(lookup.native, NoNativeSubmission) and isinstance(lookup.hint, UnreadableRequestFile):
+            raise lookup.hint.error
+        yield lookup.native
 
 
 @contextmanager

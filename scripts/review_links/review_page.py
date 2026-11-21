@@ -575,7 +575,9 @@ class ReviewSnapshotCache:
             item = ReviewRecordNotPublished()
         return self.publish_item(current, key, item, members), item
 
-    def create_submission(self, request: new_item_dialog.NewItemRequest) -> PublishedSubmission:
+    def create_submission(self, request: new_item_dialog.NewItemRequest, *,
+                          initial_delivery: review_submissions.InitialDelivery | review_submissions.NoInitialDelivery
+                          = review_submissions.NO_INITIAL_DELIVERY) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
         _ = self.get()
         with self._save_lock:
@@ -583,7 +585,7 @@ class ReviewSnapshotCache:
             remote_staff = not staff.is_owner()
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
-                saved = review_submissions.submit(request, members=members)
+                saved = review_submissions.submit(request, members=members, initial_delivery=initial_delivery)
             if not remote_staff:
                 members = staff.snapshot()
             path = saved.path

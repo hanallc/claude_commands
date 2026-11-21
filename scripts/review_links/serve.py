@@ -32,7 +32,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast, override
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
@@ -41,7 +41,7 @@ from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
-from scripts.production import change_routing, change_review, staff, the_list
+from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
@@ -1170,20 +1170,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(400, {"error": "Could not read the New item request."})
             return
         try:
-            created = server.review_cache.create_submission(request)
+            site = f"http://{server.bound_address}:{server.server_port}"
+            has_evidence = key or request.images or request.page_state is not None or isinstance(
+                request.evidence, new_item_dialog.PageDataEvidence)
+            created = server.review_cache.create_submission(request, initial_delivery=review_submissions.InitialDelivery(
+                site if has_evidence else ""))
             response = {"id": created.saved.id, "key": created.key, "version": created.version}
             if request.page == "list":
                 response["list_key"] = list_page.add_submission(created).key
             details = created.saved.details
-            evidence_url = ""
+            evidence_page = ""
             if key or details.images or request.page_state is not None or isinstance(
                     details.evidence, new_item_dialog.PageDataEvidence):
-                site = f"http://{server.bound_address}:{server.server_port}"
-                fragment = urlencode({"item": created.key})
-                evidence_url = site + review_page.PAGE_PATH + "#" + fragment
+                evidence_page = site + review_page.PAGE_PATH
             delivery = review_actions.prepare_submission_delivery(
                 created.saved, created.saved.words if created.saved.reused else request.words,
-                server.delivery_status, evidence_url=evidence_url)
+                server.delivery_status, evidence_page=evidence_page)
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
@@ -1697,6 +1699,11 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self._staff_snapshot_lock: threading.Lock = threading.Lock()
         self._staff_snapshot: StaffSnapshotAttempt | StaffSnapshotUnloaded = StaffSnapshotUnloaded()
+        if mode is ServerMode.LIVE:
+            try:
+                tidy_wrapped.recover_review_moves(self.root)
+            except (OSError, ValueError) as error:
+                print(f"review-links move recovery: {error}", file=sys.stderr)
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.review_cache: review_page.ReviewSnapshotCache = ConsoleReviewSnapshotCache(
             self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
@@ -1722,6 +1729,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
         def recover_pending() -> None:
             try:
                 recover_changes(self.delivery_status)
+                review_actions.recover_submission_deliveries(self.delivery_status, review_page.PAGE_PATH)
+            except (OSError, ValueError) as error:
+                print(f"review-links delivery recovery: {error}", file=sys.stderr)
             finally:
                 self.delivery_status.startup_recovery_pending.clear()
             recover_list()

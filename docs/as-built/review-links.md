@@ -688,6 +688,7 @@ A change hand-off or return to Open clears the saved Later time.
 The shared reader ignores any old Later time on a Validating change.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
+When wrap moves a Bug or Investigation, it moves the Later timestamp to the new owner key.
 The status cache watches that file and expires at the first pending Later time.
 The item returns after that time without a new action.
 Every action keeps its time, actor and words in the existing record log.
@@ -1744,6 +1745,16 @@ It takes the lock to clear an alert after confirmed acceptance or final failure.
 The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
+New item saves a first-message marker before it writes the native record.
+The delivery claim reads the native owner under the same lock as wrap.
+The server clears the marker after the claim saves.
+Startup recovers a marked message only when the native record exists.
+Wrap saves the digests of both copies in the move journal before it publishes the destination.
+If the destination still matches its digest, startup recovery moves the current source.
+If only the destination changed, startup recovery keeps that copy.
+If both copies changed or a digest is missing, recovery reports the refusal and keeps both copies and the journal.
+Recovery compares the copies without using the filing receipt.
+The completed move retains the original delivery path if the filing receipt is missing.
 Recovery preserves attempts that a live request owns.
 It resumes a List or Images question if the saved sender released its lock during delivery.
 It reuses the question's message ID.

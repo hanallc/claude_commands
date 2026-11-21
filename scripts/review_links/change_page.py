@@ -1110,6 +1110,24 @@ class DeliveryStatus:
     def path(self, page: ReviewPage, row: str) -> Path:
         return change_routing.delivery_path(self.root, page.review_list, row)
 
+    def previous_submission_source(self, request: str, current: Path) -> Path:
+        """Find a delivery saved before moves retained their original paths."""
+        for path in self.read_view().paths:
+            try:
+                fields = delivery_state.read_fields(path)
+            except (OSError, ValueError):
+                continue
+            saved = fields.get("review_message")
+            if not isinstance(saved, dict):
+                continue
+            record = cast(dict[str, object], saved)
+            source = record.get("source")
+            if record.get("submission_request") == request and isinstance(source, str):
+                original = Path(source)
+                if change_routing.delivery_path(self.root, original, request) == path:
+                    return original
+        return current
+
     def owns_live_claim(self, page: ReviewPage, row: str, attempt: str) -> bool:
         owner = self.request_attempts.get(attempt)
         return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
