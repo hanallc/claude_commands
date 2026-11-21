@@ -14,7 +14,7 @@ import subprocess
 import sys
 from collections.abc import Generator
 from types import SimpleNamespace
-from typing import final, override
+from typing import cast, final, override
 from contextlib import contextmanager, redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate, showrunners, staff
@@ -72,7 +72,7 @@ class MergeGatePromotionTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
         _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR",
                                                 Path(self.environment["SHOWRUNNER_STATE_DIR"])))
 
