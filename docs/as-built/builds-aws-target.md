@@ -930,10 +930,22 @@ Legacy cancellations and stopped states retain the full exposure when the journa
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.
-An account bill qualifies when the name, day label, and bounds match one full UTC day.
+The page and the guard's complete-day adjustment use strict `read_saved_bill`, and admission retains `read_charge` to preserve all existing counts and refusals.
+The later `one-day-amount` phase joins the readers and protects the count with one `LegacyCountAddition`.
+The file name, day label, and bounds must match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
 The newest read time must be valid and cannot be in the future.
-The charge file keeps each read time and amount. A legacy file without a list supplies one read.
+The check rejects duplicate JSON fields and invalid amount histories.
+The history times must increase and the last entry must match the newest read.
+A legacy file without a history supplies one read.
+The page and daily usage use an accepted bill for its UTC day.
+If a refused bill names a day, its estimate excludes saved reconciliation adjustments for that day.
+For a refused day, estimates include local charges such as Hana storage that starts before the newest bill.
+The spend view includes an earlier refused day when it has local charges.
+The page shows one notice when a displayed amount includes a refused day.
+The notice lists the dates from the file name and the bill when the page uses their estimates.
+The tooltip and buildlog report give the UTC day and reason for each applicable record.
+Each publication loads the account settings once.
 Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
 Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
 Reads less than `cost_explorer_interval_seconds` apart count once.
@@ -1138,6 +1150,7 @@ The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
+If the account settings are missing, the buildlog report says that AWS spend is unavailable.
 `spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again

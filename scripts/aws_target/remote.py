@@ -51,21 +51,11 @@ class HanaStartJournal:
         return frozenset(unstarted)
 
 
-def read_hana_start_journal(directory: Path) -> HanaStartJournal:
-    """Read definite refusals and possible starts."""
+def hana_start_journal(records: Sequence[dict[str, object]]) -> HanaStartJournal:
+    """Read definite refusals and possible starts from the captured records."""
     refused: set[int] = set()
     possible: set[int] = set()
-    try:
-        paths = tuple((directory / 'hana' / 'provider').iterdir())
-    except OSError:
-        return HanaStartJournal()
-    for path in paths:
-        if path.suffix != '.json':
-            continue
-        try:
-            record = read_record(path)
-        except (OSError, ValueError):
-            return HanaStartJournal()
+    for record in records:
         action = record.get('action')
         generation = record.get('generation')
         if start_was_refused(record):
@@ -79,3 +69,12 @@ def read_hana_start_journal(directory: Path) -> HanaStartJournal:
                 return HanaStartJournal()
             possible.add(generation)
     return HanaStartJournal(frozenset(refused), tuple(sorted(possible)))
+
+
+def read_hana_start_journal(directory: Path) -> HanaStartJournal:
+    """Read definite refusals and possible starts."""
+    try:
+        paths = (directory / 'hana' / 'provider').iterdir()
+        return hana_start_journal(tuple(read_record(path) for path in paths if path.suffix == '.json'))
+    except (OSError, ValueError):
+        return HanaStartJournal()

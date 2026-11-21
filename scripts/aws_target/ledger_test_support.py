@@ -1,10 +1,12 @@
 """Private configuration and fixed times for cost tests."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import os
 import re
+import shutil
 from decimal import Decimal
 from pathlib import Path
 import subprocess
@@ -114,70 +116,7 @@ def write_hana_config(path: Path | None = None) -> Path:
     """Write fixed setup settings to the test configuration directory."""
     if path is None:
         path = conf.path('hana_aws')
-    _ = path.write_text("""\
-enabled=off
-host=fixture-hana
-region=us-east-2
-availability_zone=us-east-2b
-instance_type=m7a.2xlarge
-fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
-stack_name=fixture-hana
-ami_id=fixture-image
-ami_owner_id=000000000000
-vpc_id=fixture-vpc
-subnet_id=fixture-subnet
-# range: 0.001..
-spot_max_usd_per_hour=0.25
-# range: 5e-324..
-spot_ceiling_margin=0.25
-# whole: 1..
-root_gib=40
-# whole: 1..
-data_gib=300
-daily_budget_usd=6
-gp3_usd_per_gib_month=0.08
-# whole: 1..60
-guard_grace_seconds=60
-# whole: 1..60
-watchdog_check_seconds=1
-# whole: 1..1800
-permit_max_seconds=1800
-# whole: 1..8
-step_cpu_limit=4
-# whole: 1..24
-step_memory_gib=24
-# whole: 1..60
-mount_timeout_seconds=15
-# whole: 1..
-aws_timeout_s=10
-# whole: 1..
-result_transfer_timeout_s=83
-# whole: 1..
-idle_stop_seconds=600
-# whole: 1..
-start_timeout_seconds=120
-# whole: 1..
-tick_interval_s=5
-# whole: 1..
-controller_tick_timeout_s=45
-# whole: 1..604800
-control_url_seconds=3600
-# whole: 1..
-stop_wait_timeout_s=600
-# whole: 1..
-stop_poll_seconds=10
-# whole: 1..
-setup_idle_wait_timeout_s=1500
-# whole: 1..
-setup_idle_heartbeat_s=15
-# whole: 1..
-intent_lookup_timeout_s=120
-image_upload_tool=fixture-nixos#coldsnap
-# whole: 60..
-image_upload_timeout_s=3600
-# whole: 1..60
-image_wait_interval_s=10
-""" + HANA_GUEST_RUNTIME_SETTINGS)
+    _ = path.write_text((FIXTURES / 'hana_aws.conf').read_text() + HANA_GUEST_RUNTIME_SETTINGS)
     return path
 
 
@@ -234,7 +173,7 @@ class CostFixture(unittest.TestCase):
         install_aws_fixture_settings(self.root)
         # The cost fixtures use one day unless a test needs a longer query.
         self.replace('cost_explorer_watch_days', '1')
-        environment = config_environment(self.root)
+        environment = self.configuration_environment()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root),
             "AWS_TARGET_CONFIG": str(self.settings),
@@ -244,6 +183,9 @@ class CostFixture(unittest.TestCase):
         # The patch above restores the removed names when the test ends.
         for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
             del os.environ[name]
+
+    def configuration_environment(self) -> dict[str, str]:
+        return config_environment(self.root)
 
     def configure(self, overrides: str) -> None:
         override_fixture_settings(self.settings, overrides)
@@ -278,3 +220,25 @@ class CostFixture(unittest.TestCase):
                           ("add", self.settings.name), ("commit", "-qm", "Record valid settings")):
             _ = subprocess.run(["git", "-C", str(self.root), *arguments], check=True,
                                capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+
+
+class SpendReferenceFixture(CostFixture):
+    """Use fixed settings for the account spend reference cases."""
+
+    @override
+    def configuration_environment(self) -> dict[str, str]:
+        _ = shutil.copyfile(FIXTURES / 'console.conf', self.root / 'console.conf')
+        return {'CONF_DIR': str(self.root), 'USER_ZONE': 'UTC',
+                'BUILD_TARGETS_CONFIG': str(self.root / 'build_targets.conf')}
+
+    @contextmanager
+    def decision_book(self, book: ledger.CostLedger) -> Generator[ledger.CostLedger]:
+        """Keep decision writes and cap changes out of the source fixture."""
+        settings = self.settings.read_bytes()
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            copy = Path(folder) / 'ledger'
+            _ = shutil.copytree(book.directory, copy)
+            try:
+                yield ledger.CostLedger(copy)
+            finally:
+                _ = self.settings.write_bytes(settings)

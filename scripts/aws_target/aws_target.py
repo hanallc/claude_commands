@@ -145,16 +145,16 @@ def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
                                 *gpu_price_sizes(values))))
 
 
-def hours_check_scope(gate: conf.ConfigRead) -> run_cost.SpotHoursScope:
+def hours_check_scope(gate: conf.ConfigRead, *, hana: conf.ConfigRead | None = None) -> run_cost.SpotHoursScope:
     sizes = gate_sizes(gate)
     try:
-        configuration = conf.read_or_repository('hana_aws')
+        configuration = conf.read_or_repository('hana_aws') if hana is None else hana
         region = configuration.text('region')
         primary = configuration.text('instance_type')
-        hana = (primary, *hana_spend.read_fallback_instance_types(configuration, primary))
+        hana_types = (primary, *hana_spend.read_fallback_instance_types(configuration, primary))
     except conf.Unusable:
         return run_cost.SpotHoursScope(sizes, {})
-    return run_cost.SpotHoursScope(tuple(dict.fromkeys((*sizes, *hana))), {region: hana})
+    return run_cost.SpotHoursScope(tuple(dict.fromkeys((*sizes, *hana_types))), {region: hana_types})
 
 
 def spot_placement_requests(values: conf.ConfigRead) -> tuple[ledger.SpotPlacementRequest, ...]:

@@ -18,10 +18,67 @@ from unittest import mock
 import unittest
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import aws_trial, config, ledger, run_cost, spend
+from scripts.aws_target import aws_trial, config, ledger, measurement, run_cost, spend
 from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
+
+
+class RefusedBillEstimateTests(CostFixture):
+    day: str = '2026-01-15'
+    query_usd: Decimal = Decimal('.07')
+    start: int = instant(day + 'T00:00:00Z')
+    end: int = start + 86400
+    now: int = end + 3600
+    bill: ledger.ChargeRead = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), query_usd)
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        start, end = self.start, self.end
+        with ledger.CostLedger(self.state).transaction() as state:
+            state.inventories.append(ledger.ResourceInventory(start, (), 'fixture', builder_removed=True))
+            state.observations.append(ledger.InstanceObservation(start, 'terminated', 'fixture'))
+            state.hana_storage.append(ledger.HanaStorageExposure(start, Decimal(90), ledger.HanaExposureClosed(end)))
+            state.reconciliations.append(ledger.CostReconciliation(
+                end, start, end, Decimal(5), 'Cost Explorer', self.query_usd))
+            state.charge_refresh_at = end
+
+    def check_amounts(self, page: spend.Spend, page_usd: Decimal, usage_usd: Decimal) -> None:
+        estimate = next(row for row in page.days if row.day == self.day)
+        self.assertEqual((estimate.usd, estimate.query_usd), (page_usd, self.query_usd))
+        self.assertEqual(measurement.daily_usage(self.settings, self.state, self.day, self.now),
+                         measurement.DailyUsage(0, usage_usd))
+
+    def test_refused_day_keeps_query_fees_with_local_storage_in_spend_and_usage(self) -> None:
+        charges = self.state / 'charges'
+        charges.mkdir()
+        january_15 = date(2026, 1, 15)
+        for name, bill, dates, reason in (
+            ('alias.json', self.bill, (january_15,), ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            ('2026-01-14.json', self.bill, (date(2026, 1, 14), january_15), ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            ('2026-01-15.json', replace(self.bill, at=self.now + 1), (january_15,), ledger.BillRecordRejection.FUTURE_READ),
+        ):
+            with self.subTest(name=name):
+                path = charges / name
+                _ = path.write_text(json.dumps(ledger.charge_record(bill)))
+                page = spend.read_spend(self.settings, self.state, self.now, '2026-01-16')
+                assert isinstance(page, spend.Spend)
+                self.assertEqual(page.refused_bills, (ledger.RefusedBillRecord(dates, reason),))
+                expected = Decimal(3) + self.query_usd
+                self.check_amounts(page, expected, expected)
+                path.unlink()
+
+        _ = (charges / (self.day + '.json')).write_text(json.dumps(ledger.charge_record(self.bill)))
+        page = spend.read_spend(self.settings, self.state, self.now, '2026-01-16')
+        assert isinstance(page, spend.Spend)
+        self.check_amounts(page, Decimal(5), Decimal(5) + self.query_usd)
+
+    def test_day_without_bill_file_keeps_saved_reconciliation(self) -> None:
+        page = spend.read_spend(self.settings, self.state, self.now, '2026-01-16')
+        assert isinstance(page, spend.Spend)
+        self.assertEqual(page.refused_bills, ())
+        self.check_amounts(page, Decimal(8), Decimal(5) + self.query_usd)
 
 
 class LedgerTests(CostFixture):
@@ -1070,6 +1127,171 @@ class LedgerTests(CostFixture):
                 self.assertEqual(actual, old)
                 if name:
                     path.unlink()
+
+    def test_page_uses_only_usable_bill_records(self) -> None:
+        start = self.start
+        end = start + 86400
+        now = end + 3600
+        day = '2026-01-15'
+        self.inventory(start)
+        self.observe(start, 'terminated')
+        charge = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), Decimal(0))
+        for name, bill, change, reason in (
+            (day + '.json', replace(charge, period_start=start + 1), '',
+             ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            ('alias.json', charge, '', ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            (day + '.json', replace(charge, at=now + 1), '', ledger.BillRecordRejection.FUTURE_READ),
+            (day + '.json', charge, '"actual_usd": "8", ', ledger.BillRecordRejection.DUPLICATE_FIELDS),
+            (day + '.json', charge, '"amount_reads": [], ', ledger.BillRecordRejection.INVALID_HISTORY),
+            (day + '.json', replace(charge, actual_usd=Decimal('.006')), '',
+             ledger.BillRecordRejection.BELOW_ONE_CENT),
+        ):
+            with self.subTest(reason=reason, name=name):
+                self.write_complete_bill_fixture(bill, name)
+                path = self.state / 'charges' / name
+                if change:
+                    _ = path.write_text('{' + change + path.read_text()[1:])
+                self.assertEqual(ledger.read_saved_bill(path, now).validation_result, reason)
+                self.assertEqual(self.book.read_bills(), (bill,))
+                self.assertEqual(self.book.validated_bills(now), ())
+                published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+                self.assertIsInstance(published, spend.Spend)
+                assert isinstance(published, spend.Spend)
+                self.assertTrue(all(row.source != 'AWS bill' and row.usd == 0 for row in published.days))
+                path.unlink()
+
+        self.write_complete_bill_fixture(charge)
+        self.write_complete_bill_fixture(replace(charge, actual_usd=Decimal(8)), 'alias.json')
+        self.assertEqual(self.book.validated_bills(now), (charge,))
+        published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+        assert isinstance(published, spend.Spend)
+        bill_rows = tuple(row.usd for row in published.days if row.source == 'AWS bill')
+        self.assertEqual(bill_rows, (Decimal(5),))
+
+    def test_refused_bill_uses_the_estimate_with_or_without_local_compute(self) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0'})
+        start = self.start
+        end = start + 86400
+        now = end + 3600
+        day = '2026-01-15'
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        self.observe(now, 'stopped')
+        bill = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), Decimal(0))
+        canonical = day + '.json'
+
+        def check_amounts(expected: Decimal) -> None:
+            published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+            assert isinstance(published, spend.Spend)
+            page_day = next(row.usd for row in published.days if row.day == day)
+            self.assertEqual(page_day, expected)
+
+        for expected in (Decimal(0), Decimal(3)):
+            if expected:
+                self.observe(end - 3 * 3600, 'running')
+                self.observe(end, 'stopped')
+            check_amounts(expected)
+            for name, reading, extra, reason in (
+                ('alias.json', bill, '', ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+                (canonical, replace(bill, day='2026-01-14'), '', ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+                (canonical, replace(bill, period_start=start + 1), '', ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+                (canonical, replace(bill, at=now + 1), '', ledger.BillRecordRejection.FUTURE_READ),
+                (canonical, bill, '"actual_usd": "8", ', ledger.BillRecordRejection.DUPLICATE_FIELDS),
+                (canonical, bill, '"amount_reads": [], ', ledger.BillRecordRejection.INVALID_HISTORY),
+                (canonical, replace(bill, account_bill=False), '', ledger.BillRecordRejection.NOT_ACCOUNT_BILL),
+                (canonical, replace(bill, actual_usd=Decimal('.006')), '', ledger.BillRecordRejection.BELOW_ONE_CENT),
+            ):
+                with self.subTest(reason=reason, name=name, local_charge=expected):
+                    self.write_complete_bill_fixture(reading, name)
+                    path = self.state / 'charges' / name
+                    if extra:
+                        _ = path.write_text('{' + extra + path.read_text()[1:])
+                    dates = tuple(sorted({date.fromisoformat(day), date.fromisoformat(reading.day)}))
+                    self.assertEqual(self.book.refused_bill_records(now), (ledger.RefusedBillRecord(dates, reason),))
+                    check_amounts(expected)
+                    path.unlink()
+
+    def test_page_shows_local_compute_on_a_refused_day_before_the_newest_bill(self) -> None:
+        start = instant('2026-01-31T00:00:00Z')
+        end = start + 86400
+        now = end + 86400
+        self.running(end - 3 * 3600)
+        self.observe(end, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-31', now, start, end,
+            Decimal(5), Decimal(0), Decimal(0)), 'alias.json')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-02-01', now, end, now,
+            Decimal(2), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(2), Decimal(2), 'Hrs'),)))
+        page = spend.read_spend(self.settings, self.state, now, '2026-02-02')
+        assert isinstance(page, spend.Spend)
+        estimate = next(row for row in page.days if row.day == '2026-01-31')
+        self.assertEqual((estimate.source, estimate.usd), ('estimated from the newest bill', Decimal(3)))
+
+    def test_refused_day_keeps_gate_compute_and_hana_storage_in_spend_and_usage(self) -> None:
+        january = date(2026, 1, 31)
+        start = instant('2026-01-31T00:00:00Z')
+        end = start + 86400
+        now = end + 86400
+        self.inventory(start)
+        self.observe(start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead(january.isoformat(), now, start, end,
+            Decimal(5), Decimal(0), Decimal(0)), 'alias.json')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-02-01', now, end, now,
+            Decimal(2), Decimal(0), Decimal(0)))
+        storage = ledger.HanaStorageExposure(start, Decimal(90), ledger.HanaExposureClosed(end))
+        gate = ledger.GateReservation('fixture-gate', end - 3 * 3600, end, Decimal(1), Decimal(0),
+            ledger.GateTerminated(end, 'fixture'), region='us-east-2')
+        for storage_rows, gate_rows, amount in (([storage], [], 3), ([], [gate], 3), ([storage], [gate], 6)):
+            with self.subTest(storage=bool(storage_rows), gate=bool(gate_rows)):
+                with self.book.transaction() as state:
+                    state.hana_storage = storage_rows
+                    state.gate_reservations = gate_rows
+                page = spend.read_spend(self.settings, self.state, now, '2026-02-02')
+                assert isinstance(page, spend.Spend)
+                estimate = next(row for row in page.days if row.day == january.isoformat())
+                self.assertEqual((estimate.source, estimate.usd), ('estimated from the newest bill', Decimal(amount)))
+                self.assertEqual(measurement.daily_usage(self.settings, self.state, january.isoformat(), now),
+                                 measurement.DailyUsage(0, Decimal(amount)))
+
+    def test_unreadable_and_malformed_bills_refuse_admission_without_saving_a_reservation(self) -> None:
+        now = self.start + 3600
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        path = self.state / 'charges' / '2026-01-14.json'
+        path.parent.mkdir()
+        attempt = ledger.GateReservation('fixture-gate', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
+        _ = path.write_text('{broken')
+        with self.assertRaises(json.JSONDecodeError):
+            _ = self.book.reserve_gate(self.settings, attempt)
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(IsADirectoryError):
+            _ = self.book.reserve_gate(self.settings, attempt)
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+        path.rmdir()
+        self.assertIsInstance(self.book.reserve_gate(self.settings, attempt), ledger.GateReserved)
+
+    def test_n01_admission_refuses_wrong_name_bill_and_local_compute_at_four_dollars(self) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '4'})
+        start = instant('2026-01-01T00:00:00Z')
+        end = start + 86400
+        now = end + 3 * 3600
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        self.observe(end, 'running')
+        self.observe(now, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-01', now, start, end,
+            Decimal(5), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(5), Decimal(5), 'Hrs'),)), 'alias.json')
+        request = ledger.GateReservation('fixture-gate', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
+        self.assertEqual(self.book.validated_bills(now), ())
+        preview = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, now)
+        assert isinstance(preview, ledger.SpendingRefused)
+        self.assertEqual(preview.reason, 'monthly_limit')
+        self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('monthly_limit'))
+        (self.state / 'charges' / 'alias.json').unlink()
+        self.assertIsInstance(self.book.reserve_gate(self.settings, request), ledger.GateReserved)
 
     def test_complete_bill_replaces_the_estimate_with_the_newest_amount(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '5'})
