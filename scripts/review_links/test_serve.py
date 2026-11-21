@@ -56,6 +56,7 @@ from scripts.review_links import accounts_page, change_browser, change_page, con
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.whoami import usage_store
 
 
 ROLE_COLOR_CONFIG = (
@@ -130,6 +131,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -4259,15 +4261,260 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if fail:
                     self.assertEqual(errors.getvalue(), "review-links accounts: no stored data\n")
 
+    def test_accounts_request_waits_for_a_new_render_when_cached_page_is_old(self) -> None:
+        cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"old page", .5, 100))):
+            self.assertEqual(cache.get(), b"old page")
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new page", .5, 200)) as render):
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(reply, b"new page")
+            render.assert_called_once_with()
+
+    def test_accounts_request_refreshes_in_background_within_current_configured_period(self) -> None:
+        cache = serve.AccountsPageCache()
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings, "page_refresh_seconds=37\n")
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"first page", .5, 100)
+            self.assertEqual(cache.get(), b"first page")
+            clock.return_value = 130
+            render.return_value = accounts_page.AccountsRender(b"second page", .5, 130)
+            self.assertEqual(cache.get(), b"first page")
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(cache.page, b"second page")
+            self.assertEqual(render.call_count, 2)
+            _ = write_config_fixture(settings, "page_refresh_seconds=15\n")
+            clock.return_value = 160
+            render.return_value = accounts_page.AccountsRender(b"third page", .5, 160)
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(reply, b"third page")
+            self.assertEqual(render.call_count, 3)
+
+    def test_old_accounts_requests_share_the_running_background_render(self) -> None:
+        entered, release, waiters_entered = threading.Event(), threading.Event(), threading.Event()
+        waiters: set[str] = set()
+
+        class WaiterCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("old-accounts-request"):
+                    waiters.add(name)
+                    if len(waiters) == 2:
+                        waiters_entered.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=WaiterCondition())
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(b"new page", .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        requests = [threading.Thread(target=request, name=f"old-accounts-request-{index}") for index in range(2)]
+        with (patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"old page", .5, 100)
+            self.assertEqual(cache.get(), b"old page")
+            render.reset_mock()
+            render.side_effect = render_page
+            try:
+                self.assertEqual(cache.get(), b"old page")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                clock.return_value = 101 + refresh
+                for reader in requests:
+                    reader.start()
+                self.assertTrue(waiters_entered.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                for reader in requests:
+                    if reader.ident is not None:
+                        reader.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"new page", b"new page"])
+            render.assert_called_once_with()
+
+    def test_old_accounts_request_keeps_last_good_page_when_the_new_render_fails(self) -> None:
+        cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("fixture render failure")),
+              redirect_stderr(StringIO())):
+            failed = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+        self.assertEqual(failed, good.replace(b'data-page-facts', b'data-page-facts data-read-error="The Accounts render failed."'))
+        self.assertEqual(cache.page, good)
+        self.assertEqual(tuple(cache.recent_times), (.25,))
+
+    def test_accounts_requests_share_a_new_render_after_the_store_changes_during_a_render(self) -> None:
+        entered, release, requests_entered = threading.Event(), threading.Event(), threading.Event()
+        readers: set[str] = set()
+
+        class ReaderCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("accounts-new-usage-"):
+                    readers.add(name)
+                    if len(readers) == 2:
+                        requests_entered.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=ReaderCondition())
+        store = usage_store.store_file()
+        _ = store.write_bytes(b"11%")
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            usage = store.read_bytes()
+            if usage == b"11%":
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(usage, .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        requests = [threading.Thread(target=request, name=f"accounts-new-usage-{index}") for index in range(2)]
+        with (patch.object(time, "monotonic", return_value=100) as clock,
+              patch.object(accounts_page, "render_with_facts") as render):
+            render.return_value = accounts_page.AccountsRender(b"11%", .5, 100)
+            self.assertEqual(cache.get(), b"11%")
+            render.side_effect = render_page
+            try:
+                self.assertEqual(cache.get(), b"11%")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                updated = store.with_suffix(".new")
+                _ = updated.write_bytes(b"10%")
+                _ = updated.replace(store)
+                clock.return_value = 101 + refresh
+                for reader in requests:
+                    reader.start()
+                self.assertTrue(requests_entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertEqual(render.call_count, 2)
+            finally:
+                release.set()
+                for reader in requests:
+                    if reader.ident is not None:
+                        reader.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"10%", b"10%"])
+            self.assertEqual(render.call_count, 3)
+
+    def test_accounts_request_returns_after_one_new_render_during_repeated_store_updates(self) -> None:
+        entered, release, request_waiting = threading.Event(), threading.Event(), threading.Event()
+
+        class ReaderCondition(threading.Condition):
+            @override
+            def wait(self, timeout: float | None = None) -> bool:
+                request_waiting.set()
+                return super().wait(timeout)
+
+        cache = serve.AccountsPageCache(condition=ReaderCondition())
+        store = usage_store.store_file()
+        _ = store.write_bytes(b"1")
+        replies: list[bytes] = []
+
+        def render_page() -> accounts_page.AccountsRender:
+            usage = store.read_bytes()
+            if usage < b"4":
+                updated = store.with_suffix(".new")
+                _ = updated.write_bytes(str(int(usage) + 1).encode())
+                _ = updated.replace(store)
+            if usage == b"1":
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(usage, .5, 200)
+
+        def request() -> None:
+            replies.append(cache.get())
+
+        with patch.object(accounts_page, "render_with_facts") as render:
+            render.return_value = accounts_page.AccountsRender(b"1", .5, 100)
+            self.assertEqual(cache.get(), b"1")
+            render.side_effect = render_page
+            reader = threading.Thread(target=request)
+            try:
+                self.assertEqual(cache.get(), b"1")
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                reader.start()
+                self.assertTrue(request_waiting.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                if reader.ident is not None:
+                    reader.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(reader.is_alive())
+                with cache.condition:
+                    self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertEqual(replies, [b"2"])
+            self.assertEqual(render.call_count, 3)
+            self.assertEqual(cache.get(), b"3")
+            self.assertEqual(store.read_bytes(), b"4")
+            self.assertEqual(render.call_count, 4)
+
+    def test_accounts_route_keeps_last_good_page_when_refresh_setting_is_unreadable(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings)
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(accounts_page, "render_with_facts", return_value=first) as render,
+              redirect_stderr(StringIO())):
+            good = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(good.status, 200)
+            settings.unlink()
+            failed = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(failed.status, 200)
+            self.assertIn(b'data-read-error="The Accounts refresh setting could not be read."', failed.body)
+            self.assertIn(b'data-read-at="100.000000"', failed.body)
+            self.assertIn(b'>board</p>', failed.body)
+
+            self.server.accounts_cache = serve.AccountsPageCache()
+            first_failure = self.request(accounts_page.PAGE_PATH)
+            self.assertEqual(first_failure.status, 503)
+            render.assert_called_once_with()
+
     def test_accounts_cached_http_response_carries_a_render_failure_then_recovers(self) -> None:
         cache = serve.AccountsPageCache()
         first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
-        with patch.object(accounts_page, "render_with_facts", return_value=first):
-            good = cache.replace()
-        with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
               redirect_stderr(StringIO())):
-            _ = cache.replace()
-        with patch.object(threading.Thread, "start"):
             failed = cache.get()
         self.assertIn(b'data-read-error="The Accounts render failed."', failed)
         self.assertIn(b'data-read-at="100.000000"', failed)
@@ -4278,8 +4525,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             response = self.request(accounts_page.PAGE_PATH)
         self.assertEqual(response.status, 200)
         self.assertEqual(response.body, failed)
-        with patch.object(accounts_page, "render_with_facts", return_value=first):
-            recovered = cache.replace()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", return_value=first)):
+            recovered = cache.get()
         self.assertNotIn(b'data-read-error', recovered)
 
     def test_accounts_first_request_waits_for_its_render(self) -> None:
@@ -4314,9 +4562,12 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_accounts_cache_keeps_only_the_last_ten_successful_render_times(self) -> None:
         cache = serve.AccountsPageCache()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
         for seconds in range(1, 13):
-            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds+100)):
-                _ = cache.replace()
+            with (patch.object(time, "monotonic", return_value=seconds * (refresh + 1)),
+                  patch.object(accounts_page, "render_with_facts",
+                               return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds + 100))):
+                _ = cache.get()
         self.assertEqual(tuple(cache.recent_times), tuple(range(3, 13)))
         self.assertIn(b'data-render-seconds="12.000000"', cache.page)
         self.assertIn(b'data-read-at="112.000000"', cache.page)
