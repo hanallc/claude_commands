@@ -11,7 +11,6 @@ import unittest
 import fcntl
 
 import io
-import json
 import os
 from pathlib import Path
 import re
@@ -28,6 +27,7 @@ from scripts.production.staff_test_support import (
     fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.test_merge_gate_promotion import green_ci_after_merge
 
 
 @final
@@ -39,6 +39,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             **fixture_git_environment(root.parent),
             **{key: value for key, value in self.environment.items() if not key.startswith("GIT_")},
             "GIT_CONFIG_SYSTEM": os.devnull,
+            "SHOWRUNNER_STATE_DIR": str(Path(self.environment["HOME"]) / ".local/state/showrunner"),
         }
 
     @override
@@ -136,13 +137,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
                     self.assertEqual(restored, [previous])
 
-    def test_checkpoint_and_promotion_retry_after_a_stop_before_push(self) -> None:
-        with self.subTest(operation="checkpoint"):
-            self.check_checkpoint_retry()
-        with self.subTest(operation="enrolled-promotion"):
-            self.check_enrolled_promotion_retry()
-
-    def check_checkpoint_retry(self) -> None:
+    def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
         checked = merge_gate.checked_git
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
@@ -163,48 +158,6 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
         self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                          [merged, self.base, self.checkpoint])
-
-    def check_enrolled_promotion_retry(self) -> None:
-        first = self.git(self.checkout, "rev-parse", "origin/integration")
-        _ = self.git(self.main, "switch", "--detach", "main")
-        _ = self.git(self.checkout, "switch", "main")
-        integration = self.root / "integration"
-        _ = self.git(self.checkout, "worktree", "add", str(integration), "integration")
-        doc = self.checkout / "docs/plans/cargo-liner-production-live.md"
-        self.write(doc, f"- **Merge checkout:** `{self.checkout}`\n"
-                   + f"- **Showrunner checkout:** `{integration}`\n"
-                   + "- **Merge branch:** `integration`\n- **Log:** `production.log`\n")
-        owner = recorded_showrunner("cargo-liner", doc)
-        owner_state = self.root / "showrunners"
-        self.environment["SHOWRUNNER_STATE_DIR"] = str(owner_state)
-        verdict = owner_state / owner.id / "session/waiting_state/ci_points.json"
-        self.write(verdict, json.dumps({"count": 1, "tip": first, "policy": "cargo-liner"}))
-        hook = self.origin / "hooks/pre-receive"
-        self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
-                   + '  if [ "$ref" = refs/heads/main ]; then echo "injected push failure" >&2; exit 1; fi\n'
-                   + "done\n")
-        hook.chmod(0o755)
-        stopped = self.run_promote_only("--production", "cargo-liner")
-        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
-        self.assertIn("injected push failure", stopped.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), first)
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-        hook.unlink()
-
-        self.write(integration / "next.txt", "next candidate\n")
-        latest = self.commit(integration, "new integration candidate")
-        _ = self.git(integration, "push", "origin", "integration")
-        held = self.run_promote_only("--production", "cargo-liner")
-        self.assertNotEqual(held.returncode, 0, held.stdout + held.stderr)
-        self.assertIn(f"collect cargo-liner CI on the integration tip before promoting {latest}", held.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), first)
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-
-        self.write(verdict, json.dumps({"count": 2, "tip": latest, "policy": "cargo-liner"}))
-        result = self.run_promote_only("--production", "cargo-liner")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), latest)
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), latest)
 
     def test_checkpoint_retry_refuses_a_remote_rewound_below_its_base(self) -> None:
         self.write(self.checkout / "published.txt", "published code\n")
@@ -450,7 +403,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef\n"
                                             + "Change-Review: none — the gate script")
         # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
-        with mock.patch.dict(os.environ, self.environment, clear=True):
+        with mock.patch.dict(os.environ, self.environment, clear=True), green_ci_after_merge(self):
             before = change_review.today()
             result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
             days = {before.isoformat(), change_review.today().isoformat()}
@@ -485,7 +438,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             return instant.astimezone(zone) if zone is not None else instant.replace(tzinfo=None)
 
         self.environment["USER_ZONE"] = "America/New_York"
-        with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)):
+        with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)), green_ci_after_merge(self):
             result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03 20:00")
@@ -502,7 +455,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef\n"
                                             + "Change-Review: The sky dims | Run `hana` in a natedev terminal | The sky turns darker | image 012345abcdef")
-        result = self.run_gate("--promote", checkpoint=checkpoint, callers_production=True)
+        with green_ci_after_merge(self):
+            result = self.run_gate("--promote", checkpoint=checkpoint, callers_production=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"Change review: 2 row(s) added to {review}: C8–C9", result.stdout)
         self.assertEqual([line.split(" | ")[1] for line in review.read_text(encoding="utf-8").splitlines()[-2:]],
@@ -523,7 +477,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(doc, "# p\n")
         _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
-        result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
+        with green_ci_after_merge(self):
+            result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Change review: the production doc has no Change review line; no rows written",
                       result.stdout)

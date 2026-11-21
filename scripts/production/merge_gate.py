@@ -1959,6 +1959,16 @@ def promotion_record_path(repo: Path, branch: str, tip: str) -> Path:
     return push_record_path(repo, "promotion", f"{branch}:{tip}")
 
 
+def promotion_retry_record(source: Path, main: Path, branch: str, tip: str) -> RecordedPush | NoRecordedPush:
+    """Find the receipt for the local tip in either checkout."""
+    for checkout in dict.fromkeys((source, main)):
+        for path in (promotion_record_path(checkout, branch, tip), push_record_path(checkout, "promotion", branch)):
+            record = read_push_record(path)
+            if isinstance(record, RecordedPush) and record.commit == tip and record.source_commit == tip:
+                return record
+    return NoRecordedPush()
+
+
 def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -2008,7 +2018,8 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str, *, legacy:
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
-    from scripts.production.checkpoint_gate import Stop, require_cargo_liner_promotion_ci
+    from scripts.production.checkpoint_gate import Stop, check_cargo_liner_promotion_ci, require_promotion_ci
+    from scripts.production.unit_lookup import doc_owner
 
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
     source = Path(args.repo).resolve() if args.enrolled else main_repo
@@ -2024,30 +2035,26 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         origin = checked_git(source, "rev-parse", "origin/main")
         target = checked_git(source, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
-            record = read_push_record(promotion_record_path(source, args.merge_branch, head))
-            if isinstance(record, NoRecordedPush):
-                record = read_push_record(push_record_path(source, "promotion", args.merge_branch))
-            if isinstance(record, NoRecordedPush) and args.enrolled:
-                record = read_push_record(push_record_path(main_repo, "promotion", args.merge_branch))
-            if (not isinstance(record, RecordedPush) or head != record.commit
-                    or record.source_commit != record.commit
+            record = promotion_retry_record(source, main_repo, args.merge_branch, head)
+            if (isinstance(record, NoRecordedPush)
                     or git(source, "merge-base", "--is-ancestor", origin, head).returncode
                     or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
-            if not args.enrolled:
-                target = record.commit
         if git(source, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
-        try:
-            require_cargo_liner_promotion_ci(main_repo, args.merge_branch, target)
-        except Stop as error:
-            raise GateRefused(str(error)) from error
         if refusal := live_file_refusal(source, target):
             raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
         if refusal := live_state_refusal(source, target):
             raise GateRefused(refusal)
+        try:
+            if check_cargo_liner_promotion_ci(main_repo, args.merge_branch, target) == "standard":
+                staff_record = staff.snapshot()
+                document = change_review.production_doc(args.production, record=staff_record)
+                require_promotion_ci(doc_owner(document, staff_record), target, "standard")
+        except (Stop, change_review.ChangeReviewError, ValueError) as error:
+            raise GateRefused(str(error)) from error
         # Preserve the receipt for HEAD if the process stops before the ref update.
         path = promotion_record_path(source, args.merge_branch, target)
         if not create_text_atomic(path, json.dumps({"base": origin, "commit": target, "source_commit": target})):
@@ -3060,7 +3067,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--tests-only", action="store_true")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
-                            help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
+                            help="promote origin/<merge-branch> to main and the Mac with a collected CI verdict")
     args = cast(GateArguments, parser.parse_args(arguments))
     args.gate_job = gate_job_for_command(["merge_gate.py", *arguments])
     if args.promote_only and not args.merge_branch:
