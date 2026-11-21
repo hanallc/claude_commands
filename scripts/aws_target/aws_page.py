@@ -228,26 +228,35 @@ class QuotaHistoryData(TypedDict):
     gpu_summary: GpuQuotaSummary
 
 
-class UnbilledHoursRowData(TypedDict):
-    kind: Literal['unbilled']
-    region: str
-    cells: list[str]
+HoursDifferenceKind = Literal['difference', 'no-difference']
+
+
+class HoursDifferenceKinds(TypedDict):
+    by_tenths: dict[str, HoursDifferenceKind]
+    default: HoursDifferenceKind
+
+
+HOURS_DIFFERENCE_KINDS: HoursDifferenceKinds = {'by_tenths': {'0': 'no-difference'}, 'default': 'difference'}
 
 
 class ComparedHoursRowData(TypedDict):
-    kind: Literal['compared']
+    size: str
     region: str
-    cells: list[str]
-    billed: float
-    recorded: float
-    difference_tenths: int
+    billed_tenths: int
+    recorded_tenths: int
+    difference_kind: HoursDifferenceKind
+    first_utc_day: str
+    last_utc_day: str
+    hana_reserved_tenths: NotRequired[int]
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill']
 
 
 class HoursComparisonData(TypedDict):
     kind: Literal['comparison']
-    rows: list[ComparedHoursRowData | UnbilledHoursRowData]
+    rows: list[ComparedHoursRowData]
     limit_percent: str
+    open_row_limit: int
+    difference_kinds: HoursDifferenceKinds
 
 
 class HoursComparisonUnavailableData(TypedDict):
@@ -284,25 +293,24 @@ def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, **table_rows_data(table)}
 
 
-def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | UnbilledHoursRowData:
+def hours_row_data(row: spot_table.ComparedMachineHoursRow) -> ComparedHoursRowData:
     check = row.check
     billed = check.billed_hours
-    recorded = round(check.box_hours, 1)
-    if billed is None:
-        return {'kind': 'unbilled', 'region': row.region, 'cells': [row.size, row.region, '—', f'{recorded:.1f}', '—', '—']}
-    difference = round(billed - check.box_hours, 1)
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
     if check.hours_gap_over:
         limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
-    if difference:
-        shown_difference = f'{difference:+.1f}'
-    else:
-        shown_difference = 'less than 0.1 hours' if check.hours_gap_over else '0.0'
-    reserved = check.hana_reserved_hours
-    cells = [row.size, row.region, f'{billed:.1f}', f'{recorded:.1f}', shown_difference,
-             f'{reserved:.1f}' if billed >= check.box_hours and reserved > 0 else '—']
-    return {'kind': 'compared', 'region': row.region, 'cells': cells, 'billed': float(billed),
-            'recorded': float(check.box_hours), 'difference_tenths': int(difference * 10), 'limit_result': limit_result}
+    billed_tenths = round(billed * 10)
+    recorded_tenths = round(check.box_hours * 10)
+    difference_kind = HOURS_DIFFERENCE_KINDS['by_tenths'].get(
+        str(billed_tenths - recorded_tenths), HOURS_DIFFERENCE_KINDS['default'])
+    compared: ComparedHoursRowData = {
+        'size': row.size, 'region': row.region, 'limit_result': limit_result,
+        'billed_tenths': billed_tenths, 'recorded_tenths': recorded_tenths, 'difference_kind': difference_kind,
+        'first_utc_day': check.first_utc_day.isoformat(), 'last_utc_day': check.last_utc_day.isoformat(),
+    }
+    if billed >= check.box_hours and check.hana_reserved_hours > 0:
+        compared['hana_reserved_tenths'] = round(check.hana_reserved_hours * 10)
+    return compared
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -609,6 +617,7 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
+              hours_table_open_row_limit: int,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
               gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
@@ -619,8 +628,13 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         percent = format(tables.hours.max_gap_ratio, '%').removesuffix('%')
         if '.' in percent:
             percent = percent.rstrip('0').rstrip('.')
-        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows],
-                 'limit_percent': f'{percent}%'}
+        hours = {
+            'kind': 'comparison', 'limit_percent': f'{percent}%',
+            'rows': [hours_row_data(row) for row in sorted(
+                tables.hours.rows, key=lambda row: row.check.box_hours - row.check.billed_hours)],
+            'open_row_limit': hours_table_open_row_limit,
+            'difference_kinds': HOURS_DIFFERENCE_KINDS,
+        }
     else:
         hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
     return {
@@ -729,6 +743,7 @@ def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, starte
     tables = spot_table.spot_tables_from(directory, now, values, configuration, gate_pricing=gate_pricing,
                                          evidence=evidence)
     data = page_data(tables, spend, now, evidence.placement_scores, launch_records=launches,
+                     hours_table_open_row_limit=configuration.whole('hours_table_open_row_limit'),
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))

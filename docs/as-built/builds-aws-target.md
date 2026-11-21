@@ -1133,17 +1133,17 @@ Below them, two tables show the refused requests and the launched boxes of each 
 Refused requests are capacity and quota refusals.
 The last card asks “Did AWS bill more machine hours than we used?”
 It uses `run_cost.hours_checks` over the days with a bill in the configured window.
-When a higher bill exceeds the limit, the answer sums the displayed differences for those rows and gives their count.
-If only lower bills exceed the limit, the answer sums the displayed differences for those rows and gives their count.
-If all comparisons pass, the answer gives the total billed hours and the total recorded hours.
-If the answer is “No” and the displayed billed total is higher, a second sentence explains the limit and the Hana allowance.
-The visible table includes only higher bills that exceed the limit.
-The closed “All rows” control opens a table for every type and region with hours in the selected regions.
-The tables show billed hours, recorded hours and the signed difference to one decimal place.
-The difference subtracts the full values before rounding.
-If a marked difference or its sum rounds to zero, it shows as “less than 0.1 hours.”
-The Hana reserved column shows the hours set aside for Hana where the check uses them.
-If the bill for a row is due, the billed hours and the difference show a dash in “All rows.”
+The answer compares the billed and recorded totals from the table.
+The next sentence reports how many rows exceed the upper limit.
+The answer reports the count below the lower limit when it is greater than zero.
+The table and its totals exclude rows without a bill.
+The “All rows” control closes the table above `hours_table_open_row_limit`.
+The date range gives the first and last UTC days that supply the displayed rows.
+The rows sort by their full difference, from largest to smallest.
+The table rounds billed and recorded hours to one decimal place before it subtracts them.
+The total row sums the displayed values.
+The same Hana allowance can appear on multiple rows in a region.
+The total row shows a dash for the Hana allowance.
 The shared region filter includes all regions with an hours check.
 
 The AWS page shows the same tables, published by `aws_page.publish`.

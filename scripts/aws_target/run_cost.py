@@ -358,24 +358,50 @@ def day_hours_from(snapshot: ledger.LedgerEvidence, readings: Sequence[ledger.Ch
                              hana_reserved_hours=reserved.get(key, _NO_RESERVED_HOURS)) for key in keys}
 
 
+@dataclass(frozen=True)
+class ComparedMachineHours:
+    billed_hours: Decimal
+    box_hours: Decimal
+    hana_reserved_hours: Decimal
+    hours_gap_over: bool
+    first_utc_day: date
+    last_utc_day: date
+
+
+@dataclass(frozen=True)
+class MachineHoursAwaitingBill:
+    box_hours: Decimal
+
+
 def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                 scope: SpotHoursScope, max_ratio: Decimal, *, bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[tuple[str, str], HoursCheck]:
-    """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
+                 scope: SpotHoursScope, max_ratio: Decimal, *,
+                 bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY
+                 ) -> dict[tuple[str, str], ComparedMachineHours | MachineHoursAwaitingBill]:
+    """Sum the hours for each type and region over its days with a bill."""
     daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_policy=bill_policy)
     return sum_hours_checks(daily, max_ratio)
 
 
-def sum_hours_checks(daily: Mapping[DayKey, HoursCheck], max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
-    billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    for (size, region, _day), check in daily.items():
-        (unbilled if check.billed_hours is None else billed)[size, region].append(check)
-    checks: dict[tuple[str, str], HoursCheck] = {}
-    for key in billed.keys() | unbilled.keys():
-        days = billed[key] if key in billed else unbilled[key]
-        billed_hours = sum((day.billed_hours or Decimal(0) for day in days), Decimal(0)) if key in billed else None
-        checks[key] = hours_check(billed_hours, sum((day.box_hours for day in days), Decimal(0)), max_ratio,
-                                 hana_reserved_hours=sum((day.hana_reserved_hours for day in days), Decimal(0)))
+def sum_hours_checks(daily: Mapping[DayKey, HoursCheck], max_ratio: Decimal
+                     ) -> dict[tuple[str, str], ComparedMachineHours | MachineHoursAwaitingBill]:
+    billed: dict[tuple[str, str], list[tuple[str, HoursCheck]]] = defaultdict(list)
+    unbilled: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+    for (size, region, day), check in daily.items():
+        if check.billed_hours is None:
+            unbilled[size, region] += check.box_hours
+        else:
+            billed[size, region].append((day, check))
+    checks: dict[tuple[str, str], ComparedMachineHours | MachineHoursAwaitingBill] = {
+        key: MachineHoursAwaitingBill(hours) for key, hours in unbilled.items() if key not in billed
+    }
+    for key, days in billed.items():
+        billed_hours = sum((check.billed_hours or Decimal(0) for _, check in days), Decimal(0))
+        box_hours = sum((check.box_hours for _, check in days), Decimal(0))
+        reserved = sum((check.hana_reserved_hours for _, check in days), Decimal(0))
+        first, last = min(day for day, _ in days), max(day for day, _ in days)
+        over = hours_check(billed_hours, box_hours, max_ratio, hana_reserved_hours=reserved).hours_gap_over
+        checks[key] = ComparedMachineHours(billed_hours, box_hours, reserved, over,
+                                          date.fromisoformat(first), date.fromisoformat(last))
     return checks
 
 

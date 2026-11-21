@@ -37,15 +37,15 @@ class Table:
 
 
 @dataclass(frozen=True)
-class MachineHoursRow:
+class ComparedMachineHoursRow:
     size: str
     region: str
-    check: run_cost.HoursCheck
+    check: run_cost.ComparedMachineHours
 
 
 @dataclass(frozen=True)
 class HoursComparison:
-    rows: tuple[MachineHoursRow, ...]
+    rows: tuple[ComparedMachineHoursRow, ...]
     checked_regions: frozenset[str]
     max_gap_ratio: Decimal
 
@@ -369,14 +369,18 @@ def billed_hours(directory: Path, now: int, scope: run_cost.SpotHoursScope, days
         checks = run_cost.sum_hours_checks(daily, max_ratio)
         checked_regions = frozenset(region for _size, region in checks)
         size_order = {size: index for index, size in enumerate(scope.sizes)}
-        active = sorted((key for key, check in checks.items() if check.billed_hours or check.box_hours),
-                        key=lambda key: (size_order[key[0]], key[1]))
-        if not active:
-            reason = ('There are no machine hours to compare.' if readings
-                      else f'No AWS bill is available yet for the last {days} days.')
-            return HoursComparisonUnavailable(reason, checked_regions)
+        rows = tuple(sorted(
+            (ComparedMachineHoursRow(size, region, check) for (size, region), check in checks.items()
+             if isinstance(check, run_cost.ComparedMachineHours) and (check.billed_hours or check.box_hours)),
+            key=lambda row: (size_order[row.size], row.region),
+        ))
+        if rows:
+            return HoursComparison(rows, checked_regions, max_ratio)
+        if any(isinstance(check, run_cost.MachineHoursAwaitingBill) and check.box_hours for check in checks.values()):
+            return HoursComparisonUnavailable('No AWS bill is available yet for the recorded hours.', checked_regions)
+        reason = ('There are no machine hours to compare.' if readings
+                  else f'No AWS bill is available yet for the last {days} days.')
+        return HoursComparisonUnavailable(reason, checked_regions)
     except ledger.LedgerUnavailable:
         return HoursComparisonUnavailable('Our records are unreadable.')
-    rows = tuple(MachineHoursRow(size, region, checks[size, region]) for size, region in active)
-    return HoursComparison(rows, checked_regions, max_ratio)
 
