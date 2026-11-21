@@ -63,12 +63,14 @@ from scripts.notify import decision_priority
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
+from scripts.whoami.mac_fallback_token import ALERT_IDS as MAC_TOKEN_ALERT_IDS
 
 API_URL = "https://api.pushover.net/1/messages.json"
 CANCEL_URL = "https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
 LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
+MAC_TOKEN_APPROVAL_REQUIRED = "Mac fallback token template needs current approval"
 RETRY_S = 300
 EXPIRE_S = 10800
 TITLE_MAX = 250
@@ -423,6 +425,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     approved = push_texts.approval_date(arguments["text_id"]) if registered_text else ""
     if arguments["text_id"] == "quota.claude_expiry" and not approved:
         return refuse(source, priority, title, message, "Claude expiry template needs current approval")
+    if arguments["text_id"] in MAC_TOKEN_ALERT_IDS and not approved:
+        return refuse(source, priority, title, message, MAC_TOKEN_APPROVAL_REQUIRED)
     if approved:
         # The text was reviewed and approved ahead of time: no live review, no reviewer wait.
         detail = f"registered text, approved {approved}"
@@ -559,7 +563,7 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail = push["detail"]
-    if push["text_id"] == "quota.claude_expiry":
+    if push["text_id"] == "quota.claude_expiry" or push["text_id"] in MAC_TOKEN_ALERT_IDS:
         if silence.active():
             return refuse(source, priority, title, message, "silence is active")
     elif priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
@@ -575,6 +579,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
     reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
+    if push["text_id"] in MAC_TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
+        reason = MAC_TOKEN_APPROVAL_REQUIRED
     if reference["kind"] == "question":
         try:
             opening = push_reference.read_question(Path(reference["path"]))
@@ -605,6 +611,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
 def post_message(source: str, priority: str, title: str, message: str,
                  keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
     """Every push to the phone goes out here, with its sender and template on one last line."""
+    if text_id in MAC_TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
+        return refuse(source, priority, title, message, MAC_TOKEN_APPROVAL_REQUIRED)
     suffix = f", {detail}" if detail else ""
     sender = sender_name(source)
     if not sender:
@@ -614,8 +622,9 @@ def post_message(source: str, priority: str, title: str, message: str,
     message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
     keys = read_keys(keys_file)
     if keys is None:
-        log(source, priority, title, message, "keys missing" + suffix)
-        print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
+        outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
+        log(source, priority, title, message, outcome + suffix)
+        print(f"pushover: {outcome}. Set PUSHOVER_USER and PUSHOVER_TOKEN in {keys_file}.", file=sys.stderr)
         return 2
     data = urllib.parse.urlencode(fields(keys, title, message, priority, key)).encode()
     try:
