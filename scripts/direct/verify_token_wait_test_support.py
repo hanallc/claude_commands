@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.process_supervisor import ManagedProcess, launch
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -31,7 +31,8 @@ from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -45,6 +46,16 @@ BOARD = VERIFY.with_name("board.sh")
 
 
 Record = dict[str, object]
+
+
+def private_verify_hold_state(root: Path, *, release_name: str = "hold-release") -> dict[str, str]:
+    """Keep the fixture's hold state and build log under its test root."""
+    return {
+        "BUILDLOG_DIR": str(root / "buildlog"),
+        "BUILD_HOLD_DIR": str(root / "build-hold"),
+        "BUILD_HOLD_RELEASE_DIR": str(root / release_name),
+        "BUILD_HOLD_ENFORCER_DIR": str(root / "hold-enforcer"),
+    }
 
 
 class VerifyTokenWaitFixture(unittest.TestCase):
@@ -197,11 +208,9 @@ esac
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
         self.environment = {
+            **verify_test_environment(),
+            **private_verify_hold_state(self.root),
             "UNIT_DETACHED_RUN": "1",
-            **{name: value for name, value in os.environ.items()
-               if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                               "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
-               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_", "UNIT_DETACHED_", "GIT_"))},
             "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
@@ -219,7 +228,6 @@ esac
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
-            "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
@@ -227,8 +235,6 @@ esac
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
-            "BUILD_HOLD_DIR": str(self.root / "build-hold"),
-            "BUILD_HOLD_RELEASE_DIR": str(self.root / "hold-release"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "ROSTER_RUN_ROOT": str(self.root / "unit"),
             "UNIT_RUN_ROOT": str(self.root / "unit"),
@@ -286,7 +292,7 @@ esac
         """
         found: list[int] = []
         result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
-                                capture_output=True, text=True, check=True)
+                                env=verify_test_environment(), capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) != 3 or parts[2].startswith("Z"):
@@ -391,6 +397,14 @@ esac
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
         admission = caller_admission(self, self.root, self.environment)
+        runner = staff.caller_identity()
+        if runner:
+            board = Path(environment["UNIT_RUN_DIR"])
+            # Bind the runner when Verify starts. Token history can assign it to a different worker.
+            if (board / "impl_worker_fixture-impl.json").is_file():
+                record_wait_workers(self.root, board, environment, {"fixture-impl": "thread-impl"},
+                                    runtime_ids={"fixture-impl": runner})
+            environment.update(build_fixture_sessions(""))
         with admission.loop_turn():
             if not admission.server.reservations and not admission.server.slots:
                 _ = admission.occupy_host()
@@ -434,10 +448,10 @@ esac
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
         """Add a private hold at the first placement request."""
         admission = caller_admission(self, self.root, self.environment)
-        holds = self.root / "build-hold"
+        holds = Path(self.environment["BUILD_HOLD_DIR"])
         holds.mkdir(exist_ok=True)
         hold = holds / fixture_runtime_id("fixture-hold-owner")
-        released = self.root / "hold-release"
+        released = Path(self.environment["BUILD_HOLD_RELEASE_DIR"])
         held_episode = ""
         previous = admission.server.handle_request
         original_provider = admission.server.host_probe
@@ -484,7 +498,7 @@ esac
         _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
         # The provider ends the hold at the next host probe, which comes with the next routing pass.
         # A short pass interval keeps the waiter from sleeping the default 15 seconds before that probe.
-        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+        return {**self.environment, **build_fixture_sessions(""), "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
                 "BUILD_TARGETS_POLL_S": "0.5"}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> ManagedProcess[bytes]:
@@ -557,8 +571,6 @@ exit "$status"
             lock = board / "locks" / "cargo.d"
             step_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
             step_group = cast(int, step_record["group"])
-            self.started_groups.add(step_group)
-
             send_process_group(first.pid, interruption)
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(first.returncode, 0)
@@ -579,7 +591,9 @@ exit "$status"
                             + "with open(os.environ['TEST_DETACHED_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
                             + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                             + "raise SystemExit(int(os.environ['TEST_DETACHED_RUNS_STATUS']))\n")
-        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": "thread-worker", "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
+        return {**self.environment, **build_fixture_sessions(""), "UNIT_DETACHED_RUN": "",
+                "CODEX_THREAD_ID": staff.caller_identity() or fixture_runtime_id("thread-worker"),
+                "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
                 "TEST_DETACHED_RUNS_CALLS": str(self.root / "detached-runs-calls"), "TEST_DETACHED_RUNS_STATUS": str(status)}
 
     def detached_runs_calls(self) -> list[list[str]]:

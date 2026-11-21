@@ -17,7 +17,7 @@ import unittest
 from unittest import mock
 
 from scripts.direct import phase_wait_holder
-from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
@@ -282,7 +282,12 @@ class VerifyTokenHolderTests(VerifyTokenWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("The fixture needs sleep.")
+        runner = staff.caller_identity()
+        if runner:
+            record_wait_workers(self.root, board, self.environment, {"fixture-impl": "thread-impl"},
+                                runtime_ids={"fixture-impl": runner})
         environment = {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+                       "CODEX_THREAD_ID": runner or self.environment["CODEX_THREAD_ID"],
                        "TEST_POLL_ROOT": str(self.root), "BUILDLOG_MEM_POLL_S": "1",
                        "TEST_REAL_SLEEP": real_sleep}
         lease = subprocess.run(["bash", str(BOARD), "acquire", str(board), "fixture-first", "cargo",

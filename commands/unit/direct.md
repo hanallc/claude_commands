@@ -329,6 +329,13 @@ started with `detached_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
 Records are in `${SESSION_DIR}/detached_runs/`, each log beside its record.
+For Python test runs, pass `--kind python-tests` before `--`.
+To limit memory for the detached command, use this scope form.
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>
+```
+
 `start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.

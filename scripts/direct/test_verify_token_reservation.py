@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.process_supervisor import ManagedProcess, launch
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue import admission_records
 
@@ -144,9 +144,10 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("the token wait test needs sleep on PATH")
-        peer = self.enterContext(launch([real_sleep, "600"]))
+        peer = self.enterContext(launch([real_sleep, str(TEST_HANG_GUARD_SECS)], env=verify_test_environment()))
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
                                 "--hold", "3600", "--wait", "0"],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stderr)
         shell = self.root / "local-attempt.sh"
@@ -226,6 +227,8 @@ python3 "$TEST_WAIT_HELPER" "$TEST_OLD_RELEASE"
 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$BUILDLOG_MEM_RESERVATION"
 BUILDLOG_MEM_RESERVATION=""
 : > "$TEST_OLD_GAP"
+# Wait for the new client to take the token after the memory refund.
+python3 "$TEST_WAIT_HELPER" "$TEST_RUNNING"
 bash "$TEST_BOARD" acquire "$TEST_BOARD_DIR" old cargo --pid $$ --hold 3600 --wait 30
 trap 'bash "$TEST_BOARD" release "$TEST_BOARD_DIR" old cargo --pid $$' EXIT
 BUILDLOG_MEM_TOKEN_BACK_AT=$(python3 -c 'import time; print(time.time())')

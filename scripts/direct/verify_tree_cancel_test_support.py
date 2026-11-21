@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, caller_admission, caller_provider_controls, private_provider_evidence,
 )
@@ -12,7 +13,6 @@ from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json
-import os
 import re
 import shlex
 import shutil
@@ -260,8 +260,6 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         process = self.enterContext(launch_process(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
-        self.started_groups.add(process.pid)
-        self.addCleanup(self.finish_process, process)
         return process
 
     @override
@@ -273,11 +271,6 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.fail(f"verify exited before {path.name}: {output!r} {errors!r}")
             raise
-
-    def finish_process(self, process: ManagedProcess[str]) -> None:
-        if process.poll() is None:
-            self.end_group(process.pid)
-        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def cargo_calls(self) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in
@@ -291,9 +284,6 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         self.assertTrue((self.board / "locks/cargo.d").is_dir(), "test did not take the cargo token")
         self.assertTrue(self.admission.server.reservations,
                         "test did not take memory admission")
-        # The token owner starts a separate session. Register it for test cleanup.
-        descendant = int((self.control / "descendant.pid").read_text())
-        self.started_groups.add(os.getpgid(descendant))
 
     def assert_resources_released(self) -> None:
         self.assertFalse((self.board / "locks/cargo.d").exists(), "cancel kept the token")
@@ -304,6 +294,7 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"cargo descendant {pid} survived: {state}")
 

@@ -1,13 +1,21 @@
 """Real verify.sh token handoff behavior."""
 from __future__ import annotations
 
-from scripts.lib.process_supervisor import ManagedProcess, launch
-
+from pathlib import Path
 import subprocess
 import unittest
+
+from scripts.build_hold.override_guard import user_home
+from scripts.buildlog import store
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_runtime_id
+
+
+def live_hold_logs() -> dict[str, int]:
+    directory = user_home() / Path(store.DEFAULT_ROOT_DISPLAY).relative_to("~") / store.host_name()
+    return {path.name: path.stat().st_size for path in directory.glob("hold-builds-*.jsonl")}
 
 
 class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
@@ -16,6 +24,7 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
         lock = board / "locks" / "cargo.d"
         environment = self.hold_environment(board, 0)
         output = self.root / "held.out"
+        live_logs_before = live_hold_logs()
         held = self.start_hold_waiter(environment, output)
         peer: ManagedProcess[bytes] | None = None
         try:
@@ -25,8 +34,7 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
             peer = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                     cwd=self.root,
                                     env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1",
-                                         "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("fixture-hold-owner"),
-                                         "CODEX_THREAD_ID": fixture_runtime_id("fixture-hold-owner")},
+                                         **build_fixture_sessions(fixture_runtime_id("fixture-hold-owner"))},
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             self.wait_for_running(self.root / "running", peer)
             self.assertEqual((lock / "holder_pid").read_text(), str(peer.pid))
@@ -46,6 +54,7 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
                     if process.poll() is None:
                         self.end_group(process.pid)
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(live_hold_logs(), live_logs_before, "the fixture changed live hold logs")
 
     def test_a_hold_wait_that_leaves_for_the_mac_never_takes_the_token(self) -> None:
         board = self.root / "board"

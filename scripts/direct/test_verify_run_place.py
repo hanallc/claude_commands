@@ -1,7 +1,7 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
 
@@ -9,16 +9,17 @@ import json
 import os
 from pathlib import Path
 import select
-import signal
 import subprocess
 from typing import TypedDict, cast
 import unittest
+from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.direct.verify_token_wait_test_support import private_verify_hold_state
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.process_group import send_process_group
 from scripts.lib.process_supervisor import ManagedProcess, launch
+from scripts.production import staff
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -78,22 +79,15 @@ fi
         repository = script.parents[2] / "repository"
         repository.mkdir()
         _ = (repository / "Cargo.toml").write_text("[workspace]\n")
-        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True,
+        environment = verify_test_environment()
+        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, env=environment, check=True,
                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
-                       "UNIT_DETACHED_RUN": "", **changes}
-        _ = environment.pop("PYTHONPATH", None)
-        _ = environment.pop("BUILDLOG_RUN", None)
-        process = self.enterContext(launch(["bash", str(script), name, *words], cwd=repository, env=environment,
-                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                           text=True))
-        self.addCleanup(self.stop, process)
-        return process
-
-    def stop(self, process: ManagedProcess[str]) -> None:
-        if process.poll() is None:
-            send_process_group(process.pid, signal.SIGKILL)
-        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        fixture_root = script.parents[2]
+        environment.update(private_verify_hold_state(fixture_root))
+        environment.update({"IN_NIX_SHELL": "fixture", "HOME": str(fixture_root), **changes})
+        return self.enterContext(launch(["bash", str(script), name, *words], cwd=repository, env=environment,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True))
 
     def probe(self, process: ManagedProcess[str]) -> RunProbe:
         assert process.stdout is not None
@@ -114,6 +108,18 @@ fi
         expected = wire.RunIdentity(probe["pid"], owner.start_time)
         self.assertEqual(probe["run"], f"{expected.pid}:{expected.start_time}")
         return expected
+
+    def test_startup_does_not_read_the_caller_bash_env(self) -> None:
+        with AdmissionFixture() as fixture:
+            startup = fixture.root / "caller-startup.sh"
+            _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\n')
+            with mock.patch.dict(os.environ, {"BASH_ENV": str(startup)}):
+                process = self.start(self.script(fixture), "startup")
+            self.assertEqual(self.probe(process)["pid"], process.pid)
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            self.assertFalse(startup.with_suffix(".sh.ran").exists())
 
     def test_nested_verify_keeps_the_outer_identity_and_queue_order(self) -> None:
         with AdmissionFixture() as fixture:
@@ -153,8 +159,8 @@ environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
 with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
     with Path(os.environ["DETACHED_OUTPUT"]).open("w") as output:
         with Path(os.environ["DETACHED_ERROR"]).open("w") as errors:
-            subprocess.Popen(command, env=environment, stdin=input_stream, stdout=output, stderr=errors,
-                             start_new_session=True)
+            # The test guardian owns the child after the launcher exits.
+            subprocess.Popen(command, env=environment, stdin=input_stream, stdout=output, stderr=errors)
 ''')
             incoming = fixture.root / "detached.in"
             outgoing = fixture.root / "detached.out"
@@ -164,7 +170,7 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             output_fd = os.open(outgoing, os.O_RDWR | os.O_NONBLOCK)
             self.addCleanup(os.close, input_fd)
             self.addCleanup(os.close, output_fd)
-            process = self.start(script, "detached", CODEX_THREAD_ID="fixture",
+            process = self.start(script, "detached", CODEX_THREAD_ID=staff.caller_identity() or "fixture",
                                  VERIFY_DETACHED_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
                                  DETACHED_OUTPUT=str(outgoing), DETACHED_ERROR=str(fixture.root / "detached.err"))
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -173,7 +179,6 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
                             "detached verify did not reach the probe")
             probe = cast(RunProbe, json.loads(os.read(output_fd, 65536)))
             run = self.identity(fixture, probe)
-            self.addCleanup(self.end_detached, run.pid)
             self.assertNotEqual(run.pid, process.pid)
             self.assertIsInstance(fixture.proc.owner_start(process.pid), service.OwnerProcessGone)
             first = fixture.request(run=run)
@@ -195,19 +200,14 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             started = fixture.root / "detach-started"
             _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
             process = self.start(script, "build", "sample", "--release", "--attached",
-                                 CODEX_THREAD_ID="fixture", VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
+                                 CODEX_THREAD_ID=staff.caller_identity() or "fixture",
+                                 VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
             probe = self.probe(process)
             self.assertEqual(probe["pid"], process.pid)
             self.proceed(process)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)
             self.assertFalse(started.exists(), "an --attached build started the detach launcher")
-
-    def end_detached(self, pid: int) -> None:
-        try:
-            send_process_group(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
 
     def test_mac_startup_reads_no_proc_and_creates_no_run_identity(self) -> None:
         with AdmissionFixture() as fixture:
