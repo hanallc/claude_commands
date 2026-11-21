@@ -69,7 +69,7 @@ from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib.build_steps import gate_job_for_command, read_step_names
 from scripts.production import affected_modules, change_review, land_runs, session_staff, staff, unit_config, unit_names  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
@@ -1955,6 +1955,10 @@ def push_record_path(repo: Path, operation: str, source: str) -> Path:
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
 
+def promotion_record_path(repo: Path, branch: str, tip: str) -> Path:
+    return push_record_path(repo, "promotion", f"{branch}:{tip}")
+
+
 def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -2018,10 +2022,11 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         fetch_branches(source, "main", args.merge_branch)
         head = checked_git(source, "rev-parse", "refs/heads/main")
         origin = checked_git(source, "rev-parse", "origin/main")
-        path = push_record_path(source, "promotion", args.merge_branch)
         target = checked_git(source, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
-            record = read_push_record(path)
+            record = read_push_record(promotion_record_path(source, args.merge_branch, head))
+            if isinstance(record, NoRecordedPush):
+                record = read_push_record(push_record_path(source, "promotion", args.merge_branch))
             if isinstance(record, NoRecordedPush) and args.enrolled:
                 record = read_push_record(push_record_path(main_repo, "promotion", args.merge_branch))
             if (not isinstance(record, RecordedPush) or head != record.commit
@@ -2029,7 +2034,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
                     or git(source, "merge-base", "--is-ancestor", origin, head).returncode
                     or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
-            target = record.commit
+            if not args.enrolled:
+                target = record.commit
         if git(source, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
         try:
@@ -2042,9 +2048,14 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             raise GateRefused(conflict)
         if refusal := live_state_refusal(source, target):
             raise GateRefused(refusal)
-        write_push_record(path, RecordedPush(origin, target, target))
+        # Preserve the receipt for HEAD if the process stops before the ref update.
+        path = promotion_record_path(source, args.merge_branch, target)
+        if not create_text_atomic(path, json.dumps({"base": origin, "commit": target, "source_commit": target})):
+            existing = read_push_record(path)
+            if not isinstance(existing, RecordedPush) or existing.commit != target or existing.source_commit != target:
+                raise GateRefused(f"promotion receipt changed: {path}")
         try:
-            waiting_rows.move_to(main_repo, target)
+            waiting_rows.move_to(main_repo, target, fast_forward=True, expected_head=head)
         except (OSError, UnicodeError) as error:
             raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
         try:

@@ -11,6 +11,7 @@ import unittest
 import fcntl
 
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,7 @@ from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -30,6 +32,15 @@ from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGat
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    @override
+    def bind_fixture(self, root: Path) -> None:
+        super().bind_fixture(root)
+        self.environment = {
+            **fixture_git_environment(root.parent),
+            **{key: value for key, value in self.environment.items() if not key.startswith("GIT_")},
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -125,7 +136,13 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
                     self.assertEqual(restored, [previous])
 
-    def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
+    def test_checkpoint_and_promotion_retry_after_a_stop_before_push(self) -> None:
+        with self.subTest(operation="checkpoint"):
+            self.check_checkpoint_retry()
+        with self.subTest(operation="enrolled-promotion"):
+            self.check_enrolled_promotion_retry()
+
+    def check_checkpoint_retry(self) -> None:
         checked = merge_gate.checked_git
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
@@ -146,6 +163,48 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
         self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                          [merged, self.base, self.checkpoint])
+
+    def check_enrolled_promotion_retry(self) -> None:
+        first = self.git(self.checkout, "rev-parse", "origin/integration")
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        integration = self.root / "integration"
+        _ = self.git(self.checkout, "worktree", "add", str(integration), "integration")
+        doc = self.checkout / "docs/plans/cargo-liner-production-live.md"
+        self.write(doc, f"- **Merge checkout:** `{self.checkout}`\n"
+                   + f"- **Showrunner checkout:** `{integration}`\n"
+                   + "- **Merge branch:** `integration`\n- **Log:** `production.log`\n")
+        owner = recorded_showrunner("cargo-liner", doc)
+        owner_state = self.root / "showrunners"
+        self.environment["SHOWRUNNER_STATE_DIR"] = str(owner_state)
+        verdict = owner_state / owner.id / "session/waiting_state/ci_points.json"
+        self.write(verdict, json.dumps({"count": 1, "tip": first, "policy": "cargo-liner"}))
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                   + '  if [ "$ref" = refs/heads/main ]; then echo "injected push failure" >&2; exit 1; fi\n'
+                   + "done\n")
+        hook.chmod(0o755)
+        stopped = self.run_promote_only("--production", "cargo-liner")
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("injected push failure", stopped.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), first)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        hook.unlink()
+
+        self.write(integration / "next.txt", "next candidate\n")
+        latest = self.commit(integration, "new integration candidate")
+        _ = self.git(integration, "push", "origin", "integration")
+        held = self.run_promote_only("--production", "cargo-liner")
+        self.assertNotEqual(held.returncode, 0, held.stdout + held.stderr)
+        self.assertIn(f"collect cargo-liner CI on the integration tip before promoting {latest}", held.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), first)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+        self.write(verdict, json.dumps({"count": 2, "tip": latest, "policy": "cargo-liner"}))
+        result = self.run_promote_only("--production", "cargo-liner")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), latest)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), latest)
 
     def test_checkpoint_retry_refuses_a_remote_rewound_below_its_base(self) -> None:
         self.write(self.checkout / "published.txt", "published code\n")

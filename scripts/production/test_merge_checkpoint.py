@@ -143,6 +143,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 _ = self.git("switch", "main")
                 integration = self.root / "integration"
                 _ = self.git("worktree", "add", str(integration), "production")
+                # The ignore rule applies to the unit worktree too.
+                checkpoint = self.checkpoint(path, content)
                 live_doc = self.checkout / "docs/plans/example-production-live.md"
                 self.write(self.checkout, str(live_doc.relative_to(self.checkout)), self.doc.read_text().replace(
                     f"- **Showrunner checkout:** `{self.checkout}`",
@@ -162,7 +164,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 main = self.git("rev-parse", "main")
                 original_index = self.git("write-tree")
                 original_tip = self.git("rev-parse", "production", cwd=self.origin)
-                checkpoint = self.checkpoint(path, content)
                 result = self.run_checkpoint(checkpoint)
                 self.assertEqual(result.process.returncode == 0, allowed, result.process.stdout + result.process.stderr)
                 self.assertEqual(self.git("rev-parse", "HEAD"), main)
@@ -174,6 +175,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin),
                                      self.git("rev-parse", "HEAD", cwd=integration))
                 else:
+                    self.assertIn("merge: held — incoming tree conflicts with live production files",
+                                  result.process.stdout)
                     self.assertIn(str(self.checkout / "live/ledger"), result.process.stdout)
                     self.assertEqual(log, "live bytes\n")
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
