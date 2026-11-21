@@ -1,7 +1,7 @@
 """Use the same Darwin start identity for claim adoption and PID reuse."""
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import io
@@ -17,7 +17,7 @@ import sys
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lib import process_start as identity
 from scripts.build_queue import placement, admission_protocol as wire
 from scripts.build_queue.test_placement import (
@@ -27,6 +27,101 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 
 class ClaimProcessStartTests(unittest.TestCase):
+    def test_claim_from_a_long_wait_uses_the_same_worktree_as_the_runner(self) -> None:
+        with PlacementFixture() as fixture:
+            root = fixture.root
+            repository = root / "hana"
+            repository.mkdir()
+            alias = root / "checkout"
+            alias.symlink_to(repository, target_is_directory=True)
+            _ = write_config_fixture(root / "mac_test.conf", "offload=on\nlinux_only.hana=\n", template="mac_test")
+            request = placement_request(fixture, since=fixture.clock.now())
+            fixture.clock.advance(3600)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            args = mac_test.CliArguments()
+            args.pid, args.repo_root, args.package = assignment.owner.pid, str(alias), "hana"
+            args.settings = str(root / "mac_test.conf")
+            args.identity = True
+            paths = mac_test.StatePaths(root / "provider")
+            reservation = io.StringIO()
+            with mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                    redirect_stdout(reservation):
+                self.assertEqual(mac_test.command_claim_wait(args, paths, session=assignment.session,
+                    assignment=assignment), 0)
+            exact = claim_state.reply_claim_identity(reservation.getvalue())
+            assert isinstance(exact, claim_state.ClaimIdentity)
+            runner_pid = assignment.owner.pid + 1
+            runner_start = identity.Started("70000")
+
+            def read_start(pid: int) -> identity.ProcessStart:
+                if pid == runner_pid:
+                    return runner_start
+                self.assertEqual(pid, assignment.owner.pid)
+                return identity.Started(assignment.owner.start_time)
+
+            with mock.patch.object(identity, "process_start", side_effect=read_start), redirect_stdout(io.StringIO()):
+                parser = offload.parser()
+                runner = offload.request_from_arguments(parser.parse_args(
+                    ["run", "--repo-root", str(alias), "--call-id", assignment.episode],
+                    namespace=offload.CliArguments()))
+                adoption = mac_test.CliArguments()
+                adoption.pid, adoption.from_pid = runner_pid, assignment.owner.pid
+                adoption.remote, adoption.worktree = assignment.destination.host, str(runner.repo_root)
+                adoption.claim_id, adoption.episode, adoption.attempt = exact.claim_id, exact.episode, exact.attempt
+                status = mac_test.command_claim(adoption, paths, watch_claim=False, assignment=assignment)
+            self.assertEqual(status, 0)
+            adopted, = mac_test.read_claims(paths)
+            self.assertEqual(claim_state.claim_identity(adopted.record), exact)
+            self.assertEqual((adopted.record["pid"], adopted.record["proc_start"]), (runner_pid, runner_start.start))
+
+    def test_adoption_refusal_names_the_failed_check_without_changing_the_reservation(self) -> None:
+        checks = ("runner pid start", "no reservation", "reservation count", "scope", "pid", "identity",
+                  "submitting session", "remote host", "proc_start", "worktree", "remote missing", "block state")
+        for check in checks:
+            with self.subTest(check=check), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = mac_test.StatePaths(root)
+                scope = mac_test.RepositoryScope("hana")
+                session = OwningSession("fixture-session")
+                record: mac_test.ProcessBoundClaim = {
+                    "claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a",
+                    "submitting_session": session.session_id, "pid": 41, "proc_start": "40000",
+                    "what": "waiting", "worktree": str(root), "since": "2026-11-04T00:00:00+00:00",
+                    "repo_name": "other" if check == "scope" else "hana", "repo_key": "",
+                }
+                args = mac_test.CliArguments()
+                args.pid, args.from_pid = 42, 40 if check == "pid" else 41
+                args.claim_id, args.episode = "claim-a", "episode-a"
+                args.attempt = "foreign-attempt" if check == "identity" else "attempt-a"
+                args.worktree = str(root / "other") if check == "worktree" else str(root)
+                if check != "remote missing":
+                    args.remote = "fixture-mac"
+                if check == "submitting session":
+                    session = OwningSession("foreign-session")
+                if check != "no reservation":
+                    mac_test.write_json(paths.run, {**record, "remote_host": "fixture-mac"} if check == "remote host"
+                                        else record)
+                if check == "reservation count":
+                    paths.claims.mkdir()
+                    mac_test.write_json(paths.claims / "duplicate.json", record)
+                if check == "block state":
+                    _ = paths.block.write_text("invalid block\n")
+                before = mac_test.read_claims(paths)
+
+                def read_start(pid: int) -> identity.ProcessStart:
+                    if pid == 42:
+                        return identity.Gone() if check == "runner pid start" else identity.Started("42000")
+                    return identity.Started("41000" if check == "proc_start" else "40000")
+
+                errors = io.StringIO()
+                with mock.patch.object(identity, "process_start", side_effect=read_start), redirect_stderr(errors), \
+                        redirect_stdout(io.StringIO()):
+                    result = mac_test.adopt_wait_claim(args, paths, scope, session=session)
+                self.assertEqual(result, mac_test.ClaimFinished(12))
+                self.assertEqual(errors.getvalue().splitlines(), [f"cannot adopt the Mac claim: {check}"])
+                self.assertEqual(mac_test.read_claims(paths), before)
+
     def test_assigned_claims_keep_provider_overlap_rules_and_never_substitute_a_linux_slot(self) -> None:
         cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int]], ...] = (
             ("mac", mac_test.RepositoryScope("hana"), mac_test.RepositoryScope("hana"), [0, 11]),

@@ -8,10 +8,11 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 import fcntl
 import json
 import math
@@ -1948,23 +1949,55 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
+class WaitClaimCheck(StrEnum):
+    RUNNER_START = "runner pid start"
+    NO_RESERVATION = "no reservation"
+    RESERVATION_COUNT = "reservation count"
+    SCOPE = "scope"
+    PID = "pid"
+    IDENTITY = "identity"
+    SESSION = "submitting session"
+    REMOTE_HOST = "remote host"
+    OWNER_START = "proc_start"
+    WORKTREE = "worktree"
+    REMOTE_MISSING = "remote missing"
+    BLOCK_STATE = "block state"
+
+
+def refuse_wait_claim(check: WaitClaimCheck) -> ClaimFinished:
+    print(f"cannot adopt the Mac claim: {check}", file=sys.stderr)
+    return ClaimFinished(12)
+
+
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                      *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer a live reservation under the target lock without releasing capacity."""
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
-        return ClaimFinished(12)
-    claims = read_claims(paths)
-    owners = [claim for claim in claims if scopes_overlap(claim.scope, scope)
-              and claim.record["pid"] == args.from_pid
-              and claim_state.claim_identity(claim.record) == claim_state.ClaimIdentity(
-                  args.claim_id, args.episode, args.attempt)
-              and claim.record["submitting_session"] == claim_state.session_id(session)
-              and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
-              and process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])
-              and (claim.record["worktree"] == args.worktree or claim.record.get("cleanup_pending"))]
-    if len(owners) != 1 or not isinstance(args.remote, str):
-        return ClaimFinished(12)
+        return refuse_wait_claim(WaitClaimCheck.RUNNER_START)
+    if not isinstance(args.remote, str):
+        return refuse_wait_claim(WaitClaimCheck.REMOTE_MISSING)
+    owners = read_claims(paths)
+    if not owners:
+        return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
+    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
+        (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
+        (WaitClaimCheck.SCOPE, lambda claim: scopes_overlap(claim.scope, scope)),
+        (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
+        (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),
+        (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
+        (WaitClaimCheck.OWNER_START, lambda claim:
+            process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
+        (WaitClaimCheck.WORKTREE, lambda claim: claim.record["worktree"] == args.worktree
+            or claim.record.get("cleanup_pending") is True),
+    )
+    for check, matches in checks:
+        owners = tuple(claim for claim in owners if matches(claim))
+        if not owners:
+            return refuse_wait_claim(check)
+    if len(owners) != 1:
+        return refuse_wait_claim(WaitClaimCheck.RESERVATION_COUNT)
     claim = owners[0]
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(claim.scope, RepositoryScope)
             and args.leased_slots and claim.scope.slot not in args.leased_slots):
@@ -1975,8 +2008,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         try:
             block = blocking_claim_block(paths, session)
         except (OSError, StateReadError):
-            print(f"state unreadable: {paths.block}")
-            return ClaimFinished(12)
+            return refuse_wait_claim(WaitClaimCheck.BLOCK_STATE)
         if not isinstance(block, NoMacBlock):
             return blocked_claim(block)
     record: RemoteJobClaim
@@ -2006,10 +2038,11 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
 
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = eligibility.read_config(settings)
-    if isinstance(eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package,
+    worktree = Path(args.repo_root).resolve()
+    if isinstance(eligibility.mac_step_eligibility(config, worktree, args.package,
                                              args.verb, args.target, kind=kind), eligibility.IneligibleMacStep):
         return 1
-    args.worktree = args.repo_root
+    args.worktree = str(worktree)
     args.what = f"{args.verb} {args.package or 'workspace'}"
     return command_claim(args, paths, watch_claim=False, session=session, assignment=assignment)
 

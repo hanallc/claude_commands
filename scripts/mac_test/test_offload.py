@@ -967,6 +967,16 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
 
 
 class OffloadCommandTests(OffloadCommandFixture):
+    def test_wait_claim_decline_prints_the_child_status_and_failed_check(self) -> None:
+        result = self.command(runner_options=(
+            "--claim-owner-pid", str(os.getpid()), "--claim-id", "missing-claim",
+            "--episode", "wait-episode", "--attempt", "wait-attempt",
+        ))
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertIn("mac_test: not running on the Mac (state: claim child exited 12: "
+                      + "cannot adopt the Mac claim: no reservation)", result.stdout)
+        self.assertEqual(self.events(), [])
+
     def test_remote_build_target_directory_reaches_the_result_file(self) -> None:
         self.write_portable_workspace()
         stub = self.bin_directory / "command-stub"

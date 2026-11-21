@@ -729,6 +729,11 @@ class MacClaimNotConfirmed:
     stderr: str
 
 
+@dataclass(frozen=True)
+class MacClaimChildStateFailure(MacClaimNotConfirmed):
+    status: int
+
+
 MacClaimAnswer = FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
 
 
@@ -1615,10 +1620,11 @@ def read_claim_answer(result: CapturedCommandResult, *,
         if len(hosts) == 1 and hosts[0]:
             return TakenOverMacClaim(hosts[0], slot)
         return TakeoverHostUnreadable()
-    reason: MacDeclineReason = (
-        "blocked" if result.status == 10 else "busy" if result.status == 11 else "state"
-    )
-    return MacClaimNotConfirmed(reason, result.stdout, result.stderr)
+    if result.status == 10:
+        return MacClaimNotConfirmed("blocked", result.stdout, result.stderr)
+    if result.status == 11:
+        return MacClaimNotConfirmed("busy", result.stdout, result.stderr)
+    return MacClaimChildStateFailure("state", result.stdout, result.stderr, result.status)
 
 
 def probe_reachability(
@@ -3291,6 +3297,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     claim = claim_for_run(controller, config, request, repository, tuple(leases))
+    claim_from_wait = isinstance(request.admission, MacClaimFromWait)
     # A transferred reservation can be adopted only once.
     request = replace(request, admission=UnclaimedMacRun())
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
@@ -3313,6 +3320,12 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
+        if claim_from_wait and isinstance(claim, MacClaimChildStateFailure):
+            check = " ".join((claim.stderr.strip() or claim.stdout.strip()).splitlines())
+            detail = f"state: claim child exited {claim.status}"
+            if check:
+                detail += f": {check}"
+            return DeclinedMacRun("state", elapsed_seconds(started), detail)
         if claim.reason in ("busy", "blocked"):
             controller.attempt_evidence.provider = placement.NoProviderClaim()
         if not decline_already_shown(claim.reason, request.last_decline):
