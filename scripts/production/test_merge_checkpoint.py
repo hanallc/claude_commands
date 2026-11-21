@@ -511,11 +511,28 @@ if "-E" not in args:
                     self.assertIn("other units: ok — same-repo: src/alpha.txt", result.process.stdout)
 
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
-        for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref"):
+        rust_file = "src/alpha.rs"
+        validation_failures = {
+            "validation": ("rustfmt", f"error: expected a closing delimiter\n --> {rust_file}:2:5"),
+            "validation rollback": ("rustfmt", f"error: formatter failed\n --> {rust_file}:2:5"),
+            "long diagnostic": ("rustfmt", "error: " + "unexpected closing delimiter in this block; " * 12
+                                + f"\n --> {rust_file}:2:5"),
+            "rustfmt missing module": ("rustfmt", "Error writing files: failed to resolve mod `alpha`: "
+                                       + f"{self.checkout / rust_file} does not exist"),
+            "cargo-mend warning": ("cargo-mend", f"warning: unused variable\n --> {rust_file}:2:5"),
+            "git fatal": ("direct push to production", "fatal: the remote end hung up unexpectedly"),
+            "branch moved": ("direct push to production", "merge branch moved during validation"),
+        }
+        for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref", *validation_failures):
             with self.subTest(failure=failure):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
+                if failure == "rustfmt missing module":
+                    self.write(self.checkout, rust_file, "fn work() {}\n")
+                    _ = self.git("add", rust_file)
+                    _ = self.git("commit", "-m", "Add alpha module")
+                    _ = self.git("merge", "--ff-only", self.git("rev-parse", "HEAD"), cwd=self.unit)
                 self.write(self.checkout, "local-only.txt", "local commit must survive\n")
                 _ = self.git("add", "local-only.txt")
                 _ = self.git("commit", "-m", "local merge branch work not on origin")
@@ -523,7 +540,16 @@ if "-E" not in args:
                 remote = self.git("rev-parse", "origin/production")
                 self.assertNotEqual(before, remote)
                 main = self.push_main_change("main-only.txt", "independent main work\n")
-                checkpoint = self.checkpoint()
+                step, diagnostic = validation_failures.get(failure, ("", ""))
+                validation = f"!!! VALIDATION FAILED at step: {step} !!!" if step and not step.startswith("direct push") else ""
+                progress = "still waiting for memory (47 min): place 8 in line"
+                if failure == "rustfmt missing module":
+                    _ = self.git("rm", rust_file, cwd=self.unit)
+                    _ = self.git("commit", "-m", "Remove alpha module", cwd=self.unit)
+                    checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+                    _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+                else:
+                    checkpoint = self.checkpoint(rust_file if step else "src/alpha.txt")
                 if failure in ("rollback-fetch", "rollback-ref"):
                     _ = self.git("merge", "--no-ff", "-m", "Merge checkpoint", checkpoint)
                     self.assertNotEqual(self.git("rev-parse", "HEAD"), before)
@@ -556,6 +582,18 @@ if "-E" not in args:
                     hook = self.origin / "hooks/pre-receive"
                     _ = hook.write_text("#!/bin/sh\nexit 1\n")
                     hook.chmod(0o755)
+                elif step:
+                    self.push = "validate_and_push"
+                    self.production_doc()
+                    formatter_edit = (f"Path({rust_file!r}).write_text('partial formatter edit\\n')\n"
+                                      if failure == "validation rollback" else "")
+                    self.executable(self.bin / "validate_and_push.sh", STUB + f"""
+print("=== STEP: {step} ===", flush=True)
+{formatter_edit}print({diagnostic!r}, flush=True)
+print({validation!r}, flush=True)
+print({progress!r}, file=sys.stderr, flush=True)
+raise SystemExit(1)
+""")
                 else:
                     real_git = shutil.which("git")
                     self.executable(self.bin / "checkpoint-test", STUB + '''
@@ -576,13 +614,41 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                 result = self.run_checkpoint(checkpoint)
                 self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
                 self.assertIn("push: failed", result.process.stdout)
+                if step:
+                    push_log = self.root / "scratch" / f"merge_{checkpoint[:7]}_push.log"
+                    summary = (f"Error writing files: failed to resolve mod `alpha`: {rust_file} does not exist"
+                               if failure == "rustfmt missing module" else diagnostic.splitlines()[0])
+                    cause = " ".join(part for part in (validation, summary) if part)
+                    if failure == "long diagnostic":
+                        stop = result.process.stdout[result.process.stdout.index("push: failed — "):].splitlines()[0]
+                        self.assertTrue(stop.startswith(f"push: failed — {validation} error: unexpected closing"), stop)
+                        self.assertTrue(stop.endswith(f" — log {push_log}"), stop)
+                        self.assertNotIn(summary, stop)
+                    else:
+                        self.assertIn(f"push: failed — {cause} — log {push_log}",
+                                      result.process.stdout)
+                    self.assertNotIn(progress, result.process.stdout)
+                    notices = [line for line in result.process.stdout.splitlines() if line.startswith("send ")]
+                    if failure in ("validation rollback", "git fatal", "branch moved"):
+                        self.assertEqual(notices, ["send alpha: the showrunner will inspect the failed command"])
+                    else:
+                        self.assertEqual(notices, [f"send alpha: repair the push failure in {rust_file} "
+                                                   + "and send a new checkpoint"])
+                    self.assertIn(f"=== STEP: {step} ===\n{diagnostic}\n{validation}\n{progress}\n",
+                                  push_log.read_text())
+                    if failure == "validation rollback":
+                        self.assertIn("rollback failed", result.process.stdout)
+                        self.assertIn("not uptodate", result.process.stdout)
+                        self.assertEqual((self.checkout / rust_file).read_text(), "partial formatter edit\n")
+                        self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, "HEAD"), "")
                 if failure == "final-fetch":
                     self.assertIn("test: ok", result.process.stdout)
                     self.assertIn("fixture final fetch failed", result.process.stdout)
                     tested_tip = (self.state / "tested-tip").read_text()
                     self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tested_tip), "")
                     self.assertEqual(self.git("merge-base", "--is-ancestor", main, tested_tip), "")
-                self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                if failure != "validation rollback":
+                    self.assertEqual(self.git("rev-parse", "HEAD"), before)
                 self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
                 self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
                 self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
@@ -602,14 +668,35 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         return doc
 
     def test_scope_leaves_out_another_productions_paths(self) -> None:
-        doc = self.import_production_paths()
-        sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
-        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            accepted = self.run_checkpoint(sha)
-        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
-        self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
+        for outcome in ("clean", "validation fails in imported file"):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                doc = self.import_production_paths()
+                sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
+                if outcome != "clean":
+                    self.push = "validate_and_push"
+                    self.production_doc()
+                    self.executable(self.bin / "validate_and_push.sh", STUB + """
+print("=== STEP: taplo ===")
+print("error: invalid TOML")
+print("  ┌─ outside/imported.txt:2:5")
+print("!!! VALIDATION FAILED at step: taplo !!!")
+raise SystemExit(1)
+""")
+                with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+                    result = self.run_checkpoint(sha).process
+                self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", result.stdout)
+                if outcome == "clean":
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+                    self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("error: invalid TOML", result.stdout)
+                    notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                    self.assertEqual(notices, ["send alpha: the showrunner will inspect the failed command"])
 
     def test_scope_keeps_imported_path_changed_by_unit(self) -> None:
         doc = self.import_production_paths()
