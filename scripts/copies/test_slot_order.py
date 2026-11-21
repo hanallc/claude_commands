@@ -569,7 +569,7 @@ placement_once
             f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max=1\nslots.wait_seconds=120\n")
         environment.update(fake_memory_readings(self.queue.root, available_kib=60 * 1024**2))
         _ = write_config_fixture(self.queue.root / "build_admission.conf",
-            "recovery_start_seconds=1\nwaiting_pass_seconds=0.05\nrunning_pass_seconds=0.1\n"
+            "recovery_start_seconds=1\nwaiting_pass_seconds=0.25\nrunning_pass_seconds=0.5\n"
             + "program_first_peak_gib.gate=4\nslot_gap_seconds=1\n")
         gate = self.root / "gate.py"
         held = self.root / "gate-holds-folder"

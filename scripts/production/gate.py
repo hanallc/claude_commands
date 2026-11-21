@@ -86,7 +86,8 @@ from scripts.production.gate_modules import GateRefused, discover_test_modules, 
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules, CloudGateRoute,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
-    MacGateExcludeFileMissing, ModuleCoverage, SelectedModules as SelectedModules,
+    MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
+    MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production import mac_gate_process

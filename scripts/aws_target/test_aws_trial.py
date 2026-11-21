@@ -392,7 +392,7 @@ class PairedTrialTests(CostFixture):
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
         (self.repo / 'scripts/production').mkdir(exist_ok=True)
-        _ = (self.repo / 'scripts/production/merge_gate.py').write_text(
+        _ = (self.repo / 'scripts/production/gate.py').write_text(
             "def test_module_environment(root, environment):\n"
             + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
             + "def process_memory_mib(roots):\n"

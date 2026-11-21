@@ -63,7 +63,7 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
 # The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
-from scripts.production.merge_gate import process_memory_mib, test_module_environment
+from scripts.production.gate import process_memory_mib, test_module_environment
 
 
 def paired_trial():

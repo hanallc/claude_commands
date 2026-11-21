@@ -3511,6 +3511,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
         folder = root / 'legacy-attempt'
         request = cloud_gate.prepare(self.repo, folder, mode, 1800)
+        self.assertEqual(request['mode'], 'merge-gate')
+        cloud_gate.save(folder / 'request.json', {**request, 'mode': mode.value})
         cloud_gate.save(root / 'current.json', {'attempt': folder.name, 'tree': request['tree'], 'commit': request['head'],
             'mode': mode.value, 'full': False, 'module_time_limit_s': 1800, 'modules': 'all', 'selection_tree': 'all'})
         cloud_gate.save(folder / 'launch.json', {'instance': 'i-fixture', 'region': 'us-east-2',
@@ -3531,6 +3533,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         def service(command: Sequence[str]) -> int:
             self.assertEqual(Path(command[command.index('--worker') + 1]), folder)
             worker_request = cloud_gate.read(folder / 'request.json')
+            self.assertEqual(worker_request['mode'], 'merge-gate')
             self.assertNotIn('gate_job', worker_request)
             if fake.has_result:
                 sidecar = Path(command[command.index('--sidecar') + 1])

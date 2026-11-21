@@ -1355,6 +1355,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                             program = ("import os; os._exit(0) if os.fork() else None; " + BLOCKING_CHILD
                                        if leader_exits else BLOCKING_CHILD)
                             child = place.popen([sys.executable, "-c", program], stdout=program_write)
+                            os.close(program_write)
                             scope_at_return = place.sidecar.read_text().strip()
                             status_at_return = child.poll()
                             place.observe(GIB, GIB)

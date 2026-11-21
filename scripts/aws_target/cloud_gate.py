@@ -1395,6 +1395,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         return LocalFallback(f'The tested commit does not read SuiteMode value {mode.wire!r}')
                     if _saved_gate_job(request) != attempt.gate_job:
                         request['gate_job'] = state['gate_job']
+                    request['mode'] = mode.wire
                     request['full'] = full
                     if retry_launch:
                         request['retry_launch'] = retry_launch
