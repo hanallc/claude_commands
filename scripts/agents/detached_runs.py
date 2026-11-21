@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import secrets
 import select
@@ -48,7 +49,6 @@ from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
 
@@ -88,6 +88,7 @@ COMMAND_GATE = ('read -r ready || exit 125; watcher_python=$1 watcher_script=$2;
 SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watcher stopped the command"
 CONFIRMED_STOP_SUFFIX = ".stop-confirmed"
 STAGED_STOP_SUFFIX = ".stop-staged"
+STOPPED_GROUP_CHECK_SECONDS = 0.25
 
 
 class PaneDispatchUnavailable(TypedDict):
@@ -96,6 +97,7 @@ class PaneDispatchUnavailable(TypedDict):
 
 class StopFields(TypedDict, total=False):
     stop_reason: str
+    stop_requested_at: float
     stop_pass_requested: Literal[True]
     self_stop: Literal[True]
 
@@ -129,6 +131,8 @@ class RunRecord(StopFields):
     # The tree key of cwd at start, "" when unknown; records before 2026-10-21 have none.
     tree_key: NotRequired[str]
     exit_code: NotRequired[int]
+    stop_escalated: NotRequired[Literal[True]]
+    stop_group_end: NotRequired[Literal["confirmed"]]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
     delivered_at: NotRequired[float]
@@ -271,6 +275,10 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields["stop_reason"] = current["stop_reason"]
         else:
             _ = fields.pop("stop_reason", "")
+        if "stop_requested_at" in current:
+            fields["stop_requested_at"] = current["stop_requested_at"]
+        else:
+            _ = fields.pop("stop_requested_at", None)
         if "stop_pass_requested" in current:
             fields["stop_pass_requested"] = current["stop_pass_requested"]
         else:
@@ -282,7 +290,7 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
         if not _is_run_record(fields):
             raise SystemExit(f"detached_runs: {path} update is not a run record")
         write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
-        if fields["status"] == "finished" and fields.get("stop_pass_requested"):
+        if fields["status"] == "finished":
             path.with_suffix(PENDING_STOP_SUFFIX).unlink(missing_ok=True)
         return fields
 
@@ -305,14 +313,21 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
                                         "delivery", "ended", "stop_reason"))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
+                    and ("stop_requested_at" not in raw or _is_stop_time(raw["stop_requested_at"]))
+                    and ("stop_group_end" not in raw or raw["stop_group_end"] == "confirmed")
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
                     and all(key not in raw or raw[key] is True
-                            for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded", "push_alert_attempted"))
+                            for key in ("stop_pass_requested", "self_stop", "stop_escalated",
+                                        "orphan_result_superseded", "push_alert_attempted"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
                          or (isinstance(pane_dispatch, dict)
                              and isinstance(cast(dict[str, object], pane_dispatch).get("unavailable"), str))))
         case _:
             return False
+
+
+def _is_stop_time(value: object) -> TypeGuard[float]:
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
 
 
 def _read_stop_fields(path: Path, run_id: object) -> StopFields:
@@ -324,6 +339,11 @@ def _read_stop_fields(path: Path, run_id: object) -> StopFields:
             or any(key in saved and saved[key] is not True for key in ("stop_pass_requested", "self_stop"))):
         raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop fields")
     fields: StopFields = {"stop_reason": reason}
+    if "stop_requested_at" in saved:
+        requested_at = saved["stop_requested_at"]
+        if not _is_stop_time(requested_at):
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop request time")
+        fields["stop_requested_at"] = requested_at
     if saved.get("stop_pass_requested") is True:
         fields["stop_pass_requested"] = True
     if saved.get("self_stop") is True:
@@ -341,13 +361,13 @@ def _read_record(path: Path) -> RunRecord:
     return {**raw, **confirmed} if confirmed else raw
 
 
-def _recover_staged_pane_stop(path: Path, record: RunRecord) -> RunRecord:
-    """Recover the pane request under the record lock after the command exits."""
+def _recover_staged_stop(path: Path, record: RunRecord) -> RunRecord:
+    """Recover the stop request under the record lock after the command exits."""
     if record.get("stop_pass_requested") or not path.with_suffix(PENDING_STOP_SUFFIX).exists():
         return record
     staged = path.with_suffix(STAGED_STOP_SUFFIX)
     fields = _read_stop_fields(staged, record["run_id"])
-    if not fields.get("stop_pass_requested"):
+    if not fields or ("stop_reason" in record and not fields.get("stop_pass_requested")):
         return record
     _ = staged.replace(path.with_suffix(CONFIRMED_STOP_SUFFIX))
     atomic_file.sync_folder(path.parent)
@@ -370,11 +390,13 @@ def stop_with_reason(
             return False
         staged = path.with_suffix(STAGED_STOP_SUFFIX)
         confirmed = path.with_suffix(CONFIRMED_STOP_SUFFIX)
-        stopping = {**record, "stop_reason": reason}
+        # Save the request time before TERM so recovery keeps the same deadline.
+        requested_at = record["stop_requested_at"] if "stop_requested_at" in record else time.monotonic()
+        stopping = {**record, "stop_reason": reason, "stop_requested_at": requested_at}
         pending_stop = path.with_suffix(PENDING_STOP_SUFFIX)
+        was_indexed = pending_stop.exists()
+        pending_stop.touch(exist_ok=True)
         if stop_pass:
-            # Index the run before it can outlive its supervisor.
-            pending_stop.touch(exist_ok=True)
             stopping["stop_pass_requested"] = True
             if self_stop:
                 stopping["self_stop"] = True
@@ -398,7 +420,7 @@ def stop_with_reason(
                 confirmed.unlink(missing_ok=True)
                 atomic_file.sync_folder(path.parent)
             finally:
-                if stop_pass and not signaled:
+                if record["status"] == "finished" or (not was_indexed and not signaled):
                     pending_stop.unlink(missing_ok=True)
                 staged.unlink(missing_ok=True)
         except OSError as error:
@@ -481,9 +503,10 @@ def _number(value: object, default: float) -> float:
 def _group_is_live(group: int) -> bool:
     """Keep the run pending while its group has live processes or cannot be read."""
     try:
+        timeout = conf.read("detached_runs").whole("STOP_GROUP_SCAN_TIMEOUT_SECONDS")
         result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
-                                capture_output=True, text=True, check=True, timeout=5)
-    except (OSError, UnicodeError, subprocess.SubprocessError):
+                                capture_output=True, text=True, check=True, timeout=timeout)
+    except (conf.Unusable, OSError, UnicodeError, subprocess.SubprocessError):
         return True
     if result.stderr or not result.stdout.strip():
         return True
@@ -523,6 +546,8 @@ def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
 
 
 def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
+    if raw.get("stop_group_end") == "confirmed":
+        return True
     command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
     if isinstance(command, (process_start.Started, process_start.Unreadable)):
         return False
@@ -646,7 +671,11 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                 record = _read_record(path)
                 if record["status"] != "running":
                     continue
-                record = _recover_staged_pane_stop(path, record)
+                record = _recover_staged_stop(path, record)
+                try:
+                    Path(record["log"]).with_suffix(".scope").unlink(missing_ok=True)
+                except OSError as error:
+                    print(f"detached_runs: {path}: could not remove the scope marker: {error}", file=sys.stderr)
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
                         and other.get("staff_id") == record["staff_id"]
                         and _number(other.get("started_at"), 0.0) > record["started_at"]
@@ -675,6 +704,12 @@ class CompletionReplay(StrEnum):
     RETRY = "the completion event needs another read"
 
 
+class PaneStopDeferred(TypedDict):
+    """The owning pane pass still needs cancellation."""
+
+    reason: str
+
+
 def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
     """Publish the finished run and claim its pending completion."""
     with path.with_suffix(".completion.lock").open("a") as claim:
@@ -683,7 +718,8 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
         if current["status"] == "finished":
             if current.get("completion_pending") is True:
                 return _replay_completion(path, current)
-            if current.get("completion_pending") is False or current.get("delivery"):
+            if (current.get("completion_pending") is False
+                    or (current.get("delivery") and not _cancels_pass(current))):
                 return CompletionReplay.HANDLED
         record["completion_pending"] = True
         record = _write_record(path, record)
@@ -692,12 +728,11 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
 
 def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
     """Keep an unresolved completion available for the next event."""
-    if _result_push_failed(record.get("delivery", "")):
+    if _result_push_failed(record.get("delivery", "")) and not _cancels_pass(record):
         return CompletionReplay.RETRY
     try:
-        if _cancels_pass(record) and record.get("delivery", "") in ("", ORPHAN_RESULT_PENDING):
-            delivery = _complete_stopped_run(path, record)
-            if _worker_result_pending(delivery):
+        if _cancels_pass(record):
+            if _complete_stopped_run(path, record) == CompletionReplay.RETRY:
                 return CompletionReplay.RETRY
         elif _retired_worker_result(record):
             if _result_push_failed(deliver(record, command_result(record))):
@@ -718,7 +753,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
     return CompletionReplay.HANDLED
 
 
-def _complete_stopped_run(path: Path, record: RunRecord) -> str:
+def _complete_stopped_run(path: Path, record: RunRecord) -> CompletionReplay:
     """End the proved pane pass or deliver the ordinary stopped result."""
     from scripts.herdr import worker_panes
 
@@ -726,12 +761,12 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str:
     runs = _runs_dir(record["session_dir"])
 
     @contextlib.contextmanager
-    def guard_ended() -> Generator[worker_panes.CloseAllowed | worker_panes.Kept]:
+    def guard_ended() -> Generator[worker_panes.CloseAllowed | worker_panes.Kept | PaneStopDeferred]:
         # The caller holds the worker lock before it takes admission and the recorder lock.
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
             if not _stopped_group_has_ended(record):
-                yield worker_panes.Kept("the command group has no confirmed end")
+                yield PaneStopDeferred(reason="the command group has no confirmed end")
                 return
             now = time.time()
             for other in _run_record_paths(runs):
@@ -748,18 +783,24 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str:
             yield worker_panes.CloseAllowed()
 
     stop_pass = cast(Callable[[Path, RunRecord, Callable[
-        [], contextlib.AbstractContextManager[worker_panes.CloseAllowed | worker_panes.Kept]]],
-        worker_panes.StoppedRunPassCompletion | worker_panes.Kept | worker_panes.NoOwningPanePass],
+        [], contextlib.AbstractContextManager[worker_panes.CloseAllowed | worker_panes.Kept | PaneStopDeferred]]],
+        worker_panes.StoppedRunPassCompletion | worker_panes.Kept | worker_panes.NoOwningPanePass | PaneStopDeferred],
         import_module("scripts.herdr.turn_end").stop_pass)
     result = stop_pass(run, record, guard_ended)
     if isinstance(result, worker_panes.StoppedRunPassCompletion):
         _ = result.send_notice()
-        return _save_delivery(path, f"finished: the pane pass {result.outcome}")
+        _ = _save_delivery(path, f"finished: the pane pass {result.outcome}")
+        return CompletionReplay.HANDLED
+    if isinstance(result, dict):
+        print(f"detached_runs: {record['run_id']}: pane cancellation is pending: {result['reason']}", file=sys.stderr)
+        return CompletionReplay.RETRY
     if isinstance(result, worker_panes.Kept):
         print(f"detached_runs: {record['run_id']}: kept the pane pass: {result.blocker}", file=sys.stderr)
     if record.get("orphan_result_superseded"):
-        return _save_delivery(path, SUPERSEDED_ORPHAN_DELIVERY)
-    return deliver(record, command_result(record))
+        _ = _save_delivery(path, SUPERSEDED_ORPHAN_DELIVERY)
+        return CompletionReplay.HANDLED
+    delivery = deliver(record, command_result(record))
+    return CompletionReplay.RETRY if _worker_result_pending(delivery) else CompletionReplay.HANDLED
 
 
 def _clear_completion_pending(path: Path) -> None:
@@ -933,6 +974,8 @@ def _needs_push_retry(record: RunRecord) -> bool:
 
 
 def _needs_completion(record: RunRecord) -> bool:
+    if _cancels_pass(record) and record.get("completion_pending"):
+        return True
     return (not _result_push_failed(record.get("delivery", ""))
             and bool(record.get("completion_pending") or _retired_worker_result(record)))
 
@@ -975,6 +1018,8 @@ class LiveRunReadError:
 
     @override
     def __str__(self) -> str:
+        if isinstance(self.error, worker_lifecycle.WorkerStateUnreadable):
+            return str(self.error)
         return f"{self.path}: {self.error}"
 
 
@@ -1021,7 +1066,7 @@ def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> li
 
 def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]], *,
                                  staff_names: Mapping[staff.StaffId, str] | None = None) -> LiveRunEvidence:
-    """Read each live record once and identify the workers affected by read errors."""
+    """Read candidate records once and identify workers affected by read errors."""
     if not folders:
         return LiveRunEvidence((), ())
     supervisors = detached_run_process.supervisor_records()
@@ -1035,11 +1080,9 @@ def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]
     for folder, identities in folders.items():
         directory = folder / DETACHED_RUNS_DIR
         try:
-            if isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
-                paths = _run_record_paths(directory)
-            else:
-                paths = named.get(folder, set()) | {
-                    marker.with_suffix(".json") for marker in directory.glob("*" + PENDING_STOP_SUFFIX)}
+            # Older stops can have a saved reason without a live supervisor or a stop marker.
+            paths = set(_run_record_paths(directory)) | named.get(folder, set())
+            paths.update(marker.with_suffix(".json") for marker in directory.glob("*" + PENDING_STOP_SUFFIX))
             evidence = _read_live_runs(
                 sorted(paths), lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities,
                 detached_run_process.supervises if isinstance(supervisors, detached_run_process.ProcessTableUnavailable)
@@ -1066,10 +1109,9 @@ def _run_is_pending(path: Path, raw: dict[str, object], supervisor_owns: Callabl
     # A stop can outlive its supervisor. The delivery process or reaper proves that its group ended.
     if raw.get("status") != "running":
         return False
-    if raw.get("stop_pass_requested") is True or supervisor_owns(_integer(raw.get("pid"))):
-        return True
     _recover_indexed_stop(path, raw)
-    return raw.get("stop_pass_requested") is True
+    return ("stop_reason" in raw or raw.get("stop_pass_requested") is True
+            or path.with_suffix(PENDING_STOP_SUFFIX).exists() or supervisor_owns(_integer(raw.get("pid"))))
 
 
 def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool],
@@ -1079,6 +1121,17 @@ def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool],
     except OSError as error:
         return LiveRunEvidence((), (LiveRunReadError(runs, error, identities),))
     return _read_live_runs(paths, owns, detached_run_process.supervises, identities)
+
+
+def _valid_live_record(path: Path, raw: dict[str, object]) -> bool:
+    if _is_run_record(raw):
+        return path.name == f"{raw['run_id']}.json"
+    # The old stop format has exactly these four fields.
+    match raw:
+        case {"worker": str(name), "pid": int(pid), "status": "running", "stop_reason": str()}:
+            return len(raw) == 4 and bool(name) and not isinstance(pid, bool)
+        case _:
+            return False
 
 
 def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], bool],
@@ -1095,28 +1148,16 @@ def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], b
         try:
             raw = worker_lifecycle.read_json_object(path)
             if not raw and not path.exists():
-                if staff_names is not None and path in supervised_paths:
+                if path in supervised_paths:
                     raise worker_lifecycle.WorkerStateUnreadable(path, "the live supervisor record is missing")
                 continue
-        except (OSError, ValueError) as error:
-            errors.append(LiveRunReadError(path, error,
-                                           identities if staff_names is not None and path in supervised_paths else affected))
-            continue
-        owner = raw.get("staff_id")
-        name = raw.get("worker")
-        legacy_owners: tuple[staff.StaffId, ...] = ()
-        if staff_names is not None and not identity and owner in (None, "") and isinstance(name, str) and name:
-            legacy_owners = tuple(member for member in identities if staff_names.get(member) == name)
-            if not legacy_owners:
-                continue
-        if isinstance(owner, str) and owner and not identity:
-            affected = frozenset({staff.StaffId(owner)})
-        try:
-            if staff_names is not None and (identity or not owner or not isinstance(owner, str) or owner in identities):
-                if (not (isinstance(owner, str) and owner or legacy_owners)
-                        or raw.get("status") not in ("running", "finished") or type(raw.get("pid")) is not int
-                        or identity and (owner != identity or not _is_run_record(dict(raw)) or f"{raw.get('run_id')}.json" != path.name)):
-                    raise worker_lifecycle.WorkerStateUnreadable(path, "invalid detached run record")
+            if staff_names is not None and not _valid_live_record(path, raw):
+                raise worker_lifecycle.WorkerStateUnreadable(path, "invalid detached run record")
+            owner = raw.get("staff_id")
+            if staff_names is not None and identity and owner != identity:
+                raise worker_lifecycle.WorkerStateUnreadable(path, "detached run owner does not match the filename")
+            legacy_owners = (tuple(member for member in identities if staff_names.get(member) == raw.get("worker"))
+                             if staff_names is not None and not owner else ())
             if (legacy_owners or owns(raw)) and _run_is_pending(path, raw, lambda pid: supervises(pid, path)):
                 if legacy_owners:
                     found.extend(cast(RunRecord, cast(object, {**raw, "staff_id": member})) for member in legacy_owners)
@@ -1320,10 +1361,18 @@ def _exit_words(result: CommandResult) -> str:
     return f"exit {result.code}" if isinstance(result, CompletedCommand) else "no exit status"
 
 
+def _was_stopped(record: RunRecord) -> bool:
+    return "stop_reason" in record or record.get("stop_escalated") is True
+
+
+def stop_signal_line(record: RunRecord) -> str:
+    return "Stop signal: SIGKILL" if record.get("stop_escalated") else ""
+
+
 def result_text(record: RunRecord, result: CommandResult) -> str:
     exit_code = result.code if isinstance(result, CompletedCommand) else result
     stop_reason = record.get("stop_reason", "")
-    if stop_reason:
+    if _was_stopped(record):
         verdict = f"STOPPED ({_exit_words(result)})"
     elif isinstance(exit_code, SupervisorLost):
         verdict = ORPHAN_VERDICT
@@ -1339,6 +1388,8 @@ def result_text(record: RunRecord, result: CommandResult) -> str:
     lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
     if stop_reason:
         lines.append(f"Stop reason: {stop_reason}")
+    if signal_line := stop_signal_line(record):
+        lines.append(signal_line)
     if exit_code == SUPERSEDED_STATUS:
         lines.append(SUPERSEDED_INSTRUCTION)
     elif exit_code == TREE_CHANGED_STATUS:
@@ -1435,9 +1486,10 @@ def deliver(record: RunRecord, result: CommandResult, *,
     self_stop = record.get("self_stop") is True
     exit_code = result.code if isinstance(result, CompletedCommand) else result
     done_file = record["done_message_file"]
-    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS) and not record.get("stop_reason"):
+    stopped = _was_stopped(record)
+    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS) and not stopped:
         return _save_delivery(path, f"nothing delivered: {_exit_words(result)} with a done message")
-    if done_file and exit_code == 0 and not record.get("stop_reason"):
+    if done_file and exit_code == 0 and not stopped:
         try:
             text = Path(done_file).read_text(encoding="utf-8")
         except OSError as exc:
@@ -1582,6 +1634,7 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
     runs = run / DETACHED_RUNS_DIR
     for record in _registered_runs(runs, worker.id):
         if (record["status"] != "finished" or record.get("staff_id") != worker.id
+                or (_cancels_pass(record) and record.get("completion_pending"))
                 or not _worker_result_pending(record.get("delivery", ""))):
             continue
         delivery = deliver(record, command_result(record), worker_input=worker_input)
@@ -1659,7 +1712,10 @@ def _retry_failed_push(path: Path) -> None:
         if not _needs_push_retry(record):
             return
         try:
-            _ = deliver(record, command_result(record))
+            if _cancels_pass(record):
+                _ = _finish_record(path, record)
+            else:
+                _ = deliver(record, command_result(record))
         except (Exception, SystemExit) as error:
             detail = " ".join(str(error).splitlines())
             print(f"detached_runs: {record['run_id']}: result retry failed: {detail}", file=sys.stderr)
@@ -1669,14 +1725,15 @@ def _retry_failed_push(path: Path) -> None:
 def command_deliver(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", ""))).resolve()
     record = _read_record(record_path)
-    if record.get("stop_pass_requested") and record["status"] != "finished":
+    published_stop = _was_stopped(record) and _integer(record.get("command_group")) > 0
+    if (published_stop or record.get("stop_pass_requested")) and record["status"] != "finished":
         if "exit_code" not in record:
             print(f"detached_runs: {record['run_id']}: the stopped command has no confirmed exit", file=sys.stderr)
             return 1
         if not _stopped_group_has_ended(record):
             print(f"detached_runs: {record['run_id']}: the command group has no confirmed end", file=sys.stderr)
             return 1
-    if _cancels_pass(record) and not _result_push_failed(record.get("delivery", "")):
+    if _cancels_pass(record):
         if record["status"] != "finished":
             record["status"] = "finished"
             _ = record.setdefault("finished_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -1724,12 +1781,39 @@ def scope_prefix(marker: Path, environment: dict[str, str], *,
             "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
+@contextlib.contextmanager
+def _observe_process_exit(pid: int, saved_start: str, *, direct_child: bool) -> Generator[Callable[[], bool]]:
+    """Observe exit without reaping the process."""
+    if direct_child and hasattr(os, "waitid"):
+        def child_exited() -> bool:
+            status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            # macOS can report a stopped child even with WEXITED.
+            return status is not None and status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)
+
+        yield child_exited
+    elif sys.platform == "darwin":
+        watcher = select.kqueue()
+        try:
+            event = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                  select.KQ_NOTE_EXIT)
+            _ = watcher.control([event], 0)
+            yield lambda: bool(watcher.control(None, 1, 0))
+        finally:
+            watcher.close()
+    else:
+        yield lambda: isinstance(_saved_process(pid, saved_start),
+                                 (process_start.Zombie, process_start.Gone, SavedProcessIdReused))
+
+
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
     """Publish the command identity and group, then run the command in its own session.
 
     A stop signals the command group only, so the supervisor stays alive to record and deliver.
     The gate input stays open until the command ends. Then the supervisor writes "done" to the watcher.
     """
+    settings = conf.read("detached_runs")
+    grace = settings.whole("STOP_GRACE_SECONDS")
+    alert_after = settings.whole("STOP_GROUP_ALERT_SECONDS")
     script = Path(__file__).resolve()
     try:
         with log.open("ab") as output:
@@ -1750,21 +1834,80 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
                 _ = output.write("detached_runs: command identity is unavailable; command did not start\n")
             # The gate shell reads the end of its input and exits 125.
             gate.close()
-        else:
-            path = Path(environment["UNIT_DETACHED_RECORD"])
-            with record_lock(path):
-                record = _read_record(path)
-                record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
-                              command_started=started.start)
-                supervisor = process_start.process_start(os.getpid())
-                if isinstance(supervisor, process_start.Started):
-                    record["supervisor_started"] = supervisor.start
-                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-            _send_gate_line(gate, b"start\n")
-        returncode = child.wait()
-        if not gate.closed:
+            return _exit_status(child.wait())
+        path = Path(environment["UNIT_DETACHED_RECORD"])
+        try:
+            with _observe_process_exit(child.pid, started.start, direct_child=True) as leader_exited:
+                if leader_exited():
+                    return _exit_status(child.wait())
+                with record_lock(path):
+                    record = _read_record(path)
+                    record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
+                                  command_started=started.start)
+                    supervisor = process_start.process_start(os.getpid())
+                    if isinstance(supervisor, process_start.Started):
+                        record["supervisor_started"] = supervisor.start
+                    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                    _send_gate_line(gate, b"start\n")
+                return _exit_status(_wait_for_command(child, gate, path, grace, alert_after, leader_exited))
+        except (ChildProcessError, ProcessLookupError):
             _send_gate_line(gate, b"done\n")
-    return _exit_status(returncode)
+            raise SystemExit(f"detached_runs: {path}: the command leader was already reaped") from None
+
+
+def _wait_for_command(child: subprocess.Popen[bytes], gate: IO[bytes], path: Path, grace: float,
+                      alert_after: float, leader_exited: Callable[[], bool]) -> int:
+    """Escalate a stop before observing exit. Reap only after the group ends."""
+    last_unstopped_check = time.monotonic()
+    leader_has_exited = False
+    while True:
+        delay = STOPPED_GROUP_CHECK_SECONDS
+        with record_lock(path):
+            record = _read_record(path)
+            now = time.monotonic()
+            if not _was_stopped(record):
+                last_unstopped_check = now
+                leader_has_exited = leader_exited()
+                if leader_has_exited:
+                    record = _recover_staged_stop(path, record)
+                    if not _was_stopped(record):
+                        _send_gate_line(gate, b"done\n")
+                        return child.wait()
+            if _was_stopped(record):
+                remaining = record.get("stop_requested_at", last_unstopped_check) + grace - now
+                if remaining <= 0:
+                    if record.get("command_pid") != child.pid or record.get("command_group") != child.pid:
+                        _send_gate_line(gate, b"done\n")
+                        raise SystemExit(f"detached_runs: {path}: the command group identity changed")
+                    if not record.get("stop_escalated"):
+                        with contextlib.suppress(ProcessLookupError):
+                            process_group.send_process_group(child.pid, signal.SIGKILL)
+                            record["stop_escalated"] = True
+                            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                    break
+                delay = min(delay, remaining)
+        time.sleep(delay)
+
+    alert_at = time.monotonic() + alert_after
+    alerted = False
+    if leader_has_exited:
+        _send_gate_line(gate, b"done\n")
+    while True:
+        if not leader_has_exited and leader_exited():
+            leader_has_exited = True
+            _send_gate_line(gate, b"done\n")
+        if leader_has_exited and not _group_is_live(child.pid):
+            break
+        if not alerted and time.monotonic() >= alert_at:
+            unit_runs.report_anomaly(f"anomaly: {path}: the command group end is still unconfirmed after escalation")
+            alerted = True
+        time.sleep(STOPPED_GROUP_CHECK_SECONDS)
+    returncode = child.wait()
+    with record_lock(path):
+        record = _recover_staged_stop(path, _read_record(path))
+        record["stop_group_end"] = "confirmed"
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+    return returncode
 
 
 def _send_gate_line(gate: IO[bytes], line: bytes) -> None:
@@ -1847,23 +1990,29 @@ def command_supervise(args: argparse.Namespace) -> int:
         kind = DetachedRunKind.DETECT
     prefix = scope_prefix(marker, environment, kind=kind)
     with _completion_sources(Path(__file__).resolve().parents[1]):
-        exit_code = _run(prefix + record["command"], environment, log)
+        if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+            with log.open("a", encoding="utf-8") as output:
+                _ = output.write("detached_runs: the supervisor cannot retain the leader with SIGCHLD ignored\n")
+            exit_code = 125
+            prefix = []
+        else:
+            exit_code = _run(prefix + record["command"], environment, log)
         with record_lock(record_path):
-            record = _recover_staged_pane_stop(record_path, _read_record(record_path))
-            retry_without_scope = bool(prefix) and not marker.exists() and not record.get("stop_reason")
+            record = _recover_staged_stop(record_path, _read_record(record_path))
+            retry_without_scope = bool(prefix) and not marker.exists() and not _was_stopped(record)
         if retry_without_scope:
             exit_code = _run(record["command"], environment, log)
             with record_lock(record_path):
-                record = _recover_staged_pane_stop(record_path, _read_record(record_path))
+                record = _recover_staged_stop(record_path, _read_record(record_path))
         marker.unlink(missing_ok=True)
         # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
         # unless the result is already held.
-        finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        finished_at = record.get("finished_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")
         record.update(exit_code=exit_code, finished_at=finished_at)
         record = _write_record(record_path, record)
         # Other members of the command group can remain after its leader exits.
         while record.get("stop_pass_requested") and not _stopped_group_has_ended(record):
-            time.sleep(0.25)
+            time.sleep(STOPPED_GROUP_CHECK_SECONDS)
         delivery_exit = deliver_in_fresh_process(record_path)
         record = _read_record(record_path)
         cancelled = _cancels_pass(record)
@@ -1910,6 +2059,7 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
             if (not _is_run_record(record) or path.name != f"{record['run_id']}.json"
                     or record["status"] != "running"):
                 return 0
+            path.with_suffix(PENDING_STOP_SUFFIX).touch(exist_ok=True)
             _ = record.setdefault("stop_reason", SUPERVISOR_GONE_REASON)
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
         with contextlib.suppress(ProcessLookupError):
@@ -1922,14 +2072,14 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
 def _wait_for_leader(command: CommandGroup) -> None:
     """Wait until the command leader exits, so the reap reads the status that the command saved."""
     try:
-        leader = os.pidfd_open(command.group)
+        with _observe_process_exit(command.group, command.started, direct_child=False) as exited:
+            if (sys.platform == "darwin"
+                    and process_start.process_start(command.group) != process_start.Started(command.started)):
+                return
+            while not exited():
+                time.sleep(STOPPED_GROUP_CHECK_SECONDS)
     except ProcessLookupError:
         return
-    try:
-        if process_start.process_start(command.group) == process_start.Started(command.started):
-            _ = select.select([leader], [], [])
-    finally:
-        os.close(leader)
 
 
 def command_record_exit(args: argparse.Namespace) -> int:
@@ -1968,6 +2118,12 @@ def command_reap(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stop_reason(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("the stop reason must contain text")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
@@ -1995,7 +2151,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = delivery.add_argument("record")
     delivery.set_defaults(handler=command_deliver)
     stop = verbs.add_parser("stop", help="stop a running command; its supervisor delivers the stopped result")
-    _ = stop.add_argument("--reason", required=True, help="the Stop reason line of the result")
+    _ = stop.add_argument("--reason", required=True, type=_stop_reason, help="the Stop reason line of the result")
     _ = stop.add_argument("record")
     stop.set_defaults(handler=command_stop)
     reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
@@ -2008,7 +2164,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["supervise"]:
-        for number in CANCELLATION_SIGNALS:
-            _ = signal.signal(number, signal.SIG_DFL)
     sys.exit(main())

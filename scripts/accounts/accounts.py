@@ -4432,9 +4432,14 @@ class NoRoleCount:
     """A spare account has no role membership to count."""
 
 
+RoleCountUnknownReason = Literal["Claude session registry unreadable", "detached run records unreadable"]
+
+
 @dataclass(frozen=True)
 class UnknownRoleCounts:
-    """An unreadable Claude session registry prevents a complete count."""
+    """Unreadable session or run evidence prevents a complete role count."""
+
+    reason: RoleCountUnknownReason = "Claude session registry unreadable"
 
 
 @dataclass(frozen=True)
@@ -4461,7 +4466,17 @@ class RoleSessionCountsDocument(TypedDict):
 
 class UnknownRoleCountsDocument(TypedDict):
     state: Literal["unknown"]
-    reason: Literal["Claude session registry unreadable"]
+    reason: RoleCountUnknownReason
+
+
+AccountRoleCountDocument = RoleSessionCountsDocument | UnknownRoleCountsDocument
+
+
+def _role_count_document(count: RoleSessionCounts | UnknownRoleCounts) -> AccountRoleCountDocument:
+    if isinstance(count, UnknownRoleCounts):
+        return UnknownRoleCountsDocument(state="unknown", reason=count.reason)
+    return RoleSessionCountsDocument(busy=count.busy, idle=count.idle, paused=count.paused,
+                                     exited=count.exited, total=count.total)
 
 
 class AccountSessionDocument(TypedDict):
@@ -4556,7 +4571,7 @@ class StatusRow:
     read_outcome: agent_accounts.UsageReadOutcome
     attempted_at: datetime | StatusUnavailable
     role_counts: tuple[RoleSessionCounts | NoRoleCount | UnknownRoleCounts, ...] = ()
-    role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
+    role_counts_by_machine: dict[str, dict[str, AccountRoleCountDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
     sessions: tuple[AccountSessionDocument, ...] = ()
     login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
@@ -4609,9 +4624,9 @@ class StatusAccountDocument(TypedDict):
     tool: Literal["claude", "codex"]
     roles: list[str]
     selected_roles: list[str]
-    role_counts: list[RoleSessionCountsDocument | UnknownRoleCountsDocument | None]
+    role_counts: list[AccountRoleCountDocument | None]
     sessions: list[AccountSessionDocument]
-    role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
+    role_counts_by_machine: dict[str, dict[str, AccountRoleCountDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
     login_ends_at: str | None
@@ -5187,11 +5202,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
-            role_counts=[RoleSessionCountsDocument(busy=count.busy,
-                idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
-                if isinstance(count, RoleSessionCounts) else
-                UnknownRoleCountsDocument(state="unknown", reason="Claude session registry unreadable")
-                if isinstance(count, UnknownRoleCounts) else None for count in
+            role_counts=[None if isinstance(count, NoRoleCount) else _role_count_document(count) for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
             sessions=list(row.sessions),
             role_counts_by_machine=row.role_counts_by_machine,
@@ -6908,7 +6919,7 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
             models_by_role=models,
             model_names_by_role=model_names,
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
-                tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
+                tuple(observed.counts.get((directory, role), {}).values())) for role in roles)))
     return tuple(counted), observed.inputs
 
 
@@ -6917,6 +6928,7 @@ class MachineSessionCounts(TypedDict):
     at: str
     accounts: dict[str, dict[str, RoleSessionCountsDocument]]
     claude_registry_unreadable: NotRequired[Literal[True]]
+    unreadable_detached_roles: NotRequired[dict[str, list[str]]]
     models: NotRequired[dict[str, dict[str, list[SessionModelCountDocument]]]]
     unknown_model_names: NotRequired[dict[str, dict[str, list[str]]]]
 
@@ -6934,7 +6946,7 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
                              claude_registry_unreadable: bool = False,
                              models: Mapping[tuple[Path, str], ObservedSessionModel] | None = None,
                              names: Mapping[tuple[Path, str], str] | None = None) -> MachineSessionCounts:
-    """Publish the four session states for each account and role."""
+    """Publish role counts and identify roles with unreadable run records."""
     mapped: dict[tuple[str, str], dict[str, tuple[session_state.SessionState, SessionModel, str]]] = {}
     unknown = SessionModelUnknown()
     models = models or {}
@@ -6949,11 +6961,14 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
         mapped.setdefault((label, role), {}).update({identity: (state, models.get((directory, identity), unknown),
                                                 names.get((directory, identity), "")) for identity, state in members.items()})
     values: dict[str, dict[str, RoleSessionCountsDocument]] = {}
+    unreadable_roles: dict[str, list[str]] = {}
     model_counts: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
     unknown_names: dict[str, dict[str, list[str]]] = {}
     for (label, role), members in mapped.items():
-        tool = "codex" if label.startswith("codex") else "claude"
-        count = _role_session_counts(tuple(state for state, _, _ in members.values()), tool)
+        count = _role_session_counts(tuple(state for state, _, _ in members.values()))
+        if isinstance(count, UnknownRoleCounts):
+            unreadable_roles.setdefault(label, []).append(role)
+            continue
         values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy, idle=count.idle,
             paused=count.paused, exited=count.exited, total=count.total)
         known: dict[ObservedSessionModel, SessionModelCountDocument] = {}
@@ -6976,6 +6991,8 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
     if claude_registry_unreadable:
         document["claude_registry_unreadable"] = True
+    if unreadable_roles:
+        document["unreadable_detached_roles"] = unreadable_roles
     if model_counts:
         document["models"] = model_counts
     if unknown_names:
@@ -7055,6 +7072,25 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
     document = MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
     if claude_registry_unreadable:
         document["claude_registry_unreadable"] = True
+    unreadable = fields.get("unreadable_detached_roles", {})
+    if not isinstance(unreadable, dict):
+        raise ValueError("invalid unreadable detached roles")
+    unreadable_roles: dict[str, list[str]] = {}
+    for label, raw_roles in cast(dict[str, object], unreadable).items():
+        if not re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", label) or not isinstance(raw_roles, list):
+            raise ValueError("invalid unreadable detached roles")
+        if claude_registry_unreadable and label.startswith("claude"):
+            continue
+        affected_roles: list[str] = []
+        for role in cast(list[object], raw_roles):
+            if (not isinstance(role, str) or role not in MODEL_ROLES
+                    or role in affected_roles or role in checked.get(label, {})):
+                raise ValueError("invalid unreadable detached role")
+            affected_roles.append(role)
+        if affected_roles:
+            unreadable_roles[label] = affected_roles
+    if unreadable_roles:
+        document["unreadable_detached_roles"] = unreadable_roles
     payload = _model_fields(fields.get("models"))
     names_payload = _model_fields(fields.get("unknown_model_names"))
     models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
@@ -7144,6 +7180,7 @@ def _machine_role_counts(
     account_config = read_account_settings(account_config)
     local, peer = _session_counts_machine(), remote.other_machine()
     peer_registry_unreadable = False
+    peer_unreadable_roles: dict[str, list[str]] = {}
     peer_models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
     peer_unknown_names: dict[str, dict[str, list[str]]] = {}
     try:
@@ -7153,6 +7190,7 @@ def _machine_role_counts(
             raise ValueError("old counts")
         peer_accounts = document["accounts"]
         peer_registry_unreadable = document.get("claude_registry_unreadable", False)
+        peer_unreadable_roles = document.get("unreadable_detached_roles", {})
         peer_models = document.get("models", {})
         peer_unknown_names = document.get("unknown_model_names", {})
         available = True
@@ -7163,12 +7201,14 @@ def _machine_role_counts(
     counted: list[StatusRow] = []
     for row in rows:
         local_unknown = row.tool == "claude" and claude_registry_unreadable
-        local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
-            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
-            for role, count in zip(row.roles, row.role_counts) if isinstance(count, RoleSessionCounts) and not local_unknown}
+        local_counts = {role: _role_count_document(count) for role, count in zip(row.roles, row.role_counts)
+                        if not isinstance(count, NoRoleCount) and not local_unknown}
         machines = {local: local_counts}
         if available:
-            machines[peer] = peer_accounts.get(row.label, {})
+            peer_counts: dict[str, AccountRoleCountDocument] = dict(peer_accounts.get(row.label, {}))
+            peer_counts.update({role: UnknownRoleCountsDocument(state="unknown", reason="detached run records unreadable")
+                                for role in peer_unreadable_roles.get(row.label, ())})
+            machines[peer] = peer_counts
         roles = tuple(dict.fromkeys((*row.roles, *(role for counts in machines.values() for role in counts))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
@@ -7178,11 +7218,16 @@ def _machine_role_counts(
                 combined.append(UnknownRoleCounts())
                 continue
             counts = [machine[role] for machine in machines.values() if role in machine]
+            unknown_counts = next((count for count in counts if "state" in count), None)
+            if unknown_counts is not None:
+                combined.append(UnknownRoleCounts(unknown_counts["reason"]))
+                continue
+            known = [count for count in counts if "busy" in count]
             combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
-                busy=sum(count["busy"] for count in counts),
-                idle=sum(count["idle"] for count in counts),
-                paused=sum(count["paused"] for count in counts),
-                exited=sum(count["exited"] for count in counts)))
+                busy=sum(count["busy"] for count in known),
+                idle=sum(count["idle"] for count in known),
+                paused=sum(count["paused"] for count in known),
+                exited=sum(count["exited"] for count in known)))
         models = {role: Counter(counts) for role, counts in row.models_by_role.items() if not local_unknown}
         model_names = {role: dict(groups) for role, groups in row.model_names_by_role.items() if not local_unknown}
         for role, peer_count in peer_accounts.get(row.label, {}).items():
@@ -7223,10 +7268,11 @@ def _role_count_text(row: StatusRow, role: str) -> str:
     return f"{role}{selected} {count.total} ({activity})"
 
 
-def _role_session_counts(states: tuple[str, ...], _tool: Literal["claude", "codex"]) -> RoleSessionCounts:
-    """Treat unknown live activity as idle without changing role membership."""
-    busy, paused, exited = (states.count(state) for state in ("busy", "paused", "exited"))
-    return RoleSessionCounts(busy, len(states) - busy - paused - exited, paused, exited)
+def _role_session_counts(states: tuple[session_state.SessionState, ...]) -> RoleSessionCounts | UnknownRoleCounts:
+    """Count the classified states when every session has a known state."""
+    if "unknown" in states:
+        return UnknownRoleCounts("detached run records unreadable")
+    return RoleSessionCounts(states.count("busy"), states.count("idle"), states.count("paused"), states.count("exited"))
 
 
 def _workers_status_lines(now: datetime, selected: CodexWorkersAccount, continuation_lines: tuple[str, ...], *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> list[str]:

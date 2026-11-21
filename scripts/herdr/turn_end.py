@@ -255,20 +255,33 @@ def _recorded_stop_notice(run: Path, notice: progress_history.StoppedPassNotice)
 
 
 def stop_pass(run: Path, stopped: detached_runs.RunRecord,
-              guard_ended: Callable[[], AbstractContextManager[worker_panes.CloseAllowed | worker_panes.Kept]],
-              ) -> worker_panes.StoppedRunPassCompletion | worker_panes.Kept | worker_panes.NoOwningPanePass:
+              guard_ended: Callable[[], AbstractContextManager[
+                  worker_panes.CloseAllowed | worker_panes.Kept | detached_runs.PaneStopDeferred]],
+              ) -> (worker_panes.StoppedRunPassCompletion | worker_panes.Kept | worker_panes.NoOwningPanePass
+                    | detached_runs.PaneStopDeferred):
     """End the owning pass and prepare its director notice."""
     linked = stopped.get("pane_dispatch_id")
     if linked == "":
         return worker_panes.NoOwningPanePass.UNRECORDED
     if isinstance(linked, dict):
         return worker_panes.Kept(linked["unavailable"])
+    result_received = stopped.get("delivery", "").startswith(("sent: ", "queued: ", "already delivered: "))
+
+    def prepare_stop_notice(notice: progress_history.StoppedPassNotice) -> worker_panes.StoppedRunPassCompletion:
+        if result_received:
+            if not notice.delivered:
+                stamp = _completion_notice_stamp(TurnOutcome.STOPPED)
+                progress_history.record_dispatch_notice(run, notice.instance_id, stamp, stopped_pass=True)
+            return worker_panes.StoppedRunPassCompletion(TurnOutcome.STOPPED, _no_notice)
+        return _recorded_stop_notice(run, notice)
+
     notice = progress_history.stopped_run_notice(run, stopped["run_id"])
     if isinstance(notice, progress_history.StoppedPassNotice):
-        return _recorded_stop_notice(run, notice)
+        return prepare_stop_notice(notice)
     reason = stopped.get("stop_reason")
     if reason is None:
         return worker_panes.Kept("the stop reason is unavailable")
+    signal_line = detached_runs.stop_signal_line(stopped)
     record = staff.snapshot()
     row = record.by_id(staff.StaffId(stopped["staff_id"]))
     if row is None or row.kind != "worker":
@@ -278,14 +291,14 @@ def stop_pass(run: Path, stopped: detached_runs.RunRecord,
         return worker_panes.Kept("the worker parent is unavailable")
     with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(row.name), blocking=True) as hold:
         if isinstance(hold, worker_panes.Kept):
-            return hold
+            return detached_runs.PaneStopDeferred(reason=hold.blocker)
         record = staff.snapshot()
         current = record.by_id(row.id)
         if current is None or not hold.owns(current) or not current.reports_to(parent.id):
             return worker_panes.Kept("the worker changed before the stop acquired its lock")
         notice = progress_history.stopped_run_notice(run, stopped["run_id"])
         if isinstance(notice, progress_history.StoppedPassNotice):
-            return _recorded_stop_notice(run, notice)
+            return prepare_stop_notice(notice)
         passed = worker_panes.worker_pass(current, run, record=record)
         instance = passed.get("instance_id")
         if linked is not None and linked != instance:
@@ -302,6 +315,10 @@ def stop_pass(run: Path, stopped: detached_runs.RunRecord,
         delivery = progress_history.dispatch_delivery(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.outcome == TurnOutcome.STOPPED:
             if passed.get("status") == "canceled":
+                if result_received:
+                    return worker_panes.StoppedRunPassCompletion(TurnOutcome.STOPPED, _no_notice)
+                if signal_line and signal_line not in completion.details:
+                    completion = replace(completion, details=(*completion.details, signal_line))
                 return worker_panes.StoppedRunPassCompletion(
                     TurnOutcome.STOPPED, _stopped_notice(current, parent, run, passed, completion).send_notice)
         if (passed.get("status") == "completed" and isinstance(instance, str)
@@ -315,27 +332,31 @@ def stop_pass(run: Path, stopped: detached_runs.RunRecord,
             return worker_panes.NoOwningPanePass.UNRECORDED
         dispatch = progress_history.active_dispatch(current.id, run)
         if isinstance(dispatch, progress_history.ActiveDispatchUnavailable):
-            return worker_panes.Kept(dispatch.reason)
+            return detached_runs.PaneStopDeferred(reason=dispatch.reason)
         if not isinstance(dispatch, progress_history.ActiveDispatch) or dispatch.instance_id != instance:
             return worker_panes.Kept("the open pane pass identity is unavailable")
         event = WorkerEvent(str(current.current_session), EventKind.RUN_FINISHED)
         with ExitStack() as admission:
             ended = admission.enter_context(guard_ended())
-            if isinstance(ended, worker_panes.Kept):
+            if not isinstance(ended, worker_panes.CloseAllowed):
                 return ended
             receipt = _recover_pass(event, current, run, passed, delivery, require_transcript=True)
             if isinstance(receipt, worker.DispatchEvidenceUnknown):
-                return worker_panes.Kept(receipt.reason)
+                return detached_runs.PaneStopDeferred(reason=receipt.reason)
             if (isinstance(receipt, (worker.DispatchComplete, worker.DispatchWaitingForRuns, worker.DispatchAwaitingReply))
                     or receipt in (TurnOutcome.WAITING_ON_RUNS, TurnOutcome.WAITING_ON_REPLY)):
                 return worker_panes.Kept("the pass has a reply pending completion")
             if not isinstance(receipt, progress_history.HookCompletion):
                 slot = str(passed.get("team_slot", ""))
+                details = "\n".join(part for part in (reason, signal_line) if part)
                 notice = progress_history.stop_dispatch(run, slot, dispatch.instance_id, current, parent.id,
-                                                        run_id=stopped["run_id"], reason=reason)
+                                                        run_id=stopped["run_id"], reason=details)
                 if isinstance(notice, progress_history.StopDispatchRefused):
+                    latest = progress_history.active_dispatch(current.id, run)
+                    if isinstance(latest, progress_history.ActiveDispatch) and latest.instance_id == dispatch.instance_id:
+                        return detached_runs.PaneStopDeferred(reason=notice.value)
                     return worker_panes.Kept(notice.value)
-                return _recorded_stop_notice(run, notice)
+                return prepare_stop_notice(notice)
             if receipt.outcome != TurnOutcome.DONE:
                 return worker_panes.Kept("the pane pass already has a completion outcome")
             state = worker_panes.observe_worker(parent.id, current, record)

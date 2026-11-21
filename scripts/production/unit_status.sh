@@ -19,7 +19,7 @@ fi
 DIR=$1
 ZONE=$2
 REPO=${0:A:h:h:h}
-# One line per unit: its id, its place now, whether Claude runs there, its session name now.
+# Read each unit's presence and work state.
 unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" --status "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
 # Staff supplies peer names, fixed identities and current session ids.
@@ -139,11 +139,13 @@ for line in $units; do
   fields=("${(@ps:\t:)line}")
   u=$fields[1]
   [[ -n ${state_keys[$u]:-} ]] || { print -u2 "No staff id for $u"; exit 1; }
-  target=$fields[2]
   echo "== $u"
-  # Status columns: unit, place, state, Claude name, session id.
   claude_state=$fields[3]
-  if [[ -z $target && $claude_state != unknown ]]; then echo 'SESSION GONE'; continue; fi
+  work_state=$fields[6]
+  if [[ $work_state == unknown && $claude_state != unknown ]]; then
+    echo 'DETACHED WORK STATE UNKNOWN'
+  fi
+  if [[ $claude_state == gone ]]; then echo 'SESSION GONE'; continue; fi
   session_id=$fields[5]
   case $claude_state in
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;
@@ -158,8 +160,8 @@ for line in $units; do
       print -r -- "TICKS FAILING (${health#failing: })"
     fi
   fi
-  [[ $claude_state == unknown || $claude_state == stopped ]] && continue
-  p=$("$PY" "$REPO/scripts/production/session_pane.py" read session "$session_id" --lines 400 --joined)
+  [[ $claude_state == live && -n $fields[2] && -n $session_id ]] || continue
+  p=$("$PY" "$REPO/scripts/production/session_pane.py" read session "$session_id" --lines 400 --joined) || continue
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)
   print -r -- "$pane" | grep -E '^● ' | grep -vE 'says:|^● (Bash|Read|Write|Edit|Skill|Update|Search)\(' | tail -2 | cut -c1-220

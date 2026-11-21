@@ -3163,7 +3163,7 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertIn(str(damaged), errors.getvalue())
                         supervised.return_value = {}
                         self.assertEqual(worker.select_worker(self.fixture.parent.id, "impl", record),
-                                         staff.WorkerName.parse("impl"))
+                                         staff.WorkerName.parse("impl2" if work == "damaged own run" else "impl"))
         self.fixture.world.locations[first.pane]["agent_status"] = "working"
         _ = self.fixture.world.stop(second.row, self.fixture.world)
         self.fixture.world.reads.clear()
@@ -4171,9 +4171,9 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertEqual(cells[opened.row.name][-1], "TEST suite, TEST build continued" if alive else "-")
                         self.assertEqual(cells[other.row.name][-1], "-")
                         self.assertEqual(cells[opened.row.name][5], expected)
-                        # Only records that a live supervisor names are read, each once.
+                        # Read each saved record once, even when the supervisor has exited.
                         for path in directory.glob("*.json"):
-                            self.assertEqual(sum(call.args == (path,) for call in reads.call_args_list), int(alive), str(path))
+                            self.assertEqual(sum(call.args == (path,) for call in reads.call_args_list), 1, str(path))
                         if location == "completed pass":
                             code, output, errors = self.command("list", "--json", *scope)
                             self.assertEqual(code, 0, errors)

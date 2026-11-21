@@ -819,19 +819,23 @@ A detached run continues across a session stop or restart.
 The command runs in a `builds-detached.slice` scope when systemd is available.
 The command runs in its own session, including through the scope prefix.
 The record saves the command's process group.
-The supervisor uses default TERM, INT, and HUP dispositions.
-It installs no signal handler.
+The supervisor keeps the signal dispositions present at entry.
+The supervisor refuses to start if it inherits `SIGCHLD=SIG_IGN`.
 `detached_runs.py stop` checks the supervisor and the command identity before it signals the command group.
-The supervisor stays alive to record the exit status and deliver the result.
+The stop records the request time and sends TERM.
+A live supervisor attempts SIGKILL on its first turn at or after the deadline.
+The deadline is the request time plus the configured grace period.
+The supervisor confirms the group end before it reaps the leader and delivers the result.
 A worker that stops its own run keeps its pass active.
 A stop from another caller can end the pass and notify the director.
 The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
 The supervisor writes "done" to the pipe after the command ends.
 If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.
 The watcher then runs `detached_runs.py supervisor-gone`. It leaves the command group and saves a stop reason.
-It sends TERM to the command group, waits for the command leader and reaps the record.
-So a supervisor end never leaves the command running, and the worker gets a STOPPED result.
-If the supervisor dies, the next start, worker restore, or explicit `detached_runs.py reap` finishes its record and delivers its result.
+It sends TERM to the group and waits for the leader to exit.
+The watcher uses TERM only.
+The run stays pending if a descendant survives TERM.
+The watcher, the next start, a worker restore, or `detached_runs.py reap` can finish the record after group confirmation.
 The result reports no exit status unless the command or the supervisor saved one. `verify.sh` saves its own status at exit.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
 After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.

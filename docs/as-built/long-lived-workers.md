@@ -715,11 +715,25 @@ The guard skips `env` assignments and the two-word `-u` and `--unset` options.
 If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
 To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
 The record saves the command's process group as `command_group`.
-The supervisor installs no signal handler.
+The supervisor leaves the signal dispositions unchanged.
+The supervisor refuses to start if it inherits `SIGCHLD=SIG_IGN`.
 `detached_runs.py stop` and a build hold stop send TERM to the command group.
 Each checks the supervisor and the command leader identity before it signals the group.
 Each stages the stop reason before it sends TERM.
-The supervisor stays alive to record the exit status and deliver the result.
+Each saves the first request time with the reason and keeps that time on retry.
+The deadline is the saved request time plus `STOP_GRACE_SECONDS`.
+A live supervisor attempts SIGKILL on its first turn at or after the deadline.
+The supervisor does no leader check or process scan between the accepted stop and the attempt.
+Even a graceful stop can take the full grace period.
+The supervisor saves `stop_escalated: true` if it sends SIGKILL.
+The result and the owning pane pass notice include `Stop signal: SIGKILL`.
+The supervisor retains the leader until a process scan confirms that the group ended.
+It runs one scan at a time outside the record lock.
+`STOP_GROUP_SCAN_TIMEOUT_SECONDS` limits each scan.
+`STOP_GROUP_ALERT_SECONDS` sets the delay after escalation before the supervisor logs one alert.
+The alert leaves admission and delivery pending.
+The supervisor reaps the leader after group confirmation.
+A watcher sends TERM if the supervisor dies. The escalation guarantee applies to a live supervisor.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.
 Exits 76 and 77 also include instructions for the next action.
@@ -730,18 +744,24 @@ The self-stop saves `self_stop: true` with the stop reason.
 The supervisor keeps the pass active and sends the result to the owning worker.
 Delivery stays pending if the worker cannot receive the result.
 If the worker's staff row is gone, the director receives the run result.
-A stop from another caller can cancel the owning pass.
+A stop from another caller cancels an identified owning pass when no other live run holds it.
 New worker runs save the recorder pass ID or the reason the lookup failed.
 An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-For either stop kind, the supervisor records the leader's exit status.
-The supervisor waits for the entire group to end.
-The supervisor starts delivery once the group ends.
-The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
-The folder reader finds pending stops by index and verifies their status in the run record.
+Every accepted stop counts against admission until the group ends, including after supervisor failure.
+The supervisor records the exit status and starts delivery after it reaps the leader.
+The folder reader checks saved records, supervisor paths, and stop markers for pending runs.
+The reader validates each current record and its basename before it matches the owner.
+The reader also accepts legacy stops with only the worker name, PID, running status, and stop reason.
+Account status and the units list report unreadable run records for the filename owner or all possible owners.
+The units list reports Claude presence and work state in separate columns.
+The status script changes saved decisions and blocks only after it reads a proved pane successfully.
+The units board shows unknown detached work beside the director's checked state.
 The stop uses the same command and group checks as the orphan reaper for other runs of the worker.
 The stop keeps the pass active if it cannot confirm ownership or the end of the commands.
 It reports the reason for keeping the pass.
+If a temporary blocker prevents a required cancellation, completion stays pending.
+A saved delivery receipt prevents a second result and allows cancellation to continue.
 The stop holds the worker lock, then the admission lock, then the recorder lock.
 The stop checks the shared receipt for DONE before it cancels the pass.
 The recorder saves a verified DONE through normal completion.

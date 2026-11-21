@@ -200,7 +200,10 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                     self.assertIn(".unit.toml", errors.getvalue())
 
     def test_units_in_uses_the_staff_name_when_the_document_filename_differs(self) -> None:
-        from scripts.production import live_units, session_staff
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from scripts.agents import detached_run_process, worker_lifecycle
+        from scripts.production import live_units, session_staff, unit_lookup
 
         fixture = self.row_production()
         every = session_staff.LabeledProductions({}, {fixture.runner.name: ("member",)})
@@ -208,6 +211,57 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         selected = live_units.units_in(fixture.runner.name, every)
         self.assertEqual([unit.unit for unit in selected], ["member"])
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+        second = fixture_member("unit", name="second", parent=fixture.runner.id)
+        unrelated = fixture_member("unit", name="unrelated", parent=fixture.runner.id)
+        members = (fixture.unit, second, unrelated)
+        run = self.root / "shared-director-run"
+        for member in members[:2]:
+            _ = staff.set_run(member.id, staff.OpenRun(run))
+        runs = run / worker_lifecycle.DETACHED_RUNS_DIR
+        runs.mkdir(parents=True)
+        every = session_staff.LabeledProductions({}, {fixture.runner.name: tuple(member.name for member in members)},
+            registry_owners={fixture.runner.name: {member.name: unit_lookup.ProvedLiveUnit(unit_lookup.LiveClaude(
+                member.name, member.current_session, "", 123, "idle")) for member in members}})
+        damaged_fields = {"pid": 90001, "status": "running", "stop_reason": 42}
+        for case, name, body, expected in (
+                ("tagged", f"old@{fixture.unit.id}.json", "{", ("unknown", "idle", "idle")),
+                ("supervised", f"supervised@{fixture.unit.id}.json", "{", ("unknown", "idle", "idle")),
+                ("untagged", "old.json", "{", ("unknown", "unknown", "idle")),
+                ("matching name", "matching.json", json.dumps({**damaged_fields, "worker": fixture.unit.name}),
+                    ("unknown", "unknown", "idle")),
+                ("former name", "former.json", json.dumps({**damaged_fields, "worker": "former"}),
+                    ("unknown", "unknown", "idle")),
+                ("absent name", "unnamed.json", json.dumps({**damaged_fields, "staff_id": fixture.unit.id}),
+                    ("unknown", "unknown", "idle")),
+                ("untagged director, invalid command", "director.json", json.dumps({
+                    "run_id": "director", "status": "running", "pid": 90001, "staff_id": fixture.unit.id,
+                    "worker": fixture.unit.name, "command": 42, "session_dir": str(run), "label": "check",
+                    "started_at": 1, "log": str(runs / "director.log"), "director_dir": str(run),
+                    "done_message_file": ""}), ("unknown", "unknown", "idle")),
+                ("legacy stop", "old.json", json.dumps({
+                    "worker": fixture.unit.name, "pid": 90001, "status": "running", "stop_reason": "Build hold."}),
+                    ("busy", "idle", "idle"))):
+            path = runs / name
+            _ = path.write_text(body, encoding="utf-8")
+            with (self.subTest(case=case), mock.patch.object(detached_run_process, "supervisor_records",
+                    return_value={path.resolve(): frozenset({90001})}
+                    if case in ("supervised", "untagged director, invalid command") else {}),
+                  redirect_stderr(io.StringIO()) as errors):
+                selected = live_units.units_in(fixture.runner.name, every)
+                self.assertEqual(tuple(unit.status for unit in selected), expected)
+                if case != "legacy stop":
+                    self.assertEqual(sum(str(path) in line for line in errors.getvalue().splitlines()), 1)
+                    with (mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources(())),
+                          mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+                          redirect_stdout(io.StringIO()) as output):
+                        self.assertEqual(live_units.main(["--status", "--production", fixture.runner.name]), 0)
+                    columns = [line.split("\t") for line in output.getvalue().splitlines()]
+                    self.assertEqual({row[0]: row[2] for row in columns},
+                                     {member.name: "live" for member in members})
+                    self.assertEqual([row[4] for row in columns], [member.current_session for member in members])
+                    self.assertEqual(tuple(row[5] for row in columns), expected)
+            path.unlink()
 
 
     def test_unknown_name_has_no_units_in_the_supplied_snapshot(self) -> None:
@@ -299,7 +353,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.hosts({})
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "offline\t\tgone\t\n")
+        self.assertEqual(result.stdout, "offline\t\tgone\t\texited\n")
 
     def test_short_unit_ids_keep_their_pane_spelling(self) -> None:
         self.members("writer", "hook")
@@ -307,7 +361,7 @@ class LiveUnitsTests(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(result.stdout.splitlines()), [
-            "hook\t\tgone\t", "writer\therdr:director:w4:p1\tunknown\t",
+            "hook\t\tgone\t\texited", "writer\therdr:director:w4:p1\tunknown\t\tunknown",
         ])
 
     def test_record_membership_wins_over_a_stale_pane_mark(self) -> None:
@@ -323,7 +377,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.doc = self.root / "receiving-production.md"
         new = self.run_script("--production", receiving.name)
         self.assertEqual(new.returncode, 0, new.stderr)
-        self.assertEqual(new.stdout, "alpha\therdr:director:w4:p1\tunknown\t\n")
+        self.assertEqual(new.stdout, "alpha\therdr:director:w4:p1\tunknown\t\tunknown\n")
 
     def test_each_member_is_listed_with_its_session_as_it_is_now(self) -> None:
         self.members("alpha", "beta")
@@ -339,8 +393,8 @@ class LiveUnitsTests(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         # The unmarked pane has no member. The other production keeps its own member.
-        self.assertEqual(sorted(result.stdout.splitlines()), ["alpha\therdr:renamed-since-launch:w4:p1\tlive\trenamed-since-launch",
-                                                      "beta\therdr:beta-label:w5:p1\tunknown\t"])
+        self.assertEqual(sorted(result.stdout.splitlines()), ["alpha\therdr:renamed-since-launch:w4:p1\tlive\trenamed-since-launch\tidle",
+                                                      "beta\therdr:beta-label:w5:p1\tunknown\t\tunknown"])
         script = SCRIPT.with_name("unit_status.sh")
         setup = script.read_text().split("NOTIFIER=", 1)[0].replace(
             "REPO=${0:A:h:h:h}", "REPO=" + shlex.quote(str(SCRIPT.parents[2])))
@@ -375,7 +429,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.claude("native-claude", "w1:p1")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "alpha\therdr:native:w1:p1\tlive\tnative-claude\n")
+        self.assertEqual(result.stdout, "alpha\therdr:native:w1:p1\tlive\tnative-claude\tidle\n")
 
     def test_the_staff_name_selects_the_showrunner_with_a_different_session_name(self) -> None:
         self.members("alpha")
@@ -384,7 +438,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.addCleanup(fake_showrunner.write_session(self.records, "director", "director-id").close)
         result = self.run_script("show")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["alpha\therdr:alpha-label:w4:p1\tunknown\t"])
+        self.assertEqual(result.stdout.splitlines(), ["alpha\therdr:alpha-label:w4:p1\tunknown\t\tunknown"])
 
     def test_a_host_that_cannot_say_is_an_error_not_an_empty_list(self) -> None:
         self.members("alpha")

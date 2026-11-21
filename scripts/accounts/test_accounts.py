@@ -1111,7 +1111,8 @@ class AccountsTests(unittest.TestCase):
                         member = replace(member, run=staff.OpenRun(run))
                         _ = run_path.write_text(json.dumps({"run_id": "fixture", "status": "running", "pid": 90001,
                             "staff_id": member.id, "worker": member.name, "command": ["private-check"],
-                            "session_dir": str(run), "label": "check", "started_at": 1, "log": str(run / "fixture.log")}))
+                            "session_dir": str(run), "label": "check", "started_at": 1, "log": str(run / "fixture.log"),
+                            "director_dir": str(run), "done_message_file": ""}))
                     parent = membership.parent_of(member)
                     snapshot = staff.StaffSnapshot((member, parent) if parent is not None else (member,))
                     process_args = ["python3", "detached_runs.py", "supervise", str(run_path)] if supervisor == "live" else []
@@ -1124,9 +1125,9 @@ class AccountsTests(unittest.TestCase):
                               if supervisor == "live" else {}),
                           patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                         status = accounts.read_status(source=accounts.StoredUsageOnly())
-                    # The status read opens only records that a live supervisor names.
+                    # The status read opens each saved record once, even after its supervisor exits.
                     if supervisor != "none":
-                        self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), int(supervisor == "live"))
+                        self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), 1)
                     role = "units" if kind == "unit" else "showrunners"
                     label = "claude4" if activity else "claude2"
                     document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
@@ -1150,8 +1151,61 @@ class AccountsTests(unittest.TestCase):
                               patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                             selected = live_units.units_in(parent.name, listing)
                         if supervisor != "none":
-                            self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), int(supervisor == "live"))
+                            self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), 1)
                         self.assertEqual(selected[0].status, expected)
+
+        first, second, unrelated = members[:3]
+        shared_run = self.root / "shared-director-run"
+        runs = shared_run / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir(parents=True)
+        idle_sessions: list[sessions.SessionRecord] = [{**session, "status": "idle"} for session in live]
+        shared = replace(membership, rows=tuple(
+            replace(row, run=staff.OpenRun(shared_run)) if row.id in (first.id, second.id) else row
+            for row in membership.rows))
+        unknown_count = {"state": "unknown", "reason": "detached run records unreadable"}
+        damaged_fields = {"pid": 90001, "status": "running", "stop_reason": 42}
+        for case, filename, body, expected in (
+                ("tagged", f"old@{first.id}.json", "{", ("unknown", "idle", "idle")),
+                ("supervised", f"supervised@{first.id}.json", "{", ("unknown", "idle", "idle")),
+                ("untagged", "old.json", "{", ("unknown", "unknown", "idle")),
+                ("matching name", "matching.json", json.dumps({**damaged_fields, "worker": first.name}),
+                    ("unknown", "unknown", "idle")),
+                ("former name", "former.json", json.dumps({**damaged_fields, "worker": "former"}),
+                    ("unknown", "unknown", "idle")),
+                ("absent name", "unnamed.json", json.dumps({**damaged_fields, "staff_id": first.id}),
+                    ("unknown", "unknown", "idle")),
+                ("untagged director, invalid command", "director.json", json.dumps({
+                    "run_id": "director", "status": "running", "pid": 90001, "staff_id": first.id,
+                    "worker": first.name, "command": 42, "session_dir": str(shared_run), "label": "check",
+                    "started_at": 1, "log": str(runs / "director.log"), "director_dir": str(shared_run),
+                    "done_message_file": ""}), ("unknown", "unknown", "idle")),
+                ("legacy stop", "old.json", json.dumps({
+                    "worker": first.name, "pid": 90001, "status": "running", "stop_reason": "Build hold."}),
+                    ("busy", "idle", "idle"))):
+            path = runs / filename
+            atomic_file.write_text_atomic(path, body)
+            with (self.subTest(case=case), patch.object(staff, "local_snapshot", return_value=shared),
+                  patch.object(sessions, "running_sessions", return_value=idle_sessions),
+                  patch.object(pane_launch, "record_directory", return_value=records),
+                  patch.object(accounts, "_session_config_dir", side_effect=live_directory),
+                  patch.object(detached_run_process, "supervisor_records",
+                               return_value={path.resolve(): frozenset({90001})}
+                               if case in ("supervised", "untagged director, invalid command") else {})):
+                status = accounts.read_status(source=accounts.StoredUsageOnly())
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
+                rows = {row["label"]: row for row in document["accounts"]}
+                activities = {entry["session"]: entry["state"] for row in rows.values() for entry in row["sessions"]}
+                self.assertEqual(tuple(activities[member.current_session] for member in (first, second, unrelated)), expected)
+                counts = {label: rows[label]["role_counts"][rows[label]["roles"].index("units")]
+                          for label in ("claude2", "claude4")}
+                exited_and_idle = {"busy": 0, "idle": 1, "paused": 0, "exited": 1, "total": 2}
+                busy_and_idle = {"busy": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}
+                self.assertEqual(counts["claude2"], unknown_count if expected[1] == "unknown" else exited_and_idle)
+                self.assertEqual(counts["claude4"], busy_and_idle if case == "legacy stop" else unknown_count)
+                if case != "legacy stop":
+                    self.assertEqual(sum(str(path) in problem for problem in document["problems"]), 1)
+                    self.assertEqual(document["board"]["rows"][-1]["cells"]["total"][0]["text"], "unknown")
+            path.unlink()
 
     def test_detached_work_and_a_starting_pane_count_as_busy(self) -> None:
         identity = staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd")
@@ -1314,7 +1368,8 @@ class AccountsTests(unittest.TestCase):
                     if supervisor != "none":
                         _ = run_path.write_text(json.dumps({"run_id": "fixture", "status": "running", "pid": 90001,
                             "staff_id": target.id, "worker": target.name, "command": ["private-check"],
-                            "session_dir": str(current_run), "label": "check", "started_at": 1, "log": str(current_run / "fixture.log")}))
+                            "session_dir": str(current_run), "label": "check", "started_at": 1,
+                            "log": str(current_run / "fixture.log"), "director_dir": str(current_run), "done_message_file": ""}))
                     if ownership == "renamed":
                         with patch.object(herdr.Herdr, "retitle_row", return_value=True):
                             _ = staff.rename(target.id, target.name + "2")
@@ -1414,6 +1469,26 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 0, 3),))
                 self.assertIn("units 10 (busy 4, idle 3, paused 0, exited 3)", accounts.render_status_table(
                     accounts.StatusReading(rows, (), (), timezone.utc, now)))
+
+                for affected_machine in (here, peer):
+                    with self.subTest(affected_machine=affected_machine):
+                        local_row = row
+                        peer_counts = session_counts_document({(self.home / ".claude1", "units"):
+                            {"peer-unit": "unknown" if affected_machine == peer else "busy"},
+                            (self.home / ".claude1", "showrunners"): {"peer-director": "idle"}})
+                        peer_counts.update(machine=peer, at=now.isoformat())
+                        atomic_file.write_text_atomic(session_counts_cache(), json.dumps(peer_counts))
+                        if affected_machine == here:
+                            local_row = replace(row, role_counts=(accounts.UnknownRoleCounts("detached run records unreadable"),))
+                        reading = machine_role_counts((local_row,), now)
+                        status = accounts.StatusReading(reading.rows, reading.problems, (), timezone.utc, now)
+                        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
+                        exposed = document["accounts"][0]
+                        unknown = {"state": "unknown", "reason": "detached run records unreadable"}
+                        self.assertEqual(exposed["role_counts"][exposed["roles"].index("units")], unknown)
+                        self.assertEqual(exposed["role_counts_by_machine"][affected_machine]["units"], unknown)
+                        self.assertEqual(exposed["role_counts"][exposed["roles"].index("showrunners")],
+                                         {"busy": 0, "idle": 1, "paused": 0, "exited": 0, "total": 1})
 
     def test_published_counts_pass_the_older_peer_count_check(self) -> None:
         self.write_note("codex1", "counts@example.invalid")

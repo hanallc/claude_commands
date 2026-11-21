@@ -1340,7 +1340,7 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
         text = "The plan is complete and the queue is empty" if next_item.plan_complete else "No plan or queued work"
         current = [WorkItem("Nothing to do", text)]
     if not current and not state.workers_unavailable:
-        current.append(WorkItem("Not recorded", "Director shell work cannot be verified"
+        current.append(WorkItem("Not recorded", "Director work cannot be verified"
                                 if state.director_work_unknown else state.fallback))
     if state.workers_unavailable:
         current.append(WorkItem("Not recorded", "Workers unavailable; who runs cannot be determined"))
@@ -1581,6 +1581,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         on_main: Callable[[str], bool] = unit_evidence.on_main if repository_available else lambda _commit: False
         status = director_status(unit)
         busy = status == "busy"
+        director_cell = (f"{status} · detached work unknown"
+                         if unit.status == "unknown" and not isinstance(unit.owner, unit_lookup.UnknownUnit) else status)
         run_events: list[dict[str, object]] = []
         phases: tuple[phase_table.OpenPhase, ...] = ()
         queue: UnitWorkQueue | UnreadableWorkQueue = UnreadableWorkQueue()
@@ -1624,7 +1626,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                         progress_record = built
             if isinstance(view, CensusView) and member.id in view.workers:
                 workers = view.workers[member.id]
-        rows, plan_eta = status_rows(unit.unit, status, (machines[index],) if machines else (), progress_record, run_events,
+        rows, plan_eta = status_rows(unit.unit, director_cell, (machines[index],) if machines else (), progress_record, run_events,
                                      phases, land, now=now, zone=zone)
         table_rows.extend(rows)
         show_plan_eta = show_plan_eta or plan_eta
@@ -1694,7 +1696,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         states.append(UnitBoardState(unit.unit, machines[index] if machines else "", tasks, next_item, merge,
                                      fallback, bool(hold), busy, bool(phases), readable,
                                      isinstance(view, census.CensusFailed), no_workers, past_tasks(facts), current_work,
-                                     owner=unit.owner, director_work_unknown=shell_work_unproved))
+                                     owner=unit.owner, director_work_unknown=shell_work_unproved or unit.status == "unknown"))
     buckets = ("working", "waiting to merge", "waiting on other work", "idle", "unknown")
     counts = {bucket: sum(state.bucket == bucket for state in states) for bucket in buckets}
     summary = " · ".join(f"{bucket} {counts[bucket]}" for bucket in buckets if bucket != "unknown" or counts[bucket])

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_runtime
 
-from scripts.agents import remote
+from scripts.agents import remote, worker_lifecycle
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from typing import ClassVar, cast, override
+from typing import ClassVar, Literal, cast, override
 import unittest
 from unittest import mock
 
@@ -38,6 +38,7 @@ from scripts.herdr.fake_herdr import CommandResponse, pane_list
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
+type DetachedRecordState = Literal["absent", "finished", "damaged"]
 # Only bound fixture hangs; no tested wait uses a clock.
 
 
@@ -91,6 +92,9 @@ def run_fixture_python() -> None:
         return herdr.json_object(herdr.decode_object(response["stdout"], "fixture response")["result"], "fixture result")
 
     sys.argv = sys.argv[1:]
+    if Path(sys.argv[0]).name == "session_pane.py":
+        with (root.parent / "pane_read_calls").open("a", encoding="utf-8") as calls:
+            _ = calls.write(f"{sys.argv[3]}\n")
     with (mock.patch.object(process_identity, "process_start", side_effect=starts.get),
           mock.patch.object(relay_identity, "process_start", side_effect=starts.get),
           mock.patch.object(session_records, "process_start", side_effect=starts.get),
@@ -105,7 +109,8 @@ def run_fixture_python() -> None:
             _ = runpy.run_path(sys.argv[0], run_name="__main__")
 
 
-def publish_host(environment: dict[str, str], units: list[HostedUnit], pids: dict[str, int]) -> None:
+def publish_host(environment: dict[str, str], units: list[HostedUnit], pids: dict[str, int], *,
+                 failed_pane_reads: tuple[str, ...] = ()) -> None:
     """Keep fake process ancestry, listener ownership, argv logs and exact response bytes.
 
     These tests use only static read responses, so generate their shell dispatch
@@ -122,6 +127,8 @@ def publish_host(environment: dict[str, str], units: list[HostedUnit], pids: dic
         if command == "default":
             continue
         arguments = command.split()
+        if arguments[1] in failed_pane_reads and arguments[2:4] == ["pane", "read"]:
+            response = CommandResponse(code=1, stdout="")
         stdout = (pane_list(response["stdout"], arguments[:2], [])
                   if arguments[2:4] == ["pane", "list"] else response["stdout"])
         lines.extend((f"{shlex.quote(command)})",
@@ -196,6 +203,9 @@ class UnitStatusFixture(unittest.TestCase):
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
         unreadable_registry: bool = False,
+        pane_absent_units: tuple[str, ...] = (),
+        failed_pane_reads: tuple[str, ...] = (),
+        detached_records: DetachedRecordState = "absent",
     ) -> tuple[tuple[str, ...], str | None, str]:
         with self.case_directory() as root, isolated_staff_file(
             root / "staff.json", environment := {**os.environ, "XDG_CONFIG_HOME": str(root / "xdg-config")},
@@ -227,6 +237,7 @@ class UnitStatusFixture(unittest.TestCase):
                     _ = unit_membership("example", unit)
             self.unit_ids = {row.name: row.id for row in staff.initial_snapshot().find(kind="unit")}
             pids: dict[str, int] = {}
+            damaged_records: list[Path] = []
             _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
             for index, unit in enumerate(units, start=1):
                 worktree = root / "worktrees" / unit
@@ -257,7 +268,22 @@ class UnitStatusFixture(unittest.TestCase):
                     else:
                         member = unit_membership("example", unit)
                     session_id = member.id
-                    if marker:
+                    if detached_records != "absent":
+                        run = root / "runs" / unit
+                        folder = run / worker_lifecycle.DETACHED_RUNS_DIR
+                        folder.mkdir(parents=True)
+                        path = folder / f"fixture@{member.id}.json"
+                        record_fields = {
+                            "run_id": path.stem, "status": "finished", "session_dir": str(run),
+                            "worker": unit, "staff_id": member.id, "label": "check", "command": ["true"],
+                            "log": str(path.with_suffix(".log")), "started_at": 1, "pid": 0,
+                            "director_dir": str(run), "done_message_file": "",
+                        }
+                        write_text_atomic(path, json.dumps(record_fields if detached_records == "finished" else {}))
+                        _ = staff.set_run(member.id, staff.OpenRun(run))
+                        if detached_records == "damaged":
+                            damaged_records.append(path)
+                    elif marker:
                         _ = staff.set_run(member.id, staff.OpenRun(Path(marker.strip())))
                     pid = pids[unit] = 992000 + index
                     record = SessionRecord(pid=pid, sessionId=session_id, name=f"claude-{unit}",
@@ -272,15 +298,26 @@ class UnitStatusFixture(unittest.TestCase):
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")
+            blocks = root / "status" / "blocks_open"
+            saved_blocks = "".join(f"{self.unit_ids[unit]}\t20000\twaiting on showrunner\n"
+                                   for unit in (*pane_absent_units, *failed_pane_reads)).encode()
+            if saved_blocks:
+                blocks.parent.mkdir()
+                _ = blocks.write_bytes(saved_blocks)
             outputs: list[str] = []
             for pane_by_unit in panes:
+                read_calls = root / "pane_read_calls"
+                read_calls.unlink(missing_ok=True)
                 hosted = [
                     labeled_host(unit, f"w{index}:p1", unit, production_name="example",
                                  screen=pane_by_unit.get(unit, "— holding: waiting on x\n"))
-                    for index, unit in enumerate(units, start=1) if unit not in missing_units]
+                    for index, unit in enumerate(units, start=1) if unit not in (*missing_units, *pane_absent_units)]
                 for unit in hosted:
                     unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
-                publish_host(environment, hosted, pids)
+                publish_host(environment, hosted, pids, failed_pane_reads=failed_pane_reads)
+                for unit in pane_absent_units:
+                    fake_unit_host.process(environment, pids[unit], 0, ["claude"],
+                                           {"CLAUDE_CODE_SESSION_ID": self.unit_ids[unit]})
                 if unreadable_registry and records.is_dir():
                     shutil.rmtree(records)
                     records.touch()
@@ -289,14 +326,28 @@ class UnitStatusFixture(unittest.TestCase):
                     check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if saved_blocks:
+                    self.assertEqual(blocks.read_bytes(), saved_blocks)
                 expected_errors = "".join(
+                    f"anomaly: {path}: worker state unreadable: invalid detached run record\n"
+                    for path in damaged_records
+                ) + "".join(
                     f"anomaly: pid {pids[unit.session]} in herdr:{unit.session}:{unit.pane}: "
                     + f"the session record of pid {pids[unit.session]} could not be read\n"
                     for unit in hosted if unit.session in unreadable_units
                 )
                 if unreadable_registry:
                     expected_errors += "anomaly: cannot list session records\n"
+                expected_errors += "".join(
+                    f"session {self.unit_ids[unit]}: herdr pane read: exit 1\n" for unit in failed_pane_reads
+                )
                 self.assertEqual(result.stderr, expected_errors)
+                if saved_blocks:
+                    pane_reads = read_calls.read_text(encoding="utf-8").splitlines() if read_calls.exists() else []
+                    for unit in pane_absent_units:
+                        self.assertNotIn(self.unit_ids[unit], pane_reads)
+                    for unit in failed_pane_reads:
+                        self.assertIn(self.unit_ids[unit], pane_reads)
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             seen_path = root / "status" / "decisions_seen"

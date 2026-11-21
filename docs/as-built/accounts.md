@@ -599,23 +599,25 @@ An accepted reading without a date removes the stored date.
 Both renderers use the same problem lines from `StatusReading.notes`, including shared-home repairs.
 JSON `problems` matches the text board's problem lines, with only the `* ` footnote prefix removed.
 Each account row exports `sessions` beside `role_counts`.
-Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
+Each entry has a native `session` ID and a `state` of `busy`, `idle`, `paused`, `exited`, or `unknown`.
 The list reuses local count observations and reads no pane again.
 Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
 Status attributes a session to its account independently of the current role selection.
 This preserves visible off-target members during a move.
 
-Local role counts read the registry, staff, pane launches, and worker records without writing state.
+Local role counts read the registry, staff, pane launches, and detached run records without writing state.
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
 A busy or starting pane gives `busy`. Live detached work also gives `busy`.
-On Linux, live detached work comes from one /proc scan for `detached_runs.py supervise` processes.
-The read opens only the records that those supervisors name. Without /proc, it reads each record.
-Exit and pause records take priority over all activity states.
-Without a live detached run, a missing live session gives `exited`.
+The reader checks saved records, supervisor paths, and stop markers for pending runs.
+A saved stop reason keeps a running record pending after its supervisor exits.
+The reader reports a damaged record for its proved owner or for all possible owners in its folder.
+An affected session gives `unknown` unless an exit, pause, or busy state has priority.
+A missing live session with no pending or unknown work gives `exited`.
 Other live activity gives `idle`.
-Role counts are `busy`, `idle`, `paused`, `exited` and `total`.
+Known role counts have `busy`, `idle`, `paused`, `exited`, and `total` fields.
+An affected role has `state: unknown` and a reason.
 The accounts board has no activity column, the same as the cargo-handler accounts table.
 The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
 An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
@@ -632,7 +634,10 @@ One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
 The cache keeps each machine's counts separate and rejects copies older than ten minutes.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
-The board sums available machine counts and identifies an unavailable peer.
+The board sums known machine counts and identifies an unavailable peer.
+The count document lists roles with unreadable run evidence in `unreadable_detached_roles`.
+Each listed role stays unknown when the board combines machine counts.
+Older readers omit the peer contribution for each listed role.
 
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.

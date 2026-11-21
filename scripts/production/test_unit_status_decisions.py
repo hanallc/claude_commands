@@ -1,18 +1,40 @@
 """Unit-status integration tests, grouped by subject."""
 from __future__ import annotations
 
-from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
+from scripts.production.unit_status_test_support import DetachedRecordState, UnitStatusFixture, setUpModule as setUpModule
 from scripts.production.unit_status import StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):
     def test_gate_first_sight_prints_decision_and_records_seen_key(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"
-        outputs, _, seen = self.run_statuses(None, "ok", 0, panes=({"hook": gate},))
-        self.assertIn("=== DECISION for you from hook ===", outputs[0])
-        self.assertIn("— gate: approve the blue path", outputs[0])
-        self.assertIn("=== end hook ===", outputs[0])
-        self.assertEqual(seen, f"{self.unit_ids['hook']}|— gate: approve the blue path\n")
+        cases: tuple[tuple[str, DetachedRecordState, tuple[str, ...], tuple[str, ...]], ...] = (
+                ("readable pane", "finished", (), ()),
+                ("damaged detached record", "damaged", (), ()),
+                ("no pane", "absent", ("hook",), ()),
+                ("failed pane read", "absent", (), ("hook",)),
+        )
+        for case, records, absent, failed in cases:
+            with self.subTest(case=case):
+                outputs, _, seen = self.run_statuses(
+                    None, "ok", 0, panes=({"hook": gate},), detached_records=records,
+                    pane_absent_units=absent, failed_pane_reads=failed,
+                )
+                if absent or failed:
+                    self.assertNotIn("CLAUDE STATE UNKNOWN", outputs[0])
+                    self.assertNotIn("CLAUDE NOT RUNNING", outputs[0])
+                    self.assertNotIn("SESSION GONE", outputs[0])
+                    self.assertNotIn("=== DECISION", outputs[0])
+                    self.assertEqual(seen, "")
+                    continue
+                self.assertIn("=== DECISION for you from hook ===", outputs[0])
+                self.assertIn("— gate: approve the blue path", outputs[0])
+                self.assertIn("=== end hook ===", outputs[0])
+                self.assertEqual(seen, f"{self.unit_ids['hook']}|— gate: approve the blue path\n")
+                if records == "damaged":
+                    self.assertIn("DETACHED WORK STATE UNKNOWN", outputs[0])
+                else:
+                    self.assertNotIn("DETACHED WORK STATE UNKNOWN", outputs[0])
 
     def test_repeated_gate_prints_still_waiting(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"

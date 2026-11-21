@@ -978,7 +978,7 @@ class UnitPhasesTests(unittest.TestCase):
         rendered = unit_phases.table([unit("shells", live("shells"))], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=read)
         self.assertIn("idle 0 · unknown 1", rendered.splitlines()[0])
         self.assertIn("**shells** — unknown", rendered)
-        self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), detail_rows(rendered, "shells"))
+        self.assertIn(("Now", "Not recorded", "Director work cannot be verified"), detail_rows(rendered, "shells"))
         self.assertNotIn("Nothing to do", rendered)
         self.assertNotIn("Run the AWS gate", rendered)
         self.assertNotIn("Watch CI", rendered)
@@ -1017,7 +1017,7 @@ class UnitPhasesTests(unittest.TestCase):
                         self.assertIn(("Also", "Watch CI", "Runs in the background"), rows)
                     else:
                         self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
-                        self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), rows)
+                        self.assertIn(("Now", "Not recorded", "Director work cannot be verified"), rows)
                         self.assertNotIn("Run the AWS gate", output)
                         self.assertNotIn("Watch CI", output)
                     self.assertNotIn("Old command", output)
@@ -1042,7 +1042,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn(("Now", "Nothing to do", "No plan or queued work"), rows)
                 else:
                     self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
-                    self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), rows)
+                    self.assertIn(("Now", "Not recorded", "Director work cannot be verified"), rows)
                     self.assertNotIn("Nothing to do", output)
                 self.assertNotIn("Old command", output)
 
@@ -1050,7 +1050,7 @@ class UnitPhasesTests(unittest.TestCase):
             output = unit_phases.table([selected._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation))], {},
                 repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=(empty_match,)))
             self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
-            self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"),
+            self.assertIn(("Now", "Not recorded", "Director work cannot be verified"),
                           detail_rows(output, "shells"))
             self.assertNotIn("Nothing to do", output)
 
@@ -1076,6 +1076,21 @@ class UnitPhasesTests(unittest.TestCase):
 
         paused = replace(member, paused=staff.Paused("2026-11-15T17:00:00+00:00", "showrunner", "review the board"))
         idle_owner = unit_lookup.ProvedLiveUnit(claude._replace(activity="idle"), generation)
+        for director, evidence, cell, summary, now_row in (
+                (selected._replace(owner=idle_owner), tiles(sessions=(empty_match,)), "idle",
+                 "idle 0 · unknown 1", ("Now", "Not recorded", "Director work cannot be verified")),
+                (selected._replace(owner=unit_lookup.ProvedAbsentUnit(), session=None), tiles(), "exited",
+                 "idle 0 · unknown 1", ("Now", "Not recorded", "Director work cannot be verified")),
+                (selected._replace(owner=idle_owner), tiles(sessions=(verified,)), "idle",
+                 "working 1", ("Now", "Run the AWS gate", "Runs in the background"))):
+            with self.subTest(detached_work="unknown", director=cell, summary=summary):
+                output = unit_phases.table([director._replace(status="unknown")], {}, repository=self.root, now=now,
+                                           zone=ZoneInfo("UTC"), census_read=evidence)
+                self.assertIn(f"| shells | {cell} · detached work unknown |", output)
+                self.assertIn(summary, output.splitlines()[0])
+                self.assertIn(now_row, detail_rows(output, "shells"))
+                self.assertNotIn("Nothing to do", output)
+
         paused_unit = selected._replace(member=paused, owner=idle_owner, lifecycle="paused")
         for evidence, count in ((tiles(sessions=(empty_match,)), "idle 1"), (half_pair, "idle 0 · unknown 1")):
             with self.subTest(case="paused with live owner", census_failed=isinstance(evidence, census.CensusFailed)):
@@ -1110,7 +1125,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn(count, output.splitlines()[0])
                     rows = detail_rows(output, "shells")
                     if not local_reached:
-                        self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), rows)
+                        self.assertIn(("Now", "Not recorded", "Director work cannot be verified"), rows)
                         self.assertNotIn("Nothing to do", output)
                     if case == "remote timeout with a local command":
                         self.assertIn(("Now", "Run the AWS gate", "Runs in the background"), rows)

@@ -9,7 +9,7 @@ except FileNotFoundError:
 import sys
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from scripts.production import session_staff, showrunners, staff
 from scripts.production import unit_lookup
@@ -21,7 +21,7 @@ class LiveUnit(NamedTuple):
     unit: str
     # None when no observed herdr session has the unit identity.
     session: unit_lookup.LabeledSession | None
-    status: session_state.SessionState | Literal["unknown"] = "exited"
+    status: session_state.SessionState = "exited"
     member: staff.StaffRow | session_state.UnrecordedStaff = session_state.UnrecordedStaff()
     machine: str = ""
     owner: session_staff.UnitOwner = session_staff.ProvedAbsentUnit()
@@ -162,7 +162,7 @@ def live_unit_ids(runner: showrunners.Showrunner) -> LiveUnitIds:
 
 
 def main(arguments: list[str]) -> int:
-    """Print one line per unit: unit id, pane, whether Claude runs (live, stopped, unknown, gone), name."""
+    """Print each unit's id, pane, Claude presence, name and work state."""
     status = arguments[:1] == ["--status"]
     if status:
         arguments = arguments[1:]
@@ -197,7 +197,7 @@ def main(arguments: list[str]) -> int:
         columns = (unit.unit, unit_lookup.place_text(unit.session.place) if unit.session is not None else "", running, unit.name)
         if status:
             columns += (session_id,)
-        print("\t".join(columns))
+        print("\t".join((*columns, unit.status)))
     return 0
 
 

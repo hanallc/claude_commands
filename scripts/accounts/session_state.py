@@ -10,7 +10,7 @@ from typing import Literal, Protocol, cast
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
 
-SessionState = Literal["busy", "idle", "paused", "exited"]
+SessionState = Literal["busy", "idle", "paused", "exited", "unknown"]
 StaffState = Literal["active", "paused", "exited"]
 
 
@@ -69,11 +69,9 @@ class RunEvidence(Protocol):
 
 def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Sequence[Path] = (),
                           worker_runs: LauncherRunDirectories | None = None) -> RunningDetachedWork:
-    """Read each run folder once and only the records that live supervisors name."""
+    """Read each run folder once, with its saved records, live supervisors and stop markers."""
     from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
 
-    live_runs = cast(Callable[[Mapping[Path, frozenset[staff.StaffId]]], Sequence[Mapping[str, object]]],
-                     import_module("scripts.agents.detached_runs").live_runs_in_folders)
     live_evidence = cast(Callable[..., RunEvidence],
                          import_module("scripts.agents.detached_runs").live_run_evidence_in_folders)
     worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
@@ -105,16 +103,11 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
     # A start or a finish adds or renames a record, so each folder's change shows on the folder.
     inputs = {folder / DETACHED_RUNS_DIR for folder in owners}
     folders = {folder: frozenset(identities) for folder, identities in owners.items()}
-    unreadable_workers: frozenset[staff.StaffId] = frozenset()
-    if worker_runs is None:
-        runs = live_runs(folders)
-    else:
-        names = {row.id: row.name for row in record.find(kind="worker")}
-        evidence = live_evidence(folders, staff_names=names)
-        evidence.report_errors()
-        unreadable_workers = frozenset(identity for error in evidence.read_errors for identity in error.staff_ids)
-        runs = evidence.runs
-    for run in runs:
+    names = {row.id: row.name for row in record.rows}
+    evidence = live_evidence(folders, staff_names=names)
+    evidence.report_errors()
+    unreadable_workers = frozenset(identity for error in evidence.read_errors for identity in error.staff_ids)
+    for run in evidence.runs:
         row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
         if row is not None:
             busy.add(row.id)
@@ -137,8 +130,11 @@ def classify(member: staff.StaffRow | UnrecordedStaff,
         return hold
     if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting", "shell"):
         return "busy"
-    if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
-        return "busy"
+    if isinstance(member, staff.StaffRow):
+        if member.id in detached.staff_ids:
+            return "busy"
+        if member.id in detached.unreadable_workers:
+            return "unknown"
     if isinstance(activity, NoLiveSession):
         return "exited"
     return "idle"
