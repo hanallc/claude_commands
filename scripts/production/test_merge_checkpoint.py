@@ -123,13 +123,19 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = config.write_text((checkout / "config/staff.conf").read_text())
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         _ = copy_helpers(Path(self.env["HOME"]))
+        document = self.checkout / self.doc.name
+        _ = shutil.copyfile(self.doc, document)
+        with (self.checkout / ".git/info/exclude").open("a") as exclude:
+            _ = exclude.write(f"\n/{document.name}\n")
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            _ = recorded_showrunner("example", document)
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
         trees = {"landed-work": self.root / "landed-work", "dirty-work": self.root / "dirty-work"}
         for branch, tree in trees.items():
             made = subprocess.run(
                 ["bash", str(checkout / "scripts/worktree/make_worktree.sh"), str(tree), branch],
-                cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=20)
+                cwd=self.other, env=self.env, capture_output=True, text=True, check=False, timeout=20)
             self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
             _ = self.git("merge", "--ff-only", checkpoint, cwd=tree)
             _ = self.git("push", "-u", "origin", branch, cwd=tree)
@@ -162,6 +168,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                      for path in (records / "made").glob("*.json")]
         self.assertEqual([(row["path"], row["branch"]) for row in remaining],
                          [(str(trees["dirty-work"]), "dirty-work")])
+        self.assertEqual([(row["owner"], row["merge_branch"]) for row in remaining],
+                         [("beta", "production")])
         self.assertEqual((trees["dirty-work"] / "src/alpha.txt").read_text(), "uncommitted work\n")
 
     def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:

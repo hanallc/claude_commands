@@ -386,9 +386,17 @@ The path hash uses SHA-256.
 `WorktreeRecord` holds version, path, branch, repository, base, merge branch, owner, and creation time.
 A failed record write removes the new tree and branch.
 
-The caller's staff row supplies its owner and merge branch.
-Without a staff row, the helper uses `origin/HEAD` and an empty owner.
-Without `origin/HEAD`, it records an empty merge branch, so a production merge does not end that tree.
+The helper resolves the owner and the production merge branch in this order:
+
+1. The staff row whose home worktree is the caller.
+2. The record of a made worktree at the caller, when its branch and base still match the caller.
+3. The caller's staff session, when its production document is in the same repository (on either machine).
+
+When none resolves, the helper refuses before it makes a folder or a branch. It never falls back to `origin/HEAD`.
+
+`worktrees.py repair` lists made-worktree records with an empty owner and the production branch that holds each tip.
+`repair --write` changes a record only when every production was checked and exactly one branch holds the tip.
+It replaces the record under the record lock, and only when the file still holds the bytes it read.
 
 `landed(record)` returns `Landed` or `NotLanded(commits, paths)`.
 It accepts patch-equivalent commits, merge commits, and commits that change only `docs/plans/`.

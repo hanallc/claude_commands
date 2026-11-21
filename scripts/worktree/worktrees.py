@@ -6,17 +6,24 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
-from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from typing import cast
+from urllib.parse import unquote, urlsplit
 
+from scripts.buildlog.repository import remote_identity
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import build_folders, scratch
 from scripts.production import session_staff, staff
@@ -33,6 +40,38 @@ class WorktreeRecord:
     merge_branch: str
     owner: str
     made_at: str
+
+
+@dataclass(frozen=True)
+class WorktreeOwner:
+    name: str
+    merge_branch: str
+
+
+@dataclass(frozen=True)
+class OwnerUnresolved:
+    reason: str
+
+
+@dataclass(frozen=True)
+class PublishedProductionBranch:
+    owner: WorktreeOwner
+    tip: str
+
+
+@dataclass(frozen=True)
+class LocalOrigin:
+    common_dir: Path
+
+
+@dataclass(frozen=True)
+class GitHubOrigin:
+    repository: str
+
+
+@dataclass(frozen=True)
+class UnclassifiedOrigin:
+    url: str
 
 
 @dataclass(frozen=True)
@@ -109,7 +148,11 @@ def record_file(path: Path) -> Path:
 
 
 def read_record(path: Path) -> WorktreeRecord:
-    fields = cast(dict[str, object], json.loads(path.read_text()))
+    return decode_record(path.read_bytes())
+
+
+def decode_record(content: bytes) -> WorktreeRecord:
+    fields = cast(dict[str, object], json.loads(content))
     return WorktreeRecord(
         version=cast(int, fields["version"]), path=cast(str, fields["path"]),
         branch=cast(str, fields["branch"]), repo=cast(str, fields["repo"]),
@@ -117,9 +160,14 @@ def read_record(path: Path) -> WorktreeRecord:
         owner=cast(str, fields["owner"]), made_at=cast(str, fields["made_at"]))
 
 
-def write_record(record: WorktreeRecord) -> None:
-    path = record_file(Path(record.path))
-    path.parent.mkdir(parents=True, exist_ok=True)
+@contextmanager
+def record_lock(path: Path) -> Generator[None]:
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def write_record(path: Path, record: WorktreeRecord) -> None:
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
     _ = temporary.write_text(json.dumps(asdict(record), indent=2) + "\n")
     _ = temporary.replace(path)
@@ -132,16 +180,54 @@ def staff_record() -> staff.StaffSnapshot:
         return staff.StaffSnapshot(())
 
 
-def caller_branch(repo: Path, caller: Path, snapshot: staff.StaffSnapshot) -> tuple[str, str]:
+def production_owner(resolver: session_staff.RowResolver, row: staff.StaffRow) -> WorktreeOwner | OwnerUnresolved:
+    try:
+        branch = resolver.merge_branch(row)
+    except staff.StaffUnreadable as error:
+        return OwnerUnresolved(str(error))
+    if isinstance(branch, session_staff.BranchUnreadable):
+        return OwnerUnresolved(branch.reason)
+    if not branch.name or branch.name == "HEAD":
+        return OwnerUnresolved(f"{row.name} has no production merge branch")
+    return WorktreeOwner(row.name, branch.name)
+
+
+def caller_matches_record(caller: Path, record: WorktreeRecord) -> bool:
+    head = git(caller, "symbolic-ref", "--quiet", "HEAD", check=False)
+    if head.returncode or head.stdout.strip() != f"refs/heads/{record.branch}":
+        return False
+    if not record.base:
+        return True
+    base = git(caller, "merge-base", "--is-ancestor", record.base, "HEAD", check=False)
+    return base.returncode == 0
+
+
+def caller_branch(repo: Path, caller: Path, snapshot: staff.StaffSnapshot) -> WorktreeOwner:
     resolver = session_staff.RowResolver(snapshot)
     member = resolver.member_by_folder(remote.local_machine(), caller)
     if isinstance(member, session_staff.MemberFound):
-        branch = resolver.merge_branch(member.row)
-        if isinstance(branch, session_staff.Branch):
-            return member.row.name, branch.name
-    # With no merge branch, no production merge ends the tree: it stays.
-    head = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
-    return "", head.stdout.strip().removeprefix("origin/") if head.returncode == 0 else ""
+        owner = production_owner(resolver, member.row)
+        if isinstance(owner, WorktreeOwner):
+            return owner
+    try:
+        inherited = read_record(record_file(caller))
+        if (inherited.owner and inherited.merge_branch
+                and Path(inherited.path).resolve() == caller and Path(inherited.repo).resolve() == repo
+                and caller_matches_record(caller, inherited)):
+            return WorktreeOwner(inherited.owner, inherited.merge_branch)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    session = snapshot.by_current_session(staff.caller_identity())
+    if session is not None:
+        try:
+            doc = resolver.production_doc(session)
+            if isinstance(doc, session_staff.ProductionDoc) and same_repository(repo, doc.path.parent, doc.machine):
+                owner = production_owner(resolver, session)
+                if isinstance(owner, WorktreeOwner):
+                    return owner
+        except (Refused, OSError, ValueError):
+            pass
+    raise Refused(1, f"{str(caller)!r}: cannot resolve a production merge branch. Run from the unit's home worktree.")
 
 
 def has_branch(repo: Path, branch: str) -> bool:
@@ -439,28 +525,224 @@ def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
             continue
         tree_path = path
         try:
-            record = read_record(path)
-            tree_path = Path(record.path)
-            if Path(record.repo).resolve() != main_repo or record.merge_branch != merge_branch:
+            try:
+                record = read_record(path)
+            except FileNotFoundError:
                 continue
-            results.append(end_record(record, snapshot))
+            tree_path = Path(record.path)
+            if record.merge_branch != merge_branch or Path(record.repo).resolve() != main_repo:
+                continue
+            with record_lock(path):
+                try:
+                    record = read_record(path)
+                except FileNotFoundError:
+                    continue
+                tree_path = Path(record.path)
+                if record.merge_branch != merge_branch or Path(record.repo).resolve() != main_repo:
+                    continue
+                if record_file(tree_path) != path:
+                    results.append(Kept(tree_path, "the worktree does not match its record file"))
+                    continue
+                results.append(end_record(record, snapshot))
         except (Refused, OSError, ValueError, KeyError, TypeError) as error:
             results.append(Kept(tree_path, str(error)))
     return results
 
 
-def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.StaffSnapshot) -> None:
-    owner, merge_branch = caller_branch(repo, caller, snapshot)
-    base = git(caller, "rev-parse", "HEAD").stdout.strip()
-    _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
-        path, caller, build_folders.NewWorktreeBranch(branch, base)))
-    record = new_record(path, branch, repo, base, owner, merge_branch)
+def common_directory(repo: Path) -> Path:
+    result = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(result.stdout.strip()).resolve()
+
+
+def network_origin(origin: str) -> GitHubOrigin | UnclassifiedOrigin:
+    if not origin:
+        raise Refused(1, "the origin URL is empty")
+    if re.fullmatch(r"(?:https://github\.com/|ssh://git@github\.com(?::22)?/|git@github\.com:)"
+                    + r"[a-z0-9_.-]+/[a-z0-9_.-]+/?", origin, re.IGNORECASE | re.ASCII):
+        return GitHubOrigin(remote_identity(origin.lower(), "/"))
+    return UnclassifiedOrigin(origin)
+
+
+def checkout_origin(repo: Path) -> LocalOrigin | GitHubOrigin | UnclassifiedOrigin:
+    origin = git(repo, "remote", "get-url", "origin").stdout.strip()
+    if origin.startswith("file://"):
+        url = urlsplit(origin)
+        if url.netloc in ("", "localhost") and url.path.startswith("/") and not (url.query or url.fragment):
+            return LocalOrigin(common_directory(Path(unquote(url.path))))
+    elif origin and ":" not in origin.split("/", 1)[0]:
+        return LocalOrigin(common_directory(main_checkout(repo) / origin))
+    return network_origin(origin)
+
+
+def remote_checkout_origin(machine: str, checkout: Path) -> GitHubOrigin | UnclassifiedOrigin:
+    if machine != remote.other_machine():
+        raise Refused(1, f"machine {machine} has no configured connection")
+    command = shlex.join(["git", "-C", str(checkout), "remote", "get-url", "origin"])
     try:
-        write_record(record)
-    except OSError:
-        _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
-        _ = git(caller, "branch", "-D", branch)
-        raise
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+                                timeout=remote.STANDARD_TIME_LIMIT["seconds"])
+    except subprocess.TimeoutExpired as error:
+        raise Refused(1, f"cannot read the origin URL on {machine}: {error}") from error
+    if result.returncode:
+        raise Refused(1, failure_detail(result))
+    origin = network_origin(result.stdout.strip())
+    if isinstance(origin, UnclassifiedOrigin):
+        url = urlsplit(origin.url)
+        host = url.hostname
+        if host and (url.scheme in ("http", "https", "git") or (url.scheme == "ssh" and url.username)):
+            try:
+                address = ip_address(host)
+            except ValueError:
+                if host.rstrip(".").split(".")[-1] != "localhost":
+                    return origin
+            else:
+                if not (address.is_loopback or address.is_unspecified):
+                    return origin
+        raise Refused(1, f"cannot compare the origin URL on {machine} with a local repository")
+    return origin
+
+
+def same_repository(repo: Path, checkout: Path, machine: str) -> bool:
+    if machine == remote.local_machine():
+        if common_directory(repo) == common_directory(checkout):
+            return True
+        candidate = checkout_origin(checkout)
+    else:
+        candidate = remote_checkout_origin(machine, checkout)
+    origin = checkout_origin(repo)
+    if origin == candidate:
+        return True
+    if isinstance(origin, UnclassifiedOrigin) or isinstance(candidate, UnclassifiedOrigin):
+        raise Refused(1, "cannot determine whether the origin URLs name the same repository")
+    return False
+
+
+def published_production_branches(repo: Path, resolver: session_staff.RowResolver
+                                 ) -> list[PublishedProductionBranch] | OwnerUnresolved:
+    try:
+        machine = remote.local_machine()
+        owners: list[WorktreeOwner] = []
+        for row in resolver.record.find(kind="showrunner"):
+            if isinstance(row.doc, staff.DocUnfilled):
+                return OwnerUnresolved(f"cannot check production {row.name!r}: its document is not recorded")
+            if row.doc.machine != machine:
+                return OwnerUnresolved(f"cannot check production {row.name!r}: its checkout is on {row.doc.machine}")
+            try:
+                if not same_repository(repo, row.doc.path.parent, machine):
+                    continue
+            except (Refused, OSError, ValueError) as error:
+                return OwnerUnresolved(f"cannot check production {row.name!r}: {error}")
+            owner = production_owner(resolver, row)
+            if isinstance(owner, OwnerUnresolved):
+                return OwnerUnresolved(f"cannot check production {row.name!r}: {owner.reason}")
+            owners.append(owner)
+        if not owners:
+            return OwnerUnresolved("no production checkout matches this repository")
+        refs = {f"refs/heads/{owner.merge_branch}" for owner in owners}
+        tips: dict[str, str] = {}
+        for line in git(repo, "ls-remote", "--heads", "origin", *sorted(refs)).stdout.splitlines():
+            tip, ref = line.split("\t", 1)
+            tips[ref] = tip
+        branches = [PublishedProductionBranch(owner, tips[ref]) for owner in owners
+                    if (ref := f"refs/heads/{owner.merge_branch}") in tips]
+        needed = {branch.tip for branch in branches}
+        missing = [tip for tip in sorted(needed) if git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False).returncode]
+        if missing:
+            _ = git(repo, "fetch", "--no-write-fetch-head", "--no-tags", "--no-auto-maintenance",
+                    "--no-recurse-submodules", "--refmap=", "origin", *missing)
+        return branches
+    except (Refused, OSError, ValueError) as error:
+        return OwnerUnresolved(str(error))
+
+
+def repair_owner(record: WorktreeRecord, resolver: session_staff.RowResolver,
+                 published: dict[Path, list[PublishedProductionBranch] | OwnerUnresolved],
+                 ) -> WorktreeOwner | OwnerUnresolved:
+    name = Path(record.path).name
+    units = [row for row in resolver.record.find(kind="unit") if name.startswith(row.name + "-")]
+    if len(units) > 1:
+        return OwnerUnresolved("the folder name matches more than one staff unit")
+    if units:
+        return production_owner(resolver, units[0])
+
+    repo = Path(record.repo).resolve()
+    local = local_branch_tip(repo, record.branch)
+    if isinstance(local, LocalBranchAbsent):
+        return OwnerUnresolved(f"the local branch {record.branch!r} is absent")
+    if repo not in published:
+        published[repo] = published_production_branches(repo, resolver)
+    branches = published[repo]
+    if isinstance(branches, OwnerUnresolved):
+        return branches
+    matches: list[WorktreeOwner] = []
+    for branch in branches:
+        ancestor = git(repo, "merge-base", "--is-ancestor", local.sha, branch.tip, check=False)
+        if ancestor.returncode == 0:
+            matches.append(branch.owner)
+        elif ancestor.returncode != 1:
+            return OwnerUnresolved(f"cannot check origin/{branch.owner.merge_branch}: {failure_detail(ancestor)}")
+    if not matches:
+        return OwnerUnresolved("the tip is on no production merge branch on origin")
+    if len(matches) > 1:
+        names = ", ".join(f"{owner.name} ({owner.merge_branch})" for owner in matches)
+        return OwnerUnresolved(f"the tip matches more than one production target: {names}")
+    return matches[0]
+
+
+def repair_records(snapshot: staff.StaffSnapshot, *, write: bool) -> None:
+    resolver = session_staff.RowResolver(snapshot)
+    published: dict[Path, list[PublishedProductionBranch] | OwnerUnresolved] = {}
+    try:
+        paths = sorted(state_folder().iterdir())
+    except FileNotFoundError:
+        return
+    for path in paths:
+        if path.suffix != ".json":
+            continue
+        label = str(path)
+        try:
+            original = path.read_bytes()
+            record = decode_record(original)
+            if record.owner != "":
+                continue
+            label = record.path
+            owner = repair_owner(record, resolver, published)
+            if isinstance(owner, OwnerUnresolved):
+                print(f"kept {label!r}: {owner.reason}")
+                continue
+            if write:
+                with record_lock(path):
+                    try:
+                        current = path.read_bytes()
+                    except FileNotFoundError:
+                        print(f"kept {label!r}: the record disappeared during repair")
+                        continue
+                    if current != original:
+                        print(f"kept {label!r}: the record changed during repair")
+                        continue
+                    write_record(path, replace(record, owner=owner.name, merge_branch=owner.merge_branch))
+            action = "repaired" if write else "would repair"
+            print(f"{action} {label!r}: owner {owner.name!r}, merge branch {record.merge_branch!r} -> {owner.merge_branch!r}")
+        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+            print(f"kept {label!r}: {error}")
+
+
+def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.StaffSnapshot) -> None:
+    owner = caller_branch(repo, caller, snapshot)
+    file = record_file(path)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with record_lock(file):
+        base = git(caller, "rev-parse", "HEAD").stdout.strip()
+        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+            path, caller, build_folders.NewWorktreeBranch(branch, base)))
+        record = new_record(path, branch, repo, base, owner.name, owner.merge_branch)
+        try:
+            write_record(file, record)
+        except OSError:
+            _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
+            _ = git(caller, "branch", "-D", branch)
+            raise
     print(f"made worktree {path} on {branch}")
 
 
@@ -475,6 +757,8 @@ def main() -> int:
     _ = check_cleanup.add_argument("--checked-tips", action="store_true")
     release = commands.add_parser("release-pair")
     _ = release.add_argument("path")
+    repair = commands.add_parser("repair", help="Preview repairs to made worktree records")
+    _ = repair.add_argument("--write", action="store_true", help="Write the repairs")
     arguments = parser.parse_args()
     if cast(str, arguments.command) == "release-pair":
         release_worktree_pair(Path(cast(str, arguments.path)).absolute())
@@ -495,6 +779,9 @@ def main() -> int:
             print("cleanup: all work is on the target branch")
         return 0
     try:
+        if cast(str, arguments.command) == "repair":
+            repair_records(staff_record(), write=cast(bool, arguments.write))
+            return 0
         caller = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").stdout.strip()).resolve()
         repo = main_checkout(caller)
         snapshot = staff_record()

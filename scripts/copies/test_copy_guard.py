@@ -14,8 +14,13 @@ import unittest
 from unittest import mock
 from typing import ClassVar, cast, override
 
+from scripts.agents import remote
 from scripts.copies import copies, copy_guard
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lint.memory_test_support import config_environment
+from scripts.production import staff
 from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
 @dataclass(frozen=True)
@@ -307,14 +312,40 @@ class CopyGuardTests(unittest.TestCase):
         }))
         self.assertIn("copies.py run", refusal)
         self.assertIn("make_worktree.sh <path> <branch>", refusal)
-        result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
-                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False,
-                                env={**os.environ, "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
+        records = self.root / "worktree state"
+        environment = {
+            **config_environment(self.root / "settings"),
+            **interpreter_cache_environment(self.root / "cache"),
+            "HOME": str(self.root),
+            "CODEX_HOME": str(self.root / "codex"),
+            "PATH": os.environ.get("PATH", os.defpath),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "WORKTREES_STATE_DIR": str(records),
+        }
+        production = self.root / "production"
+        merge_branch = "integration"
+        _ = subprocess.run(["git", "worktree", "add", "-b", merge_branch, str(production)],
+                           cwd=self.repo, capture_output=True, timeout=10, check=True, env=environment)
+        document = production / "production.md"
+        _ = document.write_text("# Copy guard fixture\n", encoding="utf-8")
+        machine = remote.local_machine()
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              isolated_staff_file(self.root / "staff.json", environment)):
+            owner = fixture_member("showrunner", name="copy-production", doc=staff.LiveDoc(machine, document))
+            unit = fixture_member("unit", name="copy-guard", parent=owner.id,
+                                  worktree=staff.PresentWorktree(machine, self.repo))
+            result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
+                                    cwd=self.repo, text=True, capture_output=True, timeout=10, check=False,
+                                    env=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         branch = subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"],
-                                text=True, capture_output=True, timeout=10, check=True).stdout.strip()
+                                text=True, capture_output=True, timeout=10, check=True, env=environment).stdout.strip()
         self.assertEqual(branch, "original-work")
         self.assertTrue((checkout / ".git").is_file())
+        (record,) = (records / "made").glob("*.json")
+        saved = cast(dict[str, object], json.loads(record.read_text(encoding="utf-8")))
+        self.assertEqual((saved["owner"], saved["merge_branch"]), (unit.name, merge_branch))
 
     def test_control_flow_and_substitutions_cannot_hide_tree_creation(self) -> None:
         source = shlex.quote(str(self.repo))

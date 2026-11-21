@@ -19,6 +19,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 
+from scripts.agents import remote
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -35,12 +36,20 @@ END_LANDED = """
 import json
 from pathlib import Path
 import sys
-from scripts.worktree.worktrees import Ended, end_landed
+from unittest.mock import patch
+from scripts.worktree import worktrees
 
-results = end_landed(Path(sys.argv[1]), sys.argv[2])
+record_lock = worktrees.record_lock
+
+def checked_record_lock(path):
+    assert str(path) not in sys.argv[3:], f"cleanup tried to lock an unrelated record: {path}"
+    return record_lock(path)
+
+with patch.object(worktrees, "record_lock", checked_record_lock):
+    results = worktrees.end_landed(Path(sys.argv[1]), sys.argv[2])
 print("RESULT=" + json.dumps([
     {"kind": type(result).__name__, "path": str(result.path),
-     "detail": result.branch if isinstance(result, Ended) else result.reason}
+     "detail": result.branch if isinstance(result, worktrees.Ended) else result.reason}
     for result in results
 ]))
 """
@@ -81,6 +90,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
     state: Path = Path()
     environment: dict[str, str] = {}
     base: str = ""
+    unit_session: str = ""
 
     @override
     def setUp(self) -> None:
@@ -130,11 +140,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = self.git(self.repository, "checkout", "-b", "unit-home")
         machine = socket.gethostname().split(".", 1)[0]
         runner_id, unit_id = str(uuid4()), str(uuid4())
+        self.unit_session = str(uuid4())
         rows: list[dict[str, object]] = [
             {"id": runner_id, "current_session": runner_id, "kind": "showrunner",
              "name": "fixture-production", "parent": None,
              "doc": {"machine": machine, "path": str(self.merge_tree / "docs/production.md"), "state": "live"}},
-            {"id": unit_id, "current_session": unit_id, "kind": "unit",
+            {"id": unit_id, "current_session": self.unit_session, "kind": "unit",
              "name": "fixture-unit", "parent": runner_id,
              "worktree": {"machine": machine, "path": str(self.repository), "state": "present"}},
         ]
@@ -149,10 +160,10 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout.strip()
 
-    def finish_landed(self) -> list[EndResult]:
+    def finish_landed(self, *unrelated_records: Path) -> list[EndResult]:
         python = self.home / ".claude/scripts/lib/py"
         result = self.command(self.repository, [str(python), "-c", END_LANDED,
-                                               str(self.repository), "integration"])
+                                               str(self.repository), "integration", *map(str, unrelated_records)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         payload = next(line.removeprefix("RESULT=") for line in result.stdout.splitlines()
                        if line.startswith("RESULT="))
@@ -211,28 +222,118 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(config.returncode, 1, config.stdout + config.stderr)
         self.assertEqual(config.stdout, "")
 
+    def remote_production_environment(self) -> dict[str, str]:
+        staff_file = Path(self.environment["STAFF_FILE"])
+        snapshot = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text()))
+        with patch.dict(os.environ, {"CONF_DIR": self.environment["CONF_DIR"]}):
+            machine = remote.other_machine()
+        doc = self.root / "remote checkout" / "docs" / "production.md"
+        snapshot["rows"][0]["doc"] = {"machine": machine, "path": str(doc), "state": "live"}
+        remote_staff = self.root / "remote-production-staff.json"
+        _ = remote_staff.write_text(json.dumps(snapshot))
+        shim = self.root / "bin" / "ssh"
+        shim.parent.mkdir()
+        facts = {f"file:{doc}": ["value", "# Fixture production\n"],
+                 f"git:{doc.parent}": ["value", "integration"]}
+        git_command = ["git", "-C", str(doc.parent), "remote", "get-url", "origin"]
+        _ = shim.write_text(
+            f"#!{sys.executable}\n"
+            + "import json, shlex, sys\n"
+            + f"assert sys.argv[1:4] == {['-o', 'BatchMode=yes', machine]!r}\n"
+            + "command = shlex.split(sys.argv[4])\n"
+            + "if command[:3] == ['~/.claude/scripts/lib/py', '-B', '-c']:\n"
+            + f"    facts = {facts!r}\n"
+            + "    assert {kind + ':' + path for kind, path in json.load(sys.stdin)} == set(facts)\n"
+            + "    print(json.dumps(facts))\n"
+            + "else:\n"
+            + f"    assert command == {git_command!r}\n"
+            + "    print('ssh://git@github.com:22/Fixture/Repository.git')\n")
+        shim.chmod(0o755)
+        return {"PATH": str(shim.parent) + os.pathsep + self.environment["PATH"], "STAFF_FILE": str(remote_staff)}
+
     def test_make_records_the_staff_owner_and_merge_branch(self) -> None:
-        for branch in ("recorded", "record-unwritable"):
+        made_caller = self.trees / "made-caller"
+        self.make(made_caller, "made-caller")
+        unrecorded_caller = self.root / "unrecorded-caller"
+        _ = self.git(self.repository, "worktree", "add", "-b", "unrecorded-caller", str(unrecorded_caller))
+        foreign_origin = self.root / "foreign.git"
+        foreign_caller = self.root / "foreign-caller"
+        _ = self.git(self.root, "clone", "--bare", str(self.origin), str(foreign_origin))
+        _ = self.git(self.root, "clone", str(foreign_origin), str(foreign_caller))
+        same_origin_caller = self.root / "same-origin-caller"
+        _ = self.git(self.root, "clone", self.origin.as_uri(), str(same_origin_caller))
+        reused = self.trees / "reused-caller"
+        self.make(reused, reused.name)
+        _ = self.git(self.repository, "worktree", "remove", str(reused))
+        _ = self.git(self.repository, "worktree", "add", "-b", "reused-path-new-branch", str(reused))
+        rewritten = self.trees / "rewritten-caller"
+        self.make(rewritten, rewritten.name)
+        new_root = self.git(self.repository, "commit-tree", "HEAD^{tree}", "-m", "New branch history")
+        _ = self.git(self.repository, "worktree", "remove", str(rewritten))
+        _ = self.git(self.repository, "branch", "-f", rewritten.name, new_root)
+        _ = self.git(self.repository, "worktree", "add", str(rewritten), rewritten.name)
+        remote_production = self.remote_production_environment()
+        remote_session_origins = {
+            "from-remote-production": "git@github.com:fixture/repository",
+            "foreign-remote-production": "git@github.com:fixture/foreign",
+            "unclassified-session-origin": "https://github.com/fixture/repository?query=value",
+        }
+        for branch, caller, session in (
+            ("recorded", self.repository, ""),
+            ("from-made-worktree", made_caller, ""),
+            ("from-staff-session", unrecorded_caller, self.unit_session),
+            ("from-same-origin-session", same_origin_caller, self.unit_session),
+            ("unowned", unrecorded_caller, ""),
+            ("foreign-session", foreign_caller, self.unit_session),
+            ("reused-path", reused, ""),
+            ("rewritten-base", rewritten, ""),
+            ("from-remote-production", same_origin_caller, self.unit_session),
+            ("foreign-remote-production", foreign_caller, self.unit_session),
+            ("unclassified-session-origin", same_origin_caller, self.unit_session),
+            ("record-unwritable", self.repository, ""),
+        ):
             with self.subTest(branch=branch):
                 tree = self.trees / branch
+                command = ["bash", str(MAKE_WORKTREE), str(tree), branch]
+                session_env = {"CODEX_THREAD_ID": session}
+                if branch in remote_session_origins:
+                    _ = self.git(caller, "remote", "set-url", "origin", remote_session_origins[branch])
+                    session_env.update(remote_production)
                 if branch == "record-unwritable":
                     blocked_state = self.root / "blocked-state"
                     _ = blocked_state.write_text("retain this file\n")
                     self.environment["WORKTREES_STATE_DIR"] = str(blocked_state)
                     retained = self.repository_state()
 
-                    result = self.command(self.repository, ["bash", str(MAKE_WORKTREE), str(tree), branch])
+                    result = self.command(caller, command)
 
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(self.repository_state(), retained)
                     self.assertEqual(blocked_state.read_text(), "retain this file\n")
+                elif branch in ("unowned", "foreign-session", "reused-path", "rewritten-base", "foreign-remote-production",
+                                "unclassified-session-origin"):
+                    retained = self.repository_state()
+                    refs = self.git(caller, "for-each-ref", "refs/heads")
+
+                    with patch.dict(self.environment, session_env):
+                        result = self.command(caller, command)
+
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr.splitlines(), [
+                        f"{str(caller)!r}: cannot resolve a production merge branch. Run from the unit's home worktree.",
+                    ])
+                    self.assertEqual(self.repository_state(), retained)
+                    self.assertEqual(self.git(caller, "for-each-ref", "refs/heads"), refs)
                 else:
                     before = datetime.now(UTC)
-                    self.make(tree, branch)
+                    with patch.dict(self.environment, session_env):
+                        result = self.command(caller, command)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     after = datetime.now(UTC)
                     record = self.record(tree)
                     self.assertEqual({key: value for key, value in record.items() if key != "made_at"}, {
-                        "version": 1, "path": str(tree), "branch": branch, "repo": str(self.repository),
+                        "version": 1, "path": str(tree), "branch": branch,
+                        "repo": str(caller if caller == same_origin_caller else self.repository),
                         "base": self.base, "merge_branch": "integration", "owner": "fixture-unit",
                     })
                     made_at = datetime.fromisoformat(record["made_at"])
@@ -244,8 +345,125 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     lease = cast(dict[str, object], json.loads(tree.with_name(tree.name + ".lease.json").read_text()))
                     self.assertEqual(lease["purpose"], tree.name)
 
+    def test_repair_previews_and_writes_only_records_with_owner_evidence(self) -> None:
+        cases = {
+            "fixture-unit-prefix": "fixture-unit",
+            "published-tip": "fixture-production",
+            "unpublished-tip": "",
+        }
+        legacy: dict[str, MadeWorktree] = {}
+        for branch in cases:
+            tree = self.trees / branch
+            self.make(tree, branch)
+            _ = self.commit(tree, f"{branch}.txt", f"{branch}\n")
+            if branch == "published-tip":
+                with self.subTest(evidence="origin tip absent from local objects"):
+                    self.publish(tree, branch)
+                    writer = self.root / "origin-writer"
+                    _ = self.git(self.root, "clone", "-b", "integration", str(self.origin), str(writer))
+                    _ = self.git(writer, "merge", "--no-ff", f"origin/{branch}", "-m", "Merge on origin")
+                    self.publish(writer, "integration")
+                    tip = self.git(writer, "rev-parse", "HEAD")
+                    absent = self.command(self.repository, ["git", "cat-file", "-e", f"{tip}^{{commit}}"])
+                    self.assertNotEqual(absent.returncode, 0, absent.stdout + absent.stderr)
+            record = self.record(tree)
+            record.update(owner="", merge_branch="main")
+            legacy[branch] = record
+            _ = self.record_path(tree).write_text(json.dumps(record))
+        _ = self.git(self.repository, "update-ref", "refs/remotes/origin/integration", self.base)
+        fetch_head = Path(self.git(self.repository, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"))
+        fetch_original = f"{self.base}\t\tfixture\n"
+        _ = fetch_head.write_text(fetch_original)
+        before = self.repository_state()
+        command = [str(self.home / ".claude/scripts/lib/py"), str(WORKTREES), "repair"]
+
+        preview = self.command(self.root, command)
+
+        self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(fetch_head.read_text(), fetch_original)
+        self.assertEqual(self.git(self.repository, "rev-parse", "refs/remotes/origin/integration"), self.base)
+
+        written = self.command(self.root, [*command, "--write"])
+
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        self.assertEqual(fetch_head.read_text(), fetch_original)
+        for branch, owner in cases.items():
+            with self.subTest(branch=branch):
+                tree = self.trees / branch
+                if owner:
+                    detail = f"{str(tree)!r}: owner {owner!r}, merge branch 'main' -> 'integration'"
+                    self.assertIn(f"would repair {detail}", preview.stdout.splitlines())
+                    self.assertIn(f"repaired {detail}", written.stdout.splitlines())
+                    expected = legacy[branch].copy()
+                    expected.update(owner=owner, merge_branch="integration")
+                    self.assertEqual(self.record(tree), expected)
+                else:
+                    line = f"kept {str(tree)!r}: the tip is on no production merge branch on origin"
+                    self.assertIn(line, preview.stdout.splitlines())
+                    self.assertIn(line, written.stdout.splitlines())
+                    path = self.record_path(tree)
+                    self.assertEqual(path.read_bytes(), before.records[path.name])
+
+        for evidence in ("unavailable-production", "deleted-record", "replaced-record"):
+            with self.subTest(evidence=evidence):
+                self.setUp()
+                tree = self.trees / evidence
+                self.make(tree, evidence)
+                _ = self.commit(tree, "landed.txt", "landed work\n")
+                self.land(evidence)
+                path = self.record_path(tree)
+                record = self.record(tree)
+                record.update(owner="", merge_branch="main")
+                original = json.dumps(record).encode()
+                _ = path.write_bytes(original)
+                if evidence == "unavailable-production":
+                    _ = self.git(self.merge_tree, "branch", "release")
+                    _ = self.git(self.merge_tree, "push", "origin", "release")
+                    staff_file = Path(self.environment["STAFF_FILE"])
+                    snapshot = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text()))
+                    identity = str(uuid4())
+                    snapshot["rows"].append({
+                        "id": identity, "current_session": identity, "kind": "showrunner", "parent": None,
+                        "name": "release-production",
+                        "doc": {"machine": "unavailable-host", "path": str(self.root / "release" / "production.md"),
+                                "state": "live"},
+                    })
+                    _ = staff_file.write_text(json.dumps(snapshot))
+                    reason = "cannot check production 'release-production': its checkout is on unavailable-host"
+                else:
+                    real_git = shutil.which("git", path=self.environment["PATH"])
+                    assert real_git is not None
+                    shim = self.root / "bin" / "git"
+                    shim.parent.mkdir()
+                    replacement = self.root / "replacement.json"
+                    record.update(owner="replacement-owner", merge_branch="release")
+                    _ = replacement.write_text(json.dumps(record))
+                    change = (["rm", str(path)] if evidence == "deleted-record"
+                              else ["mv", str(replacement), str(path)])
+                    _ = shim.write_text(
+                        '#!/bin/sh\nif [ "$3" = "ls-remote" ]; then\n'
+                        + f"    {shlex.join(change)} || exit 1\nfi\n"
+                        + f'exec {shlex.quote(real_git)} "$@"\n')
+                    shim.chmod(0o755)
+                    self.environment["PATH"] = str(shim.parent) + os.pathsep + self.environment["PATH"]
+                    reason = ("the record disappeared during repair" if evidence == "deleted-record"
+                              else "the record changed during repair")
+                repaired = self.command(self.root, [
+                    str(self.home / ".claude/scripts/lib/py"), str(WORKTREES), "repair", "--write",
+                ])
+                self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+                self.assertIn(f"kept {str(tree)!r}: {reason}", repaired.stdout.splitlines())
+                if evidence == "deleted-record":
+                    with self.assertRaises(FileNotFoundError):
+                        _ = path.read_bytes()
+                elif evidence == "replaced-record":
+                    self.assertEqual(self.record(tree), record)
+                else:
+                    self.assertEqual(path.read_bytes(), original)
+
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
-        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config"):
+        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config", "unrelated-records"):
             with self.subTest(branch=branch):
                 if branch != "checkpoint":
                     self.setUp()
@@ -271,10 +489,23 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
                 if branch == "without-branch-config":
                     _ = self.git(self.repository, "config", "--local", "--remove-section", f"branch.{branch}")
+                unrelated: dict[Path, bytes] = {}
+                if branch == "unrelated-records":
+                    for name in ("other-repository", "other-merge-branch"):
+                        other = self.trees / name
+                        self.make(other, name)
+                        record = self.record(other)
+                        if name == "other-repository":
+                            record["repo"] = str(self.root / "other-checkout")
+                        else:
+                            record["merge_branch"] = "other-target"
+                        path = self.record_path(other)
+                        unrelated[path] = json.dumps(record).encode()
+                        _ = path.write_bytes(unrelated[path])
                 cleanup = self.cleanup_result(tree)
                 self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
                 self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
-                results = self.finish_landed()
+                results = self.finish_landed(*unrelated)
 
                 self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
                 if branch == "checkpoint":
@@ -282,6 +513,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 else:
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "later target work\n")
                 self.assert_ended(tree, branch)
+                for path, original in unrelated.items():
+                    self.assertEqual(path.read_bytes(), original)
 
     def test_cherry_picked_content_ends_under_a_different_commit_hash(self) -> None:
         tree, branch = self.trees / "cherry", "cherry"
