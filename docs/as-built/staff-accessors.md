@@ -194,6 +194,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
+| `scripts/direct/verify_hold_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
+| `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names slot lease owners for the Disks page |
@@ -215,6 +217,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
+| `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/session_move.py` | read | local_snapshot, by_current_session, by_member_reference, StaffSnapshot, StaffAbsent; finds the staff member that owns a moved session |

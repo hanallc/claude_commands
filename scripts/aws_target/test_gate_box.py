@@ -60,6 +60,32 @@ subprocess.run = check_transfer
         self.assertTrue(all(set(row) == gate_box.RUN_FIELDS for row in runs))
         self.assertEqual(sum(line.startswith('{"module":') for line in log.splitlines()), 6)
 
+    def test_paired_guest_refuses_a_link_or_a_different_git_root_before_reset(self) -> None:
+        for commands, detail in (
+            (("(root / 'base').rename(root / 'saved-base')",
+              "(root / 'base').symlink_to(root / 'saved-base', target_is_directory=True)"), 'without links'),
+            (("alias = root.parent / 'box-alias'",
+              "alias.symlink_to(root, target_is_directory=True)", "root = alias"), 'without links'),
+            (("(root / 'base/.git').rename(root / 'saved-git-file')",
+              "subprocess.run(['git', 'init', '-q', str(root)], check=True)"), 'working tree root'),
+        ):
+            with self.subTest(commands=commands):
+                fixture = trial_tests.PairedTrialTests()
+                self.addCleanup(fixture.doCleanups)
+                fixture.setUp()
+                setup = "        (root / 'base/keep').write_text('fixture output')\n"
+                setup += ''.join('        ' + command + '\n' for command in commands)
+                stage = "        stage('source ready')"
+                guest = gate_box.GUEST.replace(stage, setup + stage, 1)
+                with mock.patch.object(gate_box, 'GUEST', guest):
+                    reply, traces = fixture.guest()
+                self.assertEqual(reply['verdict'], 'error')
+                error = ledger.text(reply, 'error')
+                self.assertIn('Cannot reset', error)
+                self.assertIn(detail, error)
+                self.assertEqual(traces, [])
+                self.assertEqual((fixture.root / 'box/base/keep').read_text(), 'fixture output')
+
     def test_paired_log_put_removes_signed_urls_from_errors(self) -> None:
         fixture = trial_tests.PairedTrialTests()
         self.addCleanup(fixture.doCleanups)

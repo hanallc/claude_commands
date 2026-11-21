@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
 from io import BytesIO, StringIO
@@ -38,7 +39,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 
-from scripts.aws_target import aws_page
+from scripts.aws_target import aws_page, machines_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
@@ -51,7 +52,7 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, review_submissions
+from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
@@ -387,6 +388,51 @@ class ReviewLinksServerTests(unittest.TestCase):
             with patch.object(review_submissions, 'submit', side_effect=OSError('The native store is unavailable.')):
                 self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
             self.assertEqual(cache.get().records, {})
+
+    def test_new_item_options_refuse_an_unpublished_host(self) -> None:
+        host = f"other.invalid:{self.port}"
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": ""})):
+            reply = self.new_item_http(headers={"Host": host, "Origin": f"http://{host}"})
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (403, {"error": "Open the New item dialog from Review."}))
+
+    def test_new_item_options_accept_the_bound_and_published_hosts_on_the_serving_port(self) -> None:
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": "console.invalid."})):
+            for host in (self.server.bound_address, "console.invalid"):
+                with self.subTest(host=host):
+                    authority = f"{host}:{self.port}"
+                    reply = self.new_item_http(headers={"Host": authority, "Origin": f"http://{authority}"})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(cast(dict[str, object], json.loads(reply.body))["token"], self.server.new_item_token)
+                    wrong_port = f"{host}:0"
+                    self.assertEqual(self.new_item_http(headers={"Host": wrong_port}).status, 403)
+                    self.assertEqual(self.new_item_http(headers={"Host": host}).status, 403)
+
+    def test_new_item_options_accept_bare_hosts_on_port_80(self) -> None:
+        with (patch.object(self.server, "server_port", 80),
+              patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": "console.invalid."})):
+            for host in (self.server.bound_address, "console.invalid"):
+                with self.subTest(host=host):
+                    reply = self.new_item_http(headers={"Host": host, "Origin": f"http://{host}"})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(cast(dict[str, object], json.loads(reply.body))["token"], self.server.new_item_token)
+
+    def test_new_item_options_require_a_host(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(staff, "is_owner", return_value=True)):
+            connection.putrequest("GET", review_page.NEW_ITEM_PATH, skip_host=True)
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())),
+                             (403, {"error": "Open the New item dialog from Review."}))
 
     def test_owner_options_resolve_the_recipient_and_review_reuses_its_dialog(self) -> None:
         case = self.review_fixture()
@@ -1114,6 +1160,19 @@ class ReviewLinksServerTests(unittest.TestCase):
                               f"http://127.0.0.1:{self.port}/console/review.html#owner=builds",
                               new_item_dialog.PageViewport(1280, 800, True), 1.5, (), (), "Owner builds", screenshot))
         return case.root / "page-states", cache, request
+
+    def test_only_the_published_aws_machines_path_matches_the_console_page(self) -> None:
+        output = self.root / "AWS reports"
+        output.mkdir()
+        leaf = machines_page.PAGE_NAME
+        _ = (output / leaf).write_text("<h1>AWS Machines</h1>", encoding="utf-8")
+        _ = write_config_fixture(conf.path("aws_page"), f"output_folder={output}\n")
+        self.assertEqual(serve.published_console_page(self.root, f"/AWS reports/{leaf}"), "aws_machines")
+        self.assertEqual(serve.capture_page_key(self.root, f"/AWS%20reports/{leaf}"), "aws_machines")
+        self.assertEqual(self.request(f"/AWS%20reports/{leaf}").body, b"<h1>AWS Machines</h1>")
+        for path in (f"/{leaf}", f"/elsewhere/{leaf}", "/AWS reports/other.html"):
+            with self.subTest(path=path):
+                self.assertEqual(serve.published_console_page(self.root, path), "")
 
     def test_bug_captures_the_encoded_aws_page_path(self) -> None:
         from scripts.review_links.review_link import snapshot_url
@@ -2995,13 +3054,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path).status, 404)
 
-    def post(self, path: str, body: str) -> tuple[int, bytes]:
+    def post(self, path: str, body: str, *, origin: str = "", headers: Mapping[str, str] | None = None) -> tuple[int, bytes]:
         review_post = path == review_page.PAGE_PATH
         if review_post:
             self.review_post_done.clear()
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+            sent = {"Content-Type": "application/x-www-form-urlencoded"}
+            if origin:
+                sent["Origin"] = origin
+            connection.request("POST", path, body, {**sent, **(headers or {})})
             response = connection.getresponse()
             content = response.read()
             if review_post:
@@ -4172,6 +4234,88 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, content = self.post(accounts_page.PAGE_PATH, "group=producers&clear=first")
             self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
             clear.assert_called_once_with("producers", next_moves.FIRST_GROUP_POSITION)
+
+    def test_accounts_color_rejects_an_unpublished_host_before_tune(self) -> None:
+        configuration = self.root.parent / "config"
+        configuration.mkdir()
+        _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+        tune = Mock(return_value=subprocess.CompletedProcess((), 0, "", ""))
+        body = "key=role.worker&value=%23af875f"
+        host = f"other.invalid:{self.port}"
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration), "REVIEW_LINKS_HOST": ""}),
+              patch.object(accounts_page, "subprocess", Mock(wraps=subprocess, run=tune))):
+            status, _ = self.post(accounts_page.PAGE_PATH, body, headers={"Host": host, "Origin": f"http://{host}"})
+            self.assertEqual(status, 403)
+            tune.assert_not_called()
+            status, content = self.post(accounts_page.PAGE_PATH, body)
+            self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
+            tune.assert_called_once()
+
+    def test_console_tune_requires_the_origin_and_token(self) -> None:
+        key = "faster_box_max_cost_ratio"
+        setting = console_tune.TunableSetting("console_tune_test", "AWS Machines",
+            Decimal("1.00"), Decimal("3.00"), Decimal("0.05"))
+        origin = f"http://127.0.0.1:{self.port}"
+        form = {"page": "aws_machines", "key": key, "value": "1.50"}
+        with (patch.dict(console_tune.SETTINGS, {("aws_machines", key): setting}, clear=True),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console_tune, "run") as publish):
+            token_reply = self.request(console_tune.PAGE_PATH)
+            self.assertEqual(token_reply.status, 200)
+            token = cast(dict[str, str], json.loads(token_reply.body))["token"]
+            self.assertEqual(token, self.server.new_item_token)
+            for sent_origin, fields in (
+                ("", {**form, "token": token}),
+                ("http://wrong.invalid", {**form, "token": token}),
+                (origin, form),
+                (origin, {**form, "token": "wrong"}),
+            ):
+                with self.subTest(origin=sent_origin, includes_token="token" in fields):
+                    status, _ = self.post(console_tune.PAGE_PATH, urlencode(fields), origin=sent_origin)
+                    self.assertEqual(status, 403)
+            publish.assert_not_called()
+
+    def test_console_tune_reports_live_value_after_publish_failure_and_refusal(self) -> None:
+        key = "faster_box_max_cost_ratio"
+        document = "console_tune_test"
+        config = conf.path(document)
+        self.addCleanup(config.unlink, missing_ok=True)
+        _ = config.write_text(f"{key}=1.00\n", encoding="utf-8")
+        setting = console_tune.TunableSetting(document, "AWS Machines", Decimal("1.00"), Decimal("3.00"), Decimal("0.05"))
+        origin = f"http://127.0.0.1:{self.port}"
+        token = self.server.new_item_token
+
+        def fail_after_change(*_args: object, **_options: object) -> subprocess.CompletedProcess[str]:
+            _ = config.write_text(f"{key}=1.50\n", encoding="utf-8")
+            return subprocess.CompletedProcess(["tune"], 2, stderr="two lines\nThe setting stays live.\n")
+
+        with (patch.dict(console_tune.SETTINGS, {("aws_machines", key): setting}, clear=True),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console_tune, "run", side_effect=fail_after_change) as publish):
+            for page, field, value, reason, live in (
+                ("aws", key, "1.50", "This page cannot change that setting.", None),
+                ("aws_machines", "other", "1.50", "This page cannot change that setting.", None),
+                ("aws_machines", key, "3.05", "Enter a value from 1.00 to 3.00.", "1.00"),
+                ("aws_machines", key, "1.52", "Use steps of 0.05 from 1.00.", "1.00"),
+                ("aws_machines", key, "NaN", "Enter a decimal number.", "1.00"),
+            ):
+                with self.subTest(page=page, field=field, value=value):
+                    form = urlencode({"page": page, "key": field, "value": value, "token": token})
+                    status, body = self.post(console_tune.PAGE_PATH, form, origin=origin)
+                    self.assertEqual((status, json.loads(body)), (400, {"reason": reason, "live_value": live}))
+            publish.assert_not_called()
+            form = urlencode({"page": "aws_machines", "key": key, "value": "1.50", "token": token})
+            status, body = self.post(console_tune.PAGE_PATH, form, origin=origin)
+            self.assertEqual((status, json.loads(body)), (503, {"reason": "The setting stays live.", "live_value": "1.50"}))
+            publish.assert_called_once_with((*accounts_page.TUNE, document, key, "1.50",
+                "--why", "The user confirmed the change with Go on the AWS Machines page.",
+                "--user-words", f"{key} set to 1.50 with Go on the AWS Machines page"),
+                capture_output=True, text=True, check=False)
+            publish.side_effect = None
+            publish.return_value = subprocess.CompletedProcess(["tune"], 0)
+            status, body = self.post(console_tune.PAGE_PATH, form, origin=origin)
+            self.assertEqual((status, json.loads(body)), (200, {"state": "saved", "live_value": "1.50"}))
 
     def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
         with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("staff file absent")),

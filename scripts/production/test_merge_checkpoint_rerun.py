@@ -9,7 +9,9 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
+import shlex
 import shutil
+import signal
 import subprocess
 from types import ModuleType
 from typing import cast, final
@@ -19,9 +21,12 @@ from zoneinfo import ZoneInfo
 
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
-from scripts.production import staff, unit_lookup
+from scripts.production import land_runs, staff, unit_lookup
+from scripts.production.cli_fixture import process_boundary
 from scripts.production.staff_test_support import isolated_staff_file
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import (
+    DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment,
+)
 from scripts.production.production_doc import ProductionDocument
 
 
@@ -143,6 +148,148 @@ class CheckpointRerunTests(MergeCheckpointFixture):
 
     def test_review_rows_recover_after_push_before_recording(self) -> None:
         self.assert_review_recovered("record_publication_changes")
+
+    @process_boundary
+    def test_interrupted_batch_push_recovers_validation_evidence(self) -> None:
+        for interruption in ("unpublished shared file", "published before validator exit", "before beta merge",
+                             "beta already published", "rollback fails"):
+            with self.subTest(interruption=interruption):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                beta_already_published = interruption == "beta already published"
+                partial = interruption == "before beta merge" or beta_already_published
+                published = interruption == "published before validator exit"
+                rollback_fails = interruption == "rollback fails"
+                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                path = "src/shared.toml"
+                middle = "".join(f"key{index} = {index}\n" for index in range(12))
+                self.write(self.checkout, path, f"alpha = 0\n{middle}beta = 0\n")
+                _ = self.git("add", path)
+                _ = self.git("commit", "-m", "Add shared settings")
+                start = self.git("rev-parse", "HEAD")
+                _ = self.git("push", "origin", "production", "production:main")
+                for tree in (self.unit, self.other):
+                    _ = self.git("merge", "--ff-only", start, cwd=tree)
+                alpha = self.checkpoint(path, f"alpha = 1\n{middle}beta = 0\n")
+                beta_path = "src/beta.txt" if partial else path
+                self.write(self.other, beta_path, "beta change\n" if partial else f"alpha = 0\n{middle}beta = 1\n")
+                _ = self.git("add", beta_path, cwd=self.other)
+                _ = self.git("commit", "-m", "Change beta settings", cwd=self.other)
+                beta = self.git("rev-parse", "HEAD", cwd=self.other)
+                _ = self.git("push", "origin", "beta-branch", cwd=self.other)
+                batch_items = {unit: [
+                    unit, "2", commit, "--started", STARTED, "--review-trial", TRIAL,
+                    "--delivers", DELIVERS, "--scratch", str(self.state),
+                ] for unit, commit in (("alpha", alpha), ("beta", beta))}
+                if beta_already_published:
+                    self.push = "git"
+                    self.production_doc()
+                    landed = self.invoke(["--production", "example", *batch_items["beta"]])
+                    self.assertEqual(landed.returncode, 0, landed.stdout + landed.stderr)
+                    start = self.git("rev-parse", "HEAD")
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+                self.push = "validate_and_push"
+                self.production_doc()
+                batch = self.root / "batch.txt"
+                _ = batch.write_text("".join(shlex.join(item) + "\n" for item in batch_items.values()))
+
+                if partial:
+                    real_git = shutil.which("git")
+                    assert real_git is not None
+                    self.executable(self.bin / "git", f"""#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+args = sys.argv[1:]
+if args[:4] == ["-C", {str(self.checkout)!r}, "merge", "--no-ff"] and args[-1] == {alpha!r}:
+    result = subprocess.run([{real_git!r}, *args], check=False)
+    if result.returncode == 0:
+        os.kill(os.getppid(), signal.SIGKILL)
+    raise SystemExit(result.returncode)
+os.execv({real_git!r}, [{real_git!r}, *args])
+""")
+                cause = "fatal: CI discovery failed after publication"
+                formatter_edit = "partial formatter edit\n"
+                self.executable(self.bin / "validate_and_push.sh", STUB + f"""
+import signal
+import subprocess
+first_attempt = state / "first-push-attempt"
+if not {partial!r} and not first_attempt.is_file():
+    first_attempt.touch()
+    if {published!r}:
+        print("=== STEP: direct push to production ===", flush=True)
+        subprocess.run(["git", "push", "origin", "HEAD:refs/heads/production"],
+                       check=True, timeout=TEST_HANG_GUARD_SECS)
+        print("publication finished", flush=True)
+        print({cause!r}, file=sys.stderr, flush=True)
+    os.kill(os.getppid(), signal.SIGKILL)
+else:
+    if {rollback_fails!r}:
+        Path({path!r}).write_text({formatter_edit!r})
+    print("=== STEP: taplo ===", flush=True)
+    print("error: invalid TOML", file=sys.stderr, flush=True)
+    print("  ┌─ {path}:2:5", file=sys.stderr, flush=True)
+    print("!!! VALIDATION FAILED at step: taplo !!!", flush=True)
+raise SystemExit(1)
+""")
+                args = ["--production", "example", "--batch", str(batch)]
+                interrupted = self.invoke(args)
+                self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stdout + interrupted.stderr)
+                combined = self.git("rev-parse", "HEAD")
+                self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha if partial else beta)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), combined if published else start)
+                batch_record = Path(self.git("rev-parse", "--path-format=absolute", "--git-path",
+                                             "checkpoint-batches/production"))
+                saved_record = batch_record.read_bytes() if rollback_fails else b""
+                if partial:
+                    self.assertIn(beta, batch_record.read_text())
+                with patch.dict("os.environ", self.env):
+                    results_before = land_runs.last_results()
+                result = self.invoke(args)
+                push_log = self.state / f"merge_{alpha[:7]}_push.log"
+                if published:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(self.events("validate_and_push.sh")), 1)
+                    self.assertIn(f"publication finished\n{cause}\n", push_log.read_text())
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(len(self.events("validate_and_push.sh")), 1 if partial else 2)
+                    self.assertIn(f"error: invalid TOML — log {push_log}", result.stdout)
+                    notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                    if beta_already_published:
+                        self.assertEqual(notices, [
+                            f"send alpha: repair the push failure in {path} and send a new checkpoint",
+                        ])
+                        with patch.dict("os.environ", self.env):
+                            beta_land = land_runs.last_results()[beta]
+                        self.assertTrue(results_before[beta]["landed"])
+                        self.assertEqual(beta_land, results_before[beta])
+                        self.assertFalse(batch_record.exists())
+                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                    elif partial:
+                        self.assertEqual(notices, [
+                            f"send alpha: repair the push failure in {path} and send a new checkpoint",
+                            "send beta: nothing was pushed; the push failed in alpha's change; "
+                            + "send this checkpoint again after that repair",
+                        ])
+                        with patch.dict("os.environ", self.env):
+                            beta_land = land_runs.last_results()[beta]
+                        self.assertEqual((beta_land["unit"], beta_land["landed"], beta_land["step"], beta_land["state"]),
+                                         ("beta", False, "push", "failed"))
+                        self.assertFalse(batch_record.exists())
+                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                    else:
+                        self.assertEqual(notices, [f"send {unit}: the showrunner will inspect the failed command"
+                                                   for unit in ("alpha", "beta")])
+                    if rollback_fails:
+                        self.assertIn("rollback failed", result.stdout)
+                        self.assertEqual((self.checkout / path).read_text(), formatter_edit)
+                        self.assertEqual(self.git("rev-parse", "HEAD"), combined)
+                        self.assertTrue(batch_record.exists())
+                        self.assertEqual(batch_record.read_bytes(), saved_record)
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
 
     def test_review_rows_written_before_receipt_are_not_duplicated(self) -> None:
         review, checkpoint = self.review_checkpoint("A change | Open it | Result")
