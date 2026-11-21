@@ -1024,3 +1024,26 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. The proof row fails on the base and passes on the fix.
   2. The hook's test module passes; basedpyright zero errors and warnings on changed files.
   3. Measured CPU ms for each start before and after.
+
+### Phase 416 — the gate has no integrate form  · status: todo
+**Depends on:** Phase 355
+
+#### Work Order
+- **Goal:** The gate code has no integrate entry point. The user approved the removal on 11-21 through bob: "remove integrate form". No check goes away.
+- **Spec:**
+  1. Remove the old merge entry point of `scripts/production/gate.py` (the Phase 355 name of `merge_gate.py`) and each private helper that only it calls. Ask devtools for its note first; it names the lines.
+  2. Remove the classifier at `scripts/production/build_steps.py:297` (line on main before 355) and the three text keys `names.integrate`, `about.integrate` and `changes.integrate` in `config/build_steps.conf`. The user go covers these key deletions.
+  3. Remove the merge cases in the `test_gate*.py` modules, the case at `scripts/build_queue/test_memory_feed.py:647` and the case at `memory_page_proof.mjs:2709`.
+  4. Keep `--promote-only`, test all and the recovery of existing records. A saved record with the integrate step stays readable.
+  5. Correct `docs/as-built/merge-gate-and-test-speed.md:313` in the same commit.
+  6. Before the removal, prove with a search that no caller starts the integrate form: scripts, commands, config, units and timers.
+- **Files:** `scripts/production/gate.py`; `scripts/production/build_steps.py`; `config/build_steps.conf`; the `scripts/production/test_gate*.py` modules; `scripts/build_queue/test_memory_feed.py`; `memory_page_proof.mjs`; `docs/as-built/merge-gate-and-test-speed.md`.
+- **Workers:** 1 writer + 1 tester.
+  - impl: `gate.py`, `build_steps.py`, `config/build_steps.conf`, the as-built doc.
+  - test: the test modules and `memory_page_proof.mjs`.
+- **Constraints from prior phases:** Phase 355 renames the gate files; the branch starts at main after 355 is there. Phase 355 keeps `merge_gate.py` as a compatibility entry point; this phase does not remove it.
+- **Acceptance gate:**
+  1. The search of item 6 finds no caller.
+  2. Each changed test module passes; a test proves a saved integrate record stays readable.
+  3. basedpyright zero errors and warnings on changed files.
+  4. A deletion change runs the full gate at the merge.
