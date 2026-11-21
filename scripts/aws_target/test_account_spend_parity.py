@@ -824,7 +824,7 @@ class AccountSpendParityTests(SpendReferenceFixture):
                 '--granularity', 'DAILY', '--metrics', 'UnblendedCost', 'UsageQuantity', '--group-by',
                 'Type=DIMENSION,Key=USAGE_TYPE', '--filter',
                 json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}}),
-                '--no-paginate', service='ce')
+                '--no-paginate', service='ce', timeout_s=api.timeout_s)
         self.assertEqual(bill.actual_usd, Decimal(11))
         self.write_bill(JAN1, '11', *bill.usage_types)
         self.record('87', page_day=utc_day(JAN1), cap_day=utc_day(JAN1))

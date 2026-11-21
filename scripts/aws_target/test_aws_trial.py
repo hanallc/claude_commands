@@ -40,7 +40,7 @@ from scripts.build_queue import cloud_progress, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
 from scripts.lib.git_test_support import write_fixture_git_config
-from scripts.lib import file_lock
+from scripts.lib import conf, file_lock
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -431,7 +431,8 @@ class PairedWaitTests(CostFixture):
             return cast(list[int], wait_for_channel(readers, timeout=0))
 
         def reserve(*_args: object, check_workers: Callable[[], None],
-                    before_charge_page: Callable[[], None]) -> None:
+                    before_charge_page: Callable[[], None], cohort: Path) -> None:
+            self.assertEqual(cohort, self.root / 'trial')
             clock.return_value = admission_timeout + 1
             check_workers()
             before_charge_page()
@@ -582,7 +583,7 @@ class PairedWaitTests(CostFixture):
         errors = StringIO()
         with (mock.patch.dict(os.environ, {**self.cleanup_environment(), 'SERVICE_RESULT': 'timeout'}),
               mock.patch.object(cloud_gate, 'save', side_effect=OSError('fixture disk is full')) as save,
-              mock.patch.object(trial.conf, 'read', side_effect=OSError('fixture config read failed')),
+              mock.patch.object(conf, 'read', side_effect=OSError('fixture config read failed')),
               mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
               redirect_stderr(errors)):
             self.assertEqual(trial.paired_cleanup_main(
@@ -935,7 +936,7 @@ with (mock.patch.object(aws_trial, 'stop_workers', side_effect=aws_trial.TrialWa
         cohort = self.root / 'trial'
         cohort.mkdir()
         with (mock.patch.dict(os.environ, {'SERVICE_RESULT': 'timeout'}),
-              mock.patch.object(trial.conf, 'read', side_effect=OSError('fixture config read failed')),
+              mock.patch.object(conf, 'read', side_effect=OSError('fixture config read failed')),
               self.assertRaisesRegex(OSError, 'fixture config read failed')):
             _ = trial.paired_cleanup_main(['--paired-cleanup', str(cohort)], self.settings, self.state)
         command = ['systemd-run', '--unit=fixture-unit', '--paired-worker', str(cohort)]
