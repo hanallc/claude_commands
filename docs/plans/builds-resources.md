@@ -3113,14 +3113,13 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - Read-only review: 0 findings. On main `168cedb541` as `24e9e2013` (bb12).
 
 ### Phase 180 — AWS local folder removal under the item 152 rules  · status: done
-**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Survey rows in phases/178/survey_reply.txt (180 rows). aws gets the lines first (sent 2026-11-20 10:3x).
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `5b283887e` in batch bb181f on main `cfa095c714`.
 
-#### Work Order
-1. `gate_box.py:92-93`: before each reset and clean, the checkout is exactly `<GATE_BOX_DIR>/<variant>`, with no link in its path, and Git's top level equals it. Else the round fails.
-2. `gpu_size_trial.py:460`: previous trials (an earlier run) stay, with the kept line. Current-run removals stay, with a check that the path is below the current run folder.
-3. `gpu_size_trial.py:403` `remove_path`: refuses a directory where the payload expects a file.
-4. `teardown.py:508` `remove_gate_images` (called from `deploy.py:2514, 3462`): an explicit command; it checks that the state directory resolves with no link and that `gate-image` is a direct child and not a link. Else it keeps the folder with the kept line.
-5. No change to `cloud_gate.py` or to cloud deletions: their authority is the cloud resource id.
+- `gate_box.py` resets and cleans only the exact `<GATE_BOX_DIR>/<variant>` checkout, with no link in its path.
+- `gpu_size_trial.py` keeps earlier trials with the kept line and removes only below the current run folder. `remove_path` refuses a directory where the payload expects a file.
+- `teardown.py` `remove_gate_images` removes only a direct, unlinked `gate-image` child of the state directory.
+- A GPU run that did not start keeps its real refusal reason: with no `manifest.json`, the input removal is skipped.
+- Cloud deletions do not change: their authority is the cloud resource id.
 
 ### Removals to arm again (item 152)
 Each removal below is off until the bubblewrap proof is on main and nate gives his word (nate, 2026-11-19 20:42 EST). Until then, the folders stay on disk for a manual removal with `removal_guard.py remove --list <file> --sha256 <hash>`.
@@ -3132,14 +3131,12 @@ Each removal below is off until the bubblewrap proof is on main and nate gives h
 5. The masked timers: disk-floor, tmp sweep, folder-audit, transcript-retention, tmpfiles-clean.
 
 ### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: done
-**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Every tool that removes folders calls one guard. It refuses a path not below a declared "can be made again" root, a folder with an unknown maker, and a root taken from a computed parent.
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `c29ac97f5` in batch bb181f on main `cfa095c714`.
 
-#### Work Order
-1. `scripts/lib/removal_guard.py`: the one guard. The mount check of `build_folders.may_remove_folder_tree` moves into it.
-2. One new config key per host declares the roots (working name `removal.roots`; the name goes to nate).
-3. Callers in this phase: tmp sweep, build sweep (`sweep.py`), `gate_folders_delete.py`, and the folder audit after phase 177 is on main.
-4. One test per tool: the tool runs against a fixture home folder, and nothing in it is removed.
-5. Phases 179 (worktree removal, copies and slots, Mac cleanup) and 180 (AWS cleanup) follow. No rmtree tool is armed again or added without bob's word.
+- The tmp sweep, the build sweep and `gate_folders_delete.py` write a removal list and remove nothing by themselves.
+- `removal_guard.py remove --list <file> --sha256 <hash>` removes an approved list, and only folders of the five `/build` forms. A live build keeps its folder.
+- Scratch lists external Cargo output for review. The folder audit reports no space freed when it only lists output.
+- The bubblewrap (Linux) and sandbox-exec (Mac) proofs show that nothing outside the forms can go.
 
 ### Phase 174 — Build folders track A: the form API and the worktree tool (item 143)  · status: in progress
 
