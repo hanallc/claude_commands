@@ -1047,3 +1047,26 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   2. Each changed test module passes; a test proves a saved integrate record stays readable.
   3. basedpyright zero errors and warnings on changed files.
   4. A deletion change runs the full gate at the merge.
+
+### Phase 417 — a failed merge batch has one path: each row goes back to its requester  · status: todo
+**Depends on:** Phase 355
+
+#### Work Order
+- **Goal:** `merge_checkpoint.py` has one failure path. User rule, 11-21 through bob: "if a merge fails - it gets sent back to the requester to fix and the next thing in line should proceed". This phase runs before Phase 416.
+- **Spec:**
+  1. The first stop ends the batch: a red full gate, or a merge conflict with main. No probe, no retry and no single-match case.
+  2. Each row goes back to its requester with its report: the red steps, and whether the tests of that row include a red step.
+  3. The next item in the line proceeds.
+  4. Remove `bisect_red_batch`, the row-matching block in `retest`, the retry loop in `run_recorded_batch`, and `later_item_stop` if no caller remains.
+  5. In `test_merge_checkpoint_batch.py` remove the bisect tests and the retry tests. Keep one test: a red batch stops every row and reports each one.
+  6. Remove the `BATCH_GATE_TRIES` key and its readers. The user rule covers this deletion.
+  7. Correct each doc that names the removed paths in the same commit.
+- **Files:** `scripts/production/merge_checkpoint.py`; `scripts/production/test_merge_checkpoint_batch.py`; the config file that holds `BATCH_GATE_TRIES`; the docs that name the removed paths.
+- **Workers:** 1 writer.
+  - impl: all; the code and its one test module do not split.
+- **Constraints from prior phases:** Phase 355 changes `merge_checkpoint.py`; the branch starts at the 355 preparation tip and its hash goes to builds after 355 is on main. Phase 409 loses its bisect part and Phase 411 merges on top of this phase.
+- **Acceptance gate:**
+  1. A search finds no `bisect_red_batch`, no `BATCH_GATE_TRIES` and no retry loop.
+  2. The kept test fails without the report of each row and passes with it.
+  3. Each `test_merge_checkpoint*.py` module passes; basedpyright zero errors and warnings on changed files.
+  4. A deletion change runs the full gate at the merge.
