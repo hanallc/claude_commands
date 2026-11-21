@@ -1,6 +1,11 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
+import ast
+from collections import defaultdict
+from contextlib import redirect_stderr
+import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -12,10 +17,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import TextIO, cast
+from unittest import mock
 import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib import process_group
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
@@ -235,21 +243,25 @@ class QueueRunTests(unittest.TestCase):
                 os.close(reader)
                 os.close(writer)
 
-    def test_stale_callback_does_not_stop_the_next_placement(self) -> None:
+    def save_ended_run(self, root: Path, callback: Path) -> Path:
+        directory = root / mac_queue_run.RUNS / "stale"
+        directory.mkdir(parents=True)
+        (directory / "lock").touch()
+        record = directory / "run.json"
+        _ = record.write_text(json.dumps({"lifecycle_script": str(callback),
+                                         "arguments": [], "host": "fake-mac"}))
+        return directory
+
+    def test_missing_recovery_callback_fails_the_new_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = queue_fixture(root)
-            stale = root / mac_queue_run.RUNS / "stale"
-            stale.mkdir(parents=True)
-            (stale / "lock").touch()
-            saved = stale / "run.json"
-            _ = saved.write_text(json.dumps({"lifecycle_script": str(root / "gone"),
-                                            "arguments": [], "host": "fake-mac"}))
+            stale = self.save_ended_run(root, root / "gone")
             result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
                                     text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("cleanup of an ended run failed", result.stderr)
-            self.assertTrue(saved.exists())
+            self.assertTrue((stale / "run.json").exists())
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
 
     def test_failed_cleanup_leaves_the_record_for_the_next_run(self) -> None:
@@ -394,6 +406,453 @@ else:
                 _ = (root / f"case{number}").write_text("# trap is fine in a comment\n" + line + "\n")
             self.assertEqual(len(signal_handlers(root, tuple(f"case{number}" for number in range(len(lines))))), len(lines))
         self.assertEqual(signal_handlers(Path(__file__).resolve().parents[1], NO_HANDLER_FILES), [])
+
+
+    def test_every_registered_step_records_nonzero_statuses_and_exceptions(self) -> None:
+        def refuse() -> int:
+            return 23
+
+        def crash() -> int:
+            raise OSError("fixture action failed")
+
+        for step in mac_queue_run.QueueFailureStep:
+            for action, status in ((refuse, 23), (crash, 2)):
+                with self.subTest(step=step, status=status), tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "failure-record"
+                    steps = mac_queue_run.QueueSteps(path)
+                    with redirect_stderr(io.StringIO()):
+                        self.assertEqual(steps.execute(step, action), status)
+                    failure = mac_queue_run.QueueStepFailure(step, status)
+                    self.assertEqual(mac_queue_run.read_queue_failures(path), (failure,))
+
+    def test_every_registered_step_reports_a_failed_record_write(self) -> None:
+        for step in mac_queue_run.QueueFailureStep:
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "missing" / "failure-record"
+                steps = mac_queue_run.QueueSteps(path)
+                output = io.StringIO()
+                with redirect_stderr(output):
+                    self.assertEqual(steps.execute(step, lambda: 23), 23)
+                self.assertIn(f"cannot record {step.value} failure (status 23)", output.getvalue())
+                self.assertEqual(mac_queue_run.read_queue_failures(path), ())
+                path.parent.mkdir()
+                with redirect_stderr(output):
+                    self.assertEqual(steps.execute(step, lambda: 2), 2)
+                self.assertEqual(mac_queue_run.read_queue_failures(path),
+                                 (mac_queue_run.QueueStepFailure(step, 23), mac_queue_run.QueueStepFailure(step, 2)))
+
+
+    def test_recovery_records_a_cleanup_status_and_fails_the_new_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            callback = root / "cleanup"
+            _ = callback.write_text(f"#!{sys.executable}\nraise SystemExit(19)\n")
+            callback.chmod(0o755)
+            stale = self.save_ended_run(root, callback)
+            record = root / "failure"
+            command = self.command(root, "run")
+            command[3:3] = ["--failure-file", str(record)]
+            result = subprocess.run(command, env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+            self.assertEqual(record.read_text(), "recovery-cleanup 19\n")
+            self.assertTrue((stale / "run.json").is_file())
+            self.assertFalse((root / "remote").exists())
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+
+    def test_recovery_records_file_errors_and_closes_the_lock(self) -> None:
+        for expected_step in ("receipt-removal", "run-directory-removal", "run-directory-closure"):
+            with self.subTest(step=expected_step), tempfile.TemporaryDirectory() as temporary:
+                self.check_recovery_file_error(Path(temporary), expected_step)
+
+    def check_recovery_file_error(self, root: Path, expected_step: str) -> None:
+        environment = queue_fixture(root)
+        callback = root / "cleanup"
+        _ = callback.write_text(f"#!{sys.executable}\n")
+        callback.chmod(0o755)
+        stale = self.save_ended_run(root, callback)
+        receipt = root / mac_queue_run.RECEIPTS / "stale.json"
+        record = root / "failure"
+        original_open, original_close = os.open, os.close
+        original_unlink, original_rmtree = Path.unlink, shutil.rmtree
+        descriptors: set[int] = set()
+        lock_closed = False
+
+        def open_lock(path: Path, flags: int, mode: int = 0o777, *,
+                      dir_fd: int | None = None) -> int:
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+            if path == stale / "lock":
+                descriptors.add(descriptor)
+            return descriptor
+
+        def close_lock(descriptor: int) -> None:
+            nonlocal lock_closed
+            original_close(descriptor)
+            if descriptor in descriptors:
+                descriptors.remove(descriptor)
+                lock_closed = True
+                if expected_step == "run-directory-closure":
+                    raise OSError("fixture lock closure failed")
+
+        def unlink(path: Path, missing_ok: bool = False) -> None:
+            if expected_step == "receipt-removal" and path == receipt:
+                raise OSError("fixture receipt removal failed")
+            original_unlink(path, missing_ok=missing_ok)
+
+        def rmtree(path: Path, ignore_errors: bool = False, *,
+                   dir_fd: int | None = None) -> None:
+            if expected_step == "run-directory-removal" and path == stale:
+                if ignore_errors:
+                    return
+                raise OSError("fixture directory removal failed")
+            original_rmtree(path, ignore_errors=ignore_errors, dir_fd=dir_fd)
+
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(os, "open", side_effect=open_lock),
+              mock.patch.object(os, "close", side_effect=close_lock),
+              mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink),
+              mock.patch.object(shutil, "rmtree", side_effect=rmtree),
+              redirect_stderr(io.StringIO())):
+            status = mac_queue_run.main(["--failure-file", str(record), *self.command(root, "run")[3:]])
+        self.assertEqual(status, 2)
+        self.assertTrue(lock_closed)
+        self.assertFalse(descriptors)
+        self.assertEqual(record.read_text(), f"{expected_step} 2\n")
+        self.assertFalse((root / "remote").exists())
+
+    def test_queue_records_a_control_exit_before_running_finalizers(self) -> None:
+        exits: tuple[BaseException, ...] = (KeyboardInterrupt(), SystemExit(23))
+        for error in exits:
+            with self.subTest(error=type(error)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                record = root / "failure"
+                environment = queue_fixture(root)
+
+                def check_record_before_release() -> list[str]:
+                    if (root / "events").exists():
+                        self.assertEqual(record.read_text() if record.exists() else "", "transport 1\n")
+                    return admission_command()
+
+                admission_command = mac_queue_run.admission_command
+                with (mock.patch.dict(os.environ, environment),
+                      mock.patch.object(mac_queue_run, "stream_remote", side_effect=error),
+                      mock.patch.object(mac_queue_run, "admission_command", side_effect=check_record_before_release),
+                      redirect_stderr(io.StringIO()),
+                      self.assertRaises(type(error)) as raised):
+                    _ = mac_queue_run.main(["--failure-file", str(record), *self.command(root)[3:]])
+                self.assertIs(raised.exception, error)
+                self.assertEqual(record.read_text(), "transport 1\n")
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+                self.assertEqual(list((root / mac_queue_run.RUNS).iterdir()), [])
+
+    def test_watcher_failure_stops_the_group_before_raising_the_original_interrupt(self) -> None:
+        for termination_fails in (False, True):
+            with self.subTest(termination_fails=termination_fails):
+                steps = mac_queue_run.QueueSteps(None)
+                interrupt = KeyboardInterrupt()
+                actions: list[str] = []
+                pending_at_termination: list[int] = []
+
+                def start_watcher(_caller: int, failed: threading.Event, queue_steps: mac_queue_run.QueueSteps) -> None:
+                    def stop_watcher() -> None:
+                        actions.append("watcher shutdown")
+                        failed.set()
+
+                    _ = queue_steps.defer(mac_queue_run.QueueFailureStep.CALLER_WATCH_SHUTDOWN, stop_watcher)
+
+                def interrupt_run(_args: mac_queue_run.Arguments, queue_steps: mac_queue_run.QueueSteps) -> int:
+                    _ = queue_steps.defer(mac_queue_run.QueueFailureStep.CLEANUP, lambda: actions.append("cleanup"))
+                    raise interrupt
+
+                def stop_group() -> None:
+                    actions.append("group termination")
+                    pending_at_termination.append(steps.checkpoint())
+                    if termination_fails:
+                        raise SystemExit(23)
+
+                with (mock.patch.object(mac_queue_run, "QueueSteps", return_value=steps),
+                      mock.patch.object(mac_queue_run, "caller_watch", side_effect=start_watcher),
+                      mock.patch.object(mac_queue_run, "run", side_effect=interrupt_run),
+                      mock.patch.object(process_group, "terminate_owned_process_group", side_effect=stop_group),
+                      redirect_stderr(io.StringIO()),
+                      self.assertRaises(KeyboardInterrupt) as raised):
+                    _ = mac_queue_run.main(["--caller-fd", "0", *self.command(Path.cwd())[3:]])
+
+                self.assertIs(raised.exception, interrupt)
+                self.assertEqual(actions, ["cleanup", "watcher shutdown", "group termination"],
+                                 "Group termination must run after the other finalizers.")
+                self.assertEqual(pending_at_termination, [0])
+                self.assertEqual(steps.finalizers, [])
+
+    def check_interrupted_run_lock(self, *, fail_finalizers: bool) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = root / "failure"
+            interrupt = KeyboardInterrupt("fixture lock interrupt")
+            original_rmtree, original_close = shutil.rmtree, os.close
+            lock_descriptor = -1
+            observations: list[tuple[str, str]] = []
+
+            def acquire(descriptor: int, operation: int) -> None:
+                nonlocal lock_descriptor
+                self.assertEqual(operation, fcntl.LOCK_EX)
+                lock_descriptor = descriptor
+                raise interrupt
+
+            def recorded() -> str:
+                return record.read_text() if record.exists() else ""
+
+            def remove(path: Path) -> None:
+                observations.append(("directory", recorded()))
+                original_rmtree(path)
+                if fail_finalizers:
+                    raise OSError("fixture directory removal error")
+
+            def close(descriptor: int) -> None:
+                original_close(descriptor)
+                if descriptor == lock_descriptor:
+                    observations.append(("lock", recorded()))
+                    if fail_finalizers:
+                        raise SystemExit("fixture lock closure error")
+
+            environment = queue_fixture(root)
+            observed_exit: BaseException | None = None
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(fcntl, "flock", side_effect=acquire),
+                  mock.patch.object(shutil, "rmtree", side_effect=remove),
+                  mock.patch.object(os, "close", side_effect=close),
+                  redirect_stderr(io.StringIO())):
+                try:
+                    _ = mac_queue_run.main(["--failure-file", str(record), *self.command(root)[3:]])
+                except BaseException as error:
+                    observed_exit = error
+            self.assertIs(observed_exit, interrupt)
+            opening = "run-directory-open 1\n"
+            removal = "run-directory-removal 2\n" if fail_finalizers else ""
+            closing = "run-directory-closure 1\n" if fail_finalizers else ""
+            self.assertEqual(observations, [("directory", opening), ("lock", opening + removal)])
+            self.assertEqual(record.read_text(), opening + removal + closing)
+            self.assertEqual(list((root / mac_queue_run.RUNS).iterdir()), [])
+
+    def test_run_directory_records_the_lock_interrupt_before_any_cleanup(self) -> None:
+        self.check_interrupted_run_lock(fail_finalizers=False)
+
+    def test_run_directory_preserves_the_lock_interrupt_through_finalizer_failures(self) -> None:
+        self.check_interrupted_run_lock(fail_finalizers=True)
+
+    def test_admission_records_a_subprocess_read_failure_before_closing_its_pipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = root / "failure"
+            observations: list[str] = []
+            error = OSError("fixture subprocess output read failed")
+
+            def observe() -> None:
+                observations.append(record.read_text() if record.exists() else "")
+
+            class UnreadableOutput:
+                def read(self) -> str:
+                    raise error
+
+                def close(self) -> None:
+                    observe()
+
+            class Command:
+                def __init__(self, stdout: UnreadableOutput | None) -> None:
+                    self.args: tuple[str, ...] = ()
+                    self.stdin: None = None
+                    self.stderr: None = None
+                    self.stdout: UnreadableOutput | None = stdout
+
+                def __enter__(self) -> Command:
+                    return self
+
+                def __exit__(self, *_details: object) -> None:
+                    if self.stdout is not None:
+                        self.stdout.close()
+
+                def communicate(self, _input: object = None, **_options: object) -> tuple[str, str]:
+                    return (self.stdout.read() if self.stdout is not None else ""), ""
+
+                def poll(self) -> int:
+                    return 0
+
+                def wait(self) -> int:
+                    return 0
+
+                def kill(self) -> None:
+                    pass
+
+            process = Command(UnreadableOutput())
+            release = Command(None)
+            environment = queue_fixture(root)
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(subprocess, "Popen", side_effect=(process, release)),
+                  redirect_stderr(io.StringIO())):
+                status = mac_queue_run.main(["--failure-file", str(record), *self.command(root)[3:]])
+            self.assertEqual(status, 2)
+            self.assertEqual(observations, ["admission 2\n"])
+            self.assertEqual(record.read_text(), "admission 2\n")
+
+    def test_queue_effects_require_the_step_executor(self) -> None:
+        source = Path(mac_queue_run.__file__)
+        tree = ast.parse(source.read_text())
+        nodes = tuple(ast.walk(tree))
+        parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+        scopes = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+        def scope(node: ast.AST) -> ast.AST:
+            node = parents[node]
+            while not isinstance(node, scopes):
+                node = parents[node]
+            return node
+
+        definitions = {(scope(node), node.name): node for node in nodes
+                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        executor = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QueueSteps")
+        execute = definitions[(executor, "execute")]
+        calls: dict[ast.AST, list[tuple[ast.AST, bool]]] = defaultdict(list)
+        imports = {"open": "builtins.open"}
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports[alias.asname or alias.name.split(".")[0]] = alias.name if alias.asname else alias.name.split(".")[0]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    imports[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+
+        def imported_name(node: ast.AST) -> str:
+            if isinstance(node, ast.Name):
+                return imports.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                return f"{imported_name(node.value)}.{node.attr}"
+            return ""
+
+        def as_action(node: ast.AST) -> bool:
+            parent = parents[node]
+            return (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Attribute)
+                    and parent.func.attr in ("execute", "defer") and isinstance(parent.func.value, ast.Name)
+                    and parent.func.value.id in ("steps", "self") and len(parent.args) == 2 and parent.args[1] is node)
+
+        for node in nodes:
+            if isinstance(node, ast.Lambda):
+                calls[node].append((scope(node), as_action(node)))
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                caller = search = scope(node)
+                while True:
+                    callee = definitions.get((search, node.id))
+                    if callee is not None:
+                        # A new thread has its own execution scope.
+                        parent = parents[node]
+                        caller = tree if isinstance(parent, ast.keyword) and parent.arg == "target" else caller
+                        calls[callee].append((caller, as_action(node)))
+                        break
+                    if search is tree:
+                        break
+                    search = scope(search)
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+                caller = scope(node)
+                callee = definitions.get((scope(caller), node.attr)) if caller is not tree else None
+                if callee is not None:
+                    calls[callee].append((caller, as_action(node)))
+
+        def guarded(owner: ast.AST, route: frozenset[ast.AST]) -> bool:
+            if owner is execute:
+                return True
+            if owner in route:
+                return False
+            sites = calls.get(owner, [])
+            return bool(sites) and all(direct or guarded(caller, route | {owner}) for caller, direct in sites)
+
+        methods = {"unlink", "rmtree", "close", "open", "mkdir", "chmod", "rename", "replace",
+                   "read_bytes", "read_text", "write_bytes", "write_text", "touch", "rmdir",
+                   "symlink_to", "hardlink_to", "iterdir", "exists", "pipe", "read", "write",
+                   "wait", "communicate", "terminate", "kill", "send_signal", "flock"}
+        functions = {
+            "subprocess": {"Popen", "run", "call", "check_call", "check_output", "getoutput", "getstatusoutput"},
+            "shutil": {"rmtree", "copyfile", "copy", "copy2", "copytree", "copymode", "copystat", "move"},
+            "os": methods | {"fdopen", "fchmod", "fsync", "link", "listdir", "makedirs",
+                             "remove", "removedirs", "scandir", "stat", "symlink", "truncate", "dup",
+                             "dup2", "fstat", "ftruncate", "lseek", "pread", "pwrite", "readlink"},
+            "scripts.lib.atomic_file": {"atomic_sample", "create_text_atomic", "prepared_replacement",
+                                        "sync_folder", "write_text_atomic", "write_bytes_atomic"},
+        }
+        effects = {"builtins.open"} | {f"{module}.{name}" for module, names in functions.items() for name in names}
+        unguarded: list[str] = []
+        for node in nodes:
+            if not isinstance(node, (ast.Name, ast.Attribute)) or not isinstance(node.ctx, ast.Load):
+                continue
+            name = imported_name(node)
+            method = node.attr if isinstance(node, ast.Attribute) else ""
+            if name not in effects and method not in methods:
+                continue
+            owner = scope(node)
+            parent = parents[node]
+            if name == "shutil.rmtree" and isinstance(parent, ast.Call):
+                self.assertFalse(any(keyword.arg == "ignore_errors" for keyword in parent.keywords),
+                                 f"{source.name}:{node.lineno}: rmtree must report errors")
+            if isinstance(owner, ast.FunctionDef) and owner.name == "read_queue_failures" and name == "path.read_text":
+                continue
+            # The package selector runs before the queue imports its dependencies.
+            if owner is tree and (name == "package_root.read" or (
+                    name == "builtins.open" and isinstance(parent, ast.Call) and parent.args
+                    and isinstance(parent.args[0], ast.BinOp) and isinstance(parent.args[0].right, ast.Constant)
+                    and parent.args[0].right.value == "../lib/package_root.py")):
+                continue
+            if name not in {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output"}:
+                if as_action(node) or guarded(owner, frozenset()):
+                    continue
+            unguarded.append(f"{source.name}:{node.lineno}: {ast.unparse(node)}")
+        self.assertEqual(unguarded, [])
+
+    def assert_rejects_queue_source(self, extra: str) -> None:
+        source = Path(mac_queue_run.__file__).read_text()
+        with (mock.patch.object(Path, "read_text", return_value=source + "\n" + extra),
+              self.assertRaises(AssertionError)):
+            self.test_queue_effects_require_the_step_executor()
+
+    def test_queue_source_rejects_calls_through_imported_subprocess_names(self) -> None:
+        for source in (
+            "from subprocess import Popen\nPopen(['fixture'])",
+            "from subprocess import Popen as launch\nlaunch(['fixture'])",
+            "import subprocess as commands\ncommands.Popen(['fixture'])",
+        ):
+            with self.subTest(source=source):
+                self.assert_rejects_queue_source(source)
+
+    def test_queue_source_rejects_calls_through_imported_file_names(self) -> None:
+        for source in (
+            "from shutil import rmtree\nrmtree('run')",
+            "from shutil import rmtree as erase\nerase('run')",
+            "import shutil as files\nfiles.copytree('one', 'two')",
+            "from os import unlink\nunlink('receipt')",
+            "from os import close as release\nrelease(3)",
+            "import os as files\nfiles.replace('one', 'two')",
+        ):
+            with self.subTest(source=source):
+                self.assert_rejects_queue_source(source)
+
+    def test_queue_source_rejects_builtin_and_path_file_operations(self) -> None:
+        for source in (
+            "open('receipt', 'w')",
+            "from builtins import open as create\ncreate('receipt', 'w')",
+            "Path('receipt').write_bytes(b'fixture')",
+            "Path('receipt').unlink()",
+            "Path('receipt').rename('next')",
+        ):
+            with self.subTest(source=source):
+                self.assert_rejects_queue_source(source)
+
+    def test_queue_source_rejects_imported_file_helpers(self) -> None:
+        for source in (
+            "write_text_atomic(Path('receipt'), 'fixture')",
+            "from scripts.lib.atomic_file import write_text_atomic as save\nsave(Path('receipt'), 'fixture')",
+            "import scripts.lib.atomic_file as files\nfiles.write_bytes_atomic(Path('receipt'), b'fixture')",
+        ):
+            with self.subTest(source=source):
+                self.assert_rejects_queue_source(source)
 
 
 if __name__ == "__main__":
