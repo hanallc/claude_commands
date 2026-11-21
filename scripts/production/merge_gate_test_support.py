@@ -686,18 +686,13 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "scripts/hooks/test_first.py", "from scripts.hooks import affected_subject\n" + SUITE_MODULE)
         return subject, self.commit(self.checkout, "dependency fixture")
 
-    def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False, callers_production: bool = False,
+    def run_gate(self, *extra: str, ignored_signals: bool = False,
                  own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
-             "--merge-branch", "integration", "--unit-branch", "unit-phase",
-             "--checkpoint", checkpoint or self.checkpoint,
-             "--previous-checkpoint", previous or self.base,
-             "--unit", "fixture", "--phase", "phase-2",
-             "--body", "Fixture checkpoint gate.",
+             "--merge-branch", "integration", "--unit", "fixture",
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
-             *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
+             *([] if "--production" in extra else ["--production", "quiet"]),
              *extra]
         if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
             arguments = ["--repo", str(self.checkout), *extra]
@@ -774,12 +769,6 @@ class MergeGateFixture(unittest.TestCase):
     def assert_not_pushed(self) -> None:
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
 
-    def assert_refused_before_gate(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_not_pushed()
-        self.assertEqual(self.calls(), [])
-        self.assertEqual(self.module_events(), [])
-
     def checkpoint_commit(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
         _ = registered_fixture_image(Path(self.environment["REVIEW_LINKS_ROOT"]), "012345abcdef")
@@ -806,8 +795,12 @@ class MergeGateFixture(unittest.TestCase):
             _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
         return review, doc
 
-    def publish_for_promotion(self) -> merge_gate.GateArguments:
-        _ = self.git(self.checkout, "merge", "--ff-only", "unit-phase")
+    def publish_for_promotion(self, *, checkpoint_merge: bool = False) -> merge_gate.GateArguments:
+        merge = (
+            ("--no-ff", "-m", f"Merge fixture phase-2 ({self.checkpoint}) into integration")
+            if checkpoint_merge else ("--ff-only",)
+        )
+        _ = self.git(self.checkout, "merge", *merge, "unit-phase")
         _ = self.git(self.checkout, "push", "origin", "integration")
         return merge_gate.GateArguments(
             main_repo=str(self.main), merge_branch="integration",

@@ -8,7 +8,7 @@ from typing import Literal
 class StepJob:
     """The job that the command runs.
 
-    For integrate, unit names the checkpoint's unit. Other jobs test the caller's unit.
+    In saved integrate records, unit names the checkpoint's unit.
     """
     step: str
     unit: str = ""

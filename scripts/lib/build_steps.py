@@ -294,7 +294,7 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
         return StepJob("promote", branch=branch)
     if "--tests-only" in arguments:
         return _test_job(arguments, affected=False)
-    return StepJob("integrate", unit=_option(arguments, "--unit"), branch=branch)
+    return OTHER_COMMAND
 
 
 def gate_job_for_command(argv: Sequence[str]) -> StepJob | GateJobNotRecorded:

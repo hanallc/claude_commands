@@ -148,10 +148,10 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.assertIn("fixture message failed", output.getvalue())
 
     @gate_suites("lib", "hooks")
-    def test_red_modules_fail_again_print_both_outputs_and_reset(self) -> None:
+    def test_red_modules_print_both_outputs(self) -> None:
         self.write(self.state / "red-lib", "red")
         self.write(self.state / "red-hooks", "red")
-        result = self.run_gate()
+        result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assert_not_pushed()
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
@@ -246,15 +246,6 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.assertNotIn("Rerun alone:", result.stdout)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), self.module_count)
-
-    def test_red_gate_restores_tracked_debris_before_rollback(self) -> None:
-        self.write(self.state / "modify-tracked", "modify")
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
-        self.assertIn("merge undone", result.stderr)
-        self.assert_not_pushed()
 
     def test_failed_rollback_names_merge_commit_and_blocking_files(self) -> None:
         with mock.patch.object(merge_gate, "git", return_value=subprocess.CompletedProcess([], 1, " M unit.txt", "blocked")), mock.patch.object(

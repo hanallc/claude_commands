@@ -341,16 +341,6 @@ class MergeGateTypesTests(GateSuitesFixture):
         history, = self.gate_history()
         self.assertEqual(history["shape"], "tests")
 
-    def test_merge_pushes_modules_without_a_default_type_check(self) -> None:
-        result = self.run_gate()
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
-        self.assert_all_modules_started()
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"),
-                         self.git(self.checkout, "rev-parse", "HEAD"))
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-
     @gate_suites("lib")
     def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
         self.write(self.state / "uv-fails", "fail")
@@ -361,14 +351,6 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
         self.assertRegex(result.stdout, r"(?m)^lib: OK \d+\.\d+s$")
         self.assert_not_pushed()
-
-    def test_a_red_type_stub_does_not_prevent_a_merge_push(self) -> None:
-        self.write(self.state / "types-red", "red")
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
-        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
 
 
 class NightlyClock(datetime):

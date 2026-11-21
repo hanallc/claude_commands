@@ -599,11 +599,12 @@ class ChildImports(unittest.TestCase):
         self.assert_not_pushed()
 
     def test_explicit_fetch_updates_refs_without_matching_remote_configuration(self) -> None:
-        _ = self.git(self.checkout, "config", "--unset-all", "remote.origin.fetch")
-        _ = self.git(self.checkout, "update-ref", "refs/remotes/origin/unit-phase", self.base)
-        result = self.run_gate("--promote")
+        _ = self.publish_for_promotion()
+        _ = self.git(self.main, "config", "--unset-all", "remote.origin.fetch")
+        _ = self.git(self.main, "update-ref", "refs/remotes/origin/integration", self.base)
+        result = self.run_promote_only()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "origin/unit-phase"), self.checkpoint)
+        self.assertEqual(self.git(self.main, "rev-parse", "origin/integration"), self.checkpoint)
 
     @gate_suites("lib", "direct")
     def test_recorded_durations_start_unknown_then_slowest_modules(self) -> None:

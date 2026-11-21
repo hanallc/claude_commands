@@ -30,6 +30,7 @@ from scripts.buildlog import charts, cost_actions, costs, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
+from scripts.build_queue.snapshot_codec import parse_snapshot_value
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
@@ -365,8 +366,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_steps.conf",
-            "changes.default=no branch\nchanges.integrate={branch} branch\n"
-            + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
+            "changes.default=no branch\nnames.test-affected=test affected\nnames.test=test\n"
             + "names.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
             + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
             + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
@@ -647,7 +647,6 @@ process.stdout.write(JSON.stringify({
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
         gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
         cases = (
-            (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
             (["--tests-only", "--full"], StepJob("test-all", branch="")),
             (["--tests-only", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
             (["--tests-only"], StepJob("test-all")),
@@ -665,7 +664,7 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(job, expected)
                     notes = memory_feed.job_notes(job, names)
                     self.assertTrue(notes.get("about"))
-                    self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
+                    self.assertEqual(notes.get("changes"), "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
             self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
@@ -683,23 +682,12 @@ process.stdout.write(JSON.stringify({
             (["python3", "-Xdev", "-mscripts.production.merge_gate", "--nightly"], StepJob("test-nightly")),
             (["python3", "-u", "-W", "ignore", "merge_gate.py", "--tests-only", "--full"], StepJob("test-all")),
             (["python3", "tool.py", "merge_gate.py"], OTHER_COMMAND),
+            (gate_command, OTHER_COMMAND),
             (["cargo", "build"], OTHER_COMMAND),
         ):
             with self.subTest(command=command):
                 self.assertEqual(command_job(command), named)
-        about = "Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc"
-        self.assertEqual(names.about(StepJob("integrate", unit="handler", branch="sdlc")), about)
         self.assertEqual(names.about(StepJob("test-all")), "Runs every test module")
-        reading = reservation_reading()
-        integrate = StepJob("integrate", unit="handler", branch="sdlc")
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(memory_feed, "step_job", return_value=integrate)):
-            page = memory_feed.reading()
-        running, = [row for row in page["walk"] if row.get("queued")]
-        for row in (running, *page["waiters"]):
-            self.assertEqual(row.get("changes"), "sdlc branch")
-            self.assertEqual(row.get("about"), about)
-            self.assertIn("integrate", row["name"])
 
     def test_step_descriptions_use_the_current_templates_and_recorded_work(self) -> None:
         path = self.root / "build_steps.conf"
@@ -1973,7 +1961,7 @@ process.stdout.write(JSON.stringify({
         accepted = re.search(r'^case "\$CMD" in\n    ([\w|-]+)\) ;;', script.read_text(), re.MULTILINE)
         assert accepted is not None
         verbs = set(accepted[1].split("|"))
-        jobs = (("merge_gate.py",), ("merge_gate.py", "--tests-only"), ("merge_gate.py", "--nightly"),
+        jobs = (("merge_gate.py", "--tests-only"), ("merge_gate.py", "--nightly"),
                 ("merge_gate.py", "--promote-only"), ("targeted_test.py",), ("targeted_test.py", "--module", "test_sample"))
         recorded_jobs: list[str] = []
         for command in jobs:
@@ -2684,14 +2672,13 @@ process.stdout.write(JSON.stringify({
             return memory_feed.reading()
 
     def test_gate_modes_and_jobs_show_approved_names_on_local_and_cloud_rows(self) -> None:
-        approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
+        approved = {"test all", "test named", "test affected", "test nightly", "fast track",
                     "promote", "CI", "toolchain trial"}
         modes = {mode.value for mode in SuiteMode}
         self.assertEqual(modes, memory_feed.GATE_STEPS)
         for mode in sorted(modes):
             program = mode.replace("-", "_") + ".py"
             cases = ((), ("--full",), ("--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
-                ("--unit", "devtools", "--merge-branch", "sdlc"),
                 ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
                 ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
             for arguments in (*cases, memory_feed.CommandUnreadable("missing cmdline"), admission_records.PidNotRecorded()):
@@ -2765,10 +2752,16 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("about"), "Runs 1 named test modules")
                     self.assertEqual(row.get("changes"), "no branch")
 
-        integration = self.gate_job_page("merge-gate", ("python3", "merge_gate.py"), showrunner=True)
-        for rows in (integration["walk"], integration["waiters"]):
+    def test_saved_integrate_job_stays_readable(self) -> None:
+        job = parse_snapshot_value(
+            {"kind": "StepJob", "step": "integrate", "unit": "handler", "branch": "sdlc", "modules": 0}, StepJob)
+        assert isinstance(job, StepJob)
+        self.assertEqual(job, StepJob("integrate", unit="handler", branch="sdlc"))
+        page = self.gate_job_page("merge-gate", (), job=job, showrunner=True)
+        for rows in (page["walk"], page["waiters"]):
             row, = [row for row in rows if row.get("kind") == "cloud"]
             self.assertEqual(row["name"], "showrunner integrate")
+            self.assertEqual(row.get("about"), "Runs a merge or test job")
 
     def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
         page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))

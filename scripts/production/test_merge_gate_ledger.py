@@ -117,7 +117,6 @@ TOP_RUNS=5
 """,
     "build_steps": """names.targeted-test=targeted test
 names.merge-gate=gate
-names.integrate=integrate
 names.test-all=test all
 names.test-modules=test named
 names.test-affected=test affected
@@ -131,13 +130,11 @@ prose.build=release build
 owned.default={unit} {step}
 owned.showrunner-default=showrunner {step}
 owned.ci-default=CI {step}
-about.integrate=Merges the {unit} checkpoint into the {branch} branch, tests every module, then pushes {branch}.
 about.test-all=Tests every module of {unit}.
 about.test-modules=Tests {modules} named modules of {unit}.
 about.test-modules-without-unit=Tests {modules} named modules.
 about.test-affected=Tests the modules that the {unit} change affects.
 about.test-nightly=Tests the {branch} branch each night and records a red result with its owner.
-changes.integrate={branch} branch
 changes.promote=main branch
 changes.default=no branch
 """,
@@ -444,24 +441,15 @@ class MergeGateLedgerTests(MergeGateFixture):
             ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.assertIn(f"tests reused from {cast(str, record['tree'])[:12]} ({when}, tests-only, {self.checkout})", second.stdout)
 
-    def test_checkpoint_reuses_unit_tree_without_running_types(self) -> None:
-        first = self.run_gate("--tests-only", "--repo", str(self.unit))
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.clear_gate_events()
-        second = self.run_gate()
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(self.module_events(), [])
-        self.assertFalse((self.state / "types-ran").exists())
-        self.assertIn("tests reused from", second.stdout)
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.git(self.checkout, "rev-parse", "HEAD"))
-
     @gate_suites("lib", "hooks")
-    def test_checkpoint_full_pass_records_and_tests_only_reuses_it(self) -> None:
-        first = self.run_gate()
+    def test_tests_only_reuses_a_saved_checkpoint_pass(self) -> None:
+        first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assert_all_modules_started()
         record, = self.pass_records()
-        self.assertEqual(record["source"], "checkpoint")
+        record["source"] = "checkpoint"
+        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        self.write(path, json.dumps(record) + "\n")
         self.assertEqual(record["commit"], self.git(self.checkout, "rev-parse", "HEAD"))
         self.clear_gate_events()
         second = self.run_gate("--tests-only")
@@ -713,20 +701,6 @@ class MergeGateLedgerTests(MergeGateFixture):
                 else:
                     self.assertEqual(self.pass_records(), [])
                 _ = self.git(self.checkout, "restore", "subject.txt")
-
-    def test_checkpoint_with_reused_tests_does_not_run_a_red_type_check(self) -> None:
-        first = self.run_gate("--tests-only", "--repo", str(self.unit))
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.clear_gate_events()
-        self.write(self.state / "types-red", "red")
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("tests reused from", result.stdout)
-        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
-        self.assertEqual(self.module_events(), [])
-        merged = self.git(self.checkout, "rev-parse", "HEAD")
-        self.assertNotEqual(merged, self.base)
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
 
 
 if __name__ == "__main__":

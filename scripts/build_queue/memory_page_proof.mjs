@@ -2706,10 +2706,10 @@ try {
         const gateReading=structuredClone(base);
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
-        const gateAbout='Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc';
+        const gateAbout='Runs every test module';
         const gateRow=gateReading.walk[gateIndex];
-        Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
-          about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
+        Object.assign(gateRow,{name:'natemerge test all',unit:'natemerge',title:{unit:'natemerge',step:'test all'},
+          about:gateAbout,changes:'no branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
           started_at:gateReading.read_at-600});
         delete gateRow.caller;
         // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
@@ -2717,9 +2717,9 @@ try {
         await show(gateReading);
         await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
         const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
-        assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
+        assert.ok(gateTip[0].startsWith('natemerge · test all'),'The gate tooltip title: '+gateTip[0]);
         assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
-        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'sdlc branch');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'no branch');
         assert.equal(gateTip[gateTip.indexOf('Uses')+1],'6.2 GiB');
         const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
