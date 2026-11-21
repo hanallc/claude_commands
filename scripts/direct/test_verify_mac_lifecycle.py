@@ -6,6 +6,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import final
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission
@@ -64,7 +65,7 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         lock = self.board / "locks" / "cargo.d"
         self.assertFalse(lock.exists(), "the memory waiter holds the token")
         peer = subprocess.Popen(["bash", "-c", 'read -r -t "$1" _; :', "peer", str(TEST_HANG_GUARD_SECS)],
-                                stdin=subprocess.PIPE)
+                                env=verify_test_environment(), stdin=subprocess.PIPE)
 
         def stop_peer() -> None:
             assert peer.stdin is not None
@@ -75,6 +76,7 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         acquired = subprocess.Popen(["bash", str(VERIFY.with_name("board.sh")), "acquire", str(self.board),
                                    "peer", "cargo", "--pid", str(peer.pid),
                                    "--wait", str(TEST_HANG_GUARD_SECS)],
+                                  env=verify_test_environment(),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(acquired.wait, TEST_HANG_GUARD_SECS)
         acquired_out, acquired_err = acquired.communicate(timeout=TEST_HANG_GUARD_SECS)
