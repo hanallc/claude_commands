@@ -1671,7 +1671,7 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
                 return " ".join(f"QUEUED: {outcome.header.detail}".split())
             case "retry":
                 return " ".join(f"RETRY: {outcome.header.detail}".split())
-            case "failed" | "refused" | "held" | "pending":
+            case "failed" | "refused" | "held" | "pending" | "closed" | "absent":
                 pass
     return " ".join(failure_detail(done).split())
 
@@ -1708,7 +1708,7 @@ def tell_user(push: RenderedPush) -> PushDelivery:
                 return PushSent()
             case "retry":
                 return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
-            case "queued" | "failed" | "refused" | "held" | "pending":
+            case "queued" | "failed" | "refused" | "held" | "pending" | "closed" | "absent":
                 pass
     return PushFailed(" ".join(failure_detail(done).split()))
 
