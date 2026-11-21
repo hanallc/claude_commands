@@ -597,6 +597,11 @@ These scoped stops preserve other saved rows.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
 It keeps only the row IDs whose starts failed.
+Before it stops a worker, restart checks the settings for that worker's assigned role.
+If the settings are invalid or unreadable, restart reports the role error and leaves the worker running.
+Restart checks the worker's current role under its row lock. If the role changed, restart leaves the worker running.
+Other selected rows continue through stop and restart.
+Worker restore uses the checked policy if the role still matches.
 
 `agents restart ACCOUNT --all` selects live rows on that Claude or Codex account.
 It reads the account from each observed process environment.
@@ -781,6 +786,8 @@ A composer with a draft waits until the deadline without changes to the draft.
 Worker restore shares the command's run index and Codex snapshot through stopped-worker startup.
 Restore uses `worker_panes.worker_run` for run selection and fallback.
 Stop selects workers from their current staff parent.
+An owner restart excludes each worker whose role check failed from both stop and restore.
+An explicit stop without restart can stop workers with invalid role settings.
 
 An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
 Live or unknown evidence leaves the worker pending.
