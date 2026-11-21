@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from dataclasses import replace
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -24,7 +26,9 @@ from scripts.aws_target import cloud_gate, gate_box
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
+from scripts.build_targets import build_targets, targets
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib import conf
 from scripts.lib.process_start import Started, process_start
@@ -210,6 +214,30 @@ class QueueRunTests(unittest.TestCase):
                 self.assertEqual(claim.record["pid"], os.getpid())
                 self.assertIsInstance(offload.release_claim(controller, target.name), offload.ClaimReleaseConfirmed)
                 self.assertIsInstance(offload.read_assigned_mac_claim(assignment), offload.MacClaimSettled)
+
+    def test_claude_commands_gate_claim_appears_in_target_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "claude_commands"
+            repo.mkdir()
+            args, assignment, environment = self.assigned_gate(repo)
+            session = "gate-owner"
+            assignment = replace(assignment, session=OwningSession(session))
+            _ = subprocess.run(["git", "remote", "add", "origin", "https://github.com/natepiano/claude_commands.git"],
+                               cwd=repo, env=environment, check=True, timeout=TEST_HANG_GUARD_SECS)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                target = eligibility.configured_ssh_target(assignment.destination.target)
+                controller = offload.ProcessController()
+                self.assertIsInstance(offload.claim_for_assigned_mac_run(controller, assignment, args.worktree),
+                                      offload.FreshMacClaim)
+                try:
+                    claims = claim_state.read_claims(claim_state.state_paths(target.name))
+                    claim, = claims
+                    self.assertEqual(claim.scope, claim_state.RepositoryScope("claude_commands"))
+                    since = mac_test.aware_timestamp(claim.record["since"], claim.path, "since")
+                    self.assertEqual(build_targets.target_state(target), targets.Running((
+                        targets.RunningJob("gate tests", since, targets.NOT_SEEN_IDLE, targets.HolderSession(session)),)))
+                finally:
+                    self.assertEqual(offload.release_claim(controller, target.name), offload.ClaimReleaseConfirmed())
 
     def test_assigned_claim_bounds_output_collection_and_keeps_uncertain_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -404,6 +432,33 @@ def run_pass(target):
     def test_held_linux_state_lock_does_not_block_the_claim_watcher_pass(self) -> None:
         self.exercise_stalled_claim_watch("linux-lock", "claim-watch-pass")
 
+    def test_claim_housekeeping_runs_after_invalid_recovery_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = queue_fixture(root, "print('active=1\\nwork=0\\nrc=0')\n")
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            _ = write_config_fixture(root / "config/mac_test.conf", "host=configured-mac\n")
+            watcher = root / "watcher.py"
+            _ = watcher.write_text(
+                "import os, sys\n"
+                + "if sys.argv[1] == 'claim-watch-recovery':\n"
+                + "    os.write(1, b'recovery output \\xff\\n')\n"
+                + "    os.write(2, b'recovery diagnostic \\xff\\n')\n"
+                + "else:\n"
+                + "    from scripts.mac_test import mac_test\n"
+                + "    raise SystemExit(mac_test.main())\n")
+            output, errors = io.StringIO(), io.StringIO()
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_test, "__file__", str(watcher)),
+                  redirect_stdout(output), redirect_stderr(errors)):
+                paths = claim_state.state_paths()
+                self.write_ordinary_claim(paths, root)
+                self.assertTrue(mac_test.supervised_claim_watch_pass(paths, mac_test.read_config()))
+                self.assertIn("work_idle_since", paths.run.read_text())
+            replacement = chr(0xfffd)
+            self.assertIn(f"recovery output {replacement}", output.getvalue())
+            self.assertIn(f"recovery diagnostic {replacement}", errors.getvalue())
+
     def test_claim_watcher_recovers_an_assigned_run_after_housekeeping_stalls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -556,21 +611,41 @@ def run_pass(target):
                 self.assertFalse(journal.exists())
 
     def test_assigned_gate_refuses_late_backoff_before_remote_preparation(self) -> None:
+        self.check_late_gate_policy("backoff")
+
+    def test_assigned_gate_refuses_late_off_switch_before_remote_preparation(self) -> None:
+        self.check_late_gate_policy("off")
+
+    def check_late_gate_policy(self, reason: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args, assignment, environment = self.assigned_gate(root)
             target = assignment.destination.target
-            refused = wire.DispatchStatus(assignment, placement.ClosedAssignment("backoff"),
-                placement.PermissionAvailable(), retry=placement.DoNotRetry("backoff"))
+            refused = wire.DispatchStatus(assignment, placement.ClosedAssignment(reason),
+                placement.PermissionAvailable(), retry=placement.DoNotRetry(reason))
 
             def read_backoff(_now: float, _target: str) -> eligibility.BackoffState:
                 claim = offload.read_assigned_mac_claim(assignment)
-                return eligibility.ACTIVE_BACKOFF if isinstance(claim, offload.AssignedMacClaim) else eligibility.NO_BACKOFF
+                if reason == "backoff" and isinstance(claim, offload.AssignedMacClaim):
+                    return eligibility.ACTIVE_BACKOFF
+                return eligibility.NO_BACKOFF
+
+            claim_for_run = offload.claim_for_assigned_mac_run
+
+            def claim_then_change_policy(controller: offload.ProcessController, assigned: placement.PlacementAssignment,
+                                         repo: Path) -> offload.MacClaimAnswer:
+                claim = claim_for_run(controller, assigned, repo)
+                self.assertIsInstance(claim, offload.FreshMacClaim)
+                if reason == "off":
+                    settings = eligibility.configured_ssh_target(target).settings
+                    _ = write_config_fixture(settings, "offload=off\n")
+                return claim
 
             with (mock.patch.dict(os.environ, environment, clear=True),
                   mock.patch.object(eligibility, "read_backoff", side_effect=read_backoff),
+                  mock.patch.object(offload, "claim_for_assigned_mac_run", side_effect=claim_then_change_policy),
                   mock.patch.object(mac_queue_run, "run_callback",
-                                    side_effect=AssertionError("the runner contacted the Mac during backoff")) as lifecycle,
+                                    side_effect=AssertionError("the runner started remote preparation")) as lifecycle,
                   mock.patch.object(admission_client, "consume_permission") as authorize,
                   mock.patch.object(admission_client, "report_execution", return_value=refused) as report):
                 self.assertEqual(mac_queue_run.run(args), 2)
@@ -581,7 +656,7 @@ def run_pass(target):
                 self.assertEqual(claim_state.read_claims(claim_state.state_paths(target)), ())
                 self.assertTrue((root / mac_gate.ASSIGNED_REFUSAL).exists())
                 self.assertEqual(cast(wire.ExecutionReport, report.call_args.args[0]).outcome,
-                                 placement.PrelaunchRefused("backoff"))
+                                 placement.PrelaunchRefused(reason))
 
     def test_assigned_gate_launches_only_after_authorization_and_keeps_unsettled_claims(self) -> None:
         for case in ("completed", "failed tests", "malformed", "blocked", "unknown", "cleanup failed"):
@@ -1188,22 +1263,7 @@ class MacGateCountTests(gate_fixture.GateSuitesFixture):
                 self.check_local_gate_while_mac_is_held(command, first.pid)
                 self.assertEqual(controls.claims("mac"), held_claims)
 
-                manual_output = self.state / "manual-mac-result.json"
-                # Observe the first placement answer from the manual command.
-                manual_queue = (launcher, str(Path(mac_queue_run.__file__)), "--no-wait")
-                manual_source = ("from scripts.mac_test import mac_gate\n"
-                                 + f"mac_gate.QUEUE_COMMAND = {manual_queue!r}\n"
-                                 + "raise SystemExit(mac_gate.main())\n")
-                manual = subprocess.run(
-                    [launcher, "-c", manual_source, "run", str(repo), str(manual_output)], cwd=self.root,
-                    env=self.environment, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                    check=False, timeout=start_budget,
-                )
-                self.assertEqual(manual.returncode, 2, manual.stdout + manual.stderr)
-                self.assertIn(f"status {mac_queue_run.MAC_BUSY_STATUS}", manual.stderr)
-                self.assertFalse(manual_output.exists())
-                self.assertIsNone(first.poll(), log.read_text())
-                self.assertEqual(controls.claims("mac"), held_claims)
+                self.check_manual_gate_waits_for_the_held_claim(repo, queue_command, environment, first, held_claims)
             finally:
                 if first.poll() is None:
                     first.terminate()
@@ -1211,6 +1271,75 @@ class MacGateCountTests(gate_fixture.GateSuitesFixture):
                 for claim in held_claims:
                     self.assert_process_stopped(claim.record["pid"])
         self.assertEqual(controls.claims("mac"), ())
+
+    def check_manual_gate_waits_for_the_held_claim(self, repo: Path, queue: tuple[str, str],
+                                                   environment: dict[str, str], first: subprocess.Popen[bytes],
+                                                   held_claims: tuple[claim_state.HeldClaim, ...]) -> None:
+        output = self.state / "manual-mac-result.json"
+        busy = self.state / "manual-mac-busy"
+        allow_finish = self.state / "allow-manual-finish"
+        ready = self.state / "assigned-ready"
+        ready.unlink()
+        source = ("from scripts.mac_test import mac_gate\n"
+                  + f"mac_gate.QUEUE_COMMAND = {queue!r}\n"
+                  + "raise SystemExit(mac_gate.main())\n")
+        log = self.state / "manual-mac.log"
+        reply_bytes = self.admission.server.reply_bytes
+
+        def observe(reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
+            if isinstance(reply, wire.PlacementWait) and any(
+                    candidate.destination.target == "mac" and candidate.eligibility == placement.TemporaryExclusion("busy")
+                    for candidate in reply.eligibility):
+                write_text_atomic(busy, reply.episode)
+            return reply_bytes(reply, version=version)
+
+        manual_env = {**environment, "MAC_GATE_TRANSPORT_CASE": mac_fixture.MacTransportCase.HOLD_MANUAL_TESTS.value}
+        budget = mac_test.read_config().connect_timeout_s + mac_test.message_timeout_s()
+        legacy_queue_pid = 0
+        with (mock.patch.object(self.admission.server, "reply_bytes", side_effect=observe),
+              log.open("w") as report,
+              subprocess.Popen([queue[0], "-c", source, "run", str(repo), str(output)], cwd=self.root, env=manual_env,
+                               stdin=subprocess.DEVNULL, stdout=report, stderr=report, start_new_session=True) as manual):
+            try:
+                self.wait_for_manual_gate(busy, manual, log, budget)
+                episode = busy.read_text()
+                with self.admission.loop_turn():
+                    request = self.admission.server.placement_requests[episode]
+                if request.owner.pid != manual.pid:
+                    legacy_queue_pid = request.owner.pid
+                self.assertIsNone(manual.poll(), log.read_text())
+                self.assertFalse(output.exists())
+                self.assertFalse(ready.exists())
+                self.assertEqual(tuple(claim_state.read_claims(claim_state.state_paths("mac"))), held_claims)
+                self.assertEqual(request.owner.pid, manual.pid, "The manual gate did not own the placement request")
+                self.assertEqual(request.constraints.selection, placement.MacOnlyHost())
+                first.terminate()
+                _ = first.wait(timeout=budget)
+                self.wait_for_manual_gate(ready, manual, log, budget)
+                claims = claim_state.read_claims(claim_state.state_paths("mac"))
+                claim, = claims
+                self.assertEqual(claim.scope, claim_state.RepositoryScope("claude_commands"))
+                self.assertEqual(claim.record["episode"], request.episode)
+                self.assertNotEqual(claim.record["claim_id"], held_claims[0].record["claim_id"])
+                self.assertEqual(Path(ready.read_text()).name, "mac-gate-" + claim.record["attempt"])
+                allow_finish.touch()
+                self.assertEqual(manual.wait(timeout=budget), 0, log.read_text())
+                self.assertTrue(output.is_file())
+            finally:
+                allow_finish.touch()
+                if manual.poll() is None:
+                    manual.terminate()
+                _ = manual.wait(timeout=budget)
+                if legacy_queue_pid:
+                    self.assert_process_stopped(legacy_queue_pid)
+
+    def wait_for_manual_gate(self, marker: Path, process: subprocess.Popen[bytes], log: Path, budget: float) -> None:
+        try:
+            wait_until(lambda: marker.exists() or process.poll() is not None, self.state,
+                       timeout=budget, processes=(process,))
+        except TimeoutError as error:
+            self.fail(f"The manual gate did not produce {marker.name}: {error}\n{log.read_text()}")
+        self.assertTrue(marker.exists(), log.read_text())
 
     def check_local_gate_while_mac_is_held(self, command: list[str], first_pid: int) -> None:
         environment = {**self.environment, "MAC_GATE_TRANSPORT_CASE": mac_fixture.MacTransportCase.COMPLETE.value}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 import fcntl
 import json
@@ -45,6 +45,7 @@ from scripts.mac_test.claim_state import (
     QueueProcessUnsettled as QueueProcessUnsettled,
     capture_cleanup_command as capture_cleanup_command,
     close_process_pipes as close_process_pipes,
+    GATE_JOB_LABEL,
     kill_and_wait as kill_and_wait,
     terminate_and_wait as terminate_and_wait,
 )
@@ -727,14 +728,14 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                         or not assignment.attempt.isalnum()):
                     return 'The gate received an invalid Mac assignment'
                 target = assignment.destination.target
-                paths = assigned_gate_paths(assignment)
+                paths = assigned_gate_paths(assignment.attempt)
                 folder = paths.request
                 encoded_assignment = wire.encode_reply(wire.Assignment(assignment))
                 placement_arguments = ['--assignment-file', str(folder / 'assignment.json'),
                                        '--gate-assignment', encoded_assignment]
             cancel_seconds = queue_cancel_seconds(target)
             command = [*QUEUE_COMMAND, *caller_arguments, '--owns-gate-request',
-                       '--what', 'gate tests', '--kind', 'run', '--package', '',
+                       '--what', GATE_JOB_LABEL, '--kind', 'run', '--package', '',
                        '--worktree', str(repo), '--owned-close',
                        '--lifecycle-script', str(Path(__file__).resolve()), *placement_arguments]
             with queue_call(command, [str(folder), str(int(full))], caller_fds, caller_lifetime,
@@ -812,6 +813,29 @@ def run_assigned(repo: Path, *, assignment: PlacementAssignment, mode: gate.Suit
     if isinstance(outcome, MacGateResult):
         return MacGateCompleted(outcome.run)
     return MacGateUnresolved(outcome)
+
+
+def run_manual(repo: Path) -> MacGateResult | str:
+    """Use the gate's assigned claim and wait for the Mac alone."""
+    from scripts.build_queue import admission_records, admission_wire as wire, first_step, placement
+    from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED
+    from scripts.build_queue.queue_place import gate_placement_sidecar
+
+    mode = gate.SuiteMode.MERGE_GATE
+    tree, _ = cloud_gate.working_tree(repo)
+    try:
+        with gate_placement_sidecar() as sidecar:
+            config = admission_records.read_memory_config()
+            request = first_step.gate_placement_request(repo, tree, mode.value, (), sidecar, config, GATE_JOB_NOT_RECORDED)
+            request = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
+            grant = first_step.placement_grant(request)
+            if not isinstance(grant, wire.Assignment) or grant.assignment.destination.provider != 'mac':
+                raise GateRefused('The manual gate requires a Mac assignment')
+            return run_remote(repo, mode=mode, full=True, module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                              selected=gate.ALL_MODULES, cancellation=USE_CALLER_PROCESS_LIFETIME,
+                              assignment=grant.assignment)
+    except (first_step.FirstStepRefused, SettledMacRefusal, wire.AdmissionUnavailable) as error:
+        return str(error)
 
 
 def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
@@ -938,9 +962,7 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.MERGE_GATE, full=True,
-                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
-                                cancellation=USE_CALLER_PROCESS_LIFETIME)
+            result = run_manual(args.repo.resolve())
             if isinstance(result, str):
                 raise GateRefused(result)
             cloud_gate.save(args.output, result.row)

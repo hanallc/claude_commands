@@ -483,7 +483,7 @@ class ManualMacRun:
 
 def registered_mac_run_exists(assignment: PlacementAssignment) -> bool:
     try:
-        paths = assigned_gate_paths(assignment)
+        paths = assigned_gate_paths(assignment.attempt)
     except ValueError:
         return False
     return paths.journal.exists()
@@ -491,7 +491,7 @@ def registered_mac_run_exists(assignment: PlacementAssignment) -> bool:
 
 def read_registered_mac_run(assignment: PlacementAssignment) -> RegisteredMacRun | NoRegisteredMacRun:
     try:
-        paths = assigned_gate_paths(assignment)
+        paths = assigned_gate_paths(assignment.attempt)
     except ValueError:
         return NoRegisteredMacRun()
     try:
@@ -527,7 +527,7 @@ def saved_completion(saved: SavedRun, assignment: PlacementAssignment) -> wire.E
 def journaled_mac_completion(assignment: PlacementAssignment) -> wire.ExecutionReport | NoMacCompletionReport:
     """Read the completion record without waiting for the runner lock."""
     try:
-        paths = assigned_gate_paths(assignment)
+        paths = assigned_gate_paths(assignment.attempt)
     except ValueError:
         return NoMacCompletionReport()
     registered = read_registered_mac_run(assignment)
@@ -1032,6 +1032,8 @@ def run_assigned(args: Arguments, encoded: str) -> int:
                     raise ValueError("a previous Mac claim still requires cleanup")
                 elif isinstance(eligibility.read_backoff(time.time(), destination.target), eligibility.ActiveBackoff):
                     refusal = "backoff"
+                elif not conf.read(eligibility.configured_ssh_target(destination.target).settings).value("offload", conf.on_off):
+                    refusal = "off"
                 elif prepare_lifecycle(directory, saved, path, environment, owned_close=True, caller=args.caller):
                     refusal = "Mac gate preparation failed"
                 else:
@@ -1401,7 +1403,7 @@ def own_gate_plan(paths: AssignedGatePaths, saved: SavedRun) -> Generator[None]:
 def register_mac_run(args: Arguments, assignment: PlacementAssignment) -> Generator[RegisteredMacRun]:
     from scripts.build_queue import admission_client, admission_wire as wire, placement
 
-    paths = assigned_gate_paths(assignment)
+    paths = assigned_gate_paths(assignment.attempt)
     saved, owner = gate_plan(args, paths)
     saved["host"] = assignment.destination.host
     saved["claim"] = {"assignment": args.gate_assignment}

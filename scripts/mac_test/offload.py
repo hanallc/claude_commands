@@ -253,6 +253,11 @@ class KnownMacJob:
 
 
 @dataclass(frozen=True)
+class MacJobFromCommand:
+    """Use the command and package as the claim label."""
+
+
+@dataclass(frozen=True)
 class RecordedMirrorSession:
     """The last session recorded in the mirror."""
 
@@ -633,6 +638,7 @@ class OffloadRequest:
     repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
     placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+    claim_job: KnownMacJob | MacJobFromCommand = MacJobFromCommand()
 
     @property
     def source_root(self) -> Path:
@@ -1530,6 +1536,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
+    job = request.claim_job
+    what = job.what if isinstance(job, KnownMacJob) else f"{request.verb} {request.package or 'workspace'}"
     return [
         str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).with_name("mac_test.py")),
@@ -1537,7 +1545,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--pid",
         str(os.getpid()),
         "--what",
-        f"{request.verb} {request.package or 'workspace'}",
+        what,
         "--worktree",
         str(request.repo_root),
         "--remote",
@@ -2589,7 +2597,7 @@ def claim_for_assigned_mac_run(controller: ProcessController, assignment: placem
         assignment.destination.host)
     request = OffloadRequest(repo, "", assignment.episode, NO_RESULT_FILE, (), owner="",
         holder_session=claim_state.session_id(assignment.session), target=target,
-        placement=AssignedOffloadRequest(assignment))
+        placement=AssignedOffloadRequest(assignment), claim_job=KnownMacJob(claim_state.GATE_JOB_LABEL))
     repository = eligibility.repository_identity(repo)
     if not isinstance(repository, KnownRepository):
         return MacClaimNotConfirmed("repo", "", "The gate repository identity is unavailable")

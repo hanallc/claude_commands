@@ -25,12 +25,12 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
-    from scripts.build_queue.placement import PlacementAssignment
     from scripts.buildlog.transfer_bytes import TransferBytes
 
 
 CREATION_LEASE_FD = "MAC_GATE_CREATION_LEASE_FD"
 QUEUE_RUNS = ".local/state/mac-queue/runs"
+GATE_JOB_LABEL = "gate tests"
 
 
 def gate_requests_directory() -> Path:
@@ -54,8 +54,7 @@ class AssignedGatePaths:
         return self.request_root / self.request_root.name
 
 
-def assigned_gate_paths(assignment: PlacementAssignment | str) -> AssignedGatePaths:
-    attempt = assignment if isinstance(assignment, str) else assignment.attempt
+def assigned_gate_paths(attempt: str) -> AssignedGatePaths:
     if not attempt.isascii() or not attempt.isalnum():
         raise ValueError("the Mac attempt identifier is invalid")
     runs = queue_runs_directory()
@@ -189,7 +188,7 @@ def capture_cleanup_command(command: list[str], budget: float, *,
         own_group = supervise_session or CREATION_LEASE_FD not in os.environ
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, start_new_session=own_group, cwd=cwd, pass_fds=pass_fds)
+                                   text=True, errors="replace", start_new_session=own_group, cwd=cwd, pass_fds=pass_fds)
         output, errors = collect_command_output(process, deadline, owns_group=own_group, input_text=input_text,
                                                 owns_session=supervise_session)
         assert process.returncode is not None

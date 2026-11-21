@@ -56,6 +56,7 @@ class MacTransportCase(Enum):
     STALLED_CLEANUP = "stalled-cleanup"
     CLAIM_PUBLICATION = "claim-publication"
     MANUAL_BEFORE_PLACEMENT = "manual-before-placement"
+    HOLD_MANUAL_TESTS = "hold-manual-tests"
 
 
 class ClaimWriteBarrier(Enum):
@@ -105,7 +106,7 @@ def run_queue_with_fixture_transport() -> int:
         if MacTransportCase(os.environ["MAC_GATE_TRANSPORT_CASE"]) is MacTransportCase.UNAVAILABLE_OWNER:
             args = sys.argv[1:]
             assignment = mac_queue_run.read_assignment(args[args.index("--gate-assignment") + 1])
-            paths = mac_gate.assigned_gate_paths(assignment)
+            paths = mac_gate.assigned_gate_paths(assignment.attempt)
             assert paths.journal.is_file() and not paths.request_root.exists() and not paths.directory.exists()
             write_text_atomic(state / "owner-unavailable", attempt)
             raise wire.AdmissionUnavailable("the fixture admission service is unavailable")
@@ -161,9 +162,12 @@ def run_assignment_with_fixture_transport(run: Callable[[mac_queue_run.Arguments
     def stream(_command: list[str], remote: mac_queue_run.RemoteRun, _ssh: ExitStack,
                emit: Callable[[str], None] = print, *, caller: mac_queue_run.QueueCaller) -> int:
         remote.state = mac_queue_run.RemoteState.LIVE
-        if case is MacTransportCase.HELD:
+        if case in (MacTransportCase.HELD, MacTransportCase.HOLD_MANUAL_TESTS):
             write_text_atomic(state / "assigned-ready", str(folder))
-            caller.ready(timeout=-1)
+            if case is MacTransportCase.HELD:
+                caller.ready(timeout=-1)
+            else:
+                wait_until((state / "allow-manual-finish").is_file, state)
         write_text_atomic(state / "assigned-streamed", assignment.attempt)
         if case is MacTransportCase.MALFORMED:
             emit(mac_gate.RESULT_PREFIX + "{\n")
@@ -525,7 +529,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 _ = merge_gate.run_gate_suites(self.checkout)
         attempt = (self.state / "owner-unavailable").read_text()
         assignment = self.recorded_assignment(attempt)
-        paths = mac_gate.assigned_gate_paths(assignment)
+        paths = mac_gate.assigned_gate_paths(assignment.attempt)
         self.assertFalse(paths.request_root.exists())
         self.assertFalse(paths.directory.exists())
         self.assertEqual(offload.read_assigned_mac_claim(assignment), offload.MacClaimSettled())
@@ -550,7 +554,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             with self.admission.loop_turn():
                 _ = self.admission.run_pass()
                 self.assertFalse((self.state / "recovery-entered").exists())
-                self.assertTrue(mac_gate.assigned_gate_paths(assignment).journal.exists())
+                self.assertTrue(mac_gate.assigned_gate_paths(assignment.attempt).journal.exists())
                 os.kill(claim.record["pid"], signal.SIGKILL)
                 self.assert_process_stopped(claim.record["pid"])
                 provider = self.admission.server.host_probe
@@ -602,7 +606,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 attempt, creator_pid = marker.read_text().split()
                 creator = int(creator_pid)
                 assignment = self.recorded_assignment(attempt)
-                paths = mac_gate.assigned_gate_paths(assignment)
+                paths = mac_gate.assigned_gate_paths(assignment.attempt)
                 run = mac_queue_run.read_registered_mac_run(assignment)
                 assert isinstance(run, mac_queue_run.RegisteredMacRun)
                 claim = offload.read_assigned_mac_claim(assignment)
@@ -699,7 +703,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             self.assertTrue((self.state / "cleanup-entered").exists())
             attempt = (self.state / "assigned-streamed").read_text()
             assignment = self.recorded_assignment(attempt)
-            paths = mac_gate.assigned_gate_paths(assignment)
+            paths = mac_gate.assigned_gate_paths(assignment.attempt)
             self.assertTrue(paths.journal.exists())
             self.assertTrue(paths.request.is_dir())
             claim = offload.read_assigned_mac_claim(assignment)
