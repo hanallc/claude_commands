@@ -107,8 +107,9 @@ if phase == 'prepare':
     log = shlex.quote(str(root / 'close.log'))
     status = shlex.quote(str(root / 'close_status'))
     pending = shlex.quote(str(root / 'close_status.new'))
+    # The close hook runs under zsh with the fixture PATH, which has no mv.
     argv_file.with_suffix('.json.close').write_text(
-        f'{close} >{log} 2>&1; rc=$?; printf "%s" "$rc" >{pending}; mv -- {pending} {status}; exit "$rc"')
+        f'{close} >{log} 2>&1; rc=$?; printf "%s" "$rc" >{pending}; {shlex.quote(sys.executable)} -c "import os, sys; os.replace(*sys.argv[1:])" {pending} {status}; exit "$rc"')
 elif phase == 'guest':
     try:
         mac_gate.run_guest(folder, full=True)
