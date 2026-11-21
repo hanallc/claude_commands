@@ -356,7 +356,7 @@ BUILD_TEST_ARTIFACTS_FILE=""
 buildlog_exec_with_progress() {
     local -x CARGO_TERM_PROGRESS_WHEN=always
     local -x CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}}
-    if [[ -n "$BUILD_TEST_ARTIFACTS_FILE" ]]; then
+    if [[ -n "${BUILD_TEST_ARTIFACTS_FILE:-}" ]]; then
         buildlog_exec "$@" > "$BUILD_TEST_ARTIFACTS_FILE"
     else
         buildlog_exec "$@"

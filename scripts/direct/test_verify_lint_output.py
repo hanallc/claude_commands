@@ -63,6 +63,32 @@ sweep_after_step() { :; }
                     result = self.shell(script, root)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
+    def test_inherited_artifact_path_does_not_capture_ordinary_output(self) -> None:
+        script = r"""
+buildlog_exec_with_progress printf 'ordinary\n'
+capture_artifacts() {
+    local BUILD_TEST_ARTIFACTS_FILE="$PWD/captured"
+    buildlog_exec_with_progress printf 'artifact\n'
+}
+capture_artifacts
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inherited = root / "inherited"
+            _ = inherited.write_text("original\n", encoding="utf-8")
+            result = test_invoke_scope.BuildAdmissionTests.run_invoke(
+                root, script, [], cwd=root, environment={
+                    "BUILD_TEST_ARTIFACTS_FILE": str(inherited),
+                    "BUILDLOG_MEM_RESERVATION": "",
+                    "BUILDLOG_PEAK": "",
+                    "BUILDLOG_RESERVED_STEP": "",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(inherited.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(result.stdout, "ordinary\n")
+            self.assertEqual((root / "captured").read_text(encoding="utf-8"), "artifact\n")
+
     def test_inherited_probe_flag_does_not_skip_formatting(self) -> None:
         script = r"""
 LINT_QUEUE_PLACEMENT=0

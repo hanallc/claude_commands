@@ -677,9 +677,9 @@ STEP_COPIES_SCRIPT="$VERIFY_START_DIR/../copies/copies.py"
 # on, in addition to the tree. A change to one of them makes the record stale.
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
-    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh"
-        "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lint/cargo_artifacts.py"
-        "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
+    LINT_CODE_FILES=("$BUILD_HELPER_ROOT/lint/cargo_artifacts.py"
+        "${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh"
+        "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 
