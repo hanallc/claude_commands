@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from typing import cast, override
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_lint_scope_test_support as support
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Print the board in TEST_BERTH_BOARD, as `cargo-berth board --json` does.
 BERTH_STUB = r'''
@@ -104,6 +107,61 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
         parent = self.root / "target/package"
         self.assertEqual(list(parent.glob("verify-lint-copy*")), [], output)
         self.assertNotIn(f"kept for a manual removal list: {parent / 'verify-lint-copy'}", output)
+
+    def test_helper_keeps_lint_copy_claim_across_memory_admission(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        _ = admission.occupy_host()
+        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text(
+            "MemTotal: 67108864 kB\nMemAvailable: 0 kB\n", encoding="utf-8",
+        )
+        trace = self.root / "helper-trace"
+        functions = shell_functions(support.VERIFY, "verify_helper")
+        script = "set -eu\n" + functions + r'''
+# The Bash in the Nix shell can lack programmable completion.
+enable -n compgen 2>/dev/null || true
+VERIFY_START_DIR="$HOME/.claude/scripts/direct"
+PY="$VERIFY_START_DIR/../lib/py"
+FIX_RETURN_SCRIPT="$VERIFY_START_DIR/../mac_test/fix_return.py"
+BUILDLOG_MEM_ADMIT_SCRIPT="$HOME/.claude/scripts/build_queue/admission_client.py"
+BUILDLOG_QUEUE_PLACE_SCRIPT="$HOME/.claude/scripts/build_queue/queue_place.py"
+verify_helper --start
+for action in drop-copy return-copy; do
+    answer=$(verify_helper --stdin "$FIX_RETURN_SCRIPT" copy --repo-root "$PWD" --owner "$$" <<< "$TEST_METADATA")
+    mapfile -t copy <<< "$answer"
+    folder=${copy[1]}
+    test -d "$folder"
+    source_key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$PWD")
+    status=0
+    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" place-step --once --wait-events --episode "$action" \
+        --since "$EPOCHREALTIME" --pid "$$" --repo-root "$PWD" --package sample --kind lint \
+        --source-key "$source_key" --local-only --writes-tree --assignment-file "$HOME/$action.json" \
+        -- cargo mend --workspace --fix || status=$?
+    test "$status" = 78
+    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$action" --pid "$$"
+    verify_helper "$BUILDLOG_QUEUE_PLACE_SCRIPT" release fixture-unused-reservation 0
+    args=()
+    if [[ "$action" == return-copy ]]; then
+        printf '%s\n' 'pub(crate) fn value() -> u8 { 1 }' > "${copy[2]}/src/lib.rs"
+        args=(--allocation-id "${copy[5]}")
+    fi
+    verify_helper "$FIX_RETURN_SCRIPT" "$action" --repo-root "$PWD" --folder "$folder" "${args[@]}"
+    if [[ -e "$folder" ]]; then printf 'copy remains after %s\n' "$action" >&2; fi
+done
+'''
+        result = subprocess.run(
+            ["bash", "-c", script], cwd=self.root, env={**self.environment, "VERIFY_PY_TRACE": str(trace)},
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        output = result.stdout + result.stderr
+        call_log = trace.with_suffix(".calls")
+        calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+        self.assertEqual(result.returncode, 0, output + calls)
+        self.assertIn("waiting for memory", result.stderr)
+        self.assertNotIn("copy remains after", output + calls)
+        self.assertIn("admission_client.py\tplace-step\t", calls)
+        self.assertIn("queue_place.py\trelease\t", calls)
+        self.assert_copy_removed(output)
+        self.assertEqual(self.text("src/lib.rs"), "pub(crate) fn value() -> u8 { 1 }\n")
 
     def test_held_fix_reaches_the_worktree_through_the_copy(self) -> None:
         status, output = self.lint({"src/lib.rs": "pub(crate) fn value() -> u8 { 1 }\n"})

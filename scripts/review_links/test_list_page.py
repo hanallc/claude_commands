@@ -2492,18 +2492,25 @@ document.body.append(result);
                       redirect_stdout(io.StringIO())):
                     self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1",
                                                     "--text", "The gate passed."]), 0)
+        parked_answer = self.add("Park the answered item", number=21)
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            list_page.deliver(list_page.submit(root, urlencode(self.fields(parked_answer, "question", words="Did it pass?"))))
+            self.assertEqual(the_list.main(["answer", parked_answer.id, "--question", "Q1", "--text", "It passed."]), 0)
+        answered = the_list.load(MORTY.id, parked_answer.id)
+        _ = list_page.submit(root, urlencode(self.fields(answered, "park", until=(NOW + timedelta(days=1)).isoformat())))
         markup = list_page.render(root, status=status, include_counts=False).decode()
         controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["18", "3", "2", "2", "2", "8"])
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["19", "3", "2", "2", "2", "9"])
         probe = '''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
 const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
- ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20],[1,3,4,6,9,11,13,15,18,19,20]],
+ ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21],[1,3,4,6,9,11,13,15,18,19,20,21]],
  ['needs-me',[4,5,20],[4,20]],['morty-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
- ['parked',[9,10,11,12,13,14,15,18],[9,11,13,15,18]],
+ ['parked',[9,10,11,12,13,14,15,18,21],[9,11,13,15,18,21]],
 ];
 const count=button=>Number(button.dataset.filterCount);
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
@@ -4154,10 +4161,9 @@ observer.observe(original.parentNode,{childList:true});
             list_page.deliver(list_page.submit(root, urlencode(second), status))
             waiting = list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", "")
             self.assertIn('data-question="Q1"', waiting)
-            credential = re.search(r'data-open-read-request="([^"]+)" data-open-read-token="([^"]+)"', waiting)
-            assert credential is not None
-            request, token = credential.groups()
-            _ = list_page.submit(root, urlencode({**stale, "request": request, "token": token}), status)
+            self.assertIn('value="read">Mark read</button>', waiting)
+            fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', waiting))
+            _ = list_page.submit(root, urlencode({**stale, **fields}), status)
             self.assertIn('data-log-index="Q1-answered"',
                           list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", ""))
             self.assertEqual(the_list.main(["answer", item.id, "--question", "Q2", "--text", "The next check passed."]), 0)
@@ -5641,297 +5647,30 @@ window.fetch=async(_url,options)=>{
  check(parent.document.activeElement===nav,'The response preserves the console focus');
 """, add_item=False, reduced_motion=True, in_frame=True)
 
-    def render_unread_answer(self, *, latest_status: str = "",
-                             questions_and_answers: tuple[tuple[str, str], ...] = (
-                                 ("Which check passed?", "The gate passed."),)) -> tuple[the_list.ListItem, str]:
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_open_needs_me_answer_stays_unread_after_refresh(self) -> None:
         root = self.root / "reviews"
-        item = self.add("Read the answer after opening the tab")
-        if latest_status:
-            _ = the_list.update(MORTY.id, item.id, {"latest_status": latest_status}, source="morty")
+        item = self.add("Check the result")
         with (patch.object(change_page, "send_question", return_value=question_outcome()),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
-            for question, _answer in questions_and_answers:
-                current = the_list.load(MORTY.id, item.id)
-                fields = self.fields(current, "question", words=question)
-                list_page.deliver(list_page.submit(root, urlencode(fields)))
-            for number, (_question, answer) in enumerate(questions_and_answers, start=1):
-                self.assertEqual(the_list.main(["answer", item.id, "--question", f"Q{number}", "--text", answer]), 0)
+            fields = self.fields(item, "question", words="Which check passed?")
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
         markup = list_page.render(root, include_counts=False).decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
-        return item, markup
-
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_direct_answer_link_waits_for_visibility(self) -> None:
-        item, markup = self.render_unread_answer()
-        fragment = urlencode({"show": "unread", "item": f"{MORTY.id}/{item.id}"})
-        setup = """<script>
-let visibility='hidden';
-Object.defineProperty(document,'visibilityState',{get:()=>visibility});
-window.frameElement.hidden=true;
-history.replaceState(null,'','#FRAGMENT');
-const reads=[];
-window.fetch=async(_url,options)=>{
- if(options?.method!=='POST') return new Response('',{status:503});
- reads.push(new URLSearchParams(options.body));
- return new Response(JSON.stringify({unread:'true'}));
-};
-</script>""".replace('FRAGMENT', fragment)
-        probe = """<script>
-(async()=>{
- const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
- const row=document.querySelector('[data-list-item]');
- const panel=recordDetails(row).querySelector('.list-panel');
- const unread=()=>row.dataset.unread==='true' && panel.querySelector('.question-unread');
- const showTab=()=>{visibility='visible';document.dispatchEvent(new Event('visibilitychange'));};
- const showFrame=()=>{
-  window.frameElement.hidden=false;
-  window.dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- };
- const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
- try{
-  check(!row.hidden && recordIsOpen(row),'The direct link opens the unread row');
-  check(!reads.length && unread(),'A hidden tab keeps the answer unread');
-  if(CLOSE_ROW) row.querySelector('.list-toggle').click();
-  REVEAL_FIRST();
-  await paint();
-  check(!reads.length && unread(),'The answer stays unread while the tab or frame is hidden');
-  REVEAL_SECOND();
-  await paint();
-  if(CLOSE_ROW) check(!reads.length && unread(),'Closing the row cancels its deferred read');
-  else check(reads.length===1 && reads[0].get('action')==='read' &&
-   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
-   'The visible row sends its signed read once');
- }catch(error){failures.push(String(error));}
- await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();
-</script>"""
-        for first, second, close_row in (('showTab', 'showFrame', False), ('showFrame', 'showTab', False),
-                                         ('showTab', 'showFrame', True)):
-            with self.subTest(first=first, close_row=close_row):
-                case = (probe.replace('REVEAL_FIRST', first).replace('REVEAL_SECOND', second)
-                        .replace('CLOSE_ROW', str(close_row).lower()))
-                self.browser_answer_visibility(markup, setup, case)
-
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_direct_answer_link_waits_until_the_answer_scrolls_into_view(self) -> None:
-        item, markup = self.render_unread_answer(latest_status="\n\n".join(f"Check {n} passed." for n in range(55)))
-        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
-        setup = """<script>
-history.replaceState(null,'','#FRAGMENT');
-const reads=[];
-window.fetch=async(_url,options)=>{
- if(options?.method!=='POST') return new Response('',{status:503});
- reads.push(new URLSearchParams(options.body));
- return new Response(JSON.stringify({unread:'true'}));
-};
-</script>""".replace('FRAGMENT', fragment)
-        probe = """<script>
-(async()=>{
- const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
- try{
-  const row=document.querySelector('[data-list-item]');
-  const panel=recordDetails(row).querySelector('.list-panel');
-  const answer=[...panel.querySelectorAll('[data-question="Q1"] p')].find(p=>p.textContent==='The gate passed.');
-  const sample=()=>new Promise(resolve=>{
-   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
-   observer.observe(answer);
-  });
-  check(!row.hidden && recordIsOpen(row) && row.querySelector('.list-row').getBoundingClientRect().bottom<innerHeight,
-   'The direct link opens a row within the viewport');
-  check(!(await sample()).isIntersecting && answer.getBoundingClientRect().top>innerHeight,
-   'The answer starts below the viewport');
-  check(!reads.length && panel.querySelector('.question-unread'),'The answer below the viewport stays unread');
-  answer.scrollIntoView({block:'center',behavior:'instant'});
-  check((await sample()).isIntersecting,'Scrolling brings the answer into the viewport');
-  check(reads.length===1 && reads[0].get('action')==='read' &&
-   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
-   'The answer sends one signed read when it enters the viewport');
- }catch(error){failures.push(String(error));}
- await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();
-</script>"""
-        self.browser_answer_visibility(markup, setup, probe)
-
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_direct_answer_link_reads_once_in_a_720_pixel_viewport(self) -> None:
-        with patch.object(list_page, "counts_strip", return_value=""):
-            item, markup = self.render_unread_answer()
-        markup = markup.replace('<section class="page-question" data-question="Q1">',
-                                '<div id="answer-spacer" style="height:1800px"></div>'
-                                + '<section class="page-question" data-question="Q1">', 1)
-        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
-        setup = """<script>
-history.replaceState(null,'','#FRAGMENT');
-const reads=[];
-window.fetch=async(_url,options)=>{
- if(options?.method!=='POST') return new Response('',{status:503});
- reads.push(new URLSearchParams(options.body));
- return new Response(JSON.stringify({unread:'false'}));
-};
-</script>""".replace('FRAGMENT', fragment)
-        probe = """<script>
-(async()=>{
- const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
- try{
-  const panel=document.querySelector('#record-item-dialog[open] .list-panel');
-  const answer=panel.querySelector('[data-question="Q1"] p:last-child');
-  const spacer=document.getElementById('answer-spacer');
-  spacer.style.height=(spacer.offsetHeight+1800-answer.getBoundingClientRect().top)+'px';
-  const sample=()=>new Promise(resolve=>{
-   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
-   observer.observe(answer);
-  });
-  check(innerHeight===720 && Math.abs(answer.getBoundingClientRect().top-1800)<=1,
-   'Expected a 720 pixel viewport and answer at 1,800 pixels. Got '+innerHeight+' and '+answer.getBoundingClientRect().top+'.');
-  check(!(await sample()).isIntersecting && reads.length===0,'The offscreen answer sends no read.');
-  answer.scrollIntoView({block:'center',behavior:'instant'});
-  check((await sample()).intersectionRect.height>0 && reads.length===1 &&
-   reads[0].get('action')==='read' && reads[0].get('token')===panel.dataset.openReadToken,
-   'Scrolling to the answer sends one signed read.');
-  panel.closest('.console-dialog-body').scrollTop=0;
-  await sample();
-  answer.scrollIntoView({block:'center',behavior:'instant'});
-  check((await sample()).intersectionRect.height>0 && reads.length===1,
-   'Scrolling to the answer again sends no second read.');
- }catch(error){failures.push(String(error));}
- await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();
-</script>"""
-        self.browser_answer_visibility(markup, setup, probe, viewport_height=720)
-
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_item_link_waits_for_every_unread_answer(self) -> None:
-        item, markup = self.render_unread_answer(questions_and_answers=(
-            ("Which checks passed?", "\n".join(f"Check {number} passed." for number in range(65))),
-            ("Did the final check pass?", "The final check passed.")))
-        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
-        setup = """<script>
-const fragment='#FRAGMENT',reads=[];
-const seenEntries=[],NativeIntersectionObserver=window.IntersectionObserver;
-window.IntersectionObserver=class extends NativeIntersectionObserver{
- constructor(callback,options){
-  super((entries,observer)=>{
-   if(options?.threshold) for(const entry of entries) seenEntries.push([
-    entry.target.parentElement.dataset.question,entry.isIntersecting,entry.intersectionRatio,document.visibilityState
-   ]);
-   callback(entries,observer);
-  },options);
- }
-};
-let receivedRead,receivedFirstAnswer;
-const postedRead=new Promise(resolve=>{receivedRead=resolve;});
-const firstAnswerSeen=new Promise(resolve=>{receivedFirstAnswer=resolve;});
-const unobserveAnswer=IntersectionObserver.prototype.unobserve;
-IntersectionObserver.prototype.unobserve=function(answer){
- unobserveAnswer.call(this,answer);
- if(answer.matches('[data-question="Q1"] > p:last-child')) receivedFirstAnswer();
-};
-window.fetch=async(_url,options)=>{
- if(options?.method!=='POST') return new Response('',{status:503});
- reads.push(new URLSearchParams(options.body));
- receivedRead();
- return new Response(JSON.stringify({unread:'true'}));
-};
-</script>""".replace('FRAGMENT', fragment)
-        probe = """<script>
-(async()=>{
- const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
- try{
-  const row=document.querySelector('[data-list-item]');
-  if(!LINK_ON_LOAD){
-   check(!recordIsOpen(row) && !reads.length,'The loaded List starts with a closed and unread row');
-   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-   const link=document.createElement('a');
-   link.href=fragment;document.body.append(link);link.click();
-   await changed;
-  }
-  await new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
-  const panel=recordDetails(row).querySelector('.list-panel');
-  const dialogBody=panel.closest('.console-dialog-body');
-  const first=panel.querySelector('[data-question="Q1"] p:last-child');
-  const second=panel.querySelector('[data-question="Q2"] p:last-child');
-  const sample=target=>new Promise(resolve=>{
-   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
-   observer.observe(target);
-  });
-  const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
-  const showAnswer=async answer=>{
-   dialogBody.scrollBy({top:answer.getBoundingClientRect().top-dialogBody.getBoundingClientRect().top-16,
-    behavior:'instant'});
-   await paint();
-  };
-  const requireEvent=(event,message)=>{
-   let timer;
-   const deadline=new Promise((_,reject)=>{
-    timer=setTimeout(()=>reject(new Error(message+' '+JSON.stringify({count:reads.length,seenEntries}))),20000);
-   });
-   return Promise.race([event,deadline]).finally(()=>clearTimeout(timer));
-  };
-  check(!row.hidden && recordIsOpen(row),'The item link opens the row');
-  await paint();
-  await showAnswer(first);
-  check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
-  await requireEvent(firstAnswerSeen,'The List did not record the first visible answer within 20 seconds.');
-  check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
-   'The second answer starts below the viewport');
-  check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
-   'The first answer alone leaves both answers unread');
-  await showAnswer(second);
-  check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<dialogBody.getBoundingClientRect().top,
-   'The second answer enters the viewport after the first leaves it');
-  await requireEvent(postedRead,'The List did not send the signed read within 20 seconds.');
-  check(reads.length===1 && reads[0].get('action')==='read' &&
-   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
-   'The last answer to enter the viewport sends one signed read. '+JSON.stringify({count:reads.length,seenEntries}));
- }catch(error){failures.push(String(error));}
- await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();
-</script>"""
-        for link_on_load in (True, False):
-            with self.subTest(link_on_load=link_on_load):
-                enabled = str(link_on_load).lower()
-                self.browser_answer_visibility(markup, setup, probe.replace('LINK_ON_LOAD', enabled),
-                                               viewport_height=1120,
-                                               console_fragment="#" + fragment if link_on_load else "")
-
-    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_automatic_read_defers_a_foreign_body_and_tracks_the_shown_revision(self) -> None:
-        item, markup = self.render_unread_answer()
-        root = self.root / "reviews"
-        status = change_page.DeliveryStatus(root)
-        shown = re.search(r'data-detail-revision="([0-9a-f]+)"', markup)
-        credential = re.search(r'data-open-read-request="([^"]+)" data-open-read-token="([^"]+)"', markup)
-        assert shown is not None and credential is not None
-        request, token = credential.groups()
-        fields = {**self.fields(item, "read"), "request": request, "token": token,
-                  "shown_revision": shown[1]}
-        _ = the_list.mark_read(MORTY.id, item.id, source="morty")
-        updated = the_list.update(MORTY.id, item.id, {"latest_status": "A newer update from morty."}, source="morty")
-        previous = list_page.action_state(MORTY.id, updated, status=status, include_detail=True)
-        _, response = list_page.save_action(root, urlencode(fields), status, include_detail=True)
-        assert response is not None
-        self.assertEqual(response.get("before_read_revision"), previous.get("detail_revision"))
-        self.assertNotEqual(response.get("before_read_revision"), shown[1])
-        self.assertEqual(response["unread"], "true")
-        refresh = list_page.render(root, include_counts=False, status=status).decode()
-        refresh = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', refresh, count=1)
-        fixture = json.dumps({"reply": response, "page": refresh, "revision": shown[1]}).replace("</", "<\\/")
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer update from morty."}, source="morty")
+        refreshed = list_page.render(root, include_counts=False).decode()
         setup = r"""<script>
-const fixture=FIXTURE,reads=[];
-let startRefresh,finishRefresh;
-const refreshing=new Promise(resolve=>{startRefresh=resolve;});
-const heldRefresh=new Promise(resolve=>{finishRefresh=resolve;});
-window.fetch=async(url,options)=>{
+history.replaceState(null,'','#show=needs-me');
+const snapshot=SNAPSHOT,reads=[];
+window.fetch=async(_url,options)=>{
  if(options?.method==='POST'){
   reads.push(new URLSearchParams(options.body));
-  return new Response(JSON.stringify(fixture.reply));
+  return new Response(JSON.stringify({unread:'false'}));
  }
- if(!reads.length) return new Response('',{status:503});
- startRefresh();
- await heldRefresh;
- return new Response(fixture.page);
+ return new Response(snapshot);
 };
-</script>""".replace('FIXTURE', fixture)
+</script>""".replace('SNAPSHOT', json.dumps(refreshed).replace("<", r"\u003c"))
         probe = r"""<script>
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
@@ -5939,34 +5678,45 @@ window.fetch=async(url,options)=>{
   const row=()=>document.querySelector('[data-list-item]');
   const detail=()=>recordDetails(row());
   const original=row(),updates=document.querySelector('[data-show-record-updates]');
-  const foreign='A newer update from morty.';
   original.querySelector('.list-toggle').click();
-  detail().querySelector('[data-question="Q1"] p:last-child').scrollIntoView({block:'center'});
-  await refreshing;
-  check(reads.length===1 && reads[0].get('shown_revision')===fixture.revision,
-   'The automatic read sends the signed request and the shown revision.');
-  check(!updates.hidden && detail().querySelector('.question-unread') && !detail().textContent.includes(foreign),
-   'The foreign change waits behind Show updates.');
-  updates.click();
-  check(updates.hidden && detail().textContent.includes(foreign) &&
-   row().dataset.detailRevision===fixture.reply.detail_revision,
-   'Show updates installs the foreign body and its revision.');
+  const answer=detail().querySelector('[data-question="Q1"] p:last-child');
+  answer.scrollIntoView({block:'center',behavior:'instant'});
+  const shown=await new Promise(resolve=>{
+   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
+   observer.observe(answer);
+  });
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  check(shown.isIntersecting && reads.length===0,'Opening a visible answer sends no read.');
+  const needsMe=()=>document.getElementById('filter-show-needs-me');
+  const count=()=>document.querySelector('[data-list-count]').textContent;
+  const checkUnread=()=>{
+   check(!row().hidden && recordIsOpen(row()) && detail().querySelector('.question-unread') &&
+    detail().querySelector('[value="read"]')?.textContent==='Mark read','Needs me keeps the open unread answer.');
+   check(needsMe().dataset.filterCount==='1' && count().startsWith('1 of 1 items shown · 1 need you'),
+    'The Needs me count and status agree with the visible row.');
+  };
+  checkUnread();
   const replaced=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{
-    if(row()!==original){observer.disconnect();resolve();}
+    if(!original.isConnected){observer.disconnect();resolve();}
    });
    observer.observe(document.body,{childList:true,subtree:true});
   });
-  finishRefresh();
+  document.dispatchEvent(new Event('visibilitychange'));
   await replaced;
-  check(updates.hidden && detail().textContent.includes(foreign),
-   'The refresh with the same revision does not offer another update.');
+  checkUnread();
+  check(!updates.hidden && !detail().textContent.includes('A newer update from morty.'),
+   'The dialog keeps its text until Show updates.');
+  updates.click();
+  checkUnread();
+  check(updates.hidden && detail().textContent.includes('A newer update from morty.'),
+   'Show updates applies the new text and keeps the answer unread.');
+  check(reads.length===0,'Refresh and Show updates send no read.');
  }catch(error){failures.push(String(error));}
  await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.browser_answer_visibility(markup, setup, probe, viewport_height=1120,
-                                       console_fragment="#show=all")
+        self.browser_answer_visibility(markup, setup, probe, viewport_height=1120)
 
     def browser_answer_visibility(self, markup: str, setup: str, probe: str, *,
                                   viewport_height: int | None = None, reload_markup: str = "",
@@ -6149,48 +5899,61 @@ const change=async path=>{
   check(recordIsOpen(row()) && nextQuestion(row()) && firstAnswer(row()),
    'a direct link shows both the waiting question and the first answer in the log');
   const {loggedAt}=await change('/second-answer');
-  await open('all','','1');
-  const original=row(), doc=frame.contentDocument;
+  await open('needs-me');
+  const original=row(), doc=frame.contentDocument,win=frame.contentWindow;
   const panelQuestion=recordDetails(original).querySelector('[data-question="Q2"]');
   const askedAt=Date.parse(panelQuestion.querySelector('time').dateTime);
-  check(hasDot() && recordDetails(original).querySelector('[data-question="Q2"] .question-unread'),
-   'the second answer stays unread before the row opens');
+  let posts=0;
+  const fetchList=win.fetch.bind(win);
+  win.fetch=(url,options)=>{
+   if(options?.method==='POST') posts++;
+   return fetchList(url,options);
+  };
+  const checkNeedsMe=message=>{
+   const current=row(),currentDoc=frame.contentDocument;
+   const detail=recordDetails(current),button=detail.querySelector('[value="read"]');
+   check(!current.hidden && hasDot() && detail.querySelector('[data-question="Q2"] .question-unread') &&
+    recordIsOpen(current) && button?.getClientRects().length && !button.disabled &&
+    currentDoc.getElementById('filter-show-needs-me').dataset.filterCount==='1' &&
+    currentDoc.querySelector('[data-list-count]').textContent==='1 of 2 items shown · 1 need you · 2 unread',message);
+  };
+  original.querySelector('.list-toggle').click();
+  const answer=panelQuestion.querySelector('p:last-child');
+  answer.scrollIntoView({block:'center',behavior:'instant'});
+  await new Promise(resolve=>{
+   const observer=new win.IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry.isIntersecting);});
+   observer.observe(answer);
+  }).then(visible=>check(visible,'The answer appears in the viewport.'));
+  checkNeedsMe('Opening the item keeps it unread in Needs me and shows Mark read.');
   const refreshed=new Promise(resolve=>{
-   const observer=new frame.contentWindow.MutationObserver(()=>{
-    if(row()!==original && recordDetails(row()).querySelector('[data-log-index="Q2-answered"]')){
-     observer.disconnect();resolve();
-    }
+   const observer=new win.MutationObserver(()=>{
+    if(row()===original) return;
+    observer.disconnect();resolve();
    });
    observer.observe(doc.body,{childList:true,subtree:true});
   });
-  original.querySelector('.list-toggle').click();
+  doc.dispatchEvent(new win.Event('visibilitychange'));
   await refreshed;
-  check(!hasDot() && !row().hidden && recordIsOpen(row()),
-   'opening the row marks the answer read and keeps the row open in Unread');
-  check(doc.querySelector('[data-show-record-updates]').hidden,
-   'An ordinary automatic Mark read does not offer Show updates.');
+  check(posts===0,'Opening and refreshing the item sends no write.');
+  checkNeedsMe('Refresh keeps the item unread in Needs me and shows Mark read.');
+  doc.getElementById('filter-show-all').click();
+  doc.getElementById('filter-show-needs-me').click();
+  checkNeedsMe('Changing the Show filter keeps the unread item in Needs me.');
+  await open('needs-me',key);
+  checkNeedsMe('Reloading the open item keeps it unread in Needs me.');
+  await act('read');
+  check(row().hidden && !hasDot() &&
+   frame.contentDocument.getElementById('filter-show-needs-me').dataset.filterCount==='0' &&
+   frame.contentDocument.querySelector('[data-list-count]').textContent==='0 of 2 items shown · 0 need you · 1 unread',
+   'Mark read removes the item from Needs me and updates the counts.');
+  await open('working',key);
   check(recordDetails(row()).querySelector('[data-log-index="Q2-answered"]').textContent.includes('The next check passed.'),
-   'opening the row moves the answer to the log');
+   'Mark read moves the answer to the log.');
   const asked=recordDetails(row()).querySelector('[data-log-index="Q2-asked"]');
   const answered=recordDetails(row()).querySelector('[data-log-index="Q2-answered"]');
   check(asked?.textContent.includes('Which check is next?') && Date.parse(asked.querySelector('time').dateTime)===askedAt &&
    Date.parse(answered.querySelector('time').dateTime)===Date.parse(loggedAt) && !recordDetails(row()).querySelector('[data-question="Q2"]'),
    'The log shows the question and answer with their recorded times after the panel clears.');
-  const chip=(filter,value)=>doc.querySelector('[data-filter-row="'+filter+'"] [data-filter-value="'+value+'"]');
-  const count=(filter,value)=>Number(chip(filter,value).dataset.filterCount);
-  const shown=()=>doc.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])').length;
-  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','all')===2,
-   'The Owner, Producer, and Show All counts include the row kept open after the read.');
-  check(doc.querySelector('[data-list-count]').textContent.startsWith('2 of 2 items shown'),
-   'The total includes the row kept open after the read.');
-  check(count('show','working')===1,'The Working count excludes the read row when Show changes.');
-  chip('owner','staff:'+doc.querySelector('[data-number="2"]').dataset.owner).click();
-  const allOwners=count('owner','all');
-  chip('owner','all').click();
-  check(allOwners===2 && allOwners===shown(),'The Owner All count matches the rows after its click.');
-  row().querySelector('.list-toggle').click();
-  check(row().hidden && shown()===1 && count('owner','all')===1,
-   'Closing the read row removes it from Unread only and the Owner All count.');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();

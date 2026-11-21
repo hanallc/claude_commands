@@ -70,11 +70,9 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     chip = CHIP_BY_STATE[state]
-    if unread_answer:
-        return ListChip.NEEDS_ME
     if parked:
         return ListChip.PARKED
-    if unread_delivery:
+    if unread_delivery or unread_answer:
         return ListChip.NEEDS_ME
     return ListChip.MORTY_ANSWERING if open_question else chip
 
@@ -473,14 +471,9 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], secret: str) -> str:
+                 unread_answers: frozenset[str]) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
-    read = ''
-    keeper = names.members.by_id(entry.keeper)
-    if unread_answers and keeper is not None and keeper.kind == "producer" and keeper.name == "morty":
-        request, token = signed_item_request(entry, secret)
-        read = f' data-open-read-request="{request}" data-open-read-token="{token}"'
     item = entry.item
     status_time = item.latest_status_time
     status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
@@ -490,7 +483,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
         + field_html(field, value, today, names) + '</section>'
         for field, value in (("state", item.state), ("eta", item.eta), ("latest_status", item.latest_status),
                              ("next_step", item.next_step), ("done_when", item.done_when)))
-    return (f'<div class="list-panel"{read}><div><div class="list-item-fields">' + fields
+    return ('<div class="list-panel"><div><div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
             + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
             + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
@@ -575,7 +568,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
-    return detail_panel(entry, sections, today, names, unread_answers, secret)
+    return detail_panel(entry, sections, today, names, unread_answers)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
@@ -593,7 +586,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     questions = panel_questions(item, today, unread_answers, visibility.failed)
     form = feedback_form(entry, secret, parking_label=parking_label)
     return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, secret)
+        entry, sections + questions + form, today, names, unread_answers)
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
@@ -675,8 +668,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
 def detail_revision(item: the_list.ListItem, body: str) -> str:
     version = re.sub(r'<div data-list-review-links>.*?</div>', '', body, count=1, flags=re.DOTALL)
     # Keep the unread fingerprint in the detail revision.
-    version = re.sub(r'((?:name="request" value|data-open-read-request)=")[a-f0-9]{32}', r'\1', version)
-    version = re.sub(r'((?:name="token" value|data-open-read-token)=")[a-f0-9]{64}', r'\1', version)
+    version = re.sub(r'(name="request" value=")[a-f0-9]{32}', r'\1', version)
+    version = re.sub(r'(name="token" value=")[a-f0-9]{64}', r'\1', version)
     return hashlib.sha256(f'{item.updated}\0{item.title}\0{version}'.encode()).hexdigest()
 
 @dataclass(frozen=True)
@@ -731,7 +724,6 @@ class SavedActionState(TypedDict):
     park_request_saved: NotRequired[bool]
     detail_html: NotRequired[str]
     detail_revision: NotRequired[str]
-    before_read_revision: NotRequired[str]
     detail_closed: NotRequired[bool]
 
 
@@ -747,7 +739,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
 def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                  status: change_page.DeliveryStatus | None = None, park_request: str = "",
                  review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                 include_detail: bool = False, before_read: the_list.ListItem | None = None) -> SavedActionState:
+                 include_detail: bool = False) -> SavedActionState:
     zone = user_zone()
     today = the_list.now()
     local_today = today.astimezone(zone)
@@ -792,14 +784,6 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         if include_detail:
             revision = detail_revision(item, body)
             saved.update(detail_html=body, detail_revision=revision)
-            if before_read is item:
-                saved["before_read_revision"] = revision
-            elif before_read is not None:
-                # A read changes the unread state and the log. Keep the other detail inputs.
-                prior_body = details(ListRecord(owner, before_read), local_today, secret, LinkedReviewRead.AFTER_RENDER,
-                                     names, visibility, the_list.unread_answer_ids(before_read),
-                                     parking_label=parked_until)
-                saved["before_read_revision"] = detail_revision(before_read, prior_body)
     if include_detail and item.state == the_list.ItemState.CLOSED:
         saved["detail_closed"] = True
     return saved
@@ -823,11 +807,8 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
                 include_detail: bool = False) -> tuple[ListActionSubmission, SavedActionState | None]:
     """Accept signed item actions and save their notices for morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    shown = fields.pop("shown_revision", [])
     if (set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"}
-            or any(len(values) != 1 for values in fields.values())
-            or shown and (fields["action"] != ["read"] or len(shown) != 1
-                          or re.fullmatch(r"[0-9a-f]{64}", shown[0]) is None)):
+            or any(len(values) != 1 for values in fields.values())):
         raise question_record.AnswerRefused("use the form on this page")
     keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
     if re.fullmatch(r"L[1-9]\d*", identity) is None:
@@ -854,11 +835,7 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         return delivery, None
     try:
         item = read_edit.item if read_edit is not None else the_list.load(morty.id, identity)
-        before_read = None
-        if shown and read_edit is not None:
-            before_read = read_edit.before if isinstance(read_edit, the_list.SavedEdit) else read_edit.item
-        state = action_state(morty.id, item, status=status, review_records=review_records,
-                             include_detail=True, before_read=before_read)
+        state = action_state(morty.id, item, status=status, review_records=review_records, include_detail=True)
     except Exception as error:
         print(f"review-links List saved {identity}: {error}", file=sys.stderr)
         return delivery, None
@@ -1238,9 +1215,8 @@ const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + 
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
- if(data.unread==='true' && data.unreadAnswer==='true') return 'needs-me';
  const parked=isParked(data);
- if(!parked && data.unreadDelivery==='true') return 'needs-me';
+ if(!parked && (data.unreadDelivery==='true' || data.unread==='true' && data.unreadAnswer==='true')) return 'needs-me';
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
 let content=document.querySelector('[data-list]');
@@ -1344,49 +1320,12 @@ function syncUnread(item,form,unread,unreadSort){
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
 }
-const pendingOpenReads=new Map(),keepOpenAfterRead=new Set();
-/** @type {Map<string, {unseen: Set<Element>, seen: Set<string>}>} */
-const watchedAnswers=new Map();
-let unreadShow='',unreadFilterVersion=0;
-// The second threshold reports a positive intersection after contact at the viewport edge.
-const answerVisibility=new IntersectionObserver(entries=>{
- if(listIsHidden()) return;
- for(const entry of entries){
-  if(!entry.isIntersecting || !entry.intersectionRect.width || !entry.intersectionRect.height) continue;
-  const item=recordFromDetail(entry.target);
-  if(!item?.isConnected || item!==tableView.dialogItem || item.hidden) continue;
-  const watch=watchedAnswers.get(item.dataset.key);
-  if(!watch?.unseen.delete(entry.target)) continue;
-  watch.seen.add(entry.target.parentElement.dataset.question);
-  answerVisibility.unobserve(entry.target);
-  if(!watch.unseen.size) void markOpenedAnswerRead(item,watch);
- }
-},{threshold:[0,0.000001]});
-function listIsHidden(){
- return document.visibilityState!=='visible' || window.frameElement?.hidden===true;
-}
-function stopWatchingOpenedAnswer(key){
- for(const answer of watchedAnswers.get(key)?.unseen ?? []) answerVisibility.unobserve(answer);
- watchedAnswers.delete(key);
-}
-function watchOpenedAnswer(item,seen=new Set()){
- const key=item.dataset.key;
- if(!tableView.opened.has(key) || pendingOpenReads.has(key) || watchedAnswers.has(key)) return;
- const unseen=new Set([...recordDetails(item).querySelectorAll(
-  '.list-panel[data-open-read-request] .page-question:has(.question-unread) > p:last-child')]
-  .filter(answer=>!seen.has(answer.parentElement.dataset.question)));
- if(!unseen.size) return;
- watchedAnswers.set(key,{unseen,seen});
- if(!listIsHidden()) for(const answer of unseen) answerVisibility.observe(answer);
-}
 function installListDetail(item){
   const detail=recordDetails(item),form=detail.querySelector('[data-feedback-form]');
   if(form && !form.retainDraft) bindFeedbackForm(form);
   tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
   detail.closest('dialog').style.setProperty('--list-log-max-height',content.style.getPropertyValue('--list-log-max-height'));
   restoreLogPositions();
-  stopWatchingOpenedAnswer(item.dataset.key);
-  watchOpenedAnswer(item);
 }
 function renderListDetail(revision,text,{retainLinks=false}={}){
  return (row,detail)=>{
@@ -1406,60 +1345,6 @@ function presentListDetail(item,result){
  if(revision && typeof text==='string')
   tableView.presentItemRevision(item,revision,renderListDetail(revision,text,{retainLinks:true}));
 }
-function resumeOpenedAnswerReads(){
- if(listIsHidden()) return;
- for(const {unseen} of watchedAnswers.values()) for(const answer of unseen){
-  answerVisibility.unobserve(answer);
-  answerVisibility.observe(answer);
- }
-}
-async function markOpenedAnswerRead(item,watch){
- const key=item.dataset.key;
- if(watchedAnswers.get(key)!==watch || watch.unseen.size) return;
- if(item.hidden || !tableView.opened.has(key) || tableView.itemUpdateRequired() || listIsHidden()) return;
- const panel=recordDetails(item).querySelector('.list-panel');
- const request=panel?.dataset.openReadRequest;
- if(!request || pendingOpenReads.has(key)) return;
- stopWatchingOpenedAnswer(key);
- const token=panel.dataset.openReadToken;
- const filterVersion=unreadFilterVersion;
- const [keeper,id]=key.split('/');
- const shownRevision=tableView.shownItemRevision;
- const body=new URLSearchParams({keeper,id,request,token,action:'read',words:'',until:'',
-  shown_revision:shownRevision});
- const submission=tableView.startAction(item);
- const itemRequest=saving ? null : tableView.deliveryRequest() ?? tableView.startItemRequest(key);
- const pending={keepOpen:true};
- pendingOpenReads.set(key,pending);startListSave();
- let saved=false;
- try{
-  const response=await fetch(location.pathname,{method:'POST',body});
-  const result=await response.json();
-  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
-  saved=true;
-  if(result.unread==='false'){
-   delete panel.dataset.openReadRequest;
-   if(pending.keepOpen && unreadShow && filterVersion===unreadFilterVersion && tableView.opened.has(key))
-    keepOpenAfterRead.add(key);
-  }
-  if(tableView.currentItemRequest(itemRequest) && result.detail_revision && typeof result.detail_html==='string'){
-   if(['true','false'].includes(result.unread_answer)) item.dataset.unreadAnswer=result.unread_answer;
-   if(['true','false'].includes(result.unread_delivery)) item.dataset.unreadDelivery=result.unread_delivery;
-   if(['true','false'].includes(result.unread))
-    syncUnread(item,null,result.unread==='true',result.unread_sort);
-   if(result.before_read_revision===shownRevision)
-    installSavedListDetail(itemRequest,result.detail_revision,result.detail_html,{retainLinks:true});
-   else presentListDetail(item,result);
-   tableView.apply(false);
-  }
- }catch(error){
-  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
-   {kind:'failure',message:'Read not confirmed: '+error.message});
- }finally{
-  pendingOpenReads.delete(key);saving--;
-  refreshAfterListSave(saved);
- }
-}
 const tableView=createRecordTable({content:()=>content,
  shows,
  defaultShow:'all',
@@ -1474,16 +1359,7 @@ const tableView=createRecordTable({content:()=>content,
  filters:['producer','unread'],
  staffChipFilters:['owner','producer'],
  beforeApply:rememberLogPositions,
- applied:(_items,{show,filters})=>{
-  const nextUnreadShow=filters.unread ? show : '';
-  if(nextUnreadShow!==unreadShow){
-   unreadShow=nextUnreadShow;unreadFilterVersion++;keepOpenAfterRead.clear();
-  }
-  for(const key of watchedAnswers.keys()) if(!tableView.opened.has(key)) stopWatchingOpenedAnswer(key);
-  for(const key of keepOpenAfterRead) if(!tableView.opened.has(key)) keepOpenAfterRead.delete(key);
-  restoreLogPositions();
- },
- itemOpened:watchOpenedAnswer,
+ applied:restoreLogPositions,
  itemTitle:item=>'#'+item.dataset.number+' '+item.querySelector('[data-label="Item"] strong').textContent,
  keepItemOnMissingLink:true,
  rememberItem:item=>{
@@ -1493,8 +1369,6 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
-  keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
@@ -1736,12 +1610,8 @@ function bindFeedbackForm(form){
    }
    if(parks) item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
    if(clearsUnread) item.dataset.unread='false';
-   const releasesHolds=action==='read' || parks || action==='remove';
-   const restoreLink=releasesHolds ? tableView.releaseLink(key) : undefined;
-   const readFilterVersion=unreadFilterVersion;
-   const hadReadHold=releasesHolds && keepOpenAfterRead.delete(key);
-   const pendingRead=releasesHolds ? pendingOpenReads.get(key) : undefined;
-   if(pendingRead) pendingRead.keepOpen=false;
+   const releasesLink=action==='read' || parks || action==='remove';
+   const restoreLink=releasesLink ? tableView.releaseLink(key) : undefined;
    const submission=tableView.startAction(item);
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
@@ -1806,7 +1676,7 @@ function bindFeedbackForm(form){
      return;
     }
     const wasHidden=item.hidden;
-    let restore=refused || releasesHolds,confirmedByReadback=false;
+    let restore=refused || releasesLink,confirmedByReadback=false;
     if(refused) syncConfirmed();
     else if(parks || action==='remove'){
      restore=false;
@@ -1831,13 +1701,7 @@ function bindFeedbackForm(form){
       // Keep the pending row state until a refresh can read the record.
      }
     }else if(clearsUnread) item.dataset.unread=unreadBefore;
-    if(restore){
-     restoreLink?.();
-     if(readFilterVersion===unreadFilterVersion){
-      if(hadReadHold) keepOpenAfterRead.add(key);
-      if(pendingRead) pendingRead.keepOpen=true;
-     }
-    }
+    if(restore) restoreLink?.();
     if(!confirmedByReadback){
      if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
      const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
@@ -1973,8 +1837,6 @@ async function refresh(_supersede=false,current=()=>true){
  rememberLogPositions();
  const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
  for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
- const priorWatches=new Map(watchedAnswers);
- for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter) nextFooter.replaceChildren(...footer.childNodes);
  restoreEvidenceDetails(fresh);
@@ -1987,10 +1849,6 @@ async function refresh(_supersede=false,current=()=>true){
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
  if(links && tableView.dialogItem===nextItem) presentReviewLinks(nextItem,links);
- if(priorWatches.size) for(const item of content.querySelectorAll('[data-list-item]')){
-  const watch=priorWatches.get(item.dataset.key);
-  if(watch) watchOpenedAnswer(item,watch.seen);
- }
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
    field.setSelectionRange(start,end,direction);}
@@ -2007,7 +1865,6 @@ async function refresh(_supersede=false,current=()=>true){
   createdItem='';
   tableView.followItemLink({inheritFilters:true});
  }
- watchOpenItemAnswer();
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false'){
   if(listCounts) await listCounts;
   if(current()) tableView.finishDeliveryWindow(delivery);
@@ -2130,10 +1987,7 @@ document.addEventListener('click',event=>{
 tableView.place();
 tableView.bind();bindListControls();tableView.apply(true);
 addEventListener('popstate',tableView.restorePlace);
-addEventListener('hashchange',event=>{
- tableView.restorePlace(event);
- watchOpenItemAnswer();
-});
+addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 document.addEventListener('review-item-created',event=>{
  if(typeof event.detail?.list_key!=='string') return;
@@ -2141,14 +1995,5 @@ document.addEventListener('review-item-created',event=>{
  listSaveVersion++;
  refreshAfterListSave(false);
 });
-document.addEventListener('visibilitychange',resumeOpenedAnswerReads);
-window.addEventListener('message',event=>{
- if(event.source===parent && event.origin===location.origin && event.data==='console-shown') resumeOpenedAnswerReads();
-});
-function watchOpenItemAnswer(){
- const item=tableView.dialogItem;
- if(item && content.contains(item) && !item.hidden) watchOpenedAnswer(item);
-}
-watchOpenItemAnswer();
 void loadListCounts();
 })();''')
