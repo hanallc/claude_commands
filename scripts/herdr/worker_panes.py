@@ -20,6 +20,7 @@ import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from functools import cache, partial
@@ -330,6 +331,27 @@ class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
+
+
+@dataclass(frozen=True)
+class CheckedRolePolicy:
+    """The launch policy that passed the check for this worker role."""
+
+    role: WorkerRole
+    launch: LaunchPolicy
+
+
+_checked_resume_policies: ContextVar[Mapping[StaffId, CheckedRolePolicy]] = ContextVar("checked_resume_policies")
+
+
+@contextmanager
+def use_checked_resume_policies(policies: Mapping[StaffId, CheckedRolePolicy]) -> Generator[None]:
+    """Keep the checked launch policy for each native conversation."""
+    token = _checked_resume_policies.set(policies)
+    try:
+        yield
+    finally:
+        _checked_resume_policies.reset(token)
 
 
 @dataclass(frozen=True)
@@ -1020,6 +1042,19 @@ def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned
     return _launch_policy(settings, sandbox)
 
 
+def checked_role_policy(role: WorkerRole | WorkerRoleUnavailable,
+                        family: Literal["claude", "codex", "assigned"] = "assigned") -> CheckedRolePolicy | StartRefused:
+    """Read the role policy or give the reason it cannot start a worker."""
+    if isinstance(role, WorkerRoleUnavailable):
+        return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
+    if role not in staff.WORKER_ROLES:
+        return StartRefused(StartRefusal.UNKNOWN_ROLE, str(role))
+    try:
+        return CheckedRolePolicy(role, launch_policy(role, family))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, f"{role}: {error}")
+
+
 def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
     """Use the supplied review settings with fixed read-only Codex access."""
     settings = models_registry.LaunchSettings("codex", model, effort, "")
@@ -1275,10 +1310,12 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     keep_model = isinstance(policy, UseRolePolicy)
-    try:
-        policy = launch_policy(role) if isinstance(policy, UseRolePolicy) else policy
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
+    if isinstance(policy, UseRolePolicy):
+        saved = _checked_resume_policies.get({}).get(existing.current_session) if existing is not None else None
+        checked = saved if saved is not None and saved.role == role else checked_role_policy(role)
+        if isinstance(checked, StartRefused):
+            return checked
+        policy = checked.launch
     try:
         with ExitStack() as operations:
             held = operations.enter_context(worker_lock(parent, name, blocking=existing is None)) if isinstance(lock, WorkerLockAtUse) else lock
