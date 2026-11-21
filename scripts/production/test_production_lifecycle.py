@@ -40,6 +40,7 @@ from scripts.production.production_names import (
     BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
     MERGE_CHECKOUT_FIELD, MOVE_RECORD,
 )
+from scripts.usage import agents_log
 from scripts.worktree import worktrees
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
@@ -80,9 +81,9 @@ class LifecycleTests(LifecycleFixture):
     @override
     def setUpClass(cls) -> None:
         directory = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
-        _ = cls.enterClassContext(mock.patch.dict(os.environ, {
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, {
             **fixture_git_environment(directory), "GIT_CONFIG_SYSTEM": os.devnull,
-        }, clear=True))
+        }, clear=True)))
         super().setUpClass()
 
     def test_move_and_reverse_keep_the_original_cargo_liner_log_in_main(self) -> None:
@@ -694,7 +695,7 @@ class LifecycleTests(LifecycleFixture):
                     self.assertEqual(self.git("ls-files", "--stage"), main[2])
                     self.assertEqual(self.git("show", "--format=", "--name-only", "HEAD", cwd=integration),
                                      "docs/plans/alpha.md")
-                    with mock.patch.object(update_registration.agents_log, "append"):
+                    with mock.patch.object(agents_log, "append"):
                         registered = invoke_cli(update_registration, update_registration.main,
                             ["register", "--production", "example"], self.env, integration, production_state=True)
                     self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
@@ -1268,11 +1269,11 @@ class LifecycleTests(LifecycleFixture):
                         mirror = self.root / "mac-backup.git"
                         document_bytes, log_bytes = live.read_bytes(), self.log.read_bytes()
 
-                        def destination(_identity: str) -> log_backup.BackupMirror:
+                        def backup_mirror(_identity: str) -> log_backup.BackupMirror:
                             return log_backup.BackupMirror(str(mirror), lambda _repack: "fixture")
 
                         with mock.patch.dict(os.environ, self.env):
-                            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), destination, 10), 1)
+                            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), backup_mirror, 10), 1)
                         tip = log_backup.git(repository, "rev-parse", "HEAD")
                         self.assertFalse(mirror.exists())
                         edit = b"\r\nAdded during CI.\r\n"
@@ -1302,7 +1303,7 @@ class LifecycleTests(LifecycleFixture):
                         self.assertFalse((state / runner.id).exists())
                         _ = self.git("init", "--bare", "--initial-branch=main", str(mirror), cwd=self.root)
                         with mock.patch.dict(os.environ, self.env):
-                            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), destination, 10), 0)
+                            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), backup_mirror, 10), 0)
                         self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), tip)
                         restored = self.root / "restored-backup"
                         _ = self.git("clone", "--quiet", str(mirror), str(restored), cwd=self.root)

@@ -121,9 +121,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUpClass(cls) -> None:
         directory = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
-        _ = cls.enterClassContext(patch.dict(os.environ, {
+        _ = cast(object, cls.enterClassContext(patch.dict(os.environ, {
             **fixture_git_environment(directory), "GIT_CONFIG_SYSTEM": os.devnull,
-        }, clear=True))
+        }, clear=True)))
         super().setUpClass()
 
     @override

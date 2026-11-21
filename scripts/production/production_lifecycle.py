@@ -82,6 +82,9 @@ class VerdictMissing(NamedTuple):
     pass
 
 
+VERDICT_MISSING = VerdictMissing()
+
+
 class CommitVerdict(NamedTuple):
     sha: str
 
@@ -760,7 +763,7 @@ def ci_steps(production: Production, tip: str, no_ci: bool,
 def promote_main(production: Production, lines: list[str], no_ci: bool,
                  ci_green: CommitVerdict | VerdictMissing,
                  smoke_passed: CommitVerdict | VerdictMissing,
-                 checked_tip: CommitVerdict | VerdictMissing = VerdictMissing()) -> str:
+                 checked_tip: CommitVerdict | VerdictMissing = VERDICT_MISSING) -> str:
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("promote", "held", "merge branch does not exist")
