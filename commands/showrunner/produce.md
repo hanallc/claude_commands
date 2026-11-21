@@ -812,11 +812,13 @@ Merge unit directors dispatch smoke checks, pushes, and promotion through worker
 Promote the exact sha pushed by <CIPoint/> after these checks:
 
 1. The CIPoint's local validation passed.
-2. Right after validation, with `CHECKOUT` still at that sha, run in the
-   background with `dangerouslyDisableSandbox: true`:
+2. After validation, run the smoke check in a copy of the exact sha. Run it in
+   the background with `dangerouslyDisableSandbox: true`.
 
    ```sh
-   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+     --repo CHECKOUT --commit <sha> -- \
+     bash ~/.claude/scripts/production/smoke_launch.sh '{tree}' <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,
