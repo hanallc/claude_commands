@@ -803,10 +803,15 @@ def scans_changed_paths(scans: RecordedFolderScans, changed: set[str], parents: 
     return False
 
 
-def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
+@dataclass(frozen=True)
+class NoFactCache:
+    """Read source facts without a persistent cache."""
+
+
+def retain_facts(cache_path: Path | NoFactCache, cached: dict[str, SourceFacts],
                  before: set[str], blobs: set[str]) -> None:
     current = {blob: facts for blob, facts in cached.items() if blob in blobs}
-    if cache_path is not None and current.keys() != before:
+    if isinstance(cache_path, Path) and current.keys() != before:
         write_fact_cache(cache_path, current)
 
 
@@ -818,8 +823,8 @@ def dependency_graph(repo: Path, *, state_dir: Path | None = None
                      ) -> tuple[dict[str, set[str]], dict[str, frozenset[str]]]:
     dirty = dirty_paths(repo)
     paths, blobs = worktree_files(repo, dirty)
-    cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
-    cached = read_fact_cache(cache_path) if cache_path is not None else {}
+    cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else NoFactCache()
+    cached = read_fact_cache(cache_path) if isinstance(cache_path, Path) else {}
     before = set(cached)
     result = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
     retain_facts(cache_path, cached, before, source_blobs(paths | dirty, blobs))
@@ -946,12 +951,73 @@ def script_callers(repo: Path, candidates: set[str], changed: set[str]) -> set[s
     return found
 
 
+def map_changed_modules(repo: Path, previous_revision: str, modules: Sequence[Path],
+                        changed: set[str], dirty: set[str], *, settings: conf.ConfigRead,
+                        state_dir: Path | NoFactCache) -> tuple[Path, ...]:
+    """Map paths in the candidate tree. Read deleted paths from the previous revision."""
+    declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
+    paths, blobs = worktree_files(repo, dirty)
+    cache_path = state_dir / "affected-module-facts.json" if isinstance(state_dir, Path) else state_dir
+    cached = read_fact_cache(cache_path) if isinstance(cache_path, Path) else {}
+    before = set(cached)
+    graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
+    config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
+    configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
+    recorded = latest_module_reads() if changed else {}
+    has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
+    has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+    content_changes = {path for path in changed if not path.startswith("config/")}
+    base_blobs = revision_files(repo, previous_revision) if has_folder_records else {}
+    scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
+    retained = source_blobs(paths | dirty, blobs)
+    python = {path for path in changed if path.endswith(".py")}
+    removed = {path for path in python if not (repo / path).is_file()}
+    old_graph: dict[str, set[str]] = {}
+    if removed:
+        old_blobs = base_blobs if has_folder_records else revision_files(repo, previous_revision)
+        old_paths = {path for path in old_blobs if path.endswith(".py")}
+        old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
+        retained.update(source_blobs(old_paths, old_blobs))
+    retain_facts(cache_path, cached, before, retained)
+    folder_stems: dict[str, set[str]] = defaultdict(set)
+    for source in python:
+        if not is_test_module(source):
+            folder_stems[str(Path(source).parent)].add(Path(source).stem)
+    named = changed | script_callers(repo, set(blobs) | dirty, changed)
+    folder_names = folder_names_of(named)
+    selected: list[Path] = []
+    for module in modules:
+        path = module.relative_to(repo).as_posix()
+        reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
+        sources = fixture_sources(graph.imports, path)
+        static_configs = {name for source in sources for name in graph.config_reads.get(source, frozenset())}
+        config_reads = reads.config_reads
+        config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
+            or bool(config_reads.stems & configs) or bool(static_configs & configs) or "*" in static_configs
+            or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & config_paths))
+        folder_changed = path not in declarations and has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
+            or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
+        content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
+            or bool(reads.content_reads.paths & content_changes))
+        if (path in changed or graph.imports.get(path, set()) & python
+                or old_graph.get(path, set()) & removed or names_changed_file(graph, sources, named, folder_names)
+                or scans_repository_changes(graph, sources, changed, path, declarations)
+                or config_changed or folder_changed or content_changed):
+            selected.append(module)
+            continue
+        stems = folder_stems.get(str(Path(path).parent), set())
+        if stems:
+            text = module.read_text(encoding="utf-8")
+            if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
+                selected.append(module)
+    return tuple(selected)
+
+
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
     try:
         settings = conf.read("merge_gate")
-        declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
         candidates = {base.commit: base} if isinstance(base, CertifiedBase) else {}
         for branch in settings.words("landing_branches"):
             ancestor = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD",
@@ -971,60 +1037,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             differences.append((candidate, set(changes.split("\0")) - {""}))
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
-        paths, blobs = worktree_files(repo, dirty)
-        cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
-        cached = read_fact_cache(cache_path) if cache_path is not None else {}
-        before = set(cached)
-        graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-        config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
-        configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
-        recorded = latest_module_reads() if changed else {}
-        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
-        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
-        content_changes = {path for path in changed if not path.startswith("config/")}
-        base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
-        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
-        retained = source_blobs(paths | dirty, blobs)
-        python = {path for path in changed if path.endswith(".py")}
-        removed = {path for path in python if not (repo / path).is_file()}
-        old_graph: dict[str, set[str]] = {}
-        if removed:
-            old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
-            old_paths = {path for path in old_blobs if path.endswith(".py")}
-            old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
-            retained.update(source_blobs(old_paths, old_blobs))
-        retain_facts(cache_path, cached, before, retained)
-        folder_stems: dict[str, set[str]] = defaultdict(set)
-        for source in python:
-            if not is_test_module(source):
-                folder_stems[str(Path(source).parent)].add(Path(source).stem)
-        named = changed | script_callers(repo, set(blobs) | dirty, changed)
-        folder_names = folder_names_of(named)
-        selected: list[Path] = []
-        for module in modules:
-            path = module.relative_to(repo).as_posix()
-            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
-            sources = fixture_sources(graph.imports, path)
-            static_configs = {name for source in sources for name in graph.config_reads.get(source, frozenset())}
-            config_reads = reads.config_reads
-            config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
-                or bool(config_reads.stems & configs) or bool(static_configs & configs) or "*" in static_configs
-                or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & config_paths))
-            folder_changed = path not in declarations and has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
-                or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
-            content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
-                or bool(reads.content_reads.paths & content_changes))
-            if (path in changed or graph.imports.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or names_changed_file(graph, sources, named, folder_names)
-                    or scans_repository_changes(graph, sources, changed, path, declarations)
-                    or config_changed or folder_changed or content_changed):
-                selected.append(module)
-                continue
-            stems = folder_stems.get(str(Path(path).parent), set())
-            if stems:
-                text = module.read_text(encoding="utf-8")
-                if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
-                    selected.append(module)
-        return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
+        selected = map_changed_modules(repo, base.commit, modules, changed, dirty, settings=settings,
+                                       state_dir=state_dir if state_dir is not None else NoFactCache())
+        return AffectedSelection(base, tuple(sorted(changed)), selected)
     except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
         return FullSuite(f"graph error: {error}")

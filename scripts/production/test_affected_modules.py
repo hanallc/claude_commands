@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import affected_modules as affected
+from scripts.production import merge_gate
 from scripts.test_times.gate_record_test_support import gate_run
 
 
@@ -80,6 +81,62 @@ class AffectedModulesTests(unittest.TestCase):
 
     def cache_dir(self) -> Path:
         return self.repo / ".git" / "gate-state"
+
+    def test_batch_map_uses_only_row_paths_and_reads_removed_imports_from_the_start_tip(self) -> None:
+        common = "import scripts.lib.common\n"
+        for module in self.modules:
+            self.write(module.relative_to(self.repo).as_posix(), common)
+        self.write("scripts/lib/common.py", "VALUE = 1\n")
+        self.write("scripts/production/staff.py", "VALUE = 1\n")
+        self.write("scripts/legacy/retired.py", "VALUE = 1\n")
+        self.write("commands/help.md", "before\n")
+        self.write("docs/inventory.md", "before\n")
+        self.write("README.md", "before\n")
+        self.add_test("production/test_staff_accessors.py", common)
+        self.add_test("checks/test_staff_reader.py", common + "import scripts.production.staff\n")
+        self.add_test("checks/test_doc.py", common + 'DOCUMENT = "README.md"\n')
+        self.add_test("checks/test_removed_import.py", common + "import scripts.legacy.retired\n")
+        start_tip = self.commit()
+        self.write("scripts/lib/common.py", "VALUE = 2\n")
+        self.write("scripts/production/staff.py", "VALUE = 2\n")
+        self.write("commands/help.md", "after\n")
+        self.write("docs/inventory.md", "after\n")
+        self.write("README.md", "after\n")
+        self.write("assets/unrelated.txt", "after\n")
+        (self.repo / "scripts/legacy/retired.py").unlink()
+        self.write("scripts/checks/test_removed_import.py", common)
+        candidate = self.commit()
+        _ = self.git("update-ref", "refs/remotes/origin/main", candidate)
+
+        declarations = " ".join(f"production/test_staff_accessors.py:{root}"
+                                for root in ("scripts", "commands", "docs"))
+        self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main\n"
+                   + f"# text:\nscan_roots={declarations}\n")
+        inventory = "production/test_staff_accessors.py"
+        cases = (
+            ("scripts/production/staff.py", merge_gate.MappedBatchModules(("checks/test_staff_reader.py", inventory))),
+            ("README.md", merge_gate.MappedBatchModules(("checks/test_doc.py",))),
+            ("commands/help.md", merge_gate.MappedBatchModules((inventory,))),
+            ("docs/inventory.md", merge_gate.MappedBatchModules((inventory,))),
+            ("assets/unrelated.txt", merge_gate.MappedBatchModules(())),
+            ("scripts/lib/common.py", merge_gate.FullInventory(len(self.modules))),
+            ("scripts/legacy/retired.py", merge_gate.MappedBatchModules(("checks/test_removed_import.py", inventory))),
+        )
+        state = self.cache_dir()
+        passes = state / "passes"
+        with mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(state), "MERGE_GATE_PASSED_DIR": str(passes)}):
+            for path, expected in cases:
+                with self.subTest(path=path):
+                    self.assertEqual(merge_gate.map_batch_modules(self.repo, start_tip, [path]), expected)
+            self.assertEqual(merge_gate.map_batch_modules(self.repo, start_tip, []),
+                             merge_gate.MappedBatchModules(()))
+            self.assertFalse(passes.exists())
+
+            self.write(".git/test-config/merge_gate.conf", "# text:\nscan_roots=invalid\n")
+            unavailable = merge_gate.map_batch_modules(self.repo, start_tip, ["README.md"])
+            assert isinstance(unavailable, merge_gate.BatchMapUnavailable), unavailable
+            self.assertIn("invalid scan_roots entry", unavailable.reason)
+            self.assertEqual(unavailable.reason.splitlines(), [unavailable.reason])
 
     def test_config_selection_uses_the_newest_full_record_and_direct_names(self) -> None:
         self.write("config/limits.conf", "value=one\n")

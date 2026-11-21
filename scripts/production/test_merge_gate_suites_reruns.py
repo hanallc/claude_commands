@@ -105,6 +105,58 @@ class MergeGateRerunsTests(GateSuitesFixture):
                     self.assertEqual(len(warnings), 1, result.stdout)
                     self.assertIn(warnings_by_case[label], warnings[0])
 
+    @gate_suites("hooks", "lib")
+    def test_filter_runs_named_modules_under_admission_without_certifying_the_tree(self) -> None:
+        name = "hooks/test_first.py"
+        self.set_module_time_history({name: (5.0,)})
+        jobs: list[merge_gate.RunningGateJob] = []
+        start = merge_gate.start_gate_job
+
+        def capture_started(suite: str, path: Path, argv: list[str], repo: Path, environment: dict[str, str],
+                            log: Path) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log)
+            jobs.append(job)
+            return job
+
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment), redirect_stdout(output),
+              mock.patch.object(merge_gate, "start_gate_job", side_effect=capture_started),
+              mock.patch.object(merge_gate, "record_gate_run", wraps=merge_gate.record_gate_run) as record):
+            ledger = merge_gate.PassedTreeLedger(self.checkout, "checkpoint",
+                                                 merge_gate.clean_test_tree(self.checkout), ["hooks"])
+            marker, notice = self.write_nightly_red_marker()
+            required = merge_gate.full_required()
+            assert not isinstance(required, merge_gate.NoFullRunRequired)
+            ledger.record_pass(required)
+            before = ledger.path.read_bytes()
+            tokens = self.jobserver_tokens()
+
+            for marker_present in (True, False):
+                with self.subTest(marker_present=marker_present):
+                    self.clear_gate_events()
+                    jobs.clear()
+                    if not marker_present:
+                        marker.unlink()
+                    run = merge_gate.run_filter_modules(self.checkout, (name,))
+                    self.assertTrue(run.passed, output.getvalue())
+                    self.assertFalse(run.tests_reused)
+                    self.assertFalse(run.selection_certified)
+                    starts = [(row["suite"], row["module"]) for row in self.module_events()
+                              if row["event"] == "start"]
+                    self.assertEqual(starts, [("hooks", "test_first.py")])
+                    job, = jobs
+                    self.assertEqual(job.time_limit, merge_gate.MeasuredModuleTimeLimit(4.0, 5.0))
+                    self.assertIsInstance(job.cpu_slot, merge_gate.SharedCPUSlot)
+                    self.assertEqual(self.jobserver_tokens(), tokens)
+                    self.assertEqual(ledger.path.read_bytes(), before)
+                    if marker_present:
+                        self.assertEqual(marker.read_text(), notice)
+                    else:
+                        self.assertFalse(marker.exists())
+                    self.assert_gate_released()
+            self.assertEqual(len(self.gate_history()), 2)
+            record.assert_not_called()
+
     def test_named_module_stops_at_the_fixture_floor(self) -> None:
         self.set_module_time_history({"hooks/test_first.py": (0.5,)})
         self.write(self.checkout / "scripts/hooks/test_first.py", """import os

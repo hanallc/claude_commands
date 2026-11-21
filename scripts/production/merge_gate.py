@@ -267,7 +267,7 @@ class SelectedModules:
 
 @dataclass(frozen=True)
 class NamedModules(SelectedModules):
-    """Run modules selected by the --module arguments."""
+    """Run an explicit list without certifying the tree."""
 
 
 @dataclass(frozen=True)
@@ -1435,6 +1435,44 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
 
+@dataclass(frozen=True)
+class MappedBatchModules:
+    """Gate names selected from the paths of the batch rows."""
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BatchMapUnavailable:
+    """The filter cannot use the dependency map."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class FullInventory:
+    """The map selected every gate module."""
+    count: int
+
+
+def map_batch_modules(repo: Path, start_tip: str,
+                      paths: Sequence[str]) -> MappedBatchModules | BatchMapUnavailable | FullInventory:
+    """Map row paths in the candidate checkout without a certified base."""
+    if not paths:
+        return MappedBatchModules(())
+    try:
+        modules = discover_test_modules(repo)
+        if not modules:
+            return BatchMapUnavailable("the test list is empty")
+        selected = set(affected_modules.map_changed_modules(
+            repo, start_tip, [path for _, path in modules], set(paths), set(),
+            settings=conf.read("merge_gate"), state_dir=gate_state_dir()))
+    except (affected_modules.GraphError, GateRefused, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
+        return BatchMapUnavailable("graph error: " + " ".join(str(error).split()))
+    if len(selected) == len(modules):
+        return FullInventory(len(modules))
+    return MappedBatchModules(tuple(sorted(f"{suite}/{test_module_name(repo, suite, path)}"
+                                            for suite, path in modules if path in selected)))
+
+
 def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | UnrecordableTestTree,
                             modules: Sequence[tuple[str, Path]], *,
                             source: Literal["tests-only", "checkpoint"] = "tests-only"
@@ -1581,7 +1619,7 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
     reused = False
     selection: AffectedSelection | FullSuite = FullSuite("whole machine")
-    if shared:
+    if shared and not isinstance(selected, NamedModules):
         try:
             tested_tree = clean_test_tree(repo)
         except (GateRefused, OSError) as error:
@@ -1607,6 +1645,7 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
             if isinstance(selection, AffectedSelection):
                 selected_paths = set(selection.modules)
                 modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -1655,6 +1694,8 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
     maximum_load = starting_load
     python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
+    if shared and isinstance(selected, NamedModules):
+        reason = ""
     elapsed = 0.0
     time_limit_report = ""
 
@@ -1925,8 +1966,9 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
     hold_seconds = hold.seconds if hold is not None else 0.0
     peak_mib = admission.peak_mib if admission is not None else 0.0
     elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
-    run = GateRun(tuple(results), elapsed, peak_mib, reused,
-                  isinstance(selection, AffectedSelection) or isinstance(selected, SelectedModules), tuple(executions), time_limit_report)
+    certified = (isinstance(selection, AffectedSelection)
+                 or isinstance(selected, SelectedModules) and not isinstance(selected, NamedModules))
+    run = GateRun(tuple(results), elapsed, peak_mib, reused, certified, tuple(executions), time_limit_report)
     record(0 if run.passed else 1, aborted=False)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
@@ -3038,11 +3080,22 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
 
 
 def run_named_modules(repo: Path, names: Sequence[str],
-                      module_time_policy: SuiteModuleTimePolicy, mode: SuiteMode) -> GateRun:
+                      module_time_policy: SuiteModuleTimePolicy, mode: SuiteMode, *,
+                      machine: SharedMachine | WholeMachine) -> GateRun:
     """Run the named modules with individual limits and no whole-run deadline."""
-    return run_suites_with_policy(repo, (), module_time_policy, machine=WholeMachine(), mode=mode,
+    return run_suites_with_policy(repo, (), module_time_policy, machine=machine, mode=mode,
                                   selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                                   time_limit=gate_record.NoGateTimeLimit("named modules"))
+
+
+def run_filter_modules(repo: Path, names: Sequence[str]) -> GateRun:
+    """Run named modules with shared admission and without a gate pass."""
+    if not names:
+        raise GateRefused("the filter test list is empty")
+    repo = repo.resolve()
+    with scratch.copy_lock(repo), gate_recovery(repo):
+        return run_named_modules(repo, names, HISTORY_SUITE_MODULE_TIME_LIMITS, SuiteMode.MERGE_GATE,
+                                 machine=SHARED_MACHINE)
 
 
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
@@ -3051,7 +3104,8 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = (run_named_modules(repo, args.modules, module_time_policy, mode) if args.modules else
+                run = (run_named_modules(repo, args.modules, module_time_policy, mode,
+                                         machine=WholeMachine()) if args.modules else
                        run_gate_suites(repo, module_time_policy, full=args.full, mode=mode, gate_job=args.gate_job))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
