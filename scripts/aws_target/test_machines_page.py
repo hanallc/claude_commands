@@ -113,6 +113,7 @@ def fixture_two_jobs() -> machines_data.MachinesPageData:
 
 
 class _PageServer(ThreadingHTTPServer):
+    bound_address: str = '127.0.0.1'
     new_item_token: str = 'fixture-token'
 
 
@@ -521,14 +522,15 @@ void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : summary));
             return subprocess.CompletedProcess(command, 0)
 
         profile = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
-        with (_PageServer(('127.0.0.1', 0), Handler) as server,
+        with (_PageServer((_PageServer.bound_address, 0), Handler) as server,
               patch.object(console_tune, 'run', side_effect=tune)):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 result = subprocess.run(('firefox', '--headless', '--no-remote',
                     '--profile', str(profile), '--window-size', '1300,900',
-                    '--screenshot', str(self.root / 'browser.png'), f'http://127.0.0.1:{server.server_port}/'),
+                    '--screenshot', str(self.root / 'browser.png'),
+                    f'http://{server.bound_address}:{server.server_port}/'),
                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             finally:
                 server.shutdown()
