@@ -3272,6 +3272,34 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
 
 
 
+def _move_target_sign_in_refusal(destination: NamedAccount) -> MoveRefused:
+    return MoveRefused(f"accounts: {destination.label} has no sign-in on this machine; sign in first. "
+                       + f"Run {_claude_login_command(destination.dir)}, then /login")
+
+
+def _check_move_target_directory(destination: NamedAccount) -> NamedAccount | MoveRefused:
+    """Require a real directory and regular files for local sign-in."""
+    unavailable = MoveRefused(f"accounts: {destination.label} has no usable account directory")
+    try:
+        if not stat.S_ISDIR(destination.dir.lstat().st_mode):
+            return unavailable
+    except OSError:
+        return unavailable
+    config = agent_accounts.claude_config_file(destination.dir)
+    credentials = destination.dir / ".credentials.json"
+    for path in (config, credentials):
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):
+                continue
+        except FileNotFoundError:
+            if path == credentials:
+                continue  # The credential reader can use the keychain.
+        except OSError:
+            pass
+        return _move_target_sign_in_refusal(destination)
+    return destination
+
+
 def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefused:
     target = note_file.canonical_label(target)
     try:
@@ -3281,11 +3309,9 @@ def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefu
         if isinstance(prepared, AccountRefused):
             return MoveRefused(prepared.reason.partition("\n")[0])
         destination = NamedAccount(target, claude_account_dir(target))
-        if destination.dir.is_symlink() or not destination.dir.is_dir():
-            return MoveRefused(f"accounts: {target} has no usable account directory")
     except AccountsError as error:
         return MoveRefused(str(error).partition("\n")[0])
-    return destination
+    return _check_move_target_directory(destination)
 
 
 @dataclass(frozen=True)
@@ -3300,13 +3326,65 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MoveTargetTokensMissing:
+    """The destination credential store has no usable sign-in token."""
+
+
+def _move_target_login_end(directory: Path) -> agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown | MoveTargetTokensMissing:
+    credentials = cast(object, agent_accounts.claude_credentials(directory))
+    if not isinstance(credentials, dict):
+        return MoveTargetTokensMissing()
+    oauth = cast(dict[str, object], credentials).get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return MoveTargetTokensMissing()
+    fields = cast(dict[str, object], oauth)
+    refresh = fields.get("refreshToken")
+    access = fields.get("accessToken")
+    if isinstance(refresh, str) and refresh:
+        expires = fields.get("refreshTokenExpiresAt")
+    elif isinstance(access, str) and access:
+        expires = fields.get("expiresAt")
+    else:
+        return MoveTargetTokensMissing()
+    if not isinstance(expires, int) or isinstance(expires, bool):
+        return agent_accounts.LoginEndUnknown()
+    try:
+        return agent_accounts.LoginEndKnown(datetime.fromtimestamp(expires / 1000, timezone.utc))
+    except (OverflowError, OSError, ValueError):
+        return agent_accounts.LoginEndUnknown()
+
+
+def move_target_sign_in(destination: NamedAccount, now: datetime) -> agent_accounts.NumberedAccount | MoveRefused:
+    """Check the local identity and the available token's expiry."""
+    checked = _check_move_target_directory(destination)
+    if isinstance(checked, MoveRefused):
+        return checked
+    refusal = _move_target_sign_in_refusal(destination)
+    identity = account_identity(destination.dir)
+    if not isinstance(identity, agent_accounts.NumberedAccount) or identity.label != destination.label:
+        return refusal
+    try:
+        login_end = _move_target_login_end(destination.dir)
+    except (agent_accounts.ClaudeCredentialsUnavailable, ValueError):
+        return refusal
+    if isinstance(login_end, MoveTargetTokensMissing):
+        return refusal
+    if isinstance(login_end, agent_accounts.LoginEndUnknown):
+        return MoveRefused(f"{refusal.reason}. Login end date is unknown.")
+    return identity if login_end.at > now else refusal
+
+
 def check_move_target(target: str, now: datetime, *, repair: bool = True, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
     account_config = read_account_settings(account_config)
     destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
-    reading = refusals.stored_reading("claude", claude_login(destination.dir), now)
+    identity = move_target_sign_in(destination, now)
+    if isinstance(identity, MoveRefused):
+        return identity
+    reading = refusals.stored_reading("claude", identity.login, now)
     if isinstance(reading, FreshReading):
         try:
             credits = float(reading.credits or "0")

@@ -207,6 +207,12 @@ Account moves use the shared stop and resume API.
 Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 Each attempt has its own move ID and cause.
 A session proved live on the target writes nothing.
+A failed live source read stops the move before it records a source or sends a signal.
+The stop checks that the live source PID and process start time still match.
+A Claude target needs a real account directory and a matching local sign-in.
+A refresh token needs a future `refreshTokenExpiresAt`.
+If only an access token is present, it needs a future `expiresAt`.
+The watcher checks the sign-in when it selects a target and again before it changes the group account.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 The batch stops the available members before it resumes them.
 Each session resumes its own conversation on the target account.
