@@ -1257,7 +1257,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         if not isinstance(client.pane_activity(identity), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "interrupted recovery pane is live")
         return herdr.ExistingPane(identity, terminal)
-    ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
+    ratio = conf.read("direct").number("worker_split_ratio")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                and any(_text(pane, "pane_id") == item.pane and _text(pane, "tab_id") == tab for pane in evidence.panes)}
     workers.update(_text(pane, "pane_id") for pane in evidence.panes
@@ -1330,8 +1330,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
 def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
     """Read the session report, then wait for the first Codex turn to end."""
     settings = conf.read("direct")
-    text = settings.text("WORKER_FIRST_TURN_TEXT")
-    seconds = settings.number("WORKER_FIRST_TURN_SECONDS")
+    text = settings.text("worker_first_turn_text")
+    seconds = settings.number("worker_first_turn_seconds")
     deadline = time.monotonic() + seconds
     client.prompt_terminal(pane, terminal, text)
     failure = "first turn timed out"
@@ -1371,8 +1371,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     started = time.monotonic()
     try:
         settings = conf.read("direct")
-        start_seconds = settings.number("PANE_AGENT_START_SECONDS")
-        publish_lock_seconds = settings.number("WORKER_PUBLISH_LOCK_SECONDS")
+        start_seconds = settings.number("pane_agent_start_seconds")
+        publish_lock_seconds = settings.number("worker_publish_lock_seconds")
     except conf.Unusable as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     deadline = started + start_seconds

@@ -1737,7 +1737,7 @@ class FolderRenameConfigTests(FolderRenameFixture):
 
         for configured, remaining, expected in ((37, 100, 37), (11, 100, 11), (11, 4, 4)):
             with self.subTest(configured=configured, remaining=remaining):
-                _ = write_config_fixture(self.configuration, f"RENAME_COMMAND_TIMEOUT_SECONDS={configured}\n")
+                _ = write_config_fixture(self.configuration, f"rename_command_timeout_seconds={configured}\n")
                 response = subprocess.CompletedProcess(["git"], 0, "kept\n", "")
                 with (mock.patch.object(time, "monotonic", return_value=100),
                       worker_lifecycle.operation_deadline(deadline=100 + remaining),
@@ -1753,8 +1753,8 @@ class FolderRenameConfigTests(FolderRenameFixture):
         for running in (False, True):
             for limit, poll in ((3, 1), (2, 0.5)):
                 with self.subTest(running=running, limit=limit, poll=poll):
-                    key = "RENAME_LIVE_WAIT_SECONDS" if running else "RENAME_RUN_STOP_WAIT_SECONDS"
-                    _ = write_config_fixture(self.configuration, f"{key}={limit}\nRENAME_POLL_SECONDS={poll}\n")
+                    key = "rename_live_wait_seconds" if running else "rename_run_stop_wait_seconds"
+                    _ = write_config_fixture(self.configuration, f"{key}={limit}\nrename_poll_seconds={poll}\n")
                     clock = [100.0]
                     delays: list[float] = []
                     def sleep(seconds: float) -> None:
@@ -1777,7 +1777,7 @@ class FolderRenameConfigTests(FolderRenameFixture):
 
         wait_for_rows = cast(Callable[..., bool], getattr(moving, "_wait_folder_rows"))
         _ = write_config_fixture(self.configuration,
-            "RENAME_LIVE_WAIT_SECONDS=20\nRENAME_RUN_STOP_WAIT_SECONDS=20\nRENAME_POLL_SECONDS=10\n")
+            "rename_live_wait_seconds=20\nrename_run_stop_wait_seconds=20\nrename_poll_seconds=10\n")
         for running in (False, True):
             with self.subTest(running=running):
                 clock = [100.0]
@@ -1890,7 +1890,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
         from scripts.lint.memory_test_support import write_config_fixture
         from scripts.agents import shutdown
 
-        _ = write_config_fixture(self.configuration, "RENAME_LIVE_WAIT_SECONDS=0.01\nRENAME_POLL_SECONDS=0.001\n")
+        _ = write_config_fixture(self.configuration, "rename_live_wait_seconds=0.01\nrename_poll_seconds=0.001\n")
         restore = self.enterContext(saved_fixture(self.root))
         for state in ("idle", "native director and MCP", "native director and MCP with worker",
                       "native director and MCP with worker caller", "native director and MCP with worker identity unknown"):

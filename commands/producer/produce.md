@@ -5,8 +5,8 @@ description: Run a producer role and coordinate its work.
 # Produce
 
 Load this command at startup and after compaction.
-Find `PRODUCER_FOLDER_ROOT` in `~/.claude/config/staff.conf`.
-Read `<PRODUCER_FOLDER_ROOT>/<name>/README.md` for your job and current work.
+Find `producer_folder_root` in `~/.claude/config/staff.conf`.
+Read `<producer_folder_root>/<name>/README.md` for your job and current work.
 After a restart or compaction, run `send.py pending`. Read the work record in the README folder and re-create its timers.
 
 Use `resume <name>` to resume the same conversation in its tab in the `producers` herdr workspace.
@@ -90,7 +90,7 @@ If nate answers in your session, close the question in the same turn with `updat
 If the question no longer applies, close it with `update_registration.py withdraw --key <question key>`.
 
 File an investigation with `investigation.py file --title "<one line>" --question "<full question>"` when nate asks you to find an answer.
-For usage analysis, use the report in `<PRODUCER_FOLDER_ROOT>/morty/tools/README.md`.
+For usage analysis, use the report in `<producer_folder_root>/morty/tools/README.md`.
 Do not start usage polling or change accounts for an analysis request.
 
 ## Messages and reports

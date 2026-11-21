@@ -48,7 +48,7 @@ class DiskTests(unittest.TestCase):
             copy_record.ROOT_ENV: str(root / "tmp" / "scratch"),
         }))
         _ = (root / "buildlog.conf").write_text(
-            "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
+            "# whole: 1..\ndisk_walk_minutes=60\n# whole: 0..23\ndisk_walk_hour=3\n")
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()

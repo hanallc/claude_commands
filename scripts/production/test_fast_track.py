@@ -22,7 +22,6 @@ from typing import ClassVar, Literal, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, build_slots, conf, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -334,7 +333,7 @@ class FastTrackTests(MergeCheckpointFixture):
 
     def pin_configuration(self) -> None:
         config = self.config.parent
-        machine = host_name()
+        machine = conf.local_host_key_name()
         self.env.update(CONF_DIR=str(config), USER_ZONE="UTC")
         _ = (config / "build_folders.conf").write_text(
             f"""# whole: 1..
@@ -383,7 +382,7 @@ owner.verify=verify
         _ = (config / "build_steps.conf").write_text("names.fast-track=fast track\n")
         _ = (config / "main_push_lock.conf").write_text("# whole: 1..\nrecord_days=14\n")
         _ = (config / "merge_checkpoint.conf").write_text(
-            "# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n",
+            "# whole: 1..\nmac_pull_tries=3\n# range: 0..\nmac_pull_retry_seconds=0\n",
         )
 
     def save_config(self) -> None:

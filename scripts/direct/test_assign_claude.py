@@ -172,7 +172,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
     def test_an_invalid_registry_wait_records_a_failed_pass_and_status(self) -> None:
         session = self.start_phase("invalid-registry-wait")
         _ = self.config_file.write_text(self.config_file.read_text().replace(
-            "CLAUDE_WORKER_REGISTER_WAIT_SECS=30", "CLAUDE_WORKER_REGISTER_WAIT_SECS=invalid"))
+            "claude_worker_register_wait_secs=30", "claude_worker_register_wait_secs=invalid"))
         result = self.worker_launch(session)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         finished, = self.launch_records(session, "pass_finished")

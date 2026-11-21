@@ -62,7 +62,7 @@ def facts(step: str, name: str) -> parse.LogFacts:
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
-    _ = write_config_fixture(root / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+    _ = write_config_fixture(root / "test_times.conf", "nextest_slow_test_s=1.0")
 
 
 class ArgvTests(unittest.TestCase):
@@ -390,7 +390,7 @@ class NextestFormTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary)
             _ = write_config_fixture(config / "test_times.conf")
-            _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
+            _ = write_config_fault(config / "test_times.conf", "nextest_slow_test_s=unusable")
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
                 result = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
                 self.assertEqual((result.timing_rows, result.summaries), ([], []))

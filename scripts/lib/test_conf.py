@@ -303,7 +303,7 @@ conf_reads.record('disabled')
 
     def test_short_host_override_wins_and_its_first_value_is_used(self) -> None:
         self.write("# whole: ..\ncount=1\n# whole: ..\ncount.testhost=7\ncount.testhost=8\ncount.other=9\n")
-        with mock.patch("socket.gethostname", return_value="testhost.example.invalid"):
+        with mock.patch("socket.gethostname", return_value="TESTHost.Example.Invalid"):
             self.assertEqual(conf.read("example").whole("count"), 7)
         with mock.patch("socket.gethostname", return_value="unknown.example.invalid"):
             self.assertEqual(conf.read("example").whole("count"), 1)

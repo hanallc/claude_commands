@@ -37,7 +37,7 @@ class PageDataTests(ChartFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": str(self.ZONE)})))
         clock = cast(mock.Mock, self.enterContext(mock.patch.object(charts, "datetime", wraps=datetime)))
         cast(mock.Mock, clock.now).return_value = fixtures.END.astimezone(self.ZONE)
-        self.configure("TOP_COST_RECENT_DAYS", "2")
+        self.configure("top_cost_recent_days", "2")
 
     @property
     def config_file(self) -> Path:
@@ -197,7 +197,7 @@ class PageDataTests(ChartFixture):
         opened.assert_called_once_with()
 
     def test_window_lengths_come_from_config(self) -> None:
-        self.configure("TOP_COST_RECENT_DAYS", "1")
+        self.configure("top_cost_recent_days", "1")
         with closing(self.fixture.connection(
             fixtures.build("recent", 90000, mem_wait_s=3600),
             fixtures.build("older", 10, mem_wait_s=7200),
@@ -211,9 +211,9 @@ class PageDataTests(ChartFixture):
         self.assertEqual(rows[0].window, charts.WindowMatchesRecent())
 
     def test_recent_window_cannot_exceed_the_page_days(self) -> None:
-        self.configure("TOP_COST_RECENT_DAYS", "4")
+        self.configure("top_cost_recent_days", "4")
         with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))):
-            with self.assertRaisesRegex(conf.Unusable, r"TOP_COST_RECENT_DAYS.*3"):
+            with self.assertRaisesRegex(conf.Unusable, r"top_cost_recent_days.*3"):
                 _ = charts.page_data(3)
 
     def test_page_data_returns_the_index_error(self) -> None:

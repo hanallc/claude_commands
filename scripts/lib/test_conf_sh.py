@@ -12,6 +12,7 @@ import tempfile
 from typing import override
 import unittest
 
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -126,7 +127,7 @@ class ShellConfTests(unittest.TestCase):
         self.assertFalse((self.root / "subshell.log").exists())
 
     def test_sections_comments_first_value_and_short_host_match_the_python_format(self) -> None:
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         self.write(f"[section]\ncount=1\ncount=2\ncount.{host}=7 # here\ncount.{host}=8\n")
         result = self.run_reader("count", trace=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -135,7 +136,7 @@ class ShellConfTests(unittest.TestCase):
         self.assertFalse((self.root / "subshell.log").exists())
 
     def test_host_override_ignores_inherited_host_names(self) -> None:
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         self.write(f"count=1\ncount.{host}=7\n")
         self.env.update(HOSTNAME=host + "-other", HOST=host + "-other")
         result = self.run_reader("count", trace=True)
@@ -256,7 +257,7 @@ class ZshShellConfTests(ShellConfTests):
     shell: tuple[str, ...] = (shutil.which("zsh") or "/bin/zsh", "-f")
 
     def test_host_override_uses_the_zsh_host_without_hostname(self) -> None:
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         self.write(f"count=1\ncount.{host}=7\n")
         del self.env["HOSTNAME"]
         self.env["HOST"] = socket.gethostname()

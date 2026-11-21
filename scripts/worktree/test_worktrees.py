@@ -28,7 +28,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, build_slots, cargo_output, git_files, scratch
+from scripts.lib import build_folders, build_slots, cargo_output, conf, git_files, scratch
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
@@ -116,8 +116,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.trees.mkdir()
         self.state = self.root / "worktrees-state"
         config = self.root / "staff.conf"
-        _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
-                              + "# range: 0.001..\nREMOTE_SECONDS=5\n")
+        _ = config.write_text("# range: 0.001..\noperation_lock_seconds=5\n"
+                              + "# range: 0.001..\nremote_seconds=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
             **config_environment(self.root / "settings"),
@@ -197,8 +197,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         build = self.root / "build"
         scratch_root = self.root / "scratch"
         _ = write_config_fixture(config / "build_folders.conf",
-            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_name()}={build}\n"
-            + f"roots.scratch={scratch_root}\nroots.scratch.{host_name()}={scratch_root}\n"
+            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{conf.local_host_key_name()}={build}\n"
+            + f"roots.scratch={scratch_root}\nroots.scratch.{conf.local_host_key_name()}={scratch_root}\n"
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies = config / "copies.conf"
@@ -1030,7 +1030,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.environment.update({"PATH": str(bin_dir) + os.pathsep + self.environment["PATH"],
                                  "LINT_SWEEP_STATE_DIR": str(state)})
         config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
-        host = host_name()
+        host = conf.local_host_key_name()
         _ = write_config_fixture(config, f"roots.slot_cargo.{host}={cargo_root}\nroots.cargo_paths.{host}={mirror}\n"
             + f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n"
             + f"roots.workspace={self.root / 'worktrees'}\n")

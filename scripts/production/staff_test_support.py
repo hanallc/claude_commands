@@ -433,7 +433,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     with ExitStack() as contexts:
         if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
             configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
-            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            _ = write_config_fixture(configuration, "producer_workspace=producers\n")
             environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
@@ -921,8 +921,8 @@ class StaffTestCase(unittest.TestCase):
         path = self.root / "staff.conf"
         write_text_atomic(path, "".join(
             f"# range: 5e-324..\n{key}={value}\n" for key, value in (
-                ("OPERATION_LOCK_SECONDS", lock_seconds),
-                ("REMOTE_SECONDS", remote_seconds),
+                ("operation_lock_seconds", lock_seconds),
+                ("remote_seconds", remote_seconds),
             )
         ))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"STAFF_CONFIG": str(path)})))

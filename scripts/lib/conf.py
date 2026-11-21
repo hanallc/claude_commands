@@ -252,7 +252,7 @@ class ConfigRead:
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
         if isinstance(self.settings, dict):
-            return effective_key(self.settings, key, host_name=_local_host_name())
+            return _effective_key(self.settings, key, local_host_key_name())
         return key
 
     def number(self, key: str) -> float:
@@ -271,7 +271,7 @@ class ConfigRead:
             settings = self._recover_file(settings)
         selected = dict.fromkeys(keys or settings)
         if host_only_prefix:
-            suffix = f".{_local_host_name()}"
+            suffix = f".{local_host_key_name()}"
             for key in settings:
                 if key.startswith(host_only_prefix) and key.endswith(suffix):
                     selected[key.removesuffix(suffix)] = None
@@ -393,19 +393,29 @@ def settings(source: str) -> dict[str, Setting]:
     return _parse(source)
 
 
-def _local_host_name() -> str:
-    return socket.gethostname().partition(".")[0]
+def host_key_name(host_name: str) -> str:
+    """Return the lower-case short host name for configuration keys."""
+    return host_name.partition(".")[0].lower()
+
+
+def local_host_key_name() -> str:
+    """Return the local host name for configuration keys."""
+    return host_key_name(socket.gethostname())
 
 
 def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> str:
     """Select the override for the specified short host name when it exists."""
-    candidate = f"{key}.{host_name}"
+    return _effective_key(settings, key, host_key_name(host_name))
+
+
+def _effective_key(settings: dict[str, Setting], key: str, host: str) -> str:
+    candidate = f"{key}.{host}"
     return candidate if candidate in settings else key
 
 
 def _setting(settings: dict[str, Setting], key: str) -> Setting:
     try:
-        return settings[effective_key(settings, key, host_name=_local_host_name())]
+        return settings[_effective_key(settings, key, local_host_key_name())]
     except KeyError:
         raise _MissingKey("key is missing") from None
 
@@ -520,13 +530,13 @@ def known_host_names() -> frozenset[str]:
     except FileNotFoundError:
         machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
     aliases = machines.get("aliases")
-    hosts = {_local_host_name().casefold()}
+    hosts = {local_host_key_name()}
     if aliases is not None:
         for alias in aliases.value.split():
-            hosts.add(alias.casefold())
+            hosts.add(host_key_name(alias))
             names = machines.get(f"{alias}.hosts")
             if names is not None:
-                hosts.update(name.partition(".")[0].casefold() for name in names.value.split())
+                hosts.update(host_key_name(name) for name in names.value.split())
     return frozenset(hosts)
 
 
@@ -585,8 +595,11 @@ def check(file: str | Path, key: str, value: str) -> None:
 
 def main(arguments: list[str] | None = None) -> int:
     args = sys.argv[1:] if arguments is None else arguments
+    if args == ["host"]:
+        print(local_host_key_name())
+        return 0
     if len(args) != 3 or args[0] != "get":
-        print("usage: conf.py get FILE KEY", file=sys.stderr)
+        print("usage: conf.py get FILE KEY | host", file=sys.stderr)
         return 2
     try:
         print(read(args[1]).text(args[2]))

@@ -520,7 +520,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 | `questions/<digest>.json` | Held registration questions |
 | `template-fixes/`, `template-fix-errors.jsonl` | Daily template-fix stamps and errors |
 
-- `config/notify.conf` holds `REVIEW_TIMEOUT_SECONDS=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
+- `config/notify.conf` holds `review_timeout_seconds=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
 - Worker agents are called "workers", not "seats". Worker naming and its migration are in `docs/as-built/long-lived-workers.md` and `docs/accounts.md`, not here.
 
 ## Invariants
@@ -543,7 +543,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 ## Calibration and gotchas
 
-**Time limits** (R = `REVIEW_TIMEOUT_SECONDS`, default 60; P = `pushover.TIMEOUT_S`, 15), all from `review.delivery_waits()`:
+**Time limits** (R = `review_timeout_seconds`, default 60; P = `pushover.TIMEOUT_S`, 15), all from `review.delivery_waits()`:
 
 | Helper | Formula | At R=60 |
 | --- | --- | --- |

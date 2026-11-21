@@ -2670,7 +2670,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
 
     def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "move_build_wait_minutes=30\n")
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())

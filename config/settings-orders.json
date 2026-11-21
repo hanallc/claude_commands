@@ -19,8 +19,8 @@
     "sweep": 11,
     "sweep_build_floor_gib.natedev": 6
   },
-  "merge_gate": {
-    "GATE_TIME_LIMIT_FACTOR": 5
+  "gate": {
+    "gate_time_limit_factor": 5
   },
   "statusline": {
     "role.worker": 12

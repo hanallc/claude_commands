@@ -281,16 +281,16 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         self.prepare_project(
             "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
             (
-                "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "# whole: 1..", "CLAUDE_WORKER_REGISTER_WAIT_SECS=30",
-                "# range: 0..", "CLAUDE_WORKER_POLL_SECS=15",
-                "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3",
-                "# whole: 2..", "STALLED_ROUNDS=3",
-                "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
-                "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
-                "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
-                "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
+                "# whole: 1..", "unit_progress_interval_seconds=180",
+                "# whole: 1..", "claude_worker_register_wait_secs=30",
+                "# range: 0..", "claude_worker_poll_secs=15",
+                "# whole: 1..", "unit_compact_above_tokens=100000",
+                "# whole: 1..", "max_fix_attempts=3", "# whole: 1..", "max_reopens=3",
+                "# whole: 2..", "stalled_rounds=3",
+                "# whole: 1..", "runaway_rounds=10", "# range: 5e-324..", "repair_rounds_per_finding=2",
+                "# whole: 1..", "min_repair_budget=2", "# whole: 1..", "max_consecutive_same_kind_passes=6",
+                "# whole: 0..", "max_review_cancellations=1", "# whole: 1..", "routing_from_round=4",
+                "# whole: 1..", "astra_after_failed_fixes=2", "",
             ), CLAUDE_REGISTRY,
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))

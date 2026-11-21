@@ -21,7 +21,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, copy_record, file_lock, git_rescue, scratch
+from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_rescue, scratch
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
 from scripts.lib.descendants import adopt_descendants
@@ -281,7 +281,7 @@ class BuildSlotsTests(unittest.TestCase):
                 self.assertEqual(raised.exception.machine, self.machine)
                 self.assertEqual(raised.exception.maximum, 2)
                 _ = write_config_fixture(self.settings,
-                                         f"slots.{self.machine}.widget.max=3\n")
+                                         f"slots.{conf.host_key_name(self.machine)}.widget.max=3\n")
                 with self.take() as third:
                     self.assertEqual(third.number, 3)
             with self.take() as reused:
@@ -678,7 +678,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
             _ = (path / "change.txt").write_text("save this source\n")
             source_stat = (path / "same.txt").stat()
         _ = write_config_fixture(self.settings,
-                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=64\n")
+                                 f"# whole: 1..\nslots.{conf.host_key_name(self.machine)}.widget.max_bytes=64\n")
         output = io.StringIO()
         with redirect_stdout(output), self.take() as reused:
             self.assertEqual(reused.path, path)

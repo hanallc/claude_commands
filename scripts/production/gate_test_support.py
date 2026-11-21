@@ -32,7 +32,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.git_test_support import fixture_git_environment, write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
@@ -41,7 +41,6 @@ from scripts.production.staff_test_support import build_fixture_sessions, fixtur
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
 from scripts.buildlog import index
-from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -53,7 +52,7 @@ FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "
 # Each folder holds test_first.py, and lib also holds test_second.py.
 
 GATE_TEST_SETTINGS = """# range: 1..
-GATE_TIME_LIMIT_FACTOR=100
+gate_time_limit_factor=100
 # whole: 0..
 memory_stop_reruns=1
 """
@@ -291,7 +290,7 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
 
 def pin_gate_root(configuration: Path, root: Path) -> None:
     """Keep the fixture gate in its private folder."""
-    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
+    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{conf.local_host_key_name()}={root}\n")
 
 
 def wait_for_file(path: Path) -> None:

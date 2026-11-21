@@ -40,15 +40,15 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.environment["PYTHONPYCACHEPREFIX"] = str(self.root.parent / "bytecode")
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         _ = (self.root / "direct.conf").write_text(
-            "# whole: 1..\nVERIFY_TOKEN_HOLD_SECONDS=3600\n"
-            + "# whole: 1..\nVERIFY_TOKEN_RENEW_SECONDS=60\n"
-            + "# whole: 1..\nTOKEN_GUARD_ATTEMPTS=200\n"
-            + "# whole: 1..\nTOKEN_GUARD_DELAY_MS=50\n"
-            + "VERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG "
+            "# whole: 1..\nverify_token_hold_seconds=3600\n"
+            + "# whole: 1..\nverify_token_renew_seconds=60\n"
+            + "# whole: 1..\ntoken_guard_attempts=200\n"
+            + "# whole: 1..\ntoken_guard_delay_ms=50\n"
+            + "verify_result_env_names=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG "
             + "LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS "
             + "LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER LC_TELEPHONE\n"
-            + "VERIFY_RESULT_ENV_PREFIXES=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n"
-            + "VERIFY_TEST_FIXED_ENV=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n",
+            + "verify_result_env_prefixes=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n"
+            + "verify_test_fixed_env=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n",
             encoding="utf-8",
         )
         mac_settings = (

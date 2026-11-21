@@ -153,8 +153,9 @@ def slot_paths(root: Path) -> list[tuple[Path, str, int]]:
 
 def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
     """Read the repository limit or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
+    host = conf.host_key_name(machine)
+    key = f"slots.{host}.{repository}.max"
+    return settings.whole(key if key in settings.values() else f"slots.{host}.default_max")
 
 
 def _pool(source: Path) -> RepositoryPool:
@@ -330,7 +331,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 _ = _git(path, "clean", "-ffdx", "--exclude=/target", pass_fds=(descriptor,))
                 cargo = pool.cargo_root / path.name
                 settings = conf.read_or_repository("build_folders")
-                key = f"slots.{pool.machine}.{pool.repository}.max_bytes"
+                key = f"slots.{conf.host_key_name(pool.machine)}.{pool.repository}.max_bytes"
                 if key in settings.values():
                     limit = settings.whole(key)
                     size = _size(path) + _size(cargo)

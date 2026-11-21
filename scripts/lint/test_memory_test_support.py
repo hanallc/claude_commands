@@ -15,17 +15,17 @@ class ConfigFixtureTests(unittest.TestCase):
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "direct.conf"
-            _ = path.write_text("MAX_FIX_ATTEMPTS=17\nfixture_only=kept\n")
-            _ = write_config_fixture(path, "MAX_REOPENS=19\n")
+            _ = path.write_text("max_fix_attempts=17\nfixture_only=kept\n")
+            _ = write_config_fixture(path, "max_reopens=19\n")
             text = path.read_text()
         committed = Path(__file__).resolve().parents[2] / "config" / "direct.conf"
         expected = dict(line.split("=", 1) for line in committed.read_text().splitlines()
                         if "=" in line and not line.startswith("#"))
-        expected.update(MAX_FIX_ATTEMPTS="17", MAX_REOPENS="19", fixture_only="kept")
+        expected.update(max_fix_attempts="17", max_reopens="19", fixture_only="kept")
         actual = dict(line.split("=", 1) for line in text.splitlines()
                       if "=" in line and not line.startswith("#"))
         self.assertEqual(actual, expected)
-        self.assertIn("# whole: 1..\nMAX_FIX_ATTEMPTS=17\n", text)
+        self.assertIn("# whole: 1..\nmax_fix_attempts=17\n", text)
 
     def test_successive_overrides_keep_prior_values_and_allow_an_explicit_empty_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

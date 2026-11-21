@@ -9,7 +9,6 @@ import hashlib
 import os
 from pathlib import Path
 import re
-import socket
 import subprocess
 
 from scripts.aws_target import hana_protocol
@@ -99,7 +98,7 @@ def bundle_prerequisites(bundle: Path) -> tuple[str, ...]:
 
 def admit_slot_keys(repository: str) -> None:
     """Require the user's explicit guest pool activation and capacity values."""
-    machine = socket.gethostname().split('.')[0]
+    machine = conf.local_host_key_name()
     configuration = conf.read_or_repository('build_folders')
     if not configuration.values().get(f'roots.slots.{machine}'):
         raise build_slots.SlotsNotConfigured(machine)

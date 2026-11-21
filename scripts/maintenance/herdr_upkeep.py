@@ -52,7 +52,7 @@ def upkeep() -> None:
         if producers:
             offset = int(time.time() // cadence.interval_seconds) % len(producers)
             producers = producers[offset:] + producers[:offset]
-        start_seconds = conf.read("shutdown").number("START_SECONDS")
+        start_seconds = conf.read("shutdown").number("start_seconds")
         for row in producers:
             if time.monotonic() >= deadline:
                 print("herdr-upkeep: producer budget ended; retry remaining producers next run", file=sys.stderr)

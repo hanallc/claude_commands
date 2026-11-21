@@ -341,7 +341,7 @@ class IndexTests(unittest.TestCase):
                           ("test_read.py", '["scripts/a.py", "scripts/z.py"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
-        spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+        spill_pages = conf.read("buildlog").whole("index_spill_pages")
         with closing(index.open_for_update(index.index_path())) as writer:
             self.assertEqual(writer.execute("PRAGMA cache_spill").fetchone(), (spill_pages,))
 
@@ -466,7 +466,7 @@ class IndexTests(unittest.TestCase):
 
     def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=30")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=30")
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         active_path = index.index_path()
@@ -487,7 +487,7 @@ class IndexTests(unittest.TestCase):
             os.utime(path, (accessed, modified))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=1")
         os.utime(active_path, (old, old))
         self.assertEqual(index.update(), 0)
         self.assertFalse(old_path.exists())
@@ -498,7 +498,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(index.update(), 0)
         self.assertFalse(recent_path.exists())
         self.assertEqual(self.ids(), ["retained"])
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=0")
         self.assertEqual(index.update(), 0)
         self.assertTrue(active_path.is_file())
 
@@ -517,7 +517,7 @@ class IndexTests(unittest.TestCase):
 
     def test_update_finishes_interrupted_index_cleanup_and_removes_orphan_sidecars(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=1")
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         old = time.time() - 2 * 86400
@@ -580,7 +580,7 @@ class IndexTests(unittest.TestCase):
         now = time.time()
         for minutes, age, touches in ((120, 61, False), (60, 59, False), (60, 61, True)):
             with self.subTest(minutes=minutes, age=age):
-                _ = write_config_fixture(config / "buildlog.conf", f"INDEX_TOUCH_MINUTES={minutes}")
+                _ = write_config_fixture(config / "buildlog.conf", f"index_touch_minutes={minutes}")
                 stamp = now - age * 60
                 os.utime(current, (stamp, stamp))
                 self.assertEqual(index.update(), 0)
@@ -691,7 +691,7 @@ class IndexTests(unittest.TestCase):
 
     def test_mac_nextest_rows_use_the_call_repository_from_local_steps_or_ssh_attempts(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", "nextest_slow_test_s=1.0")
         identity = "https://github.com/example/hana"
         facts = parse.log_facts("nextest", "        PASS [ 2.000s] hana tests::slow\n")
         mac_file = self.root / "Mac" / "2026-10.jsonl"
@@ -823,7 +823,7 @@ class IndexTests(unittest.TestCase):
             (1.25, {"tests::above_higher_boundary", "tests::failed", "tests::retried", "tests::reported_slow"}),
         ):
             with self.subTest(threshold=threshold):
-                _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
+                _ = write_config_fixture(config / "test_times.conf", f"nextest_slow_test_s={threshold}")
                 tests = parse.test_results(lines).timing_rows
                 self.assertEqual({test["test"] for test in tests}, expected)
                 self.write(self.host_file, step("threshold", step="nextest", tests=tests))
@@ -832,8 +832,8 @@ class IndexTests(unittest.TestCase):
 
     def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_SPILL_PAGES=65536\nINDEX_TOUCH_MINUTES=60")
+        _ = write_config_fixture(config / "test_times.conf", "nextest_slow_test_s=1.0")
+        _ = write_config_fixture(config / "buildlog.conf", "index_spill_pages=65536\nindex_touch_minutes=60")
         passed = "PASS [ 0.010s] hana tests::fast\n"
         summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
         partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"

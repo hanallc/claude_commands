@@ -19,7 +19,7 @@ The hierarchy connects the user's product choices to work in separate repository
 
 Morty, brain, and dwight have staff kind `producer` and no parent.
 They remain individual operators; their shared kind defines management.
-Each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`.
+Each producer's job is in `<producer_folder_root>/<name>/README.md`.
 `commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.
 The [staff contract](staff-accessors.md#producer-rows-and-commands) defines their commands and document folders.
 

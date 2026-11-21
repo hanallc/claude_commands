@@ -81,10 +81,10 @@ The gate reads findings, so a failed command needs a finding before it affects c
 `dispatch --covers` must include every gating open finding that remains in the phase.
 
 `config/direct.conf` supplies the required thresholds.
-`ROUTING_FROM_ROUND=4` requires evidence for retained findings.
+`routing_from_round=4` requires evidence for retained findings.
 The kept categories are `regression`, `broken`, `gate`, and an explicit `ruling`.
 Other missing criteria or work outside those categories go to an owned follow-up.
-`ASTRA_AFTER_FAILED_FIXES=2` requires a new Astra approach after two failed fixes.
+`astra_after_failed_fixes=2` requires a new Astra approach after two failed fixes.
 A gating open finding also needs that review from repair round four.
 The Astra record applies to its current fix-attempt count.
 An unavailable review can be recorded with its reason.

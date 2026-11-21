@@ -26,25 +26,25 @@ unset CLAUDE_CODE_SESSION_ID
 # Fix the demo's thresholds so local tuning cannot change its examples.
 cat > "$CONF_DIR/direct.conf" <<'CONFIG'
 # whole: 1..
-MIN_REPAIR_BUDGET=3
+min_repair_budget=3
 # range: 5e-324..
-REPAIR_ROUNDS_PER_FINDING=0.5
+repair_rounds_per_finding=0.5
 # whole: 1..
-RUNAWAY_ROUNDS=5
+runaway_rounds=5
 # whole: 1..
-MAX_FIX_ATTEMPTS=2
+max_fix_attempts=2
 # whole: 1..
-MAX_REOPENS=2
+max_reopens=2
 # whole: 2..
-STALLED_ROUNDS=2
+stalled_rounds=2
 # whole: 1..
-MAX_CONSECUTIVE_SAME_KIND_PASSES=3
+max_consecutive_same_kind_passes=3
 # whole: 0..
-MAX_REVIEW_CANCELLATIONS=1
+max_review_cancellations=1
 # whole: 1..
-ROUTING_FROM_ROUND=4
+routing_from_round=4
 # whole: 1..
-ASTRA_AFTER_FAILED_FIXES=2
+astra_after_failed_fixes=2
 CONFIG
 cat > "$CONF_DIR/machines.conf" <<'CONFIG'
 aliases=natedev mac
