@@ -1957,19 +1957,22 @@ process.stdout.write(JSON.stringify({
             cloud_gate_stale_pushes=3, repository_slots=(slot,))
         with mock.patch.object(admission_client, "view", return_value=base):
             before = memory_feed.reading()
-        with mock.patch.object(admission_client, "view", return_value=reading):
-            after = memory_feed.reading()
-        row, = after["waiters"]
-        self.assertEqual(row.get("kind"), "repository-slot")
-        self.assertEqual(cast(memory_feed.WaitRow, row)["why"], "build slot")
-        self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
-        self.assertEqual(row["pid"], slot.owner.pid)
-        self.assertEqual(row["since"], slot.since)
-        self.assertEqual(cast(memory_feed.WaitRow, row)["need"], 0)
-        self.assertEqual(after["reserved"], before["reserved"])
-        self.assertEqual(after["used"], before["used"])
-        self.assertEqual(after["waiting"], 1)
-        self.assertEqual(row.get("about"), "Waits for a build slot")
+        for step, about in (("gate", "Waits for a build slot"), ("merge-gate", "Runs a merge or test job")):
+            with self.subTest(step=step):
+                waiting_slot = replace(slot, identity=replace(slot.identity, step=step))
+                with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(waiting_slot,))):
+                    after = memory_feed.reading()
+                row, = after["waiters"]
+                self.assertEqual(row.get("kind"), "repository-slot")
+                self.assertEqual(cast(memory_feed.WaitRow, row)["why"], "build slot")
+                self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
+                self.assertEqual(row["pid"], slot.owner.pid)
+                self.assertEqual(row["since"], slot.since)
+                self.assertEqual(cast(memory_feed.WaitRow, row)["need"], 0)
+                self.assertEqual(after["reserved"], before["reserved"])
+                self.assertEqual(after["used"], before["used"])
+                self.assertEqual(after["waiting"], 1)
+                self.assertEqual(row.get("about"), about)
 
         saved = replace(slot, identity=replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")))
         with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(saved,))):

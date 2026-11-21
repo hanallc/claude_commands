@@ -799,11 +799,19 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     def test_normal_exit_records_the_exit_code_and_one_peak(self) -> None:
         with QueuePlaceFixture() as fixture:
-            for status in (0, 7):
-                with self.subTest(status=status):
+            for status, wrapper in ((0, "program_start.py"), (7, "program_start.py"), (0, "queue_place.py")):
+                with self.subTest(status=status, wrapper=wrapper):
                     with queue.queue_place("rust-analyzer", fixture.root) as place:
-                        child = place.popen([sys.executable, "-c", CHILD, str(status)],
-                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                        spawn = subprocess.Popen
+
+                        def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
+                            if argv[2:3] == ["--program-start"]:
+                                argv = [argv[0], str(Path(queue.__file__).with_name(wrapper)), *argv[2:]]
+                            return spawn(argv, **kwargs)
+
+                        with mock.patch.object(subprocess, "Popen", side_effect=start):
+                            child = place.popen([sys.executable, "-c", CHILD, str(status)],
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                         output, _ = child.communicate(b"queued protocol\x00\xff", timeout=3)
                         self.assertEqual(output, b"queued protocol\x00\xff")
                         _, row = fixture.reservation()
