@@ -814,21 +814,6 @@ def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     return (Span(" · ".join(filter(None, parts))),)
 
 
-def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
-    identity = row.identity
-    return model.cloud_labels.get(identity.session_id,
-        UnitLabels(identity.name, unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED))
-
-
-def cloud_step_name(row: wire.CloudRow, model: QueueModel) -> str:
-    """Name page steps from their recorded owner's labels."""
-    label = model.cloud_labels.get(row.identity.session_id)
-    if label is None:
-        return model.names.shown(row.identity.step)
-    unit = label.unit if label.unit not in ("", "—", unit_labels.OWNER_NOT_RECORDED) else ""
-    return model.names.for_owner(row.identity.step, unit, label.role)
-
-
 @dataclass(frozen=True)
 class WaitingBuild:
     position: int

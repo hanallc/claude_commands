@@ -16,10 +16,11 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_protocol as wire, cloud_progress, placement, progress_profile
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, snapshot_with_head_cause, wait_reply
-from scripts.build_queue.queue_fixture import head_reading
+from scripts.build_queue.queue_fixture import fixture_reservation, head_reading
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+from scripts.production import staff
 from scripts.production.staff import StaffId
 
 
@@ -114,6 +115,50 @@ class SnapshotCodecTests(unittest.TestCase):
             retained = replace(held, identity=recovered)
             expected = replace(slot, slot=retained) if isinstance(slot, records.ContinuationSlot) else retained
             self.assertEqual(parsed, replace(inputs, slots=(expected,)))
+
+    def test_older_hold_snapshot_recovers_the_caller_from_its_reservation(self) -> None:
+        inputs = head_reading().explanation.decided_from
+        reservation = fixture_reservation(42, GIB)
+        reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
+            "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": "saved caller"})
+        run = LiveBuildRun(42, "start", inputs.now - 10)
+        facts = records.EndedStepFacts("check", "hana", "hana", "/fixture/hana", records.NoEndedStepStaff())
+        held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
+        for slot in (held, records.ContinuationSlot(held, "successor")):
+            with self.subTest(slot=type(slot).__name__):
+                current = replace(inputs, reservations=(reservation,), slots=(slot,))
+                raw = cast(dict[str, object], codec.snapshot_value(current))
+                encoded, = cast(list[dict[str, object]], raw["slots"])
+                if isinstance(slot, records.ContinuationSlot):
+                    encoded = cast(dict[str, object], encoded["slot"])
+                del cast(dict[str, object], encoded["identity"])["caller_name"]
+                parsed = cast(records.QueueInputs, codec.parse_snapshot_value(raw, records.QueueInputs))
+                decoded, = parsed.slots
+                slot_read = decoded.slot if isinstance(decoded, records.ContinuationSlot) else decoded
+                self.assertEqual(slot_read.identity, replace(facts, caller_name="saved caller"))
+
+    def test_hold_caller_candidates_use_reservation_and_fixed_staff_in_order(self) -> None:
+        inputs = head_reading().explanation.decided_from
+        member = staff.StaffRow(StaffId("fixed"), "unit", "staff name", staff.StaffRoot(),
+                                current_session=StaffId("current"))
+        run = LiveBuildRun(42, "start", inputs.now - 10)
+        for stored, reserved, expected in (
+            ("recorded name", "reserved name", "recorded name"),
+            (records.EndedStepFactNotRecorded(), "reserved name", "reserved name"),
+            ("$OWNER", "owner not recorded", "staff name"),
+        ):
+            with self.subTest(stored=stored, reserved=reserved):
+                reservation = fixture_reservation(42, GIB)
+                reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
+                    "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": reserved})
+                facts = records.EndedStepFacts("merge-gate", "hana", "hana", "/fixture/hana", member.id,
+                                               caller_name=stored)
+                held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
+                current = replace(inputs, reservations=(reservation,), slots=(held,))
+                with codec.snapshot_staff(staff.StaffSnapshot((member,))):
+                    parsed = cast(records.QueueInputs, codec.parse_snapshot_value(codec.snapshot_value(current),
+                                                                                 records.QueueInputs))
+                self.assertEqual(parsed.slots, (replace(held, identity=replace(facts, caller_name=expected)),))
 
     def test_older_services_read_direct_requests_with_a_local_reason(self) -> None:
         reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
