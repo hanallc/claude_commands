@@ -285,7 +285,7 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
             head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
         elif wait.get("kind") == "CargoFolderWait":
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
-        elif wait.get("kind") == "BuildSpaceLow":
+        elif wait.get("kind") in ("BuildSpaceLow", "BuildSpaceUnreadable"):
             head, suffix = "the build space floor", BUILD_SPACE_SUFFIX
         else:
             continue

@@ -344,6 +344,7 @@ class SnapshotCodecTests(unittest.TestCase):
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
             placement.CargoFolderWait: placement.CargoFolderWait(),
             records.BuildSpaceLow: records.BuildSpaceLow(125, 150),
+            records.BuildSpaceUnreadable: records.BuildSpaceUnreadable("fixture disk offline"),
             records.ReadyForAdmission: records.ReadyForAdmission(),
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
@@ -364,11 +365,11 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_reason = cast(object, getattr(parse_reply(line), "reason"))
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
-                        legacy_wait = (records.GpuSlotWait, records.NatedevHeld, placement.CargoFolderWait,
-                                       records.BuildSpaceLow)
+                        legacy_wait = (records.GpuSlotWait | records.NatedevHeld | placement.CargoFolderWait
+                                       | records.BuildSpaceHold)
                         self.assertEqual(type(older_cause).__name__,
                                          "BehindHead" if isinstance(cause, legacy_wait) else type(cause).__name__)
-                        if isinstance(cause, records.BuildSpaceLow):
+                        if isinstance(cause, records.BuildSpaceHold):
                             self.assertEqual(cast(str, getattr(older_cause, "head_name")), "the build space floor")
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:

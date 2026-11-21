@@ -1588,7 +1588,7 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "memory pressure"
         case placement.CargoFolderWait():
             return "the build in the same Cargo folder"
-        case admission_records.BuildSpaceLow():
+        case admission_records.BuildSpaceLow() | admission_records.BuildSpaceUnreadable():
             return "build space"
         case admission_records.GpuSlotWait():
             return "GPU slot"

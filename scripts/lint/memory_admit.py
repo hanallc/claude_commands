@@ -2213,10 +2213,15 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason: WaitReason = entry.state
         else:
+            expired = estimate_expired(row, now, policy)
             if (not remote_start_pending and can_use_natedev(row)
-                    and isinstance(inputs.build_space, records.BuildSpaceLow)):
-                cause: HeadCause = (queue_order_reason(decision, RecordedQueueIdentities())
-                                    if isinstance(decision.order_hold, HeldBehindHead) else inputs.build_space)
+                    and isinstance(inputs.build_space, records.BuildSpaceHold)):
+                if expired:
+                    cause: HeadCause = EstimateExpired(row.get("estimated_at", now))
+                elif isinstance(decision.order_hold, HeldBehindHead):
+                    cause = queue_order_reason(decision, RecordedQueueIdentities())
+                else:
+                    cause = inputs.build_space
             elif isinstance(entry.cargo_folder, placement.CargoFolderWait):
                 cause = entry.cargo_folder
             elif isinstance(resolved.room, ReadingUnavailable) and not within:
@@ -2227,7 +2232,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                 if (decision.starts_at and spacing_waits.get(ahead) == decision.starts_at
                         and folder is not None and folder == inputs.cargo_folders.get(ahead)
                         and isinstance(decision.pressure, NoPressureHold)
-                        and isinstance(decision.gpu, GpuSlotFree) and not estimate_expired(row, now, policy)):
+                        and isinstance(decision.gpu, GpuSlotFree) and not expired):
                     cause = StartSpacingWait(decision.starts_at)
                 else:
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
@@ -2235,7 +2240,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                 cause = BehindHead("remote startup", row["since"], "")
             elif isinstance(local_wait, placement.EvidenceNeeded):
                 cause = ReadingUnavailable(local_wait.reason)
-            elif estimate_expired(row, now, policy):
+            elif expired:
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:
                 cause = cast(HeadCause, queue_wait_reason(decision, row["need"], available, RecordedQueueIdentities()))
@@ -2494,7 +2499,7 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         return HeadStartsAt(cause.at, ended, charge_drop, freed, growth_drop)
     if isinstance(cause, NeedsMemory):
         return HeadStillHeld(decision, ("free memory",))
-    if isinstance(cause, records.BuildSpaceLow):
+    if isinstance(cause, records.BuildSpaceHold):
         return HeadStillHeld(decision, ("build space",))
     if isinstance(cause, GpuSlotWait):
         return HeadStillHeld(decision, ("GPU test slot",))

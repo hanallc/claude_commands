@@ -949,6 +949,14 @@ class BuildSpaceLow:
 
 
 @dataclass(frozen=True)
+class BuildSpaceUnreadable:
+    error: str
+
+
+BuildSpaceHold = BuildSpaceLow | BuildSpaceUnreadable
+
+
+@dataclass(frozen=True)
 class NoBuildSpaceHold:
     """The pass has no disk space hold."""
 
@@ -995,7 +1003,7 @@ class NatedevHeld:
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission | BuildSpaceLow | placement.CargoFolderWait)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | BuildSpaceHold | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -1008,14 +1016,16 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld | BuildSpaceLow | placement.CargoFolderWait)
+              | NatedevHeld | BuildSpaceHold | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
     return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
 
 
-def build_space_text(wait: BuildSpaceLow) -> str:
+def build_space_text(wait: BuildSpaceHold) -> str:
+    if isinstance(wait, BuildSpaceUnreadable):
+        return f"cannot read /build free space: {wait.error}"
     return f"/build has {wait.free_gib} GiB free, below the {wait.floor_gib} GiB floor"
 
 
@@ -1029,7 +1039,7 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + cause.reason
     if isinstance(cause, MemoryPressure):
         return "head: " + pressure_text(cause)
-    if isinstance(cause, BuildSpaceLow):
+    if isinstance(cause, BuildSpaceHold):
         return "head: " + build_space_text(cause)
     if isinstance(cause, StartSpacingWait):
         return "head: next start at " + datetime.fromtimestamp(cause.at, zone).strftime("%H:%M:%S")
@@ -1286,7 +1296,7 @@ class QueueInputs:
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
-    build_space: BuildSpaceLow | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
+    build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1434,7 +1444,7 @@ class MemoryConfig:
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
-    build_free_floor_gib: int | None = field(default=None, kw_only=True)
+    free_floor_gib: int | None = field(default=None, kw_only=True)
     diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
@@ -1535,8 +1545,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
                 peak_wave_seconds=number("peak_wave_seconds"),
-                build_free_floor_gib=whole("build_free_floor_gib")
-                    if settings_read.effective_key("build_free_floor_gib") in values else None)
+                free_floor_gib=whole("free_floor_gib")
+                    if settings_read.effective_key("free_floor_gib") in values else None)
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)
@@ -1730,7 +1740,7 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return reason.reason
         case StartSpacingWait():
             return "another step just started; the queue waits a few seconds between starts"
-        case BuildSpaceLow():
+        case BuildSpaceLow() | BuildSpaceUnreadable():
             return build_space_text(reason)
         case NeedsMemory():
             return "free memory"

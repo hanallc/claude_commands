@@ -17,19 +17,19 @@ from scripts.lint import memory_admit as gate
 
 
 class BuildSpaceTests(unittest.TestCase):
-    def configure_floor(self, fixture: AdmissionFixture) -> Path:
+    def configure_floor(self, fixture: AdmissionFixture, *, estimate_lifetime: str = "3600") -> Path:
         output = fixture.root / "cargo-output"
         output.mkdir()
         _ = (fixture.root / "build_folders.conf").write_text(f"roots.slot_cargo={output}\n")
         write_memory_config(fixture.root / "build_admission.conf",
-                            build_free_floor_gib="150", estimate_refresh_seconds="3600")
+                            free_floor_gib="150", estimate_refresh_seconds=estimate_lifetime)
         _ = fixture.enter_context(mock.patch.object(fixture.readings, "build_space",
                                   new=admission_service.SystemReadings().build_space))
         return output
 
     def test_low_space_holds_new_local_steps_until_the_next_clear_pass(self) -> None:
         with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
-            write_memory_config(fixture.root / "build_admission.conf", build_free_floor_gib=None)
+            write_memory_config(fixture.root / "build_admission.conf", free_floor_gib=None)
             running = fixture.request(need=GIB)
             with mock.patch.object(fixture.readings, "build_space") as read_space:
                 grant = only_admitted(fixture.server.handle_request(running))
@@ -77,20 +77,70 @@ class BuildSpaceTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertIn(head.episode, fixture.server.reservations)
 
-    def test_low_space_allows_remote_placement_when_the_local_route_is_first(self) -> None:
-        with mock.patch.object(store, "host_name", return_value="natedev"), PlacementFixture() as fixture:
+    def test_failed_space_read_holds_new_steps_and_keeps_running_work(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", free_floor_gib=None)
+            running = fixture.request(need=GIB)
+            _ = only_admitted(fixture.server.handle_request(running))
             output = self.configure_floor(fixture)
-            request = placement_request(fixture)
-            _ = publish_candidate(fixture, request)
-            request = replace(request, constraints=replace(request.constraints,
-                candidates=(local_candidate(fixture), *request.constraints.candidates)))
+            fixture.allow_next_start()
+            queued = fixture.request(need=GIB)
 
-            def read_build_space(path: Path) -> os.statvfs_result:
+            with mock.patch.object(os, "statvfs", side_effect=OSError("fixture disk offline")) as read_space:
+                reply, = fixture.server.handle_request(queued)
+            read_space.assert_called_once_with(output)
+            assert isinstance(reply, wire.Wait), reply
+            self.assertEqual(reply.text, "cannot read /build free space: fixture disk offline")
+            self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+            self.assertEqual(set(fixture.server.reservations), {running.episode})
+
+    def test_estimate_refreshes_during_the_hold_and_starts_on_the_first_clear_pass(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
+            output = self.configure_floor(fixture, estimate_lifetime="10")
+            queued = fixture.request(need=GIB)
+            free = 125 * GIB
+
+            def read_space(path: Path) -> os.statvfs_result:
                 self.assertEqual(path, output)
-                return os.statvfs_result((4096, 4096, 100000000, 90000000, 125 * GIB // 4096, 0, 0, 0, 0, 255))
+                return os.statvfs_result((4096, 4096, 100000000, 90000000, free // 4096, 0, 0, 0, 0, 255))
 
-            with mock.patch.object(os, "statvfs", side_effect=read_build_space):
-                reply, = fixture.connect(request).replies()
-            assert isinstance(reply, wire.Assignment), reply
-            self.assertEqual(reply.assignment.destination.provider, "mac")
-            self.assertEqual(fixture.server.reservations, {})
+            with mock.patch.object(os, "statvfs", side_effect=read_space):
+                first, = fixture.server.handle_request(queued)
+                self.assertIsInstance(first, wire.Wait)
+                fixture.clock.advance(11)
+                _ = fixture.run_pass()
+                expired = fixture.server.waiters[queued.episode].last_reply
+                assert isinstance(expired, wire.Wait), expired
+                assert isinstance(expired.reason, records.HeadAdmissionStatus), expired.reason
+                self.assertEqual(expired.reason.cause, records.EstimateExpired(queued.profile.estimated_at))
+
+                refreshed = replace(queued, profile=replace(queued.profile, estimated_at=fixture.clock.now()))
+                reply, = fixture.server.handle_request(refreshed)
+                self.assertIsInstance(reply, wire.Wait)
+                self.assertEqual(fixture.server.reservations, {})
+
+                free = 151 * GIB
+                _ = fixture.run_pass()
+                self.assertIn(queued.episode, fixture.server.reservations)
+
+    def test_disk_hold_allows_remote_placement_when_the_local_route_is_first(self) -> None:
+        for unreadable in (False, True):
+            with (self.subTest(unreadable=unreadable), mock.patch.object(store, "host_name", return_value="natedev"),
+                  PlacementFixture() as fixture):
+                output = self.configure_floor(fixture)
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                request = replace(request, constraints=replace(request.constraints,
+                    candidates=(local_candidate(fixture), *request.constraints.candidates)))
+
+                def read_build_space(path: Path) -> os.statvfs_result:
+                    self.assertEqual(path, output)
+                    if unreadable:
+                        raise OSError("fixture disk offline")
+                    return os.statvfs_result((4096, 4096, 100000000, 90000000, 125 * GIB // 4096, 0, 0, 0, 0, 255))
+
+                with mock.patch.object(os, "statvfs", side_effect=read_build_space):
+                    reply, = fixture.connect(request).replies()
+                assert isinstance(reply, wire.Assignment), reply
+                self.assertEqual(reply.assignment.destination.provider, "mac")
+                self.assertEqual(fixture.server.reservations, {})

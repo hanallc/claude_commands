@@ -93,15 +93,17 @@ Requests and cleanup continue when this logging setting is unusable.
 
 ### Build filesystem space
 
-The natedev service reads `build_free_floor_gib` from `build_admission.conf` each pass.
+The natedev service reads `free_floor_gib` from the `[disk]` section of `build_admission.conf` each pass.
 The service measures available space at the configured `roots.slot_cargo` path once per pass.
-Below the floor, new local steps wait in order while running steps continue.
+If space is below the floor or the reading fails, new local steps wait in order.
+Running steps continue.
 Eligible remote steps can start on a remote target.
-The Builds page and the queue head alert show the measured GiB and the floor.
+The Builds page and the queue head alert show the measured GiB and the floor or the read error.
 Older clients read the disk wait as a wait behind the build space floor.
-The next pass can start local steps when space reaches the floor.
+Waiters can refresh expired estimates during the hold.
+The next pass can start local steps when a successful reading reaches the floor.
 A missing floor leaves the space check disabled.
-If a reading fails, the service logs the fault and continues to apply the memory rules.
+If a reading fails, the service logs the error.
 
 ### Placement status
 

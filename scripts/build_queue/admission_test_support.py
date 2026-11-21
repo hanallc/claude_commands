@@ -310,7 +310,7 @@ class PrivateReadings:
         self.counts["pressure"] += 1
         return gate.read_pressure(host, policy=policy)
 
-    def build_space(self, floor: int) -> records.BuildSpaceLow | records.NoBuildSpaceHold:
+    def build_space(self, floor: int) -> records.NoBuildSpaceHold:
         self.counts[f"build_space:{floor}"] += 1
         return records.NoBuildSpaceHold()
 
