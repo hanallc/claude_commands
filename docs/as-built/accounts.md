@@ -63,7 +63,7 @@ Role history removes consumed entries from coverage.
 The phone push title names the account and the estimated time in the user's zone, such as `claude3 runs out Sun 11-22 07:00 EST`.
 Its action is `Type /agents move <role> <account>`, and it has no body.
 
-`config/showrunners.conf` sets `claude_expiry_alert_hours=12` and `claude_expiry_repeat_hours=2`.
+`config/showrunners.conf` sets `claude_expiry.alert_hours=12` and `claude_expiry.repeat_hours=2`.
 Both settings require whole numbers from 1 to 168, including host overrides.
 The quota check skips expiry pushes during silence and saves no attempt.
 The first quota check after silence uses the current forecast.

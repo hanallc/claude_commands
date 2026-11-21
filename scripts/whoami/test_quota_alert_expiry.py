@@ -36,8 +36,8 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
             "USER_ZONE": "America/New_York", "NOTIFY_STATE_DIR": str(self.root / "notify"),
         })))
         with quota_alert.CONFIG.open("a", encoding="utf-8") as config:
-            _ = config.write("# whole: 1..168\nclaude_expiry_alert_hours=12\n"
-                             + "# whole: 1..168\nclaude_expiry_repeat_hours=2\n")
+            _ = config.write("# whole: 1..168\nclaude_expiry.alert_hours=12\n"
+                             + "# whole: 1..168\nclaude_expiry.repeat_hours=2\n")
 
     def check(self, at: datetime, *, left: float = 20, reset: str = "", delay_seconds: int = 0) -> None:
         self.clock = at + timedelta(seconds=delay_seconds)
@@ -275,7 +275,7 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
     def test_each_host_override_needs_a_whole_number_limit(self) -> None:
         config = quota_alert.CONFIG
         valid = config.read_text(encoding="utf-8")
-        for key in ("claude_expiry_alert_hours", "claude_expiry_repeat_hours"):
+        for key in ("claude_expiry.alert_hours", "claude_expiry.repeat_hours"):
             with self.subTest(key=key), redirect_stderr(StringIO()):
                 _ = config.write_text(valid + f"{key}.natedev=169\n", encoding="utf-8")
                 self.check(self.now)

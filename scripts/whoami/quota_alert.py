@@ -2160,7 +2160,7 @@ class NoClaudeExpirySchedule(Enum):
 
 def _claude_expiry_schedule() -> ClaudeExpirySchedule | NoClaudeExpirySchedule:
     settings = conf.read(CONFIG)
-    keys = ("claude_expiry_alert_hours", "claude_expiry_repeat_hours")
+    keys = ("claude_expiry.alert_hours", "claude_expiry.repeat_hours")
     if isinstance(settings.settings, dict) and not any(settings.effective_key(key) in settings.settings for key in keys):
         return NoClaudeExpirySchedule.CONFIGURED
     try:
