@@ -30,7 +30,7 @@ REVIEW_PLACE_SCRIPT = review_legacy.SCRIPT + r"""function legacyReviewPlace(para
  reviewPlace(params,legacy);
 }
 """
-ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "hard-drive", "image", "message-circle-question", "panel-left-close",
+ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "server", "hard-drive", "image", "message-circle-question", "panel-left-close",
                         "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 # The console folder keeps the items each page held when the user last opened it, for every browser.

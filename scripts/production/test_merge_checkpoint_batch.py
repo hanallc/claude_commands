@@ -67,8 +67,10 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
         return merges
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for outcome in ("shared list", "push failure", "separate lists", "second list fails",
-                        "second directory sync fails", "unrelated branch renamed", "unpublished main integration"):
+        for outcome in ("shared list", "push failure", "one unit push failure", "unmatched push failure",
+                        "earlier step push failure",
+                        "separate lists", "second list fails", "second directory sync fails",
+                        "unrelated branch renamed", "unpublished main integration"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -111,18 +113,38 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                     self.assertFalse(record.exists())
                 first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
                                         + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
-                second = self.beta_checkpoint("src/beta.txt", "beta batch change\n", visible=True)
-                if outcome == "push failure":
+                file_diagnostic = outcome in ("one unit push failure", "unmatched push failure", "earlier step push failure")
+                beta_path = "src/beta.toml" if file_diagnostic else "src/beta.txt"
+                second = self.beta_checkpoint(beta_path, "beta batch change\n", visible=True)
+                push_failed = outcome.endswith("push failure")
+                if push_failed:
                     self.push = "validate_and_push"
                     self.production_doc(change_review=review)
-                    self.executable(self.bin / "validate_and_push.sh", STUB + """
+                    if outcome == "push failure":
+                        failure_command = """
 import subprocess
 origin = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True,
                         text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
 subprocess.run(["git", "push", origin, "HEAD:refs/heads/production"],
                check=True, timeout=TEST_HANG_GUARD_SECS)
-raise SystemExit(1)
-""")
+"""
+                    else:
+                        failed_file = f"outside/{beta_path}" if outcome == "unmatched push failure" else beta_path
+                        failure_command = ""
+                        if outcome == "earlier step push failure":
+                            failure_command = """
+print("=== STEP: cargo-mend autofix ===", flush=True)
+print("error: recovered compiler error", file=sys.stderr, flush=True)
+print(" --> src/alpha.txt:2:5", file=sys.stderr, flush=True)
+"""
+                        failure_command += f"""
+print("=== STEP: taplo ===", flush=True)
+print("error: invalid TOML", file=sys.stderr, flush=True)
+print({f"  ┌─ {self.checkout / failed_file}:2:5"!r}, file=sys.stderr, flush=True)
+print("!!! VALIDATION FAILED at step: taplo !!!", flush=True)
+print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
+"""
+                    self.executable(self.bin / "validate_and_push.sh", STUB + failure_command + "raise SystemExit(1)\n")
                 sync_folder = atomic_file.sync_folder
 
                 def sync(folder: Path) -> None:
@@ -137,22 +159,40 @@ raise SystemExit(1)
                         result = self.land_batch(batch)
                 else:
                     result = self.land_batch(batch)
-                if outcome == "push failure":
+                if push_failed:
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     tip = self.git("rev-parse", "production", cwd=self.origin)
-                    self.assertNotEqual(tip, start)
-                    self.assertEqual(self.git("rev-parse", "HEAD"), tip)
+                    if outcome == "push failure":
+                        self.assertNotEqual(tip, start)
+                        self.assertEqual(self.git("rev-parse", "HEAD"), tip)
+                        self.assertEqual([self.git("rev-parse", "HEAD~1^2"), self.git("rev-parse", "HEAD^2")],
+                                         [first, second])
+                        self.assertEqual([line.split()[2] for line in (self.state / "pushed-refs").read_text().splitlines()],
+                                         ["refs/heads/production"])
+                        push_log = self.state / f"merge_{first[:7]}_push.log"
+                        self.assertIn(f"no clear failure line (exit 1) — log {push_log}", result.stdout)
+                    else:
+                        self.assertEqual(tip, start)
+                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
                     self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), start)
-                    self.assertEqual([self.git("rev-parse", "HEAD~1^2"), self.git("rev-parse", "HEAD^2")],
-                                     [first, second])
                     self.assertEqual(self.events("checkpoint-test"), [[]])
                     self.assertEqual(len(self.events("validate_and_push.sh")), 1)
-                    self.assertEqual([line.split()[2] for line in (self.state / "pushed-refs").read_text().splitlines()],
-                                     ["refs/heads/production"])
                     self.assertNotIn("batch: retry", result.stdout)
-                    for unit in ("alpha", "beta"):
-                        self.assertIn(f"send {unit}: repair the push failure", result.stdout)
+                    notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                    if outcome in ("one unit push failure", "earlier step push failure"):
+                        self.assertEqual(notices, [
+                            "send alpha: nothing was pushed; the push failed in beta's change; "
+                            + "send this checkpoint again after that repair",
+                            f"send beta: repair the push failure in {beta_path} and send a new checkpoint",
+                        ])
+                        self.assertNotIn("the showrunner will inspect the failed command", result.stdout)
+                    else:
+                        self.assertEqual(notices, [f"send {unit}: the showrunner will inspect the failed command"
+                                                   for unit in ("alpha", "beta")])
                     self.assertIn("push: failed", result.stdout)
+                    if outcome == "earlier step push failure":
+                        self.assertIn("error: invalid TOML", result.stdout)
+                        self.assertNotIn("recovered compiler error", result.stdout)
                 else:
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     merges = self.assert_landed(start, [first, second])
