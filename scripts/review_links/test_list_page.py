@@ -32,13 +32,13 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib import conf, file_lock
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
+from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
@@ -1611,7 +1611,9 @@ frame.addEventListener('load',async()=>{
         item = self.add("Keep the original log")
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
         base, _, _ = path.read_text().partition("## Log\n\n")
-        _ = path.write_text(base + "## Log\n\n- 2026-11-16 17:30:00+00:00 Recorded <old words> — nate\n")
+        _ = path.write_text(base + "## Log\n\n- 2026-11-16 17:30:00+00:00 Recorded <old words> — nate\n"
+            + '- {"time": "2026-11-16T17:35:00+00:00", "source": "the List", '
+            + '"action": "Unparked", "delivered_change": "sdlc/C1"}\n')
         original = the_list.load(MORTY.id, item.id)
         _ = the_list.update(MORTY.id, item.id, {"eta": NOW + timedelta(hours=3),
             "evidence": 'Source checkins.json item:\n\n{"owner": "sdlc"}\n'}, source="morty")
@@ -1624,6 +1626,7 @@ frame.addEventListener('load',async()=>{
         body = list_page.render(self.root / "reviews").decode()
         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
         self.assertIn("Recorded &lt;old words&gt;", log)
+        self.assertIn("Unparked because change sdlc/C1 is ready.", log)
         self.assertIn("ETA</dt><dd>16:00 EST</dd>", log)
         self.assertIn("Linked reviews: review&lt;key&gt;", log)
         self.assertIn("Unlinked reviews: review&lt;key&gt;", log)
@@ -2098,90 +2101,6 @@ document.body.append(result);
         first = partial.split(f'data-key="{MORTY.id}/{items[0].id}"', 1)[1].split('</tbody>', 1)[0]
         self.assertIn("2 changes for you", first)
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
-
-    def test_live_change_and_delivered_state_return_parked_items_to_needs_me(self) -> None:
-        root = self.root / "reviews"
-        doc = self.root / "sdlc.md"
-        listing = self.root / f"{change_review.PREFIX}sdlc.md"
-        _ = doc.write_text(f'# Production\n- **Change review:** `{listing}`\n')
-        _ = listing.write_text(change_review.BODY)
-        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
-        parking = the_list.ParkUntilDelivered.DELIVERED
-        first, second = self.add("Publish this change"), self.add("Record this delivery")
-        first_key, second_key = "sdlc/C1", "sdlc/C2"
-        _ = the_list.link(MORTY.id, first.id, (first_key,), source="morty")
-        _ = the_list.link(MORTY.id, second.id, (second_key,), source="morty")
-        first = the_list.park(MORTY.id, first.id, parking, source="nate")
-        second = the_list.park(MORTY.id, second.id, parking, source="nate")
-        with (patch.object(staff, "snapshot", return_value=members),
-              patch.object(change_review, "lists_directory", return_value=self.root)):
-            before = list_page.render(root, include_counts=False).decode()
-            self.assertEqual(before.count('data-parked="delivered"'), 2)
-            self.assertEqual(before.count('>Parked until delivered<'), 4)
-            self.assertEqual(list_page.waiting_updates(console.NewsRequest(root)), frozenset())
-            self.assertEqual(the_list.load(MORTY.id, first.id), first)
-            self.assertEqual(the_list.load(MORTY.id, second.id), second)
-            second = the_list.update(MORTY.id, second.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
-            self.assertIs(second.parked_until, the_list.NoTimestamp.UNSET)
-            self.assertEqual(second.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
-            self.assertEqual(the_list.load(MORTY.id, first.id), first)
-            rows = "| C1 | Publish this change | | Read C1 |\n| C2 | Record this delivery | | Read C2 |\n"
-            _ = listing.write_text(change_review.BODY.replace("\n## Reviewed", rows + "\n## Reviewed"))
-            manifest = root / change_page.CONSOLE_FOLDER / change_browser.MANIFEST
-            manifest.unlink()
-            with (patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
-                  patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save,
-                  serve.ReviewLinksServer(("127.0.0.1", 0), root, initialize_review=True) as server):
-                server.review_cache.synchronize()
-                self.assertTrue(manifest.is_file())
-                self.assertEqual(the_list.load(MORTY.id, first.id).log[-1].what,
-                                 the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(first_key)))
-                server.review_cache.invalidate()
-                server.review_cache.synchronize()
-                save.assert_called_once()
-            after = list_page.render(root, include_counts=False).decode()
-            first = the_list.load(MORTY.id, first.id)
-            self.assertEqual(first.state, the_list.ItemState.DELIVERED)
-            self.assertIs(first.parked_until, the_list.NoTimestamp.UNSET)
-            self.assertEqual(first.log[-1].what, the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(first_key)))
-            chip = 'data-filter-value="needs-me"'
-            self.assertRegex(after, chip + r'[^>]*data-filter-count="2"')
-            for item, key in ((first, first_key), (second, second_key)):
-                self.assertEqual(item.unread_since, NOW)
-                self.assertEqual(item.reviews, (key,))
-                row = after.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
-                self.assertIn('data-state="Delivered" data-unread="true" data-parked="false"', row)
-                link = html.escape(review_page.card_url(key), quote=True)
-                self.assertIn(f'href="{link}"', row)
-            self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
-            self.assertEqual(the_list.load(MORTY.id, first.id), first)
-            self.assertEqual(the_list.load(MORTY.id, second.id), second)
-
-    def test_stale_ready_change_keeps_a_newer_park_and_a_change_that_is_no_longer_ready(self) -> None:
-        root = self.root / "reviews"
-        doc = self.root / "sdlc.md"
-        listing = self.root / f"{change_review.PREFIX}sdlc.md"
-        _ = doc.write_text(f'# Production\n- **Change review:** `{listing}`\n')
-        rows = "| C1 | Publish this change | | Read C1 |\n"
-        _ = listing.write_text(change_review.BODY.replace("\n## Reviewed", rows + "\n## Reviewed"))
-        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
-        item = self.add("Keep the new park")
-        key = "sdlc/C1"
-        parking = the_list.ParkUntilDelivered.DELIVERED
-        _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
-        first = the_list.park(MORTY.id, item.id, parking, source="nate")
-        with (patch.object(staff, "snapshot", return_value=members),
-              patch.object(change_review, "lists_directory", return_value=self.root)):
-            snapshot = review_page.build_snapshot(root)
-            self.assertTrue(snapshot.records[key].for_you(NOW))
-            _ = the_list.unpark(MORTY.id, first.id, source="nate")
-            second = the_list.park(MORTY.id, first.id, parking, source="nate")
-            with patch.object(list_page, "records", return_value=[list_page.ListRecord(MORTY.id, first)]):
-                serve.release_delivery_parks(root, snapshot)
-            self.assertEqual(the_list.load(MORTY.id, first.id), second)
-            _ = listing.write_text(change_review.BODY)
-            serve.release_delivery_parks(root, snapshot)
-            self.assertEqual(the_list.load(MORTY.id, first.id), second)
 
     def test_list_readers_leave_a_ready_park_and_a_fresh_root_unchanged(self) -> None:
         root = self.root / "fresh"

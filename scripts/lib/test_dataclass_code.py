@@ -117,7 +117,7 @@ class DataclassCodeTests(unittest.TestCase):
         home.mkdir()
         top = fixture / "build"
         top.mkdir()
-        _ = (fixture / "build_folders.conf").write_text(f"removal.forms={top}/<repo>/<unit>/<short>\n")
+        _ = (fixture / "build_folders.conf").write_text(f"removal.path_templates={top}/<repo>/<unit>/<short>\n")
         plan = removal_guard.RemovalList(removal_guard.Tool.DATACLASS)
         with mock.patch.dict(os.environ, {"HOME": str(home), "CONF_DIR": str(fixture)}):
             self.assertEqual(tmp_sweep.prune_dataclass_code(root, now, 14, tmp_sweep.Sweep(), plan=plan), 1)

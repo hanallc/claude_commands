@@ -357,38 +357,6 @@ buildlog_exec_with_progress() {
         buildlog_exec "$@"
 }
 
-cargo_seed_needed() {
-    [[ "${OSTYPE:-}" == linux* && -f "${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py" ]] || return 1
-    local command="${1:-}" argument directory="${CARGO_BUILD_BUILD_DIR:-}" cwd evidence workspace target extra
-    if [[ "${command##*/}" == env ]]; then
-        shift
-        while [[ "${1:-}" == RUSTC_WRAPPER=* || "${1:-}" == RUSTC_WORKSPACE_WRAPPER=* ]]; do shift; done
-        command="${1:-}"
-        [[ "${command##*/}" == cargo ]] || return 0
-    fi
-    [[ "${command##*/}" == cargo ]] || return 1
-    for argument in "$@"; do
-        case "$argument" in
-            --) break ;;
-            --config|--config=*|--manifest-path|--manifest-path=*|--target-dir|--target-dir=*|-C|-C=*|+*) return 0 ;;
-        esac
-    done
-    if [[ -z "$directory" ]]; then
-        cwd=$(pwd -P) || return 0
-        IFS=$'\t' read -r evidence workspace target directory extra <<< "${BUILDLOG_OUTPUT_ROOTS:-}"
-        [[ -n "$evidence" && "$workspace" == "$cwd" && "$target" == /* && -z "$extra" ]] || return 0
-    fi
-    if [[ "$directory" == /* && ( -e "$directory" || -L "$directory" ) ]]; then
-        return 1
-    fi
-    return 0
-}
-
-cargo_seed_before_step() {
-    local script="${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py"
-    "${script%/*}/py" "$script" "$@"
-}
-
 run_step_attempt() {
     buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
@@ -420,7 +388,7 @@ run_step_attempt() {
         buildlog_begin "$@" || true
     fi
     BUILDLOG_PLACEMENT_PREPARED=0
-    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0 seed_notice="" seed_checked=0
+    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
         while :; do
             buildlog_wait_for_memory "$@" || {
@@ -440,17 +408,7 @@ run_step_attempt() {
                 return 2
             fi
             if build_hold_check_local; then
-                if (( seed_checked != 0 )) || ! cargo_seed_needed "$@"; then
-                    break
-                fi
-                seed_checked=1
-                seed_notice=$(cargo_seed_before_step "$@" 2>/dev/null) || seed_notice="cargo seed: helper failed. Starting cold."
-                [[ -z "$seed_notice" ]] || printf '%s\n' "$seed_notice"
-                if build_hold_check_local; then
-                    break
-                else
-                    status=$?
-                fi
+                break
             else
                 status=$?
             fi
@@ -511,7 +469,6 @@ run_step_attempt() {
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
         log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
-        [[ -z "$seed_notice" ]] || printf '%s\n' "$seed_notice" > "$log" || true
         if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
             ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
         fi
@@ -615,9 +572,17 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
-        if [[ "${DOC_COPY_LEASE_FD:-}" =~ ^[0-9]+$ ]]; then
-            eval "exec $DOC_COPY_LEASE_FD>&-"
-        fi
+        local fd
+        local -a copy_lease_fds=()
+        IFS=, read -r -a copy_lease_fds <<< "${COPIES_COMMAND_LEASE_FDS:-},${COPIES_MIRROR_LEASE_FDS:-}"
+        for fd in ${copy_lease_fds[@]+"${copy_lease_fds[@]}"} \
+            "${DOC_COPY_LEASE_FD:-}" "${NUMBERED_COPY_LOCK_FD:-}" "${COPIES_STEP_SOURCE_LOCK_FD:-}"; do
+            if [[ "$fd" =~ ^([3-9]|[1-9][0-9]+)$ ]]; then
+                eval "exec $fd>&-"
+            fi
+        done
+        unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
+        unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then

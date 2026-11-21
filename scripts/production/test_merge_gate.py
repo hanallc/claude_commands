@@ -61,6 +61,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
         checkout.parent.mkdir(parents=True)
         _ = self.git(self.checkout, "clone", str(self.checkout), str(checkout))
         self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        with mock.patch.dict(os.environ, self.environment):
+            commit = self.git(checkout, "rev-parse", "HEAD")
+            scratch.register_copy(checkout, task="gate:fixture", owner_unit="fixture",
+                                  source_path=str(self.checkout), source_commit=commit,
+                                  copy_commit=commit, target_mode="none", seed_source="", borrows_from="")
         observed: list[Path] = []
 
         def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:

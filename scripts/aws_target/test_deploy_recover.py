@@ -16,7 +16,7 @@ from scripts.aws_target import admin_secrets, aws_trial, cloud_gate, deploy, led
 from scripts.aws_target.config import deployment_record, read_budget_notification_address, save_deployment_record
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import install_cost_settings, override_fixture_settings
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -211,6 +211,17 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertEqual(output.count('already matches'), 2)
         publish.assert_not_called()
+
+    def test_recover_refusal_uses_the_configured_gate_name(self) -> None:
+        names = build_steps.StepNames({'names.merge-gate': 'fixture gate'})
+        errors = StringIO()
+        with (mock.patch.object(sys, 'argv', ['deploy.py', 'recover', '--approve-resources']),
+              mock.patch.object(build_steps, 'read_step_names', return_value=names),
+              redirect_stderr(errors), self.assertRaises(SystemExit) as raised):
+            _ = deploy.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn('Use recover for fixture gate deployment records. Omit resource approval flags.', errors.getvalue())
+        self.assertEqual(self.calls, [])
 
     def test_foundation_equals_the_record_written_by_apply(self) -> None:
         self.configure_preparation()

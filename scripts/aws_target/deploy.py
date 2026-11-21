@@ -3055,7 +3055,7 @@ class Deployment:
             self._gate_plan_locked(self.mode)
 
     def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
-        # start time: loaded only by the merge gate setup plan
+        # Load these modules only when planning gate setup.
         from scripts.aws_target import cloud_gate, gpu_size_trial
 
         settings = read_deployment_settings(self.settings_path)
@@ -3232,7 +3232,7 @@ class Deployment:
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
-        # start time: loaded only by merge gate setup
+        # Load these modules only when setting up gates.
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
 
         self._authorize(approve_resources)
@@ -4027,7 +4027,10 @@ def main() -> int:
         return run_setup_plan(args)
     if args.command == 'recover':
         if args.workload not in ('rust', 'merge-gates') or args.approve_resources or args.approve_destroy or args.approve_release:
-            parser.error('Use recover for merge gates without resource approval flags.')
+            from scripts.lib.build_steps import read_step_names
+
+            gate = read_step_names().shown('merge-gate')
+            parser.error(f'Use recover for {gate} deployment records. Omit resource approval flags.')
         subject = Deployment(args.settings, args.directory, args.output)
         try:
             return 0 if subject.recover(write=args.write) else 1

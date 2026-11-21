@@ -70,7 +70,7 @@ class GuestTests(unittest.TestCase):
             + '# range: 0..\nINDEX_TOUCH_MINUTES=60\n'
             + '# whole: 1..\nINDEX_SPILL_PAGES=65536\n')
         _ = (root / 'build_folders.conf').write_text(
-            f'roots.system={root}\nroots.gate={root}\n'
+            f'roots.system={root}\nroots.gate={root}\nroots.build={root / "build"}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'
             + 'names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n'
             + 'patterns.legacy-unique={purpose}{suffix}\n'
@@ -308,6 +308,7 @@ class GuestTests(unittest.TestCase):
                     os.chdir(previous)
             discover.assert_called_once_with(repo)
             payload = ledger.mapping(cast(object, json.loads(uploads[links['result']])))
+            self.assertEqual(payload['verdict'], 'fail', payload.get('error'))
             self.assertNotIn('governor_gib', payload)
             self.assertEqual(ledger.mapping(payload['tools'])['python_sqlite'], sqlite3.sqlite_version)
             self.assertEqual(payload['module_time_limit_s'], module_limit_s)
@@ -319,7 +320,6 @@ class GuestTests(unittest.TestCase):
             seconds = float(str(payload['gate_finished_at'])) - float(str(payload['gate_started_at']))
             self.assertEqual(payload['gate_s'], seconds)
             self.assertAlmostEqual(float(str(payload['cpu_use_percent'])), 100 * busy / (2 * seconds))
-            self.assertEqual(payload['verdict'], 'fail')
             self.assertEqual(payload['tests'], 3)
             self.assertEqual(payload['skips'], 1)
             self.assertEqual(set(cast(list[str], payload['failed_modules'])), {'fixture/test_broken.py', 'fixture/test_stuck.py'})
