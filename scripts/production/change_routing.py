@@ -340,12 +340,13 @@ class StaffRouting:
         document = self.production(production_name)
         missing_owner = isinstance(owner, ShowrunnerOwnChange) and isinstance(owner.showrunner_id, MissingShowrunner)
         route = self._document_route(production_name)
-        if missing_owner or (document is None and route in (ReviewDocumentRoute.LOCAL_OR_UNBOUND,
-                                                            ReviewDocumentRoute.REMOTE_LEGACY)):
+        if missing_owner or (document is None and route is not ReviewDocumentRoute.REMOTE_ENROLLED):
             root = self._root
             if root is not None:
-                root_document = document if document is not None else self.production(root.name)
-                if root_document is not None:
+                # An unreadable remote document can belong to an enrolled showrunner.
+                # Assign the change to the root using the root's own local document.
+                root_document = record_store.local_document(root)
+                if root_document is not None and self.production(root.name) == root_document:
                     return ChangeAssignment(owner if isinstance(owner, UnroutedChange)
                                             else ShowrunnerOwnChange(root.id, root.name), root_document)
         return ChangeAssignment(owner, document if document is not None else UnavailableProduction(review_list))

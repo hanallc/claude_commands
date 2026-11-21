@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import conf
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
@@ -276,9 +277,18 @@ class StaffRoutingTests(unittest.TestCase):
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         row = {"#": "C1", "Producer": self.unit.id}
-        assignment = self.router().owner_and_production(listing, row)
-        self.assertEqual(assignment.production, doc)
-        self.assertEqual(assignment.owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+        stale = self.root / "stale-child.md"
+        _ = stale.write_text("# Stale child document")
+        remote_document = self.root / "child-on-remote.md"
+        for remote_unreadable in (False, True):
+            with self.subTest(remote_unreadable=remote_unreadable):
+                if remote_unreadable:
+                    _ = staff.set_doc(self.child.id, staff.LiveDoc("remote-fixture", remote_document))
+                documents = {"child": stale} if remote_unreadable else {}
+                router = change_routing.StaffRouting(staff.initial_snapshot(), documents)
+                assignment = router.owner_and_production(listing, row)
+                self.assertEqual(assignment.production, doc)
+                self.assertEqual(assignment.owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
         doc.unlink()
         assignment = self.router().owner_and_production(listing, row)
         self.assertEqual(assignment.production, change_routing.UnavailableProduction(listing))
@@ -395,11 +405,24 @@ class StaffRoutingTests(unittest.TestCase):
     def test_an_existing_staff_document_wins_over_the_supplied_document(self) -> None:
         supplied, authoritative = self.root / "supplied.md", self.root / "staff.md"
         _ = supplied.write_text("# Supplied")
-        _ = authoritative.write_text("# Staff")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), authoritative))
-        router = change_routing.StaffRouting(staff.snapshot(), {"child": supplied})
-        self.assertEqual(router.owner_and_production(self.root / "change-review - top.md",
-                         {"#": "C1", "Producer": self.unit.id}).production, authoritative)
+        listing = self.root / "change-review - top.md"
+        for enrolled_remote in (False, True):
+            with self.subTest(enrolled_remote=enrolled_remote):
+                expected: Path | change_routing.UnavailableProduction
+                if enrolled_remote:
+                    content = f"# Staff\n- **{MERGE_CHECKOUT_FIELD}:** `{self.root}`\n"
+                    machine = "remote-fixture"
+                    expected = change_routing.UnavailableProduction(listing)
+                else:
+                    content = "# Staff"
+                    machine = remote.local_machine()
+                    expected = authoritative
+                _ = authoritative.write_text(content)
+                _ = staff.set_doc(self.child.id, staff.LiveDoc(machine, authoritative))
+                router = change_routing.StaffRouting(staff.initial_snapshot(), {"child": supplied})
+                assignment = router.owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
+                self.assertEqual(assignment.production, expected)
+                self.assertEqual(assignment.owner, change_routing.StaffRoutedChange(self.unit.id, self.child.id, "child"))
 
     def test_a_missing_showrunner_uses_the_supplied_document_under_the_list_name(self) -> None:
         supplied = self.root / "supplied.md"
