@@ -398,10 +398,10 @@ class GateLaunchRecoveryTests(unittest.TestCase):
                           redirect_stderr(errors)):
                         worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
                             book, folder / 'aws_target.conf', folder / 'reservation', clock=lambda: now)
-                        finished = workers.submit(worker.launch, folder, request, {})
+                        finished = workers.submit(worker.launch, folder, request, {'regions': []})
+                        self.assertTrue(termination_requested.wait(TEST_HANG_GUARD_SECS))
                         with self.assertRaisesRegex(OSError, 'Cannot save the launch identity'):
                             _ = finished.result(timeout=TEST_HANG_GUARD_SECS)
-                        self.assertTrue(termination_requested.is_set())
                     booking, = book.read_snapshot().gate_reservations
                     if hold_ledger:
                         self.assertIsInstance(booking.state, ledger.GateLaunchPending)
