@@ -23,10 +23,12 @@ from unittest.mock import patch
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.accounts import accounts, next_moves, role_map
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
-from scripts.whoami import agent_accounts
+from scripts.whoami import agent_accounts, usage_store
+from scripts.whoami.account_test_support import create_claude_account, stored_room
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
 ACCOUNT_SETTINGS = "next_move_percent=1\nusage_stale_minutes=10\n"
@@ -225,6 +227,7 @@ class AccountsPageTests(unittest.TestCase):
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = scratch / "config"
         self.review_root = scratch / "review"
+        _ = self.enterContext(patch.object(usage_store, "store_file", return_value=scratch / "home" / "usage.json"))
         _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
@@ -244,6 +247,46 @@ class AccountsPageTests(unittest.TestCase):
               patch.object(accounts_page, "cleared_quotas", return_value={}) as cleared):
             _ = accounts_page.page()
         cleared.assert_called_once_with(accounts_page.quota_state(self.review_root))
+
+    def test_next_accounts_response_shows_nav_quota_from_the_same_store(self) -> None:
+        home = self.review_root.parent / "home"
+        home.mkdir()
+        (home / ".claude").mkdir()
+        _ = (home / ".claude.json").write_text("{}")
+        configuration = Path(os.environ["CONF_DIR"])
+        write_machine_config(configuration)
+        cache = serve.AccountsPageCache()
+        login = "warning-fixture@example.invalid"
+        marker = b'data-quota-level="warning" data-quota-account="claude4"'
+        resets_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+        def render_fixture() -> accounts_page.AccountsRender:
+            return accounts_page.AccountsRender(accounts_page.page(), .5, time.time())
+
+        with (scratch_account_home(home, {"REVIEW_LINKS_ROOT": str(self.review_root),
+                  "AGENT_NOTES_DIR": str(home / "notes"), "USER_ZONE": "UTC"}),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected SSH")),
+              patch.object(accounts, "_read_local_role_sessions",
+                           return_value=accounts.LocalRoleSessions({}, {}, (), (), (), False, frozenset())),
+              patch.object(accounts, "_start_session_counts_fetch", return_value=False),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")),
+              patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", side_effect=render_fixture)):
+            create_claude_account("claude4", login)
+            self.assertTrue(usage_store.store_file().is_relative_to(home))
+            stored_room(login, 11, resets_at)
+            self.assertFalse(marker in cache.get())
+            self.assertEqual(accounts_page.nav_quota(self.review_root)["level"], accounts_page.QuotaLevel.NONE)
+
+            stored_room(login, 10, resets_at)
+            self.assertEqual(accounts_page.nav_quota(self.review_root),
+                             {"level": accounts_page.QuotaLevel.WARNING, "name": "Warning: 10% left"})
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertTrue(marker in reply)
 
     def test_quota_clear_survives_reset_time_drift_until_the_next_week(self) -> None:
         reset = AT + timedelta(days=1, microseconds=299911)
@@ -1249,10 +1292,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             content = accounts_page.page()
         content = content.replace(b'<div data-accounts>', b'<div data-accounts><p>board</p>')
         cache = serve.AccountsPageCache()
-        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time())):
-            good = cache.replace()
-        with patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")):
-            failed = cache.replace()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time()))):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure"))):
+            failed = cache.get()
         self.assertIn(b'data-read-error="The Accounts render failed."', failed)
         self.assertNotIn(b'private failure', failed)
         self.assertEqual(cache.page, good)
@@ -1265,10 +1311,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             content = accounts_page.page()
         content = content.replace(b'<div data-accounts>', b'<div data-accounts><p>board</p>')
         cache = serve.AccountsPageCache()
-        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time())):
-            good = cache.replace()
-        with patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")):
-            failed = cache.replace()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time()))):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure"))):
+            failed = cache.get()
         assert_status_states(self, good.decode(), 15, failed_markup=failed.decode())
 
     def test_render_runs_the_page_in_a_child_and_names_its_failure(self) -> None:

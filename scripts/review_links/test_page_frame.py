@@ -27,6 +27,7 @@ NO_DATA_FILE: dict[str, object] = {}
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
+    ("aws_machines", "AWS Machines", "server", "AWS Machines", 3900),
     ("builds", "Builds", "hammer", "Builds", 15),
     ("disks", "Disks", "hard-drive", "Disks", 600),
     ("images", "Images", "image", "Images", 45),

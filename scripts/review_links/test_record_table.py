@@ -187,9 +187,8 @@ class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str, *, query: str = '', closed_item: str = '',
                park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        _, start, callbacks = review_page.SCRIPT.partition('function matches(entry,')
-        callbacks = start + callbacks.split("\naddEventListener('scroll'", 1)[0]
-        callbacks = callbacks.replace('const view=createRecordTable(', 'const view=createStaticTable(')
+        _, start, rest = review_page.SCRIPT.partition('function allEntries(){')
+        table_script = start + rest.partition('\nasync function afterRowAnimations(')[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
                   + 'const queryString=' + json.dumps(query) + ';\n'
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
@@ -221,14 +220,12 @@ const rows=[
  {key:'other/C9',state:'Done',type:'change',owner:'two',parked:'false'},
 ].map((data,index)=>{
  const detail=element(),toggle=element(),row=element();
- return {...element(),dataset:{...data,order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()},
+ const dataset={...data,id:data.key,hiddenUntil:data.parked==='true' ? Date.now()+60000 : 0,
+  order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()};
+ return {...element(),dataset,
   querySelector:selector=>selector==='[data-detail]' ? detail : selector==='.list-toggle' ? toggle : row};
 });
-const index=new Map(rows.map(({dataset})=>{
- dataset.id=dataset.key;
- dataset.hiddenUntil=dataset.parked==='true' ? Date.now()+60000 : 0;
- return [dataset.key,dataset];
-}));
+const index=new Map(rows.map(({dataset})=>[dataset.key,dataset]));
 const table={append(){},addEventListener(){},getAttribute:()=> 'Review'};
 const content={
  dataset:{},addEventListener(){},
@@ -241,11 +238,12 @@ const document={createElement:element};
 const location={search:queryString,hash:fragment,pathname:'/console/review.html'};
 const history={replaceState(_state,_title,url){this.url=url;}};
 const window={},parent=window,pendingSaves=new Map(),saved=new Map();
-let selectedShow='all';
-const loadBodies=()=>{},allEntries=()=>[...index.values()];
-const summary=()=>{throw new Error('The static fixture must use its existing rows.');};
-function createStaticTable(options){return createRecordTable({...options,entries:undefined,mount:undefined});}
-''' + record_table.SCRIPT + review_legacy.SCRIPT + '\n' + callbacks + r'''
+const loadBodies=()=>{};
+''' + record_table.SCRIPT + review_legacy.SCRIPT + r'''
+const createTable=createRecordTable;
+{
+const createRecordTable=options=>createTable({...options,entries:undefined,mount:undefined});
+''' + table_script + r'''
 view.place();view.apply(false);
 if(parkOpenCard){
  view.opened.add('sdlc/C1830');view.apply(false);
@@ -270,6 +268,7 @@ console.log(JSON.stringify({
   return [value,(value || 'All')+' ('+chip.querySelector('b').textContent+')'];
  })),
 }));
+}
 '''
         result = subprocess.run([node, '-e', source], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)

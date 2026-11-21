@@ -708,6 +708,10 @@ function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
+function countChip(values,name,value,data,selection){
+ if(options.countFacet?.(name,data,selection,value)===false) return;
+ values[value]=(values[value] ?? 0)+1;
+}
 function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
  const data=item.dataset,visible=options.visible;
@@ -727,21 +731,20 @@ function matches(item,selection,counts,allowExpanded=false){
  }
  if(counts) for(const [name,field,,countMask] of options.filterFacets){
   if(excluded & countMask) continue;
-  if(options.countFacet && !options.countFacet(name,data,selection)) continue;
   const values=counts[name];
   // A change to Show ends the exception for an open read row.
   if(expanded && name==='show'){
-   if(!excluded) values[selection.show]=(values[selection.show] ?? 0)+1;
+   if(!excluded) countChip(values,name,selection.show,data,selection);
    continue;
   }
-  values.all=(values.all ?? 0)+1;
+  countChip(values,name,'all',data,selection);
   const raw=fieldValue(field);
   const value=filterChipValue(name,!options.encodedStaffFields && isStaffChipFilter(name) ? encodeIdentity(raw) : raw);
-  if(value!=='all') values[value]=(values[value] ?? 0)+1;
+  if(value!=='all') countChip(values,name,value,data,selection);
   const alternate=options.facetAlternates?.[name]?.(data);
   if(alternate && alternate!==raw){
    const other=filterChipValue(name,isStaffChipFilter(name) ? encodeIdentity(alternate) : alternate);
-   values[other]=(values[other] ?? 0)+1;
+   countChip(values,name,other,data,selection);
   }
  }
  return visible ? visible(data,selection) : !excluded;
@@ -782,7 +785,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- const active=currentSelection();
+ // Use the same time to check parking for the rows and counts.
+ const active=currentSelection({now:Date.now()});
  const counts=options.filterFacets && Object.fromEntries(options.filterFacets.map(([name])=>[name,Object.create(null)]));
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
@@ -967,6 +971,9 @@ function closeCard(key,write=true){
  measured.delete(key);
  if(write && location.hash===placeHash) writePlace();
 }
+function ownerChipSelection(selection,nextOwner){
+ return nextOwner===selection.owner ? selection : {...selection,owner:nextOwner,sourceOwner:''};
+}
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
  const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
@@ -982,7 +989,11 @@ function bind(){
   event.preventDefault();
   jump(key);
  });
- filterSelection('owner').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changeFilter();});
+ filterSelection('owner').bind(value=>{
+  const current=currentSelection(),next=ownerChipSelection(current,value);
+  if(next===current) return;
+  owner=next.owner;sourceOwner=next.sourceOwner;changeFilter();
+ });
  filterSelection('show').bind(value=>{if(value===show) return;show=value;changeFilter();});
  if(chipRow('type')) filterSelection('type').bind(value=>{if(value===type) return;type=value;changeFilter();});
  for(const name of filterNames)
@@ -1002,7 +1013,7 @@ function bind(){
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
 }
-return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
   const selection=currentSelection({query:normalizeWords(currentWords())});

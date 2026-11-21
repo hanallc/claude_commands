@@ -497,9 +497,6 @@ class ReviewSnapshotCache:
             self._wake.set()
         self._thread.start()
 
-    def _after_snapshot_update(self, _snapshot: ReviewSnapshot, /) -> None:
-        """Run background work after the worker publishes a snapshot."""
-
     def get(self) -> ReviewSnapshot:
         with self._condition:
             if isinstance(self._snapshot, SnapshotUnavailable) and self._thread.is_alive():
@@ -709,7 +706,6 @@ class ReviewSnapshotCache:
                     self._condition.notify_all()
                 checked = time.monotonic()
                 last_failure = None
-                self._after_snapshot_update(fresh)
             except Exception as error:
                 failure = ' '.join(str(error).splitlines())
                 if failure != last_failure:
@@ -1495,16 +1491,23 @@ const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null;
 function allEntries(){return [...index.values()];}
-function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
+function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
+function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
+function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys,now=Date.now()}){
  const linked=keys?.has(entry.key);
- return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
-  (!owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner) &&
+ return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=now) &&
+  matchesOwner(entry,owner) &&
   (!type || (type==='investigations' ? isInvestigation(entry) : entry.type===type)) &&
   (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
-function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
+function isListed(entry,filters){
+ const key=entry.key,departure=saved.get(key);
+ if(pendingSaves.get(key)?.departing) return false;
+ if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
+ return (!departure || departure.handed && entry.state!=='Open') && matches(entry,filters);
+}
 function savedEntry(key,result){
  if(result.state==='Done'){index.delete(key);return;}
  const entry=index.get(key);if(!entry) return;
@@ -1556,25 +1559,24 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  shows:showValues,
  staffChipFilters:['owner'],
  filterFacets:''' + json.dumps(FILTER_FACETS) + r''',
- eligibleChip:(entry,query,{keys})=>!pendingSaves.has(entry.key) && matches(entry,{query,keys}) ?
+ eligibleChip:(entry,query,{keys,now})=>isListed(entry,{query,keys,now}) ?
   (entry.state==='Open' ? 'open' : entry.state) : '',
  facetAlternates:{
   owner:entry=>isInvestigation(entry) ? entry.sourceOwner : '',
   type:entry=>isInvestigation(entry) ? 'investigations' : '',
  },
- countFacet:(name,entry,{sourceOwner})=>name==='owner' || !sourceOwner || entry.sourceOwner===sourceOwner,
- visible:(data,filters)=>{
-  const key=data.key,entry=index.get(key),departure=saved.get(key);
-  if(!entry || pendingSaves.get(key)?.departing) return false;
-  if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
-  return (!departure || departure.handed && entry.state!=='Open') && matches(entry,filters);
+ countFacet:(name,entry,filters,value)=>{
+  if(!filters.sourceOwner) return true;
+  const {sourceOwner}=name==='owner' ? view.ownerChipSelection(filters,value==='all' ? '' : staffChipId(value)) : filters;
+  return !sourceOwner || entry.sourceOwner===sourceOwner;
  },
+ visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
- applied:(_items,{type,show,owner,query,keys})=>{
+ applied:(_items,{type,show,owner,query,keys,now})=>{
   content.dataset.show=show;loadBodies();
   const owners=new Set([staffChipValue(owner)]);
   for(const entry of allEntries()){
-   if(!matches(entry,{type,query,keys})) continue;
+   if(!matches(entry,{type,query,keys,now})) continue;
    owners.add(staffChipValue(entry.owner));
    if(isInvestigation(entry)) owners.add(staffChipValue(entry.sourceOwner));
   }

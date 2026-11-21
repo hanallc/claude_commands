@@ -207,7 +207,10 @@ Each attempt reads the member's live account while it holds the row lock.
 The batch reads the current role map for a group move.
 A single-session move uses the explicit account.
 The batch keeps a member running when its live account matches the target.
-The batch validates the Claude destination again after build waits and before it sends stop signals.
+The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
+The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.
+The batch refuses a member if its live source read fails.
+The stop verifies the live source PID and process start time before it records the source and sends a signal.
 A refused destination leaves the members running and goes in the batch result.
 The handoff carries the group name or explicit account and the results already collected.
 The child saves and reports the carried failures even if a startup read fails.
@@ -594,6 +597,13 @@ These scoped stops preserve other saved rows.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
 It keeps only the row IDs whose starts failed.
+Before it stops a worker, restart checks the settings for that worker's assigned role.
+If the settings are invalid or unreadable, restart reports the role error and leaves the worker running.
+Restart checks the worker's current role under its row lock. If the role changed, restart leaves the worker running.
+Other selected rows continue through stop and restart.
+Worker restore uses the checked policy if the role still matches.
+A role write between the last restart check and restore can make restore refuse and leave the worker stopped.
+If this rare race occurs, a later restore recovers the worker when its role and the role's settings are valid.
 
 `agents restart ACCOUNT --all` selects live rows on that Claude or Codex account.
 It reads the account from each observed process environment.
@@ -778,6 +788,8 @@ A composer with a draft waits until the deadline without changes to the draft.
 Worker restore shares the command's run index and Codex snapshot through stopped-worker startup.
 Restore uses `worker_panes.worker_run` for run selection and fallback.
 Stop selects workers from their current staff parent.
+An owner restart excludes each worker whose role check failed from both stop and restore.
+An explicit stop without restart can stop workers with invalid role settings.
 
 An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
 Live or unknown evidence leaves the worker pending.
