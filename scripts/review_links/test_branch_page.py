@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from http.client import HTTPConnection
@@ -24,8 +24,10 @@ from uuid import NAMESPACE_URL, uuid5
 
 from scripts.agents import remote
 from scripts.lib import file_lock
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import branch_page, change_page, page_frame, serve
 
 
@@ -82,8 +84,11 @@ class ScratchBranches:
 
 @contextmanager
 def scratch_branches() -> Generator[ScratchBranches, None, None]:
-    with tempfile.TemporaryDirectory(prefix="branch-page-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="branch-page-test-") as temporary, ExitStack() as stack:
         root = Path(temporary)
+        stack.enter_context(patch.dict(os.environ, {
+            **fixture_git_environment(root), "GIT_ALLOW_PROTOCOL": "file",
+        }, clear=True))
         repository, origin = root / "repository", root / "origin.git"
         repository.mkdir()
         history = root / "history"
@@ -326,7 +331,7 @@ class BranchPageTests(unittest.TestCase):
                             self.assertIn(f'Merged into main: {dated_row.merge[:12]} · {merge_markup}', dated_content)
 
     def test_delete_reports_each_result_and_keeps_unchecked_branches(self) -> None:
-        for state in ("unchanged", "advanced"):
+        for state in ("unchanged", "advanced", "registered after page"):
             with self.subTest(state=state), scratch_branches() as fixture:
                 hook = fixture.origin / "hooks" / "update"
                 _ = hook.write_text('#!/bin/sh\nif [ "$1" = refs/heads/TEST-rejected ]; then\n'
@@ -337,14 +342,26 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("checkout", "TEST-merged")
                     _ = fixture.command("commit", "--allow-empty", "-m", "New work after publication")
                     _ = fixture.command("push", "origin", "TEST-merged")
+                if state == "registered after page":
+                    document = fixture.root / "late-production.md"
+                    _ = document.write_text("- **Merge branch:** TEST-merged\n")
+                    _ = fixture_member("showrunner", name="late-production",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
                 before = fixture.remote_names()
                 deletion = branch_page.submit(page, urlencode({"token": page.token,
                                                               "branch": ["TEST-rejected", "TEST-merged", "TEST-legacy"]}, doseq=True))
                 results = branch_page.delete_selected(deletion)
                 self.assertEqual([result.name for result in results], ["TEST-rejected", "TEST-merged", "TEST-legacy"])
                 self.assertIn("TEST deletion refused", results[0].message)
-                self.assertEqual([result.message for result in results[1:]], ["deleted", "deleted"])
-                self.assertEqual(fixture.remote_names(), before - {"TEST-merged", "TEST-legacy"})
+                if state == "advanced":
+                    self.assertIn("branch moved", results[1].message)
+                elif state == "registered after page":
+                    self.assertIn("production merge branch", results[1].message)
+                else:
+                    self.assertEqual(results[1].message, "deleted")
+                self.assertEqual(results[2].message, "deleted")
+                removed = {"TEST-merged", "TEST-legacy"} if state == "unchanged" else {"TEST-legacy"}
+                self.assertEqual(fixture.remote_names(), before - removed)
                 no_owner_page = fixture.page()
                 no_owner_rows = [row.name for row in no_owner_page.rows
                                  if isinstance(row, branch_page.MergedUnownedBranch)]

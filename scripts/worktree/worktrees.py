@@ -15,11 +15,11 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
-from scripts.lib import build_folders, git_files, scratch
+from scripts.lib import build_folders, git_files, origin_deletion, scratch
 from scripts.production import production_doc, session_staff, staff
 from scripts.agents import remote
 from scripts.production.production_names import CARGO_LINER_PRODUCTION
@@ -85,7 +85,7 @@ class CheckedLocalTip:
 @dataclass(frozen=True)
 class CleanupReady:
     local: CheckedLocalTip
-    origin: OriginBranchAbsent | CheckedOriginTip | Literal[production_doc.OriginRefRemoval.KEEP]
+    origin: OriginBranchAbsent | CheckedOriginTip
 
 
 class Refused(Exception):
@@ -303,11 +303,7 @@ def local_branch_tip(repo: Path, branch: str) -> LocalBranchAbsent | CheckedLoca
     return CheckedLocalTip(git(repo, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip())
 
 
-def origin_branch_state(
-    record: WorktreeRecord, removal: production_doc.OriginRefRemoval,
-) -> OriginBranchAbsent | CheckedOriginTip | Literal[production_doc.OriginRefRemoval.KEEP] | Kept:
-    if removal is production_doc.OriginRefRemoval.KEEP:
-        return removal
+def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedOriginTip | Kept:
     repo = Path(record.repo)
     remote_branch = git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{record.branch}").stdout
     if not remote_branch:
@@ -337,7 +333,7 @@ def cleanup(path: Path) -> CleanupReady | Kept:
         raise Refused(1, head.stderr.strip())
     branch = head.stdout.strip()
     try:
-        removal = production_doc.check_checkout_removal(path, path, branch)
+        production_doc.require_removable_checkout(path, path, branch)
     except production_doc.ProductionPathsError as error:
         return Kept(path, str(error))
     _ = git(path, "fetch", "--no-prune", "origin")
@@ -366,7 +362,7 @@ def cleanup(path: Path) -> CleanupReady | Kept:
     result = landed(record)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
-    origin = origin_branch_state(record, removal)
+    origin = origin_branch_state(record)
     if isinstance(origin, Kept):
         return origin
     if local_branch_tip(repo, branch) != local:
@@ -389,7 +385,7 @@ def release_worktree_pair(path: Path) -> None:
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
     try:
-        removal = production_doc.check_checkout_removal(path, repo, record.branch)
+        production_doc.require_removable_checkout(path, repo, record.branch)
     except production_doc.ProductionPathsError as error:
         return Kept(path, str(error))
     resolver = session_staff.RowResolver(snapshot)
@@ -416,7 +412,7 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))
         return Kept(path, f"work has not landed: {detail}")
-    origin = origin_branch_state(record, removal)
+    origin = origin_branch_state(record)
     if isinstance(origin, Kept):
         return origin
     cargo_mark = scratch.cargo_removal_mark(path.resolve())
@@ -426,12 +422,12 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         except (OSError, ValueError) as error:
             return Kept(path, f"Cargo output kept: {error}")
         if isinstance(origin, CheckedOriginTip):
-            deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
-                           "origin", "--delete", f"refs/heads/{record.branch}", check=False)
-            if deletion.returncode:
-                return Kept(path, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
-        elif origin is production_doc.OriginRefRemoval.KEEP:
-            print(f"Kept protected origin ref refs/heads/{record.branch}")
+            ref = f"refs/heads/{record.branch}"
+            deletion = origin_deletion.delete(repo, "origin", ref, origin.sha)
+            if isinstance(deletion, origin_deletion.Kept):
+                if deletion.cause is origin_deletion.RetentionCause.GIT_FAILURE:
+                    return Kept(path, f"origin branch deletion failed; the worktree stays: {deletion.reason}")
+                print(f"Kept origin ref {ref}: {deletion.reason}")
         registered = path in worktree_branches(repo)
         if local_branch_tip(repo, record.branch) != local:
             return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
@@ -548,6 +544,7 @@ def main() -> int:
     _ = protection.add_argument("path")
     _ = protection.add_argument("branch")
     _ = protection.add_argument("repository")
+    _ = protection.add_argument("--preview-origin", action="store_true")
     release = commands.add_parser("release-pair")
     _ = release.add_argument("path")
     retarget = commands.add_parser("cargo-liner-target")
@@ -568,12 +565,15 @@ def main() -> int:
         return 0
     if cast(str, arguments.command) == "protect-deletion":
         try:
-            removal = production_doc.check_checkout_removal(
-                Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), cast(str, arguments.branch))
+            branch = cast(str, arguments.branch)
+            production_doc.require_removable_checkout(
+                Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), branch)
+            if cast(bool, arguments.preview_origin):
+                reason = production_doc.origin_ref_protection(f"refs/heads/{branch}")
+                print("keep-origin" if reason else "delete-origin")
         except production_doc.ProductionPathsError as error:
             print(str(error), file=sys.stderr)
             return 1
-        print(removal.value)
         return 0
     if cast(str, arguments.command) == "release-pair":
         release_worktree_pair(Path(cast(str, arguments.path)).absolute())

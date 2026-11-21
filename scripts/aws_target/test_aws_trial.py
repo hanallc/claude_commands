@@ -35,8 +35,11 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
-from scripts.production import merge_gate
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.production import merge_gate, staff
+from scripts.agents import remote
+from scripts.lib import origin_deletion
+from scripts.production.staff_test_support import fixture_member
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -375,10 +378,11 @@ class PairedTrialTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
-        for name in tuple(os.environ):
-            if name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')):
-                del os.environ[name]
-        os.environ['GIT_CONFIG_GLOBAL'] = str(write_fixture_git_config(self.root))
+        record = self.root / 'staff.json'
+        _ = record.write_text('{"schema": 2, "rows": []}')
+        self.enterContext(mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root), 'STAFF_FILE': str(record), 'GIT_ALLOW_PROTOCOL': 'file',
+        }, clear=True))
         shipped = Path(__file__).resolve().parents[2]
         self.repo = self.root / 'repo'
         self.repo.mkdir()
@@ -585,6 +589,11 @@ class Sample(unittest.TestCase):
         }
         for name in expired | preserved:
             _ = trial.checked_git(self.repo, 'push', str(self.origin), self.base + ':refs/heads/' + name)
+        kept = next(name for name in expired if name.endswith('-base'))
+        expired.remove(kept)
+        doc = self.root / 'protected-sweep.md'
+        _ = doc.write_text(f'- **Merge branch:** {kept}\n')
+        _ = fixture_member('showrunner', name='sweep-protection', doc=staff.LiveDoc(remote.local_machine(), doc))
         before = self.remote_branches()
         expected = {ref: commit for ref, commit in before.items() if ref.removeprefix('refs/heads/') not in expired}
 
@@ -857,26 +866,35 @@ else:
         self.assertEqual(self.remote_branches(), branches)
 
     def test_delete_failure_names_branch_once_and_keeps_trial_status(self) -> None:
-        git = trial.checked_git
-        for status in (0, 7):
-            with self.subTest(status=status):
+        delete = origin_deletion.delete
+        for status, protected in ((0, False), (7, False), (0, True)):
+            with self.subTest(status=status, protected=protected):
                 branches = self.remote_branches()
-                refused: list[str] = []
+                retained: list[str] = []
 
-                def refuse_delete(repo: Path, *arguments: str) -> str:
-                    if arguments[0] == 'push' and '--delete' in arguments and arguments[-1].endswith('-base'):
-                        refused.append(arguments[-1])
-                        raise subprocess.CalledProcessError(1, ['git', *arguments])
-                    return git(repo, *arguments)
+                def service(_command: Sequence[str], _unit: str) -> int:
+                    branch, = (ref for ref in self.remote_branches().keys() - branches.keys() if ref.endswith('-base'))
+                    retained.append(branch)
+                    if protected:
+                        doc = self.root / 'protected-trial.md'
+                        _ = doc.write_text(f"- **Merge branch:** {branch.removeprefix('refs/heads/')}\n")
+                        _ = fixture_member('showrunner', name='trial-protection', doc=staff.LiveDoc(remote.local_machine(), doc))
+                    return status
+
+                def refuse_delete(repo: Path, destination: str, ref: str, expected: str, *, timeout: float = 30
+                                  ) -> origin_deletion.Deleted | origin_deletion.Absent | origin_deletion.Kept:
+                    if not protected and retained == [ref]:
+                        return origin_deletion.Kept('fixture deletion failed', origin_deletion.RetentionCause.GIT_FAILURE)
+                    return delete(repo, destination, ref, expected, timeout=timeout)
 
                 errors = StringIO()
-                with (mock.patch.object(trial, 'checked_git', side_effect=refuse_delete),
-                      mock.patch.object(trial, 'paired_service', return_value=status), redirect_stderr(errors)):
+                with (mock.patch.object(origin_deletion, 'delete', side_effect=refuse_delete),
+                      mock.patch.object(trial, 'paired_service', side_effect=service), redirect_stderr(errors)):
                     self.assertEqual(self.invoke_trial(), status)
-                self.assertEqual(len(refused), 1)
-                self.assertEqual(errors.getvalue().splitlines(), [
-                    'paired trial: could not delete branch ' + refused[0].removeprefix('refs/heads/')])
-                self.assertEqual(self.remote_branches(), {**branches, refused[0]: self.base})
+                self.assertEqual(len(retained), 1)
+                reason = 'trial-protection uses this production merge branch' if protected else 'fixture deletion failed'
+                self.assertEqual(errors.getvalue().splitlines(), [f'paired trial: kept {retained[0]}: {reason}'])
+                self.assertEqual(self.remote_branches(), {**branches, retained[0]: self.base})
 
     def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
         for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):

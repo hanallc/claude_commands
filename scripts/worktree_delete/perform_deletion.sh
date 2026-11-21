@@ -33,8 +33,8 @@ DELETION_REPOSITORY="$PWD"
 if [[ -n "$MAIN_WORKTREE" && -d "$MAIN_WORKTREE" ]]; then
     DELETION_REPOSITORY="$MAIN_WORKTREE"
 fi
-ORIGIN_REMOVAL=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
-    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$DELETION_REPOSITORY")
+"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
+    protect-deletion "$WORKTREE_PATH" "$BRANCH_NAME" "$DELETION_REPOSITORY"
 
 HAS_CONFIRMATION=false
 CHECKED_LOCAL_TIP=""
@@ -106,7 +106,7 @@ if [[ -z "$MAIN_WORKTREE" || "$DELETION_REPOSITORY" != "$MAIN_WORKTREE" ]]; then
 fi
 cd "$DELETION_REPOSITORY"
 
-if [[ "$ORIGIN_REMOVAL" == delete-origin && "$HAS_CONFIRMATION" == true ]]; then
+if [[ "$HAS_CONFIRMATION" == true ]]; then
     REMOTE_NAMES=$(git remote)
     if [[ " ${REMOTE_NAMES//$'\n'/ } " == *" origin "* ]]; then
         if ! ORIGIN_BRANCH=$(git ls-remote --heads origin "$BRANCH_REF"); then
@@ -117,15 +117,12 @@ if [[ "$ORIGIN_REMOVAL" == delete-origin && "$HAS_CONFIRMATION" == true ]]; then
     fi
 fi
 
-if [[ "$ORIGIN_REMOVAL" == keep-origin ]]; then
-    echo "Kept protected origin ref $BRANCH_REF"
-elif [[ "$ORIGIN_REMOVAL" == delete-origin && -n "$CHECKED_ORIGIN_TIP" ]]; then
-    echo "Deleting origin/$BRANCH_NAME"
-    if ! git push "--force-with-lease=$BRANCH_REF:$CHECKED_ORIGIN_TIP" origin --delete "$BRANCH_REF"; then
+if [[ -n "$CHECKED_ORIGIN_TIP" ]]; then
+    if ! "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/origin_deletion.py" \
+        "$DELETION_REPOSITORY" origin "$BRANCH_REF" "$CHECKED_ORIGIN_TIP"; then
         echo "Error: origin branch deletion failed; the worktree and local branch stay."
         exit 1
     fi
-    echo "Remote branch deleted."
 fi
 
 "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"

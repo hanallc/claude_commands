@@ -25,6 +25,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
 from scripts.lint.memory_test_support import config_environment
+from scripts.production import staff
 from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.production.test_production_doc import enrolled_document
 
@@ -120,7 +121,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = (self.repository / "code.txt").write_text("base\n")
         document = self.repository / "docs/production.md"
         document.parent.mkdir()
-        _ = document.write_text("# Fixture production\n")
+        _ = document.write_text("# Fixture production\n- **Merge branch:** integration\n")
         _ = (self.repository / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
         _ = self.git(self.repository, "add", ".")
         _ = self.git(self.repository, "commit", "-m", "Create the fixture")
@@ -320,7 +321,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertEqual(lease["purpose"], tree.name)
 
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
-        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config"):
+        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config", "protected-origin"):
             with self.subTest(branch=branch):
                 if branch != "checkpoint":
                     self.setUp()
@@ -346,6 +347,14 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
                 if branch == "without-branch-config":
                     _ = self.git(self.repository, "config", "--local", "--remove-section", f"branch.{branch}")
+                before = self.git(self.origin, "rev-parse", f"refs/heads/{branch}")
+                if branch == "protected-origin":
+                    document = self.root / "other-production.md"
+                    _ = document.write_text(f"- **Merge branch:** {branch}\n")
+                    with patch.dict(os.environ, self.environment, clear=True):
+                        identity = staff.StaffId(str(uuid4()))
+                        _ = staff.ensure("showrunner", name="other", runtime_id=identity,
+                                         doc=staff.LiveDoc(socket.gethostname().split(".", 1)[0], document))
                 cleanup = self.cleanup_result(tree)
                 self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
                 self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
@@ -356,7 +365,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "checkpoint\n")
                 else:
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "later target work\n")
-                self.assert_ended(tree, branch)
+                if branch == "protected-origin":
+                    self.assertFalse(tree.exists())
+                    self.assertFalse(self.record_path(tree).exists())
+                    self.assertEqual(self.git(self.repository, "branch", "--list", branch), "")
+                    self.assertEqual(self.git(self.origin, "rev-parse", f"refs/heads/{branch}"), before)
+                else:
+                    self.assert_ended(tree, branch)
 
     def test_cherry_picked_content_ends_under_a_different_commit_hash(self) -> None:
         tree, branch = self.trees / "cherry", "cherry"

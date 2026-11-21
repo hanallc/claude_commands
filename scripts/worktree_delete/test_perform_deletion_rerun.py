@@ -103,12 +103,20 @@ class DeletionRerunTests(unittest.TestCase):
                 ("different basenames", False, ""),
                 ("file and SSH access", True, ""),
                 ("HTTPS and SSH access", True, ""),
-                ("wrapped registration", True, ""))):
+                ("wrapped registration", True, ""),
+                ("unresolved registration", True, ""))):
             with self.subTest(case=case, confirmed=confirmed):
                 upstream = other_origin if case == "unrelated repository with the same origin ref" else origin
                 host = other_host if upstream == other_origin else local
                 location = staff.WrappedDoc(host, doc) if case == "wrapped registration" else staff.LiveDoc(host, doc)
                 _ = staff.set_doc(owner.id, location)
+                unresolved_id = ""
+                if case == "unresolved registration":
+                    unresolved = self.root / "unresolved.md"
+                    _ = unresolved.write_text("# Unresolved registration\n")
+                    unresolved_id = str(fixture_member("showrunner", name="unresolved", doc=staff.LiveDoc(local, unresolved)).id)
+                    _ = staff.set_doc(owner.id, staff.WrappedDoc(local, self.root / "retained.md"))
+                    _ = (self.root / "retained.md").write_text("- **Merge branch:** retained\n")
                 if case == "local worktree":
                     checkout, worktree = repo, tree
                 else:
@@ -143,7 +151,9 @@ class DeletionRerunTests(unittest.TestCase):
                     self.assertIn('"keep_origin": true', validation.stdout)
                     self.assertIn('"has_remote_branch": false', validation.stdout)
                     self.assertIn('"cleanup": true', validation.stdout)
-                    self.assertIn("Kept protected origin ref refs/heads/integration", result.stdout)
+                    self.assertIn("Kept origin ref refs/heads/integration", result.stdout)
+                    if case == "unresolved registration":
+                        self.assertIn(unresolved_id, result.stdout)
                     self.assertEqual(git(checkout, "branch", "--list", "integration"), "")
                 self.assertEqual(tuple(git(folder, *pattern) for folder in protected_repos), protected_refs)
                 if case == "missing staff record":

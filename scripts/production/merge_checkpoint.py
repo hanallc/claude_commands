@@ -36,7 +36,7 @@ from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktrees
-from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
+from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, origin_deletion, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -477,13 +477,9 @@ def branch_is_landed(checkout: Path, tip: str, target: str) -> bool:
     return all(line.startswith("- ") for line in patches.splitlines())
 
 
-def branch_keep_reason(request: MergeRequest, branch: str) -> str:
-    """Keep main, production merge branches, and branches with a present owner."""
-    if branch == "main":
-        return "main is long-lived"
-    if branch == request.production.merge_branch:
-        return "the production merge branch is long-lived"
-    record = request.staff_record if request.staff_record is not None else staff.snapshot()
+def branch_keep_reason(branch: str) -> str:
+    """Keep branches with a present owner during checkpoint cleanup."""
+    record = staff.authority_snapshot()
     resolver = session_staff.RowResolver(record)
     for row in record.rows:
         # A producer's worktree is its launch folder; it holds no branch of this repository.
@@ -493,12 +489,6 @@ def branch_keep_reason(request: MergeRequest, branch: str) -> str:
                 return f"{row.name}: owner branch is unreadable"
             if owner_branch.name == branch:
                 return f"{row.name} has a present worktree on this branch"
-        if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
-            doc = resolver.production_doc(row)
-            if not isinstance(doc, session_staff.ProductionDoc):
-                return f"{row.name}: {doc.reason}"
-            if production_field(doc.text.splitlines(), "Merge branch") == branch:
-                return f"{row.name} uses this production merge branch"
     return ""
 
 
@@ -507,9 +497,6 @@ def delete_landed_branch(request: MergeRequest, branch: str, tip: str) -> None:
     if isinstance(request.promotion, production_doc.NoPromotion):
         return
     try:
-        if reason := branch_keep_reason(request, branch):
-            checkpoint_gate.report("branch", "kept", f"origin/{branch}: {reason}")
-            return
         checkout = request.production.checkout
         ref = f"refs/remotes/origin/{branch}"
         _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main",
@@ -521,12 +508,13 @@ def delete_landed_branch(request: MergeRequest, branch: str, tip: str) -> None:
         if not branch_is_landed(checkout, branch_tip, "origin/main"):
             checkpoint_gate.report("branch", "kept", f"origin/{branch}: work has not reached main")
             return
-        deleted = git(checkout, "push", f"--force-with-lease=refs/heads/{branch}:{branch_tip}",
-                      "origin", "--delete", branch)
-        if deleted.returncode:
-            checkpoint_gate.report("branch", "kept",
-                                   f"origin/{branch}: delete failed or branch moved; {failure_detail(deleted)}".replace("\n", "; "))
-        else:
+        if reason := branch_keep_reason(branch):
+            checkpoint_gate.report("branch", "kept", f"origin/{branch}: {reason}")
+            return
+        result = origin_deletion.delete(checkout, "origin", f"refs/heads/{branch}", branch_tip)
+        if isinstance(result, origin_deletion.Kept):
+            checkpoint_gate.report("branch", "kept", f"origin/{branch}: {result.reason}".replace("\n", "; "))
+        elif isinstance(result, origin_deletion.Deleted):
             checkpoint_gate.report("branch", "deleted", f"origin/{branch}")
     except (checkpoint_gate.Stop, OSError, ValueError, Refusal, staff.StaffRefused) as error:
         checkpoint_gate.report("branch", "kept", f"origin/{branch}: {error}".replace("\n", "; "))

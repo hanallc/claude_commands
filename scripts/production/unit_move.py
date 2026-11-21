@@ -130,33 +130,6 @@ def remote_tip(checkout: Path, branch: str) -> str:
     return listed.split("\t", 1)[0] if listed else ""
 
 
-def delete_remote_branch(checkout: Path, branch: str, tip: str) -> None:
-    remote = remote_tip(checkout, branch)
-    if remote:
-        if remote != tip:
-            try:
-                _ = git(checkout, "merge-base", "--is-ancestor", remote, tip)
-            except RenameRefused as error:
-                raise RenameRefused(f"origin branch {branch} has history outside the preserved tip") from error
-        # The lease deletes only the tip just checked: a push that lands meanwhile keeps the branch.
-        _ = git(checkout, "push", f"--force-with-lease=refs/heads/{branch}:{remote}", "origin", "--delete", branch)
-
-
-def delete_local_branch(checkout: Path, branch: str, tip: str) -> None:
-    local = branch_tip(checkout, branch)
-    if local:
-        if local != tip:
-            raise RenameRefused(f"branch {branch} moved during the rename")
-        _ = git(checkout, "update-ref", "-d", f"refs/heads/{branch}", tip)
-        _ = subprocess.run(["git", "-C", str(checkout), "config", "--remove-section", f"branch.{branch}"],
-                           capture_output=True, check=False)
-
-
-def delete_branch(checkout: Path, branch: str, tip: str) -> None:
-    delete_remote_branch(checkout, branch, tip)
-    delete_local_branch(checkout, branch, tip)
-
-
 def check_tip(checkout: Path, branch: str, tip: str) -> None:
     current = branch_tip(checkout, branch)
     if current and current != tip:

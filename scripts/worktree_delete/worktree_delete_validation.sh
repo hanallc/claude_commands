@@ -45,7 +45,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if ! ORIGIN_REMOVAL=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
-    protect-deletion "$SELECTED_WORKTREE" "$TARGET_BRANCH" "$SELECTED_WORKTREE" 2>&1); then
+    protect-deletion "$SELECTED_WORKTREE" "$TARGET_BRANCH" "$SELECTED_WORKTREE" --preview-origin 2>&1); then
     "$SCRIPT_DIR/../lib/py" -c 'import json, sys; print(json.dumps({"status": "error", "message": sys.argv[1]}))' \
         "$ORIGIN_REMOVAL"
     exit 1

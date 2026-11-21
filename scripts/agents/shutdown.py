@@ -46,11 +46,12 @@ from scripts.production import (
     unit_names,
 )
 from scripts.production.production_doc import (
-    FieldPresent, OriginRefRemoval, Production, ProductionPathsError, Refusal, check_checkout_removal,
+    FieldPresent, Production, ProductionPathsError, Refusal, require_removable_checkout,
     live_paths_lock_file, optional_field, read_new_production, read_production, remember_document_rename,
 )
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.production.unit_move import RenameRefused, read_json, write_json
+from scripts.lib import origin_deletion
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.worktree.worktrees import release_worktree_pair
 from scripts.agents import (
@@ -1282,7 +1283,7 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
     try:
-        removal = check_checkout_removal(unit.worktree, unit.production.checkout, unit.branch)
+        require_removable_checkout(unit.worktree, unit.production.checkout, unit.branch)
     except ProductionPathsError as error:
         return [str(error)]
     failed: list[str] = []
@@ -1297,17 +1298,19 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
             if result.returncode:
                 failed.append(retirement_failure(result))
-        if removal is OriginRefRemoval.KEEP:
-            print(f"Kept protected origin ref refs/heads/{unit.branch}")
-            return failed
         ref = f"refs/heads/{unit.branch}"
         observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", ref, settings=settings)
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
         if observed.returncode == 0:
-            result = retirement_git(unit, "push", "-q", "origin", "--delete", ref, settings=settings)
-            if result.returncode:
-                failed.append(retirement_failure(result))
+            limit = min(settings.number("RETIRE_COMMAND_TIMEOUT_SECONDS"),
+                        worker_lifecycle.effective_deadline() - time.monotonic())
+            result = origin_deletion.delete(unit.production.checkout, "origin", ref,
+                                            observed.stdout.split()[0], timeout=limit)
+            if isinstance(result, origin_deletion.Kept):
+                print(f"Kept origin ref {ref}: {result.reason}")
+                if result.cause is origin_deletion.RetentionCause.GIT_FAILURE:
+                    failed.append(result.reason)
     return failed
 
 def retirement_release_reservations(unit: RetiringUnit, *, settings: conf.ConfigRead) -> None:

@@ -22,8 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.lib import build_folders
 from scripts.direct import plan_history
 from scripts.agents import remote
-from scripts.lib import atomic_file, file_lock, unit_runs
-from scripts.lib.process_failure import failure_detail
+from scripts.lib import atomic_file, file_lock, origin_deletion, unit_runs
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
 from scripts.review_links import change_page, review_link
@@ -514,22 +513,17 @@ def submit(page: BranchPage, body: str) -> BranchDeletion:
 
 
 def delete_selected(deletion: BranchDeletion) -> tuple[DeleteResult, ...]:
-    try:
-        resolver = session_staff.RowResolver(staff.snapshot())
-        protected, _ = production_branches(resolver, RepositoryScope(deletion.page.repository))
-    except (OSError, ValueError, Refusal, subprocess.SubprocessError, staff.StaffRefused) as error:
-        return tuple(DeleteResult(name, f"cannot verify protected branches: {error}") for name in deletion.selected)
+    tips = {row.name: row.tip for row in deletion.page.rows}
     results: list[DeleteResult] = []
     for name in deletion.selected:
-        if name in protected:
-            results.append(DeleteResult(name, "kept: protected branch"))
-            continue
-        try:
-            result = git(deletion.page.repository, "push", "origin", "--delete", "--", name)
-            message = "deleted" if result.returncode == 0 else failure_detail(result)
-            results.append(DeleteResult(name, message))
-        except OSError as error:
-            results.append(DeleteResult(name, str(error)))
+        result = origin_deletion.delete(deletion.page.repository, "origin", f"refs/heads/{name}", tips[name])
+        if isinstance(result, origin_deletion.Kept):
+            message = f"kept: {result.reason}"
+        elif isinstance(result, origin_deletion.Deleted):
+            message = "deleted"
+        else:
+            message = "already absent"
+        results.append(DeleteResult(name, message))
     return tuple(results)
 
 

@@ -77,7 +77,19 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         settings_path = self.root / "production.conf"
         _ = settings_path.write_text("# range: 0.01..\nRETIRE_COMMAND_TIMEOUT_SECONDS=5\n")
         settings = conf.read(settings_path)
-        for target, branch, kept in ((self.integration, "integration", True), (staging, "staging", False)):
+        collision = self.root / "collision"
+        _ = self.git("worktree", "add", "-qb", "collision", str(collision))
+        _ = self.git("push", "-q", "origin", "collision")
+        peer = self.root / "peer"
+        _ = self.git("clone", "-qb", "collision", str(origin), str(peer))
+        other_doc = peer / "other-production.md"
+        _ = other_doc.write_text(f"- **Merge branch:** collision\n- **Showrunner checkout:** `{peer}`\n")
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc(remote.local_machine(), other_doc))
+        for target, branch, kept, keep_origin in (
+            (self.integration, "integration", True, True),
+            (staging, "staging", False, False),
+            (collision, "collision", False, True),
+        ):
             with self.subTest(branch=branch):
                 result = shutdown.retirement_remove(shutdown.RetiringUnit(production, unit.name, target, branch, unit),
                                                     settings=settings)
@@ -87,7 +99,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
                     self.assertEqual(result, [])
                 self.assertEqual(target.exists(), kept)
                 self.assertEqual(bool(self.git("branch", "--list", branch)), kept)
-                self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), kept)
+                self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), keep_origin)
         self.assertTrue(self.integration.is_dir())
         self.assertTrue(self.git("branch", "--list", "integration"))
         self.assertTrue(self.git("ls-remote", "--heads", "origin", "integration"))

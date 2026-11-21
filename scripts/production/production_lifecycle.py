@@ -24,7 +24,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import ci_points, investigation, session_staff, staff, unit_config
 from scripts.agents import pane_record, stop_resume
-from scripts.lib import git_files, land_main, main_publish, main_push_lock, main_sync
+from scripts.lib import git_files, land_main, main_publish, main_push_lock, main_sync, origin_deletion
 from scripts.herdr import herdr, worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -852,11 +852,43 @@ def wrap_production(name: str) -> Production:
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
         for before, after in zip(renames[1::3], renames[2::3]):
             if checkout / before == source:
-                document = production_doc.read_new_production(checkout / after, owner.name)
+                document = production_doc.read_new_production(checkout / after, owner.name, infer_legacy_branch=True)
                 production = document.for_owner(owner)
                 if archived_doc(replace(production, doc=source)) == production.doc:
                     return production
+    if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        return production_doc.read_new_production(owner.doc.path, owner.name, infer_legacy_branch=True).for_owner(owner)
     return read_production(owner)
+
+
+def record_wrap_merge_branch(production: Production) -> None:
+    """Keep the resolved branch in the production record before removing worktrees."""
+    before = production.doc.read_bytes()
+    document = before.decode("utf-8")
+    lines = document.splitlines()
+    field = production_doc.optional_field(lines, "Merge branch")
+    if isinstance(field, production_doc.FieldPresent) and (saved := production_doc.cell_value(field.text)):
+        if saved != production.merge_branch:
+            raise LifecycleStop("retire", "held", f"{production.doc}: Merge branch changed to {saved}")
+        return
+    head = git_files.head(git_files.at(production.checkout))
+    if head != git_files.OnBranch(production.merge_branch):
+        raise LifecycleStop("retire", "held", f"{production.checkout}: expected {production.merge_branch}")
+    line = f"- **Merge branch:** `{production.merge_branch}`"
+    if isinstance(field, production_doc.FieldPresent):
+        updated = re.sub(r"(?m)^- \*\*Merge branch:\*\*[^\r\n]*", lambda _match: line, document, count=1)
+    else:
+        separator = "\r\n" if "\r\n" in document else "\n"
+        checkout_field = re.search(r"(?m)^- \*\*Showrunner checkout:\*\*", document)
+        if checkout_field is None:
+            raise LifecycleStop("retire", "held", f"{production.doc}: Showrunner checkout is missing")
+        position = checkout_field.start()
+        updated = document[:position] + line + separator + document[position:]
+    if production.doc.read_bytes() != before:
+        raise LifecycleStop("retire", "held", f"{production.doc}: changed while recording Merge branch")
+    write_text_atomic(production.doc, updated)
+    report("retire", "ok", f"recorded Merge branch {production.merge_branch}")
+
 
 
 def retire_reservations(worktree: Path) -> None:
@@ -1086,6 +1118,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, checked_tip=CommitVerdict(tip))
     if isinstance(status, ProductionRunning):
         _ = capture_release(production.name, record=record)
+    record_wrap_merge_branch(production)
     for item in prepared:
         unit = item.unit
         require_retirable_worktrees(production, (unit,))
@@ -1108,10 +1141,14 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             # The preparation check also accepts equal patches after a cherry-pick.
             _ = checked(production.checkout, "retire", "branch", "-D", unit.branch)
             report("retire", "ok", f"deleted local {unit.branch}")
-        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
+        ref = f"refs/heads/{unit.branch}"
+        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", ref)
         if remote.returncode == 0:
-            _ = checked(production.checkout, "retire", "push", "origin", "--delete", unit.branch)
-            report("retire", "ok", f"deleted origin/{unit.branch}")
+            result = origin_deletion.delete(production.checkout, "origin", ref, remote.stdout.split()[0])
+            if isinstance(result, origin_deletion.Kept):
+                report("retire", "kept", f"{ref} on origin: {' '.join(result.reason.splitlines())}")
+            elif isinstance(result, origin_deletion.Deleted):
+                report("retire", "ok", f"deleted origin/{unit.branch}")
         elif remote.returncode != 2:
             raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
     held = retire_wrap_rows(rows, record, runner) or held
@@ -1145,6 +1182,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if isinstance(current_status, ProductionRunning):
                 updated = re.sub(r"(?m)^> \*\*Status: PRODUCTION — running\.\*\*",
                                  "> **Status: PRODUCTION — wrapped.**", document, count=1)
+                if production.doc.read_text(encoding="utf-8", newline="") != document:
+                    raise LifecycleStop("wrap", "held", f"{production.doc}: changed while marking it wrapped")
                 write_text_atomic(production.doc, updated)
     doc_paths = [] if enrolled else [doc_path_in_checkout(production, production.doc)]
     archive = None if enrolled else archived_doc(production)
