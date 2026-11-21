@@ -23,7 +23,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
+from scripts.lib import build_folders, cargo_seed, conf, git_files, removal_guard, scratch
 from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lint.config_test_support import SWEEP_SCAN_SETTINGS
@@ -157,11 +157,19 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout.strip()
 
-    def finish_landed(self) -> list[EndResult]:
+    def finish_landed(self, *, reviewed: tuple[Path, ...] = ()) -> list[EndResult]:
         python = self.home / ".claude/scripts/lib/py"
         result = self.command(self.repository, [str(python), "-c", END_LANDED,
                                                str(self.repository), "integration"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        plans = [Path(line.removeprefix("removal list: ")) for line in result.stdout.splitlines()
+                 if line.startswith("removal list: ")]
+        rows: list[removal_guard.ListedEntry] = []
+        for plan in plans:
+            self.assertEqual(plan.parent, self.home / removal_guard.LIST_DIRECTORY)
+            rows.extend(removal_guard.ListedEntry.parse(line) for line in plan.read_text().splitlines())
+        self.assertEqual([(row.tool, row.path, row.fingerprint) for row in rows],
+                         [(removal_guard.Tool.CARGO, path, "") for path in reviewed])
         payload = next(line.removeprefix("RESULT=") for line in result.stdout.splitlines()
                        if line.startswith("RESULT="))
         return cast(list[EndResult], json.loads(payload))
@@ -348,13 +356,14 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(cargo_seed.seed_limits(conf.read(config), host), limits)
         return tree, build, limits
 
-    def test_landed_worktree_removes_its_external_cargo_seed(self) -> None:
+    def test_landed_worktree_lists_its_external_cargo_seed(self) -> None:
         tree, build, _limits = self.landed_cargo_worktree()
         file = build / "debug/deps/libportable-1234567890abcdef.rlib"
         file.parent.mkdir(parents=True)
         _ = file.write_text("seed")
-        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
-        self.assertFalse(build.exists())
+        self.assertEqual(self.finish_landed(reviewed=(build,)),
+                         [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertEqual(file.read_text(), "seed")
         self.assertFalse(scratch.cargo_removal_mark(tree).exists())
         self.assert_ended(tree, "seeded")
 
@@ -369,14 +378,15 @@ class WorktreeLifecycleTests(unittest.TestCase):
                            + '    echo "fixture refuses worktree remove" >&2\n    exit 1\nfi\n'
                            + f'exec {shlex.quote(real_git)} "$@"\n')
         git.chmod(0o755)
-        self.assertEqual(self.finish_landed(), [{"kind": "Kept", "path": str(tree),
-                                                "detail": "stderr: fixture refuses worktree remove"}])
+        self.assertEqual(self.finish_landed(reviewed=(build,)), [{"kind": "Kept", "path": str(tree),
+                                                                 "detail": "stderr: fixture refuses worktree remove"}])
         marker = scratch.cargo_removal_mark(tree)
         self.assertIn(str(build), marker.read_text())
-        self.assertFalse(build.exists())
+        self.assertTrue(build.is_dir())
         self.assertTrue(tree.is_dir())
         git.unlink()
-        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertEqual(self.finish_landed(reviewed=(build,)),
+                         [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
         self.assertFalse(marker.exists())
         self.assert_ended(tree, "seeded")
 
@@ -418,8 +428,9 @@ class WorktreeLifecycleTests(unittest.TestCase):
             for directory in (override, outside)
         ])
 
-        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
-        self.assertFalse(default.exists())
+        self.assertEqual(self.finish_landed(reviewed=(default,)),
+                         [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertEqual((default / "contents").read_text(), default.name)
         self.assertEqual((override / "contents").read_text(), "override")
         self.assertEqual((outside / "contents").read_text(), "downloads")
         self.assertFalse(mark.exists())

@@ -25,7 +25,7 @@ from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
 
 def _release_folder(path: Path) -> None:
@@ -38,16 +38,25 @@ class BuildFolderTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        private = Path(tempfile.mkdtemp(prefix="build-folders-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, private)
+        self.root = private / "case"
+        self.root.mkdir()
+        config = Path(self.enterContext(tempfile.TemporaryDirectory(dir=private)))
+        environment = fixture_git_environment(private)
+        _ = environment.pop("STAFF_CONFIG", None)
         _ = write_config_fixture(config / "build_folders.conf", defaults=workspace_folder_settings(self.root))
+        copies_settings = config / "copies.conf"
+        _ = write_config_fixture(copies_settings, defaults=f"git_timeout_seconds={TEST_HANG_GUARD_SECS}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **environment,
             **config_environment(config), "TMPDIR": str(self.root), copy_record.ROOT_ENV: str(self.root / "scratch"),
+            "COPIES_CONFIG": str(copies_settings),
             copy_record.COPIES_ENV: str(self.root / "copies"),
             scratch.HOLDS_ENV: str(self.root / "holds.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-        })))
+        }, clear=True)))
         write_scratch_settings(config, self.root)
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1625,8 +1634,8 @@ assert not loaded, loaded
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:folder-test")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-        self.assertEqual(scratch.end("gate:folder-test"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:folder-test")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_cli_preserves_spaces_existing_permissions_and_the_one_path_output(self) -> None:
         parent = self.root / "shell parent"
@@ -1681,8 +1690,8 @@ assert not loaded, loaded
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:shell-folder")
-        self.assertEqual(scratch.end("gate:shell-folder"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:shell-folder")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_names_cannot_escape_the_explicit_parent(self) -> None:
         for name in ("..", "../escape", "/absolute", "bad\x00name"):

@@ -29,6 +29,7 @@ NO_DATA_FILE: dict[str, object] = {}
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
+    ("aws_machines", "AWS Machines", "server", "AWS Machines", 3900),
     ("builds", "Builds", "hammer", "Builds", 15),
     ("disks", "Disks", "hard-drive", "Disks", 600),
     ("images", "Images", "image", "Images", 45),
@@ -38,6 +39,7 @@ STATUS_PAGES = (
 PAGE_MODULES = {
     "accounts": "scripts.review_links.accounts_page",
     "aws": "scripts.aws_target.aws_page",
+    "aws_machines": "scripts.aws_target.machines_page",
     "builds": "scripts.build_queue.memory_feed",
     "disks": "scripts.disks.disks_page",
     "images": "scripts.review_links.images",
@@ -112,6 +114,7 @@ class PageStatusTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"
         _ = write_config_fixture(config, defaults="page.list.owner=owner\nowner.default=default\n")
+        _ = write_config_fixture(root / "statusline.conf", defaults="role.showrunner=teal\n")
         document = root / "remote" / "production.md"
         live = staff.LiveDoc("natedev", document)
         parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "Nearest", staff.STAFF_ROOT,
