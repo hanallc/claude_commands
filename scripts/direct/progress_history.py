@@ -7381,7 +7381,13 @@ def _drop_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
     return passes
 
 
-def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> None:
+def _clear_run_pointer(session_dir: Path, state: dict[str, object], *, record: staff.StaffSnapshot) -> None:
+    # The hook still needs the run pointer to save the completion record.
+    for passed in _pass_slots(state).values():
+        if dispatch_delivery(passed).actions.finish_run:
+            completion = hook_completion(passed)
+            if isinstance(completion, HookCompletion) and not completion.finished:
+                return
     folder = session_dir.resolve()
     for row in record.rows:
         if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == folder:
@@ -7402,11 +7408,11 @@ def _finish_run(args: argparse.Namespace) -> InterruptedWorkerPasses:
     state = _read_state(session_dir, record=record)
     passes = InterruptedWorkerPasses(tuple(dict.fromkeys(interrupted)))
     if not unit_runs.run_is_open(session_dir, record=record):
-        _clear_run_pointer(session_dir, record=record)
+        _clear_run_pointer(session_dir, state, record=record)
         return passes
     # A repeated finish clears a restored pointer without recording the outcome again.
     if worker_lifecycle.finished_run_status(str(session_dir)):
-        _clear_run_pointer(session_dir, record=record)
+        _clear_run_pointer(session_dir, state, record=record)
         return passes
     phase = _last_finished_phase(state)
     if phase is not None:
@@ -7425,7 +7431,7 @@ def _finish_run(args: argparse.Namespace) -> InterruptedWorkerPasses:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
-    _clear_run_pointer(session_dir, record=record)
+    _clear_run_pointer(session_dir, state, record=record)
     _refresh_phase_table(session_dir)
     return passes
 

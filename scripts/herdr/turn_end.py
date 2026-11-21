@@ -458,8 +458,10 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         current = worker_panes.worker_pass(member, run, record=record)
         saved = progress_history.hook_completion(current)
         if (current.get("instance_id") != instance or not isinstance(saved, progress_history.HookCompletion)
-                or saved.finished or not _same_completion(saved, completion)
-                or not completion_notice_delivered(current)):
+                or not _same_completion(saved, completion) or not completion_notice_delivered(current)):
+            return outcome
+        if saved.finished:
+            _release_completed_run(parent, run, delivery)
             return outcome
         return _finalize_completion(member, parent, run, instance, delivery, saved, state, hold, pane)
 
@@ -524,25 +526,36 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
         except OSError as error:
             diagnostics.append(f"detached run cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     outcome = TurnOutcome(completion.outcome)
-    if not completion.recording_done:
+    artifacts = worker.CompletionArtifacts(parent, run)
+    protected_finish = delivery.actions.finish_run and artifacts.protected
+    closed = completion.pane_closed and completion.role_released
+    if not completion.recording_done and (closed or not protected_finish):
         result = assign.finish_herdr_recording(run, delivery.actions,
             completed=completion.outcome == TurnOutcome.DONE and completion.pane_closed)
-        completion = replace(completion, recording_done=True)
         if isinstance(result, assign.CompletionFailed):
             diagnostics.append(result.reason if outcome == TurnOutcome.DONE else f"{outcome}: {result.reason}")
             outcome = TurnOutcome.ERROR
+        if not protected_finish or isinstance(result, assign.CompletionApplied):
+            completion = replace(completion, recording_done=True)
     diagnostic_path = _completion_diagnostics_path(run, instance)
-    recorded = _record_completion_diagnostics(worker.CompletionArtifacts(parent, run), diagnostic_path, diagnostics)
+    recorded = _record_completion_diagnostics(artifacts, diagnostic_path, diagnostics)
     new_details = tuple(dict.fromkeys((*details, *diagnostics)))
     completion = replace(completion, details=new_details)
     progress_history.save_hook_completion(run, instance, completion)
     _deliver_completion_diagnostics(row, parent, run, instance, diagnostic_path, recorded,
                                     sender_native_id=completion.sender_native_id)
-    if completion.pane_closed and completion.role_released:
+    if closed and completion.recording_done:
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
+        _release_completed_run(parent, run, delivery)
         if isinstance(pane, worker.CloseCompletedPane):
             _remove_completed_restart(row, delivery)
     return outcome
+
+
+def _release_completed_run(parent: staff.StaffRow, run: Path, delivery: progress_history.DispatchDelivery) -> None:
+    if (delivery.actions.finish_run and isinstance(parent.run, staff.OpenRun)
+            and parent.run.path.resolve() == run.resolve() and worker_lifecycle.finished_run_status(str(run))):
+        _ = staff.clear_run(parent.id, run)
 
 
 def _remove_completed_restart(row: staff.StaffRow, delivery: progress_history.DispatchDelivery) -> None:
@@ -641,6 +654,7 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
         return worker.CompletionRecovery.NO_PENDING_NOTICE
     state = worker_panes.observe_worker(parent.id, row, record)
     if completion.finished:
+        _release_completed_run(parent, run, delivery)
         if isinstance(pane, worker.CloseCompletedPane) and isinstance(state, worker_panes.ClosedWorker):
             _remove_completed_restart(row, delivery)
         return worker.CompletionRecovery.NO_PENDING_NOTICE
@@ -1099,6 +1113,7 @@ def _handle_locked(event: WorkerEvent,
             return receipt
         if isinstance(receipt, progress_history.HookCompletion):
             if receipt.finished:
+                _release_completed_run(parent, run, delivery)
                 if isinstance(state, worker_panes.ClosedWorker):
                     _remove_completed_restart(row, delivery)
                 return ignore_turn("the hook completion is already finished")

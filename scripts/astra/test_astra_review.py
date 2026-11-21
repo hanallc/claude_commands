@@ -13,10 +13,13 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_test_support as codex_fixture
+from scripts.agents import remote
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
 from scripts.production import staff, worker_admission  # noqa: E402
+from scripts.production.production_doc import EnrolledPaths
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
@@ -388,33 +391,95 @@ class AstraReviewTests(StaffTestCase):
                 self.assertIn("w1:p0", self.world.locations)
 
     def test_staff_review_uses_its_staff_target_and_saves_the_report(self) -> None:
-        self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)
-        self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
-        self.fixture.agent.without_done = False
-        self.fixture.agent.finish_after = 1
-        with self.world.process_starts():
-            result = self.run_script(str(self.document))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        command = self.router.commands[-1]
-        self.assertEqual(command[command.index("--target") + 1], "staff-worker")
-        self.assertEqual(command[command.index("--policy") + 1], "astra-reviewer")
-        review = self.saved_prompt().with_name("review.md")
-        self.assertFalse(review.exists())
-        self.assertIn(f"Submitted: {review}", result.stdout)
-        self.assertNotIn(self.fixture.agent.final, result.stdout)
-        pending = self.run_script("--read", str(review), "--run-directory", str(review.parent))
-        self.assertEqual(pending.returncode, 1)
-        self.assertIn("not completed", pending.stderr)
-        pane = self.fixture.agent.submitted[-1][0]
-        row = self.fixture.agent.row(pane)
-        self.fixture.agent.complete(pane)
-        with patch.dict(os.environ, self.environment):
-            self.assertEqual(self.fixture.finish(row.name), turn_end.TurnOutcome.DONE)
-        saved = self.run_script("--read", str(review), "--run-directory", str(review.parent))
-        self.assertEqual(saved.returncode, 0, saved.stderr)
-        self.assertEqual(review.read_text().strip(), self.fixture.agent.replies[-1])
-        self.assertIn(self.fixture.agent.replies[-1], saved.stdout)
-        self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
+        ordinary_owner = self.fixture.fixture.parent
+        for scenario in ("unit", "enrolled", "final save interrupted", "release interrupted"):
+            with self.subTest(scenario=scenario), contextlib.ExitStack() as context:
+                owner = ordinary_owner
+                reviewed_run = self.root / "runs" / scenario.replace(" ", "-")
+                if scenario != "unit":
+                    main = self.root / "enrolled-main"
+                    integration = self.root / "enrolled-integration"
+                    main.mkdir(exist_ok=True)
+                    integration.mkdir(exist_ok=True)
+                    paths = EnrolledPaths(main, main / "production.md", main / "LOG.md", main / "notes", integration)
+                    owner = fixture_member("showrunner", name="astra-showrunner",
+                                           doc=staff.LiveDoc(remote.local_machine(), paths.live_doc))
+                    self.fixture.fixture.parent_id = owner.id
+                    reviewed_run.mkdir(parents=True)
+                    owner = staff.set_run(owner.id, staff.OpenRun(reviewed_run))
+                    _ = context.enter_context(patch.object(worker_panes, "resolve_production_paths", return_value=paths))
+                    _ = context.enter_context(patch.object(astra_review, "run_folder", return_value=reviewed_run))
+                self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
+                self.world.activate(self.environment["CODEX_THREAD_ID"], "w1:p0", "codex")
+                self.fixture.agent.without_done = False
+                self.fixture.agent.finish_after = 1
+                with self.world.process_starts():
+                    result = self.run_script(str(self.document))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                command = self.router.commands[-1]
+                self.assertEqual(command[command.index("--target") + 1], "staff-worker")
+                self.assertEqual(command[command.index("--policy") + 1], "astra-reviewer")
+                run = Path(command[command.index("--session-dir") + 1])
+                review = run / "review.md"
+                self.assertFalse(review.exists())
+                self.assertIn(f"Submitted: {review}", result.stdout)
+                self.assertNotIn(self.fixture.agent.final, result.stdout)
+                pending = self.run_script("--read", str(review), "--run-directory", str(run))
+                self.assertEqual(pending.returncode, 1)
+                self.assertIn("not completed", pending.stderr)
+                pane = self.fixture.agent.submitted[-1][0]
+                row = self.fixture.agent.row(pane)
+                self.fixture.agent.complete(pane)
+
+                def completion() -> progress_history.HookCompletion:
+                    state = cast(dict[str, dict[str, dict[str, object]]],
+                                 json.loads((run / unit_runs.STATE_FILE).read_text()))
+                    saved = progress_history.hook_completion(state["pass"][row.name])
+                    self.assertIsInstance(saved, progress_history.HookCompletion)
+                    assert isinstance(saved, progress_history.HookCompletion)
+                    return saved
+
+                save = progress_history.save_hook_completion
+
+                def interrupt_final_save(directory: Path, instance: str, saved: progress_history.HookCompletion) -> None:
+                    if saved.recording_done:
+                        raise InterruptedError("final record interrupted")
+                    save(directory, instance, saved)
+
+                with patch.dict(os.environ, self.environment):
+                    if scenario == "final save interrupted":
+                        with (patch.object(progress_history, "save_hook_completion", side_effect=interrupt_final_save),
+                              self.assertRaisesRegex(InterruptedError, "final record interrupted")):
+                            _ = self.fixture.finish(row.name)
+                        self.assertFalse(completion().recording_done)
+                        repeated = invoke_recorder(["finish-run", "--session-dir", str(run), "--status", "completed"],
+                                                   self.environment, self.root)
+                        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                        current = staff.by_id(owner.id)
+                        assert current is not None
+                        self.assertEqual(current.run, staff.OpenRun(run))
+                    if scenario == "release interrupted":
+                        with (patch.object(staff, "clear_run", side_effect=InterruptedError("release interrupted")),
+                              self.assertRaisesRegex(InterruptedError, "release interrupted")):
+                            _ = self.fixture.finish(row.name)
+                        self.assertTrue(completion().finished)
+                        self.assertTrue(completion().recording_done)
+                        current = staff.by_id(owner.id)
+                        assert current is not None
+                        self.assertEqual(current.run, staff.OpenRun(run))
+                    expected = turn_end.TurnOutcome.IGNORED if scenario == "release interrupted" else turn_end.TurnOutcome.DONE
+                    self.assertEqual(self.fixture.finish(row.name), expected)
+                if scenario != "unit":
+                    self.assertTrue(completion().recording_done)
+                    self.assertTrue(completion().finished)
+                    current = staff.by_id(owner.id)
+                    assert current is not None
+                    self.assertIsInstance(current.run, staff.NoRun)
+                saved_report = self.run_script("--read", str(review), "--run-directory", str(run))
+                self.assertEqual(saved_report.returncode, 0, saved_report.stderr)
+                self.assertEqual(review.read_text().strip(), self.fixture.agent.replies[-1])
+                self.assertIn(self.fixture.agent.replies[-1], saved_report.stdout)
+                self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
 
     def test_read_delivers_late_done_after_launcher_error_before_the_notice_stamp(self) -> None:
         self.environment["CODEX_THREAD_ID"] = str(self.fixture.fixture.parent.current_session)
