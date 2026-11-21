@@ -224,7 +224,7 @@ class StaffRouting:
     def production(self, name: str) -> Path | None:
         """Check only documents that can supply this production."""
         runner = self.runners_by_name.get(name)
-        if self._document_route(name) in (ReviewDocumentRoute.REMOTE_ENROLLED, ReviewDocumentRoute.REMOTE_UNVERIFIED):
+        if self._document_route(name) is not ReviewDocumentRoute.LOCAL_OR_UNBOUND:
             return None
         candidates: list[Path] = []
         document = record_store.local_document(runner)

@@ -7,6 +7,8 @@ from scripts.agents import remote
 
 import json
 import os
+import shlex
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,6 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import conf
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
@@ -41,8 +44,10 @@ class StaffRoutingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
-            "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links")}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+            "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
+        }, clear=True))
         self.alert = cast(mock.Mock, self.enterContext(mock.patch.object(unrouted_alert, "notify")))
         self.top = fixture_member("showrunner", name="top")
         self.child = fixture_member("showrunner", name="child", parent=self.top.id)
@@ -280,13 +285,23 @@ class StaffRoutingTests(unittest.TestCase):
         stale = self.root / "stale-child.md"
         _ = stale.write_text("# Stale child document")
         remote_document = self.root / "child-on-remote.md"
-        for remote_unreadable in (False, True):
-            with self.subTest(remote_unreadable=remote_unreadable):
-                if remote_unreadable:
+        request = ["ssh", "-o", "BatchMode=yes", "remote-fixture",
+                   shlex.join(["cat", "--", str(remote_document)])]
+        for document_route in ("unrecorded", "remote unreadable", "remote legacy"):
+            with self.subTest(document_route=document_route):
+                is_remote = document_route != "unrecorded"
+                if is_remote:
                     _ = staff.set_doc(self.child.id, staff.LiveDoc("remote-fixture", remote_document))
-                documents = {"child": stale} if remote_unreadable else {}
-                router = change_routing.StaffRouting(staff.initial_snapshot(), documents)
-                assignment = router.owner_and_production(listing, row)
+                documents = {"child": stale} if is_remote else {}
+                record = replace(staff.snapshot(), production=True)
+                result = subprocess.CompletedProcess(request, int(document_route == "remote unreadable"), "# Legacy", "")
+                with (mock.patch.object(remote, "machine_alias", return_value=remote.MachineAlias("remote-fixture")),
+                      mock.patch.object(change_routing.subprocess, "run", return_value=result) as transport):
+                    assignment = change_routing.StaffRouting(record, documents).owner_and_production(listing, row)
+                if is_remote:
+                    transport.assert_called_once_with(request, capture_output=True, text=True, timeout=2, check=False)
+                else:
+                    transport.assert_not_called()
                 self.assertEqual(assignment.production, doc)
                 self.assertEqual(assignment.owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
         doc.unlink()
@@ -406,21 +421,29 @@ class StaffRoutingTests(unittest.TestCase):
         supplied, authoritative = self.root / "supplied.md", self.root / "staff.md"
         _ = supplied.write_text("# Supplied")
         listing = self.root / "change-review - top.md"
-        for enrolled_remote in (False, True):
-            with self.subTest(enrolled_remote=enrolled_remote):
-                expected: Path | change_routing.UnavailableProduction
-                if enrolled_remote:
-                    content = f"# Staff\n- **{MERGE_CHECKOUT_FIELD}:** `{self.root}`\n"
-                    machine = "remote-fixture"
-                    expected = change_routing.UnavailableProduction(listing)
-                else:
-                    content = "# Staff"
-                    machine = remote.local_machine()
-                    expected = authoritative
-                _ = authoritative.write_text(content)
+        request = ["ssh", "-o", "BatchMode=yes", "remote-fixture",
+                   shlex.join(["cat", "--", str(authoritative)])]
+        for document_route in ("local", "remote enrolled", "remote legacy"):
+            with self.subTest(document_route=document_route):
+                is_remote = document_route != "local"
+                machine = "remote-fixture" if is_remote else remote.local_machine()
+                content = "# Staff"
+                if document_route == "remote enrolled":
+                    content += f"\n- **{MERGE_CHECKOUT_FIELD}:** `{self.root}`\n"
+                if not is_remote:
+                    _ = authoritative.write_text(content)
                 _ = staff.set_doc(self.child.id, staff.LiveDoc(machine, authoritative))
-                router = change_routing.StaffRouting(staff.initial_snapshot(), {"child": supplied})
-                assignment = router.owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
+                record = replace(staff.snapshot(), production=True)
+                result = subprocess.CompletedProcess(request, 0, content, "")
+                with (mock.patch.object(remote, "machine_alias", return_value=remote.MachineAlias("remote-fixture")),
+                      mock.patch.object(change_routing.subprocess, "run", return_value=result) as transport):
+                    router = change_routing.StaffRouting(record, {"child": supplied})
+                    assignment = router.owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
+                if is_remote:
+                    transport.assert_called_once_with(request, capture_output=True, text=True, timeout=2, check=False)
+                else:
+                    transport.assert_not_called()
+                expected = change_routing.UnavailableProduction(listing) if is_remote else authoritative
                 self.assertEqual(assignment.production, expected)
                 self.assertEqual(assignment.owner, change_routing.StaffRoutedChange(self.unit.id, self.child.id, "child"))
 
