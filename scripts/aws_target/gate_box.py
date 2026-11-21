@@ -10,13 +10,13 @@ import math
 import os
 from pathlib import Path
 import shlex
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from scripts.lib.process_group import send_process_group
 from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
-    from scripts.production import merge_gate
+    from scripts.production.gate_routes import GateRun
     from scripts.test_times import gate_record
 
 
@@ -66,6 +66,8 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
 # The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
+from scripts.production.merge_gate import process_memory_mib, test_module_environment
+
 
 def paired_trial():
     rows = []
@@ -92,6 +94,12 @@ def paired_trial():
                     stage('warm-up ' + variant if warming else f"round {round_number} of {gate_request['rounds']} {variant}")
                     upload()
                     repo = trees[variant]
+                    expected = root.absolute() / variant
+                    if repo.absolute() != expected or repo.resolve() != expected:
+                        raise ValueError(f"Cannot reset {repo}: expected the checkout at {expected} without links")
+                    top = subprocess.run(['git', '-C', str(repo), 'rev-parse', '--show-toplevel'], capture_output=True)
+                    if top.returncode or os.fsdecode(top.stdout.removesuffix(b'\n')) != str(expected):
+                        raise ValueError(f"Cannot reset {repo}: Git must report {expected} as the working tree root")
                     subprocess.run(['git', '-C', str(repo), 'reset', '--hard'], check=True, capture_output=True)
                     subprocess.run(['git', '-C', str(repo), 'clean', '-fdx', '-e', '__pycache__/'], check=True, capture_output=True)
                     with tempfile.TemporaryDirectory(dir=root) as temporary:
@@ -324,7 +332,8 @@ try:
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), links['mode'])
+                                                 result['gate_started_at'], time.time(), links['mode'],
+                                                 split=gate_request.get('split') is True)
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))
@@ -376,16 +385,13 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
     }
     exec(GUEST_TRANSFERS, namespace)
     if request.get('task') == 'paired':
-        # start time: loaded only by the paired trial on the guest
+        # Load the process helper only for a paired trial.
         from scripts.lib.descendants import adopt_descendants
-        from scripts.production import merge_gate
 
         namespace.update(
             timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
                        'kernel_boot_at', 'instance_running_at') if key in result},
-            adopt_descendants=adopt_descendants, send_process_group=send_process_group,
-            test_module_environment=merge_gate.test_module_environment,
-            process_memory_mib=merge_gate.process_memory_mib)
+            adopt_descendants=adopt_descendants, send_process_group=send_process_group)
         exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
         return
     exec(CANDIDATE_GUEST, namespace)
@@ -714,13 +720,13 @@ def encode_run(run: object) -> dict[str, object]:
     # start time: loaded only to encode a completed gate
     from dataclasses import asdict
 
-    from scripts.production import merge_gate
+    from scripts.production import gate_routes
     from scripts.test_times import gate_record
 
-    if not isinstance(run, merge_gate.GateRun):
+    if not isinstance(run, gate_routes.GateRun):
         raise TypeError('expected a completed gate')
 
-    def encode_job(job: merge_gate.GateJobResult) -> dict[str, object]:
+    def encode_job(job: gate_routes.GateJobResult) -> dict[str, object]:
         row: dict[str, object] = asdict(job)
         row['kind'] = job.kind.name
         del row['wall_clock']
@@ -743,11 +749,11 @@ def encode_run(run: object) -> dict[str, object]:
             'time_limit_report': run.time_limit_report}
 
 
-def decode_run(value: object) -> merge_gate.GateRun:
+def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     # start time: loaded only to decode a completed gate
     from scripts.aws_target import ledger
-    from scripts.production import merge_gate
+    from scripts.production import gate_routes
     from scripts.test_times import gate_record
 
     def number(row: dict[str, object], key: str) -> float:
@@ -762,7 +768,7 @@ def decode_run(value: object) -> merge_gate.GateRun:
             raise ValueError(f'{key}: expected a finite nonnegative number')
         return result
 
-    def job(row: dict[str, object]) -> merge_gate.GateJobResult:
+    def job(row: dict[str, object]) -> gate_routes.GateJobResult:
         status = row['returncode']
         if type(status) is not int:
             raise ValueError('expected an integer status')
@@ -780,17 +786,19 @@ def decode_run(value: object) -> merge_gate.GateRun:
             wall_clock = gate_record.WallClockNotRecorded('box result has only one module time')
         else:
             wall_clock = gate_record.WallClockNotRecorded('box result has no module times')
-        return merge_gate.GateJobResult(ledger.text(row, 'suite'), ledger.text(row, 'module'), status, number(row, 'seconds'),
-                             str(row['output']), str(row['killed_for']), row['tripwire_tripped'] is True,
-                             merge_gate.GateJobKind[ledger.text(row, 'kind')], number(row, 'cpu_seconds'), measured,
-                             number(row, 'peak_mib'), restart, wall_clock=wall_clock)
+        return gate_routes.GateJobResult(
+            ledger.text(row, 'suite'), ledger.text(row, 'module'), status, number(row, 'seconds'),
+            str(row['output']), str(row['killed_for']), row['tripwire_tripped'] is True,
+            gate_routes.GateJobKind[ledger.text(row, 'kind')], number(row, 'cpu_seconds'), measured,
+            number(row, 'peak_mib'), restart, wall_clock=wall_clock,
+        )
 
     row = ledger.mapping(value)
     # A newer box leaves out the executions list when it equals the jobs list.
     for key in ('tests_reused', 'selection_certified'):
         if type(row[key]) is not bool:
             raise ValueError(f'{key}: expected a boolean')
-    return merge_gate.GateRun(
+    return gate_routes.GateRun(
         tuple(job(item) for item in ledger.rows(row, 'jobs')), number(row, 'seconds'),
         number(row, 'peak_memory_mib'), row['tests_reused'] is True, row['selection_certified'] is True,
         tuple(job(item) for item in ledger.rows(row, 'executions' if 'executions' in row else 'jobs')),
@@ -798,7 +806,7 @@ def decode_run(value: object) -> merge_gate.GateRun:
     )
 
 
-def execution_records(value: merge_gate.GateRun) -> list[gate_record.Execution]:
+def execution_records(value: GateRun) -> list[gate_record.Execution]:
     """Keep every attempt's output for the gate record writer."""
     # start time: loaded only to record a completed gate
     from scripts.test_times import gate_record
@@ -809,15 +817,22 @@ def execution_records(value: merge_gate.GateRun) -> list[gate_record.Execution]:
             for job in value.executions or value.jobs]
 
 
+def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected", "subset"]:
+    """Classify a record from the assignment."""
+    if split:
+        return "subset"
+    return "affected" if mode == "targeted-test" else "full"
+
+
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
-                      started: float, ended: float, mode: str) -> dict[str, object]:
+                      started: float, ended: float, mode: str, *, split: bool = False) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
     # start time: loaded only to record a completed gate
     from scripts.buildlog import record, store
-    from scripts.production import merge_gate
+    from scripts.production import gate_routes
     from scripts.test_times import gate_record
 
-    if not isinstance(value, merge_gate.GateRun):
+    if not isinstance(value, gate_routes.GateRun):
         raise TypeError('expected a completed gate')
     modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
@@ -826,7 +841,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
+            'hold_wait_s': 0, 'selection': completion_selection(mode, split=split),
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',

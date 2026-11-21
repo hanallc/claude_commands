@@ -19,7 +19,7 @@ The flow:
 
 1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later. Inline programs import from the shim’s repository root through `PYTHONPATH` and `-P`. File scripts keep their existing import path behavior.
 2. The publisher checks every input, gets the host, writes the snapshot under the index lock and prints one URL per file.
-3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, as clickable Markdown links that show the file name.
+3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, each as the full URL in plain text. The user's terminal cannot open a Markdown link.
 4. The browser on the Mac gets the file from the server on that machine, over the tailnet.
 
 ### Publisher
@@ -132,14 +132,14 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, Builds, Disks, Images, List and Review, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List and Review.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
 A page whose `main` has the `page-wide` class uses the full pane width instead; the Builds page is the only one.
 The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
-The title, status line and content use the same centered column on all seven pages.
+The title, status line and content use the same centered column on all console pages.
 Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
@@ -250,7 +250,7 @@ Older browser folders still accept answers that a page posts to them.
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
-The entries are Accounts, AWS, Builds, Disks, Images, List and Review.
+AWS Machines follows AWS in the navigation.
 The configuration has no Changes, Investigations or Questions entries or age limits.
 The console renders every configured entry without a skip rule for Review.
 The URL value has the form `python:<module>:<function>`.
@@ -271,6 +271,48 @@ The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
 The AWS entry calls `aws_page.page_url`.
 That function returns the AWS page URL without publishing the page.
+The AWS Machines entry calls `machines_page.page_url`.
+The function returns the URL for `machines.html` in `aws_page.output_folder()`.
+The entry shows **Not available** until the publisher writes that file.
+`serve.published_console_page` identifies the published path as `aws_machines`.
+The server adds the shared page owner control for the configured AWS Machines owner.
+The AWS Machines entry uses the Lucide `server` icon.
+
+A page includes `__PAGE_SETTING_CONTROLS__` once in its head.
+`page_frame.template` replaces that slot with the style and script from `setting_controls.py`.
+The page renders these controls with the following functions.
+
+1. `slider` takes the label, bounds, step, chosen value, live value, decimal places and an optional live note.
+   `pageSettingControls.connectSlider(root)` connects the native range input to the display.
+   Read `value` for the choice or `live` for the saved value.
+   Use `setValue(value)`, `setLive(value, note)` and `format(value)` to update or display a value.
+   Use `input` to listen for the native range input events.
+2. `amount_box` takes the text before and after the USD field, its minimum, step and value.
+   Read or write the field through `valueAsNumber`.
+   Listen for its native `change` event to apply the amount to the slider.
+3. `go_button` takes the button label and the page and key for the setting.
+   Call `pageSettingControls.connectGo(root, slider, amount, describe)` with the slider and the amount input.
+   Return `newValue`, `monthlyChange` in USD, and an optional `liveNote` from `describe`.
+   Go uses the slider live value as the old value in each confirmation.
+   The Go button shows the confirmation line before Confirm can send the choice.
+   Cancel closes the confirmation. Confirm disables the controls while the server saves.
+   Go updates the Now mark from the live value in the reply.
+   A successful save with a live value emits `setting-saved` with `detail.value`.
+   A refusal or failure shows one line below Go and keeps the proposed value.
+   Use `setLabel(label)` to update the button and `cancelConfirmation()` to close an obsolete confirmation.
+
+Go reads the request token from `GET /console/tune`.
+`POST /console/tune` accepts the fields `page`, `key`, `value`, and `token`.
+The POST requires a same-origin Origin header and the current request token.
+`console_tune.SETTINGS` registers allowed page and key pairs with the target document, range and step.
+The server validates exact decimal steps from the minimum.
+It refuses pairs absent from the table.
+The AWS Machines page uses `aws_machines` in this table and in the POST.
+The frame leaves the table empty for a page to register its settings.
+The route calls `tune.py` with the page and Go button in the reason and user words.
+It returns Saved with HTTP 200, Refused with HTTP 400, or SaveFailed with HTTP 503.
+Each result includes `live_value` from a fresh configuration read.
+An unavailable live value is `null`.
 
 The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
@@ -678,15 +720,24 @@ The mark is `waiting` after Ask question and `done` after Approve or Send feedba
 
 Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
-The server keeps the last good page and its render times under one lock.
+The server keeps the last good page, its completion time, its render times, and its usage store revision under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
-A later request returns the kept page at once and starts one background render.
-A request during a render returns the kept page and starts no second render.
+The server records the usage store file metadata before it starts each render.
+File absence is a revision.
+A request returns the kept page at once if its revision matches the store and its age is at most `page_refresh_seconds`.
+It starts a background render if no render is in progress.
+A request for an older page can share an active render if its revision still matches the store when the render ends.
+A request for a changed store uses the first render that starts after it reads the store revision.
+Requests can share that render and use its result if the store changes again during the render.
+The next request checks the store revision again.
+The server reads `page_refresh_seconds` from `config/review_links.conf` when it checks the page age.
+If the server cannot read this setting, it returns the last good page with a read error.
+It returns 503 if it has no good page.
 Only requests start renders.
 The child keeps the status read's stderr capture away from the server's request log.
 `accounts_page_seconds` in `config/review_links.conf` limits each render.
 A failed or late first render gives 503 with **The Accounts page is not available.**
-A failed background render keeps the last good page and writes one line to stderr.
+A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
@@ -817,7 +868,7 @@ The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes every non-Closed item with an active park.
 An unread delivery release belongs to Needs me even if the question remains open.
-Morty answering includes other unparked items with an open question, including items that need Resend.
+Morty answering includes unparked items with an open question and no unread answer.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
@@ -1017,8 +1068,9 @@ Tell morty shows “sent to morty; update remains unread” in both cases.
 Tell morty applies the current filters. A read item leaves the view when Unread only is on.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
-The page uses the question and delivery code shared with Images.
-The server replies to the browser before it sends morty the item number, title, question, and answer command.
+List and Images share the code that saves and sends the question.
+After the server replies to the browser, it sends morty the item number, title, question, and answer command.
+The List uses the keeper as the recipient even when another producer owns the work.
 Equal words select the open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
 The row moves to Morty answering when the question saves.
@@ -1026,18 +1078,16 @@ The row shows a waiting note when each unanswered question has a live sender or 
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
 The console updates its unread indicator on its own news refresh.
-The next List refresh shows the delivery notice and Resend when a question needs another send.
-An unknown result shows “Question Qn may not have reached morty.”
-The List shows why Resend is unavailable if the previous sender is active or cannot be checked.
-Images shows the same reason when it cannot retry the question.
+The page shows “Question not delivered.” after a confirmed failure.
+List, Images, and Review use the same text.
 All attempts for one question use the same sender lock.
-A damaged delivery record keeps the question visible and cannot grant Resend while the lock is held.
-A released sender lock lets Resend proceed even if the previous process identity is unreadable.
-Resend uses the saved question, its ID, and the current recipient to repair a mismatched delivery record.
-The question reader checks the stored question words and answer command.
-A List title edit preserves the delivery state. Recovery sends the prepared message with its original title.
-Only an explicit Resend question action can retry that delivery on the List.
-Repeating the same signed resend request does not authorize another send.
+List, Images, and Review question sends use the same retry loop.
+An unconfirmed send keeps its saved message ID for the next attempt.
+The server retries unresolved attempts during recovery.
+If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
+The question reader checks the saved question words and answer command.
+A List title edit preserves the delivery state.
+Recovery sends the prepared message with its original title.
 If Ask removes the focused row, focus moves to a nearby row with an available toggle or to Search.
 After a failed POST restores the row, the List waits for the animation before it returns focus to the submit button.
 After a successful Ask keeps the row visible, the row toggle receives lost focus and keeps it through refresh.
@@ -1062,11 +1112,13 @@ The entry keeps the question ID, words, and time.
 The question no longer accepts answers or retries.
 Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
-The check runs before the first send and each retry.
+List, Images, and Review use the same send loop.
+The loop checks the saved source before each attempt.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
 A read error during retry authorization preserves the confirmed failure and reports the read error separately.
-Startup recovery skips Closed items.
+Recovery skips closed or answered questions.
+The server checks deferred questions again after the sender locks become free.
 A new Ask on a Closed item is refused.
 A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
@@ -1087,6 +1139,8 @@ Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
+The answer puts the item in Needs me until the user reads it.
+The item keeps its parking time.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
@@ -1099,9 +1153,11 @@ A job holds the question's sender lock from claim through result publication.
 The sender publishes `sending` before it calls the transport.
 The transport can confirm `sent`, `queued`, or `failed`.
 A missing confirmation leaves the outcome `unknown`.
-Recovery claims unsent work only after the shared question reader verifies the delivery.
-Recovery leaves uncertain outcomes for the user.
-An older pending attempt with no live sender appears as uncertain.
+Startup recovery verifies the saved question and claims work when the sender lock is free.
+If a sender stopped after it wrote the send marker, recovery reuses the same message ID.
+A closed item or a question that has an answer requires no send.
+The server clears that claim without a failure notice.
+If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the row above the four-line text box.
 **Unpark** and **Park until** sit at the right edge of the row.
@@ -1652,14 +1708,15 @@ The server reads the owner and its production document at use through `StaffRout
 `ValidationRequested` keeps validation ownership and feedback after delivery or an alert.
 Only a showrunner answer returns an open question to the user.
 The page shows **Saved: <answer>**, **The showrunner will validate this**, or **The showrunner will answer this**.
-The page shows no delivery state, attention links, or resend buttons.
+The page shows “Question not delivered.” after a confirmed delivery failure.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
 Each page render reads `feedback_rows` once to set every feedback box's height.
 `delivery_tries` starts at 3; `delivery_pause_seconds` starts at 5.
 Tests use a zero pause.
 Each round sends once to every recipient that has not succeeded.
-The server pauses once between rounds and retries only failed recipients.
+The server pauses once between rounds.
+For questions, it retries failed or unconfirmed sends.
 The showrunner receives its first attempt before any recipient receives a second attempt.
 Review uses the record and saved attempt to identify each message.
 Retries and recovery use the same key for each staff recipient.
@@ -1681,7 +1738,9 @@ If the showrunner is the failed recipient, the server records the failure withou
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
 Each saved alert has its own key.
-Recovery uses that key again if the server cannot clear an alert after sending it.
+Recovery reuses the alert key after an unconfirmed send or a failed clear.
+The server sends saved alerts outside the delivery lock.
+It takes the lock to clear an alert after confirmed acceptance or final failure.
 The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
@@ -1754,6 +1813,14 @@ It exits with status 0 when the folder disappears.
 
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
+
+The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+These requests require a single `Host` header for the server's bound address and port.
+The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
+On port 80, the server also accepts either host without a port.
+If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
+A Go change (`POST /console/tune`) must supply `Origin` and the token.
+The server returns 403 when the host or origin check fails.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.

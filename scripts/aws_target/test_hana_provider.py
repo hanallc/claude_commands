@@ -321,6 +321,44 @@ class HanaProviderTests(CostFixture):
         self.fake.failure = ''
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationUnresolved)
 
+    def test_start_records_only_a_definite_refusal_for_the_start_call(self) -> None:
+        self.fake.failure = 'start-instances'
+        for index, (header, refused) in enumerate((
+                ('(Blocked) when calling the StartInstances operation', True),
+                ('(Blocked) when calling the StartInstances operation (reached max retries: 0)', True),
+                ('(Blocked) when calling the StartInstances operation (reached max retries: 2)', False),
+                ('(Blocked) when calling the StopInstances operation', False),
+                ('(InternalError) when calling the StartInstances operation', False),
+                ('(DryRunOperation) when calling the StartInstances operation', False))):
+            with self.subTest(header=header):
+                operation = replace(self.operation(box.Action.START), token=f'start-{index}')
+                self.fake.failure_stderr = 'An error occurred ' + header + ': private fixture diagnostic'
+                with self.assertRaises(provider.ProviderPending):
+                    _ = self.provider.step(IDENTITY, self.start(), operation)
+                saved = remote.read_record(self.mutation_path(operation))
+                self.assertEqual(saved['dispatched'], True)
+                self.assertEqual(remote.start_was_refused(saved), refused)
+                if refused:
+                    self.assertEqual(saved['start_refusal_code'], 'Blocked')
+                else:
+                    self.assertNotIn('start_refusal_code', saved)
+                self.assertNotIn('private fixture diagnostic', json.dumps(saved))
+
+    def test_active_observation_preserves_possible_compute_after_a_start_refusal(self) -> None:
+        operation, start = self.operation(box.Action.START), self.start()
+        self.fake.failure = 'start-instances'
+        self.fake.failure_stderr = 'An error occurred (Blocked) when calling the StartInstances operation: Fixture'
+        with self.assertRaises(provider.ProviderStartRefused):
+            _ = self.provider.step(IDENTITY, start, operation)
+        path = self.mutation_path(operation)
+        self.fake.state = 'running'
+        self.clock.advance(1)
+        _ = self.provider.recover(IDENTITY, start, operation, abandon_start=True)
+        saved = remote.read_record(path)
+        self.assertEqual(saved['observed_active_at'], self.clock.now)
+        self.assertFalse(remote.start_was_refused(saved))
+        self.assertEqual(remote.read_hana_start_journal(self.state).possible_starts, (operation.generation,))
+
     def test_abandoned_start_with_a_lost_reply_keeps_exposure_until_a_later_stop(self) -> None:
         controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
         book = ledger.CostLedger(self.state)
@@ -685,10 +723,13 @@ class HanaProviderTests(CostFixture):
     def test_scaler_environment_removes_inherited_admin_credentials(self) -> None:
         with mock.patch.dict('os.environ', {'AWS_ACCESS_KEY_ID': 'inherited-admin', 'AWS_SESSION_TOKEN': 'inherited-token'}):
             subject = provider.AwsHanaProvider.from_settings(self.settings, self.state, self.workload, execute=self.fake)
-            _ = subject.step(IDENTITY, box.NoDemandStart(), self.operation(box.Action.OBSERVE))
+            subject.api.ec2_dry_run('start-instances', '--instance-ids', IDENTITY.instance)
+            _ = subject.step(IDENTITY, self.start(), self.operation(box.Action.START))
         self.assertNotIn('AWS_ACCESS_KEY_ID', self.fake.environments[-1])
         self.assertNotIn('AWS_SESSION_TOKEN', self.fake.environments[-1])
         self.assertEqual(self.fake.environments[-1]['AWS_CONFIG_FILE'], '/dev/null')
+        self.assertNotIn('AWS_MAX_ATTEMPTS', self.fake.environments[-2])
+        self.assertEqual(self.fake.environments[-1]['AWS_MAX_ATTEMPTS'], '1')
 
     def test_receiver_ignores_legacy_state_and_checks_the_shutdown_fence(self) -> None:
         folder = self.root / 'guest'

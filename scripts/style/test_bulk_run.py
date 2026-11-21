@@ -97,6 +97,10 @@ class BulkRunFixture(CargoProjectTests):
     @classmethod
     @override
     def setUpClass(cls) -> None:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("GIT_") and key not in ("BASH_ENV", "STAFF_CONFIG")}
+        environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
         super().setUpClass()
         cls.prepare_project_seed()
         cls.fixture_seed = cls.project_seed.parent / "fixture"
@@ -445,15 +449,15 @@ class WorkspaceRunTests(BulkRunFixture):
         batch = crate_run.CrateRun(ledger, "cli")
         end_workspaces = copies.end_workspaces
 
-        def remove_under_run_lock(task: str, paths: list[Path], *,
-                                  run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
+        def end_under_run_lock(task: str, paths: list[Path], *, run_lock: copies.CrateRunRemovalLock,
+                               created: dict[Path, os.stat_result]) -> None:
             with (batch.folder / "run.lock").open("a") as second:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                end_workspaces(task, paths, run_lock=run_lock)
+                end_workspaces(task, paths, run_lock=run_lock, created=created)
 
         with mock.patch.object(run, "execute_plan", wraps=run.execute_plan) as execute:
-            with mock.patch.object(copies, "end_workspaces", side_effect=remove_under_run_lock):
+            with mock.patch.object(copies, "end_workspaces", side_effect=end_under_run_lock):
                 self.assertEqual(self.crate_cli(ledger, ["--crate", "bulk_sample", "--run", "cli",
                                  "--rule", definition.rule_id, "--base-tree", self.tree,
                                  "--destination", destination]), 0)
@@ -462,21 +466,22 @@ class WorkspaceRunTests(BulkRunFixture):
             self.assertEqual(first["stage"], crate_run.CrateStage.INTEGRATED)
             self.assertFalse(Path(first["checkout"]).exists())
             self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.SELECTED)
-            with self.subTest("terminal resume removes a remaining copy"):
+            with self.subTest("terminal resume keeps an earlier workspace"):
                 with copies.workspace(batch.owner, self.repo, self.base, name=Path(first["checkout"]).name,
                                       branch=first["branch"], task=batch.task, run_manifest=batch.path) as remaining:
                     self.assertEqual(str(remaining), first["checkout"])
                 self.assertTrue(remaining.exists())
                 with mock.patch.object(batch, "frozen_checkout", side_effect=AssertionError("terminal crate reopened")):
                     self.assertEqual(batch.advance("bulk_sample"), batch.read())
-                self.assertFalse(remaining.exists())
+                self.assertTrue(remaining.is_dir())
             with mock.patch.object(run, "select", side_effect=AssertionError("no reselection")):
                 self.assertEqual(self.crate_cli(ledger, ["--crate", "beta", "--run", "cli"]), 0)
             self.assertEqual(execute.call_count, 2)
         result = batch.read()
+        self.assertTrue(Path(result["crates"]["bulk_sample"]["checkout"]).is_dir())
+        self.assertFalse(Path(result["crates"]["beta"]["checkout"]).exists())
         for record in result["crates"].values():
             self.assertEqual(record["stage"], crate_run.CrateStage.INTEGRATED)
-            self.assertFalse(Path(record["checkout"]).exists())
             checkpoint = batch.result(record)["commit"]
             self.assertEqual(self.git("merge-base", checkpoint, destination), checkpoint)
             self.assertEqual(self.git("rev-parse", record["branch"]), checkpoint)
@@ -527,15 +532,18 @@ class WorkspaceRunTests(BulkRunFixture):
                 batch = crate_run.CrateRun(failed_ledger, "failed")
                 failed = batch.read()["crates"]["bulk_sample"]
                 self.assertEqual(failed["stage"], crate_run.CrateStage.ABANDONED)
-                self.assertFalse(Path(failed["checkout"]).exists())
+                self.assertEqual(Path(failed["checkout"]), adopted)
+                self.assertTrue(adopted.is_dir())
                 self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.SELECTED)
                 with mock.patch.object(batch, "frozen_checkout", side_effect=AssertionError("terminal crate reopened")):
                     self.assertEqual(batch.advance("bulk_sample"), batch.read())
-                self.assertFalse(Path(failed["checkout"]).exists())
+                self.assertTrue(adopted.is_dir())
                 case.runner.red_tests = False
                 self.assertEqual(case.crate_cli(failed_ledger, ["--crate", "beta", "--run", "failed"]), 0)
-                self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.INTEGRATED)
-                self.assertTrue(all(not Path(record["checkout"]).exists() for record in batch.read()["crates"].values()))
+                beta = batch.read()["crates"]["beta"]
+                self.assertEqual(beta["stage"], crate_run.CrateStage.INTEGRATED)
+                self.assertFalse(Path(beta["checkout"]).exists())
+                self.assertTrue(adopted.is_dir())
             finally:
                 case.doCleanups()
 

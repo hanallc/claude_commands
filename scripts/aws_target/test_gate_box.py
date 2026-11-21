@@ -16,7 +16,7 @@ from typing import Self, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_trial, gate_box, ledger
+from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.aws_target.ledger_test_support import write_gate_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -59,6 +59,32 @@ subprocess.run = check_transfer
         self.assertEqual(len(runs), 6)
         self.assertTrue(all(set(row) == gate_box.RUN_FIELDS for row in runs))
         self.assertEqual(sum(line.startswith('{"module":') for line in log.splitlines()), 6)
+
+    def test_paired_guest_refuses_a_link_or_a_different_git_root_before_reset(self) -> None:
+        for commands, detail in (
+            (("(root / 'base').rename(root / 'saved-base')",
+              "(root / 'base').symlink_to(root / 'saved-base', target_is_directory=True)"), 'without links'),
+            (("alias = root.parent / 'box-alias'",
+              "alias.symlink_to(root, target_is_directory=True)", "root = alias"), 'without links'),
+            (("(root / 'base/.git').rename(root / 'saved-git-file')",
+              "subprocess.run(['git', 'init', '-q', str(root)], check=True)"), 'working tree root'),
+        ):
+            with self.subTest(commands=commands):
+                fixture = trial_tests.PairedTrialTests()
+                self.addCleanup(fixture.doCleanups)
+                fixture.setUp()
+                setup = "        (root / 'base/keep').write_text('fixture output')\n"
+                setup += ''.join('        ' + command + '\n' for command in commands)
+                stage = "        stage('source ready')"
+                guest = gate_box.GUEST.replace(stage, setup + stage, 1)
+                with mock.patch.object(gate_box, 'GUEST', guest):
+                    reply, traces = fixture.guest()
+                self.assertEqual(reply['verdict'], 'error')
+                error = ledger.text(reply, 'error')
+                self.assertIn('Cannot reset', error)
+                self.assertIn(detail, error)
+                self.assertEqual(traces, [])
+                self.assertEqual((fixture.root / 'box/base/keep').read_text(), 'fixture output')
 
     def test_paired_log_put_removes_signed_urls_from_errors(self) -> None:
         fixture = trial_tests.PairedTrialTests()
@@ -353,7 +379,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
                     + inspect.getsource(gate_box.run_guest)
                     + '\ndef encode_run(run): return {"passed": run.passed}\n'
-                    + 'def completion_record(*args): return {"kind": "gate_run"}\n')
+                    + 'def completion_record(*args, **kwargs): return {"kind": "gate_run"}\n')
                 if candidate_change == 'rename':
                     for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/merge_gate.py'):
                         path = repo / relative
@@ -630,6 +656,45 @@ else:
         self.assertEqual(module["content_reads"], ["scripts/fixture/data.json"])
         self.assertEqual(module["folder_scans"], ["scripts/fixture"])
         self.assertEqual([row["test"] for row in ledger.rows(module, "tests")], ["Fixture.test_slow"])
+
+    def test_aws_selection_records_the_assignment(self) -> None:
+        from scripts.production.gate_routes import ModuleCoverage
+
+        job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
+        run = gate.GateRun((job,), 2, 0, coverage=ModuleCoverage.SUBSET)
+        affected = gate_box.completion_record(
+            run, "attempt", "commit", "tree", "remote-host", 9, 15, "targeted-test")
+        self.assertEqual(affected["selection"], "affected")
+        for mode in ("targeted-test", "merge-gate"):
+            with self.subTest(mode=mode):
+                record = gate_box.completion_record(
+                    run, "attempt", "commit", "tree", "remote-host", 9, 15, mode, split=True)
+                self.assertEqual(record["selection"], "subset")
+
+    def test_controller_reclassifies_an_older_guest_record_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
+            run = gate.GateRun((job,), 2, 0)
+            keys = {"attempt": "attempt", "commit": "commit", "tree": "tree"}
+            guest_record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
+            self.assertEqual(guest_record["selection"], "full")
+            row: dict[str, object] = {
+                **keys, "host": "remote-host", "verdict": "pass", "gate": gate_box.encode_run(run),
+                "record": guest_record,
+            }
+            cloud_gate.save(folder / "outcome.json", {"status": "complete", "result": row})
+            _ = (folder / "gate.log").write_text("")
+            for mode, split, selection in (("merge-gate", True, "subset"), ("targeted-test", False, "affected")):
+                with self.subTest(mode=mode, split=split):
+                    request: dict[str, object] = {
+                        **keys, "head": "head", "mode": mode, "modules": ["scripts/fixture/test_one.py"], "split": split,
+                    }
+                    with (mock.patch.object(gate, "checked_git", return_value="head"),
+                          mock.patch.object(cloud_gate, "import_record") as import_record):
+                        result = cloud_gate.run_service(folder, folder, request, (), lambda _: 0)
+                    self.assertIsInstance(result, cloud_gate.CloudCompleted)
+                    import_record.assert_called_once_with(folder, {**row, "record": {**guest_record, "selection": selection}})
 
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3,

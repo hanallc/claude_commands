@@ -1,12 +1,12 @@
 """A step releases its token, and a detached sweep takes no token."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -31,7 +31,7 @@ class VerifyTokenSelfHoldTests(unittest.TestCase):
     def execute(self, body: str) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="verify-token-step-") as temporary:
             root = Path(temporary)
-            environment = {**os.environ, "TEST_ROOT": str(root), "TMPDIR": str(root)}
+            environment = {**verify_test_environment(), "TEST_ROOT": str(root), "TMPDIR": str(root)}
             script = r'''
 set -uo pipefail
 BOARD_DIR="$TEST_ROOT/board"; BOARD_SLOT=step

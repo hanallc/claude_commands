@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 from unittest.mock import patch
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.wait_for_test_state import wait_until
@@ -15,7 +16,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class VerifyTokenCancellationTests(VerifyTokenOwnershipFixture):
     def test_group_cleanup_ends_without_pidfd_support(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                                 start_new_session=True)
+                                 env=verify_test_environment(), start_new_session=True)
         try:
             # Pin the race where a killed member is still visible in the first
             # snapshot, so portable cleanup must take its polling branch.

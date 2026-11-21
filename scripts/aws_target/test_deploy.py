@@ -2429,6 +2429,60 @@ sys.exit(7)
         self.assertIn('remove-images --approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
+    def test_gate_image_cleanup_keeps_linked_paths(self) -> None:
+        from scripts.aws_target import teardown
+
+        state = self.root / 'real-state'
+        folder = state / 'gate-image'
+        folder.mkdir(parents=True)
+        marker = folder / 'image.json'
+        _ = marker.write_text('fixture image')
+        alias = self.root / 'state-alias'
+        alias.symlink_to(state, target_is_directory=True)
+        linked_image_state = self.root / 'linked-image-state'
+        linked_image_state.mkdir()
+        linked_image = linked_image_state / 'gate-image'
+        linked_image.symlink_to(folder, target_is_directory=True)
+        missing_image_state = self.root / 'missing-image-state'
+        missing_image_state.mkdir()
+        (missing_image_state / 'gate-image').symlink_to(self.root / 'missing-image')
+        api = aws_target.AwsCli('fixture', 'us-east-1', 1)
+        for directory in (alias, linked_image_state, missing_image_state):
+            with (self.subTest(directory=directory),
+                  mock.patch.object(api, 'call', side_effect=AssertionError('unexpected AWS call')) as call,
+                  redirect_stdout(StringIO()) as output):
+                self.assertIsInstance(teardown.remove_gate_images(api, directory, lambda: self.now),
+                                      teardown.GateImageRemovalRefused)
+                call.assert_not_called()
+                self.assertIn(f'kept for a manual removal list: {directory / "gate-image"} (teardown,',
+                              output.getvalue())
+        self.assertEqual(marker.read_text(), 'fixture image')
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue(linked_image.is_symlink())
+        self.assertTrue((missing_image_state / 'gate-image').is_symlink())
+
+    def test_remove_images_reports_failure_for_a_linked_gate_image_and_can_retry(self) -> None:
+        subject, fake = self.gate_image_fixture()
+        folder = subject.directory / 'gate-image'
+        saved = folder.with_name('saved-gate-image')
+        _ = folder.rename(saved)
+        folder.symlink_to(saved, target_is_directory=True)
+        with redirect_stdout(StringIO()) as output:
+            self.assertFalse(subject.remove_images(approve_destroy=True))
+        self.assertIn(f'kept for a manual removal list: {folder} (teardown,', output.getvalue())
+        self.assertIn('remove-images: refused:', output.getvalue())
+        self.assertIn('remove-images: deleting the gate image and its snapshot failed after', output.getvalue())
+        self.assertNotIn('remove-images: deleting the gate image and its snapshot done in', output.getvalue())
+        self.assertTrue(folder.is_symlink())
+        self.assertEqual((saved / 'image.json').read_text(), '{"image_id":"ami-old"}')
+        self.assertTrue(fake.images)
+        folder.unlink()
+        _ = saved.rename(folder)
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertFalse(folder.exists())
+        self.assertEqual(fake.images, {})
+
     def test_remove_gate_image_switches_to_the_official_image_before_deleting_the_gate_image(self) -> None:
         subject, fake = self.gate_image_fixture()
         with redirect_stdout(StringIO()) as output:
@@ -4814,6 +4868,31 @@ sys.exit(7)
         self.assertEqual(image, {'image_id': 'ami-cache'})
         self.assertEqual(box.saved_image(api, self.state)['ImageId'], 'ami-cache')
 
+
+    def test_down_keeps_its_journal_after_a_gate_image_refusal_and_can_retry(self) -> None:
+        _ = self.removal_fixture()
+        folder = self.state / 'gate-image'
+        saved = self.root / 'gate-image-data'
+        saved.mkdir()
+        _ = (saved / 'image.json').write_text('fixture image data')
+        folder.symlink_to(saved, target_is_directory=True)
+        with mock.patch.object(box, 'cleanup_images') as cleanup:
+            success, output = self.down_output()
+            self.assertFalse(success, output)
+            cleanup.assert_not_called()
+            self.assertIn('gate-image: refused:', output)
+            self.assertTrue(folder.is_symlink())
+            self.assertEqual((saved / 'image.json').read_text(), 'fixture image data')
+            self.assertTrue((self.state / 'down.json').is_file())
+            self.assertFalse((self.state / 'down-complete.json').exists())
+            self.assertTrue((self.state / 'deployment.json').is_file())
+            folder.unlink()
+            _ = saved.rename(folder)
+            success, output = self.down_output()
+            self.assertTrue(success, output)
+        self.assertFalse(folder.exists())
+        self.assertFalse((self.state / 'down.json').exists())
+        self.assertTrue((self.state / 'down-complete.json').is_file())
 
     def test_down_keeps_and_reports_the_saved_image(self) -> None:
         _ = self.removal_fixture()
