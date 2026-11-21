@@ -1904,7 +1904,7 @@ try {
               return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
                 waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
             })()`);
-            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');

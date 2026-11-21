@@ -35,7 +35,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, 
 from scripts.aws_target.config import SpendingSettings, gate_deployment, read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 
 
@@ -636,9 +636,9 @@ def prepare_locked(repo: Path, commit: str, folder: Path,
         if isinstance(mode, HanaGpuNextestRequest):
             request['hana_nextest'] = asdict(mode)
         write_json(folder / 'request.json', request)
-        hold = merge_gate.BuildHoldWait()
+        hold = gate.BuildHoldWait()
         hold.wait_until_free()
-        with merge_gate.gate_reservation(repo, folder, hold, mode=merge_gate.SuiteMode.TARGETED_TEST) as place:
+        with gate.gate_reservation(repo, folder, hold, mode=gate.SuiteMode.TARGETED) as place:
             hold.wait_until_free()
             command = [sys.executable, '-m', 'scripts.aws_target.gpu_size_trial', '--prepare-worker', str(folder)]
             with log.open('wb') as output:

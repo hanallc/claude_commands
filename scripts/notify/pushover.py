@@ -421,6 +421,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         found = review.UnreadableHold(review.held_path(source), str(error))
     detail = ""
     approved = push_texts.approval_date(arguments["text_id"]) if registered_text else ""
+    if arguments["text_id"] == "quota.claude_expiry" and not approved:
+        return refuse(source, priority, title, message, "Claude expiry template needs current approval")
     if approved:
         # The text was reviewed and approved ahead of time: no live review, no reviewer wait.
         detail = f"registered text, approved {approved}"
@@ -557,7 +559,10 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail = push["detail"]
-    if priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
+    if push["text_id"] == "quota.claude_expiry":
+        if silence.active():
+            return refuse(source, priority, title, message, "silence is active")
+    elif priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
         kept = silence.keep_here(push, deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
