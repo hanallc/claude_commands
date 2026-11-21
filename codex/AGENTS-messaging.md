@@ -47,7 +47,7 @@ including when the old run no longer exists.
 
 ## images on the other machine
 - An image on the other machine is readable. Never tell the user that you cannot read it.
-- On natedev, copy a Mac image: `scp 'mac:<path>' <scratch>/`. On the Mac, use `natedev:<path>` the same way.
+- On natedev, copy a Mac image to a fixed name: `scp 'mac:<path>' <scratch>/shot.png`. On the Mac, use `natedev:<path>` the same way.
 - Put single quotes around the remote path. Screenshot names have spaces.
 - Make a large image smaller before you read it: `magick <scratch>/shot.png -resize 50% <scratch>/shot-small.png`.
-- Read the copy with the Read tool.
+- Read the copy with the `view_image` tool.
