@@ -25,7 +25,7 @@ from enum import Enum
 from scripts.agents import remote
 from scripts.lib import conf, git_files
 from scripts.lib.atomic_file import create_text_atomic, prepared_replacement, sync_folder, write_text_atomic
-from scripts.production import staff
+from scripts.production import showrunners, staff
 from scripts.production.production_doc import (
     EnrolledPaths, Refusal, production_backup_checkout, production_backup_root, read_production, resolve_production_paths,
     staged_notes_directory,
@@ -158,7 +158,10 @@ def backup_during_check(root: Path, state: Path, reference: str) -> None:
     with _backup_lock(root):
         if not marker.is_symlink() and marker.is_file():
             return
-        production = read_production(reference)
+        owner = showrunners.owner_for(reference, staff.authority_snapshot())
+        if not isinstance(owner.doc, staff.LiveDoc) or owner.doc.machine != remote.local_machine():
+            return
+        production = read_production(owner)
         try:
             content = production.log.read_bytes()
         except FileNotFoundError:
@@ -178,12 +181,15 @@ def backup_during_check(root: Path, state: Path, reference: str) -> None:
 
 
 def preserve_legacy_logs(state: Path, owner: staff.StaffId) -> None:
-    """Save old LOG copies before cleanup removes the production state."""
+    """Verify and remove old LOG copies before cleanup removes their state."""
+    root = production_backup_root()
     source = state / owner / LEGACY_COPIES
-    if os.path.lexists(source):
-        root = production_backup_root()
-        with _backup_lock(root):
+    with _backup_lock(root):
+        if os.path.lexists(source):
+            _check_directory(source.parent)
             _copy_legacy_logs(source, root / owner / LEGACY_COPIES)
+            shutil.rmtree(source)
+            sync_folder(source.parent)
 
 
 def production_sources(row: staff.StaffRow, doc: Path) -> BackupSources:
