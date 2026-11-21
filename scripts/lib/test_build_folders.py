@@ -690,7 +690,7 @@ def interrupt():
             assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         os.kill(os.getpid(), signal.SIGINT)
 flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
-unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
+unlink, remove_folder = os.unlink, f.remove_folder
 def lock_step(fd, mode):
     result = flock(fd, mode)
     if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
@@ -732,7 +732,7 @@ patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
            'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
            'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
            'publish': mock.patch.object(f, '_locks', PublishStep()),
-           'folder_removed': mock.patch.object(f, '_remove_folder', side_effect=folder_removed),
+           'folder_removed': mock.patch.object(f, 'remove_folder', side_effect=folder_removed),
            'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}

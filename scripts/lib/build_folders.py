@@ -540,7 +540,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                                check=True, capture_output=True,
                                                pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                                timeout=repository_git_timeout())
-                            _remove_folder(path, directory, existing)
+                            remove_folder(path, directory, existing)
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
                                                pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
@@ -642,12 +642,15 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        _remove_folder(path, directory, allocated)
+        remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
+def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None) -> None:
+    """Remove an owned folder and repair permissions when removal needs it."""
+    name = os.fspath(path) if directory is None else path.name
+
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
@@ -659,12 +662,14 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> Non
         else:
             _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
-    try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if os.path.samestat(current, allocated):
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+    if allocated is not None:
+        try:
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not os.path.samestat(current, allocated):
+            return
+    shutil.rmtree(name, dir_fd=directory, onexc=repair)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -955,7 +960,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
+    _ = remove_build_folder(path, lambda: remove_folder(path, directory, allocated),
                             temporary=temporary, dir_fd=directory)
 
 
@@ -973,7 +978,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
                     return False
             except OSError:
                 return False
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
