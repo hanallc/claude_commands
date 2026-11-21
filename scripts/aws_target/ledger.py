@@ -2153,8 +2153,13 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             groups[spend_group('SpotUsage:' + settings.instance_type)] += period_cost(older, start, end)
             for charge in older:
                 include(charge)
+        if bill is None or reserve:
             for reservation in state.gate_reservations:
                 if isinstance(reservation.state, GateAbsent) or reservation.at > stop:
+                    continue
+                # Keep the booking on billed days until the launch log has a complete row.
+                if bill is not None and not (_gate_holds_booking(reservation)
+                                             or isinstance(reservation.state, GateLaunchPending)):
                     continue
                 for charge in gate_compute.get('gate:' + reservation.attempt, ()):
                     groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import subprocess
 from threading import Event
+import time
 from typing import cast, override
 from unittest import mock
 import unittest
@@ -633,6 +634,54 @@ class LedgerTests(CostFixture):
         request = ledger.GateReservation('open', self.start, self.start + 1200, Decimal('.8'), Decimal('.02'),
                                          instance_type='m7a.8xlarge', region='us-east-2')
         self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
+
+    def check_bill_keeps_unlogged_booking(self, bill_start: int, now: int,
+                                          outcome: ledger.GateRunning | ledger.GateTerminated) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0'})
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        midnight = self.start + 86400
+        booked = ledger.GateReservation('cross-midnight', midnight - 1800, midnight + 1800,
+                                        Decimal('.80'), Decimal('.02'),
+                                        instance_type='m7a.8xlarge', region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booked), ledger.GateReserved)
+        accounting = ledger.GateLaunchAccounting.from_config(conf.read_or_repository('cloud_gate'))
+        with mock.patch.object(time, 'time', return_value=now):
+            self.book.record_gate_launch_outcome(booked.attempt, outcome,
+                instance_type=booked.instance_type, lock_timeout_s=1, accounting=accounting)
+        launch = json.dumps({'attempt': booked.attempt, 'time': booked.at, 'instance_type': booked.instance_type,
+                             'region': booked.region, 'result': 'launched'})
+        _ = self.book.launch_history_path.write_text(launch)
+        self.assertEqual(self.book.launches(), ())
+        self.replace('monthly_limit_usd', '.70')
+        policy = config.read_settings(self.settings)
+        next_gate = ledger.GateReservation('next-gate', now, now + 60, Decimal(0), Decimal(0), region=booked.region)
+
+        def admission() -> tuple[Decimal, ledger.GateReserved | ledger.GateCapReached | ledger.GateAttemptEnded]:
+            days = ledger.gate_spend_days(self.book.priced_snapshot(now), policy,
+                                          self.book.read_bills(), now, reserve=True)
+            return sum((day.usd for day in days), Decimal(0)), self.book.reserve_gate(self.settings, next_gate)
+
+        refused = ledger.GateCapReached('monthly_limit')
+        self.assertEqual(admission(), (Decimal('.82'), refused))
+        bill = ledger.ChargeRead(datetime.fromtimestamp(bill_start, UTC).date().isoformat(),
+            now, bill_start, bill_start + 86400, Decimal('.08'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.08'), Decimal('.1'), 'Hrs'),), False)
+        self.write_complete_bill_fixture(bill)
+        self.assertEqual(admission(), (Decimal('.90'), refused))
+
+        _ = self.book.launch_history_path.write_text(launch + '\n')
+        amount, decision = admission()
+        self.assertLess(amount, Decimal('.70'))
+        self.assertIsInstance(decision, ledger.GateReserved)
+
+    def test_bill_for_first_day_keeps_the_unlogged_booking_across_midnight(self) -> None:
+        self.check_bill_keeps_unlogged_booking(self.start, self.start + 86400 + 900, ledger.GateRunning('i-fixture'))
+
+    def test_bill_for_second_day_keeps_the_unlogged_booking_across_midnight(self) -> None:
+        midnight = self.start + 86400
+        self.check_bill_keeps_unlogged_booking(midnight, midnight + 86400 + 900,
+                                               ledger.GateTerminated(midnight + 1800, 'i-fixture'))
 
     def test_reservation_rejects_closed_attempt_ids(self) -> None:
         request = self.allowance_gate()
