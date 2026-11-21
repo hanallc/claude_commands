@@ -250,8 +250,9 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         from scripts.buildlog import record, store
 
         self.configure("natedev,linux")
-        with mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "linux",
-                                         "BUILDLOG_PINNED_TARGET": "linux"}), \
+        with self.admission.loop_turn(), \
+             mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "linux",
+                                         "BUILDLOG_PINNED_TARGET": "linux"}, clear=True), \
              mock.patch.object(store, "host_name", return_value="linux-build"), \
              mock.patch.object(os, "getcwd", return_value=str(self.root)):
             record.step(["0", "100", "101", "0", "", "", "cargo", "nextest", "run"])

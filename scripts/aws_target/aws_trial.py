@@ -334,7 +334,11 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                 folder, worker.sidecar, PAIRED_TRIAL_JOB, group=group) as slot:
             try:
                 connection.send('ready')
-                if connection.recv() != 'launch':
+                try:
+                    decision = connection.recv()
+                except EOFError:
+                    return
+                if decision != 'launch':
                     return
                 if (folder / 'outcome.json').exists():
                     return
@@ -352,6 +356,14 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
         cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': str(error)})
     finally:
         connection.close()
+
+
+def _start_paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier, *,
+                         group: CloudGroup, coordinator_ends: tuple[LaunchBarrier, ...]) -> None:
+    # Only the coordinator keeps these ends so its exit sends EOF to each worker.
+    for end in coordinator_ends:
+        end.close()
+    paired_module(folder, directory, settings_path, connection, group=group)
 
 
 def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
@@ -414,11 +426,17 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         for request in requests:
             attempt = ledger.text(request, 'attempt')
             parent, child = context.Pipe()
-            process = context.Process(target=paired_module,
+            coordinator_ends = tuple(connection for _, connection in children) + (parent,)
+            process = context.Process(target=_start_paired_module,
                 args=(folder / attempt, directory, settings_path, child),
-                kwargs={'group': CloudGroup(folder.name, len(requests), started_at, Owner(pid, start))})
-            process.start()
-            child.close()
+                kwargs={'group': CloudGroup(folder.name, len(requests), started_at, Owner(pid, start)),
+                        'coordinator_ends': coordinator_ends})
+            try:
+                with child:
+                    process.start()
+            except BaseException:
+                parent.close()
+                raise
             children.append((process, parent))
             descriptor = parent.fileno()
             workers[descriptor] = (attempt, parent)

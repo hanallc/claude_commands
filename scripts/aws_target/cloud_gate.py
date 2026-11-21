@@ -1635,11 +1635,13 @@ def _complete_outcome(repo: Path, folder: Path, request: dict[str, object],
     try:
         validate_result(row, request)
         head = ledger.text(request, 'head')
+        selection = gate_box.completion_selection(ledger.text(request, 'mode'), split=request.get('split') is True)
     except (OSError, ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
     if gate.checked_git(repo, 'rev-parse', 'HEAD') != head:
         return LocalFallback('The checkout changed during the cloud attempt')
-    import_record(folder, row)
+    record = {**ledger.mapping(row['record']), 'selection': selection}
+    import_record(folder, {**row, 'record': record})
     print((folder / 'gate.log').read_text(), end='', flush=True)
     return CloudCompleted(gate_box.decode_run(row['gate']))
 
