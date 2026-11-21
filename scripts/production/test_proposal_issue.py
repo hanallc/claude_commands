@@ -13,11 +13,13 @@ import os
 import tempfile
 import unittest
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
 from unittest import mock
 
+from scripts.agents.remote import local_machine
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
@@ -102,6 +104,35 @@ class ProposalIssueTests(unittest.TestCase):
         assert saved is not None
         self.assertEqual(saved.path, archived)
         self.assertEqual(proposal_issue.review_submission(saved), details)
+
+    def test_f099_proposal_filing_reports_the_missing_document_before_writing(self) -> None:
+        recipient, other, *_ = staff.snapshot().find(kind="showrunner")
+        document = self.root / "other-production.md"
+        other = replace(other, doc=staff.LiveDoc(local_machine(), document))
+        folder = self.root / "issues"
+        former = self.root / "former"
+        former.mkdir()
+        legacy = former / "legacy.md"
+        _ = legacy.write_text(VAULT_ISSUE.replace("---\n", "---\nproposal_id: P8\n", 1))
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        prepared: list[tuple[str, Path]] = []
+
+        def file() -> Issue:
+            return proposal_issue.file_review_proposal(folder, recipient.id, "Next proposal", "Words",
+                                                        "hana answers this", details,
+                                                        before_write=lambda identity, path: prepared.append((identity, path)))
+
+        members = staff.StaffSnapshot((recipient, other))
+        with mock.patch.object(staff, "snapshot", return_value=members):
+            with self.assertRaisesRegex(proposal_issue.Refusal, r"Cannot check the record folders.*other-production.md"):
+                _ = file()
+            self.assertEqual(prepared, [])
+            self.assertEqual(list(folder.glob("*.md")), [])
+            self.assertFalse((record_store.state_root() / "record-ids" / "proposal.water").exists())
+            _ = document.write_text(f"- **Proposals:** {former}\n")
+            saved = file()
+        self.assertEqual(saved.value("proposal_id"), "P9")
+        self.assertEqual(prepared, [("P9", saved.path)])
 
     def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
         folder = self.root / "issues"

@@ -580,7 +580,7 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
 
 
 def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
-                  unowned: bool = False, assign_ids: bool = False) -> ReviewItem:
+                  unowned: bool = False) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
     parsed = update_registration.parse_outstanding_entries([fields], path)[0]
     filed = moment(fields['since'])
@@ -607,12 +607,6 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
     key = 'question/'+owner+'/'+path.name
     review_id = fields.get('review_id', path.stem)
-    if assign_ids:
-        try:
-            review_id = update_registration.question_review_id(record)
-            fields['review_id'] = review_id
-        except (OSError, ValueError, staff.StaffRefused, update_registration.RegistrationFailure):
-            review_id = ''
     identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     kind = ReviewType.QUESTION if response is None else ReviewType.RESPONSE
@@ -645,7 +639,7 @@ def snapshot_store_paths(folder: Path, sources: ReviewSourceStamps) -> Iterator[
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
-                   include_unowned: bool = True, assign_ids: bool = False,
+                   include_unowned: bool = True,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    kinds: tuple[ReviewType, ...] = QUESTION_TYPES,
                    owner_options: dict[staff.StaffId, str] | None = None,
@@ -669,8 +663,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
         if question_state(record) not in states or not selection.includes(
                 record.path, 'question/'+record.owner+'/'+record.path.name):
             return
-        item = (question_item(record, members, unowned=unowned, assign_ids=True) if assign_ids
-                else question_item(record, members, unowned=unowned))
+        item = question_item(record, members, unowned=unowned)
         if item.type in kinds:
             found.append(item)
 
@@ -1238,15 +1231,15 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
+         sources: list[Path] | None = None) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
-    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, assign_ids=assign_ids)
+    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS)
 
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
-            selection: ReviewSelection, *, assign_ids: bool = False) -> list[ReviewItem]:
+            selection: ReviewSelection) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
     documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
                                     if (doc := record_store.local_document(member)) is not None))
@@ -1254,7 +1247,7 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
     question_kinds = tuple(kind for kind in kinds if kind in QUESTION_TYPES)
     if question_kinds:
         items.extend(question_items(members,documents,states=states,kinds=question_kinds,owner_options=owner_options,
-                                   sources=sources,selection=selection,assign_ids=assign_ids))
+                                   sources=sources,selection=selection))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,states=states,owner_options=owner_options,sources=sources,selection=selection))
     reports = tuple(kind for kind in kinds if kind in INVESTIGATION_TYPES)

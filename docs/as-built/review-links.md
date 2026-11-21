@@ -419,7 +419,11 @@ Open items count in the status line.
 An open investigation and a deferred efficiency item do not count.
 Questions receive a stable, shared `Q<n>` ID in their registration records.
 The native writer assigns the ID under the question owner's lock.
-The snapshot uses the file name for a legacy question until a native write assigns its ID.
+All Review reads use the file name for a legacy Question until a native write assigns its ID.
+This includes the Open read and the Review snapshot.
+When the allocator cannot read a named local document needed to find record folders, it refuses the allocation.
+Proposal filing reports the reason before it saves a record or reserves its ID.
+Review checks that the selected Question still matches the saved record before it replaces a pending follow-up.
 Ordinary reminders serve the owner's session; Review excludes them from items and counts.
 Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
@@ -528,6 +532,11 @@ Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
+Standard Send, List Send and Review Send to the List owner use the same owner check.
+Send uses an active parent when the selected owner has wrapped.
+If a named local document cannot be read, Send reports the reason and leaves the request free for an edit.
+Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
+A retry can reuse an item that Send already filed.
 A new item opens when it matches the current filters.
 Review shows a save confirmation when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.

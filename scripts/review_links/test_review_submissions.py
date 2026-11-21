@@ -264,8 +264,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
         _ = write_config_fixture(conf.path("console"),
                                  f"page.review.owner={OWNER}\npage.list.owner={PRODUCER}\n")
-        morty = replace(self.members.rows[1], name="morty",
-                        doc=staff.LiveDoc(local_machine(), self.root / "unavailable.md"))
+        morty = replace(self.members.rows[1], name="morty")
         members = replace(self.members, rows=(self.members.rows[0], morty))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
         for at, kind in enumerate((submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.INVESTIGATION,
@@ -1833,6 +1832,172 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(saved.path.parent, investigation.folder(PRODUCER))
         record, = investigation.records(PRODUCER, include_read=True)
         self.assertEqual((record.id, record.owner), (saved.id, PRODUCER))
+
+    def test_f098_send_refuses_a_failed_owner_read_before_filing(self) -> None:
+        document = self.doc.read_bytes()
+        parent_doc = self.root / "parent.md"
+        _ = parent_doc.write_text("> **Status: PRODUCTION — running.**\n")
+        parent = replace(self.members.rows[1], kind="showrunner", doc=staff.LiveDoc(local_machine(), parent_doc))
+        owner = replace(self.members.rows[0], parent=staff.ReportsTo(parent.id))
+        members = staff.StaffSnapshot((owner, parent))
+        standard = request(seed="missing owner document")
+        draft = replace(request(seed="undecodable owner document"), request_id="r2-" + "a" * 32)
+
+        with patch.object(staff, "snapshot", return_value=members):
+            self.doc.unlink()
+            with self.assertRaisesRegex(submissions.SubmissionError, r"^Cannot read the production document for builds\.$"):
+                _ = submissions.submit(standard)
+            _ = self.doc.write_bytes(b"\xff")
+            with self.assertRaisesRegex(submissions.SubmissionError, r"^Cannot read the production document for builds\.$"):
+                _ = submissions.submit(draft)
+            for name in ("pending.json", "receipt.json", ".indexed", "investigation.water"):
+                self.assertEqual(list(self.root.rglob(name)), [])
+            self.assertEqual(investigation.records(OWNER), [])
+            self.assertEqual(investigation.records(parent.id), [])
+
+            _ = self.doc.write_bytes(document)
+            for number, payload in enumerate((standard, draft), 1):
+                saved = submissions.submit(payload)
+                retry = submissions.submit(payload)
+                self.assertEqual((saved.owner, saved.id), (OWNER, f"I{number}"))
+                self.assertEqual((retry.key, retry.path), (saved.key, saved.path))
+            self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1", "I2"])
+            self.assertEqual(investigation.records(parent.id), [])
+
+        producer_doc = self.root / "producer.md"
+        owner = self.members.rows[0]
+        producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), producer_doc),
+                           parent=staff.ReportsTo(owner.id))
+        members = staff.StaffSnapshot((owner, producer))
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={producer.id}\n")
+        standard = replace(request(seed="producer standard", recipient=producer.id), images=(IMAGE,))
+        list_page = replace(request(seed="producer list", recipient=producer.id), page="list", images=(IMAGE,))
+        review = replace(standard, request_id="r2-" + "b" * 32, page="review",
+                         page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+        before = {path: path.read_bytes() for path in self.root.rglob("receipt.json")}
+        with patch.object(staff, "snapshot", return_value=members):
+            for content in (b"", b"\xff"):
+                if content:
+                    _ = producer_doc.write_bytes(content)
+                for payload in (standard, list_page, review):
+                    with self.subTest(page=payload.page, content=content):
+                        with self.assertRaisesRegex(submissions.SubmissionError,
+                                                    r"^Cannot read the production document for producer\.$"):
+                            _ = submissions.submit(payload)
+                self.assertEqual({path: path.read_bytes() for path in self.root.rglob("receipt.json")}, before)
+                self.assertEqual(list(self.root.rglob("pending.json")), [])
+                self.assertEqual(list(self.root.rglob("image.png")), [])
+                self.assertEqual(investigation.records(producer.id), [])
+                self.assertEqual([item.id for item in investigation.records(owner.id)], ["I1", "I2"])
+
+            _ = producer_doc.write_text("> **Status: PRODUCTION — wrapped.**\n")
+            list_draft = replace(list_page, request_id="r2-" + "c" * 32, words="Check this from the List.")
+            for number, payload in enumerate((standard, list_page, list_draft, review), 3):
+                with self.subTest(page=payload.page, request_id=payload.request_id):
+                    saved = submissions.submit(payload)
+                    self.assertEqual((saved.owner, saved.id), (owner.id, f"I{number}"))
+                    self.assertEqual(submissions.submit(payload).key, saved.key)
+            self.assertEqual(investigation.records(producer.id), [])
+            self.assertEqual([item.id for item in investigation.records(owner.id)], ["I1", "I2", "I3", "I4", "I5", "I6"])
+
+    def test_f002_allocation_refusal_leaves_the_request_free_for_an_edited_retry(self) -> None:
+        other_doc = self.root / "missing-production.md"
+        other = replace(self.members.rows[1], kind="showrunner", doc=staff.LiveDoc(local_machine(), other_doc))
+        members = staff.StaffSnapshot((self.members.rows[0], other))
+        payload = replace(request(submissions.SubmissionKind.PROPOSAL), images=(IMAGE,))
+        draft = replace(payload, request_id="r2-" + "1" * 32)
+        folder = self.root / "review-attachments" / payload.request_id
+        with patch.object(staff, "snapshot", return_value=members):
+            for candidate in (payload, draft, draft):
+                with self.assertRaisesRegex(submissions.SubmissionError,
+                                            r"Cannot check the record folders.*missing-production.md"):
+                    _ = submissions.submit(candidate)
+                for name in ("pending.json", "receipt.json", "images", ".indexed", "recipient-*"):
+                    self.assertEqual(list(self.root.rglob(name)), [])
+            self.assertEqual(self.proposals(), [])
+
+            _ = other_doc.write_text(f"- **Proposals:** {self.root / 'other-issues'}\n")
+            registry = self.root / "state" / "review-folders" / OWNER / "proposal.json"
+            registry.parent.mkdir(parents=True)
+            _ = registry.write_text("[]\n")
+            selected = False
+            next_id = record_store.LockedRecordNumbers.next_id
+            read_text = Path.read_text
+            read_bytes = Path.read_bytes
+
+            def select_id(numbers: record_store.LockedRecordNumbers, *folders: Path,
+                          covered_owner: staff.StaffId | None = None) -> str:
+                nonlocal selected
+                identity = next_id(numbers, *folders, covered_owner=covered_owner)
+                selected = True
+                return identity
+
+            def refuse_registry_read(path: Path, encoding: str | None = None, errors: str | None = None,
+                                     newline: str | None = None) -> str:
+                if path == registry and selected:
+                    raise PermissionError("Cannot read the folder registry.")
+                return read_text(path, encoding, errors, newline)
+
+            def refuse_registry_backup(path: Path) -> bytes:
+                if path == registry:
+                    raise PermissionError("Cannot read the folder registry for rollback.")
+                return read_bytes(path)
+
+            for operation, refusal in (("read_text", refuse_registry_read), ("read_bytes", refuse_registry_backup)):
+                selected = False
+                with (self.subTest(operation=operation),
+                      patch.object(record_store.LockedRecordNumbers, "next_id", select_id),
+                      patch.object(Path, operation, refusal)):
+                    with self.assertRaisesRegex(PermissionError, "Cannot read the folder registry"):
+                        _ = submissions.submit(payload)
+                    self.assertTrue(selected)
+                    self.assertFalse(folder.exists())
+                    self.assertEqual(self.proposals(), [])
+                    self.assertFalse((self.root / "state" / "record-ids" / "proposal.water").exists())
+                self.assertEqual(registry.read_text(), "[]\n")
+
+            edited = replace(payload, words="File the edited proposal.")
+            saved = submissions.submit(edited)
+            self.assertEqual(submissions.submit(edited), saved)
+        self.assertEqual(saved.id, "P1")
+        self.assertEqual([proposal.path for proposal in self.proposals()], [saved.path])
+        self.assertTrue(proposal_issue.read_issue(saved.path).endswith(edited.words + "\n"))
+        image, = saved.details.images
+        self.assertEqual((folder / "images" / image.id / image.file).read_bytes(), base64.b64decode(PNG))
+
+    def test_f003_stale_review_action_keeps_the_unnumbered_question_wait(self) -> None:
+        path = self.issues / "question-legacy.md"
+        item = update_registration.OutstandingItem(
+            since="2026-11-17T12:00", text="Legacy question", question="What changed?", asked_by=OWNER,
+            followup=update_registration.PendingFollowup(text="Check the first result.", sent="2026-11-17T12:30"))
+        record = update_registration.QuestionRecord(path, OWNER, OWNER, item, "open")
+        update_registration.write_question_record(record)
+        stale = review_items.question_item(record, self.members)
+        pending = update_registration.PendingFollowup(text="Check the current result.", sent="2026-11-17T12:45")
+        current = replace(record, item={**item, "followup": pending})
+        update_registration.write_question_record(current)
+        before = path.read_bytes()
+        root = self.root / "review"
+        status = change_page.DeliveryStatus(root)
+        browser = change_page.ReviewBrowser("fixture-token", "")
+        body = urlencode({"row": stale.key, "token": change_browser.row_token(browser, stale.key),
+                          "outcome": "question", "feedback": "Which result is correct?"})
+        with patch.object(change_browser, "browser_manifest", return_value=(browser.token, browser.initial)):
+            with (patch.object(review_items, "read", return_value=[stale]),
+                  patch.object(status, "write_slots", wraps=status.write_slots) as write):
+                with self.assertRaisesRegex(review_items.ReviewRecordChanged, "follow-up on this question changed"):
+                    _ = review_page.submit(root, body, status)
+                write.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(self.questions()[0].item.get("followup"), pending)
+            self.assertNotIn("review_id", self.questions()[0].item)
+            with patch.object(review_items, "read", return_value=[review_items.question_item(current, self.members)]):
+                delivery, _ = review_page.submit(root, body, status)
+        self.assertIsInstance(delivery, change_page.MessageDelivery)
+        stored, = self.questions()
+        self.assertEqual(stored.item.get("review_id"), "Q1")
+        self.assertEqual(stored.item.get("waiting_why"), "Which result is correct?")
+        self.assertIn("Superseded followup: Check the current result.", stored.item.get("review_log", ""))
 
     def test_send_to_a_wrapped_owner_files_with_the_active_owner(self) -> None:
         wrapped = self.wrap_fixture()

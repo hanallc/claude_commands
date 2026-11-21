@@ -1850,7 +1850,7 @@ class ChangePageTests(unittest.TestCase):
         update_registration.write_question_record(update_registration.QuestionRecord(path, owner.id, asker.id, item, "open"))
         return "question/" + owner.id + "/" + path.name
 
-    def test_f075_open_shows_a_legacy_question_when_numbering_fails(self) -> None:
+    def test_f075_open_shows_a_legacy_question_when_another_source_is_unreadable(self) -> None:
         key = self.file_user_question()
         other_key = self.file_user_question("Read the numbered Question?")
         folder = update_registration.question_folder(self.production, update_registration.QuestionStaff.read())
@@ -1863,7 +1863,7 @@ class ChangePageTests(unittest.TestCase):
         blocked.parent.mkdir(parents=True)
         _ = blocked.write_bytes(b"---\n\xff\n")
         items = review_items.read(self.root, show="open", kinds=(review_items.ReviewType.QUESTION,))
-        self.assertEqual({item.key: item.id for item in items}, {key: "", other_key: "page-owner/Q8"})
+        self.assertEqual({item.key: item.id for item in items}, {key: "page-owner/"+path.stem, other_key: "page-owner/Q8"})
         self.assertEqual({record: record.read_bytes() for record in before}, before)
         self.assertFalse((record_store.state_root() / "record-ids" / "question.water").exists())
 

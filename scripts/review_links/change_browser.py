@@ -735,14 +735,15 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
 
 def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
                          outcome: change_page.QuestionOutcome, words: str,
-                         verify_revision: Callable[[], object] | None = None) -> None:
+                         verify_revision: Callable[[], object] | None = None, *,
+                         before_write: Callable[[], None]) -> None:
     """Validate and write one canonical question under its owner's lock."""
     path = update_registration.outstanding_path(production)
     superseded = ''
     with update_registration.outstanding_lock(path):
         if verify_revision is not None:
             _ = verify_revision()
-        records = update_registration.selected_question_records([question.record.path], (), None)
+        records = update_registration.selected_question_records([question.record.path], (), None, owner=question.owner)
         if not records or records[0].owner != question.owner or records[0].status != 'open':
             raise review_items.ReviewRecordChanged('This question is no longer open.')
         current = records[0]
@@ -750,7 +751,7 @@ def save_question_record(production: update_registration.QuestionScope, question
         pending = item.get('followup')
         if pending != question.record.item.get('followup'):
             raise review_items.ReviewRecordChanged('The follow-up on this question changed.')
-        if item != question.record.item:
+        if current != question.record:
             raise review_items.ReviewRecordChanged('This question changed. Check it again before saving.')
         now = datetime.now(production.zone)
         events = review_events.decode(item.get('review_log', ''))
@@ -770,7 +771,7 @@ def save_question_record(production: update_registration.QuestionScope, question
         label = 'feedback sent' if outcome == 'feedback' else outcome
         item['review_log'] = review_events.encode(review_events.append(
             events, review_events.ReviewLog(now.astimezone(user_zone()), 'nate', label+': '+words)))
-        update_registration.write_question_record(current)
+        update_registration.write_question_record(current, assign_id=True, before_write=before_write)
         if current.status == 'closed':
             with review_items.after_store_write(question.key):
                 update_registration.record_answer(path, production.name, item, now)
@@ -818,19 +819,24 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
         slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
-        status.write_slots(page, page.rows[0], slots)
-        status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+
+        def claim_delivery() -> None:
+            status.write_slots(page, page.rows[0], slots)
+            status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+
         try:
             if exact_record:
-                save_question_record(production, question, outcome, words, verify_revision)
+                save_question_record(production, question, outcome, words, verify_revision, before_write=claim_delivery)
             else:
+                claim_delivery()
                 relay = save_outcome(production, question, outcome, words, identities)
         except BaseException as error:
             try:
-                if exact_record:
-                    status.write_slots(previous_page, page.rows[0], previous_slots)
-                else:
-                    status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
+                if attempt in status.request_attempts:
+                    if exact_record:
+                        status.write_slots(previous_page, page.rows[0], previous_slots)
+                    else:
+                        status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
             finally:
                 _ = status.request_attempts.pop(attempt, None)
             if isinstance(error, update_registration.RegistrationFailure):
