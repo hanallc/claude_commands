@@ -37,7 +37,7 @@ class RemovalGuardTests(unittest.TestCase):
         self.home.mkdir()
         self.target.mkdir(parents=True)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.home), "CONF_DIR": str(self.fixture)}))
-        _ = self.config.write_text("removal.forms=" + " ".join(
+        _ = self.config.write_text("removal.path_templates=" + " ".join(
             str(self.root.joinpath(*form.value)) for form in removal_guard.Form) + "\n")
 
     def guard(self, *mounts: Path) -> removal_guard.RemovalGuard:

@@ -43,10 +43,12 @@ class MergeGateTypesTests(GateSuitesFixture):
         arguments = ["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"]
         if production:
             arguments.extend(["--production", production])
+        else:
+            arguments.extend(["--unit", "fixture-merge"])
         owner = nullcontext() if production else mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner")
-        with owner:
+        with owner, mock.patch.object(merge_gate, "_sweep_nightly_build_folders"):
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
-                              self.environment, self.root)
+                              self.environment, self.root, environment_lock=self.admission.loop_access)
 
     def test_nightly_checks_all_scripts_with_the_fake_type_checker(self) -> None:
         result = self.run_nightly()
@@ -55,13 +57,15 @@ class MergeGateTypesTests(GateSuitesFixture):
         type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
         python = self.state / "runner/typecheck-venv/bin/python"
         self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
-        self.assertNotEqual(type_call["cwd"], str(self.checkout))
-        self.assertTrue(Path(type_call["cwd"]).exists())
-        self.assertEqual(build_folders.build_folder_state(Path(type_call["cwd"])), "free")
-        records = list((self.root / "slots").glob("*-slot*.lease.json"))
-        self.assertEqual(len(records), 1)
-        self.assertTrue((Path(type_call["cwd"]) / "target").is_dir())
-        self.assertEqual(json.loads(records[0].read_text())["commit"], self.base)
+        checkout = Path(type_call["cwd"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertTrue(checkout.is_dir())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertTrue(checkout.is_relative_to(self.fixture_root / "build"))
+        self.assertEqual(checkout.parent.name, "fixture-merge")
+        record = build_folders.lease_path(checkout)
+        self.assertTrue((checkout / "target").is_dir())
+        self.assertEqual(json.loads(record.read_text())["commit"], self.base)
         self.assert_all_modules_started()
         self.assertIn("basedpyright: OK", result.stdout)
         history, = self.gate_history()
@@ -414,7 +418,7 @@ class NightlyPushTests(unittest.TestCase):
             yield sent
 
     def nightly(self) -> int:
-        return merge_gate.nightly(merge_gate.GateArguments(repo=str(self.root), merge_branch="main"))
+        return merge_gate.nightly(merge_gate.GateArguments(repo=str(self.root), merge_branch="main", unit="fixture-merge"))
 
     def test_nightly_push_describes_the_run_and_limits_failed_modules(self) -> None:
         good = merge_gate.GateJobResult("message", "test_send.py", 0, 0, "")

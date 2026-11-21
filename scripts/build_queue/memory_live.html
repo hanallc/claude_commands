@@ -833,11 +833,11 @@ function stepTooltip(key, data) {
   const call = verify?.call || row.call;
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
-    || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
+    || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
     : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
-  if (row.about) rows.push(field('', row.about, 'caption'));
+  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
   if (unavailable) return [...rows, ...stepFields, ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
@@ -851,9 +851,8 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
-    if (!['cloud', 'repository-slot'].includes(row.kind)) {
+    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
+    if (row.kind !== 'cloud') {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -1005,7 +1004,6 @@ function rowUnit(row) {
 }
 function rowOwner(row, waiting = false) {
   if (row.caller) return row.caller;
-  if (row.kind === "repository-slot") return "";
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {

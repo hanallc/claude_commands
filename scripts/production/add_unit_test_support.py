@@ -15,6 +15,7 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_names import fixture_names
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions as runtime_sessions
 from scripts.message import process_identity, relay_identity, session_records
 from scripts.message.process_identity import process_start as REAL_PROCESS_START
@@ -320,7 +321,14 @@ class AddUnitTestCase(ShutdownTestCase):
         self.config = self.root / "home/.claude/config/showrunners.json"
         self.prompt = self.root / "home/.local/state/showrunner/build-followups/prompt.txt"
         home = self.root / "home"
-        (home / ".claude").mkdir(parents=True)
+        (home / ".claude/config").mkdir(parents=True)
+        config_root = self.root / "config"
+        configuration = config_environment(config_root)
+        _ = write_config_fixture(config_root / "build_folders.conf",
+            f"roots.workspace={self.root / 'worktrees'}\nroots.build={self.root / 'build'}\n"
+            + f"roots.build.natedev={self.root / 'build'}\n")
+        copies_config = config_root / "copies.conf"
+        _ = write_config_fixture(copies_config, "# range: 0.001..\ngit_timeout_seconds=10\n")
         _ = (home / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
                         "projects": self.trusted_projects()}),
@@ -352,8 +360,9 @@ class AddUnitTestCase(ShutdownTestCase):
         sync_state = self.root / "catalog-sync-success"
         self.write_agent_config()
         _ = sync_state.touch()
-        self.env = {**os.environ, "HOME": str(self.root / "home"),
+        self.env = {**os.environ, **configuration, "HOME": str(home),
                     "HERDR_PLATFORM": "linux",
+                    "COPIES_CONFIG": str(copies_config),
                     "TOKIO_WORKER_THREADS": "1",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
                     "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
@@ -700,7 +709,8 @@ def submit_command(argv):
         parsed = parser.parse_args(args)
         parsed.production = self.production_name
         try:
-            requested = add_unit.launch_request(parsed)
+            with patch.dict(os.environ, self.env):
+                requested = add_unit.launch_request(parsed)
             launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
                 worktree=requested.worktree, plan=requested.plan, port=requested.port,
                 session=requested.session, timeout=requested.timeout, responsibilities=requested.responsibilities,
@@ -773,12 +783,16 @@ def submit_command(argv):
         if effort is None:
             self.assertNotIn("--effort", command)
 
+    def unit_tree(self, name: str) -> Path:
+        """Return the expected unit worktree in the fixture."""
+        return self.root / "worktrees/origin" / name / "worktree"
+
     def assert_no_launch_change(self, document: str, head: str) -> None:
         self.assertEqual(self.doc.read_text(), document)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertFalse((self.unit_tree("alpha")).exists())
         self.assertEqual(self.servers_started(), [])
 
 
@@ -796,7 +810,7 @@ def submit_command(argv):
         return worktree
 
     def prepare_restored_worktree(self, name: str, worktree: Path, *,
-                                  branch: str = "build-followups-alpha",
+                                  branch: str = "alpha-worktree",
                                   plan: str = "docs/plans/given.md") -> staff.StaffRow:
         """Record the existing location and file a scheduled restore must keep."""
         if not worktree.exists():
@@ -823,8 +837,8 @@ def submit_command(argv):
         request = add_unit.UnitLaunch(
             production=read_production(self.production_name),
             identity=add_unit.UnitIdentity("alpha", "alpha"),
-            branch="build-followups-alpha",
-            worktree=self.root / "project-alpha",
+            branch="alpha-worktree",
+            worktree=self.unit_tree("alpha"),
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             session=add_unit.NewSession(),
@@ -957,7 +971,7 @@ def submit_command(argv):
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
         row = unit_membership(self.production_name, "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
-        row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.root / "project-alpha"), expected=row.worktree)
+        row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.unit_tree("alpha")), expected=row.worktree)
         stopped = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(
             "alpha", unit_lookup.ClaudeNotRunning(), HerdrPlace(name, "w2:p1"),
             identity=unit_lookup.LiveSession(row.current_session)))
