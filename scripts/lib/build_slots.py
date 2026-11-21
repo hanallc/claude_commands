@@ -10,6 +10,7 @@ from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import fcntl
 import json
 from enum import Enum, auto
 import os
@@ -26,7 +27,7 @@ from typing import BinaryIO, cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, conf, copy_record, file_lock, git_files, git_rescue
+from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
 from scripts.lib.slot_root import SlotsNotConfigured as SlotsNotConfigured, configured_slot_root as configured_slot_root
 from scripts.lib.slot_root import slot_root as slot_root
 
@@ -262,20 +263,30 @@ def _rescue(path: Path) -> None:
         saved_index.unlink()
 
 
-def _exclude_slot_target(source: Path, path: Path, descriptor: int) -> None:
+def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> None:
+    read_extension = ("config", "--local", "--type=bool", "--get", "extensions.worktreeConfig")
+    if _git(path, *read_extension, accepted=(0, 1), pass_fds=(descriptor,)) == "true":
+        return
+    with (common_dir / "slot-worktree-config.lock").open("a") as lock:
+        # Git retains the lock if the slot process exits during a write.
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        descriptors = (descriptor, lock.fileno())
+        if _git(path, *read_extension, accepted=(0, 1), pass_fds=descriptors) == "true":
+            return
+        # Preserve the main checkout's location when Git enables worktree configuration.
+        for key in ("core.worktree", "core.bare"):
+            value = _git(path, "config", "--local", "--get", key, accepted=(0, 1), pass_fds=descriptors)
+            if value:
+                _ = _git(path, "config", "--file", str(common_dir / "config.worktree"),
+                         key, value, pass_fds=descriptors)
+                _ = _git(path, "config", "--local", "--unset", key, pass_fds=descriptors)
+        _ = _git(path, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=descriptors)
+
+
+def _exclude_slot_target(path: Path, descriptor: int) -> None:
     """Keep build output ignored only in this slot's worktree."""
     checkout = git_files.at(path)
-    with file_lock.exclusive(checkout.common_dir / "slot-worktree-config.lock"):
-        if _git(source, "config", "--local", "--type=bool", "--get", "extensions.worktreeConfig",
-                accepted=(0, 1), pass_fds=(descriptor,)) != "true":
-            # Preserve the main checkout's location when Git enables worktree configuration.
-            for key in ("core.worktree", "core.bare"):
-                value = _git(source, "config", "--local", "--get", key, accepted=(0, 1), pass_fds=(descriptor,))
-                if value:
-                    _ = _git(source, "config", "--file", str(checkout.common_dir / "config.worktree"),
-                             key, value, pass_fds=(descriptor,))
-                    _ = _git(source, "config", "--local", "--unset", key, pass_fds=(descriptor,))
-            _ = _git(source, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=(descriptor,))
+    _enable_worktree_config(path, checkout.common_dir, descriptor)
     exclude = checkout.git_dir / "info/exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     text = exclude.read_text() if exclude.exists() else ""
@@ -321,7 +332,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 if target.is_symlink():
                     target.unlink()
                     target.mkdir()
-                _exclude_slot_target(path, path, descriptor)
+                _exclude_slot_target(path, descriptor)
                 _rescue(path)
                 _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1), pass_fds=(descriptor,))
                 _ = _git(path, "checkout", "--force", "--detach", checkout.commit, pass_fds=(descriptor,))

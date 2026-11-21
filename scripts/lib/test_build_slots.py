@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator, Sequence
+from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+import fcntl
 import io
 import json
 import os
@@ -326,9 +327,10 @@ class BuildSlotsTests(unittest.TestCase):
 
     def test_two_slots_share_one_git_config_migration(self) -> None:
         common = self.source / ".git"
+        lock_path = common / "slot-worktree-config.lock"
         first_read, resume_first = threading.Event(), threading.Event()
         git = cast(Callable[..., str], getattr(build_slots, "_git"))
-        exclusive = file_lock.exclusive
+        flock = fcntl.flock
 
         def pause_after_read(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                              accepted: tuple[int, ...] = (0,)) -> str:
@@ -338,17 +340,15 @@ class BuildSlotsTests(unittest.TestCase):
                 self.assertTrue(resume_first.wait(TEST_HANG_GUARD_SECS), "The second caller did not reach the migration.")
             return result
 
-        @contextmanager
-        def observe_contention(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
+        def observe_contention(descriptor: int, mode: int) -> None:
             # Resume the first caller when the real lock makes the second caller wait.
-            if path.parent == common and wait:
-                with exclusive(path, wait=False) as result:
-                    if result is file_lock.LockResult.ACQUIRED:
-                        yield result
-                        return
-                resume_first.set()
-            with exclusive(path, wait=wait) as result:
-                yield result
+            if mode == fcntl.LOCK_EX and lock_path.exists() and os.path.samestat(os.fstat(descriptor), lock_path.stat()):
+                try:
+                    flock(descriptor, mode | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    resume_first.set()
+            flock(descriptor, mode)
 
         def take(number: int) -> Path:
             with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
@@ -356,7 +356,7 @@ class BuildSlotsTests(unittest.TestCase):
                 return slot.path
 
         with (mock.patch.object(build_slots, "_git", side_effect=pause_after_read),
-              mock.patch.object(file_lock, "exclusive", new=observe_contention),
+              mock.patch.object(fcntl, "flock", new=observe_contention),
               ThreadPoolExecutor(max_workers=1) as worker):
             first = worker.submit(take, 1)
             try:
@@ -371,6 +371,30 @@ class BuildSlotsTests(unittest.TestCase):
         self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
         self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
                                   "--get-all", "core.bare"), "false")
+
+    def test_git_inherits_the_shared_lock_during_worktree_config_migration(self) -> None:
+        lock_path = self.source / ".git/slot-worktree-config.lock"
+        git = cast(Callable[..., str], getattr(build_slots, "_git"))
+        locked_commands: list[tuple[str, ...]] = []
+
+        def observe_git(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
+                        accepted: tuple[int, ...] = (0,)) -> str:
+            if lock_path.exists():
+                contender = file_lock.take_exclusive(lock_path)
+                if isinstance(contender, file_lock.ExclusiveLock):
+                    contender.close()
+                else:
+                    lock_stat = lock_path.stat()
+                    self.assertTrue(any(os.path.samestat(os.fstat(fd), lock_stat) for fd in pass_fds),
+                                    f"Git did not inherit the shared lock: {arguments}")
+                    locked_commands.append(arguments)
+            return git(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
+
+        with mock.patch.object(build_slots, "_git", side_effect=observe_git), self.take():
+            pass
+
+        self.assertIn(("config", "--local", "--unset", "core.bare"), locked_commands)
+        self.assertIn(("config", "--local", "extensions.worktreeConfig", "true"), locked_commands)
 
     def test_repository_limit_uses_own_or_default_maximum_without_output(self) -> None:
         for maximum in (1, UseDefaultMaximum()):
