@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+import io
 import json
 import os
 import shutil
@@ -40,8 +42,14 @@ exec "$FIX_TEST_RSYNC" "${words[@]}"
 '''
 
 
+def git_environment() -> dict[str, str]:
+    environment = {name: value for name, value in os.environ.items()
+                   if not name.startswith("GIT_") and name not in ("BASH_ENV", "STAFF_CONFIG")}
+    return {**environment, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
 def git(root: Path, *words: str) -> None:
-    _ = subprocess.run(["git", "-C", str(root), *words], check=True, capture_output=True)
+    _ = subprocess.run(["git", "-C", str(root), *words], check=True, capture_output=True, env=git_environment())
 
 
 def commit_all(root: Path) -> None:
@@ -57,7 +65,7 @@ def reservation(reservation_id: str, root: Path, branch: str, *scopes: str,
 
 def head(root: Path) -> str:
     return subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True,
-                          text=True).stdout.strip()
+                          text=True, env=git_environment()).stdout.strip()
 
 
 UNCONFIGURED = berth_board.Board((), configured=False)
@@ -92,7 +100,8 @@ class ReturnFixTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root)
         real_rsync = shutil.which("rsync")
         if real_rsync is None:
             self.skipTest("rsync is not installed")
@@ -101,10 +110,11 @@ class ReturnFixTests(unittest.TestCase):
         write_shell(bin_directory / "rsync", FAKE_RSYNC)
         remote = self.root / "remote"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **git_environment(),
             **config_environment(self.root / "configuration"),
             "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
             "FIX_TEST_DIR": str(self.root), "FIX_TEST_REMOTE": str(remote), "FIX_TEST_RSYNC": real_rsync,
-        })))
+        }, clear=True)))
         self.board = UNCONFIGURED
         _ = cast(object, self.enterContext(patch.object(fix_return, "read_board", self.read_board)))
         self.worktree = self.root / "worktree"
@@ -410,7 +420,9 @@ class RollForwardTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, git_environment(), clear=True)))
         self.worktree = root / "worktree"
         self.staging = root / "staging"
         (self.worktree / "src").mkdir(parents=True)
@@ -428,7 +440,7 @@ class RollForwardTests(unittest.TestCase):
         stopped = subprocess.run(
             [sys.executable, "-c", STOPPED_CHILD, str(self.worktree), str(self.staging), stop_at],
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-            env={**os.environ, "PYTHONPATH": str(FIX_RETURN.parents[2])},
+            env={**git_environment(), "PYTHONPATH": str(FIX_RETURN.parents[2])},
         )
         self.assertEqual(stopped.returncode, 137, stopped.stdout + stopped.stderr)
 
@@ -436,7 +448,7 @@ class RollForwardTests(unittest.TestCase):
         started = subprocess.run(
             ["bash", "-c", VERIFY_START + shell_functions(VERIFY, "finish_mac_fix") + "finish_mac_fix\n", "verify", str(VERIFY.parent)],
             cwd=self.worktree / "src", capture_output=True, text=True, check=False,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**os.environ, "VERIFY_PYTHON": sys.executable},
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**git_environment(), "VERIFY_PYTHON": sys.executable},
         )
         self.assertEqual(started.returncode, status, started.stdout + started.stderr)
         return started.stdout + started.stderr
@@ -599,7 +611,8 @@ class HoldFilterTests(unittest.TestCase):
 
     def test_outstanding_reservation_whose_tip_is_in_head_history_does_not_withhold(self) -> None:
         # A later phase branch holds hook.rs by its tree; an earlier phase's outstanding reservation lists it.
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         git(root, "init", "-q")
         _ = (root / "hook.rs").write_text("earlier phase\n")
         commit_all(root)
@@ -659,7 +672,11 @@ class LocalCopyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root)
+        home = self.root / "home"
+        home.mkdir()
+        self.enterContext(patch.dict(os.environ, {**git_environment(), "HOME": str(home)}, clear=True))
         self.worktree = self.root / "worktree"
         source = self.worktree / "ws/src"
         source.mkdir(parents=True)
@@ -699,7 +716,7 @@ class LocalCopyTests(unittest.TestCase):
         (made.tree / "ws/src/gone.rs").unlink()
         _ = (made.tree / "ws/src/new.rs").write_text("fn new() {}\n")
         _ = (made.tree / "out.log").write_text("log\n")
-        result = fix_return.return_copy(self.worktree, made.folder, self.read)
+        result = fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read)
         self.assertEqual(result, fix_return.FixPartial(("ws/src/held.rs", "ws/src/new.rs"), ("ws/src/gone.rs",), (
             fix_return.Withheld("ws/src/foreign.rs", "other-2 (theirs)"), fix_return.Withheld("ws/src/free.rs", ""))))
         self.assertFalse(fix_return.local_return_succeeded(result))
@@ -714,7 +731,7 @@ class LocalCopyTests(unittest.TestCase):
     def test_foreign_only_fix_passes_and_writes_nothing(self) -> None:
         made = self.copy()
         _ = (made.tree / "ws/src/foreign.rs").write_text("pub(crate) fn foreign() {}\n")
-        result = fix_return.return_copy(self.worktree, made.folder, self.read)
+        result = fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read)
         self.assertEqual(result, fix_return.FixPartial((), (), (
             fix_return.Withheld("ws/src/foreign.rs", "other-2 (theirs)"),)))
         self.assertTrue(fix_return.local_return_succeeded(result))
@@ -722,14 +739,14 @@ class LocalCopyTests(unittest.TestCase):
 
     def test_unchanged_copy_is_none(self) -> None:
         made = self.copy()
-        self.assertEqual(fix_return.return_copy(self.worktree, made.folder, self.read), fix_return.FixNone())
+        self.assertEqual(fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read), fix_return.FixNone())
         self.assertFalse(made.folder.exists())
 
-    def test_changed_worktree_refuses_and_deletes_the_copy(self) -> None:
+    def test_changed_worktree_refuses_and_removes_its_own_copy(self) -> None:
         made = self.copy()
         _ = (made.tree / "ws/src/held.rs").write_text("pub(crate) fn held() {}\n")
         _ = (self.worktree / "ws/src/held.rs").write_text("fn held() { edited }\n")
-        result = fix_return.return_copy(self.worktree, made.folder, self.read)
+        result = fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read)
         self.assertEqual(result, fix_return.FixRefused("the worktree changed during the lint fix pass"))
         self.assertEqual(self.text("ws/src/held.rs"), "fn held() { edited }\n")
         self.assertFalse(made.folder.exists())
@@ -760,9 +777,15 @@ class LocalCopyTests(unittest.TestCase):
         self.assertIsInstance(made, fix_return.FixFailed)
 
     def stale_copy(self, owner: int) -> Path:
-        folder = fix_return.copy_parent(self.target) / fix_return.COPY_NAME
-        folder.mkdir(parents=True)
-        _ = (folder / fix_return.OWNER_NAME).write_text(str(owner))
+        folder = fix_return.claim_folder(fix_return.copy_parent(self.target), owner).folder
+        tree = folder / fix_return.TREE_NAME
+        tree.mkdir()
+        snapshot = fix_return.worktree_snapshot(self.worktree)
+        for relative in snapshot:
+            destination = tree / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copy2(self.worktree / relative, destination, follow_symlinks=False)
+        _ = (folder / fix_return.SENT_NAME).write_text(json.dumps(snapshot))
         _ = (folder / "stale").write_text("left\n")
         return folder
 
@@ -774,16 +797,91 @@ class LocalCopyTests(unittest.TestCase):
         made = self.copy()
         self.assertEqual(made.folder, fix_return.copy_parent(self.target) / f"{fix_return.COPY_NAME}-{os.getpid()}")
         self.assertTrue((folder / "stale").exists())
-        _ = fix_return.return_copy(self.worktree, made.folder, self.read)
+        _ = fix_return.return_copy(self.worktree, made.folder, made.allocation_id, self.read)
         self.assertFalse(made.folder.exists())
 
-    def test_stopped_owner_copy_is_replaced(self) -> None:
+    def test_claim_reports_the_stopped_owner_copy_and_uses_the_owner_suffix(self) -> None:
         stopped = subprocess.Popen(["true"])
         _ = stopped.wait()
         folder = self.stale_copy(stopped.pid)
+        old_stage = folder.parent / f".{folder.name}-{os.getpid()}.new"
+        old_stage.mkdir()
+        _ = (old_stage / "staged").write_text("left\n")
+        with redirect_stderr(io.StringIO()) as report:
+            made = self.copy()
+        self.assertEqual(made.folder, folder.with_name(f"{folder.name}-{os.getpid()}"))
+        self.assertEqual((folder / "stale").read_text(), "left\n")
+        self.assertEqual((old_stage / "staged").read_text(), "left\n")
+        self.assertEqual(report.getvalue().splitlines(), [
+            f"kept for a manual removal list: {old_stage} (fix_return, an earlier lint claim used this path)",
+            f"kept for a manual removal list: {folder} (fix_return, an earlier lint claim used this path)"
+        ])
+
+    def test_stale_return_refuses_a_later_copy_at_the_same_path(self) -> None:
+        first = self.copy()
+        fix_return.close_lint_copy(first.folder, "the fixture closed the first copy")
+        later = self.copy()
+        self.assertEqual(later.folder, first.folder)
+        self.assertNotEqual(later.allocation_id, first.allocation_id)
+        relative = Path("ws/src/held.rs")
+        original = (self.worktree / relative).read_bytes()
+        _ = (later.tree / relative).write_text("fn replacement() {}\n")
+        with redirect_stderr(io.StringIO()) as report:
+            status = fix_return.main(["return-copy", "--repo-root", str(self.worktree), "--folder",
+                                      str(first.folder), "--allocation-id", first.allocation_id])
+        self.assertEqual(status, 1)
+        self.assertIn("the lint copy allocation differs", report.getvalue())
+        self.assertEqual((self.worktree / relative).read_bytes(), original)
+        self.assertEqual((later.tree / relative).read_text(), "fn replacement() {}\n")
+        self.assertEqual((later.folder / fix_return.ALLOCATION_NAME).read_text(), later.allocation_id)
+
+    def test_drop_removes_its_own_copy(self) -> None:
         made = self.copy()
-        self.assertEqual(made.folder, folder)
-        self.assertFalse((folder / "stale").exists())
+        status = fix_return.main(["drop-copy", "--repo-root", str(self.worktree), "--folder", str(made.folder)])
+        self.assertEqual(status, 0)
+        self.assertFalse(made.folder.exists())
+
+    def test_drop_keeps_a_folder_that_replaced_its_own_copy(self) -> None:
+        made = self.copy()
+        _ = made.folder.rename(made.folder.with_name("original"))
+        made.folder.mkdir()
+        note = made.folder / "keep"
+        _ = note.write_text("replacement")
+        with redirect_stderr(io.StringIO()) as error:
+            status = fix_return.main(["drop-copy", "--repo-root", str(self.worktree), "--folder", str(made.folder)])
+        self.assertEqual(status, 0)
+        self.assertEqual(note.read_text(), "replacement")
+        self.assertIn(f"kept for a manual removal list: {made.folder}", error.getvalue())
+
+    def test_return_and_drop_keep_canaries_and_a_saved_copy(self) -> None:
+        home = Path.home()
+        saved = self.stale_copy(os.getpid())
+        canaries: list[Path] = []
+        for location in (home, home / "rust", home / "worktrees", home / ".claude"):
+            canary = location / "canary"
+            canary.mkdir(parents=True)
+            _ = (canary / "keep").write_text("fixture data")
+            canaries.append(canary)
+        snapshot = (saved / fix_return.SENT_NAME).read_bytes()
+        for folder in (*canaries, saved):
+            for command in ("return-copy", "drop-copy"):
+                with self.subTest(path=folder, command=command), redirect_stderr(io.StringIO()) as error:
+                    arguments = [command, "--repo-root", str(self.worktree), "--folder", str(folder)]
+                    if command == "return-copy":
+                        allocation_id = (saved / fix_return.ALLOCATION_NAME).read_text()
+                        arguments.extend(("--allocation-id", allocation_id))
+                    status = fix_return.main(arguments)
+                    self.assertEqual(status, int(command == "return-copy" and folder != saved))
+                    notices = [line for line in error.getvalue().splitlines()
+                               if line.startswith("kept for a manual removal list:")]
+                    reason = "the lint copy was dropped"
+                    if command == "return-copy":
+                        reason = "the lint copy return ended" if folder == saved else "the lint copy allocation differs"
+                    self.assertEqual(notices, [f"kept for a manual removal list: {folder} (fix_return, {reason})"])
+        for canary in canaries:
+            self.assertEqual((canary / "keep").read_text(), "fixture data")
+        self.assertEqual((saved / fix_return.SENT_NAME).read_bytes(), snapshot)
+        self.assertTrue((saved / fix_return.TREE_NAME).is_dir())
 
     def test_member_the_copy_excludes_never_finds_the_worktree_workspace(self) -> None:
         clay = self.worktree / "ws/vendor/clay"
@@ -804,7 +902,8 @@ class LocalCopyTests(unittest.TestCase):
 
 class ApplyFixTests(unittest.TestCase):
     def test_path_outside_the_worktree_fails(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         staging = root / "staging"
         staging.mkdir()
         worktree = root / "worktree"
