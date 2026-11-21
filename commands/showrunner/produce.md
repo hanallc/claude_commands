@@ -435,7 +435,7 @@ to confirm the block remains and no compaction is running. Type `/compact` with
 
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
-   The launcher starts it on the configured units account, keeps its recorded model, checks shutdown holds, and preserves its name and Remote Control link.
+   `add_unit.py` starts it on the pane launch's account, else the configured units account, using the latest turn's model and effort, launch or role defaults per field, and `--model` precedence.
    If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units <claudeN>` sets it.
 </LaunchUnits>
 
