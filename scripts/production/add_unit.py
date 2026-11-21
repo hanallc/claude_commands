@@ -33,7 +33,10 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
 from scripts.message import sessions
 from scripts.production import unit_names
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import (
+    EnrolledPaths, LegacyProduction, Production, ProductionPathsError, Refusal,
+    read_production, resolve_production_paths,
+)
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
@@ -291,12 +294,29 @@ def relative_plan(production: Production, raw: str) -> Path:
         raise Refusal("plan must be inside Showrunner checkout") from error
 
 
-def stub_plan(production: Production, branch: str) -> Path:
-    """Name a brief's stub plan beside the production doc, relative to Showrunner checkout."""
+def document_paths(production: Production) -> EnrolledPaths | LegacyProduction:
     try:
-        return production.doc.parent.relative_to(production.checkout) / f"{branch}.md"
+        return resolve_production_paths(production.doc)
+    except ProductionPathsError as error:
+        raise Refusal(str(error)) from error
+
+
+def require_serving_merge_unit(production: Production, unit_type: staff.UnitType,
+                               paths: EnrolledPaths | LegacyProduction) -> None:
+    """Require an existing merge unit before an enrolled production adds another unit."""
+    if (unit_type != "merge" and isinstance(paths, EnrolledPaths)
+            and staff.serving_merge_unit(production.owner.id) is None):
+        raise Refusal(f"{production.name}: add a merge unit before adding other units")
+
+
+def stub_plan(production: Production, branch: str) -> Path:
+    """Place the tracked brief beside the document's relative path."""
+    paths = document_paths(production)
+    checkout = paths.main if isinstance(paths, EnrolledPaths) else production.checkout
+    try:
+        return production.doc.parent.relative_to(checkout) / f"{branch}.md"
     except ValueError as error:
-        raise Refusal("production doc must be inside Showrunner checkout") from error
+        raise Refusal(f"production doc must be inside {checkout}") from error
 
 
 def launch_request(args: argparse.Namespace, *,
@@ -538,11 +558,13 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     member = checked_unit_member(production, request.unit, record,
                                  identity=(session_staff.LiveSession(request.session.session_id)
                                            if isinstance(request.session, ResumedSession) else session_staff.NO_SESSION))
+    paths = document_paths(production)
+    if isinstance(paths, LegacyProduction) and not production.doc.is_relative_to(production.checkout):
+        raise Refusal("production doc must be inside Showrunner checkout")
+    if isinstance(member, staff_sources.NoSuchMember):
+        with staff.supplied_snapshot(record):
+            require_serving_merge_unit(production, request.unit_type, paths)
     require_merge_branch(production)
-    try:
-        _ = production.doc.relative_to(production.checkout)
-    except ValueError as error:
-        raise Refusal("production doc must be inside Showrunner checkout") from error
     existing = row_is_present(request, member, record)
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (isinstance(existing, ExistingUnitRow)

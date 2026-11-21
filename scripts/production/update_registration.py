@@ -30,7 +30,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import EnrolledPaths, Production, Refusal, read_production, resolve_production_paths
 from scripts.production.checkpoint_gate import report
 
 from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
@@ -42,6 +42,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_exclude import require_untracked_ignored
 from scripts.lib.user_zone import user_zone
 
 from scripts.review_links import new_item_dialog, review_events
@@ -820,10 +821,15 @@ def register(production: Production) -> None:
     except Exception as exc:
         # Recording must never interrupt registration.
         print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
-    relative = production.doc.relative_to(production.checkout)
-    dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
-    if dirty:
-        raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
+    paths = resolve_production_paths(production.doc)
+    if isinstance(paths, EnrolledPaths):
+        for path in (paths.live_doc, paths.log):
+            require_untracked_ignored(paths.main, path.relative_to(paths.main).as_posix())
+    else:
+        relative = production.doc.relative_to(production.checkout)
+        dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
+        if dirty:
+            raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
     # The staff row owns the timer.
     owner = production.owner
     updates = f"showrunner-{owner.id}"

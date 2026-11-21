@@ -24,6 +24,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import demote_showrunner, promote_showrunner, staff
+from scripts.production.production_doc import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
@@ -791,6 +792,22 @@ class DocumentLookupTests(StaffCommandTestCase):
         record = staff.snapshot()
         self.assertEqual(record.by_doc("natedev", owner / relative), exact)
         self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
+
+        with self.subTest(documents="enrolled in the same checkout"):
+            first = main / "docs/plans" / f"example-production{LIVE_DOCUMENT_SUFFIX}"
+            second = main / "docs/plans" / f"other-production{LIVE_DOCUMENT_SUFFIX}"
+            for document in (first, second):
+                _ = document.write_text(f"- **{MERGE_CHECKOUT_FIELD}:** `{main}`\n")
+            bound = fixture_member("showrunner", name="enrolled-example", doc=staff.LiveDoc("natedev", first))
+            other = fixture_member("showrunner", name="enrolled-other", doc=staff.LiveDoc("natedev", second))
+            pointer = unit / relative
+            _ = pointer.write_text(f"Staff: {bound.id}\n")
+            record = staff.StaffSnapshot((bound, other))
+            self.assertEqual(record.by_doc("natedev", first), bound)
+            self.assertEqual(record.by_doc("natedev", second), other)
+            self.assertIsNone(record.by_doc("natedev", pointer))
+            self.assertIsNone(record.by_doc("natedev", unit / first.relative_to(main)))
+            self.assertEqual(record.by_member_reference(bound.id), bound)
 
 
 class StaffTests(StaffCommandTestCase):

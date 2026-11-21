@@ -18,7 +18,7 @@ import tempfile
 from typing import Literal, TypedDict, cast
 
 from scripts.lib import conf
-from scripts.production import production_doc, staff
+from scripts.production import staff
 from scripts.style import refill_inputs, refill_measure, style_config, style_ledger, style_reader, style_rules
 from scripts.style.unit_files import unit_worktrees
 from scripts.style.unit_plans import unit_plan_path
@@ -195,9 +195,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
     with style_ledger.Ledger(repo, database) as private:
         config = style_config.config_for_unit(unit, private.staff_resolver().record)
         save(config.route.doc, "production")
-        proposals = Path(production_doc.production_field(config.route.doc.read_text().splitlines(), "Proposals")).expanduser()
-        if not proposals.is_absolute():
-            proposals = config.route.doc.parent.parent / proposals
+        proposals = style_config.proposals_folder(config.route.doc)
         proposal_paths = sorted(proposals.rglob("*.md")) if proposals.is_dir() else []
         directories[str(proposals)] = [str(path) for path in proposal_paths]
         for path in proposal_paths:
