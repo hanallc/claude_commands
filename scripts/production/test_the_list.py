@@ -1565,6 +1565,7 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
                              (0, "", ""))
             delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
             self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual(delivered.unread_since, START + timedelta(days=30))
             self.assertEqual(delivered.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))

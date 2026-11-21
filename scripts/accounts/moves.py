@@ -425,21 +425,24 @@ def append_move(entry: MoveEntry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-        _ = worker_names.migrate_locked_journal(output, path)
-        if entry["kind"] in ("confirmed", "wait ended", "room again", "failed"):
-            _ = output.seek(0)
-            for line in output:
+        lines = worker_names.migrate_locked_journal(output, path)
+        if entry["kind"] in ("requested", "confirmed", "wait ended", "room again", "failed"):
+            for line in lines:
                 try:
                     previous = cast(object, json.loads(line))
                 except ValueError:
                     continue
-                if _valid(previous):
-                    held = cast(dict[str, object], previous)
-                    if (held.get("kind") == entry["kind"] and held.get("move_id") == entry["move_id"]
-                            and held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
-                            and (entry["kind"] != "confirmed" or
-                                 (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
-                        return
+                if not _valid(previous):
+                    continue
+                held = cast(dict[str, object], previous)
+                if held.get("kind") != entry["kind"] or held.get("move_id") != entry["move_id"]:
+                    continue
+                if entry["kind"] == "requested":
+                    return
+                if (held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
+                        and (entry["kind"] != "confirmed" or
+                             (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
+                    return
         _ = output.seek(0, os.SEEK_END)
         append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 
