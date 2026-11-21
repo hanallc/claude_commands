@@ -690,7 +690,24 @@ The run record saves the caller's staff ID. The supervisor starts in a separate 
 `send.py` uses the saved staff ID to deliver the result to the current session or queue it during a move.
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
-The supervisor waits for this process before it marks the run finished.
+The supervisor records the command exit before it starts delivery.
+After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
+A failed push saves the send error as pending delivery.
+The finished run leaves the live-run limit and keeps its record and log.
+The reaper saves an ended orphan as finished before it makes one delivery attempt.
+The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
+Before the reaper alerts for an unconfirmed push, it checks for a receipt.
+A failed turn-end replay waits for the next start or launcher reap to send its alert.
+A deferred replay keeps a saved push failure.
+The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
+The supervisor sends again only when the previous attempt sent nothing.
+If a pane or relay does not confirm delivery, the supervisor checks only for a receipt.
+After the last retry, the supervisor sends the delivery state to the director.
+The alert holds the delivery lock through submission and records the outcome after sender acceptance or a logged failure.
+The next reap can recover an alert if the process exits before the record saves its outcome.
+A rare exit or a retirement can repeat the alert once. It never repeats the result.
+The alert for an unconfirmed push says that the result may have arrived.
+If an alert fails, the sender prints one anomaly and keeps the result pending.
 The command runs in its own session, including through a systemd scope prefix.
 `detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
 Other `systemd-run` forms return exit 2.
