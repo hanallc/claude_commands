@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+from scripts.lib import conf
 from scripts.lib.transcripts import config_dirs as config_dirs, transcript_paths
 from scripts.lib.session_paths import sessions_directory
 from scripts.message.process_identity import process_start as process_start
@@ -97,7 +98,7 @@ class SessionRetryPolicy:
 
 def retry_policy() -> SessionRetryPolicy:
     """Read tuning at use; a missing or invalid setting never invents a retry budget."""
-    path = Path(__file__).resolve().parents[2] / "config/session_retries.toml"
+    path = conf.repository_root() / "config/session_retries.toml"
     with path.open("rb") as source:
         values = cast(dict[str, object], tomllib.load(source))
     count = values.get("registry_reads")

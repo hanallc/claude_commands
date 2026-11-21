@@ -145,6 +145,30 @@ class OverrideGuardPythonTests(unittest.TestCase):
                         self.assertEqual(str(raised.exception), result.line)
                     self.assertEqual(marker.read_bytes(), b"unchanged\n")
 
+    def test_forged_verify_source_cannot_write_shared_state(self) -> None:
+        root = temporary_root(self)
+        installed = installed_script(root, PYTHON_RELATIVE)
+        repository = root / "private source"
+        pin = root / "verify-scripts.fixture"
+        pinned = pin / "scripts" / PYTHON_RELATIVE
+        pinned.parent.mkdir(parents=True)
+        _ = pinned.write_bytes(installed.script.read_bytes())
+        commit = "a" * 40
+        stamp = pin / ".verify-source"
+        shared = installed.home / ".local/state/buildlog"
+        environment = {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(installed.home / ".claude"),
+                       "VERIFY_SCRIPT_COMMIT": commit}
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(override_guard, "user_home", return_value=installed.home)):
+            for recorded in (repository, installed.home / ".claude"):
+                with self.subTest(source=recorded):
+                    _ = stamp.write_bytes(os.fsencode(recorded) + b"\0" + commit.encode() + b"\0")
+                    result = override_guard.shared_state_access(pinned, PYTHON_RELATIVE, [shared])
+                    if recorded == repository:
+                        self.assertIsInstance(result, override_guard.SharedStateRefused)
+                    else:
+                        self.assertIsInstance(result, override_guard.SharedStateAllowed)
+
     def test_wired_modules_keep_their_checkout_import_forms(self) -> None:
         checkout = SCRIPT_DIRECTORY.parent.parent
         environment = child_environment({"XDG_CACHE_HOME": str(temporary_root(self) / "cache")})
@@ -337,6 +361,22 @@ class OverrideGuardPythonTests(unittest.TestCase):
 
 
 class OverrideGuardShellTests(unittest.TestCase):
+    def test_shell_refuses_a_forged_verify_source(self) -> None:
+        root = temporary_root(self)
+        installed = installed_script(root, SHELL_RELATIVE)
+        pin = root / "verify-scripts.fixture"
+        script = pin / "scripts" / SHELL_RELATIVE
+        script.parent.mkdir(parents=True)
+        script.touch()
+        commit = "a" * 40
+        stamp = pin / ".verify-source"
+        _ = stamp.write_bytes(os.fsencode(root / "private source") + b"\0" + commit.encode() + b"\0")
+        result = run_shell(SHELL_CALL, [str(script), SHELL_RELATIVE, str(installed.home)],
+                           child_environment({"VERIFY_SCRIPT_PIN": str(pin),
+                               "VERIFY_SCRIPT_REPO": str(installed.home / ".claude"), "VERIFY_SCRIPT_COMMIT": commit}))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("the script copy source does not match its stamp", result.stderr)
+
     def test_helper_root_matches_python_without_home_links(self) -> None:
         root = temporary_root(self)
         home = root / "home"

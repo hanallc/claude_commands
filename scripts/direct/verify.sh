@@ -435,6 +435,123 @@ case "${1:-}" in
         ;;
 esac
 
+# Read-only queries need no script copy.
+VERIFY_QUERY_ARGS=("$@")
+[[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
+if [[ "${VERIFY_QUERY_ARGS[0]:-}" == example-test ]]; then
+    echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
+    exit 2
+fi
+VERIFY_START_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$VERIFY_START_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_START_DIR=.
+VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
+VERIFY_OWNED_PIN=""
+
+finish_verify_script_pin() {
+    [[ -n "$VERIFY_OWNED_PIN" ]] || return 0
+    local saved_traps cleanup_signal="" cleanup_status=0 cleanup_pid cause=""
+    saved_traps="$(trap -p INT TERM HUP)"
+    trap 'cleanup_signal=SIGINT' INT
+    trap 'cleanup_signal=SIGTERM' TERM
+    trap 'cleanup_signal=SIGHUP' HUP
+    if mv -- "$VERIFY_OWNED_PIN/.verify-owner" "$VERIFY_OWNED_PIN/.removing" 2>/dev/null; then
+        flock -x -F "$VERIFY_OWNED_PIN/.sweep-lock" rm -rf -- "$VERIFY_OWNED_PIN" 2>/dev/null &
+        cleanup_pid=$!
+        if [[ -z "$cleanup_signal" ]]; then wait "$cleanup_pid" || cleanup_status=$?; fi
+        if [[ -n "$cleanup_signal" ]]; then
+            kill -KILL "$cleanup_pid" 2>/dev/null || true
+            wait "$cleanup_pid" 2>/dev/null || true
+            cause="cleanup interrupted by $cleanup_signal"
+        elif (( cleanup_status != 0 )); then
+            cause="cleanup lock or removal failed"
+        fi
+        if [[ -n "$cause" && -d "$VERIFY_OWNED_PIN" ]]; then
+            printf 'kept for a manual removal list: %s (verify, %s)\n' "$VERIFY_OWNED_PIN" "$cause" >&2
+        fi
+    fi
+    VERIFY_OWNED_PIN=""
+    trap - INT TERM HUP
+    eval "$saved_traps"
+}
+
+verify_scripts_git() (
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    export GIT_OPTIONAL_LOCKS=0
+    git "$@"
+)
+
+pin_verify_scripts() {
+    local repo commit status parent run
+    [[ "$OSTYPE" == linux* ]] || return 0
+    repo="$(verify_scripts_git -C "$VERIFY_START_DIR" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    [[ "$VERIFY_START_DIR/verify.sh" -ef "$repo/scripts/direct/verify.sh" ]] || return 0
+    if ! commit="$(verify_scripts_git -C "$repo" rev-parse --verify HEAD 2>/dev/null)" ||
+            ! status="$(verify_scripts_git -C "$repo" status --porcelain --untracked-files=all -- scripts 2>/dev/null)"; then
+        printf '%s\n' 'verify.sh: scripts are not pinned: Git could not read the script tree' >&2
+        return 0
+    fi
+    if [[ -n "$status" ]]; then
+        printf '%s\n' 'verify.sh: scripts are not pinned: the scripts tree has local changes' >&2
+        return 0
+    fi
+    run="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
+    if [[ "${1:-}" == --session-dir ]]; then run="${2:-}"; fi
+    parent="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}"
+    if [[ -n "$run" ]]; then parent="$run/tmp"; fi
+    if [[ ! -d "$parent" ]]; then
+        TMPDIR="$parent" source "$VERIFY_START_DIR/../lint/invoke.sh" --prepare-temp || return 2
+    fi
+    # Own the private directory before publishing it for handoff.
+    trap '[[ -z "$VERIFY_OWNED_PIN" ]] || rm -rf -- "$VERIFY_OWNED_PIN"' EXIT
+    if ! parent="$(cd -- "$parent" 2>/dev/null && pwd -P)" || [[ "$parent" == / ]] ||
+            ! VERIFY_OWNED_PIN="$(mktemp -d "$parent/verify-scripts.XXXXXXXX" 2>/dev/null)"; then
+        printf '%s\n' 'verify.sh: cannot create the private script copy' >&2
+        return 2
+    fi
+    if ! printf '%s\n' "$$" > "$VERIFY_OWNED_PIN/.verify-owner"; then
+        rm -rf -- "$VERIFY_OWNED_PIN"
+        VERIFY_OWNED_PIN=""
+        printf '%s\n' 'verify.sh: scripts are not pinned: could not record the copy owner' >&2
+        return 0
+    fi
+    trap 'finish_verify_script_pin' EXIT
+    if (verify_scripts_git -C "$repo" archive "$commit" scripts | tar -xf - -C "$VERIFY_OWNED_PIN") 2>/dev/null &&
+            [[ -x "$VERIFY_OWNED_PIN/scripts/direct/verify.sh" && -x "$VERIFY_OWNED_PIN/scripts/lib/py" ]] &&
+            : > "$VERIFY_OWNED_PIN/.sweep-lock" &&
+            printf '%s\0%s\0' "$repo" "$commit" > "$VERIFY_OWNED_PIN/.verify-source"; then
+        export VERIFY_SCRIPT_PIN="$VERIFY_OWNED_PIN" VERIFY_SCRIPT_REPO="$repo" VERIFY_SCRIPT_COMMIT="$commit"
+        shopt -s execfail
+        exec "$BASH" "$VERIFY_SCRIPT_PIN/scripts/direct/verify.sh" "$@" || true
+        shopt -u execfail
+        unset VERIFY_SCRIPT_PIN VERIFY_SCRIPT_REPO VERIFY_SCRIPT_COMMIT
+    fi
+    finish_verify_script_pin
+    trap - EXIT
+    printf '%s\n' 'verify.sh: scripts are not pinned: could not copy the script tree' >&2
+}
+
+if [[ -n "${VERIFY_SCRIPT_PIN:-}" && "${VERIFY_SCRIPT_PIN##*/}" == verify-scripts.* &&
+        "$VERIFY_START_DIR" == "$VERIFY_SCRIPT_PIN/scripts/direct" &&
+        ( -f "$VERIFY_SCRIPT_PIN/.verify-owner" || ( "${UNIT_DETACHED_RUN:-}" == 1 && -f "$VERIFY_SCRIPT_PIN/.detached" ) ) &&
+        -n "${VERIFY_SCRIPT_REPO:-}" && -n "${VERIFY_SCRIPT_COMMIT:-}" ]]; then
+    source "$VERIFY_START_DIR/../build_hold/override_guard.sh" || exit 2
+    if ! build_pinned_source_matches; then
+        echo 'verify.sh: the script copy source does not match its stamp' >&2
+        exit 2
+    fi
+    if [[ -f "$VERIFY_SCRIPT_PIN/.verify-owner" && "$(< "$VERIFY_SCRIPT_PIN/.verify-owner")" == "$$" ]]; then
+        VERIFY_OWNED_PIN="$VERIFY_SCRIPT_PIN"
+        trap 'finish_verify_script_pin' EXIT
+    fi
+else
+    unset VERIFY_SCRIPT_PIN VERIFY_SCRIPT_REPO VERIFY_SCRIPT_COMMIT
+    case "${VERIFY_QUERY_ARGS[0]:-}" in
+        check|test|lint|doc|build|example) pin_verify_scripts "$@" ;;
+        final)
+            if [[ " ${VERIFY_QUERY_ARGS[*]} " != *" --saved "* ]]; then pin_verify_scripts "$@"; fi ;;
+    esac
+fi
+
 # Save exported values before script variables replace caller names.
 # The --env rule refuses the VERIFY_ prefix. env -0 works in every bash build;
 # a bash built without programmable completion has no compgen.
@@ -445,9 +562,6 @@ while IFS= read -r -d '' VERIFY_ENV_ENTRY; do
 done < <(env -0)
 # Trace the helper in its interpreter. CPU time excludes child processes.
 # The normal path starts no extra interpreter.
-VERIFY_START_DIR="${BASH_SOURCE[0]%/*}"
-[[ "$VERIFY_START_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_START_DIR=.
-VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
 PY="$VERIFY_START_DIR/../lib/py"
 if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
     if [[ "$VERIFY_PY_TRACE" != /* ]]; then export VERIFY_PY_TRACE="$PWD/$VERIFY_PY_TRACE"; fi
@@ -459,7 +573,7 @@ options=()
 while [[ "${1:-}" == -S || "${1:-}" == -u ]]; do
     options+=("$1"); shift
 done
-exec "$VERIFY_TRACE_REAL_PY" "${options[@]}" -c '
+VERIFY_PY_ENTRY="${VERIFY_PY_ENTRY:-${1:--c}}" exec "$VERIFY_TRACE_REAL_PY" "${options[@]}" -c '
 import atexit, os, signal, sys, time, types
 started = float(sys.argv[1])
 arguments = sys.argv[2:]
@@ -508,8 +622,6 @@ VERIFY_TRACE_RUNNER
     chmod +x "$PY"
 fi
 # Read-only queries run before environment setup and build admission.
-VERIFY_QUERY_ARGS=("$@")
-[[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final-pass ]]; then
     command_help final >&2
     exit 2
@@ -563,8 +675,29 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
     export VERIFY_NIX_ENV_REEXEC=1
-    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
-        exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
+    VERIFY_NIX_COMMAND=("$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py"
+        exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@")
+    if [[ -z "$VERIFY_OWNED_PIN" ]]; then exec "${VERIFY_NIX_COMMAND[@]}"; fi
+
+    # Keep the owner shell until the launcher and its command have ended.
+    VERIFY_NIX_PRIOR_JOB=${!:-}
+    VERIFY_NIX_CHILD=""
+    stop_verify_nix_launcher() {
+        local status="$1" child="${VERIFY_NIX_CHILD:-${!:-}}"
+        trap '' INT TERM HUP
+        if [[ -n "$child" && "$child" != "$VERIFY_NIX_PRIOR_JOB" ]] && kill -TERM "$child" 2>/dev/null; then
+            wait "$child" || true
+        fi
+        exit "$status"
+    }
+    trap 'stop_verify_nix_launcher 130' INT
+    trap 'stop_verify_nix_launcher 143' TERM
+    trap 'stop_verify_nix_launcher 129' HUP
+    "${VERIFY_NIX_COMMAND[@]}" <&0 &
+    VERIFY_NIX_CHILD=$!
+    VERIFY_NIX_STATUS=0
+    wait "$VERIFY_NIX_CHILD" || VERIFY_NIX_STATUS=$?
+    exit "$VERIFY_NIX_STATUS"
 fi
 unset VERIFY_NIX_ENV_REEXEC
 
@@ -584,6 +717,29 @@ if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
 else
     PY="$VERIFY_START_DIR/../lib/py"
 fi
+
+# Remote launches and probes use the live scripts.
+VERIFY_LIVE_HELPER_ROOT="$BUILD_HELPER_ROOT"
+VERIFY_LIVE_SCRIPTS="${VERIFY_START_DIR%/*}"
+VERIFY_LIVE_PY="$PY"
+VERIFY_LIVE_REAL_PY="$VERIFY_START_DIR/../lib/py"
+if [[ -n "${VERIFY_SCRIPT_PIN:-}" ]]; then
+    VERIFY_LIVE_SCRIPTS="$VERIFY_SCRIPT_REPO/scripts"
+    VERIFY_LIVE_HELPER_ROOT="$(build_helper_root "$VERIFY_LIVE_SCRIPTS/direct/verify.sh")" || exit 2
+    VERIFY_LIVE_REAL_PY="$VERIFY_LIVE_SCRIPTS/lib/py"
+    [[ -n "${VERIFY_PY_TRACE:-}" ]] || VERIFY_LIVE_PY="$VERIFY_LIVE_REAL_PY"
+fi
+
+exec_verify_live_python() {
+    unset VERIFY_SCRIPT_PIN VERIFY_SCRIPT_REPO VERIFY_SCRIPT_COMMIT
+    if [[ "${1:-}" == -c ]]; then
+        export VERIFY_PY_ENTRY="${3:--c}"
+    fi
+    if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
+        export VERIFY_TRACE_REAL_PY="${VERIFY_LIVE_REAL_PY:-$VERIFY_TRACE_REAL_PY}"
+    fi
+    exec "${VERIFY_LIVE_PY:-$PY}" "$@"
+}
 
 # Send <signal> to child <pid>, then collect the child.
 # A trapped signal that arrives while Bash collects a child can lose that exit
@@ -619,6 +775,13 @@ verify_helper() {
         return 0
     fi
     (
+    if [[ -n "${VERIFY_SCRIPT_PIN:-}" && "${1:-}" == "${BUILD_TARGETS_SCRIPT:-}" ]]; then
+        case "${2:-}" in
+            probe-backoff|reserve|recover-reservation|release-wait|stop-hana-gpu)
+                shift
+                exec_verify_live_python "$LIVE_BUILD_TARGETS_SCRIPT" "$@" ;;
+        esac
+    fi
     if [[ "${1:-}" == --stdin ]]; then
         shift
         set -- 1 "$@"
@@ -757,11 +920,13 @@ source "$BUILD_HELPER_ROOT/lint/invoke.sh" || {
 }
 # The queue selects the host before the local hold check.
 LINT_QUEUE_PLACEMENT=1
+LIVE_BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$VERIFY_LIVE_HELPER_ROOT/build_targets/build_targets.py}"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$BUILD_HELPER_ROOT/build_targets/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$BUILD_HELPER_ROOT/direct/local_release_wait.py}"
 STEP_RECORD_SCRIPT="$BUILD_HELPER_ROOT/direct/step_record.py"
 # Finish records that read a copy before its lease ends.
-if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" || "${COPIES_STEP_SOURCE:-}" == "$VERIFY_REPO_ROOT" ]]; then
+if [[ -n "${VERIFY_SCRIPT_PIN:-}" ||
+        "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" || "${COPIES_STEP_SOURCE:-}" == "$VERIFY_REPO_ROOT" ]]; then
     BUILDLOG_SYNC=1
 fi
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
@@ -775,6 +940,7 @@ finish_verify_run() {
     if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
         verify_helper "$DETACHED_RUNS_SCRIPT" record-exit "$UNIT_DETACHED_RECORD" "$1" --pid "$$" || true
     fi
+    finish_verify_script_pin
 }
 STEP_RECORD_ACTIVE=0
 STEP_RECORD_PATH=""
@@ -1526,9 +1692,21 @@ fi
 
 CMD="${1:-}"
 case "$CMD" in
-    check|test|lint|doc|build|example|final|example-test) ;;
+    check|test|lint|doc|build|example|final) ;;
     *) usage; exit 2 ;;
 esac
+
+finish_verify_detach() {
+    local status="$1"
+    if [[ -n "${VERIFY_SCRIPT_PIN:-}" && ! -f "$VERIFY_SCRIPT_PIN/.verify-owner" ]]; then
+        exit "$status"
+    fi
+    case "$status" in
+        0|4|125|126) exit "$status" ;;
+        3) ;;
+        *) echo "verify.sh: detached_runs.py could not detach this run (exit $status); running attached" >&2 ;;
+    esac
+}
 
 # A native worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: detached_runs.py
@@ -1541,16 +1719,12 @@ esac
 DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$BUILD_HELPER_ROOT/agents/detached_runs.py}"
 verify_helper --start
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != *" --attached "* ]]; then
-    VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    VERIFY_SELF="$VERIFY_START_DIR/${BASH_SOURCE[0]##*/}"
+    if [[ -n "${VERIFY_SCRIPT_REPO:-}" ]]; then VERIFY_SELF="$VERIFY_SCRIPT_REPO/scripts/direct/verify.sh"; fi
     DETACH_STATUS=0
     verify_helper "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
         bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
-    case "$DETACH_STATUS" in
-        0) exit 0 ;;
-        3) ;;
-        4) exit 4 ;;
-        *) echo "verify.sh: detached_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
-    esac
+    finish_verify_detach "$DETACH_STATUS"
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
@@ -1562,10 +1736,6 @@ if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
 fi
 
 shift
-if [[ "$CMD" == example-test ]]; then
-    echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
-    exit 2
-fi
 
 
 # Use the same safe characters and single quotes as shlex.join.
@@ -2118,7 +2288,7 @@ doc_staged_helper() {
     folder=$(pwd -P) || return
     while :; do
         if [[ -f "${folder%/}/scripts/lib/py" ]]; then
-            if [[ "$folder" != "${VERIFY_START_DIR%/*/*}" ]]; then
+            if [[ "$folder" != "${VERIFY_SCRIPT_REPO:-${VERIFY_START_DIR%/*/*}}" ]]; then
                 VERIFY_PY_HELPER=DOC_STEP_PY "$PY" - "$script" "$@" < "$script"
                 return
             fi
@@ -2154,7 +2324,8 @@ with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 '
     coproc DOC_COPY {
         if [[ -n "$ssh_caller" ]]; then
-            VERIFY_PY_HELPER=SSH_SOURCE_PY exec "$PY" -c "$ssh_source_py" "$STEP_COPIES_SCRIPT" "$top" "$tree" "$ssh_caller"
+            VERIFY_PY_HELPER=SSH_SOURCE_PY exec_verify_live_python -c "$ssh_source_py" \
+                "$VERIFY_LIVE_SCRIPTS/copies/copies.py" "$top" "$tree" "$ssh_caller"
         fi
         exec "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$top" --tree "$tree" --scratch
     }
@@ -2241,8 +2412,8 @@ note_event() {
         </dev/null >/dev/null 2>&1 || true
 }
 
-MAC_RUNNER="${VERIFY_MAC_RUNNER:-$BUILD_HELPER_ROOT/mac_test/offload.py}"
-MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$BUILD_HELPER_ROOT/mac_test/mac_test.py}"
+MAC_RUNNER="${VERIFY_MAC_RUNNER:-$VERIFY_LIVE_HELPER_ROOT/mac_test/offload.py}"
+MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$VERIFY_LIVE_HELPER_ROOT/mac_test/mac_test.py}"
 export BUILDLOG_MAC_IDLE_HOOK=""
 MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
 COPY_WATCH_PID=""
@@ -2407,7 +2578,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 '
     local runner="$MAC_RUNNER"
     if [[ "$selected_target" == hana-gpu ]]; then
-        runner="$BUILD_TARGETS_SCRIPT"
+        runner="${LIVE_BUILD_TARGETS_SCRIPT:-$BUILD_TARGETS_SCRIPT}"
         runner_args=(run-hana-gpu --assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
             --repo-root "$runner_root" --package "$PKG"
             --result-file "$MAC_RESULT_FILE" -- "${PLACEMENT_COMMAND[@]}")
@@ -2420,10 +2591,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             cd -- "$runner_root" || exit $?
         fi
         if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
-            exec "$PY" "$runner" "${runner_args[@]}"
+            exec_verify_live_python "$runner" "${runner_args[@]}"
+        else
+            VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec_verify_live_python -c "$VERIFY_MAC_ENV_PY" "$runner" "${runner_args[@]}" \
+                3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
         fi
-        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$runner" "${runner_args[@]}" \
-            3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
     ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
     MAC_RUNNER_PID=$!
     MAC_RUNNER_LAUNCHING=0
@@ -3276,7 +3448,7 @@ start_copy_watch() {
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         watch_args+=(--filter-run)
     fi
-    "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
+    (exec_verify_live_python "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}") &
     COPY_WATCH_PID=$!
 }
 

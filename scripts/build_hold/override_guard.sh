@@ -3,9 +3,28 @@
 # bash 5.3.9, 2026-10-12).
 BUILD_OVERRIDE_VARIABLES="ADMISSION_SOCKET CONF_DIR BUILD_HOLD_DIR BUILD_HOLD_RELEASE_DIR MAC_TEST_STATE_DIR MAC_TEST_CONFIG BUILD_TARGETS_SCRIPT BUILD_TARGETS_CONFIG BUILD_TARGETS_NOW"
 
+# Compare the source identity written when Verify made the copy.
+build_pinned_source_matches() {
+    local stamp="$VERIFY_SCRIPT_PIN/.verify-source" repository commit extra
+    [[ -f "$stamp" && ! -L "$stamp" && -O "$stamp" ]] || return 1
+    {
+        IFS= read -r -d '' repository &&
+            IFS= read -r -d '' commit &&
+            ! IFS= read -r -n 1 extra
+    } < "$stamp" &&
+        [[ "$repository" == /* && "$repository" == "${VERIFY_SCRIPT_REPO:-}" &&
+            -n "$commit" && "$commit" == "${VERIFY_SCRIPT_COMMIT:-}" ]]
+}
+
 # build_helper_root <caller file>
 build_helper_root() {
     local file="$1" name IFS=$' \t\n'
+    if [[ -n "${VERIFY_SCRIPT_PIN:-}" && "${VERIFY_SCRIPT_PIN##*/}" == verify-scripts.* &&
+            "$file" == "$VERIFY_SCRIPT_PIN"/scripts/* ]]; then
+        build_pinned_source_matches || return 2
+        printf '%s\n' "$VERIFY_SCRIPT_PIN/scripts"
+        return
+    fi
     for name in $BUILD_OVERRIDE_VARIABLES; do
         if [[ -n "${!name+x}" ]]; then
             [[ "$file" == */* ]] || file="./$file"
@@ -20,6 +39,14 @@ build_helper_root() {
 build_override_refusal() {
     local file="$1" relative="$2" user_home="${3:-}" name found="" IFS=$' \t\n'
     local home_present="${HOME+x}" home_now="${HOME:-}"
+    if [[ -n "${VERIFY_SCRIPT_PIN:-}" && "${VERIFY_SCRIPT_PIN##*/}" == verify-scripts.* &&
+            "$file" == "$VERIFY_SCRIPT_PIN"/scripts/* ]]; then
+        if ! build_pinned_source_matches; then
+            echo "${file##*/}: the script copy source does not match its stamp" >&2
+            return 1
+        fi
+        file="$VERIFY_SCRIPT_REPO/scripts/$relative"
+    fi
     for name in $BUILD_OVERRIDE_VARIABLES; do
         if [[ -n "${!name+x}" ]]; then found="$name"; break; fi
     done

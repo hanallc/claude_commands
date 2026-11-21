@@ -576,6 +576,13 @@ Before deleting a linked worktree, the folder audit saves its source repositorie
 
 ## Verify commands and metadata
 
+On natedev, Verify copies the clean `scripts/` tree at one commit before it enters the queue.
+Local steps use that copy through cleanup and detached result delivery.
+This prevents an install from changing local helper arguments during a wait.
+Configuration stays live.
+Remote routes use their current scripts. The pin does not cover them yet.
+Help and saved-pass queries use the current scripts.
+
 Every command uses `verify.sh <command> [<package>] [flags]`.
 No package selects the whole workspace.
 

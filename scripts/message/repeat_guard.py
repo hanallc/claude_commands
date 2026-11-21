@@ -32,10 +32,10 @@ from dataclasses import asdict, dataclass, field
 from subprocess import Popen
 from typing import Literal, cast
 
-from scripts.lib import conf_reads
+from scripts.lib import conf, conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 
-CONFIG = _WORKER_PATH.parents[2] / "config/send_repeat_guard.conf"
+CONFIG = conf.repository_root() / "config/send_repeat_guard.conf"
 NOTICE_SENDER = "send-repeat-guard"
 
 

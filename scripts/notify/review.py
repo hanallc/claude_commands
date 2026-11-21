@@ -35,7 +35,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-from scripts.lib import conf_reads, models_registry, nix_env
+from scripts.lib import conf, conf_reads, models_registry, nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -46,9 +46,10 @@ if TYPE_CHECKING:
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path.home() / ".local/state/notify"
 GUIDE = Path.home() / "rust/nate_style/message"
-LOADER = Path.home() / ".claude/scripts/ux_style/load-ux-style.sh"
+LOADER = ((ROOT if os.environ.get("VERIFY_SCRIPT_PIN") == str(ROOT) else Path.home() / ".claude")
+          / "scripts/ux_style/load-ux-style.sh")
 PROMPT_FILE = Path(__file__).with_name("reviewer_prompt.md")
-NOTIFY_CONFIG = ROOT / "config/notify.conf"
+NOTIFY_CONFIG = conf.repository_root() / "config/notify.conf"
 HOLD_SECONDS = 300
 # Minimum age; the configured review and post budgets may require more time.
 CLAIM_STALE_SECONDS = 120

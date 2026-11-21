@@ -319,12 +319,32 @@ def main(arguments: list[str]) -> int:
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
-        from scripts.lib.models_registry import agent_environment
+        return _exec_in_environment(arguments[1:])
+    print("nix_env: usage: nix_env.py ensure DIR | exec ABSOLUTE_PROGRAM [ARGS...]", file=sys.stderr)
+    return 2
 
-        program = arguments[1]
-        if not Path(program).is_absolute():
-            print("nix_env: exec requires an absolute program path", file=sys.stderr)
-            return 2
+
+def _exec_in_environment(arguments: list[str]) -> int:
+    import signal
+
+    from scripts.lib.cancellation import CANCELLATION_SIGNALS
+    from scripts.lib import verify_script_pin
+    from scripts.lib.operation_environment import agent_environment
+
+    program = Path(arguments[0])
+    if not program.is_absolute():
+        print("nix_env: exec requires an absolute program path", file=sys.stderr)
+        return 2
+    pin = verify_script_pin.from_code_root(Path(__file__).resolve().parents[2])
+    verify_reexec = isinstance(pin, verify_script_pin.VerifyScriptPin) and program == pin.folder / verify_script_pin.VERIFY_ENTRY
+    previous_handlers = {number: signal.getsignal(number) for number in CANCELLATION_SIGNALS} if verify_reexec else {}
+
+    def end_setup(number: int, _frame: object) -> None:
+        raise SystemExit(128 + number)
+
+    try:
+        for number in previous_handlers:
+            _ = signal.signal(number, end_setup)
         outcome = ensure(Path.cwd())
         if isinstance(outcome, Refused):
             print(outcome.reason, file=sys.stderr)
@@ -333,13 +353,15 @@ def main(arguments: list[str]) -> int:
             outcome.env["NIX_ENV_ENVRC"] = str(outcome.envrc.resolve())
         else:
             _ = outcome.env.pop("NIX_ENV_ENVRC", None)
-        try:
-            os.execvpe(program, arguments[1:], agent_environment(outcome.env))
-        except OSError as error:
-            print("nix_env: " + last_line(str(error), type(error).__name__), file=sys.stderr)
-            return 1
-    print("nix_env: usage: nix_env.py ensure DIR | exec ABSOLUTE_PROGRAM [ARGS...]", file=sys.stderr)
-    return 2
+        if verify_reexec:
+            outcome.env.update({key: os.environ[key] for key in verify_script_pin.PIN_ENV})
+        os.execvpe(str(program), arguments, agent_environment(outcome.env))
+    except OSError as error:
+        print("nix_env: " + last_line(str(error), type(error).__name__), file=sys.stderr)
+        return 1
+    finally:
+        for number, handler in previous_handlers.items():
+            _ = signal.signal(number, handler)
 
 
 if __name__ == "__main__":

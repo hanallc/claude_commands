@@ -20,8 +20,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.lib import conf_reads
 
 DEFAULT_ZONE = "America/New_York"
-CONF = os.environ.get("USER_ZONE_CONF") or os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "config", "user_zone.conf")
+_CODE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+_CONFIG_ROOT = os.environ.get("VERIFY_SCRIPT_REPO") if os.environ.get("VERIFY_SCRIPT_PIN") == _CODE_ROOT else None
+CONF = os.environ.get("USER_ZONE_CONF") or os.path.join(_CONFIG_ROOT or _CODE_ROOT, "config", "user_zone.conf")
 
 
 def stored_zone(path: str) -> str:

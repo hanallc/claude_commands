@@ -401,7 +401,7 @@ class CopiesConfiguration:
 
 
 def config_settings() -> tuple[Path, dict[str, str]]:
-    path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
+    path = Path(os.environ.get("COPIES_CONFIG") or conf.repository_root() / "config/copies.conf")
     path = path.expanduser()
     return path, conf.read(path).values()
 
@@ -427,7 +427,7 @@ def guard_choice_limit() -> int:
     """Read the branch limit, using the repository setting for older configuration files."""
     path, values = config_settings()
     if "guard_choice_limit" not in values:
-        path = Path(__file__).resolve().parents[2] / "config/copies.conf"
+        path = conf.repository_root() / "config/copies.conf"
         values = conf.read(path).values()
     try:
         limit = int(values["guard_choice_limit"])

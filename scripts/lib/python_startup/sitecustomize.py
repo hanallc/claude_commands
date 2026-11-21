@@ -70,10 +70,16 @@ def select_checkout(arguments: list[str]) -> str:
     if selected and state.__dict__.get("completed_selection") == (selected, _selection_inputs(sys.path)):
         return selected
     if not selected:
-        script = arguments[0] if arguments else ""
-        selected = checkout_root(os.path.dirname(os.path.abspath(script))) if script not in {"", "-", "-c", "-m"} else ""
-        selected = selected or checkout_root(os.getcwd())
-        selected = selected or os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+        entry = os.environ.pop("VERIFY_PY_ENTRY", "")
+        script = entry or (arguments[0] if arguments else "")
+        shim_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+        if os.environ.get("VERIFY_SCRIPT_PIN") == shim_root:
+            selected = shim_root
+        elif script not in {"", "-", "-c", "-m"}:
+            selected = checkout_root(os.path.dirname(os.path.abspath(script)))
+        if not entry:
+            selected = selected or checkout_root(os.getcwd())
+        selected = selected or shim_root
         state.__path__ = [selected]
     paths = inherited_paths(os.environ.get("PYTHONPATH", ""))
     if paths:

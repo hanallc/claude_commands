@@ -369,10 +369,18 @@ def path(file: str | Path) -> Path:
     return directory() / f"{file}.conf"
 
 
+def repository_root() -> Path:
+    """Find live repository data for the selected scripts."""
+    code_root = Path(__file__).resolve().parents[2]
+    if os.environ.get("VERIFY_SCRIPT_PIN") == str(code_root) and (repository := os.environ.get("VERIFY_SCRIPT_REPO")):
+        return Path(repository)
+    return code_root
+
+
 def _repository_path(stem: str) -> Path:
     """Return the repository configuration file for a validated stem."""
     conf_reads.record(stem)
-    return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
+    return repository_root() / "config" / f"{stem}.conf"
 
 
 def _parse(source: str) -> dict[str, Setting]:

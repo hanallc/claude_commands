@@ -48,7 +48,7 @@ def model_color_key(stem: str, key: str) -> bool:
         source = Path(override) if override else conf.path("models")
         try:
             if not override and not source.exists():
-                source = Path(__file__).resolve().parents[2] / REGISTRY_PATH
+                source = conf.repository_root() / REGISTRY_PATH
             registry = registry_rows.parse_registry(conf_reads.read_text(source))
         except (OSError, UnicodeError):
             return False

@@ -13,6 +13,7 @@ import math
 import multiprocessing
 import os
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -46,6 +47,7 @@ from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, sessions
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, test_worker, unit_lookup, worker, worker_admission
@@ -316,6 +318,216 @@ class DetachedRunsTests(unittest.TestCase):
     def supervise(self, path: Path) -> detached_runs.RunRecord:
         self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
         return cast(detached_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+
+    @staticmethod
+    def stamp_pin(pin: Path, original: Path) -> None:
+        _ = (pin / ".verify-source").write_bytes(os.fsencode(original) + b"\0" + b"a" * 40 + b"\0")
+
+    @contextlib.contextmanager
+    def pin_handoff(self, pin: Path) -> Generator[int]:
+        _ = (pin / ".verify-owner").write_text(f"{os.getpid()}\n")
+        with ForkChildren() as children:
+            reader, writer = children.pipe()
+            with patch.dict(os.environ, {detached_runs.PIN_READY_FD: str(os.dup(writer))}):
+                yield reader
+
+    def test_detached_verify_uses_its_script_copy_through_delivery(self) -> None:
+        original = self.root / "installed"
+        pin = self.root / "verify-scripts.fixture"
+        entry = Path("scripts/direct/verify.sh")
+        pinned_verify = pin / entry
+        pinned_verify.parent.mkdir(parents=True)
+        _ = pinned_verify.write_text("printf 'pinned Verify\\n'\n", encoding="utf-8")
+        current_verify = original / entry
+        current_verify.parent.mkdir(parents=True)
+        _ = current_verify.write_text("exit 91\n", encoding="utf-8")
+        command = ["bash", str(current_verify), "check"]
+        self.stamp_pin(pin, original)
+
+        def deliver_pinned_result(path: Path) -> int:
+            self.assertTrue(pinned_verify.is_file())
+            self.assertTrue((pin / ".detached").is_file())
+            return deliver_in_fixture(path)
+
+        with (patch.dict(os.environ, {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(original),
+                                      "VERIFY_SCRIPT_COMMIT": "a" * 40}),
+              patch.object(detached_runs, "__file__", str(pin / "scripts/agents/detached_runs.py")),
+              patch.object(detached_runs, "_launch_pinned_supervisor", return_value=SimpleNamespace(pid=4321)),
+              patch.object(detached_runs, "deliver_in_fresh_process", new=deliver_pinned_result)):
+            _, _ = self.start(command)
+            path, = (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+            with self.pin_handoff(pin) as ready:
+                record = self.supervise(path)
+                self.assertEqual(os.read(ready, 1), b"1")
+        self.assertEqual(record["command"], command)
+        self.assertEqual(record.get("exit_code"), 0)
+        self.assertIn("pinned Verify", Path(record["log"]).read_text(encoding="utf-8"))
+        self.assertFalse(pin.exists())
+
+    def test_verify_supervisor_removes_its_copy_if_the_record_cannot_be_read(self) -> None:
+        original = self.root / "installed"
+        pin = self.root / "verify-scripts.fixture"
+        pin.mkdir()
+        self.stamp_pin(pin, original)
+        command = ["bash", str(original / "scripts/direct/verify.sh"), "check"]
+        with (patch.dict(os.environ, {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(original),
+                                      "VERIFY_SCRIPT_COMMIT": "a" * 40}),
+              patch.object(detached_runs, "__file__", str(pin / "scripts/agents/detached_runs.py"))):
+            record = self.record(command)
+            record.unlink()
+            with self.pin_handoff(pin), self.assertRaisesRegex(SystemExit, "is not a run record"):
+                _ = detached_runs.main(["supervise", str(record)])
+        self.assertFalse(pin.exists())
+
+    def test_verify_supervisor_reports_the_copy_when_cleanup_cannot_lock(self) -> None:
+        original = self.root / "installed"
+        pin = self.root / "verify-scripts.fixture"
+        pin.mkdir()
+        self.stamp_pin(pin, original)
+        record = self.record(["bash", str(original / "scripts/direct/verify.sh"), "check"])
+        real_flock = fcntl.flock
+
+        for interrupted in (False, True):
+            def refuse_cleanup(lock: IO[str], operation: int) -> None:
+                if Path(lock.name).name != ".sweep-lock":
+                    real_flock(lock, operation)
+                elif interrupted:
+                    signal.raise_signal(signal.SIGTERM)
+                else:
+                    raise OSError("lock refused")
+
+            with (self.subTest(interrupted=interrupted),
+                  patch.dict(os.environ, {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(original),
+                                         "VERIFY_SCRIPT_COMMIT": "a" * 40}),
+                  patch.object(detached_runs, "__file__", str(pin / "scripts/agents/detached_runs.py")),
+                  patch.object(detached_runs, "_supervise", return_value=0),
+                  patch.object(fcntl, "flock", new=refuse_cleanup),
+                  contextlib.redirect_stderr(io.StringIO()) as errors,
+                  self.pin_handoff(pin)):
+                if interrupted:
+                    with self.assertRaises(detached_runs.SupervisorCancelled) as stopped:
+                        _ = detached_runs.main(["supervise", str(record)])
+                    self.assertEqual(stopped.exception.code, 143)
+                    cause = "cleanup interrupted by SIGTERM"
+                else:
+                    self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
+                    cause = "cleanup lock or removal failed: lock refused"
+                self.assertTrue((pin / ".detached").is_file())
+                self.assertEqual(errors.getvalue(), f"kept for a manual removal list: {pin} (verify, {cause})\n")
+
+    def test_verify_launcher_exit_before_supervise_leaves_cleanup_with_verify(self) -> None:
+        original = self.root / "installed"
+        pin = self.root / "verify-scripts.fixture"
+        launcher = pin / "scripts/lib/py"
+        launcher.parent.mkdir(parents=True)
+        _ = launcher.write_text("#!/bin/sh\nexit 91\n")
+        launcher.chmod(0o700)
+        self.stamp_pin(pin, original)
+        _ = (pin / ".verify-owner").write_text(f"{os.getpid()}\n")
+        command = ["bash", str(original / "scripts/direct/verify.sh"), "check"]
+        with (patch.dict(os.environ, {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(original),
+                                      "VERIFY_SCRIPT_COMMIT": "a" * 40}),
+              patch.object(detached_runs, "__file__", str(pin / "scripts/agents/detached_runs.py")),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            status = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER, "--", *command])
+        self.assertEqual(status, detached_runs.PINNED_SUPERVISOR_START_FAILED, errors.getvalue())
+        self.assertFalse((pin / ".detached").exists())
+        self.assertFalse(list((self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")))
+        verify = Path(__file__).resolve().parents[1] / "direct/verify.sh"
+        cleanup = shell_functions(verify, "finish_verify_script_pin") + 'VERIFY_OWNED_PIN=$1; finish_verify_script_pin\n'
+        _ = subprocess.run(["bash", "-c", cleanup, "verify", str(pin)], check=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertFalse(pin.exists())
+
+    def test_pinned_verify_starts_once_if_the_parent_cannot_write_the_pid(self) -> None:
+        original = self.root / "installed"
+        pin = self.root / "verify-scripts.fixture"
+        entry = Path("scripts/direct/verify.sh")
+        source = Path(__file__).resolve().parents[2]
+        _ = shutil.copytree(source / "scripts", pin / "scripts", symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        self.stamp_pin(pin, original)
+        script = pin / entry
+        runs = self.root / "verify-invocations"
+        _ = script.write_text('printf "detached\n" >> "$1"\n')
+        _ = (pin / ".verify-owner").write_text(f"{os.getpid()}\n")
+        launcher = pin / "scripts/lib/py"
+        pinned_supervisor = pin / "scripts/agents/detached_runs.py"
+        _ = launcher.write_text(f"#!{sys.executable} -I\n"
+            + f"import sys; sys.path.insert(0, {str(pin)!r})\n"
+            + "from scripts.agents import detached_runs\n"
+            + "detached_runs.deliver_in_fresh_process = lambda _path: 0\n"
+            + "raise SystemExit(detached_runs.main(sys.argv[2:]))\n")
+        launcher.chmod(0o700)
+        start_process = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+        supervisors: list[subprocess.Popen[bytes]] = []
+
+        def launch(arguments: list[str], **options: object) -> subprocess.Popen[bytes]:
+            process = start_process(arguments, **options)
+            if arguments[0] == str(launcher):
+                supervisors.append(process)
+                self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
+                self.addCleanup(process.kill)
+            return process
+
+        def fail_pid_write(path: Path, contents: str) -> None:
+            row = cast(dict[str, object], json.loads(contents))
+            if row["status"] == "running" and row["pid"]:
+                raise OSError("fixture PID write failure")
+            write_text_atomic(path, contents)
+
+        with (patch.dict(os.environ, {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(original),
+                                      "VERIFY_SCRIPT_COMMIT": "a" * 40}),
+              patch.object(detached_runs, "__file__", str(pinned_supervisor)),
+              patch.object(subprocess, "Popen", side_effect=launch),
+              patch.object(detached_runs, "write_text_atomic", side_effect=fail_pid_write),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            status = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                        "--", "bash", str(original / entry), str(runs)])
+            logs = (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.log")
+            self.assertEqual(status, detached_runs.PINNED_SUPERVISOR_PID_WRITE_FAILED,
+                             errors.getvalue() + "".join(log.read_text() for log in logs))
+            self.assertIn("fixture PID write failure", errors.getvalue())
+            finish = shell_functions(source / entry, "finish_verify_detach")
+            attached = 'finish_verify_detach "$1"\nprintf "attached\n" >> "$2"\n'
+            result = subprocess.run(["bash", "-c", finish + attached, "verify", str(status), str(runs)],
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, status, result.stderr)
+        supervisor, = supervisors
+        record, = (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+        log = record.with_suffix(".log")
+        self.assertEqual(supervisor.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
+        self.assertEqual(runs.read_text().splitlines(), ["detached"])
+        self.assertFalse(pin.exists())
+
+    def test_verify_supervisor_signals_remove_its_copy(self) -> None:
+        original = self.root / "installed"
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(number=number), ForkChildren() as children:
+                pin = self.root / "verify-scripts.fixture"
+                pin.mkdir()
+                self.stamp_pin(pin, original)
+                _ = (pin / ".verify-owner").write_text(f"{os.getpid()}\n")
+                record = self.record(["bash", str(original / "scripts/direct/verify.sh"), "check"])
+                reader, writer = children.pipe()
+
+                def supervise_pin() -> int:
+                    with (patch.dict(os.environ, {"VERIFY_SCRIPT_PIN": str(pin), "VERIFY_SCRIPT_REPO": str(original),
+                                                  "VERIFY_SCRIPT_COMMIT": "a" * 40,
+                                                  detached_runs.PIN_READY_FD: str(writer)}),
+                          patch.object(detached_runs, "__file__", str(pin / "scripts/agents/detached_runs.py"))):
+                        return detached_runs.main(["supervise", str(record)])
+
+                with (record.parent / ".start.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    supervisor = children.start(supervise_pin, pass_fds=(writer,), close_fds=(lock.fileno(),))
+                    self.assertTrue(select.select([reader], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertEqual(os.read(reader, 1), b"1")
+                    self.assertTrue((pin / ".detached").exists())
+                    self.assertFalse((pin / ".verify-owner").exists())
+                    os.kill(supervisor.pid, number)
+                    result = supervisor.result()
+                    self.assertEqual(result.returncode, 128 + number, result.stderr)
+                self.assertFalse(pin.exists())
 
     def test_supervisor_keeps_completion_when_the_command_changes_its_module(self) -> None:
         module_name = "_fixture_detached_completion"

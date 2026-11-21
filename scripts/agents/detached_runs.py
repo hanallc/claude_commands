@@ -46,9 +46,9 @@ from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
+from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs, verify_script_pin
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.cancellation import CANCELLATION_SIGNALS
+from scripts.lib.cancellation import CANCELLATION_SIGNALS, defer_cleanup_signals
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
 
@@ -59,6 +59,10 @@ if TYPE_CHECKING:
 NOT_A_DETACHED_WORKER = 3
 # A worker at its live-run limit must keep its command pending, never run it attached.
 LIVE_RUN_LIMIT_REACHED = 4
+# The attached Verify owner removes its copy after this refusal.
+PINNED_SUPERVISOR_START_FAILED = 125
+PINNED_SUPERVISOR_PID_WRITE_FAILED = 126
+PIN_READY_FD = "VERIFY_SUPERVISOR_READY_FD"
 # Lines of the log the result message carries.
 RESULT_TAIL_LINES = 20
 # verify.sh's VERIFY_SUPERSEDED_STATUS: a newer call of the same verb from the same worker in the
@@ -1159,6 +1163,49 @@ def _uses_unsupported_systemd_run(command: list[str]) -> bool:
             and command[index + 1:index + 3] != ["--user", "--scope"])
 
 
+def _verify_command_pin(command: list[str]) -> verify_script_pin.VerifyScriptPin | verify_script_pin.UnpinnedVerify:
+    pin = verify_script_pin.from_code_root(Path(__file__).resolve().parents[2])
+    if isinstance(pin, verify_script_pin.VerifyScriptPin):
+        if command[:2] == ["bash", str(pin.repository / verify_script_pin.VERIFY_ENTRY)]:
+            return pin
+    return verify_script_pin.UnpinnedVerify.NO_PIN
+
+
+def _launch_supervisor(record: Path, log: IO[bytes], cwd: str, *,
+                       ready_fd: int = -1) -> subprocess.Popen[bytes]:
+    script = Path(__file__).resolve()
+    environment = dict(os.environ)
+    _ = environment.pop(PIN_READY_FD, None)
+    if ready_fd >= 0:
+        environment[PIN_READY_FD] = str(ready_fd)
+    return subprocess.Popen([str(script.parents[1] / "lib/py"), str(script), "supervise", str(record)],
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True, cwd=cwd, env=environment,
+                            pass_fds=(ready_fd,) if ready_fd >= 0 else ())
+
+
+class PinnedSupervisorStartFailed(RuntimeError):
+    """The launcher did not confirm that it owns the script copy."""
+
+
+def _launch_pinned_supervisor(record: Path, log: IO[bytes], cwd: str) -> subprocess.Popen[bytes]:
+    """Wait for the supervisor to accept the script copy before Verify exits."""
+    read_fd, write_fd = os.pipe()
+    try:
+        try:
+            supervisor = _launch_supervisor(record, log, cwd, ready_fd=write_fd)
+        finally:
+            os.close(write_fd)
+        readable, _, _ = select.select([read_fd], [], [], DETACHED_RUN_START_GRACE_SECS)
+        if readable and os.read(read_fd, 1) == b"1":
+            return supervisor
+        with contextlib.suppress(ProcessLookupError):
+            supervisor.terminate()
+        raise PinnedSupervisorStartFailed("the supervisor exited or did not accept the script copy")
+    finally:
+        os.close(read_fd)
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -1248,14 +1295,26 @@ def command_start(args: argparse.Namespace) -> int:
                 record["pane_dispatch_id"] = {"unavailable": "the worker staff row is unavailable"}
             with record_lock(record_path):
                 write_text_atomic(record_path, json.dumps(record, indent=2, sort_keys=True))
+            pin = _verify_command_pin(command)
             with log_path.open("ab") as log:
-                supervisor = subprocess.Popen(
-                    [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True, cwd=cwd,
-                )
+                if isinstance(pin, verify_script_pin.VerifyScriptPin):
+                    try:
+                        supervisor = _launch_pinned_supervisor(record_path, log, cwd)
+                    except (OSError, PinnedSupervisorStartFailed) as error:
+                        record_path.unlink(missing_ok=True)
+                        print(f"detached_runs: {error}; see {log_path}", file=sys.stderr)
+                        return PINNED_SUPERVISOR_START_FAILED
+                else:
+                    supervisor = _launch_supervisor(record_path, log, cwd)
             record["pid"] = supervisor.pid
-            _ = _write_record(record_path, record)
+            try:
+                _ = _write_record(record_path, record)
+            except (OSError, SystemExit) as error:
+                if not isinstance(pin, verify_script_pin.VerifyScriptPin):
+                    raise
+                print(f"detached_runs: the supervisor accepted Verify, but its PID could not be saved: {error}; see {log_path}",
+                      file=sys.stderr)
+                return PINNED_SUPERVISOR_PID_WRITE_FAILED
     finally:
         reaped.complete()
     _ = prune_finished(runs)
@@ -1744,24 +1803,40 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
 
     assert child.stdin is not None
     with child.stdin as gate:
-        started = process_start.process_start(child.pid)
-        if not isinstance(started, process_start.Started):
-            with log.open("a", encoding="utf-8") as output:
-                _ = output.write("detached_runs: command identity is unavailable; command did not start\n")
-            # The gate shell reads the end of its input and exits 125.
-            gate.close()
-        else:
+        try:
+            started = process_start.process_start(child.pid)
+            if not isinstance(started, process_start.Started):
+                with log.open("a", encoding="utf-8") as output:
+                    _ = output.write("detached_runs: command identity is unavailable; command did not start\n")
+                # The gate shell reads the end of its input and exits 125.
+                gate.close()
+            else:
+                path = Path(environment["UNIT_DETACHED_RECORD"])
+                with record_lock(path):
+                    record = _read_record(path)
+                    record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
+                                  command_started=started.start)
+                    supervisor = process_start.process_start(os.getpid())
+                    if isinstance(supervisor, process_start.Started):
+                        record["supervisor_started"] = supervisor.start
+                    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                _send_gate_line(gate, b"start\n")
+            returncode = child.wait()
+        except SupervisorCancelled as cancelled:
+            with contextlib.suppress(ProcessLookupError):
+                process_group.send_process_group(child.pid, signal.SIGTERM)
+            try:
+                _ = child.wait(timeout=DETACHED_RUN_START_GRACE_SECS)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    process_group.send_process_group(child.pid, signal.SIGKILL)
+                _ = child.wait()
             path = Path(environment["UNIT_DETACHED_RECORD"])
             with record_lock(path):
                 record = _read_record(path)
-                record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
-                              command_started=started.start)
-                supervisor = process_start.process_start(os.getpid())
-                if isinstance(supervisor, process_start.Started):
-                    record["supervisor_started"] = supervisor.start
+                _ = record.setdefault("stop_reason", SUPERVISOR_GONE_REASON)
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-            _send_gate_line(gate, b"start\n")
-        returncode = child.wait()
+            returncode = cast(int, cancelled.code)
         if not gate.closed:
             _send_gate_line(gate, b"done\n")
     return _exit_status(returncode)
@@ -1816,14 +1891,59 @@ def _completion_sources(root: Path) -> Generator[None]:
         sys.meta_path.remove(sources)
 
 
+class SupervisorCancelled(SystemExit):
+    """A signal stopped the pinned supervisor."""
+
+
+def _cancel_supervisor(number: int, _frame: object) -> None:
+    for cancellation in CANCELLATION_SIGNALS:
+        _ = signal.signal(cancellation, signal.SIG_IGN)
+    raise SupervisorCancelled(128 + number)
+
+
+def _remove_supervisor_pin(pin: verify_script_pin.VerifyScriptPin) -> None:
+    try:
+        pin.remove()
+    except SupervisorCancelled as cancelled:
+        if pin.folder.exists():
+            number = signal.Signals(cast(int, cancelled.code) - 128)
+            pin.report_retained(f"cleanup interrupted by {number.name}")
+        raise
+
+
 def command_supervise(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", "")))
-    with (record_path.parent / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
-        record = _read_record(record_path)
-        if record["pid"] == 0:
-            record["pid"] = os.getpid()
-            record = _write_record(record_path, record)
+    pin = verify_script_pin.from_code_root(Path(__file__).resolve().parents[2])
+    with contextlib.ExitStack() as cleanup:
+        ready_fd = int(os.environ.pop(PIN_READY_FD, "-1"))
+        if ready_fd >= 0:
+            with os.fdopen(ready_fd, "wb", buffering=0) as ready, defer_cleanup_signals():
+                if not isinstance(pin, verify_script_pin.VerifyScriptPin):
+                    raise ValueError("The supervisor has no Verify script copy")
+                for number in CANCELLATION_SIGNALS:
+                    previous = signal.signal(number, _cancel_supervisor)
+                    _ = cleanup.callback(signal.signal, number, previous)
+                # This rename and the attached cleanup compete for the same file.
+                _ = pin.attached_owner.rename(pin.detached_marker)
+                _ = cleanup.callback(_remove_supervisor_pin, pin)
+                _ = ready.write(b"1")
+        else:
+            pin = verify_script_pin.UnpinnedVerify.NO_PIN
+        with (record_path.parent / ".start.lock").open("a") as admission:
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            record = _read_record(record_path)
+            if record["pid"] == 0:
+                record["pid"] = os.getpid()
+                record = _write_record(record_path, record)
+        command = record["command"]
+        if isinstance(pin, verify_script_pin.VerifyScriptPin):
+            if command[:2] != ["bash", str(pin.repository / verify_script_pin.VERIFY_ENTRY)]:
+                raise ValueError("The detached command does not match its Verify script copy")
+            command = [command[0], str(pin.folder / verify_script_pin.VERIFY_ENTRY), *command[2:]]
+        return _supervise(record_path, record, command)
+
+
+def _supervise(record_path: Path, record: RunRecord, command: list[str]) -> int:
     environment = dict(os.environ)
     from scripts.lib.python_startup.sitecustomize import inherited_paths
 
@@ -1847,12 +1967,12 @@ def command_supervise(args: argparse.Namespace) -> int:
         kind = DetachedRunKind.DETECT
     prefix = scope_prefix(marker, environment, kind=kind)
     with _completion_sources(Path(__file__).resolve().parents[1]):
-        exit_code = _run(prefix + record["command"], environment, log)
+        exit_code = _run(prefix + command, environment, log)
         with record_lock(record_path):
             record = _recover_staged_pane_stop(record_path, _read_record(record_path))
             retry_without_scope = bool(prefix) and not marker.exists() and not record.get("stop_reason")
         if retry_without_scope:
-            exit_code = _run(record["command"], environment, log)
+            exit_code = _run(command, environment, log)
             with record_lock(record_path):
                 record = _recover_staged_pane_stop(record_path, _read_record(record_path))
         marker.unlink(missing_ok=True)

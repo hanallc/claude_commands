@@ -16,6 +16,7 @@ import sys
 
 from scripts.build_hold import shared_state_defaults
 from scripts.buildlog import store
+from scripts.lib import verify_script_pin
 
 
 OVERRIDE_VARIABLES: tuple[str, ...] = (
@@ -56,7 +57,13 @@ class OverridesRefused:
     line: str
 
 
-def is_installed_file(script: Path, relative: str, home: Path) -> bool:
+def is_installed_file(script: Path, relative: str, home: Path,
+                      environment: Mapping[str, str] = os.environ) -> bool:
+    folder = environment.get("VERIFY_SCRIPT_PIN", "")
+    if folder and script.resolve() == Path(folder) / "scripts" / relative:
+        pin = verify_script_pin.from_code_root(Path(folder), environment)
+        if isinstance(pin, verify_script_pin.VerifyScriptPin):
+            script = pin.repository / "scripts" / relative
     try:
         return os.path.samefile(script, home / ".claude" / "scripts" / relative)
     except OSError:
@@ -145,7 +152,7 @@ def refusal(
         name = "HOME"
 
     installed_root = home / ".claude" / "scripts"
-    if not is_installed_file(script, relative, home):
+    if not is_installed_file(script, relative, home, environment):
         return OverridesAllowed()
     return OverridesRefused(
         f"{script.name}: {name} is set to '{environment[name]}'; "

@@ -583,6 +583,12 @@ sweep_after_step() {
         done
         unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
         unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
+        # The sweep holds the copy until its last process closes this descriptor.
+        if [[ -n "${VERIFY_SCRIPT_PIN:-}" && "$BUILD_HELPER_ROOT" == "$VERIFY_SCRIPT_PIN/scripts" ]]; then
+            local pin_sweep_fd
+            exec {pin_sweep_fd}<"$VERIFY_SCRIPT_PIN/.sweep-lock" || exit 2
+            flock -s "$pin_sweep_fd" || exit 2
+        fi
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
