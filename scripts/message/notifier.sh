@@ -499,7 +499,8 @@ ensure_production_backup() {
   local name=production-backup timeout command backup_script="${SCRIPT:h:h}/production/log_backup.py"
   [[ ! -r $STATE_DIR/$name/conf || ! -r $STATE_DIR/$name/state ]] || return 0
   timeout=$("$PY" "${SCRIPT:h:h}/lib/conf.py" get production_backup timeout_seconds) || return 1
-  command="${(q)PY} ${(q)backup_script}"
+  # The first successful hourly run ends the legacy LOG backup route.
+  command="${(q)PY} ${(q)backup_script} --hourly"
   cmd_new "$name" --every 60 --run "$command" --timeout "$timeout" >/dev/null
 }
 

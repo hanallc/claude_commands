@@ -24,22 +24,53 @@ from scripts.production.update_registration import QuestionStaff
 
 
 class LogBackupTests(unittest.TestCase):
-    def test_production_check_reports_status_without_starting_backup(self) -> None:
+    def test_production_check_keeps_backups_until_hourly_migration(self) -> None:
         with TemporaryDirectory() as folder:
             root = Path(folder)
             document = root / "production.md"
             check = Path(__file__).with_name("production_check.sh")
-            with isolated_staff_file(root / "staff.json", {}), patch.dict(os.environ, {"HOME": str(root)}):
+            state = root / "state"
+            log = root / "LOG.md"
+            with (isolated_staff_file(root / "staff.json", {}),
+                  patch.dict(os.environ, {"HOME": str(root), "SHOWRUNNER_STATE_DIR": str(state)})):
                 owner = fixture_member("showrunner", name="backup-owner",
                                        doc=staff.LiveDoc(remote.local_machine(), document))
-                for status, code in (("running", 0), ("wrapped", 2), ("paused", 1)):
-                    with self.subTest(status=status):
-                        _ = document.write_text(f"> **Status: PRODUCTION — {status}.**\n")
+                legacy = state / owner.id / LEGACY_COPIES
+                backup_root = production_backup_root()
+                migrated = backup_root / owner.id / LEGACY_COPIES
+
+                def no_mirror(identity: staff.StaffId) -> log_backup.BackupMirror:
+                    raise AssertionError(f"{identity}: no Git history to publish")
+
+                cases = (("before migration", "running", 0, 1),
+                         ("migration conflict", "running", 0, 2),
+                         ("after migration", "running", 0, 2),
+                         ("after wrap", "wrapped", 2, 2),
+                         ("while paused", "paused", 1, 2))
+                for stage, status, code, count in cases:
+                    with self.subTest(stage=stage):
+                        if stage == "migration conflict":
+                            migrated.mkdir(parents=True)
+                            (copied,) = legacy.iterdir()
+                            conflict = migrated / copied.name
+                            _ = conflict.write_bytes(b"Different content")
+                            self.assertEqual(log_backup.backup_all(backup_root, state, staff.StaffSnapshot(()),
+                                                                  no_mirror, 1, hourly=True), 1)
+                            conflict.unlink()
+                        elif stage == "after migration":
+                            self.assertEqual(log_backup.backup_all(backup_root, state, staff.StaffSnapshot(()),
+                                                                  no_mirror, 1, hourly=True), 0)
+                            expected = {path.name: path.read_bytes() for path in legacy.iterdir()}
+                            self.assertEqual({path.name: path.read_bytes() for path in migrated.iterdir()}, expected)
+                        _ = document.write_text(f"> **Status: PRODUCTION — {status}.**\n"
+                                                f"- **Showrunner checkout:** `{root}`\n"
+                                                "- **Merge branch:** `integration`\n- **Log:** `LOG.md`\n")
+                        _ = log.write_text(stage)
                         result = subprocess.run(["zsh", str(check), owner.id], capture_output=True, text=True,
                                                 env={**os.environ, "XDG_STATE_HOME": str(root)},
                                                 check=False, timeout=TEST_HANG_GUARD_SECS)
                         self.assertEqual((result.returncode, result.stdout, result.stderr), (code, "", ""))
-                        self.assertFalse(production_backup_root().exists())
+                        self.assertEqual(len(list(legacy.glob("log-*.md"))), count)
 
     def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
         with (TemporaryDirectory() as folder,

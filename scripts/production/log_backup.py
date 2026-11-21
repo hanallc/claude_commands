@@ -18,12 +18,13 @@ import sys
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from enum import Enum
 
 from scripts.agents import remote
 from scripts.lib import conf, git_files
-from scripts.lib.atomic_file import sync_folder, write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, prepared_replacement, sync_folder, write_text_atomic
 from scripts.production import staff
 from scripts.production.production_doc import (
     EnrolledPaths, Refusal, production_backup_checkout, production_backup_root, read_production, resolve_production_paths,
@@ -37,6 +38,7 @@ BACKUP_BRANCH = "refs/heads/main"
 SSH_OPTIONS = ("ssh", "-o", "BatchMode=yes")
 BACKUP_MARKER = ".production-backup"
 BACKUP_MARKER_TEXT = "production backup checkout\n"
+HOURLY_ACTIVE = ".hourly-active"
 
 
 class NoStagedNotes(Enum):
@@ -119,6 +121,12 @@ def _backup_lock(root: Path) -> Generator[None]:
         os.close(descriptor)
 
 
+def _save_legacy_copy(target: Path, content: bytes) -> None:
+    with prepared_replacement(target, content, mode=0o600) as temporary:
+        os.link(temporary, target, follow_symlinks=False)
+    sync_folder(target.parent)
+
+
 def _copy_legacy_logs(source: Path, destination: Path) -> None:
     if not os.path.lexists(source):
         return
@@ -137,7 +145,36 @@ def _copy_legacy_logs(source: Path, destination: Path) -> None:
             if target.is_file() and target.read_bytes() == content:
                 continue
             raise OSError(f"{target}: legacy LOG backup differs from {entry}")
-        write_bytes_atomic(target, content)
+        _save_legacy_copy(target, content)
+        if target.read_bytes() != content or entry.read_bytes() != content:
+            raise OSError(f"{entry}: cannot verify the legacy LOG copy")
+
+
+def backup_during_check(root: Path, state: Path, reference: str) -> None:
+    """Keep dated LOG copies until the hourly job verifies migration."""
+    marker = root / HOURLY_ACTIVE
+    if not marker.is_symlink() and marker.is_file():
+        return
+    with _backup_lock(root):
+        if not marker.is_symlink() and marker.is_file():
+            return
+        production = read_production(reference)
+        try:
+            content = production.log.read_bytes()
+        except FileNotFoundError:
+            return
+        if not content.strip():
+            return
+        directory = state / production.owner.id / LEGACY_COPIES
+        _check_directory(directory.parent)
+        _check_directory(directory)
+        kept = sorted(directory.glob("log-*.md"))
+        if kept and kept[-1].read_bytes() == content:
+            return
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(production.zone).strftime("%Y%m%dT%H%M%S%f")
+        target = directory / f"log-{stamp}.md"
+        _save_legacy_copy(target, content)
 
 
 def preserve_legacy_logs(state: Path, owner: staff.StaffId) -> None:
@@ -231,7 +268,8 @@ def publish(repository: Path, mirror: BackupMirror, repack_after_commits: int) -
 
 
 def backup_all(root: Path, state: Path, record: staff.StaffSnapshot,
-               mirror: Callable[[staff.StaffId], BackupMirror], repack_after_commits: int) -> int:
+               mirror: Callable[[staff.StaffId], BackupMirror], repack_after_commits: int, *,
+               hourly: bool = False) -> int:
     standard_root = production_backup_root()
     failures = 0
     with _backup_lock(root):
@@ -258,27 +296,32 @@ def backup_all(root: Path, state: Path, record: staff.StaffSnapshot,
                 except (OSError, ValueError) as error:
                     print(f"log_backup: {identity}: {error}", file=sys.stderr)
                     failures += 1
+        if hourly and not failures:
+            _ = create_text_atomic(root / HOURLY_ACTIVE, "legacy LOG migration verified\n")
     return int(failures != 0)
 
 
 def main(arguments: list[str]) -> int:
-    if arguments:
-        print("usage: log_backup.py", file=sys.stderr)
+    if len(arguments) > 1 or (arguments and arguments[0].startswith("-") and arguments != ["--hourly"]):
+        print("usage: log_backup.py [--hourly | <production>]", file=sys.stderr)
         return 2
-    if sys.platform != "linux":
-        print("log_backup: run this job on natedev", file=sys.stderr)
-        return 1
     try:
         root = production_backup_root()
         state = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+        if arguments and arguments != ["--hourly"]:
+            backup_during_check(root, state, arguments[0])
+            return 0
+        if sys.platform != "linux":
+            print("log_backup: run this job on natedev", file=sys.stderr)
+            return 1
         peer = remote.other_machine()
         repack_after_commits = conf.read("production_backup").whole("repack_after_commits")
         return backup_all(root, state, staff.local_snapshot(), lambda identity: mac_mirror(identity, peer),
-                          repack_after_commits)
+                          repack_after_commits, hourly=arguments == ["--hourly"])
     except BlockingIOError:
         print("log_backup: another backup is active", file=sys.stderr)
         return 1
-    except (OSError, ValueError, staff.StaffRefused, staff.StaffUnreadable) as error:
+    except (OSError, ValueError, Refusal, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"log_backup: {error}", file=sys.stderr)
         return 1
 
