@@ -946,7 +946,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; one blind review; 20 repeated runs of each changed test module after natemerge's go; the gate route that builds names for the merge passes.
 
-### Phase 412 — the CPU cost of one Python start in a gate has a measured cause  · status: todo
+### Phase 412 — the CPU cost of one Python start in a gate has a measured cause  · status: done (no change; measure)
+
+**As built:** no code change. One Python start costs 19.7, 19.7 and 19.6 CPU ms on e7670cf8d7, b576bf26b5 and main 262952c406 (natedev, 200 starts): the start is not the cause of the rise. An empty gate job rose from 120 to 151 CPU ms: 51a28f5e8c adds 11 ms and 70e6c54344 adds 24 ms (leased folders in module_run.py), about 29 CPU s for each gate. One gate starts about 33,800 Python processes (estimate from 20 module traces): about 660 CPU s of bare starts. The repository start hook costs 5 CPU ms for each start. Sent to builds on 11-21 with the proposal: trace the started programs of one gate; Phase 413.
 **Depends on:** none
 
 #### Work Order
@@ -964,3 +966,21 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Acceptance gate:**
   1. Each number names its tree and its command.
   2. The report says which part of the 407 rise the start cost explains.
+
+### Phase 413 — the repository Python start hook has a measured cost for each part  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** one report gives the CPU of each part of `scripts/lib/python_startup/sitecustomize.py` at one Python start, and a repair that brings the hook under 1 CPU ms. Baseline: about 5 CPU ms for each start, about 165 CPU s for each full gate (estimate: 33,800 starts, Phase 412). Predicted saving: 0 CPU in this phase (measure and proposal).
+- **Spec:**
+  1. Read the hook and each module it imports. Name each part: imports, the fixture file tuple, the dataclass code cache, environment reads, file reads.
+  2. Measure each part: 200 starts of `python3 -c pass` with the gate environment, with the full hook and with each part removed in a private clone of main. Use `-X importtime` for the imports. Fresh TMPDIR on /tmp, bytecode on, 2 GiB scope.
+  3. Say which parts each Python start needs and which only a test runner or a named program needs.
+  4. Proposal: the repair with its CPU for each start after it, its owner, and its risk. Change no repository file. Run no test module.
+- **Files:** none (a report in the session folder).
+- **Workers:** 1 writer.
+  - impl: all steps; nothing splits.
+- **Constraints from prior phases:** Phase 412: the start cost is equal on old and new trees; the Nix interpreter keeps its own installed hook under `-I`.
+- **Acceptance gate:**
+  1. Each number names its command and tree.
+  2. The parts add up to the measured hook cost within 0.5 ms.
