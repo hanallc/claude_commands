@@ -76,7 +76,8 @@ class FindStallTests(unittest.TestCase):
         protected = waiter(NOW - 3600)
         queue = snapshot([protected], (holder(NOW - 3600),))
         inputs = replace(queue.inputs, landing_test_waits=frozenset({records.waiter_owner(protected)}))
-        self.assertEqual(head_stall.find_stall(replace(queue, inputs=inputs), 0.0, NOW, LIMIT), head_stall.NoStall())
+        self.assertEqual(head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT),
+                         head_stall.NoStall())
 
     def test_holder_time_starts_at_admission(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 62 * 60),))
