@@ -52,6 +52,7 @@ from scripts.herdr.pane_launch import (
     RESUME_FLAGS as RESUME_FLAGS,
     ClaudeArguments as ClaudeArguments,
     parse_claude_arguments as parse_claude_arguments,
+    parse_claude_flags as parse_claude_flags,
 )
 
 RECORD_DIR = pane_launch.record_directory()
