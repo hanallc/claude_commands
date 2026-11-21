@@ -9,14 +9,14 @@ except FileNotFoundError:
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from types import FrameType
+from queue import SimpleQueue
+from threading import Lock, Thread
 from typing import NotRequired, TypedDict, cast
 
 from scripts.herdr import herdr
@@ -159,34 +159,42 @@ def child_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str
 def run(argv: list[str]) -> int:
     """Run a child on this terminal, then consume a restart or wait under a hold."""
     argv, environment = child_launch(argv, dict(os.environ))
-    child: subprocess.Popen[bytes] | None = None
+    environment = agent_environment({**environment, "RELAUNCH_SUPERVISED": "1"})
+    launch: SimpleQueue[bool] = SimpleQueue()
+    finished = Lock()
+    _ = finished.acquire()
+    result: list[int | BaseException] = []
 
-    def ignore(_number: int, _frame: FrameType | None) -> None:
-        pass
+    def launch_and_wait() -> None:
+        try:
+            if launch.get():
+                child = subprocess.Popen(argv, env=environment, restore_signals=False)
+                result.append(child.wait())
+        except BaseException as error:
+            result.append(error)
+        finally:
+            finished.release()
 
-    def forward(number: int, _frame: FrameType | None) -> None:
-        if child is not None:
-            try:
-                child.send_signal(number)
-            except ProcessLookupError:
-                pass
-
-    previous = {number: signal.getsignal(number) for number in (
-        signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP, signal.SIGTERM, signal.SIGHUP,
-    )}
+    # Python raises KeyboardInterrupt in the main thread. The other thread owns the child.
     try:
-        # A caught handler becomes the default on exec; SIG_IGN would also make
-        # the child ignore keyboard signals.
-        for number in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
-            _ = signal.signal(number, ignore)
-        for number in (signal.SIGTERM, signal.SIGHUP):
-            _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv, env=agent_environment({**environment, "RELAUNCH_SUPERVISED": "1"}))
-        code = child.wait()
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
-    code = code if code >= 0 else 128 - code
+        Thread(target=launch_and_wait, daemon=True).start()
+    except BaseException:
+        launch.put(False)
+        raise
+    published = False
+    # SIGINT can interrupt the retry jump, and the worker takes only one token even if publication repeats.
+    while not result:
+        try:
+            if not published:
+                launch.put(True)
+                published = True
+            _ = finished.acquire()
+        except KeyboardInterrupt:
+            continue
+    status, = result
+    if isinstance(status, BaseException):
+        raise status
+    code = status if status >= 0 else 128 - status
     request = request_path(os.getpid())
     hold = hold_path(os.getpid())
     announced = False

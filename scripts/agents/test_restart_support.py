@@ -1,11 +1,18 @@
 """Delivery outcomes used by the refusal watcher."""
 import subprocess
 import unittest
+from typing import override
 from unittest.mock import patch
 from scripts.agents import restart_support as settle
+from scripts.message import send_budget
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 NOW = "2026-10-09T21:49:10+00:00"
 
 class SendOutcomeTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(patch.object(send_budget, "seconds", return_value=5.0))
+
     def test_confirmed_send_outcomes_preserve_restart_delivery_states(self) -> None:
         cases: tuple[tuple[int, str, settle.MessageSendOutcome], ...] = (
             (0, "SENT: fixture", settle.MessageSent(kind="sent")),
@@ -21,7 +28,8 @@ class SendOutcomeTests(unittest.TestCase):
                 self.assertEqual(settle.send_message("fixture", "summary", "message"), expected)
 
     def test_confirmed_send_failures_raise_without_recording_delivery(self) -> None:
-        for code, header in ((3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING")):
+        for code, header in ((3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING"),
+                             (SEND_CLOSED_EXIT, "CLOSED"), (SEND_ABSENT_EXIT, "ABSENT")):
             with self.subTest(header=header), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unavailable", "")):
                 with self.assertRaisesRegex(RuntimeError, header + ": unavailable"):
                     _ = settle.send_message("fixture", "summary", "message")
