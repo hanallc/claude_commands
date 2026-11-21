@@ -41,7 +41,7 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
-from scripts.lib import inotify
+from scripts.lib import inotify, signal_test_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -110,11 +110,6 @@ def stub_build_tool_path(directory: Path) -> str:
             _ = target.write_text('#!/bin/sh\necho "Unexpected build tool: $0" >&2\nexit 99\n')
             target.chmod(0o755)
     return str(directory)
-
-
-def restore_sigint() -> None:
-    # Background suite processes may inherit SIG_IGN; Bash cannot trap that.
-    _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def processes_carrying(marker: str) -> set[int]:
@@ -1443,7 +1438,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                         "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
                                         **(extra or {})},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True, preexec_fn=restore_sigint)
+                                   start_new_session=True, preexec_fn=signal_test_support.restore_sigint)
 
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
@@ -1485,7 +1480,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            preexec_fn=restore_sigint,
+            preexec_fn=signal_test_support.restore_sigint,
         )
 
     def cargo_events(self) -> list[CargoEvent]:

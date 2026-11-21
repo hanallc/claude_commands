@@ -1,7 +1,8 @@
-"""Reject unsafe process IDs before a test can reach an operating-system signal."""
+"""Signal setup for tests: unsafe process ID guards and the child SIGINT reset."""
 from __future__ import annotations
 
 import os
+import signal
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,3 +26,8 @@ def install_signal_pid_guard() -> None:
     _ = unittest.enterModuleContext(patch.object(os, "kill", new=SignalPidGuard(os.kill)))
     _ = unittest.enterModuleContext(patch.object(
         process_group, "send_process_group", new=SignalPidGuard(process_group.send_process_group)))
+
+
+def restore_sigint() -> None:
+    """Restore the default SIGINT action before a test child executes."""
+    _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
