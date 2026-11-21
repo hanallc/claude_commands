@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.copies import copies
@@ -18,8 +18,9 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib import build_folders, unit_runs
+from scripts.lib import build_folders, copy_record, unit_runs
 from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -43,6 +44,10 @@ class EndSessionTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = fixture_git_environment(self.root)
+        for key in ("BASH_ENV", "STAFF_CONFIG"):
+            _ = environment.pop(key, None)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment, clear=True)))
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()
         session_id = fixture_runtime_id(f"end-session:{self.root.name}")
@@ -62,8 +67,6 @@ class EndSessionTests(unittest.TestCase):
         (scripts / "lib").mkdir()
         (scripts / "production").mkdir()
         (scripts / "production/staff.py").symlink_to(Path(staff.__file__))
-        (scripts / "copies").mkdir()
-        (scripts / "copies/copies.py").symlink_to(Path(copies.__file__))
         (scripts / "astra").mkdir()
         (scripts / "astra/design_roles.py").symlink_to(END_SESSION.parent.parent / "astra/design_roles.py")
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
@@ -79,8 +82,7 @@ class EndSessionTests(unittest.TestCase):
             "#!/usr/bin/env bash\ncase \"$1\" in */remove_run_scratch.py)"
             + " printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
             + f" exec {sys.executable} \"$@\";; -c|*/staff.py|*/unit_runs.py)"
-            + f" exec {sys.executable} \"$@\";; */copies.py)"
-            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;;"
+            + f" exec {sys.executable} \"$@\";;"
             + " */design_roles.py) printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
             + f" exec {sys.executable} \"$@\";; esac\n"
             + "printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n",
@@ -127,33 +129,47 @@ class EndSessionTests(unittest.TestCase):
         return ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
                                        "end@example.invalid", {"Cargo.toml": "[workspace]\n", "file": "content"}).checkout
 
-    def test_end_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
+    def test_end_keeps_trees_and_reports_only_the_units_workspaces(self) -> None:
         environment = self.environment()
-        environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
+            canaries = [self.root / name / "keep" for name in ("", "rust", "worktrees", ".claude")]
+            for path in canaries:
+                path.parent.mkdir(exist_ok=True)
+                _ = path.write_text("keep this file\n")
             source = self.seed()
-            with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
+            owner = str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit"))
+            with copies.standing(owner, source, copies.CommittedSource("HEAD")) as tree:
                 cache = (tree / "target").resolve().parent
                 with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
                     other_cache = (other / "target").resolve().parent
                 self.assertNotEqual(tree, other)
-            with copies.workspace(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, "HEAD", name="worker", branch="worker") as workspace:
-                pass
+            with copies.workspace(owner, source, "HEAD", name="worker", branch="worker") as workspace:
+                self.assertTrue(workspace.is_dir())
+            with copies.workspace("other-unit", source, "HEAD", name="other-worker", branch="other-worker") as other_workspace:
+                self.assertTrue(other_workspace.is_dir())
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(tree.exists())
             self.assertEqual(build_folders.build_folder_state(tree), "free")
-            self.assertFalse(workspace.exists())
+            self.assertEqual((workspace / "file").read_bytes(), (source / "file").read_bytes())
+            self.assertTrue(other_workspace.is_dir())
+            notice = f"kept for a manual removal list: {workspace} (remove_run_scratch, the session ended)"
+            self.assertEqual(result.stderr.splitlines().count(notice), 1)
+            self.assertNotIn(str(other_workspace), result.stderr)
+            self.assertNotIn("copies.py remove", self.calls.read_text())
+            self.assertTrue(all(path.read_text() == "keep this file\n" for path in canaries))
             self.assertTrue(other.exists())
             self.assertEqual(build_folders.build_folder_state(other), "free")
             self.assertTrue(cache.exists())
             self.assertEqual(build_folders.build_folder_state(cache), "free")
             self.assertTrue(other_cache.is_dir())
             self.assertIsNone(self.run_pointer())
+            later = self.run_end(environment)
+            self.assertEqual(later.returncode, 0, later.stderr)
+            self.assertEqual(later.stderr.splitlines().count(notice), 1)
 
-    def test_end_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
+    def test_end_keeps_a_standing_tree_without_a_build_cache(self) -> None:
         environment = self.environment()
-        environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
             owner = str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit"))
             source = ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
@@ -167,11 +183,37 @@ class EndSessionTests(unittest.TestCase):
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIsNone(self.run_pointer())
+            self.assertTrue(tree.is_dir())
             self.assertEqual(build_folders.build_folder_state(tree), "free")
+
+    def test_end_reports_each_workspace_after_an_unreadable_record_of_another_unit(self) -> None:
+        environment = self.environment()
+        with patch.dict(os.environ, environment):
+            source = self.seed()
+            owner = str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit"))
+            with copies.workspace("another-unit", source, "HEAD", name="other", branch="other") as other:
+                pass
+            owned: list[Path] = []
+            for name in ("first", "second"):
+                with copies.workspace(owner, source, "HEAD", name=name, branch=name) as tree:
+                    owned.append(tree)
+            broken = other / copy_record.RECORD
+            _ = broken.write_text("{invalid")
+
+            result = self.run_end(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(sum(line.startswith(f"copies: repair record {broken}:") for line in lines), 1)
+        notices = [line for line in lines if line.startswith("kept for a manual removal list:")]
+        self.assertCountEqual(notices, [
+            f"kept for a manual removal list: {tree} (remove_run_scratch, the session ended)" for tree in owned
+        ])
+        self.assertTrue(all(tree.is_dir() for tree in owned))
+        self.assertEqual(broken.read_text(), "{invalid")
 
     def test_end_keeps_a_busy_tree_and_still_clears_the_run_pointer(self) -> None:
         environment = self.environment()
-        environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
             source = self.seed()
             with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
@@ -224,7 +266,7 @@ class EndSessionTests(unittest.TestCase):
         self.assertIsNone(self.run_pointer())
         self.assertEqual(unit_runs.open_run(other_owner.current_session), other)
 
-    def test_every_run_the_director_holds_is_cleaned_and_no_other(self) -> None:
+    def test_end_reports_scratch_from_each_run_the_director_holds(self) -> None:
         marked = self.make_run("run-marked", self.session_id)
         side = self.make_run("run-side", self.session_id)
         other = self.make_run("run-other", "another-director")
@@ -242,16 +284,18 @@ class EndSessionTests(unittest.TestCase):
         self.assertEqual(removal.split()[1:], ["--session-dir", str(marked), "--session-dir", str(side)])
         self.assertNotIn(str(other), "\n".join(calls))
         for run in (marked, side):
-            self.assertFalse((run / "verify_cache").exists())
-            self.assertFalse((run / "phases" / "p3" / "gate").exists())
-            self.assertFalse((run / "p62_bin").exists())
+            for folder in (run / "verify_cache", run / "phases" / "p3" / "gate", run / "p62_bin"):
+                self.assertTrue(folder.is_dir())
+                self.assertEqual(result.stderr.splitlines().count(
+                    f"kept for a manual removal list: {folder} (remove_run_scratch, the run ended)"), 1)
             self.assertTrue((run / "phases" / "p3" / "review.diff").is_file())
         self.assertTrue((other / "verify_cache").is_dir())
         self.assertTrue((other / "phases" / "p3" / "gate" / ".git").is_dir())
         self.assertTrue((other / "p62_bin").is_dir())
+        self.assertNotIn(str(other), result.stderr)
         self.assertIsNone(self.run_pointer())
 
-    def test_held_runs_are_cleaned_after_the_pointer_is_cleared(self) -> None:
+    def test_end_reports_held_run_scratch_after_the_pointer_is_cleared(self) -> None:
         side = self.make_run("run-side", self.session_id)
         other = self.make_run("run-other", "another-director")
         row = staff.by_current_session(self.session_id)
@@ -269,10 +313,12 @@ class EndSessionTests(unittest.TestCase):
         self.assertEqual(unbind.split()[-1], str(side))
         self.assertEqual(removal.split()[1:], ["--session-dir", str(side)])
         self.assertNotIn(str(other), "\n".join(calls))
-        self.assertFalse((side / "verify_cache").exists())
+        cache = side / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertIn(f"kept for a manual removal list: {cache} (remove_run_scratch, the run ended)", result.stderr)
         self.assertTrue((other / "verify_cache").is_dir())
 
-    def test_run_end_keeps_tracked_scratch_holding_a_paused_workers_live_command(self) -> None:
+    def test_run_end_keeps_live_and_idle_tracked_scratch(self) -> None:
         scratch = self.root / "tracked-scratch" / "command-checkout"
         command_cwd = scratch / "build"
         command_cwd.mkdir(parents=True)
@@ -301,7 +347,9 @@ class EndSessionTests(unittest.TestCase):
         result = self.run_end(environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(command_cwd.is_dir(), result.stdout + result.stderr)
-        self.assertFalse(unused.exists(), result.stdout + result.stderr)
+        self.assertTrue(unused.is_dir(), result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines().count(
+            f"kept for a manual removal list: {unused} (scratch, task run:run ended)"), 1)
 
 
 
