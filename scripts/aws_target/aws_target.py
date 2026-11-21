@@ -523,7 +523,9 @@ USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': 
 
 
 def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
-                          read_usd: Decimal) -> tuple[ledger.ChargeRead, ...]:
+                          read_usd: Decimal, *,
+                          page_timeout: Callable[[float], float] = lambda timeout: timeout,
+                          after_page: Callable[[], None] = lambda: None) -> tuple[ledger.ChargeRead, ...]:
     """Read daily account costs by usage type and count every API page."""
     period = f'Start={datetime.fromtimestamp(start, UTC):%Y-%m-%d},End={datetime.fromtimestamp(end, UTC):%Y-%m-%d}'
     days: dict[str, ledger.ChargeRead] = {}
@@ -534,7 +536,8 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
                      '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--filter', USAGE_ONLY, '--no-paginate']
         if token:
             arguments.extend(('--next-page-token', token))
-        reply = api.call('get-cost-and-usage', *arguments, service='ce')
+        reply = api.call('get-cost-and-usage', *arguments, service='ce', timeout_s=page_timeout(api.timeout_s))
+        after_page()
         items = ledger.rows(reply, 'ResultsByTime')
         if not items:
             raise ValueError('Cost Explorer daily reply is unavailable')

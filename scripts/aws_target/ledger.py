@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
@@ -24,7 +24,7 @@ from typing import BinaryIO, Literal, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
 from scripts.aws_target import hana_result, remote
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -2352,10 +2352,12 @@ def decision_record(decision: SpendingDecision) -> dict[str, object]:
 
 
 class CostLedger:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *,
+                 mutation_lock: Callable[[Path], AbstractContextManager[file_lock.LockResult]] = file_lock.exclusive) -> None:
         self.directory: Path = directory
         self.path: Path = directory / "cost-ledger.json"
         self.launch_history_path: Path = directory / 'cloud-gate-launches.jsonl'
+        self.mutation_lock: Callable[[Path], AbstractContextManager[file_lock.LockResult]] = mutation_lock
 
     def _read(self) -> LedgerEvidence:
         """Read atomically published evidence without creating files or acquiring locks."""
@@ -2386,15 +2388,14 @@ class CostLedger:
     @contextmanager
     def _locked(self) -> Generator[LedgerEvidence]:
         self.directory.mkdir(parents=True, exist_ok=True)
-        with (self.directory / "cost-ledger.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with self.mutation_lock(self.directory / "cost-ledger.lock") as result:
+            if result is file_lock.LockResult.BUSY:
+                raise LedgerUnavailable("The cost ledger lock is busy")
             try:
                 state = self._read() if self.path.exists() else LedgerEvidence()
                 yield state
             except (KeyError, TypeError, ArithmeticError, UnicodeError) as error:
                 raise LedgerUnavailable(f"ledger evidence is invalid: {error}") from error
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _save(self, state: LedgerEvidence) -> None:
         document = _encode(state)

@@ -18,6 +18,7 @@ import os
 import re
 import selectors
 import signal
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -2658,7 +2659,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.fake.result = {**request, 'runs': [], 'verdict': 'error', 'gate_s': 1.0}
         worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', 'fixture-region', 1, execute=self.fake),
             self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
-        connection = mock.Mock(recv=mock.Mock(return_value='launch'))
+        connection = mock.Mock(recv=mock.Mock(return_value=aws_trial.TrialMessage.LAUNCH))
         group = CloudGroup('fixture', 1, self.now, Owner(1, 'fixture'))
         with (mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
               mock.patch.object(cloud_gate, 'cloud_reservation',
@@ -2709,8 +2710,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                         self.assertTrue(self.fake.terminated)
                         _, cleanup = aws_trial.trial_cost(self.book, {attempt}, self.settings, int(self.now))
                         self.assertEqual(cleanup, confirmed)
-                parent, child = multiprocessing.get_context('fork').Pipe()
-                parent.send('launch')
+                parent_socket, child_socket = socket.socketpair()
+                parent, child = aws_trial.TrialChannel(parent_socket), aws_trial.TrialChannel(child_socket)
+                parent.send(aws_trial.TrialMessage.LAUNCH)
                 previous = {number: signal.getsignal(number) for number in aws_trial.TRIAL_SIGNALS}
                 try:
                     with (mock.patch.object(aws_trial, 'AwsCli', return_value=api),
