@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from contextlib import chdir
 import os
 import shlex
@@ -19,15 +19,14 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
+from typing import TYPE_CHECKING, NamedTuple, cast, override
 
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
 from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
-from scripts.agents import remote
+from scripts.agents import pane_record, remote
 from scripts.lib import build_folders, git_exclude, git_files, models_registry
-from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
@@ -1093,7 +1092,12 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         if isinstance(request.session, ResumedSession) and not config_dir:
             from scripts.production import unit_move
 
-            conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            try:
+                conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            except staff.StaffUnreadable:
+                raise
+            except (OSError, unit_move.RenameRefused):
+                conversation = unit_move.NoUnitConversation()
             if source_fallback and (not isinstance(conversation, unit_move.UnitConversation)
                                     or conversation.account != target):
                 raise Refusal("--source-fallback must name the pane launch's source account")
@@ -1108,74 +1112,41 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         raise Refusal(str(error)) from error
 
 
-class TranscriptMessage(TypedDict, total=False):
-    model: str
-
-
-class TranscriptEntry(TypedDict, total=False):
-    type: str
-    message: TranscriptMessage
-
-
-def transcript_lines_from_end(path: Path) -> Iterator[str]:
-    """Read newest entries first without loading the whole conversation."""
-    with open_transcript(path) as stream:
-        offset = stream.seek(0, os.SEEK_END)
-        pending = b""
-        while offset:
-            size = min(offset, 65536)
-            offset -= size
-            _ = stream.seek(offset)
-            lines = (stream.read(size) + pending).split(b"\n")
-            pending = lines[0]
-            for line in reversed(lines[1:]):
-                yield line.decode("utf-8", errors="replace")
-        if pending:
-            yield pending.decode("utf-8", errors="replace")
-
-
 def transcript_model(session_id: str) -> str:
-    """The newest real assistant model in the newest transcript for this session."""
-    try:
-        matches = transcript_paths(Path.home() / ".claude/projects", f"**/{session_id}.jsonl")
-        if not matches:
-            return ""
-        path = max(matches, key=lambda path: path.stat().st_mtime)
-        for line in transcript_lines_from_end(path):
-            try:
-                value = cast(object, json.loads(line))
-            except ValueError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            entry = cast(TranscriptEntry, cast(object, value))
-            message = cast(object, entry.get("message"))
-            if entry.get("type") != "assistant" or not isinstance(message, dict):
-                continue
-            model = cast(object, cast(TranscriptMessage, cast(object, message)).get("model", ""))
-            if isinstance(model, str) and model and model != "<synthetic>":
-                return model
-    except OSError:
-        pass
-    return ""
+    """Read the model of the latest real assistant turn."""
+    turn = pane_record.claude_turn_settings(session_id)
+    return turn.model if isinstance(turn, pane_record.ClaudeTurnSettings) else ""
 
 
 def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
-    """Use the pane launch model when available, with --model as the restore boundary."""
+    """Read the model for a unit resume."""
+    return settings_for_resume(request, explicit).model
+
+
+def settings_for_resume(request: RequestedUnitLaunch, explicit: str = "", *config_dirs: Path) -> pane_record.ClaudeResumeSettings:
+    """Use the latest Claude turn, with an explicit model override."""
     if isinstance(request.session, NewSession):
         if explicit:
             raise Refusal("--model requires --resume")
-        return ""
-    if explicit:
-        return explicit
-    from scripts.agents import pane_record
+        return pane_record.ClaudeResumeSettings()
+    identity = request.session.session_id
+    record = staff.initial_snapshot()
+    owner = record.by_current_session(identity)
+    if owner is not None and isinstance(owner.home, staff.SessionHome):
+        config_dirs = (*config_dirs, owner.home.path)
+    turn = pane_record.claude_turn_settings(identity, *config_dirs)
     try:
-        entry = pane_record.launch_for_session(request.session.session_id)
+        entry = pane_record.launch_for_session(identity)
     except (OSError, ValueError) as error:
-        raise Refusal(f"pane launch unreadable: {error}") from error
-    if entry is not None and entry["model"]:
-        return entry["model"]
-    return transcript_model(request.session.session_id) if isinstance(launched_unit(request), LabeledSessionFound) else ""
+        if not explicit and isinstance(turn, pane_record.NoClaudeTurn):
+            raise Refusal(f"pane launch unreadable: {error}") from error
+        entry = None
+    if entry is not None:
+        home = pane_launch.config_home(entry, record=record)
+        if isinstance(home, staff.SessionHome) and home.path not in (*config_dirs, *sessions.config_dirs()):
+            turn = pane_record.claude_turn_settings(identity, *config_dirs, home.path)
+    fallback = pane_record.ClaudeResumeSettings(model=entry["model"] if entry is not None else "")
+    return pane_record.claude_resume_settings(turn, fallback=fallback, explicit_model=explicit)
 
 
 def autocompact_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
@@ -1412,7 +1383,8 @@ def _main(argv: list[str]) -> int:
                 raise Refusal(
                     f"unit account {unit_account.label}: {problems[0]}; see Hana console, Accounts"
                 )
-            resume_model = model_for_resume(request, cast(str, args.model))
+            explicit_model = cast(str, args.model)
+            resume = settings_for_resume(request, explicit_model, unit_account.dir)
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
 
             handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
@@ -1424,6 +1396,7 @@ def _main(argv: list[str]) -> int:
                 assert isinstance(source, RunningSessionHandoff)
                 stop_for_attach(source)
                 require_stopped_session(source)
+                resume = settings_for_resume(request, explicit_model, unit_account.dir)
                 handoff = StoppedSessionHandoff(source)
                 request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
@@ -1471,8 +1444,13 @@ def _main(argv: list[str]) -> int:
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if isinstance(labeled_session, NoLabeledSession):
                 prompt = prompt_for(request)
-                outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
-                               if isinstance(request.session, ResumedSession) else "", model=resume_model,
+                role_effort = ready.director.effort
+                launch_settings = pane_record.claude_resume_settings(resume, fallback=pane_record.ClaudeResumeSettings(
+                    effort=role_effort.value if isinstance(role_effort, Effort) else ""))
+                director = ready.director._replace(
+                    effort=Effort(launch_settings.effort) if launch_settings.effort else DefaultEffort())
+                outcome = launch_session(request, director, prompt, unit_account, target=unit_account.label
+                               if isinstance(request.session, ResumedSession) else "", model=launch_settings.model,
                                autocompact_window=resume_autocompact)
             elif opening_record(request.production, request.unit_id).exists():
                 recovered = finish_opening(request, labeled_session)

@@ -37,6 +37,7 @@ from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.lib import test_hang_guard
+from scripts.message.send_result import SEND_CLOSED_EXIT
 from scripts.production.cli_fixture import process_boundary
 
 
@@ -1150,6 +1151,7 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                         self.assertEqual(Path(arguments[1]).name, "send.py")
                         self.assertEqual(arguments[arguments.index("--to") + 1],
                                          recipient if recipient.startswith("codex:") else "uds:/worker/socket")
+                        self.assertEqual("--skip-closed" in arguments, recipient.startswith("codex:"))
                         self.assertEqual(arguments[arguments.index("--text") + 1],
                                          f"{build_hold.release_notice(cycle['holders'])} Session {recipient}.")
                     if recipient.startswith("codex:"):
@@ -1601,6 +1603,33 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             (build_hold.release_directory() / "current").unlink()
         result = self.stop_release_after_unlink(name)
         self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_closed_codex_result_records_worker_closed_without_not_reached_text(self) -> None:
+        self.leave_release_pending("holder", [("worker", "codex:t1")])
+        closed = subprocess.CompletedProcess([], SEND_CLOSED_EXIT, "CLOSED: codex:t1 has a closed worker pane\n", "")
+        with mock.patch.object(subprocess, "run", return_value=closed) as send_release:
+            result = invoke_hold(["release", "--holder", "holder"], dict(os.environ))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Not reached", result.stdout)
+        self.assertEqual(result.stderr, "")
+        send_release.assert_called_once()
+        self.assertIn("--skip-closed", cast(list[str], send_release.call_args.args[0]))
+        entry, = self.cycle()["entries"]
+        self.assertEqual(entry, {"session_id": "codex:t1", "name": "worker", "delivery": "WorkerClosed"})
+
+    def test_codex_release_lookup_failure_is_reported(self) -> None:
+        self.leave_release_pending("holder", [("worker", "codex:t1")])
+        failed = subprocess.CompletedProcess([], 3, "FAILED: Codex daemon socket unreadable\n", "")
+        with mock.patch.object(subprocess, "run", return_value=failed) as send_release:
+            result = invoke_hold(["release", "--holder", "holder"], dict(os.environ))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Not reached, tell them yourself: worker (send failed)", result.stdout)
+        self.assertIn("Codex daemon socket unreadable", result.stderr)
+        send_release.assert_called_once()
+        entry, = self.cycle()["entries"]
+        self.assertEqual(entry["delivery"], "DeliveryFailed")
 
     def test_status_names_unsent_release_after_last_holder_is_gone(self) -> None:
         self.leave_release_pending("holder", [("waiting", "one"), ("already told", "two")])

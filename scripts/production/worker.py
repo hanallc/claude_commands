@@ -850,7 +850,7 @@ def launched_agent(row: staff.StaffRow) -> progress_history.CalledAgent:
             return progress_history.CALLED_AGENT_NOT_RECORDED
         kind = pane_launch.saved_kind(entry if "session_id" in entry else pane_record.resume_launch(entry))
         settings = worker_panes.kept_settings(models_registry.LaunchSettings(kind, "", "", ""),
-                                              pane_record.resume_arguments(entry))
+                                              ["--model", entry["model"], *entry.get("codex_policy", [])])
     except (OSError, ValueError):
         return progress_history.CALLED_AGENT_NOT_RECORDED
     if not settings.model:

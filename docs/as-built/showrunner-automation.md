@@ -101,7 +101,13 @@ Other options include `--permanent`, `--account`, `--model`, `--port`, `--resume
   A failed trust write prints one anomaly and prevents the start.
 
 - **Steps**, each skipped when already done: the brief stub beside the production doc at `<its directory>/<branch>.md` (`## Source`, a zone stamp and the user's words); the unit staff row and its `.unit.toml`; commit `production(<showrunner name>): add unit <unit> (<plan|brief|standby|permanent>)` on the merge branch for a brief stub or a brief-to-plan switch, which is not pushed here and goes out with the next merge push (user, 2026-10-08); `git worktree add` from the local merge branch, with no push of the unit branch (the unit's first checkpoint push sets its upstream), plus `branch.<branch>.cargoBerthTarget` when the repo has `.claude/config/berth.toml`; the herdr session (Launch below); the wait for `/remote-control is active` (default 90 s, last 15 pane lines on timeout); one LOG line `added <unit> (<mode>), worktree <path>`. It prints `<unit> started: herdr session attach <name>`. Shutdown restart resumes the staff session directly.
- New units select the configured units account through `accounts.account_for_group_launch("unit", ...)`. Resumes use the pane launch’s account when available, else the configured units account. `--source-fallback` must name the pane launch’s account. Resume model selection uses explicit `--model`, then the pane launch, then the last assistant model from the unit session (`transcript_model`); otherwise it uses the director model.
+ New units use the configured units account through `accounts.account_for_group_launch("unit", ...)`.
+ Resumes use the pane launch's account when available and the configured units account otherwise.
+ `--source-fallback` must name the pane launch's account.
+ A resume uses the model and effort from the latest real assistant turn across the Claude homes.
+ An explicit `--model` overrides the turn's model.
+ If no turn supplies a model, the pane launch supplies the fallback model.
+ The director settings supply any model or effort that remains unset.
 
 - **Launch.** `launch_session` starts the shared herdr server and opens the unit's tab in its production workspace.
   The tab title uses the unit name. The agent name uses the production and unit names.
@@ -204,7 +210,11 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `[assignments]` has `production=claude`; `[production.claude]` has `director=opus:xhigh`. There is no `[production.codex]`: unit directors launch only on Claude, and the showrunner is whichever session runs `/showrunner:produce`. The header Consumers list names `production unit directors (add_unit.py)`.
 - `director_agent(request) -> DirectorAgent(model, effort: DefaultEffort | Effort(value))` runs `bash -c 'source "$1" && agents_resolve production.director && printf …'` with the `models_config.sh` from the script's own checkout (`Path(__file__).resolve().parents[1] / "agents/models_config.sh"`); `MODELS_CONFIG_FILE` comes from the caller (default `~/.claude/config/models.conf`). A resolver failure is exit 2 with its first `ERROR:` line; a family other than `claude` is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`. Both happen in `preflight`, so `--check` refuses too. `--effort` is passed only for `Effort(value)`.
 - **One-family pinning** (`scripts/agents/models_config.sh`): a function with exactly one family set is pinned to it (`_agents_pinned_family`). Every-function switches (`agents_set_all_assignments <family>`, `agents_set_model <agent>` with no function) leave it as it is and add it to `AGENT_KEPT_FUNCTIONS`; `default_models.sh` prints `# kept production on claude: its only set`. A switch aimed at it (`agents_set_assignment production codex`, `agents_set_model <codex agent> production`, `agents_set_row production.director <codex agent>`) prints `ERROR: 'production' runs only on claude: [production.claude] is its only set.`, returns 1 and leaves the file untouched. `/default_models production.director <model>:<effort>` changes the row.
-- **Resume** in `<LaunchUnits/>` uses add_unit’s live session and pane launch checks. Its Claude arguments come from `models_config.sh`, `agents_resolve production.director` and `agents_claude_args`, then `--resume <session-id> --remote-control <session> -n <session>`. No shutdown hold is read.
+- **Resume** in `<LaunchUnits/>` uses `add_unit.py` and checks the live session and pane launch.
+  It uses the model and effort from the latest real assistant turn.
+  An explicit `--model` overrides the turn's model.
+  The pane launch supplies the fallback model.
+  The director role supplies any missing model or effort.
 
 ### Phase end on the unit side
 
@@ -1336,7 +1346,7 @@ An unreadable registry preserves `ClaudeUnknown(reason)`.
 A registered Claude without its messaging socket also remains unknown.
 
 Units launch in herdr and restore through `add_unit.py --host-session`.
-Resume models come from transcripts.
+Resumes use the latest assistant turn's settings with the overrides and fallbacks described above.
 Native runtime ids select staff rows.
 New launches carry no copied staff identity.
 Promotion waits for Claude to exit before it starts the replacement.

@@ -125,7 +125,9 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
-- After the last holder file is gone, each recipient gets one release notice.
+- After the last holder file is gone, release sends each live recipient one notice.
+  It records `WorkerClosed` when the sender finds a closed Codex worker with no route.
+  The next assignment resumes a closed worker.
   The notice names each hold, its purpose, and its start time in the user zone.
   For example: `fps hold for frame capture, from 07:33:20 EST`.
   An old cycle without a purpose still names the hold and its start time.
