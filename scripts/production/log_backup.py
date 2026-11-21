@@ -26,12 +26,12 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, Refusal, read_production, resolve_production_paths
 
+from scripts.production.production_names import (
+    BACKUP_CHECKOUT, BACKUP_DOCUMENT_DIRECTORY, BACKUP_ROOT, LEGACY_COPIES, MAC_BACKUP_REPOSITORY,
+)
 
-BACKUP_ROOT = Path(".local/state/production-backups")
-BACKUP_CHECKOUT = "backup"
-MAC_REPOSITORY = "backup.git"
-LEGACY_COPIES = "log-backups"
-SNAPSHOT_FOLDERS = ("document", "log", "notes")
+
+SNAPSHOT_FOLDERS = (BACKUP_DOCUMENT_DIRECTORY, "log", "notes")
 BACKUP_BRANCH = "refs/heads/main"
 SSH_OPTIONS = ("ssh", "-o", "BatchMode=yes")
 
@@ -97,7 +97,7 @@ def backup(sources: BackupSources, repository: Path) -> None:
             if isinstance(notes, Path) and notes.is_dir():
                 _ = shutil.copytree(notes, target, symlinks=True)
         else:
-            source = sources.document if folder == "document" else sources.log
+            source = sources.document if folder == BACKUP_DOCUMENT_DIRECTORY else sources.log
             target.mkdir()
             _ = shutil.copyfile(source, target / source.name)
     # Include tracked paths that disappeared and exclude incidental files.
@@ -111,7 +111,7 @@ def backup(sources: BackupSources, repository: Path) -> None:
 
 
 def mac_mirror(identity: str, peer: str) -> BackupMirror:
-    relative = (BACKUP_ROOT / identity / MAC_REPOSITORY).as_posix()
+    relative = (BACKUP_ROOT / identity / MAC_BACKUP_REPOSITORY).as_posix()
     remote_path = '"$HOME"/' + shlex.quote(relative)
 
     def maintenance(repack: bool) -> str:

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self
 from uuid import UUID
 
 from scripts.lib import git_files
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
@@ -36,7 +37,6 @@ if TYPE_CHECKING:
     import argparse
 
 OWNER_MACHINE = "natedev"
-CARGO_LINER_PRODUCTION = "cargo-liner"
 StaffId = NewType("StaffId", str)
 Kind = Literal["showrunner", "unit", "worker", "producer"]
 _KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
@@ -569,8 +569,6 @@ def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout | Un
 
 
 def declares_merge_checkout(lines: Sequence[str]) -> bool:
-    from scripts.production.production_doc import MERGE_CHECKOUT_FIELD
-
     return any(line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**") for line in lines)
 
 

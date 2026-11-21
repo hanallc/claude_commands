@@ -41,6 +41,10 @@ from scripts.production.merge_checkpoint import (
     branch_is_landed, git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
 )
 from scripts.production import production_doc
+from scripts.production.production_names import (
+    CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, MOVE_RECORD,
+    MOVE_VERSION, NOTES_DIRECTORY,
+)
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
@@ -49,8 +53,6 @@ from scripts.lib import berth_board
 from scripts.worktree.worktrees import main_checkout, release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
-MOVE_RECORD = Path("item154/move.json")
-MOVE_VERSION = 1
 OFFSET_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
                          + r"(?:\.[0-9]+)?[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
@@ -298,7 +300,7 @@ def move_plan(production: Production, lines: list[str]) -> MovePlan:
     if source.common_dir != main_git.common_dir:
         raise Refusal(f"{production.doc}: document belongs to a different repository")
     integration, branch = production.checkout, production.merge_branch
-    if production.name == staff.CARGO_LINER_PRODUCTION:
+    if production.name == CARGO_LINER_PRODUCTION:
         merge_unit = staff.serving_merge_unit(owner.id)
         if (merge_unit is None or merge_unit.name != f"{production.name}-merges"
                 or not isinstance(merge_unit.worktree, staff.PresentWorktree)
@@ -311,7 +313,7 @@ def move_plan(production: Production, lines: list[str]) -> MovePlan:
             or git_files.head(merge_git) != git_files.OnBranch(branch)):
         raise Refusal(f"{integration}: expected a separate worktree of {main} on {branch}")
     relative_doc = production.doc.relative_to(source.toplevel)
-    relative_live = relative_doc.with_name(relative_doc.stem + production_doc.LIVE_DOCUMENT_SUFFIX)
+    relative_live = relative_doc.with_name(relative_doc.stem + LIVE_DOCUMENT_SUFFIX)
     relative_log = Path(production_field(lines, "Log"))
     live_doc, log = main / relative_live, main / relative_log
     for path in (live_doc, log):
@@ -352,7 +354,7 @@ def migrated_document(production: Production, lines: list[str], plan: MovePlan) 
         "Repository": f"- **Repository:** `{plan.main}`",
         "Merge branch": f"- **Merge branch:** `{plan.merge_branch}`",
         "Showrunner checkout": (f"- **Showrunner checkout:** `{plan.integration}`\n"
-                                + f"- **{production_doc.MERGE_CHECKOUT_FIELD}:** `{plan.main}`"),
+                                + f"- **{MERGE_CHECKOUT_FIELD}:** `{plan.main}`"),
     }
     result: list[str] = []
     merge_tests = False
@@ -421,7 +423,7 @@ def stage_notes(production: Production, lines: list[str], record: staff.StaffSna
     if move_caller(record).id != production.owner.id:
         raise Refusal("only the owning showrunner can stage its notes")
     plan = move_plan(production, lines)
-    relative = Path(production_doc.NOTES_DIRECTORY) / staff.native_id(production.owner.id)
+    relative = Path(NOTES_DIRECTORY) / staff.native_id(production.owner.id)
     source = production.checkout / relative
     destination = plan.main / relative
     if source != source.resolve() or destination != destination.resolve():
@@ -545,13 +547,13 @@ def move_session_state(production_name: str, scratch: Path) -> None:
 def require_guard_ready() -> None:
     """Require the installed guard proof before a production starts."""
     if production_doc.read_guard_ready() is None:
-        raise Refusal("new production creation requires a valid guard-ready.json")
+        raise Refusal(f"new production creation requires a valid {GUARD_READY_FILE}")
 
 
 def require_new_document(document: production_doc.ProductionDocument) -> None:
     require_guard_ready()
     if not staff.declares_merge_checkout(document.doc.read_text(encoding="utf-8").splitlines()):
-        raise Refusal(f"{document.doc}: new productions require {production_doc.MERGE_CHECKOUT_FIELD}")
+        raise Refusal(f"{document.doc}: new productions require {MERGE_CHECKOUT_FIELD}")
     main = session_staff.production_session_directory(document.doc, document.checkout)
     for path in (document.doc, document.log):
         try:
@@ -692,7 +694,7 @@ def open_production(production: Production, lines: list[str]) -> None:
 def ci_steps(production: Production, tip: str, no_ci: bool,
              ci_green: CommitVerdict | VerdictMissing,
              smoke_passed: CommitVerdict | VerdictMissing) -> None:
-    if production.name == staff.CARGO_LINER_PRODUCTION and staff.declares_merge_checkout(doc_lines(production)):
+    if production.name == CARGO_LINER_PRODUCTION and staff.declares_merge_checkout(doc_lines(production)):
         if no_ci:
             raise LifecycleStop("ci", "held", "this production requires CI on the integration tip")
         state_dir = showrunners.session_state_dir(production.owner.id) / "waiting_state"

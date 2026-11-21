@@ -285,7 +285,8 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
 def enrolled_launch_directory(lines: list[str], legacy: Path) -> Path:
     if not staff.declares_merge_checkout(lines):
         return legacy
-    from scripts.production.production_doc import MERGE_CHECKOUT_FIELD, Refusal, production_field
+    from scripts.production.production_doc import Refusal, production_field
+    from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 
     try:
         directory = Path(production_field(lines, "Repository"))

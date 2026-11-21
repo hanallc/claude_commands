@@ -2,7 +2,7 @@
 import subprocess
 
 from scripts.lib.git_exclude import ExcludeRefused, ensure_exact_excluded, ensure_excluded, require_untracked_ignored
-from scripts.production.production_doc import NOTES_DIRECTORY
+from scripts.production.production_names import NOTES_DIRECTORY
 from scripts.production.unit_config_test_support import UnitConfigFixture
 
 
