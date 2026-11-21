@@ -9,12 +9,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=confirm_gate.sh
 source "$SCRIPT_DIR/confirm_gate.sh"
 
+remove_branch_config() {
+    local branch=$1 error status
+    shift
+    if error=$(LC_ALL=C git "$@" config --local --remove-section "branch.$branch" 2>&1); then
+        return 0
+    else
+        status=$?
+        if [[ "$status" -ne 128 || "$error" != "fatal: no such section: branch.$branch" ]]; then
+            printf '%s\n' "$error" >&2
+            return "$status"
+        fi
+    fi
+}
+
 if [[ "${1:-}" == --branch-only ]]; then
     if [[ $# -ne 5 ]]; then
         echo "Usage: perform_deletion.sh --branch-only <worktree_path> <repository> <branch_ref> <preview_id>" >&2
         exit 1
     fi
-    wt_command delete-branch-only "$WT_CONFIRM_DIR" "$5" "$2" "$3" "$4"
+    REPOSITORY=$3
+    if [[ "$REPOSITORY" != /* ]]; then
+        REPOSITORY=./$REPOSITORY
+    fi
+    REPOSITORY=$(cd -P -- "$REPOSITORY" && pwd -P)
+    wt_command delete-branch-only "$WT_CONFIRM_DIR" "$5" "$2" "$REPOSITORY" "$4"
+    remove_branch_config "${4#refs/heads/}" -C "$REPOSITORY"
     exit
 fi
 
@@ -55,26 +75,13 @@ if [[ "$BRANCH_NAME" == main || "$BRANCH_NAME" == "${ORIGIN_DEFAULT#origin/}" ]]
 fi
 cd "$DELETION_REPOSITORY"
 
-remove_branch_config() {
-    local error status
-    if error=$(LC_ALL=C git config --local --remove-section "branch.$BRANCH_NAME" 2>&1); then
-        return 0
-    else
-        status=$?
-        if [[ "$status" -ne 128 || "$error" != "fatal: no such section: branch.$BRANCH_NAME" ]]; then
-            printf '%s\n' "$error" >&2
-            return "$status"
-        fi
-    fi
-}
-
 # Retry a failed config removal when the worktree and ref are already absent.
 if git show-ref --verify --quiet "$BRANCH_REF"; then
     :
 else
     status=$?
     if [[ "$status" -eq 1 && -z "$PREVIEW_ID" && ! -e "$WORKTREE_PATH" && ! -L "$WORKTREE_PATH" ]]; then
-        remove_branch_config
+        remove_branch_config "$BRANCH_NAME"
         exit 0
     fi
     exit "$status"
@@ -160,5 +167,5 @@ if ! git update-ref -d "$BRANCH_REF" "$CHECKED_LOCAL_TIP"; then
     echo "Error: the local branch changed after the cleanup check; the local branch stays."
     exit 1
 fi
-remove_branch_config
+remove_branch_config "$BRANCH_NAME"
 echo "Branch deleted."
