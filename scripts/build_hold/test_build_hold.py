@@ -31,7 +31,8 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
-    HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
+    FIXTURE_SHOWRUNNER, HoldEventRecord, SCRIPT, clear_caller, invoke_hold, recorded_hold_events,
+    showrunner_caller, write_holder,
 )
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
@@ -436,13 +437,6 @@ class QuietTests(IsolatedBuildHoldTest):
 
 
 class TargetCommandTests(PrivateReleaseBroadcastTest):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(SCRIPT.parent.parent.parent / "config"),
-        }))
-
     def test_remote_commands_refuse_without_state_changes(self) -> None:
         for action in ("clear", "drain", "release"):
             for target in ("mac", "aws", "all"):
@@ -485,6 +479,68 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     self.assertEqual(result.exception.code, 2)
 
 
+class ClearRoleTests(IsolatedBuildHoldTest):
+    unit_id: staff.StaffId = staff.native_id(fixture_runtime_id("clear-unit"))
+    worker_id: staff.StaffId = staff.native_id(fixture_runtime_id("clear-worker"))
+    rows: tuple[staff.StaffRow, ...] = ()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        unit = staff.StaffRow(self.unit_id, "unit", "test-unit", staff.ReportsTo(FIXTURE_SHOWRUNNER.id),
+                              current_session=self.unit_id, unit_type=staff.UnitDetails("direct"))
+        worker = staff.StaffRow(self.worker_id, "worker", "test-worker", staff.ReportsTo(unit.id),
+                                current_session=self.worker_id)
+        self.rows = (FIXTURE_SHOWRUNNER, unit, worker)
+
+    def run_hold(self, action: str, session: str, *, thread: str = "",
+                 holder: str = "") -> subprocess.CompletedProcess[str]:
+        arguments = [action, "--for", "private test", "--release-eta", "23:59", "--zone", "Etc/GMT+12",
+                     "--proc-root", str(self.scratch / "proc")]
+        if holder:
+            arguments.extend(["--holder", holder])
+        return invoke_hold(arguments, {**os.environ, "CLAUDE_CODE_SESSION_ID": session, "CODEX_THREAD_ID": thread})
+
+    def assert_clear_refused(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "use drain for planned work; clear needs nate's word\n")
+        for name in ("holders", "release", "enforcer"):
+            self.assertFalse((self.scratch / name).exists(), name)
+
+    def test_unit_and_worker_cannot_clear(self) -> None:
+        for session in (self.unit_id, self.worker_id):
+            with self.subTest(session=session), clear_caller(session, *self.rows):
+                self.assert_clear_refused(self.run_hold("clear", FIXTURE_SHOWRUNNER.current_session,
+                                                       holder=FIXTURE_SHOWRUNNER.name))
+
+    def test_caller_without_staff_row_cannot_clear(self) -> None:
+        session = fixture_runtime_id("clear-unregistered")
+        with clear_caller(session, *self.rows):
+            self.assert_clear_refused(self.run_hold("clear", session, holder=FIXTURE_SHOWRUNNER.name))
+        with mock.patch.object(staff, "authority_snapshot", side_effect=staff.StaffAbsent("missing fixture")):
+            self.assert_clear_refused(self.run_hold("clear", FIXTURE_SHOWRUNNER.current_session))
+
+    def test_staff_file_override_cannot_authorize_clear(self) -> None:
+        _ = (self.scratch / "staff.json").write_text(staff.StaffSnapshot(self.rows).encode())
+        result = self.run_hold("clear", "", thread=FIXTURE_SHOWRUNNER.current_session)
+        self.assert_clear_refused(result)
+
+    def test_showrunner_can_clear(self) -> None:
+        membership = staff.StaffSnapshot(self.rows, production=True)
+        with mock.patch.object(staff, "authority_snapshot", return_value=membership):
+            result = self.run_hold("clear", "", thread=FIXTURE_SHOWRUNNER.current_session)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tests and builds outside the hold are stopped", result.stdout)
+        self.assertTrue((self.scratch / "holders" / FIXTURE_SHOWRUNNER.id).is_file())
+
+    def test_unit_can_drain(self) -> None:
+        with staff.supplied_snapshot(staff.StaffSnapshot(self.rows)):
+            result = self.run_hold("drain", self.unit_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("drained; natedev stays held until release", result.stdout)
+        self.assertTrue((self.scratch / "holders" / self.unit_id).is_file())
+
+
 class CommandTests(PrivateReleaseBroadcastTest):
     def test_live_holder_precedes_a_former_name_release_receipt(self) -> None:
         folder = self.scratch / "holders"
@@ -507,7 +563,12 @@ class CommandTests(PrivateReleaseBroadcastTest):
         audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"clear", "drain", "status", "audit"} else []
         eta_args = (["--release-eta", "23:59", "--zone", "Etc/GMT+12"]
                     if args[0] in {"clear", "drain"} and "--release-eta" not in args else [])
-        return invoke_hold([*args, *eta_args, *audit_args], {**os.environ, "BUILD_HOLD_DIR": str(folder)})
+        arguments = [*args, *eta_args, *audit_args]
+        environment = {**os.environ, "BUILD_HOLD_DIR": str(folder)}
+        if args[0] == "clear":
+            with showrunner_caller():
+                return invoke_hold(arguments, environment)
+        return invoke_hold(arguments, environment)
 
     def damage_record(self, kind: str, scratch: Path, *, two_holders: bool = False) -> tuple[Path, bytes]:
         folder = scratch / "holders"
@@ -597,7 +658,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
             _ = build_hold.held_key(folder, "new-name")
         self.assertEqual(build_hold.held_key(folder, "old-name"), "old-name")
         # With no name and no session, there is no holder to look up.
-        refused = self.run_cli(folder, "clear", "--for", "one test")
+        refused = self.run_cli(folder, "drain", "--for", "one test")
         self.assertEqual(refused.returncode, 1)
         self.assertIn("give --holder: this caller has no staff row", refused.stderr)
 
@@ -1008,7 +1069,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 with self.subTest(action=action, eta=eta), tempfile.TemporaryDirectory() as scratch:
                     folder = Path(scratch) / "holders"
                     with mock.patch.object(build_hold, "datetime", FixedDatetime), \
-                         mock.patch.object(hold_enforcer, "start") as start:
+                         mock.patch.object(hold_enforcer, "start") as start, showrunner_caller():
                         result = invoke_hold([action, "--holder", "slot", "--for", "the test", *eta],
                                              {**os.environ, "BUILD_HOLD_DIR": str(folder),
                                               "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
@@ -1045,19 +1106,15 @@ class CommandTests(PrivateReleaseBroadcastTest):
                                   ("2026-10-05T00:30", "2026-10-05T00:30:00-07:00")):
                 with self.subTest(action=action, eta=eta), tempfile.TemporaryDirectory() as scratch:
                     folder = Path(scratch)
-                    output = io.StringIO()
-                    errors = io.StringIO()
                     try:
-                        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York",
-                                                          "BUILD_HOLD_DIR": str(folder)}):
+                        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
                             time.tzset()
-                            with mock.patch.object(build_hold, "datetime", FixedDatetime), \
-                                 redirect_stdout(output), redirect_stderr(errors):
-                                result = build_hold.main([action, "--holder", "slot", "--for", "the test",
-                                                          "--release-eta", eta, "--zone", "America/Los_Angeles"])
+                            with mock.patch.object(build_hold, "datetime", FixedDatetime):
+                                result = self.run_cli(folder, action, "--holder", "slot", "--for", "the test",
+                                                      "--release-eta", eta, "--zone", "America/Los_Angeles")
                     finally:
                         time.tzset()
-                    self.assertEqual(result, 0, errors.getvalue())
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     fields = cast(dict[str, object], json.loads((folder / "slot").read_text()))
                     self.assertEqual(fields["release_eta"], expected)
 
@@ -1436,15 +1493,22 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
         return folder
 
     def test_locked_log_does_not_delay_hold_or_keep_the_release_lock(self) -> None:
+        program = """import sys
+from scripts.build_hold import build_hold
+from scripts.build_hold.build_hold_test_support import showrunner_caller
+with showrunner_caller():
+    sys.exit(build_hold.main(sys.argv[1:]))
+"""
         log = self.scratch / "buildlog" / socket.gethostname().split(".")[0] / f"{datetime.now(timezone.utc):%Y-%m}.jsonl"
         log.parent.mkdir(parents=True)
         with log.open("a+") as held_log:
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
                 result = subprocess.run(
-                    ["python3", str(SCRIPT), "clear", "--holder", "alice", "--for", "render checks",
+                    ["python3", "-c", program, "clear", "--holder", "alice", "--for", "render checks",
                      "--release-eta", "23:59", "--zone", "Etc/GMT+12", "--proc-root", str(self.scratch / "proc")],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                    cwd=SCRIPT.parents[2],
+                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())
@@ -2823,7 +2887,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         _ = self.process(20, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         output = io.StringIO()
-        with redirect_stdout(output):
+        with redirect_stdout(output), showrunner_caller():
             for pid in (10, 20):
                 self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
                                                  "--release-eta", "23:59", "--zone", "Etc/GMT+12",
@@ -2865,7 +2929,7 @@ with mock.patch("sys.exit", side_effect=exit_code):
                     self.assertEqual(result.returncode, 0, result.stderr)
                 _ = output.write(result.stdout)
             else:
-                with redirect_stdout(output):
+                with redirect_stdout(output), showrunner_caller():
                     self.assertEqual(build_hold.main(args), 0)
             self.assertIn("other_session: other, pid 10: cargo test", output.getvalue())
             if action == "audit":
@@ -2881,7 +2945,7 @@ with mock.patch("sys.exit", side_effect=exit_code):
         for args in (["clear", "--holder", "holder", "--for", "app test",
                       "--release-eta", "23:59", "--zone", "Etc/GMT+12"], ["status"]):
             output = io.StringIO()
-            with redirect_stdout(output):
+            with redirect_stdout(output), showrunner_caller():
                 self.assertEqual(build_hold.main([*args, "--proc-root", str(missing_proc)]), 0)
             self.assertIn("Build audit unavailable:", output.getvalue())
             self.assertTrue((self.holders / "holder").is_file())

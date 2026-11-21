@@ -77,6 +77,10 @@ class ReleaseRecordReadError(ValueError):
     """The stored hold cycle cannot be read safely."""
 
 
+class ClearRequiresShowrunner(ValueError):
+    """The staff authority did not confirm a showrunner caller."""
+
+
 @dataclass(frozen=True)
 class NoCycle:
     pass
@@ -720,14 +724,26 @@ def holder_path(directory: Path, name: str) -> Path:
     return directory / safe
 
 
-def holder_of(given: str | None) -> HolderIdentity:
+def holder_of(given: str | None, *, require_showrunner: bool = False) -> HolderIdentity:
     """Resolve a fixed staff key and its current display name."""
     from scripts.production import staff
 
-    try:
-        membership = staff.snapshot()
-    except staff.StaffAbsent:
-        membership = staff.StaffSnapshot(())
+    if require_showrunner:
+        try:
+            membership = staff.authority_snapshot()
+            session = staff.runtime_id() if membership.production else ""
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            raise ClearRequiresShowrunner from error
+        caller = membership.by_current_session(session) if session else None
+        if caller is None or caller.kind != "showrunner":
+            raise ClearRequiresShowrunner
+        if given is None:
+            return HolderIdentity(caller.id, caller.name)
+    else:
+        try:
+            membership = staff.snapshot()
+        except staff.StaffAbsent:
+            membership = staff.StaffSnapshot(())
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         member = membership.by_current_session(own) if own else None
@@ -1971,7 +1987,7 @@ def main(arguments: list[str]) -> int:
                 if refused:
                     print(f"{refused[0]} is not supported with --target {target_name}")
                     return 2
-                identity = holder_of(cast(str | None, options.holder))
+                identity = holder_of(cast(str | None, options.holder), require_showrunner=action == "clear")
                 if action == "clear":
                     command = ["block", "--holder", identity.key, "--for", cast(str, options.purpose)]
                     result = run_mac_hold(command, target_name)
@@ -2015,8 +2031,8 @@ def main(arguments: list[str]) -> int:
             return hold_enforcer().wait_for_kept_runs(
                 read_holder(holder_path(holder_directory(), identity.key)), proc_root)
         elif action == "clear":
+            identity = holder_of(cast(str | None, options.holder), require_showrunner=True)
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
-            identity = holder_of(cast(str | None, options.holder))
             keep: list[ProcessIdentity] = []
             proc_root = cast(Path, options.proc_root)
             for pid in cast(list[int], options.keep):
@@ -2106,6 +2122,9 @@ def main(arguments: list[str]) -> int:
                 print_hold_audit(holder_directory(), cast(Path, options.proc_root))
             for line in pending_release_status_lines():
                 print(line)
+    except ClearRequiresShowrunner:
+        print("use drain for planned work; clear needs nate's word", file=sys.stderr)
+        return 1
     except override_guard.SharedStateWriteRefused as error:
         print(f"build_hold: {error}", file=sys.stderr)
         return 2

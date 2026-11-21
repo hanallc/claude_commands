@@ -4,22 +4,53 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import os
 import subprocess
-from typing import override
+from pathlib import Path
+from typing import cast, override
 from unittest import mock
 import unittest
 
+from scripts.build_hold.build_hold_test_support import hold_config_environment, showrunner_caller
+from scripts.mac_test import test_target_state
 from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold
+from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 ORIGINAL_RUN = subprocess.run
 ORIGINAL_POPEN = subprocess.Popen
 
 
+def write_target_settings(path: Path, overrides: str = "", *, template: str | None = None) -> int:
+    """Write the settings for the private Mac and Linux targets."""
+    if template != "mac_test":
+        raise AssertionError(template)
+    text = {"host": "fake-mac", "ci_repo": "", "offload": "on"}
+    numbers = {
+        "gh_timeout_s": "1", "block_hours": "4", "block_max_hours": "48", "block_warn_minutes": "15",
+        "connect_timeout_s": "1", "probe_timeout_s": "1", "unreachable_backoff_s": "30",
+        "claim_idle_minutes": "15", "claim_poll_seconds": "60",
+        "alert_seconds": "180", "push_seconds": "600", "stale_seconds": "300",
+        "repeat_minutes": "60", "send_timeout_s": "5",
+    }
+    for line in overrides.splitlines():
+        key, value = line.split("=", 1)
+        (numbers if key in numbers else text)[key] = value
+    lines = [f"{key}={value}\n" for key, value in text.items()]
+    lines.extend(f"# range: 0.001..\n{key}={value}\n" for key, value in numbers.items())
+    return path.write_text("".join(lines), encoding="utf-8")
+
+
 class TargetHoldTests(IsolatedTargetState):
     @override
     def setUp(self) -> None:
-        super().setUp()
+        with (mock.patch.object(test_target_state, "config_environment", side_effect=hold_config_environment),
+              mock.patch.object(test_target_state, "write_config_fixture", side_effect=write_target_settings)):
+            super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "BUILD_HOLD_CGROUP_ROOT": str(self.root / "cgroup"),
+            "BUILD_TARGETS_STATE_DIR": str(self.root / ".local/state/build-targets"),
+        })))
         _ = self.config.write_text(self.config.read_text() + "sync.hosts.aws=aws-build\n")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         for name in ("alice", "bob"):
@@ -67,7 +98,7 @@ class TargetHoldTests(IsolatedTargetState):
                      mock.patch.object(build_hold.hold_enforcer(), "start"), \
                      mock.patch.object(build_hold.hold_enforcer(), "wait_for_kept_runs", return_value=0), \
                      mock.patch.object(build_hold, "print_hold_audit"), \
-                     mock.patch.object(build_hold, "record_hold_event"):
+                     mock.patch.object(build_hold, "record_hold_event"), showrunner_caller(*staff.local_snapshot().rows):
                     result = self.invoke_hold([action, *selection, "--holder", "alice", "--for", "inspect local",
                                                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                                "--proc-root", str(self.root / "proc")])

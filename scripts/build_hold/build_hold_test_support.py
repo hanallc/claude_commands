@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from contextvars import ContextVar
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import io
 import json
 import os
@@ -23,6 +23,7 @@ from unittest import mock
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_hold import build_hold
 from scripts.buildlog import record, store
+from scripts.build_queue import admission_test_support
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.lib import test_hang_guard
 from scripts.build_hold.override_guard import require_checkout
@@ -30,10 +31,57 @@ from scripts.build_hold.override_guard import require_checkout
 require_checkout(Path(__file__))
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint import memory_test_support
+from scripts.production import staff
 from scripts.production.cli_fixture import process_boundary_for_case
+from scripts.production.staff_test_support import fixture_runtime_id
 
 _finish_writers: ContextVar[Callable[[], None] | None] = ContextVar("finish_hold_writers", default=None)
+
+
+FIXTURE_SHOWRUNNER = staff.StaffRow(staff.native_id(fixture_runtime_id("clear-member")), "showrunner",
+                                    "clear-showrunner", staff.StaffRoot(),
+                                    current_session=staff.native_id(fixture_runtime_id("clear-session")))
+
+
+@contextmanager
+def clear_caller(session: str, *rows: staff.StaffRow) -> Generator[None]:
+    """Supply private staff rows and a runtime identity to clear."""
+    with (mock.patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot(rows, production=True)),
+          mock.patch.object(staff, "runtime_id", return_value=session)):
+        yield
+
+
+@contextmanager
+def showrunner_caller(*rows: staff.StaffRow) -> Generator[None]:
+    """Use the fixture showrunner for a clear command."""
+    with clear_caller(FIXTURE_SHOWRUNNER.current_session, FIXTURE_SHOWRUNNER, *rows):
+        yield
+
+
+def hold_config_environment(root: Path) -> dict[str, str]:
+    """Seed fixed settings for the hold and admission fixtures."""
+    root.mkdir(parents=True, exist_ok=True)
+    targets = root / "build_targets.conf"
+    if not targets.exists():
+        _ = targets.write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\ndefault_target=natedev\n"
+            + "sync.hosts.mac=fixture-mac\nsync.hosts.aws=fixture-aws\n"
+            + "# range: 0.01..300\nhold_sender_timeout_seconds=1\n")
+    admission = root / "build_admission.conf"
+    if not admission.exists():
+        _ = admission.write_text(memory_test_support.ADMISSION_CONFIG_FIXTURE.read_text()
+                                 + "\n# whole: 0..50\npeak_history_share_percent=10\n"
+                                 + "# range: 0..\nprogress_profile_sweep_seconds=0.05\n"
+                                 + "# whole: 1..\nremote_start_hold_seconds=1200\n")
+    detached = root / "detached_runs.conf"
+    if not detached.exists():
+        _ = detached.write_text("# whole: 1..\nRESULT_LINE_CHARS=300\n# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
+    staff_config = root / "staff.conf"
+    if not staff_config.exists():
+        _ = staff_config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\nPRODUCER_WORKSPACE=producers\n")
+    return {"CONF_DIR": str(root), "BUILD_TARGETS_CONFIG": str(targets), "STAFF_CONFIG": str(staff_config),
+            "USER_ZONE": "UTC", "VERIFY_STEPS_DIR": str(root / "steps")}
 
 
 def invoke_hold(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -122,6 +170,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         (cls.seed / "child-lifetime").mkdir()
         _ = (cls.seed / "child-lifetime/sitecustomize.py").write_text(CHILD_LIFETIME)
         _ = (cls.seed / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+        _ = hold_config_environment(cls.seed)
         (cls.seed / "tools").mkdir()
         systemctl = cls.seed / "tools/systemctl"
         _ = systemctl.write_text("#!/bin/sh\nexit 0\n")
@@ -143,6 +192,8 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         # Held until cleanup, so the FIFO has had a writer and reports EOF
         # once the last one closes, even when a test starts no child.
         self.lifetime_writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        with mock.patch.object(memory_test_support, "config_environment", side_effect=hold_config_environment):
+            memory = memory_test_support.fake_memory_readings(self.scratch)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.scratch),
             **interpreter_cache_environment(self.scratch / "cache"),
@@ -155,17 +206,20 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "MAC_TEST_STATE_DIR": str(self.scratch / "mac-state"),
-            **fake_memory_readings(self.scratch),
+            **memory,
             # No test reads the machine's own session records, or passes for the session that runs it.
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
+            "CODEX_THREAD_ID": "",
             "STAFF_FILE": str(self.scratch / "staff.json"),
             "UNIT_RUN_DIR": "",
             "UNIT_SESSION_DIR": "",
             "BUILD_HOLD_TEST_LIFETIME_FIFO": str(fifo),
             "PYTHONPATH": os.pathsep.join(filter(None, (str(lifetime), os.environ.get("PYTHONPATH", "")))),
         }))
-        self.admission_fixture = caller_admission(self, self.scratch, dict(os.environ))
+        with (mock.patch.object(memory_test_support, "config_environment", side_effect=hold_config_environment),
+              mock.patch.object(admission_test_support, "config_environment", side_effect=hold_config_environment)):
+            self.admission_fixture = caller_admission(self, self.scratch, dict(os.environ))
         if not process_boundary_for_case(self):
             self.install_recorder_threads()
         token = _finish_writers.set(self.finish_writers)

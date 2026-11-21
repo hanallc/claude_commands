@@ -23,11 +23,11 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
+from scripts.build_hold.build_hold_test_support import hold_config_environment, showrunner_caller
 from scripts.build_queue import admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -66,9 +66,7 @@ class HoldEnforcerTests(unittest.TestCase):
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
         _ = boot.write_text("test-boot\n")
-        configuration = self.root / "config"
-        environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
+        environment = hold_config_environment(self.root / "config")
         self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
@@ -508,7 +506,8 @@ class HoldEnforcerTests(unittest.TestCase):
 
         with mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop), \
              mock.patch.object(hold_enforcer, "start") as start, \
-             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()), \
+             showrunner_caller(member):
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "30", "--proc-root", str(self.proc)]), 0)
@@ -527,7 +526,8 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(12, "rustc", parent=11)
         with mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(build_hold, "start_hold_recorder"), \
-             mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()):
+             mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()), \
+             showrunner_caller(member):
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "11", "--proc-root", str(self.proc)]), 0)

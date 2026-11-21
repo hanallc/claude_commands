@@ -1312,6 +1312,8 @@ GPU slot waits use the same shape with a `_gpu_slot` field.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
+Only a caller with a current showrunner staff row can clear. A unit uses drain.
+If you clear from a Codex-only session, use `release --holder <staff ID>` to release the hold.
 It retains explicit keep entries and their children.
 The command leaves the target held until release.
 `clear` and `drain` accept an optional positional target before their options.
@@ -1479,7 +1481,19 @@ The `clear`, `drain`, `status`, and `audit` commands accept `--proc-root` for a 
 
 The audit calls `hold_enforcer.record_build(..., action="audit")` for each `other_session` or `no_session` build. The enforcer uses the same writer with `action="stopped"` for each stopped root. Both call `store.append_line` in the current process, after the audit read; no detached audit recorder runs. The kernel boot id, PID and process start time identify the build. The permanent file is `buildlog/<host>/hold-builds-<hold hash>.jsonl`. A separate `.lock` file covers the duplicate check and append, once per build, holder key, `since` and action. A new hold or a reused PID gets a new row. Index schema 21 adds `action` to `hold_builds`; old rows read as `audit`. Rows record hold identity, build identity, class, owner, command as shell text, working directory and observation time. Holder and admitted builds get no audit row.
 
-**Holder key.** A staff holder uses its fixed staff ID as the file key. Without `--holder`, `CLAUDE_CODE_SESSION_ID` must resolve through `staff.snapshot().by_current_session`. A given holder resolves through its fixed ID, current session, or current staff name. An explicit holder outside staff keeps its given text as the key. Registry names and former names do not select holds or release records. `Holder.name` shows the current staff name when the key resolves. `cycle["holders"]` retains the key from `start_hold`. `holder_path` replaces unsafe file-name characters in that key. A recorded release matches the resulting file name and its `since` instant. The deployment converter handles old keys once; runtime readers accept only the fixed key.
+**Holder key.** A staff holder uses its fixed staff ID as the file key.
+`clear` uses `staff.runtime_id()` to find the caller's showrunner row in the authoritative staff record.
+Without `--holder`, `clear` uses the fixed staff ID from that row.
+When `drain` or `release` resolves an implicit holder, it looks up `CLAUDE_CODE_SESSION_ID` with `staff.snapshot().by_current_session`.
+A given holder resolves through its fixed ID, current session, or current staff name.
+An explicit holder outside staff keeps its given text as the key.
+Registry names and former names do not select holds or release records.
+`Holder.name` shows the current staff name when the key resolves.
+`cycle["holders"]` retains the key from `start_hold`.
+`holder_path` replaces unsafe file-name characters in that key.
+A recorded release matches the resulting file name and its `since` instant.
+The deployment converter updates old keys once.
+Runtime readers accept only the fixed key.
 
 **Hold cycle.** `release_directory()` uses `BUILD_HOLD_RELEASE_DIR` when set.
 Otherwise, it uses a sibling of `holder_directory()` named `<hold folder name>-release`.

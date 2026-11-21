@@ -10,6 +10,9 @@ Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
 
 ## Clear existing work
 
+Only a showrunner can clear. A unit uses drain.
+If you clear from a Codex-only session, use `release --holder <staff ID>` to release the hold.
+
 1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py clear [target] --for '<why>' --release-eta HH:MM --zone <IANA zone>`.
 2. Add `--keep <pid>` for each run that must continue.
 3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
