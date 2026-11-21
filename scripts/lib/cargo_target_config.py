@@ -98,7 +98,15 @@ def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, s
 
     for config in cargo_config_folders(cwd, environment):
         legacy = config / "config"
-        read_config(legacy if not strict and legacy.is_file() else config / "config.toml")
+        if strict:
+            try:
+                _ = legacy.lstat()
+            except FileNotFoundError:
+                read_config(config / "config.toml")
+            else:
+                read_config(legacy)
+        else:
+            read_config(legacy if legacy.is_file() else config / "config.toml")
     for key, variable in (("target-dir", "CARGO_BUILD_TARGET_DIR"), ("build-dir", "CARGO_BUILD_BUILD_DIR")):
         if environment.get(variable):
             settings[key] = CargoFolderSetting(environment[variable], directory)

@@ -672,9 +672,13 @@ def main(argv: list[str] | None = None) -> int:
     if argv[:1] == ["--"]:
         argv = argv[1:]
     try:
+        descriptor = os.environ.pop("CARGO_OUTPUT_LOCK_FD", "")
+        pass_fds = (int(descriptor),) if descriptor else ()
+        for fd in pass_fds:
+            os.set_inheritable(fd, False)
         with queue_place(argv, Path.cwd()) as place:
-            return place.popen(argv).wait()
-    except QueuePlaceRefused as error:
+            return place.popen(argv, pass_fds=pass_fds).wait()
+    except (QueuePlaceRefused, OSError, ValueError) as error:
         print(f"queue place: {error}", file=sys.stderr)
         return 1
 
