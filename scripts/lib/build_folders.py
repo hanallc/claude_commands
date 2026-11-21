@@ -454,7 +454,11 @@ def _stable_folder(spec: BuildFolderSpec) -> bool:
     return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable", "slot")
 
 
-def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:
+FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
+
+
+def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest, *,
+                        on_create: FolderCreationNotice = "untracked") -> Path:
     """Allocate a unique folder or retain an owner's folder."""
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     spec = _request_spec(original)
@@ -464,11 +468,12 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
         descriptors: tuple[int, ...] = ()
         if isinstance(original, LinkedEditableRepository):
             descriptors = source_locks.enter_context(_linked_source_locks(original.source))
-        return _create_build_folder(request, spec, descriptors)
+        return _create_build_folder(request, spec, descriptors, on_create)
 
 
 def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest,
-                         spec: BuildFolderSpec, source_descriptors: tuple[int, ...]) -> Path:
+                         spec: BuildFolderSpec, source_descriptors: tuple[int, ...],
+                         on_create: FolderCreationNotice) -> Path:
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, ExistingWorktreeBranch):
         import subprocess
@@ -550,8 +555,9 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                                 _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"],
                                                      pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors))
-                            if not isinstance(_remove_leased_folder(path, directory, None, temporary=False,
-                                                                      expected=existing), Removed):
+                            if not isinstance(_remove_leased_folder(
+                                    path, directory, None, temporary=False, expected=existing,
+                                    permissions=RemovalPermissions.REPAIR_OWNED_DIRECTORIES), Removed):
                                 raise BlockingIOError(errno.EWOULDBLOCK, "cannot repair an incomplete slot", str(path))
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
@@ -600,6 +606,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             if isinstance(detail, bytes):
                                 detail = detail.decode(errors="replace")
                             raise OSError(errno.EIO, f"git repository creation failed: {detail.strip()}", str(path)) from error
+                        if made_inode is not None and callable(on_create):
+                            on_create(path, made_inode)
                         return path
                     if new_folder and isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
@@ -610,6 +618,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                             pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                            timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
+                    if made_inode is not None and callable(on_create):
+                        on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
@@ -631,7 +641,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     _ = _locks.pop(descriptor, None)
                     if (made_inode is not None or (new_folder and not stable)) and _take_lock(descriptor, fcntl.LOCK_EX):
                         cleanup = None if made_inode is not None else lambda: None
-                        _ = _remove_leased_folder(path, directory, cleanup, temporary=True, expected=made_inode)
+                        permissions = (RemovalPermissions.PRESERVE if made_inode is None else
+                                       RemovalPermissions.REPAIR_OWNED_DIRECTORIES)
+                        _ = _remove_leased_folder(path, directory, cleanup, temporary=True, expected=made_inode,
+                                                  permissions=permissions)
                         if isinstance(original, LinkedEditableRepository):
                             import subprocess
 
@@ -755,6 +768,15 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
+def temporary_allocation_entries(folder: Path) -> tuple[Path, ...]:
+    """List the folder and its lease files that are still present."""
+    try:
+        return tuple(sorted(entry for entry in folder.parent.iterdir() if entry == folder or (
+            (metadata := _METADATA.fullmatch(entry.name)) is not None and metadata[1] == folder.name)))
+    except FileNotFoundError:
+        return ()
+
+
 def _parent_has_symlink(parent: Path) -> bool:
     absolute = parent.absolute()
     # A link before '..' can lead to the same parent as the absolute path.
@@ -785,6 +807,11 @@ class UnsafeChild:
 
 RemovalRefusal = BlockedByLiveLease | FolderChanged | UnsafeChild
 RemovalAttempt = Removed | RemovalRefusal
+
+
+class RemovalPermissions(Enum):
+    PRESERVE = "preserve directory permissions"
+    REPAIR_OWNED_DIRECTORIES = "restore access to directories owned by this user"
 
 
 @dataclass(frozen=True)
@@ -1213,9 +1240,10 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder) -> Generator[Path]:
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder, *,
+                        on_create: FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
-    path = create_build_folder(spec)
+    path = create_build_folder(spec, on_create=on_create)
     try:
         yield path
     finally:
@@ -1249,6 +1277,8 @@ def removal_refusal_detail(result: RemovalRefusal) -> str:
 def attempt_folder_removal(path: Path, cleanup: Callable[[], object] | None = None, *, temporary: bool = True,
                            retained_parent: build_folder_lock.OpenLock | None = None, wait: RemovalProbe = True,
                            handle: AllocatedFolder | None = None,
+                           expected: os.stat_result | None = None,
+                           permissions: RemovalPermissions = RemovalPermissions.PRESERVE,
                            pending: ExitStack | None = None) -> RemovalAttempt:
     """Remove only the verified folder under its namespace lock."""
     probe = _probe_removal_lease(path, wait, handle=handle, pending=pending)
@@ -1279,6 +1309,13 @@ def attempt_folder_removal(path: Path, cleanup: Callable[[], object] | None = No
         if handle is not None and _folder_exists(path, directory):
             if not _named_folder_matches(directory, path.name, handle.folder):
                 return FolderChanged(path)
+        if expected is not None:
+            try:
+                current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return Removed()
+            if not os.path.samestat(current, expected):
+                return FolderChanged(path)
         if handle is not None:
             _ = locks.callback(fcntl.flock, handle.lease, fcntl.LOCK_UN)
             lease = _reserve_removal_lease(path, directory, handle.lease, locks, pending=pending)
@@ -1288,13 +1325,20 @@ def attempt_folder_removal(path: Path, cleanup: Callable[[], object] | None = No
             return lease.reason
         if isinstance(lease, UnreservedRemovalFolder):
             return FolderChanged(path)
-        return _remove_leased_folder(path, directory, cleanup, temporary=temporary, handle=handle, pending=pending)
+        return _remove_leased_folder(path, directory, cleanup, temporary=temporary, handle=handle,
+                                    expected=expected, permissions=permissions, pending=pending)
 
 
 def _finish_removal(path: Path, cleanup: Callable[[], object] | None, *,
                     directory: int = -1, temporary: bool = True) -> RemovalAttempt:
-    if cleanup is not None and cleanup() is False:
-        return UnsafeChild(path, "the cleanup callback refused removal")
+    if cleanup is not None:
+        try:
+            if cleanup() is False:
+                return UnsafeChild(path, "the cleanup callback refused removal")
+        except FileNotFoundError:
+            if temporary and directory >= 0 and not _folder_exists(path, directory):
+                _unlink_metadata(path, directory)
+            raise
     if directory < 0:
         try:
             _ = path.lstat()
@@ -1324,18 +1368,18 @@ def _remove_locked_tree(path: Path, directory: int, folder: int, *, repair: bool
 
 
 def _remove_leased_folder(path: Path, directory: int, cleanup: Callable[[], object] | None, *,
-                          temporary: bool, handle: AllocatedFolder | None = None,
+                          temporary: bool, permissions: RemovalPermissions, handle: AllocatedFolder | None = None,
                           expected: os.stat_result | None = None,
                           pending: ExitStack | None = None) -> RemovalAttempt:
+    repair = permissions is RemovalPermissions.REPAIR_OWNED_DIRECTORIES
     with ExitStack() as children:
         if _folder_exists(path, directory):
             try:
                 folder = (handle.folder if handle is not None else
-                          children.enter_context(_open_folder(directory, path.name, repair=expected is not None)))
+                          children.enter_context(_open_folder(directory, path.name, repair=repair)))
                 if (not _named_folder_matches(directory, path.name, folder)
                         or expected is not None and not os.path.samestat(expected, os.fstat(folder))):
                     return FolderChanged(path)
-                repair = handle is not None or expected is not None
                 scan = _hold_child_leases(path, folder, children, repair=repair, pending=pending)
                 if not isinstance(scan, DescendantLeasesHeld):
                     return scan
@@ -1408,7 +1452,8 @@ def _finish_temporary(handle: AllocatedFolder, *, descriptor: int, temporary: bo
     while True:
         with ExitStack() as pending:
             result = attempt_folder_removal(handle.path, temporary=temporary, wait=timing,
-                                            handle=handle, pending=pending)
+                                            handle=handle, permissions=RemovalPermissions.REPAIR_OWNED_DIRECTORIES,
+                                            pending=pending)
             if not isinstance(result, _PendingRemoval):
                 break
             if handle.supervised:
@@ -1579,8 +1624,9 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
     with temporary_build_folder(spec) as path:
         pid = os.getpid()
         start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-        marker = {"owner": owner, "pid": pid, "start_time": start_time,
-                  "boot_id": boot_identity()}
+        information = path.stat()
+        marker = {"owner": owner, "pid": pid, "start_time": start_time, "boot_id": boot_identity(),
+                  "copy_path": str(path.resolve()), "copy_device": information.st_dev, "copy_inode": information.st_ino}
         _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
         descriptor = build_folder_lock_fd(path)
         return run_build_command(command, path=path,

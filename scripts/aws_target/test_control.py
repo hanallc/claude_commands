@@ -34,7 +34,7 @@ from scripts.review_links import console_theme, review_link
 def table_texts(tables: spot_table.SpotTables) -> tuple[str, ...]:
     """Every snapshot line, then every title, header and cell of the tables, for text checks."""
     every = (*tables.prices, *tables.quotas, *(table for costs in tables.runs
-             for table in (*costs.tables, costs.gate_prices, costs.refused, costs.launched)), tables.hours)
+             for table in (*costs.tables, costs.gate_prices, costs.refused, costs.launched)))
     return (*(text for _region, text in tables.snapshot_rows),
             *(text for table in every for text in (table.title, *table.headers, *(cell for row in table.rows for cell in row))))
 
@@ -1396,8 +1396,10 @@ class HoursCheckTests(CostFixture):
         claims = ledger.mapping(cast(object, json.loads((self.state / 'hours-gap-notices.json').read_text())))
         self.assertEqual(claims['claimed'], [f'aws-hours-gap:{fallback}:{self.other}:{day.date().isoformat()}'])
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
-        row = next(row for row in table.rows if row[0] == fallback)
-        self.assertEqual(row[table.headers.index(self.other)], '2.0/0.0 + 1.00 reserved (100%) over')
+        assert isinstance(table, spot_table.HoursComparison)
+        row = next(row for row in table.rows if row.size == fallback)
+        self.assertTrue(row.check.hours_gap_over)
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [fallback, self.other, '2.0', '0.0', '+2.0', '1.0'])
 
     def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
         text_setting(self.root / 'hana_aws.conf', 'fallback_instance_types', 'm6a.4xlarge,')
@@ -1412,8 +1414,10 @@ class HoursCheckTests(CostFixture):
         self.assertIn('The gap is 100%.', command[-1])
         self.assertNotIn('Hana box time', command[-1])
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(table, spot_table.HoursComparison)
         row, = table.rows
-        self.assertEqual(row[table.headers.index(self.other)], '2.0/1.0 (100%) over')
+        self.assertTrue(row.check.hours_gap_over)
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.other, '2.0', '1.0', '+1.0', '—'])
 
     def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
         one = self.day(1)
@@ -1436,23 +1440,60 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(self.notice_run(), 0)
         self.assertEqual(len(self.notice_commands), 1)
 
-    def test_spot_table_shows_billed_over_box_hours_with_the_gap(self) -> None:
+    def test_spot_table_shows_separate_hours_and_the_signed_difference(self) -> None:
         one, two = self.day(1), self.day(2)
         gpu = conf.read_or_repository('cloud_gate').words('gpu_instance_types')[0]
         self.gate(self.size, self.home, one, 3600)
         self.gate(self.size, self.other, one, 1800)
         self.gate(gpu, self.home, two, 3600)
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
-        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        columns = tables.hours.headers
-        cells = {row[0]: dict(zip(columns[1:], row[1:])) for row in tables.hours.rows}
-        self.assertEqual(set(cells), {self.size, gpu})
-        self.assertEqual(cells[self.size][self.home], f'{Decimal(1) + self.limit * 2:.1f}/1.0 ({self.limit * 2:.0%}) over')
-        # The other region has no Spot hours on the billed day.
-        self.assertEqual(cells[self.size][self.other], '0.0/0.5 (100%) over')
-        self.assertEqual(cells[gpu][self.home], 'not billed')
-        self.assertIn(f'above {self.limit:.0%}', tables.hours_note)
-        self.assertEqual(tables.hours.title, 'Billed hours / box hours')
+        hours = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).hours
+        assert isinstance(hours, spot_table.HoursComparison)
+        self.assertEqual([aws_page.hours_row_data(row)['cells'] for row in hours.rows], [
+            [self.size, self.home, '1.3', '1.0', '+0.3', '—'],
+            [self.size, self.other, '0.0', '0.5', '-0.5', '—'],
+            [gpu, self.home, '—', '1.0', '—', '—'],
+        ])
+        self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True, False])
+
+    def test_over_uses_the_full_precision_of_the_hours_and_limit(self) -> None:
+        day = self.day(1)
+        self.gate(self.size, self.home, day, 3600)
+        self.bill(day, {(self.size, self.home): Decimal('1.154')})
+        for ratio, mark in (('0.155', False), ('0.150', True), ('0.0000123', True)):
+            with self.subTest(ratio=ratio):
+                self.replace('billed_hours_gap_max_ratio', ratio)
+                hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+                assert isinstance(hours, spot_table.HoursComparison)
+                row, = hours.rows
+                self.assertEqual(aws_page.hours_row_data(row)['cells'][4], '+0.2')
+                self.assertEqual(row.check.hours_gap_over, mark)
+
+    def test_hours_difference_rounds_only_after_subtracting(self) -> None:
+        for billed, recorded, cells in (
+            ('0.96', '1', ['1.0', '1.0', '0.0']),
+            ('4.24', '4.26', ['4.2', '4.3', '0.0']),
+            ('1.24', '1.06', ['1.2', '1.1', '+0.2']),
+        ):
+            with self.subTest(billed=billed, recorded=recorded):
+                check = run_cost.hours_check(Decimal(billed), Decimal(recorded), self.limit)
+                row = spot_table.MachineHoursRow(self.size, self.home, check)
+                self.assertEqual(aws_page.hours_row_data(row)['cells'][2:5], cells)
+
+    def test_billed_hours_empty_states_distinguish_a_missing_bill_from_no_hours(self) -> None:
+        def check(note: str) -> None:
+            hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+            self.assertEqual(hours, spot_table.HoursComparisonUnavailable(note))
+
+        check('No AWS bill is available yet for the last 7 days.')
+        self.bill(self.day(2), {})
+        check('There are no machine hours to compare.')
+        self.gate(self.size, self.home, self.day(1), 3600)
+        hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(hours, spot_table.HoursComparison)
+        row, = hours.rows
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.home, '—', '1.0', '—', '—'])
+        self.assertFalse(row.check.hours_gap_over)
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
         day = self.day(1)
@@ -1460,10 +1501,16 @@ class HoursCheckTests(CostFixture):
         self.gate(self.size, self.other, day, 3600)
         self.exposures.append(ledger.HanaComputeExposure(at, at + 7200, 1, Decimal('.25'),
             ledger.HanaExposureClosed(at + 7200), self.size, region=self.other))
-        self.bill(day, {(self.size, self.other): Decimal(3)})
+        fallback = 'm6a.4xlarge'
+        self.bill(day, {(self.size, self.other): Decimal(3), (fallback, self.other): Decimal('0.9')})
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
-        row = next(row for row in table.rows if row[0] == self.size)
-        self.assertEqual(row[table.headers.index(self.other)], '3.0/1.0 + 2.00 reserved (0%)')
+        assert isinstance(table, spot_table.HoursComparison)
+        cells = {row.size: aws_page.hours_row_data(row)['cells'][1:] for row in table.rows}
+        self.assertEqual(cells, {
+            self.size: [self.other, '3.0', '1.0', '+2.0', '2.0'],
+            fallback: [self.other, '0.9', '0.0', '+0.9', '2.0'],
+        })
+        self.assertFalse(any(row.check.hours_gap_over for row in table.rows))
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:
         one = self.day(1)

@@ -10,6 +10,7 @@ import io
 import math
 import json
 import os
+import fcntl
 import signal
 import shlex
 import shutil
@@ -19,7 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, RLock, Thread
@@ -657,13 +658,22 @@ class RecordedResumeTests(RestartTestCase):
                 self.assertEqual(arguments, expected)
 
     def test_claude_resume_keeps_model_plugins_and_one_current_name(self) -> None:
-        for recorded_name in ("recorded-name", ""):
-            with self.subTest(recorded_name=recorded_name):
+        home = Path(self.enterContext(tempfile.TemporaryDirectory())) / "claude account"
+        for recorded_name, turn_model, effort in (("recorded-name", "", ""), ("", "", ""),
+                                                 ("recorded-name", "claude-opus-5-5", "high")):
+            with self.subTest(recorded_name=recorded_name, turn_model=turn_model):
                 entry = self.entry("claude", "claude-model")
                 entry["name"] = recorded_name
+                entry["config_dir"] = str(home)
+                if turn_model:
+                    write_text_atomic(home / "projects/prior/current-id.jsonl",
+                        json.dumps({"type": "assistant", "message": {"model": turn_model}, "effort": effort}) + "\n")
                 arguments = self.resumed_arguments(entry)
                 expected = ["--resume", "current-id", "-n", "current-name", "--remote-control", "current-name"]
-                expected.extend(("--model", "claude-model", "--plugin-dir", "/plugins/first",
+                expected.extend(("--model", turn_model or "claude-model"))
+                if effort:
+                    expected.extend(("--effort", effort))
+                expected.extend(("--plugin-dir", "/plugins/first",
                                  "--plugin-dir", "/plugins/second plugin", "--settings", '{"disableAgentView": true}'))
                 self.assertEqual(arguments, expected)
                 names = [arguments[index + 1] for index, value in enumerate(arguments) if value in ("-n", "--name")]
@@ -692,7 +702,15 @@ class MixedRestartTests(ShutdownTestCase):
     maxDiff: int | None = None
 
     def test_mixed_restart_and_stop_share_all_full_reads(self) -> None:
-        self.run_commands(("restart", "stop"), frozenset())
+        for commands, role_case in (
+            (("restart", "stop"), ""),
+            (("restart",), "selected"),
+            (("restart",), "owner"),
+            (("restart",), "owner-lock"),
+            (("restart",), "role-changed"),
+        ):
+            with self.subTest(commands=commands, role_case=role_case):
+                self.run_commands(commands, frozenset(), role_case=role_case)
 
     def test_failed_worker_stop_keeps_the_live_process_pending(self) -> None:
         self.run_commands(("restart",), frozenset({991104}))
@@ -732,18 +750,20 @@ class MixedRestartTests(ShutdownTestCase):
         with patch.object(herdr, "_PLATFORM", "darwin"), patch.object(sys, "platform", "darwin"):
             self.run_commands(("stop",), frozenset())
 
-    def run_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
+    def run_commands(self, commands: tuple[str, ...], surviving: frozenset[int], *,
+                     role_case: str = "") -> None:
         with (patch.object(herdr, "_PLATFORM", "linux"), patch.object(sys, "platform", "linux"),
-              patch.object(conf, "read", side_effect=short_resume_check_config)):
-            self.linux_commands(commands, surviving)
+              patch.object(conf, "read", side_effect=short_resume_check_config), ExitStack() as fixture):
+            self.linux_commands(commands, surviving, fixture=fixture, role_case=role_case)
 
-    def linux_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
+    def linux_commands(self, commands: tuple[str, ...], surviving: frozenset[int], *,
+                       fixture: ExitStack, role_case: str) -> None:
         self.assertEqual(herdr._PLATFORM, "linux")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(sys.platform, "linux")
         from scripts.herdr import worker_panes
         from scripts.herdr.test_worker_panes import PaneWorld
 
-        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
         environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),
@@ -753,11 +773,17 @@ class MixedRestartTests(ShutdownTestCase):
             "CONF_DIR": str(root / "conf"), "SHUTDOWN_PROOF_WORKSPACE": "w1",
             "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
-        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        _ = cast(object, fixture.enter_context(patch.dict(os.environ, environment)))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(root / 'conf' / source.name)
-        write_text_atomic(root / "conf/models.conf",
-            Path(__file__).resolve().parents[1].joinpath("lib/test_models_registry.conf").read_text())
+        registry = root / "conf/models.conf"
+        invalid_role = role_case in ("selected", "owner", "owner-lock")
+        if invalid_role:
+            _ = write_registry(registry, {"assignments": {"direct": "claude"},
+                "direct.claude": {"impl": "opus:invalid-effort"}})
+        else:
+            write_text_atomic(registry,
+                Path(__file__).resolve().parents[1].joinpath("lib/test_models_registry.conf").read_text())
         directory = staff.PresentWorktree(remote.local_machine(), root)
         doc = root / "production.md"
         write_text_atomic(doc, "# Fixture\n")
@@ -767,8 +793,10 @@ class MixedRestartTests(ShutdownTestCase):
             worktree=staff.PresentWorktree(remote.local_machine(), root / "other"))
         seat = fixture_member("worker", name="mixed-seat", parent=other.id)
         owner = fixture_member("unit", name="mixed-pane", parent=show.id, worktree=directory)
-        workers = [fixture_member("worker", name=name, parent=owner.id,
-            backend=staff.CodexBackend(root / ".codex1")) for name in ("impl", "review")]
+        codex_worker = staff.CodexBackend(root / ".codex1")
+        workers = [fixture_member("worker", name="impl", parent=owner.id,
+                                  backend=staff.ClaudeBackend() if invalid_role else codex_worker),
+                   fixture_member("worker", name="review", parent=owner.id, backend=codex_worker)]
         rows = [show, other, seat, owner, *workers]
         run = root / "runs/pane"
         other_run = root / "runs/other"
@@ -781,7 +809,8 @@ class MixedRestartTests(ShutdownTestCase):
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Preserve behavior.\n")
         for row in workers:
-            _ = progress_history.begin_dispatch(run, slot=row.name, phase="work", role="impl", worker_name=row.name,
+            role = "astra-reviewer" if invalid_role and row.name == "review" else "impl"
+            _ = progress_history.begin_dispatch(run, slot=row.name, phase="work", role=role, worker_name=row.name,
                 worker_id=row.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
         world = PaneWorld()
         panes = world.locations
@@ -929,8 +958,8 @@ class MixedRestartTests(ShutdownTestCase):
         server = socketserver.ThreadingUnixStreamServer(str(endpoint), Handler)
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
+        _ = fixture.callback(server.server_close)
+        _ = fixture.callback(server.shutdown)
         cli = root / "herdr"
         write_text_atomic(cli, f"#!{sys.executable}\n" +
             "import json, socket, sys\n" + f"with socket.socket(socket.AF_UNIX) as stream:\n    stream.connect({str(endpoint)!r})\n" +
@@ -938,7 +967,7 @@ class MixedRestartTests(ShutdownTestCase):
             "    response = stream.makefile().readline()\n" +
             "    if sys.argv[3:5] == ['pane', 'read']:\n        response = json.loads(response)['result']['text']\n" +
             "    print('status: running' if sys.argv[-2:] == ['status', 'server'] else response, end='\\n')\n", new_file_mode=0o700)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": str(cli)})))
+        _ = cast(object, fixture.enter_context(patch.dict(os.environ, {"HERDR_BIN": str(cli)})))
         program = herdr.run_program
 
         def run_program(argv: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
@@ -953,12 +982,12 @@ class MixedRestartTests(ShutdownTestCase):
             else:
                 output = "status: running" if argv[-2:] == ["status", "server"] else json.dumps({"result": response})
             return subprocess.CompletedProcess(argv, 0, output + "\n", "")
-        _ = self.enterContext(patch.object(herdr, "run_program", run_program))
-        _ = cast(object, self.enterContext(patch.multiple(unit_runs, RUN_ROOT=root / "runs", FORMER_RUN_ROOT=root / "former", ASTRA_RUN_ROOT=root / "astra")))
+        _ = fixture.enter_context(patch.object(herdr, "run_program", run_program))
+        _ = cast(object, fixture.enter_context(patch.multiple(unit_runs, RUN_ROOT=root / "runs", FORMER_RUN_ROOT=root / "former", ASTRA_RUN_ROOT=root / "astra")))
         def role_account(role: str) -> accounts.AccountSelection:
             return (accounts.CodexWorkersAccount("codex1", root / ".codex1") if role == "workers" else
                     accounts.NamedAccount("claude2", root / ".claude2"))
-        _ = self.enterContext(patch.object(accounts, "role_account", side_effect=role_account))
+        _ = fixture.enter_context(patch.object(accounts, "role_account", side_effect=role_account))
         process(990999, 1, ["herdr", "server"], {})
         herdr_listener(proc, 990999, "agents", os.environ)
         read_bytes, kill = Path.read_bytes, os.kill
@@ -983,8 +1012,26 @@ class MixedRestartTests(ShutdownTestCase):
             # The fake server answers under this lock; an exit is one change to its world.
             with lock:
                 exit_process(pid, number)
-        _ = self.enterContext(patch.object(Path, "read_bytes", proc_bytes))
-        _ = self.enterContext(patch.object(os, "kill", side_effect=signal_process))
+        _ = fixture.enter_context(patch.object(Path, "read_bytes", proc_bytes))
+        _ = fixture.enter_context(patch.object(os, "kill", side_effect=signal_process))
+        if role_case == "owner-lock":
+            lock_path = root / "rows" / f"{workers[0].id}.lock"
+            lock_path.parent.mkdir(exist_ok=True)
+            refused_lock = fixture.enter_context(lock_path.open("a+b"))
+            fcntl.flock(refused_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIsInstance(staff.row_activity(workers[0].id), staff.RowBusy)
+        if role_case == "role-changed":
+            row_operation = staff.row_operation
+
+            @contextmanager
+            def change_role_before_lock(reference: str) -> Generator[None]:
+                if reference == workers[0].id:
+                    with row_operation(reference):
+                        _ = staff.set_worker_role(workers[0].id, staff.KnownWorkerRole("review"))
+                with row_operation(reference):
+                    yield
+
+            _ = fixture.enter_context(patch.object(staff, "row_operation", change_role_before_lock))
         for command in commands:
             for pid in tuple(live.values()):
                 signal_process(pid, signal.SIGTERM)
@@ -1002,7 +1049,7 @@ class MixedRestartTests(ShutdownTestCase):
                     shell_pids[pane] = 991000 + index
                     process(shell_pids[pane], 990999, ["zsh"], {})
             for pane in panes:
-                kind = "codex" if int(pane[-1]) in (1, 4, 5) else "claude"
+                kind = "codex" if pane in ("w1:p1", "w1:p5") or (pane == "w1:p4" and not invalid_role) else "claude"
                 start(pane, [kind, "resume" if kind == "codex" else "--resume", str(rows[int(pane[-1])].current_session)])
 
             def serial_executor(**_options: object) -> ThreadPoolExecutor:
@@ -1016,8 +1063,24 @@ class MixedRestartTests(ShutdownTestCase):
                   patch.object(pane_record, "seed", wraps=pane_record.seed) as seeds,
                   patch.object(herdr.Herdr, "order_tabs", autospec=True, side_effect=herdr.Herdr.order_tabs) as orders,
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(shutdown.main([command, "--all"]), 0, errors.getvalue())
+                options = (["--only", ",".join(str(row.id) for row in workers)] if role_case == "selected" else [])
+                self.assertEqual(shutdown.main([command, "--all", *options]), 0, errors.getvalue())
             launched_sessions = {cast(dict[str, object], panes[pane]["agent_session"])["value"] for pane in launches}
+            if role_case:
+                expected_restarts = workers[1:] if role_case == "selected" else [show, other, owner, workers[1]]
+                self.assertEqual(live["w1:p4"], 991104)
+                self.assertNotIn(991104, signals)
+                self.assertEqual(launched_sessions, {row.current_session for row in expected_restarts}, errors.getvalue())
+                self.assertEqual(shutdown_record.read(), [])
+                (anomaly,) = errors.getvalue().splitlines()
+                if invalid_role:
+                    self.assertIn("impl: restart anomaly: invalid role configuration", anomaly)
+                    self.assertIn("invalid-effort", anomaly)
+                else:
+                    self.assertIn("impl: restart anomaly: worker role changed from impl to review", anomaly)
+                    current = staff.initial_snapshot().rows_by_id[workers[0].id]
+                    self.assertEqual(worker_panes.dispatch_role(current), "review")
+                continue
             self.assertCountEqual([identity for identity, text in messages if "Continue where you stopped." in text],
                                   [show.id, other.id, owner.id] if command == "restart" else [],
                                   errors.getvalue())
@@ -1550,6 +1613,7 @@ class RestartTests(RestartTestCase):
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
                     other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
                     selected = fixture.worker("TEST-selected")
+                    selected = staff.set_worker_role(selected.id, staff.KnownWorkerRole("impl"))
                     sibling = fixture.worker("TEST-sibling")
                     missing = fixture_member("worker", name="TEST-unselected", parent=other.id)
                     world = fixture.world
@@ -1597,7 +1661,8 @@ class RestartTests(RestartTestCase):
 
     def test_restart_only_keeps_worker_and_owner_operations_within_selected_rows(self) -> None:
         owner = self.rows[0]
-        children = tuple(replace(row, kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
+        children = tuple(replace(row, kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id),
+                                 role=staff.KnownWorkerRole("impl")) for row in self.rows[1:])
         record = staff.StaffSnapshot((owner, *children))
         for selected in (owner, children[0]):
             with (self.subTest(selected=selected.id),

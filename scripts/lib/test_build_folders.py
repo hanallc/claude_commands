@@ -6,6 +6,7 @@ from collections.abc import Callable, Generator, Iterator
 import errno
 import os
 import fcntl
+from io import StringIO
 import json
 import select
 import signal
@@ -19,13 +20,13 @@ import threading
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, cargo_output, conf, copy_record, scratch, unit_runs, process_group
-from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.lib import removal_guard
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
 
 def _release_folder(path: Path) -> None:
@@ -38,15 +39,21 @@ class BuildFolderTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        private = Path(tempfile.mkdtemp(prefix="build-folders-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, private)
+        self.root = private / "case"
+        self.root.mkdir()
+        config = Path(self.enterContext(tempfile.TemporaryDirectory(dir=private)))
+        environment = fixture_git_environment(private)
+        _ = environment.pop("STAFF_CONFIG", None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **environment,
             **config_environment(config), "TMPDIR": str(self.root), copy_record.ROOT_ENV: str(self.root / "scratch"),
             copy_record.COPIES_ENV: str(self.root / "copies"),
             scratch.HOLDS_ENV: str(self.root / "holds.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-        })))
+        }, clear=True)))
         _ = write_config_fixture(config / "build_folders.conf",
             "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
             + "patterns.standing={repository}/{owner}-gate{suffix}\npatterns.editable={repository}-{owner}/{purpose}\n"
@@ -1109,6 +1116,14 @@ locks.probe_retry_seconds=0.005
         cleanup.assert_called_once_with()
         self.assertFalse(path.parent.exists())
 
+    def test_retry_after_removal_does_not_leave_a_lock(self) -> None:
+        path = self.root / "tree"
+        path.mkdir()
+        self.assertEqual(folders.attempt_folder_removal(path, lambda: shutil.rmtree(path)), folders.Removed())
+        with self.assertRaises(FileNotFoundError):
+            _ = folders.attempt_folder_removal(path, lambda: shutil.rmtree(path))
+        self.assertFalse(path.with_suffix(".lock").exists())
+
     def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
         outcome = folders.FolderPairRelease
         for name, expected in (("released", outcome.RELEASED), ("present", outcome.FOLDER_PRESENT),
@@ -1418,7 +1433,7 @@ with mock.patch.object(fcntl, 'flock', side_effect=no_wait):
                 self.assertTrue(lock.is_file())
                 self.assertTrue(lease.is_file())
 
-    def test_removal_cleans_cargo_output_below_a_search_only_sibling(self) -> None:
+    def test_removal_lists_external_cargo_output_below_a_search_only_sibling(self) -> None:
         checkout = self.root / "source-parent" / "checkout"
         checkout.mkdir(parents=True)
         _ = (checkout / "Cargo.toml").write_text("[workspace]\n")
@@ -1430,14 +1445,34 @@ with mock.patch.object(fcntl, 'flock', side_effect=no_wait):
         self.addCleanup(sibling.chmod, stat.S_IMODE(sibling.stat().st_mode))
         sibling.chmod(0o111)
 
-        with (mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "lint")}),
+        with (mock.patch.dict(os.environ, {"HOME": str(self.root)}),
               mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots),
-              mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
-              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([]))):
-            sweep.save_cargo_output_roots(sweep.CargoOutputIndex((roots,)))
+              redirect_stdout(StringIO()) as report):
             self.assertEqual(scratch.remove_folder(checkout), scratch.RemovedCopy())
         self.assertFalse(checkout.exists())
-        self.assertFalse(output.exists())
+        self.assertEqual((output / "artifact").read_text(), "build output")
+        [plan] = list((self.root / removal_guard.LIST_DIRECTORY).glob("*.jsonl"))
+        self.assertEqual(report.getvalue().splitlines(), [f"removal list: {plan}"])
+        [line] = plan.read_text().splitlines()
+        row = removal_guard.ListedEntry.parse(line)
+        self.assertEqual((row.tool, row.path, row.anchor, row.reason),
+                         (removal_guard.Tool.CARGO, output, checkout, "external Cargo output"))
+
+    def test_identity_checked_removal_preserves_directory_permissions(self) -> None:
+        path = self.root / "read-only"
+        path.mkdir()
+        artifact = path / "artifact"
+        _ = artifact.write_text("build output")
+        mode = path.stat().st_mode
+        path.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            result = folders.attempt_folder_removal(path, expected=path.stat())
+            self.assertIsInstance(result, folders.UnsafeChild)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), stat.S_IRUSR | stat.S_IXUSR)
+            self.assertEqual(artifact.read_text(), "build output")
+        finally:
+            if path.exists():
+                path.chmod(stat.S_IMODE(mode))
 
     def test_cargo_reservation_refuses_a_replaced_shared_parent(self) -> None:
         parent = self.root / "shared"
@@ -1930,8 +1965,8 @@ print("moved", flush=True)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:folder-test")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-        self.assertEqual(scratch.end("gate:folder-test"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:folder-test")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_cli_preserves_spaces_existing_permissions_and_the_one_path_output(self) -> None:
         parent = self.root / "shell parent"
@@ -1986,8 +2021,8 @@ print("moved", flush=True)
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:shell-folder")
-        self.assertEqual(scratch.end("gate:shell-folder"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:shell-folder")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_names_cannot_escape_the_explicit_parent(self) -> None:
         for name in ("..", "../escape", "/absolute", "bad\x00name"):

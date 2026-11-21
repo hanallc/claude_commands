@@ -4433,8 +4433,8 @@ class HerdrTests(unittest.TestCase):
                 ("claude", "starting", ["birth", "birth"], False, ""),
                 ("claude", "exits during the check",
                  ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
-                ("claude", "exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], True, ""),
-                ("codex", "exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], False, ""),
+                ("claude", "exits before the read", [herdr.NativeRegistryChanging(herdr.process_exit_reason(992001))], True, ""),
+                ("codex", "exits before the read", [herdr.NativeRegistryChanging(herdr.process_exit_reason(992001))], False, ""),
                 ("claude", "steady", ["birth", "birth"], True,
                  f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
             info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
@@ -7401,7 +7401,11 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1)
         with self.assertRaises(herdr.NativeRegistryChanging) as raised:
             _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(str(raised.exception), "pid 42: process exited")
+        reason = str(raised.exception)
+        self.assertEqual(reason, "pid 42: process exited")
+        self.assertEqual(herdr.exited_process_pid(reason), 42)
+        self.assertIsNone(herdr.exited_process_pid(f"read failed: {reason}"))
+        self.assertIsNone(herdr.exited_process_pid(herdr.process_exit_reason(0)))
         self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="ps refused")
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "ps refused"):
             _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]

@@ -37,6 +37,8 @@ Codex review prompts also include section 3's command block.
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --label "<what>" -- <command>`.
+   For Python test runs, pass `--kind python-tests` before `--`.
+   To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
    A successful start returns at once with the run, its pid and its log.
    A live twin takes priority over config/detached_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.

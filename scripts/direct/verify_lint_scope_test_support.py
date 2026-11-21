@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
@@ -314,12 +314,7 @@ if __name__ == "__main__":
                 ],
             }],
         }
-        self.environment = {
-            name: value for name, value in os.environ.items()
-            if name != "COPIES_RUN_PID"
-            and not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
-                                     "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
-        }
+        self.environment = verify_test_environment()
         self.environment.update({
             # The fixture supplies its complete toolchain; Nix discovery is unrelated
             # to lint scope, formatting, fix convergence or cache assertions.

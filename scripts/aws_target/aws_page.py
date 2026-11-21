@@ -21,7 +21,7 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
-from scripts.aws_target import config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -165,6 +165,14 @@ def classify_launch_row(
             return LaunchRowEvidence.NO_ATTEMPT
 
 
+class CloudGatesOff(TypedDict):
+    kind: Literal['off']
+
+
+class InvalidCloudGateSetting(TypedDict):
+    kind: Literal['invalid']
+
+
 class NoLaunchEvidence(TypedDict):
     kind: Literal['no-evidence']
 
@@ -185,11 +193,14 @@ class LaunchesRefused(TypedDict):
     last_good_at: NotRequired[float]
 
 
-type LaunchState = NoLaunchEvidence | LaunchesWorking | LaunchesRefused
+type LaunchState = CloudGatesOff | InvalidCloudGateSetting | NoLaunchEvidence | LaunchesWorking | LaunchesRefused
 
 
-class QuotaRequestCell(TypedDict):
-    text: str
+class QuotaRequestColumns(TypedDict):
+    wanted: str
+    request: QuotaRequestOutcome | Literal['not measured', '—']
+    age: str
+    detail: NotRequired[str]
     note: NotRequired[str]
     history_missing: NotRequired[Literal[True]]
 
@@ -200,9 +211,36 @@ class GpuQuotaSummary(TypedDict):
 
 
 class QuotaHistoryData(TypedDict):
-    standard: dict[str, QuotaRequestCell]
-    gpu: dict[str, QuotaRequestCell]
+    standard: dict[str, QuotaRequestColumns]
+    gpu: dict[str, QuotaRequestColumns]
     gpu_summary: GpuQuotaSummary
+
+
+class UnbilledHoursRowData(TypedDict):
+    kind: Literal['unbilled']
+    region: str
+    cells: list[str]
+
+
+class ComparedHoursRowData(TypedDict):
+    kind: Literal['compared']
+    region: str
+    cells: list[str]
+    billed: float
+    recorded: float
+    difference_tenths: int
+    limit_result: Literal['within_limit', 'higher_bill', 'lower_bill']
+
+
+class HoursComparisonData(TypedDict):
+    kind: Literal['comparison']
+    rows: list[ComparedHoursRowData | UnbilledHoursRowData]
+    limit_percent: str
+
+
+class HoursComparisonUnavailableData(TypedDict):
+    kind: Literal['unavailable']
+    reason: str
 
 
 class PageData(TypedDict):
@@ -220,8 +258,7 @@ class PageData(TypedDict):
     quota_history: QuotaHistoryData
     cached_spot_status: dict[str, Literal['read failed', 'old']]
     runs: list[RunCostData]
-    hours: TableData
-    hours_note: str
+    hours: HoursComparisonData | HoursComparisonUnavailableData
 
 
 def table_rows_data(table: spot_table.Table) -> TableRowsData:
@@ -233,6 +270,27 @@ def table_rows_data(table: spot_table.Table) -> TableRowsData:
 
 def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, **table_rows_data(table)}
+
+
+def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | UnbilledHoursRowData:
+    check = row.check
+    billed = check.billed_hours
+    recorded = round(check.box_hours, 1)
+    if billed is None:
+        return {'kind': 'unbilled', 'region': row.region, 'cells': [row.size, row.region, '—', f'{recorded:.1f}', '—', '—']}
+    difference = round(billed - check.box_hours, 1)
+    limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
+    if check.hours_gap_over:
+        limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
+    if difference:
+        shown_difference = f'{difference:+.1f}'
+    else:
+        shown_difference = 'less than 0.1 hours' if check.hours_gap_over else '0.0'
+    reserved = check.hana_reserved_hours
+    cells = [row.size, row.region, f'{billed:.1f}', f'{recorded:.1f}', shown_difference,
+             f'{reserved:.1f}' if billed >= check.box_hours and reserved > 0 else '—']
+    return {'kind': 'compared', 'region': row.region, 'cells': cells, 'billed': float(billed),
+            'recorded': float(check.box_hours), 'difference_tenths': int(difference * 10), 'limit_result': limit_result}
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -349,8 +407,12 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
 
 
-def launch_state(records: Sequence[dict[str, object]]) -> LaunchState:
-    """Count each refused gate attempt once since the last good launch."""
+def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
+    """Show the switch state or the latest launch evidence."""
+    if gate_switch is cloud_gate.CloudGateSwitch.OFF:
+        return {'kind': 'off'}
+    if isinstance(gate_switch, cloud_gate.InvalidCloudGateSwitch):
+        return {'kind': 'invalid'}
     requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
                           and isinstance(attempt := row.get('attempt'), str) and attempt}
     counted_refusals: set[str] = set()
@@ -432,19 +494,25 @@ def quota_request_note(reason: str) -> str:
     return 'The page could not measure quota request history.'
 
 
-def quota_request_cell(reading: quota_requests.QuotaRequestReading,
-                       applied: Decimal | AppliedQuotaUnavailable, now: int) -> QuotaRequestCell:
+def quota_request_columns(reading: quota_requests.QuotaRequestReading,
+                          applied: Decimal | AppliedQuotaUnavailable, now: int) -> QuotaRequestColumns:
     if isinstance(reading, quota_requests.QuotaRequest):
         wanted = reading.requested_vcpus
         outcome = quota_request_outcome(reading, applied, wanted)
-        return {'text': f'{wanted:f} vCPUs wanted · {outcome}, {quota_request_age(reading, now)}'}
+        columns: QuotaRequestColumns = {'wanted': f'{wanted:f}', 'request': outcome, 'age': quota_request_age(reading, now)}
+        if outcome in (QuotaRequestOutcome.CLOSED_QUOTA_UNKNOWN, QuotaRequestOutcome.STATUS_UNKNOWN):
+            columns.update(request='not measured', detail=outcome)
+        return columns
+    unavailable: QuotaRequestColumns = {'wanted': '—', 'request': 'not measured', 'age': '—'}
     if isinstance(reading, quota_requests.NoQuotaRequest):
-        return {'text': 'no request'}
-    if isinstance(reading, quota_requests.QuotaRequestReadFailed):
-        return {'text': 'request read failed'}
-    if reading.reason == 'The snapshot has no quota request history for this region.':
-        return {'text': 'not measured', 'history_missing': True}
-    return {'text': 'not measured', 'note': quota_request_note(reading.reason)}
+        unavailable['request'] = '—'
+    elif isinstance(reading, quota_requests.QuotaRequestReadFailed):
+        unavailable['detail'] = 'request read failed'
+    elif reading.reason == 'The snapshot has no quota request history for this region.':
+        unavailable['history_missing'] = True
+    else:
+        unavailable['note'] = quota_request_note(reading.reason)
+    return unavailable
 
 
 def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryData:
@@ -466,8 +534,8 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
         region = history.region
         applied = gpu[region]
         request = history.gpu
-        data['standard'][region] = quota_request_cell(history.standard, standard[region], now)
-        data['gpu'][region] = quota_request_cell(request, applied, now)
+        data['standard'][region] = quota_request_columns(history.standard, standard[region], now)
+        data['gpu'][region] = quota_request_columns(request, applied, now)
         if isinstance(applied, Decimal) and applied >= needed:
             regions_by_outcome[QuotaRequestOutcome.GRANTED].append(region)
         elif isinstance(request, quota_requests.QuotaRequest) and request.requested_vcpus >= needed:
@@ -479,14 +547,24 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
-              launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = ()) -> PageData:
+              launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
+              gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
-    regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
+    regions = {row[0] for row in placement.rows} | tables.hours.checked_regions
+    hours: HoursComparisonData | HoursComparisonUnavailableData
+    if isinstance(tables.hours, spot_table.HoursComparison):
+        percent = format(tables.hours.max_gap_ratio, '%').removesuffix('%')
+        if '.' in percent:
+            percent = percent.rstrip('0').rstrip('.')
+        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows],
+                 'limit_percent': f'{percent}%'}
+    else:
+        hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
     return {
         'read_at': now,
         'render_seconds': 0.0,
-        'launch_state': launch_state(launch_records),
+        'launch_state': launch_state(launch_records, gate_switch),
         'spend': spend,
         'settled_notes': list(settled_notes),
         'regions': sorted(regions, key=region_filter_key),
@@ -504,8 +582,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
                   'no_estimate': costs.summary_of(None),
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
                  for costs in tables.runs],
-        'hours': table_data(tables.hours),
-        'hours_note': tables.hours_note,
+        'hours': hours,
     }
 
 
@@ -557,11 +634,11 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    values = conf.read_or_repository('cloud_gate')
+    values = cloud_gate.settings()
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
-                     settled_notes=settled_amount_notes(watched))
+                     settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)

@@ -23,7 +23,8 @@ from unittest.mock import MagicMock, patch
 from scripts.lib import process_group
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.shell_test_support import refusing_bash_startup, shell_functions
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -149,7 +150,7 @@ def unguarded_group_signals(scripts: Path) -> list[str]:
                     lines.add(number)
         if relative == Path("lib/process_group.py"):
             allowed = next((node for node in ast.walk(ast.parse(source))
-                            if isinstance(node, ast.FunctionDef) and node.name == "send_process_group"), None)
+                            if isinstance(node, ast.FunctionDef) and node.name == "_send_checked_group"), None)
             if allowed is not None:
                 send_line = next((node.lineno for node in ast.walk(allowed)
                                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -188,6 +189,16 @@ class ProcessGroupTests(PrivateGroupFixture):
             process_group.send_process_group(child.pid, signal.SIGTERM)
             send.assert_called_once_with(child.pid, signal.SIGTERM)
 
+    def test_only_the_group_leader_can_terminate_its_own_group(self) -> None:
+        pid = os.getpid()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid + 1):
+            with self.assertRaises(ValueError):
+                process_group.terminate_owned_process_group()
+            send.assert_not_called()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid):
+            process_group.terminate_owned_process_group()
+            send.assert_called_once_with(pid, signal.SIGTERM)
+
     def test_cli_refuses_invalid_ids_without_sending_a_signal(self) -> None:
         invalid: tuple[object, ...] = (MagicMock(), True, False, 0, 1, -2, os.getpgrp())
         with patch.object(os, "killpg") as send, redirect_stderr(io.StringIO()):
@@ -208,7 +219,7 @@ class ProcessGroupTests(PrivateGroupFixture):
 
 class ShellProcessGroupTests(PrivateGroupFixture):
     root: Path = Path()
-    environment: dict[str, str] = {}
+    fixture_environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -217,9 +228,13 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         copy_runtime(self.root, configuration=False)
         home = self.root / "home"
         home.mkdir()
-        self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
-                            "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+        self.fixture_environment = {**config_environment(self.root / "config"),
+                                    "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
+                                    "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {**verify_test_environment(), **self.fixture_environment}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         board = self.root / "scripts/direct/board.sh"
@@ -306,12 +321,18 @@ stop_interrupted_run_log() { :; }
     def test_copied_verify_cancellation_uses_the_local_helper(self) -> None:
         sends = self.fake_group_sender()
         child = self.private_child()
-        for function, status in (("cancel_tree_run", 77), ("verify_interrupted", 128 + signal.SIGTERM)):
-            with self.subTest(function=function):
+        startup = refusing_bash_startup(self.root)
+        for function, status, bash_env in (
+            ("cancel_tree_run", 77, ""),
+            ("verify_interrupted", 128 + signal.SIGTERM, ""),
+            ("cancel_tree_run", 77, str(startup)),
+        ):
+            with (self.subTest(function=function, caller_startup=bool(bash_env)),
+                  patch.dict(os.environ, {"BASH_ENV": bash_env})):
                 result = self.cancel_step(function, child)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
         self.assertEqual(sends.read_text().splitlines(), [
-            f"{child.pid} {signum}" for signum in (signal.SIGKILL, signal.SIGTERM, signal.SIGCONT)])
+            f"{child.pid} {signum}" for signum in (signal.SIGKILL, signal.SIGTERM, signal.SIGCONT, signal.SIGKILL)])
 
     def test_verify_cancellation_reports_missing_or_refused_local_helpers(self) -> None:
         child = self.private_child()

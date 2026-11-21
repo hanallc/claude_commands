@@ -1,7 +1,7 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
 
@@ -13,11 +13,13 @@ import signal
 import subprocess
 from typing import TypedDict, cast
 import unittest
+from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.production import staff
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -77,12 +79,10 @@ fi
         repository = script.parents[2] / "repository"
         repository.mkdir()
         _ = (repository / "Cargo.toml").write_text("[workspace]\n")
-        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True,
+        environment = verify_test_environment()
+        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, env=environment, check=True,
                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
-                       "UNIT_DETACHED_RUN": "", **changes}
-        _ = environment.pop("PYTHONPATH", None)
-        _ = environment.pop("BUILDLOG_RUN", None)
+        environment.update({"IN_NIX_SHELL": "fixture", "HOME": str(script.parents[2]), **changes})
         process = subprocess.Popen(["bash", str(script), name, *words], cwd=repository, env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
@@ -113,6 +113,18 @@ fi
         expected = wire.RunIdentity(probe["pid"], owner.start_time)
         self.assertEqual(probe["run"], f"{expected.pid}:{expected.start_time}")
         return expected
+
+    def test_startup_does_not_read_the_caller_bash_env(self) -> None:
+        with AdmissionFixture() as fixture:
+            startup = fixture.root / "caller-startup.sh"
+            _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\n')
+            with mock.patch.dict(os.environ, {"BASH_ENV": str(startup)}):
+                process = self.start(self.script(fixture), "startup")
+            self.assertEqual(self.probe(process)["pid"], process.pid)
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            self.assertFalse(startup.with_suffix(".sh.ran").exists())
 
     def test_nested_verify_keeps_the_outer_identity_and_queue_order(self) -> None:
         with AdmissionFixture() as fixture:
@@ -163,7 +175,7 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             output_fd = os.open(outgoing, os.O_RDWR | os.O_NONBLOCK)
             self.addCleanup(os.close, input_fd)
             self.addCleanup(os.close, output_fd)
-            process = self.start(script, "detached", CODEX_THREAD_ID="fixture",
+            process = self.start(script, "detached", CODEX_THREAD_ID=staff.caller_identity() or "fixture",
                                  VERIFY_DETACHED_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
                                  DETACHED_OUTPUT=str(outgoing), DETACHED_ERROR=str(fixture.root / "detached.err"))
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -194,7 +206,8 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             started = fixture.root / "detach-started"
             _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
             process = self.start(script, "build", "sample", "--release", "--attached",
-                                 CODEX_THREAD_ID="fixture", VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
+                                 CODEX_THREAD_ID=staff.caller_identity() or "fixture",
+                                 VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
             probe = self.probe(process)
             self.assertEqual(probe["pid"], process.pid)
             self.proceed(process)
