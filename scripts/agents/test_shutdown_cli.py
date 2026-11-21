@@ -359,12 +359,12 @@ caller_margin_seconds=15
 remote_transport_seconds=30
 """,
     "build_steps": """\
-names.targeted-test=targeted test
-names.merge-gate=gate
+names.test-affected=test affected
+names.gate=gate
 names.integrate=integrate
 names.test-all=test all
 names.test-modules=test named
-prose.merge-gate=the gate
+prose.gate=the gate
 prose.build=release build
 owned.default={unit} {step}
 owned.showrunner-default=showrunner {step}
