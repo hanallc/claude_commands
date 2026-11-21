@@ -229,28 +229,31 @@ def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, 
 
 
 def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTestStep], flakes: frozenset[str],
-                   flaky_tests: frozenset[str], log: Path, *, raise_start_errors: bool = False) -> str:
-    """Run the given commands and their retries; the caller owns merge rollback."""
+                   flaky_tests: frozenset[str], log: Path, *, retry_failed_steps: bool = True) -> str:
+    """Run checkpoint tests with the caller's retry policy."""
     log.parent.mkdir(parents=True, exist_ok=True)
     failed: list[tuple[CheckpointTestStep, frozenset[str], frozenset[str]]] = []
     with log.open("a", encoding="utf-8") as output:
-        for step in steps:
-            result = run_test_command(step.command, step.folder, raise_start_errors=raise_start_errors)
+        for count, step in enumerate(steps, 1):
+            result = run_test_command(step.command, step.folder)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
             stop_cancelled_test(step.label, result, log)
             if not test_passed(result):
-                failed.append((step, failed_tests(result.stdout + result.stderr),
-                               red_names(step.command, result.stdout + result.stderr)))
+                output_text = result.stdout + result.stderr
+                names = red_names(step.command, output_text)
+                if not retry_failed_steps:
+                    report("test", "ok", f"{count} commands ran; 1 red; log {log}")
+                    raise unit_red((RedStep(step, names),), log)
+                failed.append((step, failed_tests(output_text), names))
     red_steps: list[RedStep] = []
     for step, tests, first_names in failed:
         name, command, folder = step
         # Run only the known flaky tests when they cause the failure.
         alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, folder,
-                                      raise_start_errors=raise_start_errors)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)

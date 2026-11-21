@@ -877,12 +877,11 @@ def merge_main(production: ProductionDocument) -> None:
 
 
 class MainConflict(checkpoint_gate.Stop):
-    """The main commit that conflicts with the unpublished merge tip."""
+    """A conflict between main and the unpublished merge tip."""
 
-    def __init__(self, main_commit: str, paths: tuple[str, ...]) -> None:
+    def __init__(self, paths: tuple[str, ...]) -> None:
         super().__init__("push", "held", "origin/main conflicts: " + ", ".join(paths),
                          "merge origin/main into the merge branch, resolve the conflict, and run the push again")
-        self.main_commit: str = main_commit
 
 
 def merge_main_commit(production: ProductionDocument, main_commit: str) -> None:
@@ -895,7 +894,7 @@ def merge_main_commit(production: ProductionDocument, main_commit: str) -> None:
             conflicts = good(git(checkout, "diff", "--name-only", "--diff-filter=U"), "push")
             _ = good(git(checkout, "merge", "--abort"), "push")
             if conflicts:
-                raise MainConflict(main_commit, tuple(conflicts.splitlines()))
+                raise MainConflict(tuple(conflicts.splitlines()))
             _ = good(merged, "push")
 
 
@@ -1716,9 +1715,8 @@ def run(request: MergeRequest, *, push_scope: StandaloneCheckpointPush | Resumed
 
 
 class MergedBatchItem(NamedTuple):
-    """One checked merge and its identity within the current batch attempt."""
+    """A checked merge and its test paths."""
 
-    position: int
     request: MergeRequest
     origin: CheckpointOrigin
     merge_head: str
@@ -1744,45 +1742,8 @@ class BatchResumeRecord:
             checkpoint_gate.report("batch", "warning", f"{self.path}: could not remove the batch record ({error})")
 
 
-class BatchItemStop(Exception):
-    """The items that prevent the current unpublished batch from landing."""
-
-    def __init__(self, indices: tuple[int, ...], stop: checkpoint_gate.Stop,
-                 item_stops: tuple[tuple[int, checkpoint_gate.Stop], ...] = ()) -> None:
-        super().__init__(stop.detail)
-        self.indices: tuple[int, ...] = indices
-        self.stop: checkpoint_gate.Stop = stop
-        self.item_stops: tuple[tuple[int, checkpoint_gate.Stop], ...] = item_stops
-
-
-def batch_main_conflicts(items: list[MergedBatchItem], conflict: MainConflict) -> BatchItemStop:
-    """Check each submitted checkpoint against the main commit that held publication."""
-    stops: list[tuple[int, checkpoint_gate.Stop]] = []
-    for item in items:
-        request = item.request
-        result = git(request.production.checkout, "merge-tree", "--write-tree", "--name-only",
-                     conflict.main_commit, request.commit)
-        if result.returncode == 1:
-            paths = tuple(result.stdout.split("\n\n", 1)[0].splitlines()[1:])
-            files = ", ".join(paths)
-            label = f"{request.unit.name} phase {request.phase} ({request.commit[:12]})"
-            stops.append((item.position, checkpoint_gate.Stop("push", "held",
-                f"{label}: origin/main conflicts: {files}",
-                f"merge origin/main into your own unit branch, resolve {files}, and send a new checkpoint")))
-        elif result.returncode:
-            stop = checkpoint_gate.Stop("push", "failed", result.stderr.strip() or f"merge-tree exit {result.returncode}",
-                                        "the showrunner will inspect the merge-tree failure")
-            return BatchItemStop(tuple(item.position for item in items), stop)
-    if not stops:
-        # No individual checkpoint explains the conflict in the combined merge tip.
-        stops = [(item.position, checkpoint_gate.Stop("push", "held", conflict.detail,
-                  "your checkpoint is clean against origin/main and can land alone; "
-                  + "the showrunner will inspect the combined merge conflict")) for item in items]
-    return BatchItemStop(tuple(index for index, _ in stops), conflict, tuple(stops))
-
-
 def reset_batch(production: ProductionDocument, start_tip: str, *, merge_in_progress_at_start: bool) -> None:
-    """Undo every unpublished merge from the current batch attempt."""
+    """Undo the unpublished merges from this batch."""
     if not merge_in_progress_at_start and git(production.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
         _ = good(git(production.checkout, "merge", "--abort"), "merge")
     head = good(git(production.checkout, "rev-parse", "HEAD"), "merge")
@@ -1790,100 +1751,49 @@ def reset_batch(production: ProductionDocument, start_tip: str, *, merge_in_prog
         undo_unpushed_merge(production, head, start_tip)
 
 
-def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem, ...], start_tip: str,
-                     red: checkpoint_gate.RedCheckpointTests, paths: tuple[str, ...], log: Path) -> MergedBatchItem:
-    """Find the first candidate whose merge makes the unresolved commands red."""
-    try:
-        try:
-            main_commit = good(git(reference.production.checkout, "rev-parse", "origin/main"), "bisect")
-            low, high = 0, len(candidates) - 1
-            while low < high:
-                middle = (low + high) // 2
-                item = candidates[middle]
-                _ = good(git(reference.production.checkout, "reset", "--keep", item.merge_head), "bisect")
-                merge_main_commit(reference.production, main_commit)
-                selected = checkpoint_gate.test_steps(reference.production, paths, reference.merge_tests)
-                commands = {(tuple(step.command), step.folder) for step in selected}
-                red_steps = tuple(checkpoint_gate.narrowed(item) for item in red.red
-                                  if (tuple(item.step.command), item.step.folder) in commands)
-                try:
-                    _ = checkpoint_gate.run_test_steps(reference.parent_production, red_steps, reference.flakes,
-                                                        reference.flaky_tests, log, raise_start_errors=True)
-                except checkpoint_gate.RedCheckpointTests:
-                    probe_result = "red"
-                    high = middle
-                else:
-                    probe_result = "green"
-                    low = middle + 1
-                checkpoint_gate.report("bisect", probe_result,
-                                       f"{item.request.unit.name} phase {item.request.phase} at {item.merge_head}")
-            return candidates[low]
-        finally:
-            _ = good(git(reference.production.checkout, "reset", "--keep", start_tip), "bisect")
-    except MainConflict:
-        raise
-    except checkpoint_gate.Stop as error:
-        raise BatchItemStop(tuple(item.position for item in candidates), error) from error
-    except (OSError, ValueError) as error:
-        raise BatchItemStop(tuple(item.position for item in candidates), checkpoint_gate.Stop(
-            "run", "failed", str(error), "the showrunner will inspect the failed command")) from error
-
-
 def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: Path,
-                      resume_record: BatchResumeRecord) -> int:
-    """Merge the ordered items and share their tests, publication, and promotion."""
+                      resume_record: BatchResumeRecord, *, merge_in_progress_at_start: bool) -> int:
+    """Merge and test the batch once, then publish it or report the stop."""
     items: list[MergedBatchItem] = []
-    for index, request in enumerate(requests):
-        try:
+    row_test_commands: dict[str, set[tuple[tuple[str, ...], Path]]] = {}
+    publication_started = False
+    tip = ""
+    try:
+        for request in requests:
             origin = ancestry(request)
             if origin.already_merged:
                 raise checkpoint_gate.Stop("ancestry", "held", "the batch item is already merged",
                                            "resume it alone with the single command")
             commits, paths, own_paths, merge_head = merge_checked_checkpoint(request)
             check_publication_sources(request, commits, merge_head, start_tip)
-            items.append(MergedBatchItem(index, request, origin, merge_head, paths, own_paths))
-        except checkpoint_gate.Stop as error:
-            raise BatchItemStop((index,), error) from error
-        except (OSError, ValueError) as error:
-            raise BatchItemStop((index,), checkpoint_gate.Stop("run", "failed", str(error),
-                                "the showrunner will inspect the failed command")) from error
+            items.append(MergedBatchItem(request, origin, merge_head, paths, own_paths))
 
-    first = items[0]
-    shared = first.request
-    code_items = [item for item in items if isinstance(item.request.kind, CodeCheckpoint)]
-    test_paths = {path for item in code_items for path in item.paths}
-    non_code_paths = {path for item in items if not isinstance(item.request.kind, CodeCheckpoint) for path in item.paths}
-    tests_green = "no tests"
-
-    def retest(paths: tuple[str, ...], test_tip: str) -> None:
-        nonlocal tests_green
-        test_paths.update(set(paths) - non_code_paths)
-        if not code_items and not test_paths:
-            tests_green = tests(shared, (), first.merge_head)
-            return
-        selections = [(item, checkpoint_gate.test_steps(item.request.production, item.paths, item.request.merge_tests))
-                      for item in code_items]
+        first = items[0]
+        shared = first.request
+        code_items = [item for item in items if isinstance(item.request.kind, CodeCheckpoint)]
+        test_paths = {path for item in code_items for path in item.paths}
+        non_code_paths = {path for item in items if not isinstance(item.request.kind, CodeCheckpoint) for path in item.paths}
+        tests_green = "no tests"
         reference = code_items[0].request if code_items else shared
-        try:
+
+        def retest(paths: tuple[str, ...], _test_tip: str) -> None:
+            nonlocal tests_green
+            test_paths.update(set(paths) - non_code_paths)
+            if not code_items and not test_paths:
+                tests_green = tests(shared, (), first.merge_head)
+                return
+            for item in code_items:
+                row = item.request
+                steps = checkpoint_gate.test_steps(row.production, item.paths, row.merge_tests)
+                row_test_commands[row.commit] = {(tuple(step.command), step.folder) for step in steps}
+            steps = checkpoint_gate.test_steps(reference.production, tuple(sorted(test_paths)), reference.merge_tests)
             with ExitStack() as waits:
                 for item in code_items:
                     _ = waits.enter_context(merge_gate_wait(item.request.unit.worktree, item.request.phase,
                                                             item.request.unit.name, item.request.commit))
-                tests_green = run_checkpoint_tests(reference.production, tuple(sorted(test_paths)), reference.merge_tests,
-                                                   reference.flakes, reference.flaky_tests, log, test_tip, start_tip,
-                                                   base_tip=start_tip, ledger=reference.parent_production)
-        except checkpoint_gate.RedCheckpointTests as error:
-            red_commands = {(tuple(red.step.command), red.step.folder) for red in error.red}
-            affected = tuple(item for item, steps in selections
-                             if any((tuple(step.command), step.folder) in red_commands for step in steps))
-            candidates = affected or tuple(code_items) or tuple(items)
-            if len(candidates) > 1:
-                candidates = (bisect_red_batch(reference, candidates, start_tip, error, tuple(sorted(test_paths)), log),)
-            raise BatchItemStop(tuple(item.position for item in candidates), error) from error
+                tests_green = checkpoint_gate.run_test_steps(reference.parent_production, steps, reference.flakes,
+                                                            reference.flaky_tests, log, retry_failed_steps=False)
 
-    publication_started = False
-    tip = ""
-    try:
         remote = f"refs/remotes/origin/{shared.production.merge_branch}"
         _ = good(git(shared.production.checkout, "fetch", "origin",
                      f"+refs/heads/{shared.production.merge_branch}:{remote}"), "test")
@@ -1924,13 +1834,31 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
     except (OSError, ValueError, checkpoint_gate.Stop) as error:
         stop = error if isinstance(error, checkpoint_gate.Stop) else checkpoint_gate.Stop(
             "run", "failed", str(error), "the showrunner will inspect the failed command")
-        if not publication_started:
-            if isinstance(error, MainConflict):
-                raise batch_main_conflicts(items, error) from error
-            raise BatchItemStop(tuple(range(len(requests))), stop) from error
-        for item in items:
-            _ = report_checkpoint_stop(item.request, stop)
-        return 1
+        if isinstance(stop, checkpoint_gate.RedCheckpointTests):
+            red_commands = {(tuple(red.step.command), red.step.folder) for red in stop.red}
+            labels = checkpoint_gate.red_labels(stop.red)
+            for request in requests:
+                label = f"phase {request.phase} ({request.commit[:12]})"
+                includes_red = bool(red_commands.intersection(row_test_commands.get(request.commit, ())))
+                if includes_red:
+                    match = "this row's tests include a red step"
+                    message = stop.message
+                else:
+                    match = "this row's tests include no reported red step"
+                    message = f"{labels} failed; resend this checkpoint after the repair; test log: {log}"
+                _ = report_checkpoint_stop(request, checkpoint_gate.Stop(
+                    stop.step, stop.state, f"{stop.detail}; {match}", f"{label}: {match}; {message}"))
+        else:
+            if isinstance(stop, MainConflict):
+                stop = checkpoint_gate.Stop(stop.step, stop.state, stop.detail,
+                    f"{stop.detail}; check your checkpoint against origin/main, resolve any conflict, and resend it")
+            for request in requests:
+                label = f"phase {request.phase} ({request.commit[:12]})"
+                _ = report_checkpoint_stop(request, checkpoint_gate.Stop(
+                    stop.step, stop.state, stop.detail, f"{label}: {stop.message}"))
+        if not publication_started and stop.state in ("held", "failed"):
+            reset_batch(requests[0].production, start_tip, merge_in_progress_at_start=merge_in_progress_at_start)
+        return checkpoint_gate.TREE_CHANGED_STATUS if stop.state == "cancelled" else 1
 
 
 def later_item_stop(cause: MergeRequest, step: str, state: str) -> checkpoint_gate.Stop:
@@ -2073,7 +2001,7 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
 
 
 def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
-    """Remove stopped items and their unit's later items before each retry."""
+    """Resume completed merges and run the remaining batch once."""
     production = resume_record.checkpoints[0].production
     requests, resumed = resume_merged_items(resume_record)
     if not requests:
@@ -2084,29 +2012,8 @@ def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
     log = first.scratch / f"merge_{first.commit[:7]}_test.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     _ = log.write_text("", encoding="utf-8")
-    while requests:
-        try:
-            return run_batch_attempt(requests, start_tip, log, resume_record) or resumed
-        except BatchItemStop as error:
-            dropped = dict.fromkeys(error.indices, error.stop)
-            dropped.update(error.item_stops)
-            if error.stop.state in ("held", "failed"):
-                for index, request in enumerate(requests):
-                    for cause_index in sorted(error.indices):
-                        cause = requests[cause_index]
-                        if index > cause_index and request.unit.staff_id == cause.unit.staff_id and index not in dropped:
-                            dropped[index] = later_item_stop(cause, error.stop.step, error.stop.state)
-                            break
-            for index in sorted(dropped):
-                _ = report_checkpoint_stop(requests[index], dropped[index])
-            if error.stop.state not in ("held", "failed"):
-                return checkpoint_gate.TREE_CHANGED_STATUS if error.stop.state == "cancelled" else 1
-            reset_batch(production, start_tip, merge_in_progress_at_start=merge_in_progress_at_start)
-            requests = tuple(request for index, request in enumerate(requests) if index not in dropped)
-            if not requests:
-                return 1
-            checkpoint_gate.report("batch", "retry", f"{len(requests)} item(s) remain; retrying from {start_tip}")
-    return 1
+    return run_batch_attempt(requests, start_tip, log, resume_record,
+                             merge_in_progress_at_start=merge_in_progress_at_start) or resumed
 
 
 class NotMerged(NamedTuple):

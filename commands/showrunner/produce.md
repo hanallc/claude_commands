@@ -605,10 +605,9 @@ notice to the unit director before any merge command runs:
    bump: merge and push the code checkpoint first, then gate the pushed tip
    in a detached clone in the background; red goes to the unit and the
    showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
-   and `--from-child`. The script checks ancestry,
-   origin, scope and conflicts, reports overlaps with other units, merges,
-   tests, reruns red packages, pushes, promotes, and records the result. Its
-   first `held` or `failed` line stops a single-item run.
+   and `--from-child`. The script checks ancestry, origin, scope, conflicts, and overlaps before it merges.
+   A single checkpoint reruns red packages. The first hold or failure stops a batch.
+   Return every stopped row to its requester. Proceed with the next queued item.
    A batch drops stopped items and retries the remaining items once.
    Send each final `send <unit>:` message to its unit director.
    A `merge director:` line names red tests or modules that are red on the
