@@ -16,21 +16,18 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
                          + repr(self.admission.server.assignments))
         return attempts[0]
 
-    def test_failed_probe_with_live_leftovers_continues_without_backoff(self) -> None:
-        self.configure("linux,spare,natedev")
-        with self.spare_after_linux_refusal():
-            result = self.verify("test", "sample", "--no-cache", extra={
-                "TEST_SSH_MODES": '{"linux":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        events = self.ssh_events()
-        self.assertEqual(len(events), 2, json.dumps(events) + repr(self.admission.server.assignments))
-        first, second = events
-        self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
+    def test_failed_probe_with_live_leftovers_keeps_the_claim_without_backoff(self) -> None:
+        self.configure("linux,natedev")
+        result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
+            "TEST_SSH_MODES": '{"linux":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, = self.ssh_events()
+        self.assertEqual(first["target"], "linux")
         self.assertEqual(first["result_type"], "BusyMacDecline")
         self.assertEqual(first["holder"], "LostRunLeftovers")
         self.assertNotIn("run", first["actions"])
         self.assertNotIn("release", first["actions"])
-        self.assertEqual(first["queued_at"], second["queued_at"])
+        self.assertEqual(first["queued_at"], "100.25")
         state = self.target_state("linux")
         self.assertTrue(list((state / "claims").glob("**/*.json")))
         self.assertFalse((state / "unreachable_until").exists())

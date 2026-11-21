@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
 import fcntl
+from functools import partial
 import io
 import json
 import os
@@ -39,6 +40,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
+from scripts.mac_test.claim_release_test_support import run_claim_release
+from scripts.mac_test.offload_test_support import prepared_probe
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
@@ -668,21 +671,14 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             output = io.StringIO()
             with redirect_stdout(output):
                 status = mac_test.command_claim(args, mac_test.state_paths(args.target))
-            attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
-            if status in (0, 13):
-                controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
+            controller.collect_claim_reply(attempt, offload.CommandOutput(status, output.getvalue(), ""))
 
-        def release(current: offload.ProcessController, name: str) -> None:
-            self.assertIs(current, controller)
-            identity = current.claim_identity
-            if isinstance(identity, claim_state.NoClaimIdentity):
-                return
-            args = mac_test.CliArguments()
-            args.pid = os.getpid()
-            args.target = name
-            args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
-            _ = mac_test.command_release(args, mac_test.state_paths(name))
-            current.claim_identity = claim_state.NO_CLAIM_IDENTITY
+        def checked_leftovers(*_args: object, **_options: object) -> offload.LeftoversEnded:
+            fence = controller.fence
+            if isinstance(fence, claim_state.FenceRef):
+                self.assertIsInstance(controller.settle_start_journal(fence, fence.acknowledgement("settled")),
+                                      offload.StartSettled)
+            return offload.LeftoversEnded()
 
         def stream(arguments: Sequence[str]) -> offload.ReportedMacStatus:
             self.assertIn("mirror-use", arguments[-1])
@@ -690,6 +686,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertEqual(len(records), 1)
             args = mirror_arguments(records[0], "mirror-use")
             self.assertEqual(copies.mirror_run(args), 0)
+            _ = checked_leftovers()
             return offload.ReportedMacStatus(0, offload.CleanupKept())
 
         def mirror_path(repository: eligibility.KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -708,10 +705,10 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             mock.patch.object(offload, "expected_linux_parity", return_value={}),
             mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
             mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
-            mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(free_gib, "host")),
-            mock.patch.object(offload, "check_current_leftovers", return_value=offload.LeftoversEnded()),
+            mock.patch.object(offload, "probe_mac", side_effect=partial(prepared_probe, free_gib=free_gib)),
+            mock.patch.object(offload, "check_current_leftovers", side_effect=checked_leftovers),
             mock.patch.object(offload, "remote_test_command", return_value="true"),
-            mock.patch.object(offload, "release_claim", side_effect=release),
+            mock.patch.object(controller, "capture", side_effect=run_claim_release),
             mock.patch.object(controller, "stream_mac_run", side_effect=stream),
             mock.patch("scripts.buildlog.sync.sync_target", return_value=0),
         ):

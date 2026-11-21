@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 from contextlib import redirect_stdout
+from functools import partial
 import sys
 import subprocess
 import tempfile
@@ -19,15 +20,100 @@ import unittest
 from unittest import mock
 from collections.abc import Sequence
 from scripts.mac_test import offload, mac_test, claim_state
-from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.mac_test.claim_release_test_support import run_claim_release
+from scripts.mac_test.offload_test_support import OffloadCommandFixture, write_mac_target_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
 from scripts.lib import test_hang_guard
 from scripts.lib import process_start as process_identity
+from scripts.build_targets.target_config import Platform
+
+
+FENCE_TARGETS: tuple[tuple[str, Platform], ...] = (("mac", "macos"), ("linux", "linux"))
 
 
 class PendingDispatchTests(unittest.TestCase):
+    def claim_release_fixture(self) -> tuple[mac_test.StatePaths, claim_state.HeldClaim, offload.ProcessController]:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        paths = mac_test.StatePaths(root / "provider")
+        _ = write_config_fixture(root / "mac_test.conf", "offload=on\n")
+        write_mac_target_registry(root, "mac_test.conf")
+        self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(root), "MAC_TEST_STATE_DIR": str(paths.directory),
+        }))
+        args = mac_test.CliArguments()
+        args.pid, args.worktree, args.what = os.getpid(), str(root), "test release"
+        args.identity = True
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0)
+        held, = mac_test.read_claims(paths)
+        identity = claim_state.claim_identity(held.record)
+        child = mock.Mock(returncode=0, communicate=mock.Mock(return_value=(stdout.getvalue(), "")),
+                          poll=mock.Mock(return_value=0))
+        controller = offload.ProcessController()
+        with mock.patch.object(subprocess, "Popen", return_value=child):
+            controller.complete_claim(["fixture-claim"], offload.LocalClaimAttempt())
+        self.assertEqual(controller.claim_identity, identity)
+        return paths, held, controller
+
+    def test_release_reads_only_the_exact_claim_record(self) -> None:
+        paths, held, controller = self.claim_release_fixture()
+        paths.claims.mkdir(exist_ok=True)
+        unrelated = paths.claims / "unrelated.json"
+        _ = unrelated.write_text("damaged claim\n")
+        opened: list[Path] = []
+        read_run = mac_test.read_run
+
+        def observe(path: Path) -> claim_state.RunState:
+            opened.append(path)
+            return read_run(path)
+
+        with (mock.patch.object(mac_test, "read_run", side_effect=observe),
+              mock.patch.object(controller, "capture", side_effect=run_claim_release)):
+            self.assertIsInstance(offload.release_claim(controller), offload.ClaimReleaseConfirmed)
+        self.assertEqual(set(opened), {held.path})
+        self.assertFalse(held.path.exists())
+        self.assertEqual(unrelated.read_text(), "damaged claim\n")
+
+    def test_unreadable_exact_claim_keeps_the_start_journal(self) -> None:
+        _, held, controller = self.claim_release_fixture()
+        identity = claim_state.claim_identity(held.record)
+        journal = offload.pending_start_path("", identity)
+        journal.parent.mkdir()
+        pending = offload.pending_start_key(identity)
+        _ = journal.write_text(pending)
+        _ = held.path.write_text("damaged claim\n")
+
+        with mock.patch.object(controller, "capture", side_effect=run_claim_release):
+            release = offload.release_claim(controller)
+            self.assertEqual(held.path.read_text(), "damaged claim\n")
+            self.assertTrue(journal.exists(), "Unreadable claim state must keep the start journal.")
+            self.assertEqual(journal.read_text(), pending)
+            self.assertIsInstance(release, offload.ClaimReleaseUnconfirmed)
+
+            held.path.unlink()
+            self.assertIsInstance(offload.release_claim(controller), offload.ClaimReleaseUnconfirmed)
+            self.assertEqual(journal.read_text(), pending)
+
+            journal.unlink()
+            self.assertIsInstance(offload.release_claim(controller), offload.ClaimReleaseConfirmed)
+
+    def test_no_claim_acquired_requires_proof(self) -> None:
+        controller = offload.ProcessController()
+        with mock.patch.object(subprocess, "Popen", side_effect=OSError("fixture cannot launch the claim")):
+            controller.complete_claim(["fixture-claim"], offload.LocalClaimAttempt())
+        self.assertIn("claim", vars(controller.attempt_evidence))
+        self.assertIsInstance(controller.attempt_evidence.claim_release, offload.NoClaimAcquired)
+        self.assertEqual(controller.attempt_evidence.cleanup, "unconfirmed")
+        self.assertEqual(type(controller.ssh_dispatch_path()).__name__, "DispatchPathSettled")
+        child = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("claimed\n", "")), poll=mock.Mock(return_value=0))
+        with mock.patch.object(subprocess, "Popen", return_value=child):
+            controller.complete_claim(["fixture-claim"], offload.LocalClaimAttempt())
+        self.assertIsInstance(controller.attempt_evidence.claim_release, offload.ClaimAcquisitionUnconfirmed)
+        self.assertEqual(type(controller.ssh_dispatch_path()).__name__, "DispatchPathPending")
+
     def test_a_pending_claim_or_start_cannot_release_capacity_before_its_child_settles(self) -> None:
         for operation in ("claim", "start-acknowledged", "start-uncertain"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
@@ -49,7 +135,8 @@ class PendingDispatchTests(unittest.TestCase):
                 mac_test.write_json(paths.run, record)
                 controller = offload.ProcessController()
                 identity = claim_state.claim_identity(record)
-                controller.claim_identity = identity
+                if operation != "claim":
+                    controller.adopt_claim(identity)
                 ready, finish = root / "ready", root / "finish"
                 os.mkfifo(ready)
                 os.mkfifo(finish)
@@ -75,14 +162,6 @@ class PendingDispatchTests(unittest.TestCase):
                     except BaseException as error:
                         failures.append(error)
 
-                def release(arguments: Sequence[str],
-                            deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CommandOutput:
-                    del deadline
-                    parsed = mac_test.parser().parse_args(arguments[2:], namespace=mac_test.CliArguments())
-                    with redirect_stdout(io.StringIO()):
-                        status = mac_test.command_release(parsed, paths)
-                    return offload.CommandOutput(status, "", "")
-
                 worker = threading.Thread(target=dispatch)
                 remote: subprocess.Popen[str] | None = None
                 if operation == "start-uncertain":
@@ -96,9 +175,11 @@ class PendingDispatchTests(unittest.TestCase):
                     self.assertEqual(os.read(ready_fd, 5), b"ready")
                     before = paths.run.read_bytes()
                     with mock.patch.dict(os.environ, {"CONF_DIR": str(root), "MAC_TEST_STATE_DIR": str(paths.directory)}), \
-                         mock.patch.object(controller, "capture", side_effect=release) as provider_release:
+                         mock.patch.object(controller, "capture",
+                                           side_effect=partial(run_claim_release, paths=paths)) as provider_release:
                         result = offload.release_claim(controller)
-                        self.assertIsInstance(result, offload.ClaimReleaseUnconfirmed)
+                        self.assertIsInstance(result, offload.ClaimAcquisitionUnconfirmed
+                                              if operation == "claim" else offload.ClaimReleaseUnconfirmed)
                         self.assertEqual(paths.run.read_bytes(), before)
                         provider_release.assert_not_called()
                         if operation == "claim":
@@ -125,7 +206,7 @@ class PendingDispatchTests(unittest.TestCase):
                             self.assertEqual(paths.run.read_bytes(), before)
                             provider_release.assert_not_called()
                         else:
-                            self.assertIsInstance(controller.pending, offload.SettledDispatchOperations)
+                            self.assertIsInstance(controller.pending, offload.NoPendingOperation)
                             self.assertIsInstance(offload.release_claim(controller), offload.ClaimReleaseConfirmed)
                             self.assertIsInstance(mac_test.read_run(paths.run), mac_test.NoRun)
                             self.assertEqual(provider_release.call_count, 1)
@@ -136,55 +217,57 @@ class PendingDispatchTests(unittest.TestCase):
                     if remote is not None:
                         _ = remote.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
-        for target, active_start in (("mac", False), ("mac", True), ("linux", False), ("linux", True)):
-            with self.subTest(target=target, active_start=active_start), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                environment = {**os.environ, "HOME": str(root)}
-                identity = claim_state.ClaimIdentity("fenced-claim", "fenced-episode", "fenced-attempt")
-                acknowledgement = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
-                start = offload.start_fence_command(identity, target)
-                settle = offload.start_fence_command(identity, target, settle=True)
-                prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(identity, target)],
-                    cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=5)
-                self.assertEqual(prepared.returncode, 0, prepared.stderr)
-                fence_directory = root / offload.start_fence_relative(identity, target).parent
-                self.assertEqual(len(list(fence_directory.iterdir())), 1)
-                if active_start:
-                    active = subprocess.Popen(["bash", "-c", start + "printf 'active\\n'; read -r release; printf 'completed\\n'"],
-                        cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, text=True)
-                    try:
-                        assert active.stdout is not None
-                        self.assertTrue(select.select([active.stdout], [], [], 5)[0])
-                        self.assertEqual(active.stdout.readline(), "active\n")
-                        pending = subprocess.run(["bash", "-c", settle], cwd=root, env=environment,
-                            capture_output=True, text=True, check=False, timeout=5)
-                        self.assertEqual(pending.returncode, 0, pending.stderr)
-                        self.assertNotIn(acknowledgement, pending.stdout)
-                        output, errors = active.communicate("release\n", timeout=5)
-                        self.assertEqual(active.returncode, 0, errors)
-                        self.assertEqual(output, "completed\n")
-                    finally:
-                        if active.poll() is None:
-                            active.kill()
-                            _ = active.communicate(timeout=5)
-                settled = subprocess.run(["bash", "-c", settle], cwd=root, env=environment,
-                    capture_output=True, text=True, check=False, timeout=5)
-                self.assertEqual(settled.returncode, 0, settled.stderr)
-                self.assertEqual(settled.stdout, acknowledgement)
-                self.assertEqual(list(fence_directory.iterdir()), [])
-                mirror = fence_directory.parent / "mirror/hana"
-                mirror.mkdir(parents=True)
-                _ = (mirror / "source.rs").write_text("the copied source\n")
-                shutil.rmtree(mirror)
-                mirror.mkdir()
-                late = subprocess.run(["bash", "-c", start + "printf 'executed\\n'"], cwd=root,
-                    env=environment, capture_output=True, text=True, check=False, timeout=5)
-                self.assertEqual(late.returncode, 75, late.stdout + late.stderr)
-                self.assertEqual(late.stdout, acknowledgement)
-                self.assertEqual(list(fence_directory.iterdir()), [])
+        for target, platform in FENCE_TARGETS:
+            for active_start in (False, True):
+                with self.subTest(target=target, active_start=active_start), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    environment = {**os.environ, "HOME": str(root)}
+                    identity = claim_state.ClaimIdentity("fenced-claim", "fenced-episode", "fenced-attempt")
+                    fence = offload.fence_reference(claim_state.ClaimKey.for_target(claim_state.StatePaths(root, target, platform=platform), identity), "private-host", "", "run")
+                    acknowledgement = fence.acknowledgement("settled") + "\n"
+                    start = offload.start_fence_command(fence)
+                    settle = offload.start_fence_command(fence, settle=True)
+                    prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(fence)],
+                        cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=5)
+                    self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                    fence_directory = root / offload.start_fence_relative(identity, target).parent
+                    self.assertEqual(len(list(fence_directory.iterdir())), 1)
+                    if active_start:
+                        active = subprocess.Popen(["bash", "-c", start + "printf 'active\\n'; read -r release; printf 'completed\\n'"],
+                            cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+                        try:
+                            assert active.stdout is not None
+                            self.assertTrue(select.select([active.stdout], [], [], 5)[0])
+                            self.assertEqual(active.stdout.readline(), "active\n")
+                            pending = subprocess.run(["bash", "-c", settle], cwd=root, env=environment,
+                                capture_output=True, text=True, check=False, timeout=5)
+                            self.assertEqual(pending.returncode, 0, pending.stderr)
+                            self.assertNotIn(acknowledgement, pending.stdout)
+                            output, errors = active.communicate("release\n", timeout=5)
+                            self.assertEqual(active.returncode, 0, errors)
+                            self.assertEqual(output, "completed\n")
+                        finally:
+                            if active.poll() is None:
+                                active.kill()
+                                _ = active.communicate(timeout=5)
+                    settled = subprocess.run(["bash", "-c", settle], cwd=root, env=environment,
+                        capture_output=True, text=True, check=False, timeout=5)
+                    self.assertEqual(settled.returncode, 0, settled.stderr)
+                    self.assertEqual(settled.stdout, acknowledgement)
+                    self.assertEqual(list(fence_directory.iterdir()), [])
+                    mirror = fence_directory.parent / "mirror/hana"
+                    mirror.mkdir(parents=True)
+                    _ = (mirror / "source.rs").write_text("the copied source\n")
+                    shutil.rmtree(mirror)
+                    mirror.mkdir()
+                    late = subprocess.run(["bash", "-c", start + "printf 'executed\\n'"], cwd=root,
+                        env=environment, capture_output=True, text=True, check=False, timeout=5)
+                    self.assertEqual(late.returncode, 75, late.stdout + late.stderr)
+                    self.assertEqual(late.stdout, acknowledgement)
+                    self.assertEqual(list(fence_directory.iterdir()), [])
 
-        for target in ("mac", "linux"):
+        for target, platform in FENCE_TARGETS:
             for ending in ("completed", "failed", "cancelled", "released"):
                 with self.subTest(target=target, ending=ending), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -197,24 +280,25 @@ class PendingDispatchTests(unittest.TestCase):
                     for name in ("mac_test.conf", "linux_target.conf"):
                         _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", template="mac_test")
                     identity = claim_state.ClaimIdentity("cleanup-claim", "cleanup-episode", "cleanup-attempt")
-                    prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(identity, target)],
+                    fence = offload.fence_reference(claim_state.ClaimKey.for_target(claim_state.StatePaths(root, target, platform=platform), identity), "private-host", "", "run")
+                    prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(fence)],
                         cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=5)
                     self.assertEqual(prepared.returncode, 0, prepared.stderr)
                     fence_directory = root / offload.start_fence_relative(identity, target).parent
                     self.assertEqual(len(list(fence_directory.iterdir())), 1)
                     if ending in ("completed", "failed"):
                         status = 37 if ending == "failed" else 0
-                        command = offload.fenced_start_command(identity, target,
+                        command = offload.fenced_start_command(fence,
                             f"printf 'payload-completed\\n'; exit {status}")
                         completed = subprocess.run(["bash", "-c", command], cwd=root, env=environment,
                             capture_output=True, text=True, check=False, timeout=5)
                         self.assertEqual(completed.returncode, status, completed.stderr)
                         self.assertIn("payload-completed\n", completed.stdout)
                     elif ending == "cancelled":
-                        settled = subprocess.run(["bash", "-c", offload.start_fence_command(identity, target, settle=True)],
+                        settled = subprocess.run(["bash", "-c", offload.start_fence_command(fence, settle=True)],
                             cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=5)
                         self.assertEqual(settled.returncode, 0, settled.stderr)
-                        self.assertEqual(settled.stdout, "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n")
+                        self.assertEqual(settled.stdout, fence.acknowledgement("settled") + "\n")
                     else:
                         with mock.patch.dict(os.environ, environment):
                             paths = claim_state.state_paths(target)
@@ -229,7 +313,7 @@ class PendingDispatchTests(unittest.TestCase):
                             mac_test.write_json(paths.run, retained_record)
                             pending = offload.pending_start_path(target, identity)
                             pending.parent.mkdir(parents=True, exist_ok=True)
-                            _ = pending.write_text("pending")
+                            _ = pending.write_text(offload.pending_start_key(identity))
                             before = paths.run.read_bytes()
                             args = mac_test.CliArguments()
                             args.pid, args.target, args.settings = os.getpid(), target, str(settings)
@@ -259,7 +343,7 @@ class PendingDispatchTests(unittest.TestCase):
                     self.assertEqual(list(fence_directory.iterdir()), [])
 
 
-        for target in ("mac", "linux"):
+        for target, platform in FENCE_TARGETS:
             with self.subTest(target=target, stale_scope=True), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 environment = {**os.environ, "HOME": str(root)}
@@ -269,8 +353,8 @@ class PendingDispatchTests(unittest.TestCase):
                 scope_key = "repository-a.slot-1"
                 other_scope_key = "repository-b.slot-1"
                 for identity, scope in ((old, scope_key), (other, other_scope_key), (current, scope_key)):
-                    prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(
-                        identity, target, scope_key=scope)], cwd=root, env=environment,
+                    fence = offload.fence_reference(claim_state.ClaimKey.for_target(claim_state.StatePaths(root, target, platform=platform), identity), "private-host", "", scope)
+                    prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(fence)], cwd=root, env=environment,
                         capture_output=True, text=True, check=False, timeout=5)
                     self.assertEqual(prepared.returncode, 0, prepared.stderr)
                 old_fence = root / offload.start_fence_relative(old, target, scope_key=scope_key).with_suffix(".lock")
@@ -279,34 +363,28 @@ class PendingDispatchTests(unittest.TestCase):
                 self.assertTrue(old_fence.exists())
                 self.assertTrue(other_fence.exists())
                 self.assertTrue(current_fence.exists())
-                payload = ("test ! -e " + shlex.quote(str(old_fence))
+                payload = ("test -e " + shlex.quote(str(old_fence))
                     + " && test -e " + shlex.quote(str(current_fence))
                     + " && test -e " + shlex.quote(str(other_fence))
                     + " && printf 'completed\\n'")
+                fence = offload.fence_reference(claim_state.ClaimKey.for_target(claim_state.StatePaths(root, target, platform=platform), current), "private-host", "", scope_key)
                 completed = subprocess.run(["bash", "-c", offload.fenced_start_command(
-                    current, target, payload, scope_key=scope_key)], cwd=root, env=environment,
+                    fence, payload)], cwd=root, env=environment,
                     capture_output=True, text=True, check=False, timeout=5)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn("completed\n", completed.stdout)
-                self.assertEqual(list(current_fence.parent.iterdir()), [])
+                self.assertEqual(list(current_fence.parent.iterdir()), [old_fence])
                 self.assertTrue(other_fence.exists())
                 prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(
-                    current, target, scope_key=scope_key)], cwd=root, env=environment,
+                    fence)], cwd=root, env=environment,
                     capture_output=True, text=True, check=False, timeout=5)
-                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                self.assertEqual(prepared.returncode, 75, prepared.stderr)
                 late = subprocess.run(["bash", "-c", offload.fenced_start_command(
-                    old, target, "printf 'executed\\n'", scope_key=scope_key)], cwd=root,
+                    fence, "printf 'executed\\n'")], cwd=root,
                     env=environment, capture_output=True, text=True, check=False, timeout=5)
                 self.assertEqual(late.returncode, 75, late.stdout + late.stderr)
                 self.assertNotIn("executed", late.stdout)
-                self.assertTrue(current_fence.exists())
-                self.assertTrue(other_fence.exists())
-                completed = subprocess.run(["bash", "-c", offload.fenced_start_command(
-                    current, target, "printf 'completed\\n'", scope_key=scope_key)], cwd=root, env=environment,
-                    capture_output=True, text=True, check=False, timeout=5)
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertIn("completed\n", completed.stdout)
-                self.assertEqual(list(current_fence.parent.iterdir()), [])
+                self.assertFalse(current_fence.exists())
                 self.assertTrue(other_fence.exists())
 
 
@@ -547,11 +625,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertNotIn("select_leftovers()", probe_event["args"][-1])
                 self.assertIn("lint nextest", run_event["args"][-1])
                 self.assertIn("dispatch_start_settled=", settlement_event["args"][-1])
-                self.assertIn("claim", probe_event)
-                assert "claim" in probe_event
-                claim = probe_event["claim"]
-                identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
-                self.assertIn(offload.pending_start_key(identity), settlement_event["args"][-1])
+                self.assert_exact_fence_settlement(probe_event, settlement_event)
                 cleanup_arguments = cleanup_event["args"]
                 self.assertEqual(
                     cleanup_arguments[:-1],

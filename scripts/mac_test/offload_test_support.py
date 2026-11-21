@@ -6,6 +6,7 @@ from scripts.build_queue import execution_identity
 from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import os
@@ -17,6 +18,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest import mock
 from pathlib import Path
 from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
 
@@ -30,11 +32,11 @@ from scripts.lint.memory_test_support import write_config_fixture, config_enviro
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
-from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, capture_fence_query, write_shell
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
-from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
+from scripts.build_queue.admission_test_support import caller_admission, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import claim_state
@@ -205,6 +207,7 @@ def main() -> int:
                              else arguments[arguments.index(flag) + 1])
         record["submitting_session"] = arguments[arguments.index("--session") + 1]
         identity_line = "claim_identity=" + json.dumps({field: record[field] for field in ("claim_id", "episode", "attempt")})
+        location_line = "claim_record=" + str(previous_path.relative_to(state))
         actions = (root / "state-events").read_text().splitlines()
         if (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
                 or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
@@ -213,6 +216,7 @@ def main() -> int:
             (state / "claims").mkdir(exist_ok=True)
             (state / "claims" / "hana.json").write_text(json.dumps(record))
             print(identity_line, flush=True)
+            print(location_line, flush=True)
             print("leftovers: previous-mac", flush=True)
             return 13
         takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
@@ -225,19 +229,24 @@ def main() -> int:
         while not (root / "finish-claim").exists():
             time.sleep(0.01)
         print(identity_line, flush=True)
+        print(location_line, flush=True)
         if takeover:
             print("leftovers: " + os.environ.get("MAC_TEST_TAKEOVER_REPLY", "reply-mac"), flush=True)
             return 13
         return 0
     if action == "release":
+        arguments = sys.argv[2:]
+        identity = {field: arguments[arguments.index("--" + field.replace("_", "-")) + 1]
+                    for field in ("claim_id", "episode", "attempt")}
         path = state / "claims" / "hana.json"
         if path.exists():
-            arguments = sys.argv[2:]
             record = json.loads(path.read_text())
-            identity = {field: arguments[arguments.index("--" + field.replace("_", "-")) + 1]
-                        for field in ("claim_id", "episode", "attempt")}
-            if all(record[field] == value for field, value in identity.items()):
-                path.unlink()
+            if (not all(record[field] == value for field, value in identity.items())
+                    or record["pid"] != int(arguments[arguments.index("--pid") + 1])):
+                return 12
+            path.unlink()
+        if "--require-same-holder" in arguments:
+            print("claim_released=" + json.dumps(["mac", "mac", *identity.values()]))
         return 0
     return 12
 
@@ -246,6 +255,22 @@ if __name__ == "__main__":
 __file__ = os.environ["MAC_TEST_REAL_STATE"]
 exec(compile(Path(__file__).read_text(), __file__, "exec"), globals())
 '''
+
+
+def prepared_probe(controller: offload.ProcessController, config: eligibility.OffloadConfig,
+                   _repository: eligibility.KnownRepository, target: str = "mac", _slot: int = 1, *,
+                   free_gib: float = 120) -> offload.ProbeSnapshot:
+    """Record preparation for fixture streams that do not run the remote probe."""
+    claim = controller.attempt_evidence.claim
+    if not isinstance(claim, claim_state.ClaimLifecycle):
+        paths = claim_state.state_paths(target)
+        identity = claim_state.ClaimIdentity(uuid.uuid4().hex, "", "")
+        key = claim_state.ClaimKey.for_target(paths, identity)
+        claim = claim_state.ClaimLifecycle(key, claim_state.WHOLE_MAC)
+    fence = offload.fence_reference(claim.key, config.host, "", "fixture")
+    controller.attempt_evidence.claim = claim_state.transition_claim(claim, claim_state.Held(), fence=fence)
+    offload.write_start_journal(claim_state.StartFenceJournal(fence, claim_state.FencePreparation.PREPARED))
+    return offload.ProbeSnapshot(free_gib, config.host)
 
 
 class OffloadCommandFixture(unittest.TestCase):
@@ -396,6 +421,8 @@ class OffloadCommandFixture(unittest.TestCase):
             "PYTHONPYCACHEPREFIX": str(self.private_tools() / "bytecode"),
         }
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        identity = capture_fence_query(offload.FENCE_HOST_QUERY, environment=self.environment)
+        _ = (self.stub_directory / "fence-host").write_text(identity.stdout)
         self.start_admission()
 
     def start_admission(self) -> None:
@@ -403,11 +430,7 @@ class OffloadCommandFixture(unittest.TestCase):
         admission.configure(waiting_pass_seconds=0.25)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            directory = (self.state_directory if key.destination.provider == "mac" else
-                         Path(self.environment["HOME"]) / ".local/state/build-targets" / key.destination.target)
-            paths = claim_state.StatePaths(directory, key.destination.target,
-                platform="macos" if key.destination.provider == "mac" else "linux")
-            return private_provider_evidence(admission, key, paths)
+            return private_caller_provider(admission, self.environment, key)
 
         admission.server.host_probe = provider
 
@@ -729,6 +752,30 @@ raise SystemExit(offload.main())
             if event["command"] in {"ssh", "rsync"}:
                 self.assertTrue(event["claimed"], event)
 
+    def assert_exact_fence_settlement(self, claimed: CommandEvent, settlement: CommandEvent) -> None:
+        assert "claim" in claimed
+        record = claimed["claim"]
+        identity = claim_state.ClaimIdentity(record["claim_id"], record["episode"], record["attempt"])
+        key = claim_state.ClaimKey.for_target("mac", identity)
+        expected = offload.fence_reference(key, record["remote_host"], "", self.claim_file.stem)
+        command, _, _ = claimed["args"][-1].partition(" || exit 75\n")
+        journal = bytes.fromhex(shlex.split(command)[3]).decode()
+        address = cast(list[object], json.loads(journal))
+        fence = replace(expected, responder=claim_state.FenceHostIdentity.parse(address[-2]))
+        self.assertEqual(fence.journal_text(), journal)
+        self.assertTrue(any(offload.start_fence_command(fence, settle=True, preparation=state) in settlement["args"][-1]
+                            for state in claim_state.FencePreparation), settlement)
+
+    def pending_fence(self, record: RemoteClaimRecord) -> claim_state.FenceRef:
+        """Read the fixture's exact pending fence."""
+        identity = claim_state.ClaimIdentity(record["claim_id"], record["episode"], record["attempt"])
+        key = claim_state.ClaimKey.for_target("mac", identity)
+        expected = offload.fence_reference(key, record["remote_host"], "", self.claim_file.stem)
+        with mock.patch.dict(os.environ, self.environment):
+            journal = offload.read_start_fence(expected)
+        assert isinstance(journal, claim_state.StartFenceJournal), journal
+        return journal.fence
+
     def leftover_events(self) -> list[CommandEvent]:
         return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
 
@@ -768,7 +815,13 @@ raise SystemExit(offload.main())
 
     def reset_leftover_case(self) -> None:
         self.clear_events()
-        self.claim_file.unlink(missing_ok=True)
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            self.claim_file.unlink(missing_ok=True)
+            admission.server.current_assignments.clear()
+            admission.server.assignments.clear()
+            admission.server.placement_requests.clear()
+            admission.server.persist()
         (self.state_directory / "unreachable_until").unlink(missing_ok=True)
         for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer"):
             (self.stub_directory / name).unlink(missing_ok=True)

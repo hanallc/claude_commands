@@ -18,13 +18,14 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import execution_identity
+from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.test_placement import (
     PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment,
     consume_permission, coordinator_holder, hana_policy_request, local_candidate,
 )
 from scripts.build_queue.admission_test_support import only_admitted
-from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_protocol, hana_result, ledger, test_hana_execution
+from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_protocol, hana_result, hana_transport, ledger, test_hana_execution
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import install_cost_settings, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
@@ -58,6 +59,17 @@ def hana_fallback_request(fixture: PlacementFixture, *, include_mac: bool = Fals
     candidates = (remote, mac, local) if include_mac else (remote, local)
     return replace(request, prerequisite=placement.TokenNotRequired(),
         constraints=replace(request.constraints, candidates=candidates))
+
+
+def record_native_refusal(reference: placement.ProviderClaimReference,
+                          outcome: str | execution_identity.HanaCommandAdmissionRefused) -> None:
+    target = target_config.configured_ssh_target(reference.target)
+    transport = target_config.read_execution_transport(target)
+    assert isinstance(transport, hana_placement.HanaControlTransport)
+    directory = hana_placement.controller_for(transport, read_only=True).directory
+    result = hana_execution.settle_unpublished_claim(directory, reference,
+        release_claim=hana_placement.HanaClaimReleased, reason=outcome)
+    assert isinstance(result, hana_execution.HanaSettled), result
 
 
 class HanaQueueTests(unittest.TestCase):
@@ -158,8 +170,10 @@ class HanaQueueTests(unittest.TestCase):
                 assignment = assignment_for(fixture, request)
                 claim = (adopt_assignment(fixture, request, assignment) if claim_adopted
                          else placement.assigned_claim_reference(assignment))
+                outcome = execution_identity.HanaCommandAdmissionRefused(cause)
+                record_native_refusal(claim, outcome)
                 _ = fixture.connect(wire.ExecutionReport('admission-refusal', assignment, claim,
-                    execution_identity.ExecutionNotStarted(), execution_identity.HanaCommandAdmissionRefused(cause),
+                    execution_identity.ExecutionNotStarted(), outcome,
                     placement.DispatchPathSettled())).replies()
                 key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 closed = fixture.server.assignments[key]
@@ -206,6 +220,7 @@ class HanaQueueTests(unittest.TestCase):
             self.assertNotIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
             fixture.clock.advance(10)
             _ = publish_candidate(fixture, request, placement.TemporaryExclusion('boot failed'))
+            record_native_refusal(reference, 'boot failed')
             _ = fixture.connect(replace(report, request_id='boot-settled', path=placement.DispatchPathSettled())).replies()
             settled = fixture.server.assignments[key]
             self.assertIsInstance(settled.state, placement.ClosedAssignment)
@@ -246,11 +261,17 @@ class HanaQueueTests(unittest.TestCase):
                         assignment.owner.host, assignment.owner.pid, assignment.owner.start_time),
                         assignment.session, assignment.destination.host, 'host-generation-a')
                     _ = publish_candidate(fixture, other, claims=(provider,))
+                outcome = execution_identity.HanaCommandAdmissionRefused(cause)
                 report = wire.ExecutionReport('admission-refused', assignment, claim,
-                    execution_identity.ExecutionNotStarted(), execution_identity.HanaCommandAdmissionRefused(cause),
+                    execution_identity.ExecutionNotStarted(), outcome,
                     placement.DispatchPathSettled())
-                _ = fixture.connect(report).replies()
                 key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                if stale_absence or stale_image:
+                    _ = fixture.connect(report).replies()
+                    self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                    self.assertIsInstance(fixture.connect(other).replies()[-1], wire.PlacementWait)
+                record_native_refusal(claim, outcome)
+                _ = fixture.connect(report).replies()
                 saved = fixture.server.assignments[key]
                 self.assertEqual(saved.retry, placement.DoNotRetry(cause))
                 self.assertEqual(saved.state, placement.ClosedAssignment(cause))
@@ -261,8 +282,6 @@ class HanaQueueTests(unittest.TestCase):
                 self.assertEqual(fallback.assignment.episode, assignment.episode)
                 self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
                 if stale_absence or stale_image:
-                    self.assertIsInstance(fixture.connect(other).replies()[-1], wire.PlacementWait)
-                    _ = publish_candidate(fixture, other)
                     self.assertEqual(assignment_for(fixture, other).destination, remote.destination)
 
     def test_dead_coordinator_releases_an_assignment_that_never_bound(self) -> None:
@@ -289,6 +308,60 @@ class HanaQueueTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.current_assignments)
                 self.assertFalse(hana_execution.execution_path(controller.directory,
                     execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)).exists())
+
+    def test_saved_settled_report_requires_native_journal_proof(self) -> None:
+        self.check_legacy_hana_obligation(closed=False)
+
+    def test_old_closure_with_pending_native_dispatch_has_unknown_status(self) -> None:
+        self.check_legacy_hana_obligation(closed=True)
+
+    def test_native_release_uses_the_original_journal_after_a_transport_change(self) -> None:
+        self.check_legacy_hana_obligation(closed=True, change_transport=True)
+
+    def check_legacy_hana_obligation(self, *, closed: bool, change_transport: bool = False) -> None:
+        with (PlacementFixture() as fixture,
+              mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker)):
+            request = hana_fallback_request(fixture)
+            target = hana_target(fixture)
+            controller = hana_box.HanaController(fixture.root / 'hana-state', fixture.root / 'account.conf',
+                target.settings, hana_box.ProviderNotInstalled())
+            with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                  mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                reference = placement.assigned_claim_reference(assignment)
+                controller.bind_execution(reference.claim_id)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                saved = replace(saved, provider=reference, terminal_report=placement.TerminalAttemptReport(
+                    placement.PrelaunchRefused('busy', placement.PrelaunchEnded()),
+                    placement.DispatchPathSettled(), fixture.clock.now()))
+                if closed:
+                    saved = replace(saved, state=placement.ClosedAssignment('busy'))
+                    del fixture.server.current_assignments[assignment.episode]
+                fixture.server.assignments[key] = saved
+                fixture.server.persist()
+                if change_transport:
+                    settings = target.settings.read_text().replace('execution_transport=hana-control', 'execution_transport=ssh')
+                    _ = target.settings.write_text(settings + '# range: 0.1..\nprobe_timeout_s=5\n')
+                fixture.restart()
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request)
+                if not closed:
+                    _ = fixture.run_pass()
+                    self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment,
+                                          'A saved report cannot replace native release proof.')
+                    return
+                if change_transport:
+                    _ = fixture.run_pass()
+                status, = fixture.server.handle_request(status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt))
+                self.assertEqual(status, status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus(
+                    assignment.episode, assignment.attempt)), 'An old closure without native proof has unknown status.')
+                next_request = replace(placement_request(fixture), constraints=replace(request.constraints,
+                    candidates=request.constraints.candidates[:1]))
+                _ = publish_candidate(fixture, next_request)
+                reply, = fixture.server.handle_request(next_request)
+                self.assertIsInstance(reply, wire.PlacementWait, 'An unknown claim must keep its exclusion.')
 
     def test_dead_coordinator_keeps_a_bound_assignment_with_missing_or_unreadable_journal(self) -> None:
         for journal in ('missing', 'unreadable'):
@@ -576,7 +649,7 @@ class HanaQueueTests(unittest.TestCase):
             request = placement_request(fixture)
             candidate = request.constraints.candidates[0]
             request = replace(request, constraints=replace(request.constraints, candidates=(replace(candidate,
-                destination=replace(candidate.destination, provider='ssh', target=target.name)),)))
+                destination=replace(candidate.destination, provider='ssh', target=target.name, host=target.name)),)))
             with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
                     mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
                 _ = publish_candidate(fixture, request)
@@ -602,6 +675,9 @@ class HanaQueueTests(unittest.TestCase):
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                 _ = fixture.connect(wire.ClaimFailure('refusal-after-cancel', assignment, 'disabled')).replies()
                 self.assertEqual(fixture.server.assignments[key].terminal_report, pending.terminal_report)
+                settled = hana_execution.settle_unpublished_claim(controller.directory, reference,
+                    release_claim=hana_placement.HanaClaimReleased, reason='cancelled', cancelled=True)
+                self.assertIsInstance(settled, hana_execution.HanaSettled)
                 _ = fixture.connect(report).replies()
                 self.assertIsInstance(fixture.server.assignments[key].state, placement.ClosedAssignment)
                 self.assertNotIn(request.episode, fixture.server.current_assignments)
@@ -707,6 +783,42 @@ class HanaQueueTests(unittest.TestCase):
             self.assertNotIn(request.episode, fixture.server.waiters)
             self.assertNotIn(request.episode, fixture.caller_reservations())
             self.assertEqual(fixture.proc.owner_start(request.owner.pid), service.LiveOwnerIdentity(request.owner.start_time))
+
+    def test_unbound_adapter_refusal_reaches_fallback_without_a_native_journal(self) -> None:
+        with PlacementFixture() as fixture:
+            request = hana_fallback_request(fixture)
+            remote, _ = request.constraints.candidates
+            target = target_config.configured_ssh_target(remote.destination.target)
+            transport = hana_placement.HanaControlTransport(target.settings, remote.destination.host)
+            controller = hana_box.HanaController(fixture.root / 'hana-state', fixture.root / 'aws_target.conf',
+                target.settings, hana_box.ProviderNotInstalled())
+            adapter = offload.ProcessController()
+            with (mock.patch.object(hana_placement, 'controller_for', return_value=controller),
+                    mock.patch.object(hana_placement, 'validate_assignment', return_value=transport),
+                    mock.patch.object(hana_placement, 'claim_assigned', return_value=hana_placement.HanaClaimResourcesHeld()),
+                    mock.patch.object(hana_transport, 'check_inputs')):
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                offload_request = offload.OffloadRequest(fixture.root, 'hana', 'adapter', offload.NO_RESULT_FILE,
+                    (), '', '', target=target.name, verb='check', kind='check',
+                    placement=offload.AssignedOffloadRequest(assignment))
+                outcome = offload.claimed_run(adapter, transport, offload_request,
+                    eligibility.KnownRepository('hana'), time.monotonic())
+                def report(message: wire.ExecutionReport) -> list[wire.Reply]:
+                    return fixture.connect(message).replies()
+
+                with mock.patch.object(admission_client, 'report_execution', side_effect=report):
+                    offload.report_placement_result(adapter, offload_request, outcome)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                self.assertIsInstance(saved.state, placement.ClosedAssignment,
+                                      'The unbound adapter refusal must close without a journal.')
+                self.assertIsInstance(saved.provider, placement.NoProviderClaim)
+                self.assertEqual(saved.claim_release, records.ProviderClaimReleased(offload.NoClaimAcquired()))
+                self.assertEqual(saved.retry, placement.DoNotRetry(hana_box.HANA_CLAIM_BUSY))
+                fixture.restart()
+                self.assertEqual(fixture.server.assignments[key], saved)
+                self.assertIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
 
     def test_unbound_refusal_reaches_fallback_after_worker_evidence_with_a_live_coordinator(self) -> None:
         for reason in ('disabled', 'busy'):
@@ -969,9 +1081,9 @@ class HanaGpuQueueTests(unittest.TestCase):
 
                 def report(message: wire.ExecutionReport) -> wire.DispatchStatus:
                     self.assertEqual(message.outcome, placement.AttemptDeclined(reason))
-                    self.assertEqual(message.path, placement.DispatchPathSettled())
-                    self.assertFalse(hana_placement_adapter.gpu_claim_pending('hana-gpu', message.claim.claim_id)
-                                     if isinstance(message.claim, placement.ProviderClaimReference) else True)
+                    assert isinstance(message.claim, placement.ProviderClaimReference)
+                    self.assertEqual(message.path, placement.DispatchPathSettled(claim_state.ReleaseReceipt(message.claim.key)))
+                    self.assertFalse(hana_placement_adapter.gpu_claim_pending('hana-gpu', message.claim.claim_id))
                     publish_evidence(fresh_evidence())
                     answer = fixture.connect(message).replies()[-1]
                     assert isinstance(answer, wire.DispatchStatus)

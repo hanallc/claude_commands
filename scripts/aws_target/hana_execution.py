@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from enum import Enum
 import json
 import time
 from typing import TYPE_CHECKING, Protocol, cast
@@ -171,14 +172,83 @@ def execution_command_settled(directory: Path, execution: str) -> bool:
         return False
 
 
-def claim_dispatch_pending(directory: Path, reference: placement.ProviderClaimReference) -> bool:
-    """Retain missing, unreadable, or incomplete dispatches after local holder death."""
+class ClaimDispatchJournalState(Enum):
+    MISSING = 'missing'
+    UNRESOLVED = 'unresolved'
+    SETTLED = 'settled'
+
+
+def _claim_dispatch_journal(directory: Path, reference: placement.ProviderClaimReference) -> ClaimDispatchJournalState:
+    execution = reference.claim_id
     try:
-        row = _read_journal(directory, reference.claim_id)
-        return (_journal_attempt(row) != (reference.episode, reference.attempt)
-                or row['phase'] != 'settled')
+        _ = execution_path(directory, execution).lstat()
+    except FileNotFoundError:
+        return ClaimDispatchJournalState.MISSING
+    except OSError:
+        return ClaimDispatchJournalState.UNRESOLVED
+    try:
+        row = _read_journal(directory, execution)
+        if _journal_attempt(row) == (reference.episode, reference.attempt) and row['phase'] == 'settled':
+            return ClaimDispatchJournalState.SETTLED
     except (OSError, ValueError, KeyError, TypeError):
-        return True
+        pass
+    return ClaimDispatchJournalState.UNRESOLVED
+
+
+def claim_dispatch_pending(directory: Path, reference: placement.ProviderClaimReference) -> bool:
+    """Require a settled journal for a recorded dispatch."""
+    return _claim_dispatch_journal(directory, reference) is not ClaimDispatchJournalState.SETTLED
+
+
+class ClaimReleaseState(Enum):
+    PENDING = 'pending'
+    DISPATCH_SETTLED = 'dispatch settled'
+    NO_CLAIM = 'no claim'
+
+
+def claim_release_state(controller: hana_box.HanaController, reference: placement.ProviderClaimReference, *,
+                        require_dispatch_settlement: bool = False, wait_for_controller: bool = False
+                        ) -> ClaimReleaseState:
+    """Distinguish an open obligation, settled dispatch, and confirmed absence."""
+    from scripts.aws_target import hana_box
+    from scripts.build_targets.target_config import ssh_target_state_directory
+    from scripts.mac_test import claim_state
+
+    journal = _claim_dispatch_journal(controller.directory, reference)
+    if (journal is ClaimDispatchJournalState.UNRESOLVED
+            or require_dispatch_settlement and journal is ClaimDispatchJournalState.MISSING):
+        return ClaimReleaseState.PENDING
+    execution = reference.claim_id
+    try:
+        if journal is ClaimDispatchJournalState.MISSING and wait_for_controller:
+            if controller.execution_bound(execution):
+                return ClaimReleaseState.PENDING
+        else:
+            # Read atomic records on the admission loop.
+            lifecycle = controller.read_saved_lifecycle()
+            if isinstance(lifecycle, hana_box.HanaLifecycleEvidence):
+                operation = lifecycle.operation
+                if (any(claim.execution == execution for claim in lifecycle.claims)
+                        or isinstance(operation, hana_box.PendingOperation) and operation.execution == execution):
+                    return ClaimReleaseState.PENDING
+            # Acquisition writes the guard before the lifecycle claim.
+            # A settled dispatch leaves its guard on disk.
+            if journal is ClaimDispatchJournalState.MISSING:
+                try:
+                    _ = execution_guard_path(controller.directory, execution).lstat()
+                    return ClaimReleaseState.PENDING
+                except FileNotFoundError:
+                    pass
+        target = reference.target
+        paths = claim_state.StatePaths(ssh_target_state_directory(target), target, platform="linux")
+        if any(claim_state.claim_identity(claim.record) == reference.key.identity
+               for claim in claim_state.read_claims(paths)):
+            return ClaimReleaseState.PENDING
+    except (OSError, ValueError, KeyError, TypeError):
+        return ClaimReleaseState.PENDING
+    if journal is ClaimDispatchJournalState.SETTLED:
+        return ClaimReleaseState.DISPATCH_SETTLED
+    return ClaimReleaseState.NO_CLAIM
 
 
 def claim_admission_refused(directory: Path, reference: placement.ProviderClaimReference) -> bool:

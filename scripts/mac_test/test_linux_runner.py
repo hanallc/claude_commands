@@ -26,6 +26,8 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test.claim_release_test_support import run_claim_release
+from scripts.mac_test.offload_test_commands import capture_fence_query, prepare_probe_fence
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -1482,7 +1484,7 @@ class LinuxProcessTests(unittest.TestCase):
         for result in cleanups:
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.returncode, 3)
-            self.assertEqual(result.stdout.strip(), "")
+            self.assertNotIn("leftovers=0", result.stdout.splitlines())
             self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("Traceback", output + errors)
         self.assertFalse(kill_log.exists())
@@ -1543,7 +1545,7 @@ class LinuxProcessTests(unittest.TestCase):
                     and "probe" in shlex.split(arguments[-1]) and "--mirror" in arguments[-1]):
                 dispatch.commands.append(list(arguments))
                 dispatch.actions.append("probe")
-                reply = runner(arguments)
+                reply = runner([*arguments[:-1], prepare_probe_fence(arguments[-1])])
                 probe_replies.append(reply)
                 return offload.CommandOutput(reply.returncode, reply.stdout, reply.stderr)
             return dispatch.capture(arguments, deadline)
@@ -1960,17 +1962,15 @@ class LinuxDispatchTests(unittest.TestCase):
         with redirect_stdout(output):
             status = mac_test.command_claim(args, mac_test.state_paths(args.target))
         self.actions.append(f"claim:{status}")
-        self.controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
-        attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
+        self.controller.collect_claim_reply(attempt, offload.CommandOutput(status, output.getvalue(), ""))
 
     def capture(self, arguments: Sequence[str],
                 _deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CommandOutput:
         argv = list(arguments)
         self.commands.append(argv)
         if len(argv) > 2 and argv[2] == "release":
-            args = self.state_arguments(argv)
             self.actions.append("release")
-            return offload.CommandOutput(mac_test.command_release(args, mac_test.state_paths(args.target)), "", "")
+            return run_claim_release(argv)
         if argv[0] == "git":
             if argv[-2:] == ["rev-parse", "HEAD"]:
                 return offload.CommandOutput(0, self.script_commit + "\n", "")
@@ -1992,9 +1992,12 @@ class LinuxDispatchTests(unittest.TestCase):
                     self.actions.append("source-copy")
             return offload.CommandOutput(0, "", "")
         if argv[0] == "ssh":
+            if argv[-1] == offload.FENCE_HOST_QUERY:
+                return capture_fence_query(argv[-1])
             if ".build-target-script-commit" in argv[-1] and "printf" in argv[-1] and "rustc" not in argv[-1]:
                 return offload.CommandOutput(0, "", "")
             self.actions.append("probe")
+            _ = prepare_probe_fence(argv[-1])
             return offload.CommandOutput(0, self.probe_wire, "")
         self.fail(f"Unexpected command: {argv}")
 
@@ -2013,10 +2016,10 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertEqual(argv[0], "ssh", f"Unexpected external command: {argv}")
         self.commands.append(argv)
         self.actions.append("cleanup")
-        identity = self.controller.claim_identity
+        fence = self.controller.fence
         if ("dispatch_start_settled=" in argv[-1] and self.cleanup_reply.returncode == 0
-                and isinstance(identity, claim_state.ClaimIdentity)):
-            marker = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
+                and isinstance(fence, claim_state.FenceRef)):
+            marker = fence.acknowledgement("settled") + "\n"
             return subprocess.CompletedProcess(argv, self.cleanup_reply.returncode,
                 marker + self.cleanup_reply.stdout, self.cleanup_reply.stderr)
         return self.cleanup_reply
@@ -2045,6 +2048,27 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertTrue(state_commands)
         for argv in state_commands:
             self.assertEqual(argv[argv.index("--target") + 1], "linux")
+
+    def test_takeover_second_claim_starts_with_unconfirmed_release(self) -> None:
+        _ = self.settings.write_text(self.settings.read_text().replace("slots=2", "slots=1"))
+        previous_owner = 101
+        status, reply = self.fixture.claim("linux", self.source, previous_owner, remote=True, identity=True)
+        self.assertEqual(status, 0)
+        old = claim_state.reply_claim_identity(reply)
+        self.fixture.dead.add(previous_owner)
+
+        def run_replacement(arguments: Sequence[str]) -> offload.RemoteRunStatus:
+            held, = mac_test.read_claims(mac_test.state_paths("linux"))
+            self.assertNotEqual(claim_state.claim_identity(held.record), old)
+            self.assertEqual(self.controller.attempt_evidence.cleanup, "unconfirmed")
+            return self.stream(arguments)
+
+        with mock.patch.object(self.controller, "stream_mac_run", side_effect=run_replacement):
+            result, _, _ = self.run_request(self.request())
+        self.assertIsInstance(result, offload.PassedOnTarget)
+        self.assertEqual([action for action in self.actions if action.startswith("claim:")], ["claim:13", "claim:0"])
+        self.assertEqual(self.controller.attempt_evidence.cleanup, "confirmed")
+        self.assertFalse(self.fixture.claims("linux"))
 
     def test_linux_rejects_lint_even_when_the_kind_setting_contains_it(self) -> None:
         _ = self.settings.write_text(self.settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,clippy,mend-check"))
@@ -2150,27 +2174,21 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIsInstance(result, offload.LostMacRun)
         retained = self.fixture.claims("linux")
         self.assertIn(os.getpid(), retained)
-        old_claim = retained[os.getpid()]
-        old_identity = claim_state.ClaimIdentity(*(cast(str, old_claim[field])
-                                                  for field in ("claim_id", "episode", "attempt")))
+        fence = self.pending_fence()
         self.assertNotIn("release", self.actions)
         self.assertIn("linux stays busy", errors)
         self.assertNotIn("Mac stays busy", errors)
         self.stream_status = offload.ReportedMacStatus(0, offload.CleanupKept())
         self.cleanup_reply = subprocess.CompletedProcess([], 0, "leftovers=0\nrc=0\n", "")
         self.actions.clear()
+        self.commands.clear()
         self.fixture.dead.add(os.getpid())
 
         with mock.patch.object(os, "getpid", return_value=999):
             retry, _, _ = self.run_request(self.request())
 
         self.assertIsInstance(retry, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:5], ["claim:13", "cleanup", "release", "cleanup", "claim:0"])
-        settlements = [argv[-1] for argv in self.commands
-                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
-                       and "dispatch_start_settled=" in argv[-1]
-                       and offload.pending_start_key(old_identity) in argv[-1]]
-        self.assertEqual(len(settlements), 1)
+        self.check_takeover_settles_fence(fence)
         self.assertFalse(self.fixture.claims("linux"))
 
     def test_live_slot_children_block_new_work_until_cleanup_confirms_they_ended(self) -> None:
@@ -2222,23 +2240,30 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertNotIn("run", self.actions)
         self.assertNotIn("release", self.actions)
         self.assertIn(999, self.fixture.claims("linux"))
-        old_claim = self.fixture.claims("linux")[999]
-        old_identity = claim_state.ClaimIdentity(*(cast(str, old_claim[field])
-                                                  for field in ("claim_id", "episode", "attempt")))
+        fence = self.pending_fence()
 
         self.cleanup_reply = subprocess.CompletedProcess([], 0, "leftovers=0\nrc=0\n", "")
         self.fixture.dead.add(999)
         self.actions.clear()
+        self.commands.clear()
         with mock.patch.object(os, "getpid", return_value=1000):
             fresh, _, _ = self.run_request(self.request())
         self.assertIsInstance(fresh, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:5], ["claim:13", "cleanup", "release", "cleanup", "claim:0"])
-        settlements = [argv[-1] for argv in self.commands
-                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
-                       and "dispatch_start_settled=" in argv[-1]
-                       and offload.pending_start_key(old_identity) in argv[-1]]
-        self.assertEqual(len(settlements), 1)
+        self.check_takeover_settles_fence(fence)
         self.assertFalse(self.fixture.claims("linux"))
+
+    def pending_fence(self) -> claim_state.FenceRef:
+        fence = self.controller.fence
+        assert isinstance(fence, claim_state.FenceRef)
+        return fence
+
+    def check_takeover_settles_fence(self, fence: claim_state.FenceRef) -> None:
+        self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
+        commands = tuple(offload.start_fence_command(fence, settle=True, preparation=state) + " || exit 1\n"
+                         for state in claim_state.FencePreparation)
+        settlements = [argv[-1] for argv in self.commands
+                       if argv[0] == "ssh" and argv[-1].startswith(commands)]
+        self.assertEqual(len(settlements), 1)
 
     def test_deleted_worktree_cleanup_selects_only_the_retained_slot(self) -> None:
         old = self.fixture.repository("old-worktree", "https://example.com/team/hana.git", self.source)

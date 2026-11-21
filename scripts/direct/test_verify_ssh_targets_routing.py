@@ -526,9 +526,7 @@ runpy.run_path(str(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/direct/local_
         result = self.verify(kind, "sample", "--target", "linux", extra={
             "TEST_BUSY_CLAIM": str(paths.run), "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        replies = [wire.parse_reply(json.dumps(reply))
-                   for line in (self.runner_state / "queue-events.jsonl").read_text().splitlines()
-                   for reply in cast(list[dict[str, object]], cast(dict[str, object], json.loads(line))["replies"])]
+        replies = [reply for exchange in self.queue_exchanges() for reply in exchange.replies]
         waits = [reply.wait for reply in replies if isinstance(reply, wire.PlacementWait)
                  and isinstance(reply.wait, wire.PlacementResourceWait)]
         self.assertTrue(waits)

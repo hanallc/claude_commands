@@ -96,7 +96,7 @@ class HanaExecutionTests(unittest.TestCase):
         self.root = Path()
         self.key = result.HanaAttemptKey('fixture-episode', 'fixture-attempt',
             execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'), hana.HanaHostGeneration('deployment', 'start', 'boot'))
-        self.source_key = execution_identity.SourceKeyKnown('verify-source')
+        self.source_key: execution_identity.SourceIdentity = execution_identity.SourceKeyKnown('verify-source')
         scope = RepositoryScope('hana', 'github.com/natepiano/hana', 1)
         self.assignment = placement.PlacementAssignment(self.key.episode, self.key.attempt,
             placement.PlacementDestination('ssh', 'configured-target', 'fixture-host', scope, 1),
@@ -164,6 +164,7 @@ class HanaExecutionTests(unittest.TestCase):
                 reason=reason, fence_window=window, cancelled=cancelled)
 
     def command_result(self, status: int = 0) -> result.HanaCommandResult:
+        assert isinstance(self.source_key, execution_identity.SourceKeyKnown)
         return result.HanaCommandResult(self.key, self.source_key.key, self.manifest.commit, self.manifest.toolchain,
             'fixture-host', self.request.argv, 1, status, b'compiler output', b'diagnostics', 1000, 1010, 10,
             result.PeakUnavailable('The fake has no memory measurement'))

@@ -37,7 +37,7 @@ from scripts.build_queue import placement
 from scripts.mac_test import claim_state, mac_test
 from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.build_targets import build_targets
+from scripts.build_targets import build_targets, target_config
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
@@ -351,7 +351,7 @@ class SocketPeer:
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
-                 skip_idle_spacing: bool = False) -> None:
+                 skip_idle_spacing: bool = False, caller_environment: dict[str, str] | None = None) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
@@ -390,6 +390,11 @@ class AdmissionFixture(ExitStack):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root), "TMPDIR": str(self.temporary),
             **interpreter_cache_environment(self.root / "cache")}
+        self.caller_environment: dict[str, str] = environment if caller_environment is None else caller_environment
+        if caller_environment is not None:
+            environment["MAC_TEST_STATE_DIR"] = str(target_config.ssh_target_state_directory("mac", environment=caller_environment))
+            environment["BUILD_TARGETS_STATE_DIR"] = str(target_config.ssh_target_state_directory(
+                "linux", environment=caller_environment).parent)
         self.enter_context(mock.patch.dict(os.environ, environment))
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
@@ -983,7 +988,15 @@ def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvid
             OwningSession(session_id) if session_id else NoOwningSession(),
             record["remote_host"], record.get("instance_generation", "")))
     return PrivateHostEvidence(key, fixture.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup),
-        holder=holder, provider_diagnostic=diagnostic, holder_claim=holder_claim)
+        holder=holder, provider_diagnostic=diagnostic, holder_claim=holder_claim,
+        inventory=claim_state.claim_inventory(paths, claims))
+
+
+def caller_claim_paths(target: str, environment: dict[str, str]) -> claim_state.StatePaths:
+    """Use the configured platform and the caller's state directory."""
+    configured = target_config.configured_ssh_target(target)
+    directory = target_config.ssh_target_state_directory(target, environment=environment)
+    return claim_state.StatePaths(directory, target, registry_selected=True, platform=configured.platform)
 
 
 class CallerProviderControls:
@@ -1027,9 +1040,7 @@ class CallerProviderControls:
             self.fixture.server.next_pass = self.fixture.clock.monotonic()
 
     def claim_paths(self, target: str) -> claim_state.StatePaths:
-        directory = (self.fixture.root / "mac-state" if target == "mac" else
-                     self.fixture.root / "home/.local/state/build-targets" / target)
-        return claim_state.StatePaths(directory, target, platform="macos" if target == "mac" else "linux")
+        return caller_claim_paths(target, self.fixture.caller_environment)
 
     def claims(self, target: str) -> tuple[claim_state.HeldClaim, ...]:
         paths = self.claim_paths(target)
@@ -1063,11 +1074,8 @@ def private_caller_provider(fixture: AdmissionFixture, environment: dict[str, st
             eligibility = placement.TemporaryExclusion(environment.get("TEST_RUNNER_BUSY_REASON", "busy"))
         elif environment.get("TEST_RUNNER_MAC") == "declined" and not allow_refusal:
             eligibility = placement.TemporaryExclusion(environment.get("TEST_RUNNER_REASON") or "busy")
-    directory = (fixture.root / "local-provider" if key.destination.provider == "local" else
-                 Path(environment["MAC_TEST_STATE_DIR"]) if key.destination.provider == "mac" else
-                 Path(environment["HOME"]) / ".local/state/build-targets" / key.destination.target)
-    paths = claim_state.StatePaths(directory, key.destination.target,
-        platform="macos" if key.destination.provider == "mac" else "linux")
+    paths = (claim_state.StatePaths(fixture.root / "local-provider", key.destination.target, platform="linux")
+             if key.destination.provider == "local" else caller_claim_paths(key.destination.target, environment))
     return private_provider_evidence(fixture, key, paths, eligibility)
 
 
@@ -1093,7 +1101,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
         return existing
     _ = test.enterContext(LauncherHangGuard(test.id()).protect())
     fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"]),
-                                               skip_idle_spacing=skip_idle_spacing))
+                                               skip_idle_spacing=skip_idle_spacing, caller_environment=environment))
     _caller_services[str(fixture.socket_path)] = fixture
     test.addCleanup(_caller_services.pop, str(fixture.socket_path))
     fixture.clock.epoch = time.time()

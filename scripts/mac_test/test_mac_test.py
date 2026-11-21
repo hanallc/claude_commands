@@ -595,10 +595,11 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             json.loads((self.state_directory / "run.json").read_text(encoding="utf-8")),
         )
 
-    def release_record(self, record: RunState, *, pid: int | None = None) -> subprocess.CompletedProcess[str]:
+    def release_record(self, record: RunState, *, pid: int | None = None,
+                       require_same_holder: bool = False) -> subprocess.CompletedProcess[str]:
         return self.command("release", "--pid", str(record["pid"] if pid is None else pid),
                             "--claim-id", record["claim_id"], "--episode", record["episode"],
-                            "--attempt", record["attempt"])
+                            "--attempt", record["attempt"], *(["--require-same-holder"] if require_same_holder else []))
 
     def release_claim(self, pid: int) -> subprocess.CompletedProcess[str]:
         paths = [self.state_directory / "run.json", *sorted((self.state_directory / "claims").glob("*.json"))]
@@ -1116,6 +1117,8 @@ finally:
         self.assertIn(f"running: leftovers of older tests on previous-mac since {self.local_time(record['since'])}, "
                       + f"kept under pid {record['pid']}\n", status.stdout)
         self.assert_command(self.release_record(record, pid=os.getpid()), 0, "")
+        self.assert_command(self.release_record(record, pid=os.getpid(), require_same_holder=True), 12, "",
+                            "cannot release: the exact claim belongs to a different holder\n")
         self.assertEqual(self.run_state(), record)
         self.assert_command(self.release_claim(record["pid"]), 0, "")
         self.assertFalse((self.state_directory / "run.json").exists())
@@ -3281,12 +3284,14 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             def run_shell(command: str) -> subprocess.CompletedProcess[str]:
                 return self.run_private_shell(command, self.root)
 
-            prepared = run_shell(offload.prepare_start_fence_command(identity, "mac"))
+            fence = offload.fence_reference(claim_state.ClaimKey.for_target(self.paths, identity),
+                                           cast(str, record["remote_host"]), "", self.paths.run.stem)
+            prepared = run_shell(offload.prepare_start_fence_command(fence))
             self.assertEqual(prepared.returncode, 0, prepared.stderr)
             fence_directory = self.root / offload.start_fence_relative(identity, "mac").parent
             pending = offload.pending_start_path(self.paths.target, identity)
             pending.parent.mkdir(parents=True, exist_ok=True)
-            _ = pending.write_text("pending")
+            _ = pending.write_text(offload.pending_start_key(identity))
             pending_before = pending.read_bytes()
             transport_calls = 0
 
@@ -3320,15 +3325,17 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         # A copy stopped before its final status leaves remote work and a held start fence.
         for leftovers, released in ((0, True), (1, False)):
             with self.subTest(leftovers=leftovers):
-                record = self.write_claim()
+                record = self.write_claim(attempt=f"stopped-holder-{leftovers}")
                 identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
                                                      cast(str, record["attempt"]))
-                prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
+                fence = offload.fence_reference(claim_state.ClaimKey.for_target(self.paths, identity),
+                                               cast(str, record["remote_host"]), "", self.paths.run.stem)
+                prepared = self.run_private_shell(offload.prepare_start_fence_command(fence), self.root)
                 self.assertEqual(prepared.returncode, 0, prepared.stderr)
                 fence_directory = self.root / offload.start_fence_relative(identity, "mac").parent
                 pending = offload.pending_start_path(self.paths.target, identity)
                 pending.parent.mkdir(parents=True, exist_ok=True)
-                _ = pending.write_text("pending")
+                _ = pending.write_text(offload.pending_start_key(identity))
                 scripts: list[str] = []
 
                 def end_work(repository: eligibility.KnownRepository, target: str, slot: int) -> str:
@@ -3369,14 +3376,16 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                                                  "received_bytes": 21, "complete": True}
         for new_owner in (False, True):
             with self.subTest(new_owner=new_owner):
-                record = self.write_claim()
+                record = self.write_claim(attempt=f"watcher-settle-{new_owner}")
                 identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
                                                      cast(str, record["attempt"]))
-                prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
+                fence = offload.fence_reference(claim_state.ClaimKey.for_target(self.paths, identity),
+                                               cast(str, record["remote_host"]), "", self.paths.run.stem)
+                prepared = self.run_private_shell(offload.prepare_start_fence_command(fence), self.root)
                 self.assertEqual(prepared.returncode, 0, prepared.stderr)
                 pending = offload.pending_start_path(self.paths.target, identity)
                 pending.parent.mkdir(parents=True, exist_ok=True)
-                _ = pending.write_text("pending")
+                _ = pending.write_text(offload.pending_start_key(identity))
                 rewritten: dict[str, object] = {**record, "transfers": [transfer],
                                                 "idle_since": "2026-10-13T12:01:00+00:00",
                                                 "work_idle_since": "2026-10-13T12:01:00+00:00"}

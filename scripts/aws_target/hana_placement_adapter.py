@@ -502,7 +502,8 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,
-        tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+        tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic,
+        inventory=claim_state.claim_inventory(paths, tuple(held)))
 
 
 GPU_SETUP_REQUIRED = 'Hana GPU setup is required. On natedev, run deploy.py up --workload merge-gates --approve-resources'
@@ -591,6 +592,7 @@ def read_gpu_evidence(transport: HanaGpuNextestTransport, key: placement.HostEvi
     paths = claim_state.state_paths(destination.target)
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
+    present: list[claim_state.HeldClaim] = []
     with claim_state.locked(paths.lock):
         for held in claim_state.read_claims(paths):
             record = held.record
@@ -600,6 +602,7 @@ def read_gpu_evidence(transport: HanaGpuNextestTransport, key: placement.HostEvi
                     and (not record.get('cleanup_pending') or gpu_size_trial.assigned_gpu_cleanup_confirmed(record['claim_id']))):
                 held.path.unlink()
                 continue
+            present.append(held)
             reference = placement.ProviderClaimReference('ssh', destination.target, held.scope,
                 record['claim_id'], record['episode'], record['attempt'])
             if record.get('cleanup_pending'):
@@ -610,12 +613,14 @@ def read_gpu_evidence(transport: HanaGpuNextestTransport, key: placement.HostEvi
                     placement.ClaimHolderIdentity(store.host_name(), record['pid'], record['proc_start']),
                     OwningSession(sid) if sid else NoOwningSession(), record['remote_host'],
                     record.get('instance_generation', '')))
+        observed_at = time.time()
     if isinstance(policy, placement.AllowedHost):
         if not isinstance(mac_test.blocking_claim_block(paths, request.constraints.session), mac_test.NoMacBlock):
             policy = placement.TemporaryExclusion('blocked')
         elif cleanup or any(claim.reference.episode != request.episode for claim in adopted):
             policy = placement.TemporaryExclusion('busy')
-    return placement.FreshHostEvidence(key, time.time(), generation, policy, tuple(adopted), tuple(cleanup))
+    return placement.FreshHostEvidence(key, observed_at, generation, policy, tuple(adopted), tuple(cleanup),
+        inventory=claim_state.claim_inventory(paths, tuple(present)))
 
 
 def gpu_command_generation(command: tuple[str, ...]) -> str:
@@ -745,7 +750,7 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
                     settled = True
         except (OSError, claim_state.StateReadError):
             pass
-    dispatch = (placement.DispatchPathSettled() if settled else
+    dispatch = (placement.DispatchPathSettled(claim_state.ReleaseReceipt(reference.key)) if settled else
                 placement.DispatchPathPending('The Hana GPU claim release remains pending'))
     if isinstance(result, HanaStepRefused):
         print('Hana GPU infrastructure failure: ' + result.reason, file=sys.stderr)

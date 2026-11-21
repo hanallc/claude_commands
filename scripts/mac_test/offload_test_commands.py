@@ -2,9 +2,37 @@
 
 import shlex
 from pathlib import Path
+import subprocess
 from typing import Literal
 
 from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import offload
+
+_popen = subprocess.Popen
+
+
+def capture_fence_query(command: str, *, environment: dict[str, str] | None = None) -> offload.CommandOutput:
+    """Run the responder query in the fixture's private home."""
+    with _popen(["/bin/bash", "-c", command], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=environment) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
+        return offload.CommandOutput(process.returncode, stdout, stderr)
+
+
+def prepare_probe_fence(command: str) -> str:
+    """Run the preparation prefix before the SSH fixture supplies its probe result."""
+    prepare, separator, probe = command.partition(" || exit 75\n")
+    if separator and prepare.startswith("python3 -c ") and "def fence_record():" in prepare:
+        _ = capture_fence_query(prepare)
+        return probe
+    return command
 
 
 JSON_SHELL = r'''
@@ -71,6 +99,11 @@ COMMAND_STUB = r'''
 root=$MAC_TEST_STUB_DIR
 source "$root/fixture.sh"
 command=${0##*/}
+if [[ $command == ssh && ${!#} == *'print("dispatch_fence_host=" +'* ]]; then
+    IFS= read -r identity < "$root/fence-host"
+    printf '%s\n' "$identity"
+    exit 0
+fi
 if [[ $command == systemd-run ]]; then
     json_args "$@" >> "$root/systemd-run.jsonl"
     printf '\n' >> "$root/systemd-run.jsonl"
@@ -203,12 +236,27 @@ from scripts.mac_test import claim_state, offload
 path = Path(sys.argv[1])
 claim = json.loads(path.read_text())
 identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
-command = offload.start_fence_command(identity, "mac", settle=True, scope_key=path.stem)
+paths = claim_state.state_paths("mac")
+key = claim_state.ClaimKey.for_target(paths, identity)
+location = claim_state.ClaimRecordLocation(path.relative_to(paths.directory))
+journal = offload.record_start_fence(key, claim, location)
+if not isinstance(journal, claim_state.StartFenceJournal):
+    raise SystemExit(75)
+command = offload.start_fence_command(journal.fence, settle=True, preparation=journal.preparation)
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
 ''') + r'''
 SETTLE_FENCE
     fi
     exit "$run_ssh_status"
+fi
+if [[ $remote == python3\ -c\ * && $remote == *'def fence_record():'* ]]; then
+    python3 - "$remote" <<'PREPARE_FENCE' || exit 75
+''' + python_tool_source(r'''
+import sys
+from scripts.mac_test.offload_test_commands import prepare_probe_fence
+prepare_probe_fence(sys.argv[1])
+''') + r'''
+PREPARE_FENCE
 fi
 printf 'started\n' > "$root/probe-started"
 if (( hold_probe )); then await_release continue-probe; fi

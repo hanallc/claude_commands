@@ -234,7 +234,7 @@ source_forbidden_paths=*.key
                            else [call for message in messages for call in (mock.call(message), mock.call('\n'))])
         self.assertEqual(stderr.call_args_list, expected_writes)
         self.assertIsInstance(self.controller.pending,
-                              offload.PendingHanaOperation if cleanup_pending else offload.SettledDispatchOperations)
+                              offload.PendingHanaOperation if cleanup_pending else offload.NoPendingOperation)
         evidence = self.controller.attempt_evidence
         self.assertEqual(evidence.completion, 'confirmed')
         self.assertEqual(evidence.cleanup, 'unconfirmed' if cleanup_pending else 'confirmed')
@@ -257,7 +257,7 @@ source_forbidden_paths=*.key
             self.assertEqual(self.finish_claimed(outcome), 0)
             note.assert_called_once()
             self.assertIn('disk full', str(note.call_args))
-        self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
+        self.assertIsInstance(self.controller.pending, offload.NoPendingOperation)
         self.assertEqual(self.controller.attempt_evidence.completion, 'confirmed')
 
     def test_cost_journal_write_failure_preserves_the_accepted_exit_status(self) -> None:
@@ -394,16 +394,16 @@ route_test
             offload.report_placement_result(self.controller, self.request, outcome)
         assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
         self.assertEqual(outcome.reason, box.HANA_CLAIM_BUSY)
-        self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
+        self.assertIsInstance(self.controller.pending, offload.NoPendingOperation)
         self.assertIsInstance(self.controller.attempt_evidence.provider, placement.NoProviderClaim)
         settle.assert_not_called()
         claim_failure.assert_not_called()
         report.assert_called_once()
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertEqual(sent.claim, self.fixture.reference)
+        self.assertIsInstance(sent.claim, placement.NoProviderClaim)
         self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY))
         self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
-        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+        self.assertEqual(sent.path, placement.DispatchPathSettled(offload.NoClaimAcquired()))
 
     def test_prelaunch_refusal_reports_the_fault_without_publishing_a_command(self) -> None:
         root = self.root
@@ -555,6 +555,7 @@ route_test
 
     def test_stale_image_at_claim_reports_a_settled_refusal(self) -> None:
         cause = placement.HANA_IMAGE_STALE
+        self.lifecycle.bind_execution(self.fixture.key.claim_id)
         with (self.context(), mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimRefused(cause)),
                 mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()) as release,
                 mock.patch.object(admission_client, 'report_execution') as report):
@@ -720,7 +721,8 @@ route_test
                 report.assert_called_once()
                 sent = cast(wire.ExecutionReport, report.call_args.args[0])
                 self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
-                self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+                self.assertIsInstance(sent.claim, placement.NoProviderClaim)
+                self.assertEqual(sent.path, placement.DispatchPathSettled(offload.NoClaimAcquired()))
                 self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
                 self.assertFalse(self.lifecycle.execution_bound(self.fixture.key.claim_id))
                 self.assertFalse(execution.execution_path(directory, self.fixture.key.claim_id).exists())
@@ -752,7 +754,7 @@ route_test
         upload.assert_not_called()
         self.assertEqual(self.fixture.objects.envelopes, [])
 
-    def test_unreadable_lifecycle_preserves_claim_refusal(self) -> None:
+    def test_unreadable_lifecycle_keeps_the_input_refusal_pending(self) -> None:
         checkout = self.checkout_with_ignored_path()
         _ = (checkout / 'refused.rs').write_text('ignored build input\n')
         self.request = replace(self.request, repo_root=checkout)
@@ -765,8 +767,9 @@ route_test
             outcome = self.run_claimed()
 
         assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
-        self.assertEqual(outcome.reason, box.HANA_CLAIM_BUSY)
-        claim.assert_called_once()
+        self.assertIn('IgnoredInput:', outcome.reason)
+        self.assertIsInstance(self.controller.pending, offload.PendingHanaOperation)
+        claim.assert_not_called()
         release.assert_not_called()
         self.assertFalse(execution.execution_path(self.root, self.fixture.key.claim_id).exists())
 
@@ -1107,6 +1110,7 @@ route_test
         _ = self.enterContext(mock.patch.object(admission_service, 'HostEvidenceWorker', queue_fixtures.ManualEvidenceWorker))
         target = target_config.SshTarget(self.request.target, 'linux', self.transport.settings)
         _ = self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=(target,)))
+        _ = self.enterContext(mock.patch.object(hana_placement_adapter, 'controller_for', return_value=self.lifecycle))
         submitted = queue_fixtures.placement_request(queue)
         submitted = replace(submitted, constraints=replace(submitted.constraints, repository=str(self.root),
             command=('cargo', 'check'), command_kind='check', source_key=self.fixture.source_key,
@@ -1207,7 +1211,7 @@ route_test
         assert isinstance(decoded, runner_result.UsableRunnerResult)
         self.assertEqual((decoded.word, decoded.reason), ('hana_command_admission_refused', reason))
         self.assertIsInstance(self.controller.pending,
-                              offload.SettledDispatchOperations if release_succeeds else offload.PendingHanaOperation)
+                              offload.NoPendingOperation if release_succeeds else offload.PendingHanaOperation)
         self.assertTrue(execution.execution_command_settled(self.root, self.fixture.key.claim_id))
         self.assertEqual(execution.claim_admission_refused(self.root, self.fixture.reference), release_succeeds)
         self.assertEqual(execution.claim_dispatch_pending(self.root, self.fixture.reference), not release_succeeds)

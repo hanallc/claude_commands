@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import Literal, cast
+from typing import Literal
 from unittest import mock
 
 from scripts.build_queue import execution_identity
@@ -19,6 +19,7 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.build_queue.admission_test_support import caller_provider_controls
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
+from scripts.direct.verify_ssh_claim_test_support import claim_exclusion_path, exclude_retained_claim
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -31,11 +32,6 @@ mac_test = eligibility_support.mac_test
 
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
-    def queue_requests(self) -> list[wire.Request]:
-        lines = (self.runner_state / "queue-events.jsonl").read_text().splitlines()
-        return [wire.parse_request(json.dumps(cast(dict[str, object], json.loads(line))["request"]))
-                for line in lines]
-
     def test_ssh_launch_failure_settles_start_before_releasing_claim(self) -> None:
         self.check_launch_refusal("start-launch-failed")
 
@@ -81,20 +77,38 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         self.assertFalse(list((state / "dispatch-fences").glob(f"*/{key}.lock")))
         self.assertEqual(self.local_runs(), [])
 
-    def test_fixture_exclusion_follows_exact_release(self) -> None:
+    def test_success_with_unconfirmed_release_keeps_exact_claim(self) -> None:
+        self.check_release_projections("run-cleanup-unconfirmed", retained=True)
+
+    def test_launch_failure_with_confirmed_release_clears_exact_claim(self) -> None:
+        self.check_release_projections("start-launch-failed", retained=False)
+
+    def check_release_projections(self, mode: str, *, retained: bool) -> None:
         self.configure("natedev,linux")
-        exclusion = self.runner_state / "provider-outcome-linux.json"
-        for mode, retained in (("start-launch-failed", False), ("run-release-unconfirmed", True)):
-            with self.subTest(mode=mode):
-                self.clear_observations()
-                result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
-                    "TEST_SSH_MODES": json.dumps({"linux": mode})})
-                attempt = self.ssh_events()[-1]
-                self.assertEqual(result.returncode == 0, retained, result.stdout + result.stderr)
-                self.assertEqual(attempt["actions"][-1], "release", attempt)
-                self.assertEqual(attempt["result_type"], "PassedOnTarget" if retained else "LostMacRun")
-                self.assertEqual(attempt["remaining_claim_ids"], attempt["adopted_claim_ids"] if retained else [])
-                self.assertEqual(exclusion.exists(), retained, attempt)
+        result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
+            "TEST_SSH_MODES": json.dumps({"linux": mode})})
+        self.assertEqual(result.returncode == 0, retained, result.stdout + result.stderr)
+        attempt, = self.ssh_events()
+        self.assertEqual(attempt["result_type"], "PassedOnTarget" if retained else "LostMacRun")
+        report, = [request for request in self.queue_requests() if isinstance(request, wire.ExecutionReport)]
+        self.assertIsInstance(report.path, placement.DispatchPathPending if retained else placement.DispatchPathSettled)
+        assert isinstance(report.claim, placement.ProviderClaimReference)
+        identity = claim_state.ClaimIdentity(report.claim.claim_id, report.claim.episode, report.claim.attempt)
+        self.assertEqual(attempt["adopted_claim_ids"], [identity.claim_id])
+        held = caller_provider_controls(self, self.admission).claims("linux")
+        self.assertEqual([claim_state.claim_identity(claim.record) for claim in held], [identity] if retained else [])
+        self.assertEqual(claim_exclusion_path(self.runner_state, "linux", identity).exists(), retained)
+        scope = report.claim.scope
+        assert isinstance(scope, claim_state.RepositoryScope)
+        self.assertEqual(exclude_retained_claim(self.runner_state, "linux", scope), retained)
+        self.assertFalse(exclude_retained_claim(
+            self.runner_state, "linux", claim_state.RepositoryScope(scope.name, scope.key, scope.slot + 1)))
+        cleanup = "unconfirmed" if retained else "confirmed"
+        self.assertIn(f"cleanup={cleanup}", attempt["provider_result"].splitlines())
+        record, = self.attempts()
+        self.assertEqual(record["cleanup"], cleanup)
+        self.assertEqual(attempt.get("release_state"),
+                         "ClaimReleaseUnconfirmed" if retained else "ClaimReleaseConfirmed")
 
     def test_lost_authorization_releases_the_exact_settled_start(self) -> None:
         self.check_lost_authorization("start-fence-confirmed")
@@ -165,14 +179,16 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.assertEqual(first["result_type"], "LostMacRun")
             self.assertIsInstance(report.outcome, placement.AttemptOutcomeUnavailable)
         else:
-            self.assertEqual(report.outcome, placement.PrelaunchRefused("state"))
+            launch = (placement.PrelaunchEnded() if fence_settled
+                      else placement.PrelaunchEndUnconfirmed())
+            self.assertEqual(report.outcome, placement.PrelaunchRefused("state", launch))
         self.assertEqual(self.local_runs(), [])
         if confirmed:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIsInstance(report.path, placement.DispatchPathSettled)
             self.assertNotIn(claim.claim_id, first["remaining_claim_ids"])
             self.assertFalse(journal.exists())
-            self.assertFalse((self.runner_state / "provider-outcome-linux.json").exists())
+            self.assertFalse(claim_exclusion_path(self.runner_state, "linux", identity).exists())
             _, successful = authorizations
             self.assertEqual(successful.assignment.episode, lost.assignment.episode)
             self.assertNotEqual(successful.claim, claim)
@@ -189,7 +205,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.assertEqual(journal.exists(), not fence_settled)
             fence = offload.start_fence_relative(identity, "linux", scope_key=held.path.stem)
             self.assertEqual((self.home / fence.with_suffix(".lock")).exists(), not fence_settled)
-            self.assertTrue((self.runner_state / "provider-outcome-linux.json").exists())
+            self.assertTrue(claim_exclusion_path(self.runner_state, "linux", identity).exists())
 
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()
@@ -308,74 +324,86 @@ if output_size:
         self.assertEqual(attempt["remaining_claim_ids"], [old.record["claim_id"]])
         remaining, = controls.claims("linux")
         self.assertEqual(claim_state.claim_identity(remaining.record), claim_state.claim_identity(old.record))
-        self.assertTrue((self.runner_state / "provider-outcome-linux.json").is_file())
+        self.assertTrue(claim_exclusion_path(self.runner_state, "linux", claim_state.claim_identity(old.record)).is_file())
         self.assertFalse(any(isinstance(request, wire.ClaimFailure) for request in self.queue_requests()))
 
-    def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
-        self.configure("natedev,linux,spare")
-        claims = self.retain_slots()
-        _ = self.hold_memory()
-        pressure = Path(self.environment["BUILDLOG_MEMORY_PRESSURE"])
-        _ = pressure.write_text("some avg10=100 avg60=0 avg300=0 total=0\n"
-                                + "full avg10=100 avg60=0 avg300=0 total=0\n")
-        before_attempt = r'''
-steps_path = root / "memory-steps.json"
-steps = json.loads(steps_path.read_text()) if steps_path.exists() else []
-if request.target == "linux":
-    assert steps == [], steps
-    steps.append("linux_attempt")
-else:
-    assert request.target == "spare", request.target
-    assert steps == ["linux_attempt", "linux_cleanup_failed"], steps
-    prior = json.loads((root / "ssh-events.jsonl").read_text().splitlines()[-1])
-    assert prior["target"] == "linux" and "cleanup" in prior["actions"], prior
-    assert prior["holder"] == "LostRunLeftovers", prior
-    steps.append("spare_retry")
-steps_path.write_text(json.dumps(steps))
-'''
-        after_attempt = r'''
-if request.target == "linux":
-    assert isinstance(result, offload.BusyMacDecline), result
-    assert isinstance(result.holder, offload.LostRunLeftovers), result
-    assert "cleanup" in actions and "run" not in actions, actions
-    steps.append("linux_cleanup_failed")
-else:
-    assert isinstance(result, offload.PassedOnTarget), result
-    steps.append("spare_completed")
-    Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
-    Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text(
-        "some avg10=0 avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n")
-steps_path.write_text(json.dumps(steps))
-'''
-        self.write_executable(self.runner, support.SSH_RUNNER.replace(
-            "started = time.monotonic()", before_attempt + "\nstarted = time.monotonic()").replace(
-            "\noutcome = ", after_attempt + "\noutcome = "))
-        with self.spare_after_linux_refusal():
-            result = self.verify("test", "sample", "--no-cache", extra={
-                "TEST_SSH_MODES": '{"linux":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        first, second = self.ssh_events()
-        self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
-        self.assertEqual(first["result_type"], "BusyMacDecline")
-        self.assertEqual(first["holder"], "LostRunLeftovers")
-        self.assertIn("cleanup", first["actions"])
-        self.assertNotIn("run", first["actions"])
-        self.assertNotIn("release", first["actions"])
+    def test_retained_slots_stay_owned_when_cleanup_finds_leftovers(self) -> None:
+        self.check_retained_takeover("retained-leftovers")
+
+    def test_takeover_needs_a_fence_acknowledgement_before_reporting_prelaunch_ended(self) -> None:
+        self.check_retained_takeover("start-fence-unconfirmed")
+
+    def test_takeover_keeps_the_journal_when_the_claim_location_is_unknown(self) -> None:
+        self.check_retained_takeover("start-fence-wrong-path")
+
+    def check_retained_takeover(self, mode: Literal[
+            "retained-leftovers", "start-fence-unconfirmed", "start-fence-wrong-path"]) -> None:
+        self.configure("natedev,linux")
+        fence_unconfirmed = mode != "retained-leftovers"
+        claims = self.retain_slots(old_capacity=1 if fence_unconfirmed else 2)
+        controls = caller_provider_controls(self, self.admission)
+        old = controls.claims("linux")[0]
+        identity = claim_state.claim_identity(old.record)
+        key = offload.pending_start_key(identity)
+        state = claim_state.StatePaths(self.target_state("linux"))
+        journal = state.directory / "pending-starts" / key
+        relative = offload.start_fence_relative(identity, "linux", scope_key=state.run.stem)
+        lock = self.home / relative.with_suffix(".lock")
+        if mode == "start-fence-wrong-path":
+            claims = [old.path.rename(state.run)]
+            lock.parent.mkdir(parents=True)
+            lock.touch()
+            self.addCleanup(lock.unlink, missing_ok=True)
+        if fence_unconfirmed:
+            journal.parent.mkdir()
+            _ = journal.write_text(key)
+
+        result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
+            "TEST_SSH_MODES": json.dumps({"linux": mode})})
+
+        self.assertEqual(journal.exists(), fence_unconfirmed, "The inherited start journal must remain pending.")
+        if mode == "start-fence-wrong-path":
+            self.assertTrue(lock.is_file())
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "BusyMacDecline")
+        self.assertEqual(event["holder"], "LostRunLeftovers")
+        actions = ["claim:13"] if mode == "start-fence-wrong-path" else ["claim:13", "cleanup"]
+        self.assertEqual(event["actions"], actions)
+        self.assertEqual(event["adopted_claim_ids"], [identity.claim_id])
+        self.assertIn(identity.claim_id, event["remaining_claim_ids"])
         self.assertTrue(all(path.exists() for path in claims))
-        self.assertEqual(first["queued_at"], second["queued_at"])
+        if fence_unconfirmed:
+            self.assertEqual(journal.read_text(), key)
+        self.assertEqual(self.local_runs(), [])
         self.assertFalse((self.target_state("linux") / "unreachable_until").exists())
-        self.assertEqual(json.loads((self.runner_state / "memory-steps.json").read_text()),
-                         ["linux_attempt", "linux_cleanup_failed", "spare_retry", "spare_completed"])
-        refusal, = [request for request in self.queue_requests() if isinstance(request, wire.ClaimFailure)
-                    and request.assignment.destination.target == "linux"]
-        self.assertIsInstance(refusal.claim, placement.ProviderClaimReference)
-        assert isinstance(refusal.claim, placement.ProviderClaimReference)
-        self.assertEqual(refusal.claim.claim_id, first["adopted_claim_ids"][0])
-        self.assertNotEqual(refusal.claim.episode, refusal.assignment.episode)
-        saved = self.admission.server.assignments[execution_identity.attempt_key(
-            refusal.assignment.episode, refusal.assignment.attempt)]
-        self.assertEqual(saved.provider, refusal.claim)
-        self.assertIsInstance(saved.state, placement.ClosedAssignment)
+        reports = [exchange for exchange in self.queue_exchanges()
+                   if isinstance(exchange.request, (wire.ExecutionReport, wire.ClaimFailure))
+                   and exchange.request.assignment.destination.target == "linux"]
+        self.assertEqual(len(reports), 1, "The takeover must report the inherited claim as pending.")
+        report = reports[0].request
+        assert isinstance(report, (wire.ExecutionReport, wire.ClaimFailure))
+        reply, = reports[0].replies
+        assert isinstance(reply, wire.DispatchStatus)
+        self.assertIsInstance(reply.state, placement.CurrentAssignment)
+        if fence_unconfirmed:
+            assert isinstance(report, wire.ClaimFailure)
+            self.assertEqual(report.reason, "busy")
+        else:
+            assert isinstance(report, wire.ExecutionReport)
+            self.assertIsInstance(report.path, placement.DispatchPathPending)
+            self.assertEqual(report.outcome, placement.PrelaunchRefused("busy", placement.PrelaunchEnded()))
+        self.assertIsInstance(report.claim, placement.ProviderClaimReference)
+        assert isinstance(report.claim, placement.ProviderClaimReference)
+        self.assertEqual((report.claim.claim_id, report.claim.episode, report.claim.attempt),
+                         (identity.claim_id, identity.episode, identity.attempt))
+        self.assertNotEqual(report.claim.episode, report.assignment.episode)
+        with self.admission.loop_turn():
+            saved = self.admission.server.assignments[execution_identity.attempt_key(
+                report.assignment.episode, report.assignment.attempt)]
+            self.assertEqual(saved.provider, report.claim)
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+            self.assertIsInstance(saved.terminal_report.path, placement.DispatchPathPending)
 
     def test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits(self) -> None:
         self.configure("natedev,mac")

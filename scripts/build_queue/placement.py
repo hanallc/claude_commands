@@ -7,6 +7,7 @@ from typing import Literal
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import ClaimScope
 
 SubmittingSession = OwningSession | NoOwningSession
@@ -90,9 +91,20 @@ class AttemptCompleted:
 
 
 @dataclass(frozen=True)
+class PrelaunchEnded:
+    """The adapter finished this attempt without starting the command."""
+
+
+@dataclass(frozen=True)
+class PrelaunchEndUnconfirmed:
+    """The provider still needs to confirm that the command cannot start."""
+
+
+@dataclass(frozen=True)
 class PrelaunchRefused:
     """The reason explains why the attempt was refused before launch."""
     reason: str
+    launch: PrelaunchEnded | PrelaunchEndUnconfirmed = PrelaunchEndUnconfirmed()
 
 
 @dataclass(frozen=True)
@@ -150,8 +162,16 @@ SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
 
 
 @dataclass(frozen=True)
+class NoClaimReleaseProof:
+    """This dispatch report supplies no exact claim release proof."""
+
+
+@dataclass(frozen=True)
 class DispatchPathSettled:
     """The dispatch path has settled."""
+
+    release: (claim_state.ReleaseReceipt | claim_state.AuthoritativeClaimAbsence | claim_state.NoClaimAcquired
+              | NoClaimReleaseProof) = NoClaimReleaseProof()
 
 
 @dataclass(frozen=True)
@@ -362,6 +382,15 @@ class ProviderClaimReference:
     episode: str
     attempt: str
 
+    @property
+    def key(self) -> claim_state.ClaimKey:
+        return claim_state.ClaimKey(self.provider, self.target, claim_state.ClaimIdentity(self.claim_id, self.episode, self.attempt))
+
+    @classmethod
+    def from_claim(cls, claim: claim_state.ClaimLifecycle) -> ProviderClaimReference:
+        key = claim.key
+        return cls(key.provider, key.target, claim.scope, key.identity.claim_id, key.identity.episode, key.identity.attempt)
+
 
 @dataclass(frozen=True)
 class NoProviderClaim:
@@ -468,6 +497,14 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
+    inventory: claim_state.CompleteClaimInventory | claim_state.IncompleteClaimInventory = claim_state.IncompleteClaimInventory()
+
+    @property
+    def held_claims(self) -> tuple[ProviderClaimReference, ...]:
+        """Return the claims that still hold provider capacity."""
+        if isinstance(self.inventory, claim_state.CompleteClaimInventory):
+            return tuple(ProviderClaimReference.from_claim(claim) for claim in self.inventory.claims if claim.excludes)
+        return tuple(claim.reference for claim in (*self.claims, *self.cleanup_claims))
 
 
 @dataclass(frozen=True)

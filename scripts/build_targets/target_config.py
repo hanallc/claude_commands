@@ -169,15 +169,22 @@ def require_target_name(target: str) -> None:
         raise ConfigError(f"invalid target name: {target}")
 
 
-def ssh_target_state_directory(target: str) -> Path:
+def ssh_target_state_directory(target: str, *, environment: Mapping[str, str] = os.environ) -> Path:
     """Return the state path without requiring target registration."""
     require_target_name(target)
-    if target != "mac":
-        configured_root = os.environ.get("BUILD_TARGETS_STATE_DIR")
-        root = Path(configured_root).expanduser() if configured_root else Path.home() / ".local/state/build-targets"
-        return root / target
-    configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
-    return Path(configured).expanduser()
+    home = Path(environment["HOME"]) if environment.get("HOME") else Path.home()
+    if target == "mac":
+        variable, default = "MAC_TEST_STATE_DIR", home / ".local/state/mac-test"
+    else:
+        variable, default = "BUILD_TARGETS_STATE_DIR", home / ".local/state/build-targets"
+    configured = environment.get(variable)
+    if not configured:
+        root = default
+    elif configured == "~" or configured.startswith("~/"):
+        root = home / configured[2:]
+    else:
+        root = Path(configured).expanduser()
+    return root if target == "mac" else root / target
 
 
 def uses_legacy_mac_layout(platform: Platform) -> bool:

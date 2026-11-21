@@ -610,6 +610,8 @@ import shlex
 import subprocess
 import sys
 command = sys.argv[-1]
+if 'print("dispatch_fence_host=" +' in command:
+    raise SystemExit(subprocess.run(["bash", "-c", command], check=False).returncode)
 if command == "true":
     raise SystemExit(0)
 if command.startswith("printf"):
@@ -721,6 +723,8 @@ import subprocess
 import sys
 root = Path(os.environ["PACKAGE_ROOT"])
 command = sys.argv[-1]
+if 'print("dispatch_fence_host=" +' in command:
+    raise SystemExit(subprocess.run(["bash", "-c", command], check=False).returncode)
 if command == "true":
     raise SystemExit(0)
 if command.startswith("printf") and ".build-target-script-commit" in command:
@@ -729,6 +733,8 @@ if command.startswith("printf") and ".build-target-script-commit" in command:
 if "dispatch_start_settled=" in command and "leftovers=0" in command:
     raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
 if "linux_runner.py" in command and "probe" in command:
+    from scripts.mac_test.offload_test_commands import prepare_probe_fence
+    prepare_probe_fence(command)
     with (root / "recovery-probes").open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + "\n")
     with (root / "probe-release").open() as release:

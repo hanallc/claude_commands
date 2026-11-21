@@ -43,12 +43,20 @@ class SshRunnerEvent(TypedDict):
     remote_status: int
     token_held: bool
     pinned: str
+    provider_result: str
+    release_state: str
 
 
 class CompletedMemoryHook(TypedDict):
     left: bool
     clock: str
     attempts: int
+
+
+@dataclass(frozen=True)
+class QueueExchange:
+    request: wire.Request
+    replies: tuple[wire.Reply, ...]
 
 
 @dataclass(frozen=True)
@@ -127,17 +135,22 @@ from scripts.mac_test import eligibility, offload, mac_test, claim_state
 from scripts.build_queue import admission_client, admission_protocol as queue_wire, execution_identity, placement
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.direct.verify_ssh_claim_test_support import RetainedClaimExclusion, claim_exclusion_path
+from scripts.mac_test.claim_release_test_support import run_claim_release
+from scripts.mac_test.offload_test_commands import capture_fence_query, prepare_probe_fence
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
 config = eligibility.read_config(Path(args.settings))
 controller = offload.ProcessController()
 root = Path(os.environ["TEST_RUNNER_STATE"])
-mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
+configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
+mode = configured_mode
 if mode in ("disk-once", "lost-once"):
     mode = "passed" if (root / "ssh-events.jsonl").exists() else mode.removesuffix("-once")
 actions = []
 adopted_claim_ids = []
+adopted_scopes = {}
 initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
 reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_owner_pid for claim in initial))
@@ -166,21 +179,23 @@ def complete(arguments, attempt):
                                             session=assigned.session, assignment=assigned)
         else:
             status = mac_test.command_claim(parsed, mac_test.state_paths(parsed.target), watch_claim=False)
-    attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, text.getvalue(), ""))
-    if status in (0, 13):
-        controller.claim_identity = claim_state.reply_claim_identity(text.getvalue())
+    reply = text.getvalue()
+    if mode == "start-fence-wrong-path":
+        reply = "".join(line for line in reply.splitlines(keepends=True) if not line.startswith("claim_record="))
+    controller.collect_claim_reply(attempt, offload.CommandOutput(status, reply, ""))
     actions.append("claim:" + str(status))
     after = mac_test.read_claims(mac_test.state_paths(parsed.target))
     adopted_claim_ids.extend(claim.record["claim_id"] for claim in after if claim.record["pid"] == os.getpid())
+    adopted_scopes.update((claim_state.claim_identity(claim.record), claim.scope)
+                          for claim in after if claim.record["pid"] == os.getpid())
     same_path = any(claim.path in before and claim.record["pid"] == os.getpid() for claim in after)
 
 def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if len(arguments) > 2 and arguments[2] == "release":
-        parsed = mac_test.parser().parse_args(arguments[2:], namespace=mac_test.CliArguments())
         actions.append("release")
-        if mode in ("start-release-unconfirmed", "takeover-release-unconfirmed", "run-release-unconfirmed"):
+        if mode in ("start-release-unconfirmed", "takeover-release-unconfirmed"):
             return offload.CommandOutput(1, "", "release was not confirmed")
-        return offload.CommandOutput(mac_test.command_release(parsed, mac_test.state_paths(parsed.target)), "", "")
+        return run_claim_release(arguments)
     versions = {("rustc", "-V"): "rustc fixture",
                 ("cargo", "nextest", "--version"): "nextest fixture",
                 ("cargo", "mend", "--version"): "mend fixture"}
@@ -189,12 +204,17 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if arguments[0] == "git" and arguments[-2:] == ["rev-parse", "HEAD"]:
         return offload.CommandOutput(0, "fixture-commit\n", "")
     assert arguments[0] == "ssh", arguments
+    if arguments[-1] == offload.FENCE_HOST_QUERY:
+        if request.target != "mac":
+            actions.append("reachability")
+        return capture_fence_query(arguments[-1])
     if arguments[-1] == "true":
         actions.append("reachability")
         return offload.CommandOutput(0, "", "")
     actions.append("probe")
     if mode == "probe-leftovers":
         return offload.CommandOutput(255, "", "host unavailable")
+    prepare_probe_fence(arguments[-1])
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
@@ -207,12 +227,6 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()
-    if check_start_fence:
-        identity = controller.claim_identity
-        assert isinstance(identity, claim_state.ClaimIdentity)
-        prepare = offload.prepare_start_fence_command(identity, request.target, scope_key=controller.claim_scope_key)
-        assert prepare in arguments[-1]
-        run_start_fence(prepare)
     return offload.CommandOutput(0, wire, "")
 
 def copy_scripts(*arguments):
@@ -245,10 +259,12 @@ def stream(arguments):
         wire, status = "connection lost\n", 255
     else:
         status = 75 if mode == "completed-decline" else 42 if mode == "failed" else 4 if mode == "no-tests" else 0
-        wire = "mac_exit=" + str(status) + "\nmac_cleanup=0\n"
-        if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-            command = offload.start_fence_command(controller.claim_identity, request.target,
-                settle=True, scope_key=controller.claim_scope_key)
+        cleanup = "unconfirmed" if mode == "run-cleanup-unconfirmed" else "0"
+        wire = "mac_exit=" + str(status) + "\nmac_cleanup=" + cleanup + "\n"
+        if isinstance(controller.fence, claim_state.FenceRef):
+            journal = offload.read_start_fence(controller.fence)
+            assert isinstance(journal, claim_state.StartFenceJournal), journal
+            command = offload.start_fence_command(journal.fence, settle=True, preparation=journal.preparation)
             wire += run_start_fence(command)
 
     remote_output, remote_status = wire, status
@@ -268,11 +284,15 @@ def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
-        count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
+        count = 2 if mode in ("probe-leftovers", "retained-leftovers", "run-cleanup-unconfirmed") else 0
         fence = ""
         identity = controller.claim_identity
-        if check_start_fence and isinstance(identity, claim_state.ClaimIdentity):
-            command = offload.start_fence_command(identity, request.target, settle=True, scope_key=controller.claim_scope_key)
+        reference = controller.fence
+        if check_start_fence and isinstance(reference, claim_state.FenceRef):
+            assert isinstance(identity, claim_state.ClaimIdentity)
+            journal = offload.read_start_fence(reference)
+            assert isinstance(journal, claim_state.StartFenceJournal), journal
+            command = offload.start_fence_command(journal.fence, settle=True, preparation=journal.preparation)
             settles_fence = arguments[-1].startswith(command + " || exit 1\n")
             if mode == "start-fence-interrupted" or launch_error is not None:
                 if settles_fence:
@@ -285,8 +305,10 @@ def commands(arguments, **options):
                     journal = offload.pending_start_path(request.target, identity)
                     journal.unlink()
                     journal.mkdir()
-        elif not unresolved and count == 0 and isinstance(identity, claim_state.ClaimIdentity):
-            fence = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
+        elif mode == "start-fence-wrong-path":
+            raise AssertionError("Takeover sent a fence command without the original record path")
+        elif not unresolved and count == 0 and isinstance(reference, claim_state.FenceRef):
+            fence = reference.acknowledgement("settled") + "\n"
         return subprocess.CompletedProcess(arguments, 3 if unresolved else 0,
             "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
     return real_run(arguments, **options)
@@ -328,10 +350,22 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
         result = offload.LostMacRun(offload.elapsed_seconds(started), str(error))
 
 outcome = root / ("provider-outcome-" + request.target + ".json")
-if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-    write_text_atomic(outcome, json.dumps({"target": request.target, "reason": "busy"}))
-elif adopted_claim_ids:
-    outcome.unlink(missing_ok=True)
+if (isinstance(result, offload.DeclinedMacRun) and not configured_mode.endswith("-once")
+        and mode in ("disk", "version-mismatch", "runtime-version-mismatch")):
+    write_text_atomic(outcome, json.dumps({"target": request.target, "reason": result.reason}))
+release = controller.attempt_evidence.claim_release
+if isinstance(release, (offload.ClaimReleaseConfirmed, offload.ClaimReleaseUnconfirmed)):
+    exclusion = claim_exclusion_path(root, request.target, release.identity)
+    if isinstance(release, offload.ClaimReleaseConfirmed):
+        exclusion.unlink(missing_ok=True)
+    else:
+        scope = adopted_scopes.get(release.identity, controller.claim_scope)
+        exclusion.parent.mkdir(exist_ok=True)
+        write_text_atomic(exclusion, queue_wire.encode_record(RetainedClaimExclusion(scope)))
+
+status = interrupted_status or offload.write_result(result, request.result, request.last_decline, request.verb,
+                                                    request.target, controller.attempt_evidence)
+provider_result = request.result.path.read_text() if isinstance(request.result, offload.ResultFile) and not interrupted_status else ""
 
 event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.attempt_evidence.slot,
              token_held=(Path(os.environ["TEST_TOKEN_RECORD"]).exists()
@@ -342,20 +376,17 @@ event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.
              entry_claim_ids=[claim.record["claim_id"] for claim in initial],
              adopted_claim_ids=adopted_claim_ids,
              remaining_claim_ids=[claim.record["claim_id"] for claim in mac_test.read_claims(mac_test.state_paths(request.target))],
-             result_type=type(result).__name__,
+             result_type=type(result).__name__, provider_result=provider_result, release_state=type(release).__name__,
              remote_output=remote_output, remote_status=remote_status,
              holder=type(result.holder).__name__ if isinstance(result, offload.BusyMacDecline) else "",
              clock=Path(os.environ["TEST_ROUTING_CLOCK"]).read_text() if os.environ.get("TEST_ROUTING_CLOCK") else "")
 with (root / "ssh-events.jsonl").open("a") as output:
     output.write(json.dumps(event) + "\n")
 try:
-    status = interrupted_status or offload.write_result(result, request.result, request.last_decline, request.verb,
-                                                        request.target, controller.attempt_evidence)
+    offload.report_placement_result(controller, request, result)
+except (queue_wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
+    print(f"offload: cannot report placement: {error}", file=sys.stderr)
 finally:
-    try:
-        offload.report_placement_result(controller, request, result)
-    except (queue_wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
-        print(f"offload: cannot report placement: {error}", file=sys.stderr)
     try:
         offload.persist_attempt(request, result, controller.attempt_evidence, started)
     except (OSError, ValueError) as error:
@@ -473,6 +504,19 @@ source() {
     def ssh_events(self) -> list[SshRunnerEvent]:
         path = self.runner_state / "ssh-events.jsonl"
         return [cast(SshRunnerEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def queue_exchanges(self) -> list[QueueExchange]:
+        lines = (self.runner_state / "queue-events.jsonl").read_text().rpartition("\n")[0].splitlines()
+        exchanges: list[QueueExchange] = []
+        for line in lines:
+            event = cast(dict[str, object], json.loads(line))
+            request = wire.parse_request(json.dumps(event["request"]))
+            replies = tuple(wire.parse_reply(json.dumps(reply), request) for reply in cast(list[object], event["replies"]))
+            exchanges.append(QueueExchange(request, replies))
+        return exchanges
+
+    def queue_requests(self) -> list[wire.Request]:
+        return [exchange.request for exchange in self.queue_exchanges()]
 
     def attempts(self) -> list[dict[str, object]]:
         rows = [cast(dict[str, object], json.loads(line))

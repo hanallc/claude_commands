@@ -29,6 +29,7 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
+from scripts.mac_test import claim_state
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
@@ -88,6 +89,73 @@ class RemoteStartHoldEnded:
 
 
 @dataclass(frozen=True)
+class ClaimAcquisitionEnded:
+    """The adapter can no longer acquire or launch the claim."""
+
+    observed_at: float
+
+
+@dataclass(frozen=True)
+class ClaimAcquisitionUnconfirmed:
+    """No report confirms that the adapter stopped acquiring the claim."""
+
+
+@dataclass(frozen=True)
+class SshClaimJournal:
+    """The SSH adapter records pending starts in this provider state directory."""
+
+    directory: Path
+
+
+@dataclass(frozen=True)
+class HanaClaimJournal:
+    """The native Hana controller uses this journal and settings."""
+
+    directory: Path
+    settings: Path
+    host: str
+
+
+@dataclass(frozen=True)
+class HanaGpuClaimState:
+    """The Hana GPU adapter tracks its exact claim in this state directory."""
+
+    directory: Path
+
+
+@dataclass(frozen=True)
+class ClaimJournalUnrecorded:
+    """The applicable claim journal has no verified address."""
+
+
+ClaimJournal = SshClaimJournal | HanaClaimJournal | HanaGpuClaimState | ClaimJournalUnrecorded
+
+
+@dataclass(frozen=True)
+class NativeClaimRelease:
+    """The exact native journal confirms command settlement and claim release."""
+
+    key: claim_state.ClaimKey
+
+
+@dataclass(frozen=True)
+class ProviderReleaseUnconfirmed:
+    """There is no durable release proof for the provider claim."""
+
+
+ProviderReleaseEvidence = (
+    claim_state.ReleaseReceipt | claim_state.AuthoritativeClaimAbsence | NativeClaimRelease | claim_state.NoClaimAcquired
+)
+
+
+@dataclass(frozen=True)
+class ProviderClaimReleased:
+    """Admission confirmed exact release or that the attempt acquired no claim."""
+
+    evidence: ProviderReleaseEvidence
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
     """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
@@ -101,6 +169,27 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    acquisition: ClaimAcquisitionEnded | ClaimAcquisitionUnconfirmed = ClaimAcquisitionUnconfirmed()
+    claim_release: ProviderClaimReleased | ProviderReleaseUnconfirmed = ProviderReleaseUnconfirmed()
+    claim_journal: ClaimJournal = ClaimJournalUnrecorded()
+
+    def release_pending(self) -> bool:
+        """Return whether this provider claim still requires release proof."""
+        return (self.assignment.destination.provider != "local"
+                and isinstance(self.provider, placement.ProviderClaimReference)
+                and (not isinstance(self.claim_release, ProviderClaimReleased)
+                     or isinstance(self.claim_release.evidence, claim_state.NoClaimAcquired)
+                     or self.claim_release.evidence.key != self.provider.key))
+
+    def acquisition_evidence(self) -> ClaimAcquisitionEnded | ClaimAcquisitionUnconfirmed:
+        """Use the launch evidence from a report saved before this field existed."""
+        report = self.terminal_report
+        if (isinstance(self.acquisition, ClaimAcquisitionUnconfirmed)
+                and isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, placement.PrelaunchRefused)
+                and isinstance(report.outcome.launch, placement.PrelaunchEnded)):
+            return ClaimAcquisitionEnded(report.received_at)
+        return self.acquisition
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125

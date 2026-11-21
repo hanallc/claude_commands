@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_queue import admission_protocol as wire, execution_identity, placement
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
@@ -31,38 +32,60 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         self.assertEqual(self.attempts(), [])
         self.assertEqual(len(self.local_runs()), 1)
 
-    def test_probe_refusal_keeps_queue_age_and_continues_to_the_next_ssh_target(self) -> None:
+    def test_probe_refusal_keeps_queue_age_and_waits_for_claim_release(self) -> None:
         self.check_busy_startup("probe-refusal")
 
-    def test_run_refusal_keeps_queue_age_and_continues_to_the_next_ssh_target(self) -> None:
+    def test_run_refusal_keeps_queue_age_and_waits_for_claim_release(self) -> None:
         self.check_busy_startup("run-refusal")
 
-    def test_after_probe_refusal_keeps_queue_age_and_continues_to_the_next_ssh_target(self) -> None:
+    def test_after_probe_refusal_keeps_queue_age_and_waits_for_claim_release(self) -> None:
         self.check_busy_startup("after-probe")
 
     def check_busy_startup(self, mode: str) -> None:
         self.configure("linux,spare,natedev")
+        queue_log = self.runner_state / "queue-events.jsonl"
+
+        def replay_after_refusal() -> bool:
+            if not queue_log.exists():
+                return False
+            requests = self.queue_requests()
+            for index, report in enumerate(requests):
+                if isinstance(report, wire.ExecutionReport) and report.assignment.destination.target == "linux":
+                    return any(isinstance(request, wire.PlacementRequest)
+                               and request.episode == report.assignment.episode for request in requests[index + 1:])
+            return False
+
         with self.spare_after_linux_refusal():
-            result = self.verify("test", "sample", "--no-cache", extra={
+            process = self.start_verify("test", "sample", "--no-cache", extra={
                 "TEST_SSH_MODES": json.dumps({"linux": mode}), "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        events = self.ssh_events()
-        self.assertEqual([event["target"] for event in events], ["linux", "spare"],
-                         json.dumps(events) + result.stdout + result.stderr)
+            try:
+                self.wait_until(replay_after_refusal, str(queue_log), (process,), directory=self.runner_state)
+                with self.admission.loop_turn():
+                    report, = [request for request in self.queue_requests()
+                               if isinstance(request, wire.ExecutionReport)
+                               and request.assignment.destination.target == "linux"]
+                    key = execution_identity.attempt_key(report.assignment.episode, report.assignment.attempt)
+                    saved = self.admission.server.assignments[key]
+                    self.assertIsInstance(saved.state, placement.CurrentAssignment)
+                    self.assertEqual(self.admission.server.current_assignments[report.assignment.episode], key)
+                    self.assertIsInstance(report.path, placement.DispatchPathPending)
+                    assert isinstance(report.outcome, placement.PrelaunchRefused)
+                    self.assertEqual(report.outcome.reason, "busy")
+                    self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
+            finally:
+                _ = self.stop_verify(process)
+        event, = self.ssh_events()
         self.assertEqual(self.local_runs(), [])
-        self.assertNotIn("release", events[0]["actions"])
-        self.assertEqual(events[0]["queued_at"], "100.25")
-        self.assertEqual(events[1]["queued_at"], "100.25")
+        self.assertNotIn("release", event["actions"])
+        self.assertEqual(event["queued_at"], "100.25")
         self.assertTrue((self.runner_state / "linux.marker").exists())
         state = self.target_state("linux")
         self.assertTrue(list((state / "claims").glob("**/*.json")))
         self.assertFalse((state / "unreachable_until").exists())
-        self.assertNotIn("Traceback", result.stdout + result.stderr)
-        attempts = self.attempts()
-        self.assertEqual([attempt["target"] for attempt in attempts], ["linux", "spare"])
-        self.assertEqual((attempts[0]["outcome"], attempts[0]["completion"], attempts[0]["cleanup"]),
+        attempt, = self.attempts()
+        self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("declined", "missing", "unconfirmed"))
-        self.assertIsNone(attempts[0]["unresolved_count"])
+        self.assertIsNone(attempt["unresolved_count"])
 
 
 class SshReservationTests(unittest.TestCase):
@@ -175,7 +198,7 @@ class SshResultBoundaryTests(unittest.TestCase):
     def test_linux_result_keeps_completion_separate_from_unconfirmed_cleanup(self) -> None:
         offload = eligibility_support.offload
         destination = self.fixture.root / "result"
-        evidence = offload.AttemptEvidence(slot=2, completion="confirmed", cleanup="unconfirmed",
+        evidence = offload.AttemptEvidence(slot=2, completion="confirmed",
                                           unresolved_count=offload.UnresolvedLeftoverCount(), evidence_at=150.5)
         with redirect_stdout(io.StringIO()):
             status = offload.write_result(offload.PassedOnTarget(4.5), offload.ResultFile(destination),

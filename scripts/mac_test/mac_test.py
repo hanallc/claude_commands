@@ -340,6 +340,8 @@ class CliArguments(argparse.Namespace):
         self.episode: str = ""
         self.attempt: str = ""
         self.identity: bool = False
+        self.require_same_holder: bool = False
+        self.claim_record: claim_state.ClaimRecordLocation | claim_state.UnlocatedClaimRecord = claim_state.UNLOCATED_CLAIM_RECORD
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
 
 
@@ -740,12 +742,12 @@ def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     for claim in read_claims(paths):
         if run_is_live(claim.record):
             live.append(claim)
-        elif offload.pending_start_path(paths.target, claim_state.ClaimIdentity(
-                claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])).exists():
+        elif offload.start_journal_present(paths.target, claim_state.claim_identity(claim.record)):
             release = CliArguments()
             release.pid, release.target = claim.record["pid"], paths.target
             release.claim_id = claim.record["claim_id"]
             release.episode, release.attempt = claim.record["episode"], claim.record["attempt"]
+            release.claim_record = claim_state.ClaimRecordLocation(claim.path.relative_to(paths.directory))
             if command_release(release, paths, provider_lock_held=True) != 0:
                 live.append(claim)
         else:
@@ -1520,6 +1522,7 @@ def watch_claim(
     release.pid, release.target = current["pid"], paths.target
     release.claim_id = current["claim_id"]
     release.episode, release.attempt = current["episode"], current["attempt"]
+    release.claim_record = claim_state.ClaimRecordLocation(claim.path.relative_to(paths.directory))
     if command_release(release, paths) != 0:
         return True
     released_at = local_time(timestamp(now), include_zone=False)
@@ -1787,14 +1790,15 @@ def requested_showrunner(name: str) -> Showrunner:
     return NamedShowrunner(name) if name else NO_SHOWRUNNER
 
 
-def print_claim_identity(args: CliArguments, record: RunRecord) -> None:
+def print_claim_receipt(args: CliArguments, record: RunRecord, paths: StatePaths, path: Path) -> None:
     if args.identity:
         identity = claim_state.claim_identity(record)
         print("claim_identity=" + json.dumps({"claim_id": identity.claim_id,
               "episode": identity.episode, "attempt": identity.attempt}))
+        print(f"claim_record={path.relative_to(paths.directory)}")
 
 
-def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
+def take_over_kept_claim(args: CliArguments, paths: StatePaths, claim: HeldClaim, kept: RemoteJobClaim,
                          *, session: SubmittingSession) -> ClaimAttempt:
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
@@ -1809,7 +1813,7 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     else:
         _ = kept.pop("copy", None)
     write_json(claim.path, kept)
-    print_claim_identity(args, kept)
+    print_claim_receipt(args, kept, paths, claim.path)
     print(f"leftovers: {kept['remote_host']}")
     if "slot" in kept:
         print(f"slot: {kept['slot']}")
@@ -1838,7 +1842,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
                 and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
-            print_claim_identity(args, record)
+            print_claim_receipt(args, record, paths, claim.path)
             print(f"leftovers: {record['remote_host']}")
             if "slot" in record:
                 print(f"slot: {record['slot']}")
@@ -1859,7 +1863,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                     and not run_is_kept(claim.record) and "slot" in claim.record
                     and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
                     and isinstance(block, NoMacBlock)):
-                print_claim_identity(args, claim.record)
+                print_claim_receipt(args, claim.record, paths, claim.path)
                 print(f"claimed\nslot: {claim.record['slot']}")
                 return ClaimFinished(0)
         for slot in slots:
@@ -1882,7 +1886,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         for claim in overlapping:
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record):
-                return take_over_kept_claim(args, claim, record, session=session)
+                return take_over_kept_claim(args, paths, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
     owner = session
@@ -1921,7 +1925,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
-    print_claim_identity(args, claimed)
+    print_claim_receipt(args, claimed, paths, path)
     if isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
     print("claimed")
@@ -1987,7 +1991,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     record["pid"] = args.pid
     record["proc_start"] = start.start
     write_json(claim.path, record)
-    print_claim_identity(args, record)
+    print_claim_receipt(args, record, paths, claim.path)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
         remember_slot(paths, claim.scope, record)
         print(f"slot: {claim.scope.slot}")
@@ -2112,35 +2116,62 @@ class ClaimReleaseRefused:
 def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
+    require_same_holder: bool = False,
+    location: claim_state.ClaimRecordLocation | claim_state.UnlocatedClaimRecord = claim_state.UNLOCATED_CLAIM_RECORD,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
 
     with nullcontext() if provider_lock_held else locked(paths.lock):
-        # Each file is read alone, so another repository's damaged record
-        # cannot keep this owner's claim in place.
         owned: list[tuple[Path, RunRecord]] = []
-        for path in claim_files(paths):
+        unreadable: list[StateReadError] = []
+        exact_path = paths.directory / location.relative if isinstance(location, claim_state.ClaimRecordLocation) else None
+        candidates = (exact_path,) if exact_path is not None else claim_files(paths)
+        for path in candidates:
             try:
                 record = read_run(path)
-            except StateReadError:
+            except StateReadError as error:
+                unreadable.append(error)
                 continue
-            if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
-                owned.append((path, record))
+            if isinstance(record, NoRun) or claim_state.claim_identity(record) != identity:
+                continue
+            if record["pid"] != pid:
+                if require_same_holder:
+                    return ClaimReleaseRefused("the exact claim belongs to a different holder")
+                continue
+            owned.append((path, record))
+        if not owned:
+            if unreadable:
+                return ClaimReleaseRefused(f"claim state is unreadable: {unreadable[0]}")
+            if require_same_holder:
+                if offload.start_journal_present(paths.target, identity):
+                    return ClaimReleaseRefused("a start journal remains without a readable claim")
+                if exact_path is not None and any(claim_state.claim_identity(held.record) == identity
+                                                  for held in read_claims(paths)):
+                    return ClaimReleaseRefused("the exact claim is at a different record path")
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
-        pending = offload.pending_start_path(paths.target, identity)
-        if "remote_host" in record and pending.exists():
+        fence: claim_state.FenceRef | claim_state.UnresolvedFenceRef = claim_state.UnresolvedFenceRef()
+        acknowledgement = ""
+        if offload.start_journal_present(paths.target, identity):
+            key = claim_state.ClaimKey.for_target(paths, identity)
+            location = claim_state.ClaimRecordLocation(path.relative_to(paths.directory))
+            recovered = offload.record_start_fence(key, record, location)
+            if not isinstance(recovered, claim_state.StartFenceJournal):
+                return ClaimReleaseRefused("the original start fence is unresolved")
+            fence = recovered.fence
             connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
-            fence = offload.start_fence_command(identity, paths.target, settle=True, scope_key=path.stem)
+            settle = offload.start_fence_command(fence, settle=True, preparation=recovered.preparation)
             # Stopped work ends first, so the fence it holds is free to settle.
-            command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
-                       + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
-                       else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
-            observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
+            command = (offload.verify_start_fence_command(fence, preparation=recovered.preparation) + " || exit 1\n"
+                       + offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
+                       + "\n" + settle + "\n" if isinstance(remote_work, EndStoppedWork)
+                       else settle + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
+            observed = offload.read_leftovers(connection, fence.host, command, paths.target)
             if not isinstance(observed.result, offload.LeftoversEnded):
                 return ClaimReleaseRefused("the remote work of the claim has not ended")
-            if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
+            acknowledgement = fence.acknowledgement("settled")
+            if acknowledgement not in observed.output.splitlines():
                 return ClaimReleaseRefused("the remote start fence remains unconfirmed")
         with nullcontext() if provider_lock_held else locked(paths.lock):
             # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
@@ -2148,7 +2179,11 @@ def release_exact_claims(
             if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
             transfers.extend(current.get("transfers", []))
-            pending.unlink(missing_ok=True)
+            if isinstance(fence, claim_state.FenceRef):
+                if not offload.remove_start_journal(fence, acknowledgement):
+                    return ClaimReleaseRefused("the exact start journal changed during cleanup")
+            elif offload.start_journal_present(paths.target, identity):
+                return ClaimReleaseRefused("a start journal appeared during cleanup")
             path.unlink(missing_ok=True)
     with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
@@ -2158,13 +2193,17 @@ def release_exact_claims(
 
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
-    released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
-                                    args.settings, provider_lock_held=provider_lock_held)
+    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    released = release_exact_claims(paths, args.pid, identity,
+                                    args.settings, provider_lock_held=provider_lock_held,
+                                    require_same_holder=args.require_same_holder, location=args.claim_record)
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12
     if released.transfers:
         print("copy_bytes=" + json.dumps(list(released.transfers)))
+    if args.require_same_holder:
+        print(claim_state.ReleaseReceipt(claim_state.ClaimKey.for_target(paths, identity)).line())
     return 0
 
 
@@ -2607,6 +2646,9 @@ def parser() -> argparse.ArgumentParser:
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
     _ = release.add_argument("--settings", default="")
+    _ = release.add_argument("--require-same-holder", action="store_true")
+    _ = release.add_argument("--claim-record", type=claim_state.ClaimRecordLocation.parse,
+                             default=claim_state.UNLOCATED_CLAIM_RECORD)
     for command in (claim, wait_claim, release):
         for field in ("claim-id", "episode", "attempt"):
             _ = command.add_argument("--" + field, required=command is release, default="")

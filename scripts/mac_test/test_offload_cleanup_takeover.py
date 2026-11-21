@@ -30,9 +30,9 @@ class OffloadCommandTests(SeededCleanupFixture):
                     self.assertTrue(self.claim_file.exists())
                     pending_identity = self.remote_claim()
                     cleanup, = self.leftover_events()
-                    exact = claim_state.ClaimIdentity(pending_identity["claim_id"], pending_identity["episode"],
-                                                     pending_identity["attempt"])
-                    self.assertIn(offload.pending_start_key(exact), cleanup["args"][-1])
+                    fence = self.pending_fence(pending_identity)
+                    self.assertIn(offload.start_fence_command(fence, settle=True, preparation=claim_state.FencePreparation.PREPARED),
+                                  cleanup["args"][-1])
                     self.assertTrue(cleanup["claimed"])
                     previous_host = self.remote_claim()["remote_host"]
                     self.clear_events()
@@ -54,9 +54,8 @@ class OffloadCommandTests(SeededCleanupFixture):
                                       pending_identity["attempt"], pending_identity["remote_host"]))
                     self.assertEqual(self.events_for("rsync"), [])
                     self.clear_events()
-                    exact = claim_state.ClaimIdentity(pending_identity["claim_id"], pending_identity["episode"],
-                                                     pending_identity["attempt"])
-                    self.fixture["cleanup_lines"] = ["dispatch_start_settled=" + offload.pending_start_key(exact),
+                    fence = self.pending_fence(pending_identity)
+                    self.fixture["cleanup_lines"] = [fence.acknowledgement("settled"),
                                                      "leftovers=0", "rc=0"]
                     self.sync_fixture()
                     cleanup_result = self.command("--no-fail-fast", settings=alternate, subprocess_cli=unacknowledged,

@@ -45,7 +45,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot, slot_wait
 from scripts.build_targets import target_config
-from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
+from scripts.build_targets.execution_transport import ExecutionTransport, HanaControlTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
@@ -64,6 +64,7 @@ from scripts.build_queue.scope_activity import (
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
+from scripts.mac_test import claim_state as provider_claim
 
 
 
@@ -885,18 +886,23 @@ class HostEvidenceWorker:
         with self.lock:
             self.observations[evidence.key] = evidence
 
+    @staticmethod
+    def _same_dispatch(first: records.SavedPlacementAssignment, second: records.SavedPlacementAssignment) -> bool:
+        """Reuse the dispatch reading after the release obligation changes."""
+        return replace(first, claim_release=second.claim_release) == second
+
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Request a worker reading and retain ownership until the exact reading arrives."""
         assignment = probe.saved.assignment
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         with self.lock:
             previous = self.dispatch_probes.get(attempt)
-            if previous is None or previous.saved != probe.saved:
+            if previous is None or not self._same_dispatch(previous.saved, probe.saved):
                 self.dispatch_probes[attempt] = probe
                 self.due[probe.key] = float('-inf')
                 self.requested.set()
             observed = self.dispatch_observations.get(attempt)
-            return (observed is None or observed.saved != probe.saved
+            return (observed is None or not self._same_dispatch(observed.saved, probe.saved)
                     or time.monotonic() - observed.observed_at > self.interval
                     or not isinstance(observed.result, placement.DispatchPathSettled))
 
@@ -906,7 +912,8 @@ class HostEvidenceWorker:
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         with self.lock:
             observed = self.dispatch_observations.get(attempt)
-            if observed is not None and observed.saved == saved and isinstance(observed.result, wire.ExecutionReport):
+            if (observed is not None and self._same_dispatch(observed.saved, saved)
+                    and isinstance(observed.result, wire.ExecutionReport)):
                 return observed.result
         return placement.NoTerminalReport()
 
@@ -1520,6 +1527,7 @@ class AdmissionServer:
             self.caller_versions = state.caller_versions
             self.placement_requests = state.placement_requests
             self.assignments = state.assignments
+            self._restore_claim_journals()
             self.current_assignments = state.current_assignments
             self.pending_cloud_groups = state.pending_cloud_groups
         self.persist()
@@ -3041,7 +3049,7 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
-        request = self.host_requests[key]
+        request = self.host_requests.get(key)
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
         target = records.effective_target(destination.target, key.settings)
@@ -3049,49 +3057,60 @@ class AdmissionServer:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
         configuration = conf.read(target.settings if isinstance(target, target_config.SshTarget) else "mac_test",
                                   load=conf.read_bytes)
-        if isinstance(target, target_config.SshTarget):
-            from scripts.aws_target import hana_placement
-
-            transport = target_config.read_execution_transport(target, configuration=configuration)
-            if isinstance(transport, HanaGpuNextestTransport):
-                from scripts.aws_target.hana_placement_adapter import read_gpu_evidence
-
-                return read_gpu_evidence(transport, key, request, configuration=configuration)
-            if isinstance(transport, hana_placement.HanaControlTransport):
-                return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
-        sent = request.constraints.command_kind
-        kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
-        eligibility: placement.HostEligibility
-        if kind in placement.MAC_RUN_KINDS and isinstance(target, target_config.SshTarget) and target.platform == "macos":
-            # A Mac run has no repository step policy. The busy check and the claims below still apply.
-            eligibility = placement.AllowedHost()
-        elif kind not in placement.STEP_COMMAND_KINDS:
-            # The target can never run this command, so a pinned step refuses at once.
-            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
+        if request is None:
+            eligibility: placement.HostEligibility = placement.EvidenceNeeded("recovery reads only the claim inventory")
         else:
             if isinstance(target, target_config.SshTarget):
-                answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
-                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                    new_step=True, session=key.session, configuration=configuration)
+                from scripts.aws_target import hana_placement
+
+                transport = target_config.read_execution_transport(target, configuration=configuration)
+                if isinstance(transport, HanaGpuNextestTransport):
+                    from scripts.aws_target.hana_placement_adapter import read_gpu_evidence
+
+                    return read_gpu_evidence(transport, key, request, configuration=configuration)
+                if isinstance(transport, hana_placement.HanaControlTransport):
+                    return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
+            sent = request.constraints.command_kind
+            kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
+            if kind in placement.MAC_RUN_KINDS and isinstance(target, target_config.SshTarget) and target.platform == "macos":
+                # A Mac run has no repository step policy. The busy check and the claims below still apply.
+                eligibility = placement.AllowedHost()
+            elif kind not in placement.STEP_COMMAND_KINDS:
+                # The target can never run this command, so a pinned step refuses at once.
+                return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
             else:
-                answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
-                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
-                    configuration=configuration)
-            eligibility = (placement.TemporaryExclusion(answer.reason)
-                if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
+                if isinstance(target, target_config.SshTarget):
+                    answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
+                        request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
+                        new_step=True, session=key.session, configuration=configuration)
+                else:
+                    answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
+                        request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
+                        configuration=configuration)
+                eligibility = (placement.TemporaryExclusion(answer.reason)
+                    if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
+        if claim_state.remote_claim_destination(paths.target, paths.platform) != (destination.provider, destination.target):
+            return placement.HostEvidenceUnavailable(key, self.clock.now(), "the configured provider differs from the assignment")
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
-        if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
-                and target.platform == "macos"
+        if (request is not None and isinstance(eligibility, placement.AllowedHost)
+                and isinstance(target, target_config.SshTarget) and target.platform == "macos"
                 and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
                                       session=key.session, configuration=configuration) == "busy"):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
-        with claim_state.locked(paths.lock):
-            held = claim_state.read_claims(paths)
+        try:
+            with claim_state.locked(paths.lock):
+                held = claim_state.read_claims(paths)
+                observed_at = self.clock.now()
+        except (claim_state.StateReadError, OSError) as error:
+            return placement.HostEvidenceUnavailable(key, self.clock.now(), f"claim inventory is unreadable: {error}")
+        inventory = claim_state.claim_inventory(paths, held)
+        if request is None:
+            return placement.FreshHostEvidence(key, observed_at, "", eligibility, inventory=inventory)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)
@@ -3104,12 +3123,11 @@ class AdmissionServer:
                     holder = placement.ResourceHolderSession(session_id)
                     break
         generation = ""
-        for claim in held:
+        for claim, lifecycle in zip(held, inventory.claims, strict=True):
             record = claim.record
             if "remote_host" not in record:
                 continue
-            reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
-                record["claim_id"], record["episode"], record["attempt"])
+            reference = placement.ProviderClaimReference.from_claim(lifecycle)
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()
             if record.get("cleanup_pending", False):
@@ -3121,7 +3139,9 @@ class AdmissionServer:
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record["remote_host"], record.get("instance_generation", ""), configuration)))
-        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+        return placement.FreshHostEvidence(key, observed_at, generation, eligibility,
+            tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic,
+            inventory=inventory)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,
@@ -3171,8 +3191,9 @@ done
             last[episode] = max(last.get(episode, at), at)
         owners = {saved.assignment.episode: saved.assignment.owner for saved in self.assignments.values()}
         owners.update((episode, request.owner) for episode, request in self.placement_requests.items())
+        obligated = {saved.assignment.episode for saved in self.assignments.values() if saved.release_pending()}
         ended = {episode for episode, at in last.items()
-                 if at < cutoff and episode not in self.current_assignments
+                 if at < cutoff and episode not in obligated and episode not in self.current_assignments
                  and not self._placement_owner_live(owners[episode])}
         if not ended:
             return
@@ -3189,22 +3210,47 @@ done
 
     def _saved_assignment(self, episode: str, attempt: str
                           ) -> records.SavedPlacementAssignment | status_wire.UnknownPlacementStatus:
-        return self.assignments.get(execution_identity.attempt_key(episode, attempt),
-            status_wire.UnknownPlacementStatus(episode, attempt))
+        saved = self.assignments.get(execution_identity.attempt_key(episode, attempt))
+        if saved is None or isinstance(saved.state, placement.ClosedAssignment) and saved.release_pending():
+            return status_wire.UnknownPlacementStatus(episode, attempt)
+        return saved
 
-    def _provider_release_evidence(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None
-                                   ) -> placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest:
-        """Read evidence for the submitted request under the current configuration."""
-        submitted = self.placement_requests.get(saved.assignment.episode, NoSubmittedPlacementRequest())
-        if isinstance(submitted, NoSubmittedPlacementRequest):
-            return submitted
-        key = self._placement_evidence_key(submitted, saved.assignment.destination, keys)
-        return key if isinstance(key, placement.EvidenceNeeded) else self.host_evidence(key)
+    def _release_evidence_key(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None
+                              ) -> placement.HostEvidenceKey | placement.EvidenceNeeded:
+        assignment = saved.assignment
+        destination = assignment.destination
+        submitted = self.placement_requests.get(assignment.episode)
+        if submitted is not None:
+            return self._placement_evidence_key(submitted, destination, keys)
+        settings = placement.ConfiguredProviderSettings()
+        try:
+            with conf.report_key_changes():
+                generation = _provider_configuration().generation(destination.target, settings)
+        except (OSError, ValueError) as error:
+            return placement.EvidenceNeeded(str(error))
+        return placement.HostEvidenceKey(destination, assignment.session, (), generation)
+
+    def _provider_release_evidence(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None,
+                                   *, refresh: bool = False) -> placement.HostEvidence | placement.EvidenceNeeded:
+        """Refresh the exact provider even after the original request ends."""
+        key = self._release_evidence_key(saved, keys)
+        if isinstance(key, placement.EvidenceNeeded):
+            return key
+        evidence = self.host_evidence(key)
+        if refresh and not isinstance(evidence, placement.FreshHostEvidence):
+            assignment = saved.assignment
+            self.placement_host_keys[(assignment.episode, assignment.destination)] = key
+            submitted = self.placement_requests.get(assignment.episode)
+            if submitted is not None:
+                self.host_requests[key] = submitted
+            if isinstance(self.last_usable_configuration, records.MemoryConfig):
+                _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+        return evidence
 
     def _assignment_state(self, saved: records.SavedPlacementAssignment) -> placement.AssignmentState:
-        """Project placement lifetime without changing records or requesting evidence."""
+        """Project placement lifetime without releasing the provider claim."""
         if isinstance(saved.state, placement.ClosedAssignment):
-            return saved.state
+            return placement.CurrentAssignment() if saved.release_pending() else saved.state
         assignment = saved.assignment
         if assignment.destination.provider == "local":
             replay = self.ledger.get(assignment.episode)
@@ -3217,43 +3263,126 @@ done
                 return placement.ClosedAssignment("local run has ended")
             if isinstance(self._lifetime(reservation), gate.EndedStep):
                 return placement.ClosedAssignment("local execution has ended")
-        elif self._provider_claim_released(saved, self._provider_release_evidence(saved)):
+        elif isinstance(saved.claim_release, records.ProviderClaimReleased) and not saved.release_pending():
             return placement.ClosedAssignment("provider claim released")
+        elif saved.release_pending() and not isinstance(self._provider_release_proof(saved, self._provider_release_evidence(saved)),
+                                                       records.ProviderReleaseUnconfirmed):
+            return placement.ClosedAssignment("provider claim released")
+        elif self._allows_claim_takeover(saved):
+            return placement.ClosedAssignment("provider assignment ended")
         return saved.state
 
-    def _provider_claim_released(self, saved: records.SavedPlacementAssignment,
-                                 evidence: placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest) -> bool:
-        """Confirm claim release under the same rules for status, replay, and settlement."""
-        assignment = saved.assignment
-        if (not isinstance(saved.state, placement.CurrentAssignment)
-                or self.current_assignments.get(assignment.episode) != execution_identity.attempt_key(assignment.episode, assignment.attempt)
-                or assignment.episode not in self.placement_requests):
-            return False
-        if self._claim_holder_ended(saved):
-            return True
-        if (not isinstance(evidence, placement.FreshHostEvidence)
-                or any(claim.reference == saved.provider for claim in (*evidence.claims, *evidence.cleanup_claims))):
-            return False
-        report = saved.terminal_report
-        if isinstance(report, placement.TerminalAttemptReport):
-            return (isinstance(report.path, placement.DispatchPathSettled)
-                and isinstance(report.outcome, placement.AttemptDeclined)
-                and evidence.observed_at >= report.received_at)
-        return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
-            and isinstance(saved.permission, placement.PermissionConsumed)
-            and evidence.observed_at > saved.permission.consumed_at
-            and not self._start_pending(saved))
+    @staticmethod
+    def _provider_report_needs_release(saved: records.SavedPlacementAssignment) -> bool:
+        return saved.release_pending() and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
 
-    def _claim_holder_ended(self, saved: records.SavedPlacementAssignment) -> bool:
-        """A provider claim whose holder and submitting owner ended frees its assignment.
+    def _provider_release_proof(self, saved: records.SavedPlacementAssignment,
+                               evidence: placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest
+                               ) -> records.ProviderReleaseEvidence | records.ProviderReleaseUnconfirmed:
+        """Accept exact release evidence only after the applicable dispatch ends."""
+        unconfirmed = records.ProviderReleaseUnconfirmed()
+        provider = saved.provider
+        journal = self._claim_journal(saved)
+        report = saved.terminal_report
+        if isinstance(provider, placement.NoProviderClaim):
+            if (not isinstance(journal, records.HanaClaimJournal)
+                    or not isinstance(saved.permission, placement.PermissionAvailable)
+                    or not isinstance(report, placement.TerminalAttemptReport)):
+                return unconfirmed
+            if (isinstance(report.path, placement.DispatchPathSettled)
+                    and isinstance(report.path.release, provider_claim.NoClaimAcquired)):
+                return report.path.release
+            # Old reports can omit the claim. Look up their journal by the assignment.
+            provider = placement.assigned_claim_reference(saved.assignment)
+        if isinstance(journal, records.HanaClaimJournal):
+            if (saved.assignment.destination.host != journal.host
+                    or self._hana_release_pending(journal, provider, require_dispatch_settlement=True)):
+                return unconfirmed
+            return records.NativeClaimRelease(provider.key)
+        if (isinstance(journal, records.ClaimJournalUnrecorded)
+                or journal.directory != target_config.ssh_target_state_directory(provider.target).resolve()):
+            return unconfirmed
+        if isinstance(journal, records.SshClaimJournal) and self._ssh_start_journal_pending(saved, journal):
+            return unconfirmed
+        if isinstance(journal, records.HanaGpuClaimState):
+            from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
+
+            try:
+                if gpu_claim_pending(provider.target, provider.claim_id):
+                    return unconfirmed
+            except (OSError, ValueError, provider_claim.StateReadError):
+                return unconfirmed
+        acquisition = saved.acquisition_evidence()
+        if (isinstance(acquisition, records.ClaimAcquisitionUnconfirmed)
+                and isinstance(saved.terminal_report, placement.NoTerminalReport)
+                and isinstance(saved.permission, placement.PermissionConsumed)
+                and (self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))):
+            acquisition = records.ClaimAcquisitionEnded(saved.permission.consumed_at)
+        if not isinstance(acquisition, records.ClaimAcquisitionEnded):
+            return unconfirmed
+        if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled):
+            receipt = report.path.release
+            if isinstance(receipt, provider_claim.ReleaseReceipt) and receipt.key == provider.key:
+                return receipt
+        if (not isinstance(evidence, placement.FreshHostEvidence)
+                or not isinstance(evidence.inventory, provider_claim.CompleteClaimInventory)
+                or (provider.provider, provider.target) != (evidence.key.destination.provider, evidence.key.destination.target)
+                or evidence.observed_at <= acquisition.observed_at
+                or journal != self._registered_claim_journal(evidence.key.destination, evidence.key.settings)):
+            return unconfirmed
+        proof = evidence.inventory.evidence(provider.key)
+        return (provider_claim.AuthoritativeClaimAbsence(proof.key)
+                if isinstance(proof, provider_claim.ClaimAbsentFromInventory) else unconfirmed)
+
+    def _confirm_provider_release(self, saved: records.SavedPlacementAssignment,
+                                  evidence: placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest
+                                  ) -> records.SavedPlacementAssignment:
+        """Make the only transition that removes the provider obligation."""
+        if (isinstance(saved.claim_release, records.ProviderClaimReleased) and not saved.release_pending()
+                or saved.assignment.destination.provider == "local"):
+            return saved
+        proof = self._provider_release_proof(saved, evidence)
+        if isinstance(proof, records.ProviderReleaseUnconfirmed):
+            return saved
+        report = saved.terminal_report
+        retry = saved.retry
+        if isinstance(report, placement.TerminalAttemptReport):
+            if (isinstance(proof, records.NativeClaimRelease)
+                    and isinstance(report.path, placement.DispatchPathPending)
+                    and isinstance(report.outcome, placement.PrelaunchRefused)
+                    and isinstance(saved.permission, placement.PermissionAvailable)):
+                retry = placement.DoNotRetry(report.outcome.reason)
+            path = (placement.DispatchPathSettled() if isinstance(proof, records.NativeClaimRelease)
+                    else placement.DispatchPathSettled(proof))
+            report = replace(report, path=path)
+        return replace(saved, claim_release=records.ProviderClaimReleased(proof),
+                       terminal_report=report, retry=retry)
+
+    def _allows_claim_takeover(self, saved: records.SavedPlacementAssignment) -> bool:
+        """Allow a successor to adopt a dead holder's claim without releasing it."""
+        report = saved.terminal_report
+        return (saved.release_pending()
+                and (isinstance(report, placement.NoTerminalReport) or report.outcome == placement.AttemptDeclined("lost"))
+                and self._takeover_assignment_ended(saved))
+
+    def _takeover_assignment_ended(self, saved: records.SavedPlacementAssignment) -> bool:
+        """Allow a new assignment when the previous owner and holder ended.
 
         The Mac can keep the claim after its holder ends. The next claim for the scope takes it
         over and checks for leftovers, so the old assignment holds nothing. A live owner can still
         send a terminal report, and a pending start can still launch, so both keep it current.
         """
-        return (self._ended_claim_holder(saved)
-            and not self._placement_owner_live(saved.assignment.owner)
-            and not self._start_pending(saved))
+        if not self._ended_claim_holder(saved) or self._placement_owner_live(saved.assignment.owner):
+            return False
+        journal = self._claim_journal(saved)
+        if not isinstance(journal, records.SshClaimJournal):
+            return False
+        destination = saved.assignment.destination
+        submitted = self.placement_requests.get(saved.assignment.episode)
+        settings = (placement.ConfiguredProviderSettings() if submitted is None
+                    else self._placement_settings(submitted, destination))
+        return (journal == self._registered_claim_journal(destination, settings)
+                and not self._ssh_start_journal_pending(saved, journal))
 
     def _ended_claim_holder(self, saved: records.SavedPlacementAssignment) -> bool:
         return (saved.assignment.destination.provider != "local"
@@ -3274,74 +3403,163 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
                 and not self._placement_owner_live(saved.assignment.owner))
 
-    def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
-        from scripts.mac_test import claim_state, offload
-
-        provider = saved.provider
-        from scripts.aws_target import hana_placement
-        if saved.assignment.destination.provider == 'ssh':
-            try:
-                destination = saved.assignment.destination
-                submitted = self.placement_requests.get(saved.assignment.episode)
-                settings = (placement.ConfiguredProviderSettings() if submitted is None
-                            else self._placement_settings(submitted, destination))
-                with conf.report_key_changes():
+    @staticmethod
+    def _registered_claim_journal(destination: placement.PlacementDestination,
+                                  settings: placement.ProviderSettings) -> records.ClaimJournal:
+        try:
+            with conf.report_key_changes():
+                if destination.provider == "mac":
+                    return records.SshClaimJournal(target_config.ssh_target_state_directory(destination.target).resolve())
+                if destination.provider == "ssh":
                     configuration = _provider_configuration()
                     target = configuration.target(destination.target, settings)
-                    if not isinstance(target, target_config.SshTarget):
-                        return True
-                    transport = configuration.transport(target)
-                if isinstance(transport, HanaGpuNextestTransport):
-                    from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
+                    if isinstance(target, target_config.SshTarget):
+                        transport = configuration.transport(target)
+                        if isinstance(transport, HanaControlTransport):
+                            from scripts.aws_target import hana_placement
 
-                    return gpu_claim_pending(destination.target,
-                        execution_identity.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt))
-                if isinstance(transport, hana_placement.HanaControlTransport):
-                    if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
-                        return True
-                    reference = placement.assigned_claim_reference(saved.assignment)
+                            controller = hana_placement.controller_for(transport, read_only=True)
+                            return records.HanaClaimJournal(controller.directory.resolve(), transport.settings, transport.host)
+                        directory = target_config.ssh_target_state_directory(destination.target).resolve()
+                        if isinstance(transport, HanaGpuNextestTransport):
+                            return records.HanaGpuClaimState(directory)
+                        return records.SshClaimJournal(directory)
+        except (OSError, ValueError):
+            pass
+        return records.ClaimJournalUnrecorded()
 
-                    def read_dispatch() -> placement.DispatchPathState | wire.ExecutionReport:
-                        from scripts.aws_target.hana_execution import HanaSettled, claim_dispatch_pending
-                        from scripts.aws_target.hana_placement_adapter import recover_assigned_execution
-
-                        controller = hana_placement.controller_for(transport, read_only=True)
-                        report = saved.terminal_report
-                        if (isinstance(saved.permission, placement.PermissionConsumed)
-                                and isinstance(saved.holder, placement.ClaimHolderIdentity)
-                                and (isinstance(report, placement.NoTerminalReport)
-                                     or isinstance(report.path, placement.DispatchPathPending))):
-                            if saved.provider != reference or destination.host != transport.host:
-                                return placement.DispatchPathPending('The Hana claim differs from the assignment')
-                            recovered = recover_assigned_execution(saved.assignment, saved.holder, controller)
-                            if isinstance(recovered, HanaSettled):
-                                outcome = report.outcome if isinstance(report, placement.TerminalAttemptReport) else recovered.outcome
-                                evidence = (execution_identity.ExecutionNotStarted()
-                                    if isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
-                                    else recovered.evidence)
-                                return wire.ExecutionReport('hana-recovery:' + reference.claim_id, saved.assignment,
-                                    reference, evidence, outcome, placement.DispatchPathSettled())
-                            return placement.DispatchPathPending(recovered.reason)
-                        if (controller.execution_bound(reference.claim_id)
-                                and claim_dispatch_pending(controller.directory, reference)):
-                            return placement.DispatchPathPending('The Hana dispatch remains pending')
-                        return placement.DispatchPathSettled()
-
-                    key = self.host_evidence_key(submitted, destination)
-                    self.host_requests[key] = submitted
-                    self.placement_host_keys[(submitted.episode, destination)] = key
-                    reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-                    return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read_dispatch))
-            except (OSError, ValueError):
-                return True
-        if not isinstance(provider, placement.ProviderClaimReference):
-            return False
-        identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
-        with conf.report_key_changes():
+    def _claim_journal(self, saved: records.SavedPlacementAssignment) -> records.ClaimJournal:
+        """Keep the original journal across retries, restart, and settings changes."""
+        journal = saved.claim_journal
+        if not isinstance(journal, records.ClaimJournalUnrecorded):
+            return journal
+        assignment = saved.assignment
+        destination = assignment.destination
+        submitted = self.placement_requests.get(assignment.episode)
+        settings = (placement.ConfiguredProviderSettings() if submitted is None
+                    else self._placement_settings(submitted, destination))
+        recorded = saved.assigned_settings_generation
+        if destination.provider == "ssh" and isinstance(recorded, placement.AssignedSettingsGeneration):
             try:
-                return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
-            except conf.Unusable:
+                with conf.report_key_changes():
+                    if _provider_configuration().generation(destination.target, settings) != recorded.digest:
+                        return journal
+            except (OSError, ValueError):
+                return journal
+        return self._registered_claim_journal(destination, settings)
+
+    @staticmethod
+    def _hana_release_pending(journal: records.HanaClaimJournal, reference: placement.ProviderClaimReference, *,
+                              require_dispatch_settlement: bool = False) -> bool:
+        from scripts.aws_target import hana_execution, hana_placement
+
+        try:
+            transport = HanaControlTransport(journal.settings, journal.host)
+            controller = hana_placement.controller_for(transport, read_only=True)
+            return (controller.directory.resolve() != journal.directory
+                    or hana_execution.claim_release_state(controller, reference,
+                        require_dispatch_settlement=require_dispatch_settlement) is hana_execution.ClaimReleaseState.PENDING)
+        except (OSError, ValueError):
+            return True
+
+    def _restore_claim_journals(self) -> None:
+        """Restore exact journal obligations from assignments saved before their binding."""
+        for key, saved in self.assignments.items():
+            if saved.assignment.destination.provider not in ("mac", "ssh"):
+                continue
+            if not saved.release_pending() and isinstance(saved.claim_release, records.ProviderClaimReleased):
+                continue
+            journal = self._claim_journal(saved)
+            provider = saved.provider
+            if isinstance(provider, placement.NoProviderClaim):
+                assigned = placement.assigned_claim_reference(saved.assignment)
+                if isinstance(journal, records.SshClaimJournal) and self._ssh_start_journal_pending(saved, journal):
+                    provider = assigned
+                elif isinstance(journal, records.HanaClaimJournal) and self._hana_release_pending(journal, assigned):
+                    provider = assigned
+            if provider != saved.provider or journal != saved.claim_journal:
+                self.assignments[key] = replace(saved, provider=provider, claim_journal=journal)
+
+    def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
+        """Check the applicable dispatch journal for an exact attempt."""
+        assignment = saved.assignment
+        destination = assignment.destination
+        journal = self._claim_journal(saved)
+        if isinstance(journal, records.SshClaimJournal):
+            return self._ssh_start_journal_pending(saved, journal)
+        if isinstance(journal, records.ClaimJournalUnrecorded):
+            return destination.provider in ("mac", "ssh")
+        if isinstance(journal, records.HanaGpuClaimState):
+            from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
+
+            try:
+                return (journal.directory != target_config.ssh_target_state_directory(destination.target).resolve()
+                        or gpu_claim_pending(destination.target,
+                            execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)))
+            except (OSError, ValueError, provider_claim.StateReadError):
                 return True
+
+        from scripts.aws_target import hana_placement
+
+        submitted = self.placement_requests.get(assignment.episode)
+        transport = HanaControlTransport(journal.settings, journal.host)
+        try:
+            if not isinstance(self.last_usable_configuration, records.MemoryConfig):
+                return True
+            reference = placement.assigned_claim_reference(saved.assignment)
+
+            def read_dispatch() -> placement.DispatchPathState | wire.ExecutionReport:
+                from scripts.aws_target.hana_execution import ClaimReleaseState, HanaSettled, claim_release_state
+                from scripts.aws_target.hana_placement_adapter import recover_assigned_execution
+
+                controller = hana_placement.controller_for(transport, read_only=True)
+                if controller.directory.resolve() != journal.directory:
+                    return placement.DispatchPathPending("The Hana journal directory changed")
+                report = saved.terminal_report
+                if (self._ended_claim_holder(saved)
+                        and isinstance(saved.holder, placement.ClaimHolderIdentity)):
+                    if saved.provider != reference or destination.host != transport.host:
+                        return placement.DispatchPathPending('The Hana claim differs from the assignment')
+                    recovered = recover_assigned_execution(saved.assignment, saved.holder, controller)
+                    if isinstance(recovered, HanaSettled):
+                        outcome = report.outcome if isinstance(report, placement.TerminalAttemptReport) else recovered.outcome
+                        evidence = (execution_identity.ExecutionNotStarted()
+                            if isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                            else recovered.evidence)
+                        return wire.ExecutionReport('hana-recovery:' + reference.claim_id, saved.assignment,
+                            reference, evidence, outcome, placement.DispatchPathSettled())
+                    return placement.DispatchPathPending(recovered.reason)
+                assigned_claim = (isinstance(saved.provider, placement.ProviderClaimReference)
+                    and (saved.provider.episode, saved.provider.attempt) == (reference.episode, reference.attempt))
+                release = claim_release_state(controller, reference, require_dispatch_settlement=assigned_claim,
+                                              wait_for_controller=True)
+                if release is ClaimReleaseState.PENDING:
+                    return placement.DispatchPathPending('The Hana dispatch remains pending')
+                return placement.DispatchPathSettled()
+
+            key = self._release_evidence_key(saved, None)
+            if isinstance(key, placement.EvidenceNeeded):
+                return True
+            if submitted is not None:
+                self.host_requests[key] = submitted
+            self.placement_host_keys[(saved.assignment.episode, destination)] = key
+            reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+            return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read_dispatch))
+        except (OSError, ValueError):
+            return True
+
+    @staticmethod
+    def _ssh_start_journal_pending(saved: records.SavedPlacementAssignment, journal: records.SshClaimJournal) -> bool:
+        from scripts.mac_test import offload
+
+        assigned = placement.assigned_claim_reference(saved.assignment)
+        references = (saved.provider, assigned) if isinstance(saved.provider, placement.ProviderClaimReference) else (assigned,)
+        return any(offload.start_journal_present(reference.target, reference.key.identity, directory=journal.directory)
+                   for reference in references)
+
+    def _recorded_start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
+        journal = self._claim_journal(saved)
+        return isinstance(journal, records.SshClaimJournal) and self._ssh_start_journal_pending(saved, journal)
 
     def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
         if self._ended_claim_holder(saved):
@@ -3456,23 +3674,23 @@ done
                 permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
                              else placement.EvidenceNeeded(evidence.reason))
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
+                    from scripts.mac_test import claim_state
                     from scripts.mac_test.mac_test import scopes_overlap
 
-                    retained = tuple((attempt.provider, report.received_at) for attempt in self.assignments.values()
-                        for report in (attempt.terminal_report,)
-                        if isinstance(attempt.state, placement.ClosedAssignment)
-                        and isinstance(report, placement.TerminalAttemptReport)
-                        and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                    retained = tuple(attempt for attempt in self.assignments.values()
+                        if attempt.release_pending()
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
-                        and scopes_overlap(attempt.provider.scope, destination.scope))
-                    if any(scopes_overlap(claim.reference.scope, destination.scope)
-                            and (isinstance(claim, placement.RetainedCleanupClaim)
-                                 or any(claim.reference == item[0] for item in retained))
-                            for claim in (*evidence.cleanup_claims, *evidence.claims)):
+                        and scopes_overlap(attempt.provider.scope, destination.scope)
+                        and not self._allows_claim_takeover(attempt))
+                    if (any(scopes_overlap(claim.reference.scope, destination.scope) for claim in evidence.cleanup_claims)
+                            or any(self._recorded_start_pending(attempt) for attempt in retained)
+                            or any(attempt.provider in evidence.held_claims for attempt in retained)):
                         permitted = placement.TemporaryExclusion("busy")
-                    elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
-                        permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+                    elif retained and not isinstance(evidence.inventory, claim_state.CompleteClaimInventory):
+                        permitted = placement.EvidenceNeeded("the retained claim inventory is incomplete")
+                    elif retained:
+                        permitted = placement.EvidenceNeeded("the retained claim release is unconfirmed")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -3545,6 +3763,7 @@ done
     def _prune_host_evidence(self) -> None:
         active = {episode for episode, request in self.placement_requests.items()
                   if episode in self.current_assignments or self._placement_waiting(request)}
+        active.update(saved.assignment.episode for saved in self.assignments.values() if saved.release_pending())
         self.placement_host_keys = {pair: key for pair, key in self.placement_host_keys.items()
                                     if pair[0] in active
                                     and (pair[1].provider != "local" or pair[0] in self.waiters
@@ -3564,7 +3783,7 @@ done
         # Keep the current holder label without retaining local process evidence.
         self.local_hold_holders.clear()
         for saved in self.assignments.values():
-            if saved.assignment.destination.provider == "local":
+            if saved.assignment.destination.provider == "local" or saved.release_pending():
                 continue
             submitted = self.placement_requests.get(saved.assignment.episode)
             if submitted is not None and (submitted.episode in self.current_assignments
@@ -3578,7 +3797,8 @@ done
             saved = self.assignments.get(key)
             if not self._placement_owner_live(request.owner):
                 if saved is not None:
-                    if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
+                    if (isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved)
+                            and not self._provider_report_needs_release(saved)):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
                     else:
                         self.assignments[key] = self._end_remote_start_hold(request, saved)
@@ -3615,9 +3835,10 @@ done
         hold = (records.RemoteStartHold(self.clock.now() + remote_start_hold_seconds)
                 if destination.provider != "local" and self._can_hold_local_place(request)
                 else records.RemoteStartHoldUnrecorded())
+        journal = self._registered_claim_journal(destination, evidence_key.settings)
         self.assignments[key] = records.SavedPlacementAssignment(assignment,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
-            remote_start_hold=hold)
+            remote_start_hold=hold, claim_journal=journal)
         self.current_assignments[request.episode] = key
         return assignment
 
@@ -3687,7 +3908,7 @@ done
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
-            if isinstance(saved.permission, placement.PermissionConsumed):
+            if isinstance(saved.permission, placement.PermissionConsumed) or saved.release_pending():
                 return wire.PlacementWait(request.episode, request.since, 1,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
@@ -4022,6 +4243,14 @@ done
 
     def _close_placement(self, saved: records.SavedPlacementAssignment, reason: str,
                          retry: placement.RetryDecision) -> None:
+        if saved.release_pending() or (isinstance(saved.provider, placement.NoProviderClaim)
+                                       and self._recorded_start_pending(saved)):
+            return
+        self._finish_placement(saved, reason, retry)
+
+    def _finish_placement(self, saved: records.SavedPlacementAssignment, reason: str,
+                          retry: placement.RetryDecision) -> None:
+        """Record the outcome while preserving the independent claim obligation."""
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         self._drop_waiter(assignment.episode)
@@ -4035,89 +4264,86 @@ done
         self.persist()
         self.next_pass = self.clock.monotonic()
 
-    def _settle_hana_prelaunch(self, saved: records.SavedPlacementAssignment,
-                               report: placement.TerminalAttemptReport) -> bool:
-        """Close a Hana attempt when its journal confirms release before launch."""
+    def _close_unbound_hana_attempt(self, saved: records.SavedPlacementAssignment,
+                                    report: placement.TerminalAttemptReport) -> bool:
+        """Close an unbound successor while retaining the inherited claim."""
+        provider = saved.provider
         assignment = saved.assignment
         if (assignment.destination.provider != "ssh"
                 or not isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled,
                                                      execution_identity.HanaCommandAdmissionRefused))
-                or not isinstance(saved.permission, placement.PermissionAvailable)):
+                or not isinstance(saved.permission, placement.PermissionAvailable)
+                or not isinstance(provider, placement.ProviderClaimReference)
+                or (provider.episode, provider.attempt) == (assignment.episode, assignment.attempt)):
             return False
-        from scripts.aws_target import hana_placement
-        from scripts.aws_target.hana_execution import claim_dispatch_pending, read_claim_execution
-
         try:
-            target = target_config.configured_ssh_target(assignment.destination.target)
-            transport = _provider_configuration().transport(target)
-            if not isinstance(transport, hana_placement.HanaControlTransport):
+            if not isinstance(self._claim_journal(saved), records.HanaClaimJournal) or self._start_pending(saved):
                 return False
-            directory = hana_placement.controller_for(transport, read_only=True).directory
         except (OSError, ValueError):
             return False
-        reference = placement.assigned_claim_reference(assignment)
-        # The atomic journal proves settlement without a controller lock or a provider probe.
-        if (claim_dispatch_pending(directory, reference)
-                or not isinstance(read_claim_execution(directory, reference), execution_identity.ExecutionNotStarted)):
-            return False
-        settled = replace(report, path=placement.DispatchPathSettled())
         reason = report.outcome.reason
-        state_reason = "cancelled" if isinstance(report.outcome, placement.AttemptCancelled) else reason
-        self._close_placement(replace(saved, terminal_report=settled), state_reason, placement.DoNotRetry(reason))
+        if isinstance(report.outcome, placement.AttemptCancelled):
+            self._finish_placement(saved, "cancelled", placement.DoNotRetry(reason))
+        else:
+            self._finish_placement(saved, reason, saved.retry)
         return True
 
     def _settle_attempt_reports(self, keys: PlacementEvidenceKeys) -> None:
         for key, saved in tuple(self.assignments.items()):
             assignment = saved.assignment
-            if self.current_assignments.get(assignment.episode) != key:
+            current = self.current_assignments.get(assignment.episode) == key
+            native_release = (isinstance(saved.claim_release, records.ProviderClaimReleased)
+                              and isinstance(saved.claim_release.evidence, records.NativeClaimRelease))
+            if saved.release_pending() or current and native_release:
+                if isinstance(recovered := self._recovered_hana_dispatch(saved), wire.ExecutionReport) and current:
+                    _ = self._handle_placement(recovered)
+                    continue
+            if saved.release_pending():
+                evidence = self._provider_release_evidence(saved, keys, refresh=True)
+                verified = self._confirm_provider_release(saved, evidence)
+                if verified != saved:
+                    self.assignments[key] = saved = verified
+                if saved.release_pending():
+                    if not current:
+                        continue
+                    report = saved.terminal_report
+                    if isinstance(report, placement.TerminalAttemptReport) and self._close_unbound_hana_attempt(saved, report):
+                        continue
+                    if self._allows_claim_takeover(saved):
+                        if isinstance(report, placement.NoTerminalReport):
+                            report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
+                                placement.DispatchPathSettled(), self.clock.now())
+                        self._finish_placement(replace(saved, terminal_report=report), "lost",
+                            placement.retry_decision(assignment.destination, "lost", report.received_at))
+                    continue
+            if not current:
                 continue
+            if isinstance(saved.provider, placement.NoProviderClaim):
+                saved = self._confirm_provider_release(saved, NoSubmittedPlacementRequest())
             report = saved.terminal_report
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
-                    and self._settle_hana_prelaunch(saved, report)):
-                continue
-            if (isinstance(report, placement.TerminalAttemptReport)
-                    and isinstance(report.path, placement.DispatchPathPending)
                     and isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled))
-                    and (isinstance(saved.provider, placement.NoProviderClaim)
-                        or isinstance(report.outcome, placement.PrelaunchRefused)
-                        and (saved.provider.episode, saved.provider.attempt) != (assignment.episode, assignment.attempt))
-                    and isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved)):
+                    and isinstance(saved.provider, placement.NoProviderClaim)
+                    and isinstance(saved.permission, placement.PermissionAvailable)
+                    and not self._start_pending(saved)):
                 report = replace(report, path=placement.DispatchPathSettled())
                 saved = replace(saved, terminal_report=report)
-            if (isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
-                    and not isinstance(report.outcome, placement.AttemptDeclined)):
+            if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled):
                 self._close_for_report(saved, report)
-                continue
-            if assignment.destination.provider == "local":
-                # A coordinator that ends before its execution report leaves the local assignment current.
+            elif assignment.destination.provider == "local":
                 state = self._assignment_state(saved)
                 if isinstance(state, placement.ClosedAssignment) and not self._placement_owner_live(assignment.owner):
                     self._close_placement(saved, state.reason, placement.DoNotRetry("coordinator ended"))
-                continue
-            submitted = self.placement_requests.get(assignment.episode)
-            if submitted is None:
-                continue
-            if isinstance(recovered := self._recovered_hana_dispatch(saved), wire.ExecutionReport):
-                _ = self._handle_placement(recovered)
-                if self.current_assignments.get(assignment.episode) == key:
-                    # The worker already confirmed release for the exact settled decline.
-                    updated = self.assignments[key]
-                    terminal = updated.terminal_report
-                    if (isinstance(terminal, placement.TerminalAttemptReport)
-                            and isinstance(terminal.path, placement.DispatchPathSettled)
-                            and terminal.outcome == recovered.outcome):
-                        self._close_for_report(updated, terminal)
-                continue
-            if not self._claim_holder_ended(saved):
-                _ = self._request_host_evidence(submitted, assignment.destination, keys)
-                if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
-                    continue
-            if isinstance(report, placement.NoTerminalReport):
-                report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
-                    placement.DispatchPathSettled(), self.clock.now())
-                saved = replace(saved, terminal_report=report)
-            self._close_for_report(saved, report)
+            elif (isinstance(saved.claim_release, records.ProviderClaimReleased)
+                    and isinstance(saved.claim_release.evidence, (provider_claim.ReleaseReceipt,
+                                                                  provider_claim.AuthoritativeClaimAbsence))):
+                path = placement.DispatchPathSettled(saved.claim_release.evidence)
+                if isinstance(report, placement.NoTerminalReport):
+                    report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), path, self.clock.now())
+                else:
+                    report = replace(report, path=path)
+                self._close_for_report(replace(saved, terminal_report=report), report)
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
@@ -4128,10 +4354,58 @@ done
         elif isinstance(outcome, execution_identity.HanaCommandAdmissionRefused):
             self._close_placement(saved, outcome.reason,
                 placement.retry_decision(saved.assignment.destination, outcome, report.received_at))
-        elif not self._settle_hana_prelaunch(saved, report):
+        else:
             self._close_placement(saved, outcome.reason,
-                saved.retry if isinstance(saved.retry, placement.RetryAt) else
+                saved.retry if saved.retry != placement.DoNotRetry("attempt is not settled") else
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
+
+    def _accepts_execution_report(self, saved: records.SavedPlacementAssignment, request: wire.ExecutionReport) -> bool:
+        if (isinstance(saved.state, placement.ClosedAssignment)
+                and (not saved.release_pending() or saved.provider != request.claim)):
+            return False
+        if isinstance(request.path, placement.DispatchPathSettled):
+            proof = request.path.release
+            if isinstance(proof, provider_claim.NoClaimAcquired):
+                journal = self._claim_journal(saved)
+                return (isinstance(request.claim, placement.NoProviderClaim)
+                        and isinstance(saved.provider, placement.NoProviderClaim)
+                        and isinstance(saved.permission, placement.PermissionAvailable)
+                        and isinstance(request.outcome, execution_identity.HanaCommandAdmissionRefused)
+                        and isinstance(request.evidence, execution_identity.ExecutionNotStarted)
+                        and isinstance(journal, records.HanaClaimJournal)
+                        and not self._hana_release_pending(journal, placement.assigned_claim_reference(saved.assignment)))
+            if (isinstance(proof, provider_claim.AuthoritativeClaimAbsence)
+                    or isinstance(proof, provider_claim.ReleaseReceipt)
+                    and (not isinstance(request.claim, placement.ProviderClaimReference) or proof.key != request.claim.key)):
+                return False
+        if isinstance(saved.permission, placement.PermissionConsumed):
+            return saved.provider == request.claim
+        claim = request.claim
+        outcome = request.outcome
+        if not isinstance(claim, placement.ProviderClaimReference):
+            return False
+        if (isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+                and isinstance(saved.provider, placement.ProviderClaimReference) and saved.provider != claim):
+            return False
+        if not (isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                or isinstance(outcome, placement.AttemptCancelled)
+                and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+                and saved.terminal_report.outcome == outcome):
+            return False
+        assignment = saved.assignment
+        destination = assignment.destination
+        if claim.provider != destination.provider or claim.target != destination.target:
+            return False
+        if (claim.episode, claim.attempt) == (assignment.episode, assignment.attempt):
+            return claim.scope == destination.scope
+        if (isinstance(outcome, placement.PrelaunchRefused)
+                and (isinstance(request.path, placement.DispatchPathPending)
+                     or isinstance(outcome.launch, placement.PrelaunchEnded))
+                and isinstance(request.evidence, execution_identity.ExecutionNotStarted)):
+            from scripts.mac_test.mac_test import scopes_overlap
+
+            return scopes_overlap(claim.scope, destination.scope)
+        return False
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
                           | wire.PrerequisiteReport | wire.CancelPlacement,
@@ -4159,16 +4433,20 @@ done
                         with retry_cleanup(Path(reservation.path)):
                             self._end(request.episode, OwnerExited())
                     report = saved.terminal_report
-                    if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
+                    if (self._start_pending(saved) or self._provider_report_needs_release(saved)
+                            or (isinstance(report, placement.TerminalAttemptReport)
                             and isinstance(report.path, placement.DispatchPathPending))):
                         key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
-                        self.assignments[key] = replace(saved, terminal_report=placement.TerminalAttemptReport(
+                        self.assignments[key] = replace(saved, acquisition=saved.acquisition_evidence(),
+                            terminal_report=placement.TerminalAttemptReport(
                             placement.AttemptCancelled(request.reason), placement.DispatchPathPending('provider settlement remains pending'),
                             self.clock.now()))
                     else:
                         self._close_placement(saved, "cancelled", placement.DoNotRetry(request.reason))
                 elif saved is None:
-                    _ = self.placement_requests.pop(request.episode, None)
+                    if not any(attempt.assignment.episode == request.episode and attempt.release_pending()
+                               for attempt in self.assignments.values()):
+                        _ = self.placement_requests.pop(request.episode, None)
                     self._drop_waiter(request.episode, return_claim=True)
                 self._prune_host_evidence()
             self.persist()
@@ -4246,31 +4524,39 @@ done
                 retained = request.claim if isinstance(request.claim, placement.ProviderClaimReference) else saved.provider
                 refused = replace(saved, terminal_report=terminal, provider=retained,
                                   refusal_settings=request.refusal_settings)
-                if not self._settle_hana_prelaunch(refused, terminal):
-                    retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
-                    if self._start_pending(saved):
+                retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
+                refused = self._confirm_provider_release(refused, NoSubmittedPlacementRequest())
+                report = refused.terminal_report
+                if isinstance(refused.claim_release, records.ProviderClaimReleased):
+                    self._close_placement(refused, request.reason, refused.retry)
+                else:
+                    pending = self._start_pending(refused)
+                    inherited = (isinstance(retained, placement.ProviderClaimReference)
+                                 and (retained.episode, retained.attempt) != (assignment.episode, assignment.attempt))
+                    if pending or refused.release_pending() and not inherited:
                         self.assignments[key] = replace(refused, retry=retry)
                         self.persist()
                         self.next_pass = self.clock.monotonic()
-                    else:
-                        terminal = replace(terminal, path=placement.DispatchPathSettled())
+                    elif inherited:
+                        self._finish_placement(refused, request.reason, retry)
+                    elif isinstance(report, placement.TerminalAttemptReport):
+                        terminal = replace(report, path=placement.DispatchPathSettled())
                         self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
-        elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
-                or isinstance(saved.permission, placement.PermissionAvailable)
-                and (isinstance(request.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
-                    or isinstance(request.outcome, placement.AttemptCancelled)
-                    and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
-                    and saved.terminal_report.outcome == request.outcome)
-                and isinstance(request.claim, placement.ProviderClaimReference)
-                and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
-                and request.claim.provider == assignment.destination.provider
-                and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
+        elif self._accepts_execution_report(saved, request):
             self.execution_evidence[key] = request.evidence
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
                     and isinstance(request.evidence, execution_identity.ExecutionNotStarted)):
                 previous = saved.terminal_report
+                ended = (isinstance(outcome, placement.PrelaunchRefused) and isinstance(outcome.launch, placement.PrelaunchEnded)
+                         or isinstance(request.path, placement.DispatchPathSettled)
+                         and (isinstance(saved.permission, placement.PermissionConsumed)
+                              or isinstance(request.path.release, (provider_claim.ReleaseReceipt,
+                                                                   provider_claim.NoClaimAcquired))))
+                if ended and isinstance(saved.acquisition_evidence(), records.ClaimAcquisitionUnconfirmed):
+                    saved = replace(saved, acquisition=records.ClaimAcquisitionEnded(self.clock.now()))
+                    self.assignments[key] = saved
                 if isinstance(previous, placement.NoTerminalReport):
                     terminal = placement.TerminalAttemptReport(outcome, request.path, self.clock.now())
                     retry = saved.retry
@@ -4279,16 +4565,28 @@ done
                     elif isinstance(outcome, placement.PrelaunchRefused) and not isinstance(retry, placement.RetryAt):
                         retry = placement.retry_decision(assignment.destination, outcome.reason, terminal.received_at)
                     self.assignments[key] = replace(saved, terminal_report=terminal, provider=request.claim, retry=retry)
-                elif previous.outcome == outcome:
+                elif (previous.outcome == outcome or isinstance(request.path, placement.DispatchPathSettled)
+                      and (isinstance(request.path.release, provider_claim.NoClaimAcquired)
+                           or saved.provider == request.claim and isinstance(previous.path, placement.DispatchPathPending))):
                     terminal = (replace(previous, path=request.path)
                         if isinstance(request.path, placement.DispatchPathSettled) else previous)
                     self.assignments[key] = replace(saved, provider=request.claim, terminal_report=terminal)
-            saved = self.assignments[key]
+            saved = self._confirm_provider_release(self.assignments[key], NoSubmittedPlacementRequest())
+            self.assignments[key] = saved
             report = saved.terminal_report
+            if (isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
+                    and self._provider_report_needs_release(saved)
+                    and not isinstance(report.outcome, placement.AttemptDeclined)
+                    and isinstance(report.path.release, placement.NoClaimReleaseProof)):
+                report = replace(report, path=placement.DispatchPathPending("the provider has not confirmed exact release"))
+                saved = replace(saved, terminal_report=report)
+                self.assignments[key] = saved
             if (self.current_assignments.get(assignment.episode) == key
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
-                    and not isinstance(report.outcome, placement.AttemptDeclined)):
+                    and (not isinstance(report.outcome, placement.AttemptDeclined)
+                         or isinstance(saved.claim_release, records.ProviderClaimReleased))
+                    and not saved.release_pending()):
                 self._close_for_report(saved, report)
             else:
                 self.persist()
@@ -4383,8 +4681,10 @@ done
             return [wire.Refused(refusal)]
         if isinstance(request, status_wire.PlacementStatusRequest):
             saved = self._saved_assignment(request.episode, request.attempt)
-            status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
-                status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
+            if isinstance(saved, status_wire.UnknownPlacementStatus):
+                status = saved
+            else:
+                status = status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider)
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
             return self._repository_slot(request, connection)

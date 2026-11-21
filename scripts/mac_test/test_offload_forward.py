@@ -19,6 +19,7 @@ from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class OffloadForwardTests(OffloadCommandFixture):
@@ -282,13 +283,19 @@ class OffloadForwardTests(OffloadCommandFixture):
                 self.assertEqual(len(self.events_for("rsync")), 1)
 
     def test_size_probe_uses_its_deadline_and_releases_the_claim(self) -> None:
-        self.config["probe_timeout_s"] = "0.5"
-        self.sync_config()
         self.configure_fetch(hold_fetch_probe=True)
-        answer = self.command(
-            "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
-        )
+        fetch_settings = self.root / "fetch.conf"
+        _ = write_config_fixture(fetch_settings, "probe_timeout_s=0.5\n", template="mac_test")
+        fetch_timeout = eligibility.read_config(fetch_settings).probe_timeout_s
+        fetch_folder = offload.fetch_folder
+
+        def fetch(controller: offload.ProcessController, config: eligibility.OffloadConfig,
+                  request: offload.OffloadRequest, repository: eligibility.KnownRepository) -> offload.FetchResult:
+            return fetch_folder(controller, replace(config, probe_timeout_s=fetch_timeout), request, repository)
+
+        with mock.patch.object(offload, "fetch_folder", side_effect=fetch):
+            answer = self.command("--workspace", runner_options=("--fetch", "target/shots"),
+                                  call_id="call-forward", separate_stderr=True, assigned_adapter=True)
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertTrue((self.stub_directory / "fetch-probe-started").exists())
         self.assert_fetch_wire("failed")

@@ -32,7 +32,7 @@ import time
 import types
 import subprocess
 import unittest
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
@@ -269,7 +269,7 @@ class PlacementStatusTests(unittest.TestCase):
             _ = publish_candidate(fixture, request, claims=(kept,))
             status = self.read_only_status(fixture, assignment)
             assert isinstance(status, status_wire.KnownPlacementStatus)
-            self.assertEqual(status.state, placement.ClosedAssignment("provider claim released"))
+            self.assertEqual(status.state, placement.ClosedAssignment("provider assignment ended"))
             _ = fixture.run_pass()
             self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
             self.assertNotIn(assignment.episode, fixture.server.current_assignments)
@@ -502,7 +502,126 @@ class PlacementStatusTests(unittest.TestCase):
                     self.assertEqual((reply.assignment.episode, reply.assignment.since), (assignment.episode, assignment.since))
                     self.assertNotEqual(reply.assignment.attempt, assignment.attempt)
 
-    def test_a_settled_decline_waits_for_evidence_at_or_after_its_report(self) -> None:
+    def test_pending_prelaunch_settles_when_the_exact_release_is_confirmed(self) -> None:
+        for proof in ("provider-evidence", "adapter-report"):
+            with self.subTest(proof=proof):
+                self.check_prelaunch_release(proof)
+
+    def test_inherited_prelaunch_report_settles_after_exact_release(self) -> None:
+        self.check_prelaunch_release("adapter-report", inherited=True)
+
+    def test_failed_adoption_keeps_the_wait_reservation_current(self) -> None:
+        self.check_prelaunch_release("wait-reservation")
+
+    def check_prelaunch_release(self, proof: Literal["provider-evidence", "adapter-report", "wait-reservation"],
+                               *, inherited: bool = False) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+        from scripts.mac_test import claim_state, offload
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = (placement.assigned_claim_reference(assignment) if proof == "wait-reservation"
+                     else adopt_assignment(fixture, request, assignment))
+            if inherited:
+                claim = replace(claim, claim_id="inherited-claim", episode="previous-episode", attempt="previous-attempt")
+            elif proof != "wait-reservation":
+                self.assertEqual(fixture.server.handle_request(consume_permission("consume-prelaunch", assignment, claim)),
+                                 [wire.FirstAuthorization(assignment, claim)])
+            identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
+            controller = offload.ProcessController()
+            controller.adopt_claim(identity)
+            controller.attempt_evidence.provider = claim
+            adapter = offload.OffloadRequest(fixture.root, "hana", "call", offload.NO_RESULT_FILE, (),
+                owner="fixture-adapter", holder_session=claim_state.session_id(assignment.session),
+                target=assignment.destination.target, placement=offload.AssignedOffloadRequest(assignment))
+            refused = offload.BusyMacDecline(offload.LostRunLeftovers(), 0)
+
+            def report_result() -> None:
+                with (mock.patch.object(client, "report_execution", side_effect=fixture.server.handle_request),
+                      mock.patch.object(client, "claim_failure", side_effect=fixture.server.handle_request)):
+                    offload.report_placement_result(controller, adapter, refused)
+
+            report_result()
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            before = fixture.server.assignments[key]
+            self.assertIsInstance(before.state, placement.CurrentAssignment)
+            assert isinstance(before.terminal_report, placement.TerminalAttemptReport)
+            self.assertEqual(before.terminal_report.outcome, placement.PrelaunchRefused("busy", placement.PrelaunchEnded()))
+            self.assertIsInstance(before.terminal_report.path, placement.DispatchPathPending)
+            if proof != "adapter-report":
+                _ = publish_candidate(fixture, request, claims=())
+                _ = fixture.run_pass()
+                self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                journal = offload.pending_start_path(adapter.target, identity)
+                journal.parent.mkdir(parents=True, exist_ok=True)
+                _ = journal.write_text(offload.pending_start_key(identity))
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, claims=())
+                _ = fixture.run_pass()
+                self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                journal.unlink()
+                if proof == "wait-reservation":
+                    self.check_failed_wait_adoption(fixture, request, assignment, claim)
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, claims=())
+                _ = fixture.run_pass()
+            else:
+                from scripts.mac_test.claim_release_test_support import run_claim_release
+
+                with mock.patch.object(controller, "capture", side_effect=run_claim_release):
+                    self.assertIsInstance(offload.release_claim(controller, adapter.target), offload.ClaimReleaseConfirmed)
+                report_result()
+
+            settled = fixture.server.assignments[key]
+            self.assertIsInstance(settled.state, placement.ClosedAssignment)
+            self.assertNotEqual(fixture.server.current_assignments.get(assignment.episode), key)
+            self.assertEqual(settled.provider, claim)
+            release = (claim_state.AuthoritativeClaimAbsence(claim.key) if proof != "adapter-report"
+                       else claim_state.ReleaseReceipt(claim.key))
+            self.assertEqual(settled.terminal_report,
+                replace(before.terminal_report, path=placement.DispatchPathSettled(release)))
+
+    def check_failed_wait_adoption(self, fixture: AdmissionFixture, request: wire.PlacementRequest,
+                                   assignment: placement.PlacementAssignment,
+                                   claim: placement.ProviderClaimReference) -> None:
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, mac_test
+
+        destination = assignment.destination
+        paths = claim_state.StatePaths(fixture.root / "wait-claims")
+        paths.directory.mkdir()
+        args = mac_test.CliArguments()
+        args.target, args.pid, args.worktree = destination.target, os.getpid(), str(fixture.root)
+        args.what, args.claim_id = "wait for adoption", claim.claim_id
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
+        held, = claim_state.read_claims(paths)
+        original = held.path.read_bytes()
+        args.from_pid, args.remote = args.pid, destination.host
+        args.worktree = str(fixture.root / "different-source")
+        self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 12)
+        self.assertEqual(held.path.read_bytes(), original)
+        self.assertNotIn("remote_host", held.record)
+        target = target_config.SshTarget(destination.target, "macos", fixture.root / "mac_test.conf")
+        fixture.clock.advance(1)
+        with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
+              mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.EligibleTarget(target)),
+              mock.patch.object(claim_state, "state_paths", return_value=paths),
+              mock.patch.object(mac_test, "free_now", return_value="busy")):
+            evidence_key = fixture.server.host_evidence_key(request, destination)
+            fixture.server.host_requests[evidence_key] = request
+            fixture.server.publish_host_evidence(fixture.server.read_provider_evidence(evidence_key))
+        _ = fixture.run_pass()
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+        self.assertEqual(fixture.server.current_assignments.get(assignment.episode), key)
+        held.path.unlink()
+
+    def test_a_settled_decline_waits_for_evidence_after_acquisition_ends(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
         )
@@ -520,12 +639,14 @@ class PlacementStatusTests(unittest.TestCase):
             key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
                 placement.DispatchPathSettled(), fixture.clock.now())
-            fixture.server.assignments[key] = replace(fixture.server.assignments[key], terminal_report=report)
+            fixture.server.assignments[key] = replace(fixture.server.assignments[key], terminal_report=report,
+                acquisition=records.ClaimAcquisitionEnded(report.received_at))
             status = self.read_only_status(fixture, assignment)
             assert isinstance(status, status_wire.KnownPlacementStatus)
             self.assertEqual(status.state, placement.CurrentAssignment())
             replay, = fixture.server.handle_request(request)
             self.assertIsInstance(replay, wire.PlacementWait)
+            fixture.clock.advance(1)
             _ = publish_candidate(fixture, request, claims=())
             status = self.read_only_status(fixture, assignment)
             assert isinstance(status, status_wire.KnownPlacementStatus)
@@ -713,9 +834,10 @@ class PlacementStatusTests(unittest.TestCase):
                                     (assignment.episode, "unknown-attempt"), ("unknown-episode", assignment.attempt)):
                                 reply, = fixture.server.handle_request(status_wire.PlacementStatusRequest(
                                     episode, attempt, code_version="new-caller"), connection)
+                                known = ((episode, attempt) == (assignment.episode, assignment.attempt)
+                                         and not (isinstance(state, placement.ClosedAssignment) and saved.release_pending()))
                                 expected = (status_wire.KnownPlacementStatus(assignment, state, provider)
-                                    if (episode, attempt) == (assignment.episode, assignment.attempt) else
-                                    status_wire.UnknownPlacementStatus(episode, attempt))
+                                    if known else status_wire.UnknownPlacementStatus(episode, attempt))
                                 self.assertEqual(reply, status_wire.PlacementStatusReply(expected))
                             persist.assert_not_called()
                             record_version.assert_not_called()
@@ -1025,6 +1147,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
     def test_ended_requests_remove_their_probe_schedule_keys(self) -> None:
         from scripts.build_queue import placement
+        from scripts.mac_test import claim_state
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for,
             adopt_assignment, consume_permission,
@@ -1055,7 +1178,8 @@ class LocalHoldPlacementTests(unittest.TestCase):
                         authorized, = fixture.server.handle_request(consume_permission("launch", assignment, claim))
                         self.assertIsInstance(authorized, wire.FirstAuthorization)
                         _ = fixture.server.handle_request(wire.ExecutionReport("done", assignment, claim,
-                            execution_identity.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled()))
+                            execution_identity.ExecutionNotStarted(), placement.AttemptCompleted(0),
+                            placement.DispatchPathSettled(claim_state.ReleaseReceipt(claim.key))))
                     else:
                         _ = fixture.server.handle_request(wire.CancelPlacement("cancel", request.episode, request.owner, "ended"))
                     self.assertNotIn(key, fixture.server.host_readers)
@@ -1179,7 +1303,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                                       provider="ssh", target="linux", host="private-linux")
                 request = replace(request, constraints=replace(request.constraints, candidates=(
                     placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings)),)))
-                paths = claim_state.StatePaths(fixture.root / "claims")
+                paths = claim_state.StatePaths(fixture.root / "claims", target.name, platform=target.platform)
                 record: claim_state.RemoteJobClaim = {"claim_id": "retained", "episode": "old", "attempt": "old-attempt",
                     "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
                     "remote_host": destination.host, "what": "busy claim", "worktree": str(fixture.root), "since": "private"}

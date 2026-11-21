@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.direct.verify_ssh_claim_test_support import exclude_retained_claim
 
 from scripts.build_queue.admission_test_support import (
     PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,
@@ -578,18 +579,20 @@ if "--assignment-file" in arguments:
     fixture_cleanup_confirmed = False
 
     def finish_assigned() -> None:
-        settled = fixture_cleanup_confirmed
-        if settled:
+        path = placement.DispatchPathPending("the private runner has unresolved work")
+        if fixture_cleanup_confirmed:
             release = assigned_mac_test.CliArguments()
             release.pid, release.target = os.getpid(), assignment.destination.target
             release.claim_id, release.episode, release.attempt = identity.claim_id, identity.episode, identity.attempt
-            with redirect_stdout(io.StringIO()):
+            release.require_same_holder = True
+            output = io.StringIO()
+            with redirect_stdout(output):
                 status = assigned_mac_test.command_release(release, paths)
-            settled = status == 0 and not any(claim_state.claim_identity(held.record) == identity
-                                             for held in claim_state.read_claims(paths))
+            receipt = claim_state.ReleaseReceipt(reference.key)
+            if status == 0 and receipt.line() in output.getvalue().splitlines():
+                path = placement.DispatchPathSettled(receipt)
         admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assignment, reference,
-            fixture_evidence, fixture_outcome,
-            placement.DispatchPathSettled() if settled else placement.DispatchPathPending("the private runner has unresolved work")))
+            fixture_evidence, fixture_outcome, path))
 
     atexit.register(finish_assigned)
 
@@ -1103,6 +1106,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     eligibility = placement.TemporaryExclusion(reason)
                 elif not self.ssh_probe_reaches(values.get("host", destination.host)):
                     eligibility = placement.TemporaryExclusion("unreachable")
+                elif isinstance(eligibility, placement.AllowedHost) and exclude_retained_claim(
+                        self.runner_state, destination.target, destination.scope):
+                    eligibility = placement.TemporaryExclusion("busy")
             directory = (Path(self.environment["MAC_TEST_STATE_DIR"]) if destination.target == "mac" else
                          self.home / ".local/state/build-targets" / destination.target)
             controller = directory / "controller.json"

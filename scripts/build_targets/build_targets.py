@@ -438,7 +438,7 @@ def fixed_remote_candidates(
     from scripts.build_targets import target_config
     from scripts.mac_test import eligibility
 
-    provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
+    provider, target_name = claim_state.remote_claim_destination(target.name, target.platform)
     policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
     try:
         configuration = conf.read(target.settings)
@@ -454,7 +454,7 @@ def fixed_remote_candidates(
                 policy = hana_placement_adapter.gpu_step(transport,
                     repository.key if isinstance(repository, eligibility.KnownRepository) else '',
                     package, kind, command, configuration=configuration)
-            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            destination = placement.PlacementDestination(provider, target_name, transport.host, scope, 1)
             return (placement.PlacementCandidate(destination, policy, settings),)
         if isinstance(transport, hana_placement.HanaControlTransport):
             scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
@@ -468,7 +468,7 @@ def fixed_remote_candidates(
                 judgment = hana_placement.classify_command('check' if kind == 'check' else 'clippy', kind, command)
                 if isinstance(judgment, hana_placement.HanaStepRefused):
                     policy = placement.FixedExclusion('command')
-            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            destination = placement.PlacementDestination(provider, target_name, transport.host, scope, 1)
             return (placement.PlacementCandidate(destination, policy, settings),)
 
         paths = claim_state.state_paths(target.name)
@@ -489,10 +489,10 @@ def fixed_remote_candidates(
                  missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
                  if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
     except conf.Unusable:
-        destination = placement.PlacementDestination(provider, target.name, target.name, claim_state.WHOLE_MAC)
+        destination = placement.PlacementDestination(provider, target_name, target_name, claim_state.WHOLE_MAC)
         return (placement.PlacementCandidate(destination, placement.FixedExclusion("state unreadable"), settings),)
 
-    return tuple(placement.PlacementCandidate(placement.PlacementDestination(provider, target.name, host,
+    return tuple(placement.PlacementCandidate(placement.PlacementDestination(provider, target_name, host,
         claim_state.RepositoryScope(scope.name, scope.key, slot)
             if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope,
         slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
@@ -937,7 +937,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
             if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
                 continue
             with redirect_stdout(io.StringIO()):
-                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
+                attempt = mac_test.take_over_kept_claim(owner, paths, claim, claim.record, session=session)
             if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                 continue
         try:
@@ -953,6 +953,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
             release.claim_id = claim.record["claim_id"]
             release.episode = claim.record["episode"]
             release.attempt = claim.record["attempt"]
+            release.claim_record = claim_state.ClaimRecordLocation(claim.path.relative_to(paths.directory))
             release.settings = str(target.settings)
             _ = mac_test.command_release(release, paths)
 
@@ -1156,7 +1157,7 @@ def command_release_wait(pid: int, *,
                     from scripts.mac_test import offload
 
                     exact = claim_state.ClaimIdentity(claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])
-                    if offload.pending_start_path(target.name, exact).exists():
+                    if offload.start_journal_present(target.name, exact):
                         fenced.append(claim)
                     else:
                         claim.path.unlink(missing_ok=True)
@@ -1167,6 +1168,7 @@ def command_release_wait(pid: int, *,
             release.pid, release.target, release.settings = pid, target.name, str(target.settings)
             release.claim_id = claim.record["claim_id"]
             release.episode, release.attempt = claim.record["episode"], claim.record["attempt"]
+            release.claim_record = claim_state.ClaimRecordLocation(claim.path.relative_to(paths.directory))
             status = mac_test.command_release(release, paths)
             if status != 0:
                 return status
