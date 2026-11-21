@@ -35,6 +35,11 @@ from scripts.production import showrunner_tree
 from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, staged_notes_directory
+from scripts.production.production_admission import (
+    capture_rollout_inventory, record_verified_move, require_admission,
+    require_guard_ready as require_guard_ready,
+    require_new_document as require_new_document,
+)
 from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
     PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed, VerifiedIntegrationTip,
@@ -46,9 +51,7 @@ from scripts.production.production_names import (
     MOVE_VERSION, NOTES_DIRECTORY,
 )
 from scripts.production.update_registration import (
-    QuestionStaff, RegistrationFailure, judgment_state, require_planned_admission, status_line,
-    require_guard_ready as require_guard_ready,
-    require_new_document as require_new_document,
+    QuestionStaff, RegistrationFailure, judgment_state, status_line,
 )
 
 from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
@@ -261,22 +264,22 @@ def locked_move(owner: staff.StaffRow) -> Generator[Path]:
         yield path
 
 
-def require_approval_terminal() -> None:
+def require_approval_terminal(action: str = "approve-move") -> None:
     if (staff.caller_identity() or os.environ.get("CLAUDECODE")
             or not all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr))):
-        raise Refusal("approve-move requires a regular interactive terminal outside an agent session")
+        raise Refusal(f"{action} requires a regular interactive terminal outside an agent session")
     pid = os.getpid()
     try:
         while pid > 1:
             arguments = pane_record.process_arguments(pid)
             if herdr.is_claude_process(arguments) or herdr.is_codex_process(arguments):
-                raise Refusal("approve-move cannot run from an agent process")
+                raise Refusal(f"{action} cannot run from an agent process")
             parent = pane_record.process_parent(pid)
             if parent < 0 or parent == pid:
                 raise ValueError("invalid process parent")
             pid = parent
     except (OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
-        raise Refusal(f"approve-move cannot verify process ancestry: {error}") from error
+        raise Refusal(f"{action} cannot verify process ancestry: {error}") from error
 
 
 def move_member(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow:
@@ -422,6 +425,7 @@ def move_files(production: Production, lines: list[str], record: staff.StaffSnap
             print(f"Restored {count} cargo-liner worktree records.")
             return
         _ = require_move_window(approval)
+        require_admission(production)
         for destination in (targets.live_doc, targets.log):
             require_untracked_ignored(plan.main, destination.relative_to(plan.main).as_posix())
         document = migrated_document(production, lines, plan)
@@ -445,6 +449,8 @@ def move_files(production: Production, lines: list[str], record: staff.StaffSnap
         if production.name == CARGO_LINER_PRODUCTION:
             _ = require_move_window(approval)
             _ = worktrees.retarget_cargo_liner_records(plan.main, plan.merge_branch, receipt)
+        _ = require_move_window(approval)
+        record_verified_move(production, targets.live_doc)
         closed = replace(approval, status=MoveClosed(require_move_window(approval)))
         write_text_atomic(path, closed.encode())
         print(f"Moved {targets.live_doc} and {targets.log}.")
@@ -581,9 +587,8 @@ def move_session_state(production_name: str, scratch: Path) -> None:
 
 
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
+    require_admission(production)
     status = ProductionRunning() if resume else doc_status(lines)
-    if isinstance(status, ProductionPlanned):
-        require_planned_admission(production, lines)
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
     if scratch is not None:
@@ -632,7 +637,10 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
-    require_planned_admission(production, lines)
+    require_admission(production)
+    original = production.doc.read_bytes()
+    if original.decode("utf-8").splitlines() != lines:
+        raise LifecycleStop("doc", "held", f"{production.doc}: document changed before open")
     record = staff.snapshot()
     enrolled = production_doc.resolve_production_paths(production.doc)
     main = enrolled.main if isinstance(enrolled, production_doc.EnrolledPaths) else production.checkout
@@ -652,7 +660,12 @@ def open_production(production: Production, lines: list[str]) -> None:
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
     if updated != lines:
-        write_text_atomic(production.doc, "\n".join(updated) + "\n")
+        mode = production.doc.stat().st_mode & 0o777
+        with prepared_replacement(production.doc, "\n".join(updated) + "\n", mode=mode) as temporary:
+            if production.doc.read_bytes() != original or production.doc.stat().st_mode & 0o777 != mode:
+                raise LifecycleStop("doc", "held", f"{production.doc}: document changed during open")
+            _ = temporary.replace(production.doc)
+            sync_folder(production.doc.parent)
     report("doc", "ok", "running")
     paths = [doc_path_in_checkout(production, production.doc)] if isinstance(enrolled, production_doc.LegacyProduction) else []
     for row in rows:
@@ -1200,9 +1213,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap",
-                                               "approve-move", "move-files", "stage-notes"))
-    _ = parser.add_argument("--production", required=True, type=str)
+    _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap", "approve-move", "move-files",
+                                               "stage-notes", "capture-admission-inventory"))
+    _ = parser.add_argument("--production")
+    _ = parser.add_argument("--staff-id", action="append", default=[],
+                            help="capture-admission-inventory: repeat for each existing legacy production")
     _ = parser.add_argument("--reverse", action="store_true",
                             help="move-files: restore cargo-liner worktree records after restoring its legacy document")
     _ = parser.add_argument("--executor")
@@ -1219,11 +1234,22 @@ def main() -> int:
     args = parser.parse_args()
     try:
         action = cast(str, args.action)
-        name = cast(str, args.production)
+        name = cast(str | None, args.production)
+        identities = cast(list[str], args.staff_id)
         executor = cast(str | None, args.executor)
         start = cast(str | None, args.window_start)
         end = cast(str | None, args.window_end)
         reverse = cast(bool, args.reverse)
+        if action == "capture-admission-inventory":
+            if name is not None or executor is not None or start is not None or end is not None or reverse:
+                raise Refusal("capture-admission-inventory accepts only --staff-id")
+            require_approval_terminal(action)
+            print(capture_rollout_inventory(identities))
+            return 0
+        if identities:
+            raise Refusal("only capture-admission-inventory accepts --staff-id")
+        if name is None:
+            parser.error("--production is required")
         if reverse and action != "move-files":
             raise Refusal("only move-files accepts --reverse")
         if action == "approve-move":

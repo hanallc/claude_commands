@@ -31,9 +31,9 @@ from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
 from scripts.production.production_doc import (
-    EnrolledPaths, Production, ProductionDocument, Refusal, read_guard_ready, read_production, resolve_production_paths,
+    EnrolledPaths, Production, Refusal, read_production, resolve_production_paths,
 )
-from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD
+from scripts.production.production_admission import require_admission
 from scripts.production.checkpoint_gate import report
 
 from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
@@ -45,7 +45,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.git_exclude import ExcludeRefused, require_untracked_ignored
+from scripts.lib.git_exclude import require_untracked_ignored
 from scripts.lib.user_zone import user_zone
 
 from scripts.review_links import new_item_dialog, review_events
@@ -820,37 +820,11 @@ def status_line(lines: list[str]) -> re.Match[str] | None:
                  for line in lines if line.startswith("> **Status:")), None)
 
 
-def require_guard_ready() -> None:
-    """Require the installed guard proof before a production starts."""
-    if read_guard_ready() is None:
-        raise Refusal(f"new production creation requires a valid {GUARD_READY_FILE}")
-
-
-def require_new_document(document: ProductionDocument) -> None:
-    require_guard_ready()
-    if not staff.declares_merge_checkout(document.doc.read_text(encoding="utf-8").splitlines()):
-        raise Refusal(f"{document.doc}: new productions require {MERGE_CHECKOUT_FIELD}")
-    main = session_staff.production_session_directory(document.doc, document.checkout)
-    for path in (document.doc, document.log):
-        try:
-            require_untracked_ignored(main, path.relative_to(main).as_posix())
-        except (ExcludeRefused, ValueError) as error:
-            raise Refusal(str(error)) from error
-
-
-def require_planned_admission(production: Production, lines: list[str]) -> None:
-    status = status_line(lines)
-    if status is not None and status[1] == "planned" and (
-            staff.declares_merge_checkout(lines)
-            or isinstance(showrunners.timer_for(production.owner, staff.snapshot()), showrunners.NoTimer)):
-        require_new_document(production)
-
-
 def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
-    require_planned_admission(production, production.doc.read_text(encoding="utf-8").splitlines())
+    require_admission(production)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:
@@ -865,6 +839,8 @@ def register(production: Production) -> None:
         dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
         if dirty:
             raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
+    for line in adopt_moved_state(production):
+        report("state-dir", "ok", line)
     # The staff row owns the timer.
     owner = production.owner
     updates = f"showrunner-{owner.id}"
@@ -2729,6 +2705,9 @@ def main() -> int:
             questions_table(scope, identities=identities)
             return 0
         production = read_production(name, identities.record if identities else None)
+        if action == "register":
+            register(production)
+            return 0
         if action == "questions":
             questions(production, cast(Path | None, args.state), identities=identities)
             for line in adopt_moved_state(production):
@@ -2736,9 +2715,7 @@ def main() -> int:
             return 0
         for line in adopt_moved_state(production, record=identities.record if identities is not None else None):
             report("state-dir", "ok", line)
-        if action == "register":
-            register(production)
-        elif action == "time":
+        if action == "time":
             report("time", "ok", production_time(production, cast(str, args.stamp)))
         elif action == "log":
             append_log(production, cast(str, args.event), cast(Path | None, args.state), cast(bool, args.before_compaction))

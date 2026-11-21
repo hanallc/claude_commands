@@ -36,7 +36,7 @@ from scripts.production import showrunner_tree
 from scripts.production.fake_unit_host import HostedUnit
 
 
-from scripts.production import log_backup, production_doc, staff, unit_config, update_registration
+from scripts.production import log_backup, production_admission, production_doc, staff, unit_config, update_registration
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import (
     BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
@@ -155,6 +155,8 @@ class LifecycleTests(LifecycleFixture):
         _ = staff.set_doc(target.id, staff.LiveDoc(remote.local_machine(), live_doc))
         live = read_production(target.id)
         self.assertEqual((live.checkout, live.log), (integration, self.log))
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.require_admission(live)
         with live.log.open("ab") as output:
             _ = output.write(b"Entry after the move\n")
         assert isinstance(target.doc, staff.LiveDoc)
@@ -164,6 +166,8 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(worktrees.read_record(made_path), made)
         restored = read_production(target.id)
         self.assertEqual((restored.doc, restored.log), (self.doc, self.log))
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.require_admission(restored)
         self.assertEqual((restored.log.read_bytes(), restored.log.stat().st_ino),
                          (original_log + b"Entry after the move\n", inode))
         self.assertEqual((self.git("rev-parse", "main"), (common / "index").read_bytes()), (tip, index))
@@ -254,6 +258,8 @@ class LifecycleTests(LifecycleFixture):
         super().setUp()
         self.env["GATE_TEST_HOST"] = remote.local_machine()
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
+        with mock.patch.dict(os.environ, self.env):
+            _ = production_admission.capture_rollout_inventory([self.owner_id()])
 
     @override
     def reports_to(self, child: str, parent: str) -> Path:
@@ -633,6 +639,7 @@ class LifecycleTests(LifecycleFixture):
             session_staff.UnreadablePaneList("agents", "pane list denied"),))
         output = io.StringIO()
         with (mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+              mock.patch.dict(os.environ, self.env),
               contextlib.redirect_stdout(output)):
             production_lifecycle.load(production, [], True, None)
         self.assertIn("alpha: unknown", output.getvalue())
@@ -667,24 +674,63 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("production.log", (self.checkout / common_dir / "info/exclude").read_text())
 
     def test_open_needs_no_session_name(self) -> None:
-        for form in ("legacy", "enrolled"):
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "fixture"
+        _ = shutil.copytree(self.root, snapshot)
+        staff_bytes = self.staff.staff_file.read_bytes()
+
+        def assert_registration_refused(name: str, checkout: Path) -> None:
+            with mock.patch.object(agents_log, "append") as usage:
+                denied = invoke_cli(update_registration, update_registration.main,
+                    ["register", "--production", name], self.env, checkout, production_state=True)
+                self.assert_step(denied, "failed")
+                self.assertIn(GUARD_READY_FILE, denied.stdout)
+                usage.assert_not_called()
+
+        for form in ("unlisted legacy", "legacy", "enrolled"):
             with self.subTest(form=form):
-                if form == "enrolled":
-                    self.production_doc("planned")
-                    live, integration = self.enroll_document()
-                    _ = self.git("checkout", "HEAD", "--", str(self.doc))
-                else:
-                    live, integration = self.doc, self.checkout
+                if form != "unlisted legacy":
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root)
+                    _ = self.staff.staff_file.write_bytes(staff_bytes)
+                if form == "unlisted legacy":
+                    new_doc = self.doc.with_name("new-production.md")
+                    self.write(new_doc, "\n".join(line for line in self.doc.read_text().splitlines()
+                                                  if not line.startswith("> **Status:")) + "\n")
+                    newcomer = fixture_member("showrunner", name="new", doc=staff.LiveDoc(remote.local_machine(), new_doc))
+                    _ = self.git("add", str(new_doc))
+                    _ = self.git("commit", "-m", "Add a legacy document without a status")
+                    assert_registration_refused(newcomer.name, self.checkout)
+                    timer = self.state / "notifier" / f"showrunner-{newcomer.id}"
+                    self.assertFalse(timer.exists())
+                    self.write(timer / "conf", f"TARGET=session:{newcomer.id}\n")
+                    self.write(new_doc, "> **Status: PRODUCTION — planned.**\n\n" + new_doc.read_text())
+                    _ = self.git("add", str(new_doc))
+                    _ = self.git("commit", "-m", "Add planned status to the unlisted production")
+                    before = new_doc.read_bytes(), self.git("rev-parse", "HEAD"), self.calls()
+                    assert_registration_refused(newcomer.name, self.checkout)
+                    for arguments in (("load",), ("load", "--resume"), ("open",)):
+                        result = self.run_lifecycle(arguments[0], *arguments[1:], "--production", newcomer.name)
+                        self.assert_step(result, "failed")
+                        self.assertIn(GUARD_READY_FILE, result.stdout)
+                    self.assertEqual((new_doc.read_bytes(), self.git("rev-parse", "HEAD"), self.calls()), before)
+                    self.assertFalse((self.state / "showrunner/admission" / f"{newcomer.id}.json").exists())
+                    continue
+                if form == "legacy":
+                    timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
+                    saved = timer.rename(timer.with_name("saved-fixture-timer"))
+                    result = self.run_lifecycle("open")
+                    _ = saved.rename(timer)
+                    self.assert_step(result, "ok")
+                    self.assertIn("doc: ok — running", result.stdout)
+                    continue
+                receipt = self.state / "showrunner/admission" / f"{self.owner_id()}.json"
+                receipt.unlink()
+                live, integration = self.enroll_document()
                 before = live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)
                 timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
                 saved_timer = timer.rename(timer.with_name("saved-fixture-timer"))
                 calls = self.calls()
-                with mock.patch.object(agents_log, "append") as usage:
-                    registered = invoke_cli(update_registration, update_registration.main,
-                        ["register", "--production", "example"], self.env, integration, production_state=True)
-                    self.assert_step(registered, "failed")
-                    self.assertIn(GUARD_READY_FILE, registered.stdout)
-                    usage.assert_not_called()
+                assert_registration_refused("example", integration)
                 self.assertFalse(timer.exists())
                 self.assertEqual(self.calls(), calls)
                 for action in ("load", "open"):
@@ -693,31 +739,30 @@ class LifecycleTests(LifecycleFixture):
                     self.assertIn(GUARD_READY_FILE, result.stdout)
                 _ = saved_timer.rename(timer)
                 self.assertEqual((live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)), before)
-                if form == "enrolled":
-                    write_guard_proof(self.root, self.state / "showrunner", self.checkout)
-                    for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
-                        self.write(folder / ".unit.toml", f'plan = "docs/plans/{name}.md"\nresponsibilities = []\n')
-                    _ = self.git("rm", "docs/plans/alpha.md", cwd=integration)
-                    _ = self.git("commit", "-m", "Prepare an untracked unit plan", cwd=integration)
-                    self.write(integration / "docs/plans/alpha.md", "# Alpha plan\n")
-                    main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
-                    with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
-                        result = self.run_lifecycle("open")
-                    self.assertEqual(self.git("ls-files", "--", str(live), str(self.log)), "")
-                    self.assertEqual(self.git("symbolic-ref", "HEAD"), main[0])
-                    self.assertEqual(self.git("rev-parse", "HEAD"), main[1])
-                    self.assertEqual(self.git("ls-files", "--stage"), main[2])
-                    self.assertEqual(self.git("show", "--format=", "--name-only", "HEAD", cwd=integration),
-                                     "docs/plans/alpha.md")
-                    with mock.patch.object(agents_log, "append"):
-                        registered = invoke_cli(update_registration, update_registration.main,
-                            ["register", "--production", "example"], self.env, integration, production_state=True)
-                    self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
-                    self.assertIn("registered", registered.stdout)
-                else:
+                write_guard_proof(self.root, self.state / "showrunner", self.checkout)
+                for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
+                    self.write(folder / ".unit.toml", f'plan = "docs/plans/{name}.md"\nresponsibilities = []\n')
+                _ = self.git("rm", "docs/plans/alpha.md", cwd=integration)
+                _ = self.git("commit", "-m", "Prepare an untracked unit plan", cwd=integration)
+                self.write(integration / "docs/plans/alpha.md", "# Alpha plan\n")
+                main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
+                with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
                     result = self.run_lifecycle("open")
                 self.assert_step(result, "ok")
                 self.assertIn("doc: ok — running", result.stdout)
+                self.assertEqual(self.git("ls-files", "--", str(live), str(self.log)), "")
+                self.assertEqual(self.git("symbolic-ref", "HEAD"), main[0])
+                self.assertEqual(self.git("rev-parse", "HEAD"), main[1])
+                self.assertEqual(self.git("ls-files", "--stage"), main[2])
+                self.assertEqual(self.git("show", "--format=", "--name-only", "HEAD", cwd=integration),
+                                 "docs/plans/alpha.md")
+                self.assertIn('"basis": "guard and document"', receipt.read_text())
+                (self.state / "showrunner" / GUARD_READY_FILE).unlink()
+                with mock.patch.object(agents_log, "append"):
+                    registered = invoke_cli(update_registration, update_registration.main,
+                        ["register", "--production", "example"], self.env, integration, production_state=True)
+                self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+                self.assertIn("registered", registered.stdout)
 
     def test_open_skips_missing_plan_then_commits_it_on_rerun(self) -> None:
         _ = self.git("rm", "--cached", "docs/plans/alpha.md")
