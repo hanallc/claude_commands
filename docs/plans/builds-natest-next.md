@@ -425,34 +425,34 @@ Phase 404 found 30 candidates on main at `9f3459ec1b`. Builds routes the questio
 Record the owner and the date with each answer. The answers are `delete`, `keep`, and `not yet`.
 
 - `scripts/style/selection_capture.py` — delete (resources, 2026-11-21).
-- `scripts/style/refill_measure.py` — not asked yet.
-- `scripts/direct/demo_refusals.sh` — not asked yet.
-- `scripts/production/unit_run.py` — not asked yet.
-- `scripts/style/order_waste.py` — not asked yet.
-- `scripts/style/style_reader_tables.py` — not asked yet.
-- `scripts/style/style_reader_oracle.py` — not asked yet.
-- `scripts/style/style_reader_parity.py` — not asked yet.
-- `scripts/direct/phase_process.py` — not asked yet.
-- `scripts/production/roles_audit.py` — not asked yet.
-- `scripts/whoami/profile_notes_pass.py` — not asked yet.
-- `scripts/whoami/worker_usage.py` — not asked yet.
-- `scripts/usage/compaction_replay.py` — not asked yet.
+- `scripts/style/refill_measure.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/direct/demo_refusals.sh` — delete (sdlc, 2026-11-21).
+- `scripts/production/unit_run.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/style/order_waste.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/style_reader_tables.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/style_reader_oracle.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/style_reader_parity.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/direct/phase_process.py` — not answered. sdlc: the phases unit answers (2026-11-21).
+- `scripts/production/roles_audit.py` — keep (sdlc, 2026-11-21). `test_roles_audit` runs its check on repository sources; `docs/as-built/roles-and-names.md`.
+- `scripts/whoami/profile_notes_pass.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/whoami/worker_usage.py` — keep (sdlc, 2026-11-21). Documented Codex worker measurement in `usage-ledger.md` and `long-lived-workers.md`.
+- `scripts/usage/compaction_replay.py` — delete (sdlc, 2026-11-21). One-time study tool. Remove its `usage-ledger.md` lines in the same commit.
 - `scripts/lint/gate_folders_delete.py` — delete (resources, 2026-11-21). Also remove its name from `scripts/lib/removal_guard.py` and its tests.
-- `scripts/agents/pane_restore.py` — not asked yet.
-- `scripts/hooks/session-end-pane-record.py` — not asked yet.
-- `scripts/mac_test/loopback_proof.py` — not asked yet.
-- `scripts/lint/package_imports.py` — not asked yet.
+- `scripts/agents/pane_restore.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/hooks/session-end-pane-record.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/mac_test/loopback_proof.py` — not answered. sdlc: devtools answers (2026-11-21).
+- `scripts/lint/package_imports.py` — not answered. sdlc: natedev owns it (2026-11-21).
 - `scripts/statusline/statusline_rows.py` — delete (natest, 2026-11-21). `statusline.sh` calls `assignment.py` directly since 79a64de8e0.
 - `scripts/aws_target/terminal_table.py` — delete (aws, 2026-11-21). Main dropped its only use in 89e5ebf9b7.
-- `scripts/nix_env/heal.py` — not asked yet.
-- `scripts/test_times/coverage_overlap.py` — not asked yet.
+- `scripts/nix_env/heal.py` — not answered. sdlc: natedev owns it (2026-11-21).
+- `scripts/test_times/coverage_overlap.py` — keep (natest, 2026-11-21). Manual coverage reviews and Phase 392 test isolation use it.
 - `scripts/message/repeats.py` — not answered. queue is not the owner (2026-11-21); routed to postmaster.
 - `scripts/message/install_codex_agents.py` — not answered. queue is not the owner; queue says it is a manual tool (`docs/as-built/session-roster.md:781`) (2026-11-21).
-- `scripts/buildlog/width_trial.py` — not asked yet.
-- `scripts/model_study/` — not asked yet.
-- `scripts/style/crate_run.py` — not answered. resources is not the owner; routed to style (2026-11-21).
-- `scripts/style/bulk_run.py` — not answered. resources is not the owner; routed to style (2026-11-21).
-- `scripts/style/bulk_constants.py` — not asked yet.
-- `scripts/style/bulk_rename.py` except `cargo_output` and its dependencies — not asked yet.
+- `scripts/buildlog/width_trial.py` — delete (report, 2026-11-21). Same commit: update the two `invoke.sh` comments (lines 605-607, 663-665) and remove `width_trial` from `docs/as-built/nextest-width-and-lint-scope.md` (lines 86, 91, 138-140, 173). The trial mode of `nextest_width_arm` in `invoke.sh` then has no reader: remove it in the same commit (natest ruling).
+- `scripts/model_study/` — delete (sdlc, 2026-11-21). The study is done. Update `director-model-study-results.md` and `config/README.md:683` in the same commit.
+- `scripts/style/crate_run.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/bulk_run.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/bulk_constants.py` — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
+- `scripts/style/bulk_rename.py` except `cargo_output` and its dependencies — not answered. sdlc: cargo-liner (dwight's production) owns it (2026-11-21).
 
 Natest decision, 2026-11-21: keep `test_times/coverage_overlap.py`. It supports manual coverage reviews. Phase 184 recorded 941 tests with unknown coverage. Phase 392 names the collector as an entry point for test isolation.
