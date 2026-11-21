@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fcntl
+import io
 import json
 import os
 import re
 from pathlib import Path
 import select
+import selectors
 import shlex
 import shutil
 import signal
@@ -349,76 +351,169 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
     return {'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'gate': gate_box.encode_run(run)}
 
 
+@dataclass
+class MacGateDiagnostics:
+    output: bytearray = field(default_factory=bytearray)
+    queue_failures: list[str] = field(default_factory=list)
+    gate_failures: list[str] = field(default_factory=list)
+    queue_status: int = 0
+
+    def read_failure_record(self, path: Path) -> None:
+        from scripts.mac_test.mac_queue_run import QueueFailureStep, read_queue_failures
+
+        for failure in read_queue_failures(path):
+            if failure.step is QueueFailureStep.GUEST:
+                reason = f'The Mac gate guest ended with status {failure.status}'
+            elif failure.step is QueueFailureStep.CLEANUP:
+                reason = 'The Mac gate cleanup failed'
+            else:
+                label = failure.step.value.replace('-', ' ')
+                reason = f'The Mac queue {label} failed with status {failure.status}'
+            self.queue_failures.append(reason)
+
+    def format_failure(self) -> str:
+        reasons = self.queue_failures + self.gate_failures
+        if not self.queue_failures and self.queue_status:
+            reasons.append(f'The Mac queue call ended with status {self.queue_status}')
+        if self.output:
+            reasons.append(self.output.decode('utf-8', errors='surrogateescape'))
+        return '\n'.join(reasons)
+
+
+def report_interrupted_gate(report: str) -> None:
+    if not report.endswith('\n'):
+        report += '\n'
+    with suppress(OSError, UnicodeError):
+        if isinstance(sys.stderr, io.TextIOWrapper):
+            _ = sys.stderr.flush()
+            _ = sys.stderr.buffer.write(report.encode('utf-8', errors='surrogateescape'))
+            _ = sys.stderr.buffer.flush()
+        else:
+            _ = sys.stderr.write(report)
+
+
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                selected: gate.AllModules | gate.TreeSelection,
                cancellation: MacGateCancellation | UseCallerProcessLifetime,
                ) -> MacGateResult | str:
     """Wait for a Mac placement in queue order and run the assigned modules."""
+    diagnostics = MacGateDiagnostics()
+    outcome: MacGateResult | str = ''
+    deferred_exit: BaseException | None = None
+    attempt_error: BaseException | None = None
+    try:
+        with ExitStack() as cleanup:
+            try:
+                outcome = run_remote_attempt(repo, cleanup, diagnostics, mode=mode, full=full,
+                                             module_time_limit_s=module_time_limit_s,
+                                             selected=selected, cancellation=cancellation)
+                if isinstance(outcome, str) and outcome:
+                    diagnostics.gate_failures.append(outcome)
+            except BaseException as error:
+                attempt_error = error
+                if not isinstance(error, Exception):
+                    deferred_exit = error
+                detail = str(error) or type(error).__name__
+                diagnostics.gate_failures.append(f'The Mac gate could not finish: {detail}')
+                raise
+    except BaseException as error:
+        if error is not attempt_error:
+            if deferred_exit is None and not isinstance(error, Exception):
+                deferred_exit = error
+            detail = str(error) or type(error).__name__
+            diagnostics.gate_failures.append(f'The Mac gate could not finish local cleanup: {detail}')
+    if (isinstance(outcome, MacGateResult) and not diagnostics.queue_failures
+            and not diagnostics.gate_failures):
+        return outcome
+    report = diagnostics.format_failure()
+    if deferred_exit is not None:
+        report_interrupted_gate(report)
+        raise deferred_exit
+    return report
+
+
+def collect_queue_output(process: subprocess.Popen[bytes], output: bytearray, deadline: float) -> int:
+    """Read queue output and wait for exit within the same time limit."""
+    assert process.stdout is not None
+    descriptor = process.stdout.fileno()
+    with selectors.DefaultSelector() as ready:
+        _ = ready.register(descriptor, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not ready.select(remaining):
+                raise subprocess.TimeoutExpired(process.args, MAC_TIME_LIMIT_S)
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            output.extend(chunk)
+    return process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
+def run_remote_attempt(repo: Path, cleanup: ExitStack, diagnostics: MacGateDiagnostics, *,
+                       mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
+                       selected: gate.AllModules | gate.TreeSelection,
+                       cancellation: MacGateCancellation | UseCallerProcessLifetime) -> MacGateResult | str:
     from scripts.production.gate_routes import MacGateCancellation
 
+    repo = repo.resolve()
+    if isinstance(cancellation, MacGateCancellation):
+        caller = os.dup(cancellation.caller_fd)
+    else:
+        caller, lifetime = os.pipe()
+        _ = cleanup.callback(os.close, lifetime)
+    _ = cleanup.callback(os.close, caller)
+    cancelled = select.poll()
+    cancelled.register(caller, select.POLLIN)
+    if cancelled.poll(0):
+        return 'The Mac gate was cancelled'
+    folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='mac-gate-')))
+    failure_file = folder / 'queue-failure'
+    # Read the record before the stack removes the temporary folder.
+    _ = cleanup.callback(diagnostics.read_failure_record, failure_file)
+    request = cloud_gate.prepare_request(repo, folder, mode, module_time_limit_s, selected=selected)
+    cloud_gate.save(folder / 'request.json', request)
+    _ = (folder / 'local-repo').write_text(str(repo))
+    if not request['modules']:
+        return 'No modules selected for the Mac'
+    timings = gate.read_measures(gate.gate_state_dir() / 'module_seconds.json')
+    _ = (folder / 'module_seconds.json').write_text(json.dumps(timings))
+    command = [*QUEUE_COMMAND, '--what', 'gate tests', '--kind', 'run', '--package', '',
+               '--worktree', str(repo), '--owned-close', '--failure-file', str(failure_file),
+               '--lifecycle-script', str(Path(__file__).resolve()),
+               '--', str(folder), str(int(full))]
+    command[2:2] = ['--caller-fd', str(caller)]
+    if cancelled.poll(0):
+        return 'The Mac gate was cancelled'
+    process = cleanup.enter_context(subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                      start_new_session=True, pass_fds=(caller,)))
     try:
-        repo = repo.resolve()
-        with ExitStack() as cleanup:
-            if isinstance(cancellation, MacGateCancellation):
-                caller = os.dup(cancellation.caller_fd)
-            else:
-                caller, lifetime = os.pipe()
-                _ = cleanup.callback(os.close, lifetime)
-            _ = cleanup.callback(os.close, caller)
-            cancelled = select.poll()
-            cancelled.register(caller, select.POLLIN)
-            if cancelled.poll(0):
-                return 'The Mac gate was cancelled'
-            folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='mac-gate-')))
-            request = cloud_gate.prepare_request(repo, folder, mode, module_time_limit_s, selected=selected)
-            cloud_gate.save(folder / 'request.json', request)
-            _ = (folder / 'local-repo').write_text(str(repo))
-            if not request['modules']:
-                return 'No modules selected for the Mac'
-            timings = gate.read_measures(gate.gate_state_dir() / 'module_seconds.json')
-            _ = (folder / 'module_seconds.json').write_text(json.dumps(timings))
-            command = [*QUEUE_COMMAND, '--what', 'gate tests', '--kind', 'run', '--package', '',
-                       '--worktree', str(repo), '--owned-close',
-                       '--lifecycle-script', str(Path(__file__).resolve()),
-                       '--', str(folder), str(int(full))]
-            command[2:2] = ['--caller-fd', str(caller)]
-            if cancelled.poll(0):
-                return 'The Mac gate was cancelled'
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, encoding='utf-8', errors='replace', start_new_session=True,
-                                       pass_fds=(caller,))
-            with process:
-                try:
-                    output, _ = process.communicate(timeout=MAC_TIME_LIMIT_S)
-                except BaseException:
-                    with suppress(ProcessLookupError):
-                        process_group.send_process_group(process.pid, signal.SIGKILL)
-                    raise
-            lines = output.splitlines()
-            was_cancelled = bool(cancelled.poll(0))
-            status = process.returncode
-            assert status is not None
-            if status or was_cancelled:
-                return queue_failure(lines, folder, status, cancelled=was_cancelled)
-            results = [line.removeprefix(RESULT_PREFIX) for line in lines if line.startswith(RESULT_PREFIX)]
-            if len(results) != 1:
-                return 'The Mac returned no unique gate result'
-            row = ledger.mapping(cast(object, json.loads(results[0])))
-            run = cloud_gate.decode_requested_run(row, request)
-            cloud_gate.validate_run_modules(run, request)
-            return MacGateResult(row, run)
-    except subprocess.TimeoutExpired:
-        return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
-        return f'The Mac gate could not finish: {error}'
-
-
-def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
-    prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
-    cleanup = next((line.removeprefix(prefix).strip() for line in reversed(lines) if line.startswith(prefix)), '')
-    reason = cleanup or ('The Mac gate was cancelled' if cancelled else f'The Mac queue call ended with status {status}')
-    detail = next((line.strip().removeprefix(prefix).strip() for line in reversed(lines) if line.strip()), '')
-    return f'{reason}: {detail}' if detail and detail != reason and not detail.startswith(RESULT_PREFIX) else reason
+        status = collect_queue_output(process, diagnostics.output, time.monotonic() + MAC_TIME_LIMIT_S)
+    except BaseException as error:
+        timed_out = isinstance(error, subprocess.TimeoutExpired)
+        if timed_out:
+            diagnostics.gate_failures.append(f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds')
+        try:
+            process_group.send_process_group(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as stop_error:
+            diagnostics.gate_failures.append(f'The Mac gate could not stop the queue call: {stop_error}')
+        if timed_out:
+            return ''
+        raise
+    if cancelled.poll(0):
+        return 'The Mac gate was cancelled'
+    if status:
+        diagnostics.queue_status = status
+        return ''
+    text = diagnostics.output.decode('utf-8', errors='surrogateescape')
+    results = [line.removeprefix(RESULT_PREFIX) for line in text.splitlines() if line.startswith(RESULT_PREFIX)]
+    if len(results) != 1:
+        return 'The Mac returned no unique gate result'
+    row = ledger.mapping(cast(object, json.loads(results[0])))
+    run = cloud_gate.decode_requested_run(row, request)
+    cloud_gate.validate_run_modules(run, request)
+    return MacGateResult(row, run)
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,

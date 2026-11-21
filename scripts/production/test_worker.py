@@ -336,6 +336,10 @@ class WorkerCommandTests(unittest.TestCase):
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
+        atomic_file.write_text_atomic(config.with_name("detached_runs.conf"),
+            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
+            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
+            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
         atomic_file.write_text_atomic(config.with_name("send.conf"),
             "# range: 0.001..\nwaits_review_seconds=1\n"
             + "# range: 0.001..\ndelivery_timeout=5\n"
@@ -438,12 +442,18 @@ class WorkerCommandTests(unittest.TestCase):
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
 
+    def test_shared_fixture_supplies_the_process_check_for_ps(self) -> None:
+        exists = Path.exists
+
+        def without_proc(path: Path) -> bool:
+            return path != Path("/proc/self") and exists(path)
+
+        with patch.object(Path, "exists", autospec=True, side_effect=without_proc):
+            arguments = detached_run_process.process_args(os.getpid())
+        self.assertIsInstance(arguments, detached_run_process.ProcessCommandText)
+
     def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
         config = self.fixture.root / "conf"
-        atomic_file.write_text_atomic(config / "detached_runs.conf",
-            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
-            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
-            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
         atomic_file.write_text_atomic(config / "postmaster.conf",
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")
@@ -454,11 +464,12 @@ class WorkerCommandTests(unittest.TestCase):
         folder = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         folder.mkdir()
         path = folder / "orphan.json"
+        # The test process owns this PID but does not supervise the run.
         run: detached_runs.RunRecord = {
             "run_id": "orphan", "status": "running", "session_dir": str(self.run_dir),
             "worker": opened.row.name, "staff_id": opened.row.id, "label": "fixture gate",
             "command": ["true"], "log": str(folder / "orphan.log"), "started_at": 1,
-            "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
+            "pid": os.getpid(), "director_dir": str(self.run_dir), "done_message_file": "",
         }
         atomic_file.write_text_atomic(path, json.dumps(run))
         return opened, path, run

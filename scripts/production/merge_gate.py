@@ -993,8 +993,11 @@ def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
 
 
 def failure_log_tail(output: str) -> str:
-    """Keep the same output limit as the saved failure log."""
-    limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+    """Apply the saved log limit when the setting is available."""
+    try:
+        limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+    except conf.Unusable:
+        return output
     return output.encode("utf-8")[-limit:].decode("utf-8", errors="replace")
 
 
