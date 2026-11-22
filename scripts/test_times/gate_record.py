@@ -424,21 +424,35 @@ class ReadGateTimeLimit:
 READ_GATE_TIME_LIMIT: Final = ReadGateTimeLimit()
 
 
+@dataclass(frozen=True)
+class NoPassingModuleHistory:
+    """The module has no passing wall times for this vCPU count."""
+
+
+NO_PASSING_MODULE_HISTORY: Final = NoPassingModuleHistory()
+
+
+def _passing_module_wall_median(connection: sqlite3.Connection, vcpus: int, path: str,
+                                count: int) -> float | NoPassingModuleHistory:
+    suite, module = path.removeprefix("scripts/").split("/", 1)
+    walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
+        """SELECT m.wall_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+           WHERE r.vcpus = ? AND r.status = 0 AND r.aborted = 0
+             AND r.selection != 'reused' AND m.status = 0 AND m.restart = ''
+             AND m.suite = ? AND m.module = ? AND m.wall_s > 0
+           ORDER BY r.started_at DESC, r.id DESC, m.attempt DESC LIMIT ?""",
+        (vcpus, suite, module, count)).fetchall())]
+    return statistics.median(walls) if walls else NO_PASSING_MODULE_HISTORY
+
+
 def passing_module_wall_medians(connection: sqlite3.Connection, vcpus: int, modules: Sequence[str],
                                 count: int) -> dict[str, float]:
     """Return passing medians for modules with history on the same vCPU count."""
     medians: dict[str, float] = {}
     for path in modules:
-        suite, module = path.removeprefix("scripts/").split("/", 1)
-        walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
-            """SELECT m.wall_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
-               WHERE r.vcpus = ? AND r.status = 0 AND r.aborted = 0
-                 AND r.selection != 'reused' AND m.status = 0 AND m.restart = ''
-                 AND m.suite = ? AND m.module = ? AND m.wall_s > 0
-               ORDER BY r.started_at DESC, r.id DESC, m.attempt DESC LIMIT ?""",
-            (vcpus, suite, module, count)).fetchall())]
-        if walls:
-            medians[path] = statistics.median(walls)
+        median = _passing_module_wall_median(connection, vcpus, path, count)
+        if isinstance(median, float):
+            medians[path] = median
     return medians
 
 
@@ -461,11 +475,13 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
         if walls:
             return GateTimeLimit(factor * statistics.median(walls))
         return NoGateTimeLimit(f"no passing full gate history for {vcpus} vCPUs at {jobs} jobs")
-    medians = passing_module_wall_medians(connection, vcpus, modules, count)
+    medians: list[float] = []
     for path in modules:
-        if path not in medians:
+        median = _passing_module_wall_median(connection, vcpus, path, count)
+        if isinstance(median, NoPassingModuleHistory):
             name = path.removeprefix("scripts/")
             return NoGateTimeLimit(f"no passing module history for {name} on {vcpus} vCPUs")
+        medians.append(median)
     if medians:
-        return GateTimeLimit(factor * max(max(medians.values()), sum(medians[path] for path in modules) / jobs))
+        return GateTimeLimit(factor * max(max(medians), sum(medians) / jobs))
     return NoGateTimeLimit(f"no passing module history for {vcpus} vCPUs")

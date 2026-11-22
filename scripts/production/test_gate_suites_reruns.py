@@ -8,6 +8,7 @@ import io
 import os
 import sqlite3
 import subprocess
+from collections.abc import Sequence
 from typing import final
 from contextlib import closing, redirect_stdout
 from unittest import mock
@@ -91,6 +92,27 @@ class HangingModule(unittest.TestCase):
         self.assertIn("hooks/test_first.py killed: still running after 3 s, "
                       + "the module time limit (configured rerun floor)", result.stdout)
         self.assertFalse((self.state / "module-completed").exists(), result.stdout)
+
+    def test_nightly_timeout_names_the_default_limit(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        start = gate.start_gate_job
+
+        def start_held_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
+                           environment: dict[str, str], log: Path, *,
+                           kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE) -> gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
+            if suite == "hooks":
+                job.started -= gate.DEFAULT_MODULE_TIME_LIMIT_S
+            return job
+
+        with (mock.patch.object(gate, "start_gate_job", side_effect=start_held_job),
+              mock.patch.object(gate, "push_nightly_result"),
+              mock.patch.object(gate, "tell_nightly_red", return_value=gate.NightlyNoticeUnreceived()),
+              mock.patch.object(gate, "_sweep_nightly_build_folders")):
+            result = self.run_gate("--nightly")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("hooks/test_first.py killed: still running after 1800 s, "
+                      + "the module time limit (default)", result.stdout)
 
     def test_memory_stop_with_a_tripwire_reports_failure_without_a_rerun(self) -> None:
         module = self.checkout / "scripts/hooks/test_first.py"

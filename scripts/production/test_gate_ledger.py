@@ -577,14 +577,14 @@ class MergeGateLedgerTests(MergeGateFixture):
         marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
-                def suite_run(repo: Path, type_dirs: tuple[str, ...], *, module_time_limit_s: float,
+                def suite_run(repo: Path, type_dirs: tuple[str, ...], *, module_time_limit_s: float | None,
                               full: bool) -> gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git").is_file())
                     self.assertEqual(gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
                     self.assertEqual(gate.checked_git(repo, "status", "--porcelain"), "")
                     self.assertTrue(full)
-                    self.assertGreater(module_time_limit_s, 0)
+                    self.assertIsNone(module_time_limit_s)
                     self.assertEqual(type_dirs, ("scripts",))
                     self.write(repo / "subject.txt", "only the copy changes\n")
                     copies.append(repo)

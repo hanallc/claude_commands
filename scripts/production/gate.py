@@ -2880,8 +2880,7 @@ def nightly(args: GateArguments) -> int:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
-                                 module_time_limit_s=(DEFAULT_MODULE_TIME_LIMIT_S if args.module_time_limit_s is None
-                                                      else args.module_time_limit_s), full=True)
+                                 module_time_limit_s=args.module_time_limit_s, full=True)
             except (GateRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
                 run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),

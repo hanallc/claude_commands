@@ -607,7 +607,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The limit is the greater of the passing median wall time times `GATE_TIME_LIMIT_FACTOR` and `rerun_time_limit_floor_seconds`.
   `config/gate.conf` sets the factor to 5.0 and the floor to 120 seconds.
   A module without passing history uses the default limit of 1800 seconds.
-  Initial jobs, `--full` runs, and nightly runs use the default module limit.
+  The merge gate uses this limit for module reruns, and an explicit `--full` run keeps the default.
+  Initial jobs and nightly runs use the default module limit.
   An explicit `--module-time-limit-s` applies to every attempt.
   The stop message gives the limit and its source.
   A pass replaces the first failure and prints `Rerun alone: <suite>/<module> passed (first run exit N, X s)`.

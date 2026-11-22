@@ -79,6 +79,15 @@ class GateRecordTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 self.assertIsInstance(gate_record.history_time_limit(connection, 8, [*modules, *missing], 2, True),
                                       gate_record.NoGateTimeLimit)
+        queries: list[str] = []
+        connection.set_trace_callback(queries.append)
+        try:
+            self.assertEqual(gate_record.history_time_limit(connection, 8, ["lib/test_missing.py", *modules], 2, True),
+                             gate_record.NoGateTimeLimit("no passing module history for lib/test_missing.py on 8 vCPUs"))
+        finally:
+            connection.set_trace_callback(None)
+        query, = queries
+        self.assertIn("m.module = 'test_missing.py'", query)
         _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=3")
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(60))
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
