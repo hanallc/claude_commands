@@ -31,7 +31,9 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
+from scripts.herdr import herdr, pane_launch
 from scripts.lib import build_folders, build_slots, cargo_output, conf, git_exclude, git_files, scratch
+from scripts.message import sessions
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
@@ -1406,6 +1408,151 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertIn(f"move {old} -> {new}", resumed.getvalue())
         self.assertEqual(resumed.getvalue().splitlines()[-1], "moved 1, kept in use 0, kept 1")
         self.assertEqual(old.readlink(), new)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_ignores_only_the_idle_shell_of_a_stopped_pane(self) -> None:
+        self.check_idle_pane_migration(("child", "non-herdr", "live", "open-file", "mapped-file", "root", "not-ended"))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_keeps_a_pane_shell_that_execs_during_the_herdr_query(self) -> None:
+        self.check_idle_pane_migration(("shell-exec",))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_keeps_a_pid_that_is_not_the_pane_shell(self) -> None:
+        self.check_idle_pane_migration(("other-shell", "unknown-shell"))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_keeps_a_reused_pid(self) -> None:
+        self.check_idle_pane_migration(("reused-pid",))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_keeps_shells_with_missing_path_data(self) -> None:
+        self.check_idle_pane_migration(("missing-root", "missing-fd", "missing-maps"))
+
+    def check_idle_pane_migration(self, kept: tuple[str, ...]) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        cases = ("stopped", *kept)
+        trees = {name: self.add_linked_tree(main, self.trees / name, name) for name in cases}
+        list_file = self.root / "list"
+        _ = list_file.write_text("".join(f"{old} fixture-unit {name}\n" for name, old in trees.items()))
+        record_dir = self.root / "panes"
+        record_dir.mkdir()
+        registry = self.root / "sessions"
+        registry.mkdir()
+        self.environment.update(HERDR_PANE_RECORD_DIR=str(record_dir), NOTIFIER_SESSIONS_DIR=str(registry),
+                                HERDR_PROC=str(registry))
+        snapshot = staff.StaffSnapshot.decode(Path(self.environment["STAFF_FILE"]).read_text())
+        owner = next(row for row in snapshot.rows if row.kind == "unit")
+        live_id = staff.StaffId(str(uuid4()))
+        live_owner = replace(owner, id=live_id, current_session=live_id, name="live-unit", worktree=staff.WORKTREE_UNFILLED)
+        snapshot = replace(snapshot, rows=(*snapshot.rows, live_owner))
+        _ = Path(self.environment["STAFF_FILE"]).write_text(snapshot.encode())
+        live_pid = os.getpid()
+        _ = (registry / f"{live_pid}.json").write_text(json.dumps({
+            "pid": live_pid, "sessionId": live_id, "name": live_owner.name, "messagingSocketPath": "",
+            "procStart": sessions.process_start(live_pid), "updatedAt": 1,
+        }))
+        entries: dict[str, pane_launch.PaneLaunch] = {}
+        parent_processes = [(100, 1, b"herdr\0--session\0agents\0server\0"), (101, 1, b"python3\0")]
+        if "child" in cases:
+            parent_processes.append((999, 200 + cases.index("child"), b"python3\0"))
+        for pid, ppid, argv in parent_processes:
+            parent = self.proc / str(pid)
+            parent.mkdir()
+            _ = (parent / "status").write_text(f"State:\tS\nUid:\t{os.geteuid()}\t{os.geteuid()}\nThreads:\t1\n")
+            _ = (parent / "stat").write_text(f"{pid} (fixture) S {ppid}\n")
+            _ = (parent / "cmdline").write_bytes(argv)
+        responses: dict[str, dict[str, object]] = {}
+        for pid, (name, old) in enumerate(trees.items(), 200):
+            pane = f"w1:p{pid}"
+            launch = pane_launch.launch(pane, live_id if name == "live" else owner.current_session,
+                                        str(old), {}, ["claude"])
+            launch["ended"] = name != "not-ended"
+            entries[pane] = pane_launch.retained_launch(launch, snapshot)
+            process = self.proc / str(pid)
+            process.mkdir()
+            parent = 101 if name == "non-herdr" else 100
+            _ = (process / "stat").write_text(f"{pid} (zsh) S {parent} {'0 ' * 17}{pid}\n")
+            _ = (process / "comm").write_text("zsh\n")
+            _ = (process / "status").write_text(f"State:\tS\nUid:\t{os.geteuid()}\t{os.geteuid()}\nThreads:\t1\n")
+            _ = (process / "environ").write_bytes(f"HERDR_PANE_ID={pane}\0".encode())
+            (process / "cwd").symlink_to(old)
+            (process / "exe").symlink_to("/usr/bin/zsh")
+            if name != "missing-root":
+                (process / "root").symlink_to(old if name == "root" else "/")
+            if name != "missing-fd":
+                (process / "fd").mkdir()
+            if name == "open-file":
+                (process / "fd/7").symlink_to(old / "code.txt")
+            mapped = f"00-01 r--p 0 00:1 1 {old / 'code.txt'}\n" if name == "mapped-file" else ""
+            if name != "missing-maps":
+                _ = (process / "maps").write_text(mapped)
+            info = {} if name == "unknown-shell" else {"shell_pid": pid + 100 if name == "other-shell" else pid}
+            responses[f"--session agents pane process-info --pane {pane}"] = {
+                "code": 0, "stdout": json.dumps({"result": {"process_info": info}}),
+            }
+        _ = (record_dir / "agents.json").write_text(json.dumps(entries))
+        response_file = self.root / "herdr-responses.json"
+        _ = response_file.write_text(json.dumps(responses))
+        self.environment.update(HERDR_BIN=str(CHECKOUT / "scripts/herdr/fake_herdr.py"),
+                                FAKE_HERDR_RESPONSES=str(response_file), FAKE_HERDR_LOG=str(self.root / "herdr.log"))
+
+        if "shell-exec" in cases:
+            exec_pid = 200 + cases.index("shell-exec")
+            process = self.proc / str(exec_pid)
+            old = trees["shell-exec"]
+            query = herdr.Herdr.result
+
+            def exec_during_query(server: herdr.Herdr, *args: str) -> dict[str, object]:
+                result = query(server, *args)
+                if args == ("pane", "process-info", "--pane", f"w1:p{exec_pid}"):
+                    _ = (process / "comm").write_text("python3\n")
+                    (process / "exe").unlink()
+                    (process / "exe").symlink_to("/usr/bin/python3")
+                    (process / "fd/7").symlink_to(old / "code.txt")
+                return result
+
+            with (patch.dict(os.environ, self.environment, clear=True), redirect_stdout(report := StringIO()),
+                  patch.object(herdr.Herdr, "result", exec_during_query)):
+                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=True), 0)
+            self.assertIn(f"keep {old}: in use (pids {exec_pid})", report.getvalue())
+            return
+
+        if "reused-pid" in cases:
+            scan = tmp_sweep.process_paths
+            reused = 200 + cases.index("reused-pid")
+            process_stat = self.proc / str(reused) / "stat"
+            start = reused
+
+            def reuse_pid(proc: str, prefix: str | tuple[str, ...], *,
+                          require_readable_user_processes: bool = False,
+                          ignored_self_fds: frozenset[int] = NO_PROBE_FDS,
+                          ) -> tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable:
+                nonlocal start
+                result = scan(proc, prefix, require_readable_user_processes=require_readable_user_processes,
+                              ignored_self_fds=ignored_self_fds)
+                start += 1
+                _ = process_stat.write_text(f"{reused} (zsh) S 100 {'0 ' * 17}{start}\n")
+                return result
+
+            with (patch.dict(os.environ, self.environment, clear=True), redirect_stdout(report := StringIO()),
+                  patch.object(tmp_sweep, "process_paths", side_effect=reuse_pid)):
+                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=True), 0)
+            self.assertIn(f"keep {trees['reused-pid']}: in use (pids {reused})", report.getvalue())
+            return
+
+        new = self.trees / "origin/fixture-unit/stopped"
+        for flags in (["--dry-run"], []):
+            result = self.command(self.root, self.migration_command("--list", list_file, *flags))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"move {trees['stopped']} -> {new}", result.stdout)
+            for pid, name in enumerate(cases[1:], 201):
+                with self.subTest(name=name, flags=flags):
+                    self.assertIn(f"keep {trees[name]}: in use (pids {pid})", result.stdout)
+                    self.assertFalse(trees[name].is_symlink())
+        self.assertEqual(trees["stopped"].readlink(), new)
+        self.assertEqual(self.git(new, "branch", "--show-current"), "stopped")
 
     @unittest.skipUnless(sys.platform == "linux", "requires /proc")
     def test_migration_keeps_every_candidate_for_an_unreadable_same_user_process(self) -> None:
