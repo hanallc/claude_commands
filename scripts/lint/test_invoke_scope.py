@@ -20,8 +20,6 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
-from scripts.copies import copies
-from scripts.style import bulk_run
 
 from scripts.buildlog.cgroup_test_support import write_cgroup
 from scripts.buildlog.test_memory_window import write_lint_config
@@ -555,13 +553,11 @@ sweep_after_step test-step
                                          "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
                                          "LINT_INVOKE_SOURCED": "", "LINT_SKIP_SWEEP": ""}, clear=True)):
                 leases = (planning.fileno(), validation.fileno())
-                token = copies.COMMAND_LOCKS.set(leases)
-                try:
-                    result = bulk_run.run_command(root, ("bash", "-c", command, "sweep-test", str(INVOKE),
-                                                         *map(str, leases)))
-                finally:
-                    copies.COMMAND_LOCKS.reset(token)
-            self.assertEqual(result.code, 0, result.stdout + result.stderr)
+                environment = {**os.environ, "COPIES_COMMAND_LEASE_FDS": ",".join(map(str, leases))}
+                result = subprocess.run(("bash", "-c", command, "sweep-test", str(INVOKE), *map(str, leases)),
+                                        cwd=root, capture_output=True, text=True, check=False,
+                                        pass_fds=leases, env=environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             readable, _, _ = select.select([read_fd], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertTrue(readable, "the sweep did not report its descriptors")
             self.assertEqual(os.read(read_fd, 4096), b"closed\n")
