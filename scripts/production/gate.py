@@ -80,7 +80,7 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import gate_job_for_command, read_step_names
+from scripts.lib.build_steps import gate_job_for_command, gate_job_from_process, read_step_names
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -92,7 +92,7 @@ from scripts.production.gate_routes import (
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
     MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
     MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
-    SuiteMode as SuiteMode, TreeSelection as TreeSelection,
+    SuiteMode as SuiteMode, TreeSelection as TreeSelection, WholeGateRoute,
 )
 from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
@@ -108,7 +108,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records  # noqa: E402
+from scripts.build_queue import admission_client, admission_records, admission_wire, placement  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck, step_identity  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -204,9 +204,16 @@ class HoldExemptNamedModuleMachine:
 
 
 @dataclass(frozen=True)
+class ConfiguredGateParent:
+    """Use the gate parent from build_folders.conf."""
+
+
+@dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    gate_parent: ConfiguredGateParent | build_folders.ExplicitBuildParent = field(
+        default_factory=ConfiguredGateParent, kw_only=True)
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1631,6 +1638,13 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
+def gate_work_parent(machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine) -> Path:
+    """Select the folder for gate recovery, state, and tests."""
+    if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent):
+        return machine.gate_parent.path
+    return _gate_job_parent()
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1657,10 +1671,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     runner = module_runner(repo)
-    tmpfs = _gate_job_parent()
-    if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
-    report_retained_gate_test_folders(tmpfs)
+    gate_parent = gate_work_parent(machine)
+    if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
+        raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
+    report_retained_gate_test_folders(gate_parent)
     hold = BuildHoldWait() if isinstance(machine, SharedMachine) else None
     tested_tree: CleanTestTree | UnrecordableTestTree = UnrecordableTestTree("whole machine")
     if hold is not None:
@@ -1722,7 +1736,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
     scope_prefix = suite_scope_prefix() if shared else []
-    state_directory = gate_state_dir() if shared else tmpfs
+    state_directory = gate_state_dir() if shared else gate_parent
     timings_path = state_directory / "module_seconds.json"
     timings = machine.module_seconds.copy() if isinstance(machine, WholeMachine) else read_measures(timings_path)
     cpu_path = state_directory / "module_cpu_seconds.json"
@@ -1784,8 +1798,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
     hold_check = hold if hold is not None else NoBuildHoldCheck()
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, folder_tool, tmpfs) as temporary,
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
+          gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if shared else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -1993,7 +2007,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if running or pending:
                     time.sleep(0.05)
         finally:
-            # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
+            # Reap this runner's groups before the gate folder cleanup.
             with cancellation.defer_cleanup_signals():
                 stop_gate_jobs(running)
                 for job in running:
@@ -3086,12 +3100,43 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
+def mac_linux_gate_placed(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> bool:
+    """Check that the current gate has the Mac Linux assignment."""
+    path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
+    if not path:
+        return False
+    try:
+        saved = admission_wire.read_assignment(Path(path)).assignment
+        if saved.destination.target != "mac-linux":
+            return False
+        if not conf.read("build_targets").value("enabled.mac-linux", conf.on_off,
+                                               default=False, recover_invalid=False):
+            return False
+        if not isinstance(gate_job, StepJob) or saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
+            return False
+        owner = saved.owner
+        identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+        pid = os.getpid()
+        if (owner.host != host_name()
+                or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid)):
+            return False
+        if (owner.pid != pid and gate_job != gate_job_from_process(
+                mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
+            return False
+        status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
+        return (isinstance(status, admission_wire.KnownPlacementStatus)
+                and isinstance(status.state, placement.CurrentAssignment)
+                and status.assignment == saved)
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable):
+        return False
+
+
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
-    """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    """Route the whole test selection to the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
@@ -3101,20 +3146,35 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
 
+    def finish_remote(outcome: GateRun) -> GateRun:
+        if not type_dirs or outcome.time_limit_report:
+            return outcome
+        local = run_local_subset((), type_dirs)
+        return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
+
+    def attempt(route: WholeGateRoute, selection: AllModules | TreeSelection) -> GateRun | str:
+        return route.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                           selected=selection, gate_job=gate_job)
+
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job)
+        outcome = attempt(cloud, selection)
         if isinstance(outcome, str):
             print('Cloud gate uses natedev: ' + outcome, flush=True)
             return run_local(type_dirs)
-        if type_dirs and not outcome.time_limit_report:
-            local = run_local_subset((), type_dirs)
-            return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
-        return outcome
+        return finish_remote(outcome)
+
+    def run_whole_gate(selection: AllModules | TreeSelection) -> GateRun:
+        if mac_linux_gate_placed(mode, gate_job):
+            guest = cast(WholeGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
+            outcome = attempt(guest, selection)
+            if isinstance(outcome, GateRun):
+                return finish_remote(outcome)
+            print('Mac Linux gate falls back: ' + outcome, flush=True)
+        return run_cloud(selection)
 
     def select_and_run(routed: RoutedGateTree, dirty: set[str]) -> GateRun:
         if mode is SuiteMode.GATE:
-            return run_cloud(ALL_MODULES)
+            return run_whole_gate(ALL_MODULES)
 
         selected: AllModules | TreeSelection = ALL_MODULES
         whole_suite = full
@@ -3138,7 +3198,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 return GateRun((), 0.0, 0.0, selection_certified=True)
 
         # Nate ordered the Mac split off on 2026-11-21.
-        return run_cloud(selected)
+        return run_whole_gate(selected)
 
         mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
         try:
