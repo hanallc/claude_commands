@@ -967,6 +967,7 @@ class MemoryWaitRow(WaitRow):
 
     place: int
     move: NotRequired[admission_records.QueueMoveMember]
+    order_note: NotRequired[str]
 
 
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
@@ -2988,9 +2989,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         owner = step_page_owner(waiter, labels, ci_runners, members, machine, ci_label=ci_label)
         identity = owner.labels
         cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
-        target = waiter.placement_target
-        if target:
-            reason = f"waiting for {target}"
+        targets = waiter.placement_targets
+        target_text = " or ".join(targets)
+        if isinstance(cause, admission_records.NatedevHeld):
+            reason = reason_phrase(waiter.reason, waiting)
+        elif targets:
+            reason = f"waiting for {target_text}"
         elif isinstance(cause, admission_records.BehindHead):
             order = order_holds.get(waiter.pid)
             blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
@@ -3009,7 +3013,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(named, NoNamedStep):
             name = QueueRowName.owner_only("Build step")
             named = LocalStepName(name, name, staff_names.text_parts(name))
-        notes: TargetNotes = {"runs_on": target, "targets": target.split(" or "), "mac_text": ""} if target else (
+        notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
             NO_TARGET_NOTES if ci_label else target_notes(waiter.route, routes, waiter.step, waiter.folder, waiter.package))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
@@ -3017,10 +3021,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
                         "reason": reason,
-                        "fits": not target and need <= captured.signed_room, "place": place,
+                        "fits": not targets and not isinstance(cause, admission_records.NatedevHeld)
+                                and need <= captured.signed_room, "place": place,
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
-                        "why": "target" if target else wait_why(waiter.reason),
+                        "why": "target" if targets and not isinstance(cause, admission_records.NatedevHeld)
+                                else wait_why(waiter.reason),
                         **local_call_notes(waiter),
                         **notes,
                         # A waiting step names its slot, so the Disks page names the slot's work as this row does.
@@ -3028,6 +3034,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                      waiter.folder, host_name()),
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify,
                                     ci=bool(ci_label))}
+        if waiter.speculative_copy:
+            waiters[place]["order_note"] = "Newest eligible copy starts first"
         if place <= len(parsed.ordered):
             _, ordered_waiter = parsed.ordered[place - 1]
             member = move_members.get(ordered_waiter.get("move_id", ""))
@@ -3185,7 +3193,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting
-            if not step.placement_target), default=0.0),
+            if not step.placement_targets), default=0.0),
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,

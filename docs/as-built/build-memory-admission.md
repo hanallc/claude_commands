@@ -2362,14 +2362,17 @@ Cloud waits have their own order.
 The admission service gives each wait an ID.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
-A grant or cancellation ends the move.
-The service saves the rank on each waiter that a move reorders in `state.json`.
-That rank lasts while the step waits, including during a remote startup hold.
+The service saves each moved episode's rank in `state.json`.
+The rank lasts until the command starts or the request ends.
+A remote startup timeout or an expired local claim keeps the rank while the assignment settles.
 The bumped units still have priority.
-New natedev waits join the end of a group with manual order.
-Both hosts use the visible order, and only starts selected by the local preview can pass a new remote startup hold.
-The queue table includes remote-only waits at their rank positions.
-A refusal before launch keeps the local wait and its continuation claim.
+New waits join after all current ranks in a group with manual order.
+Both hosts use the visible order for normal steps.
+Only starts that the local preview selects can pass a new remote startup hold.
+The table includes remote-only waits at their rank positions.
+The table identifies waits that a build hold blocks.
+Speculative Mac copy rows show the newest-first rule.
+A refusal before launch keeps the rank and any active local startup claim.
 Use `/build:bump` to change priority between groups.
 
 The service checks the current order revision before it commits a move.

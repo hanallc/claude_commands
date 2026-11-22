@@ -580,7 +580,8 @@ try {
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '6');
 
         queueFixture.waiters.splice(2, 0, {...template, key:'mac-only', pid:652,
-          name:'Mac-only step', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          order_note:'Newest eligible copy starts first',
           move:{row_id:'mac-only', group:'', movable:false}});
         await evaluate('pageRefresh.refresh(true)');
         const macStart = await grip('typesafe');
@@ -593,6 +594,7 @@ try {
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['2', '3', '4']);
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] .machine').textContent`), 'mac');
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
+        assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
         assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
         if (queueDragProof) {
           const clip = await evaluate(`(() => {

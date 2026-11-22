@@ -1008,7 +1008,7 @@ class EstimateExpired:
 
 @dataclass(frozen=True)
 class NatedevHeld:
-    """A CI step waits for the release of a natedev hold."""
+    """A step waits for the release of a natedev hold."""
     holder: str
     purpose: str
 
@@ -1030,7 +1030,9 @@ WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMe
 
 
 def held_text(wait: NatedevHeld) -> str:
-    return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    if wait.holder and wait.purpose:
+        return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    return f"{wait.holder} holds natedev" if wait.holder else "natedev is held"
 
 
 def build_space_text(wait: BuildSpaceHold) -> str:
@@ -1110,7 +1112,8 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
-    placement_target: str = field(default="", kw_only=True)
+    placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    speculative_copy: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)

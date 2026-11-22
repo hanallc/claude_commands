@@ -368,6 +368,10 @@ class WaiterPlace:
     move_rank: records.WaitRank | records.SubmissionRank = field(default=records.SubmissionRank(), kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
 
+    @property
+    def submission_rank(self) -> records.WaitRank:
+        return (self.order_since if isinstance(self.order_since, float) else self.since, self.owner.pid)
+
 
 def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
     """Keep a logical identity with every active place."""
@@ -1404,8 +1408,13 @@ class StateIntents:
             raise ValueError("finalization reservation changed")
         self.fault("after_history_append")
         record = self.reservations[self.episode]
-        if not isinstance(record.ending, TokenWaiting):
-            _ = self.places.pop(_place_key(record.owner, record.queue_waiter["since"]), None)
+        key = _place_key(record.owner, record.queue_waiter["since"])
+        place = self.places.get(key)
+        # A placement release can precede a refusal before launch.
+        awaiting_report = (isinstance(record.ending, ReleaseStatus) and place is not None
+                           and place.episode == self.episode and bool(place.move_id))
+        if not isinstance(record.ending, TokenWaiting) and not awaiting_report:
+            _ = self.places.pop(key, None)
         del self.reservations[self.episode]
         self.persist()
 
@@ -2128,11 +2137,14 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
+            lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
+            if isinstance(lifetime, gate.PopulatedStepScope) and episode in self.placement_requests:
+                self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
             memories.append((row, memory))
-            self._watch_scope(evidence.lifetimes.get(episode, gate.LiveOwnerProcess()), episode)
+            self._watch_scope(lifetime, episode)
         for waiting in self.waiters.values():
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
                 continue
@@ -2755,8 +2767,9 @@ class AdmissionServer:
                  for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
         ci_holds: dict[str, records.WaitReason] = {records.waiter_owner(self.waiters[episode].row): reason
                     for episode, reason in self._ci_hold_reasons().items()}
-        routed = {records.run_owner(request.owner.pid, request.owner.start_time): request.episode
-                  for request in self.placement_requests.values() if self._placement_waiting(request)}
+        routed = {records.run_owner(request.owner.pid, request.owner.start_time): request
+                  for request in self.placement_requests.values()
+                  if request.episode in self.waiters or self._placement_waiting(request)}
         ordered, _ = self._queue_order()
         visible: list[records.WaitingStep] = []
         for path, row in ordered:
@@ -2764,14 +2777,20 @@ class AdmissionServer:
                 visible.append(local[path])
                 continue
             owner = records.waiter_owner(row)
-            candidates = self.placement_eligibility.get(routed.get(owner, ""), ())
-            target = " or ".join(dict.fromkeys(item.destination.target for item in candidates
+            request = routed.get(owner)
+            candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
+            targets = tuple(dict.fromkeys(item.destination.target for item in candidates
                 if item.destination.provider != "local" and not isinstance(item.eligibility, placement.FixedExclusion)))
+            reason = ci_holds.get(owner, records.ReadyForAdmission())
+            if request is not None and self._local_placement_eligibility(request) == placement.TemporaryExclusion("blocked"):
+                holder = self.local_hold_holders.get(request.episode)
+                reason = records.NatedevHeld(holder.unit if isinstance(holder, placement.ResourceHolderUnit) else "", "")
             visible.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
-                ci_holds.get(owner, records.ReadyForAdmission()), row.get("unit", ""), route=records.waiter_route(row),
+                reason, row.get("unit", ""), route=records.waiter_route(row),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
-                verify=row.get("verify", records.NotVerifyCall()), placement_target=target))
+                verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
+                speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy)))
         reading = replace(reading, ordered=ordered,
             view=replace(reading.view, waiting=tuple(visible), move_line=self._current_move_line(ordered)))
         reading = self._placement_reading(reading)
@@ -2809,20 +2828,32 @@ class AdmissionServer:
         previous = self.places.get(key)
         if "move_id" not in row:
             row["move_id"] = uuid.uuid4().hex
-            bumped = {entry["unit"] for entry in self.priority.entries} if isinstance(self.priority, records.QueuePriority) else set[str]()
-
-            def group(name: str) -> str:
-                return name if name in bumped else ""
-
-            own_group = group(self._priority_name(row))
-            tail = max((place.move_rank for place in self.places.values()
-                if place.move_id and not isinstance(place.move_rank, records.SubmissionRank)
-                and group(place.ci_runner or place.queue_identity.get("unit", "")) == own_group),
-                default=records.SubmissionRank())
-            if not isinstance(tail, records.SubmissionRank):
+            tail = self._manual_group_tail(row)
+            if tail is not None:
                 row["move_rank"] = max(gate.waiter_order(row)[1:], (tail[0], tail[1] + 1))
         place = waiter_place(row, request.episode)
         self.places[key] = replace(place, queue_identity=previous.queue_identity) if previous is not None else place
+
+    def _manual_group_tail(self, row: records.Waiter) -> records.WaitRank | None:
+        places = [place for place in self.places.values() if place.move_id]
+        if not any(isinstance(place.move_rank, tuple) for place in places):
+            return None
+        bumped = {entry["unit"] for entry in self.priority.entries} if isinstance(self.priority, records.QueuePriority) else set[str]()
+        sessions = {place.queue_identity["session_id"] for place in places
+                    if not (place.ci_runner or place.queue_identity.get("unit"))}
+        if not self._priority_name(row):
+            sessions.add(row.get("session_id", ""))
+        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sorted(sessions)) if bumped and sessions else {}
+
+        def group(name: str, session: str) -> str:
+            unit = gate.queue_unit(name, session, labels)
+            return unit if unit in bumped else ""
+
+        own_group = group(self._priority_name(row), row.get("session_id", ""))
+        members = [place for place in places if group(place.ci_runner or place.queue_identity.get("unit", ""),
+                                                     place.queue_identity["session_id"]) == own_group]
+        saved = [place.move_rank for place in members if isinstance(place.move_rank, tuple)]
+        return max(max(saved), max(place.submission_rank for place in members)) if saved else None
 
     def _end_move(self, waiting: WaitingAdmission) -> None:
         self._clear_wait_rank(waiting.request.owner, waiting.row["since"], waiting.request.episode)
@@ -2834,6 +2865,14 @@ class AdmissionServer:
         place = self.places.get(key)
         if place is not None and place.episode == episode and place.move_id:
             self.places[key] = replace(place, move_id="", move_rank=records.SubmissionRank())
+
+    def _end_placement_rank(self, request: wire.PlacementRequest) -> None:
+        waiting = self.waiters.get(request.episode)
+        if waiting is not None:
+            self._end_move(waiting)
+        else:
+            self._clear_wait_rank(wire.Owner(request.owner.pid, request.owner.start_time), request.since,
+                                  request.episode)
 
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: records.AdmissionDecision,
@@ -2946,7 +2985,8 @@ class AdmissionServer:
                 self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
                 self._watch_owner(request.owner)
             self._save_place(request, waiting.row)
-            self._end_move(waiting)
+            if request.episode not in self.placement_requests:
+                self._end_move(waiting)
             replies.append(reply)
         first = waiters[0].request
         if (isinstance(first, wire.AdmitRequest) and isinstance(first.place, wire.CloudPlace)
@@ -3672,11 +3712,7 @@ done
     def _update_remote_start_hold(self, request: wire.PlacementRequest, key: str,
                                   saved: records.SavedPlacementAssignment, remote_start_hold_seconds: int) -> bool:
         if (saved.assignment.destination.provider == "local"
-                or not isinstance(saved.state, placement.CurrentAssignment)
-                or isinstance(saved.remote_start_hold, records.RemoteStartHoldEnded)):
-            return False
-        if not self._can_hold_local_place(request):
-            self.assignments[key] = self._end_remote_start_hold(request, saved)
+                or not isinstance(saved.state, placement.CurrentAssignment)):
             return False
         if isinstance(saved.permission, placement.PermissionConsumed):
             evidence = self.execution_evidence.get(key)
@@ -3686,9 +3722,15 @@ done
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
                             for reference, execution in host_evidence.executions)):
+                self._end_placement_rank(request)
                 self.assignments[key] = self._end_remote_start_hold(request, saved)
                 return False
         hold = saved.remote_start_hold
+        if isinstance(hold, records.RemoteStartHoldEnded):
+            return False
+        if not self._can_hold_local_place(request):
+            self.assignments[key] = self._end_remote_start_hold(request, saved)
+            return False
         now = self.clock.now()
         if isinstance(hold, records.RemoteStartHoldUnrecorded):
             hold = records.RemoteStartHold(now + remote_start_hold_seconds)
@@ -3733,6 +3775,7 @@ done
             key = self.current_assignments.get(request.episode, "")
             saved = self.assignments.get(key)
             if not self._placement_owner_live(request.owner):
+                self._end_placement_rank(request)
                 if saved is not None:
                     if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
@@ -4019,7 +4062,7 @@ done
                         if isinstance(folder, placement.CargoFolder):
                             cargo_folders[owner] = folder
                 else:
-                    self._remove_waiter(self.waiters.get(request.episode), keep_rank=True)
+                    self._remove_waiter(self.waiters.get(request.episode))
                     if isinstance(request.purpose, placement.NormalStep):
                         self._release_unclaimed_remote_slots(request)
                     removed.add(owner)
@@ -4192,14 +4235,13 @@ done
             and isinstance(report.outcome, BeforeLaunchRefusal) and reason == report.outcome.reason)
         keep_local_wait = (current and refused_before_launch and request is not None
             and isinstance(saved.remote_start_hold, records.RemoteStartHold) and self._can_hold_local_place(request))
-        if not keep_local_wait:
+        if current and not keep_local_wait:
             self._remove_waiter(self.waiters.get(assignment.episode))
         if current:
             if request is not None:
                 saved = self._end_remote_start_hold(request, saved)
-                if not refused_before_launch:
-                    self._clear_wait_rank(wire.Owner(request.owner.pid, request.owner.start_time), request.since,
-                                          request.episode)
+                if reason in ("cancelled", "completed"):
+                    self._end_placement_rank(request)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
         self._prune_host_evidence()
@@ -4338,6 +4380,7 @@ done
                     else:
                         self._close_placement(saved, "cancelled", placement.DoNotRetry(request.reason))
                 elif saved is None:
+                    self._end_placement_rank(submitted)
                     _ = self.placement_requests.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)
@@ -4437,6 +4480,13 @@ done
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
             self.execution_evidence[key] = request.evidence
+            if ((isinstance(request.evidence, execution_identity.ObservedExecution)
+                    or isinstance(request.outcome, placement.AttemptCompleted))
+                    and self.current_assignments.get(assignment.episode) == key
+                    and (submitted := self.placement_requests.get(assignment.episode)) is not None):
+                self._end_placement_rank(submitted)
+                saved = self._end_remote_start_hold(submitted, saved)
+                self.assignments[key] = saved
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)
@@ -4907,14 +4957,11 @@ done
 
     def _remove_waiter(self, waiting: WaitingAdmission | None,
                        reply: wire.Reply | NoWaitReply = NO_WAIT_REPLY, *,
-                       claim_disposition: WaiterClaimDisposition = WaiterClaimDisposition.RELEASE,
-                       keep_rank: bool = False) -> None:
+                       claim_disposition: WaiterClaimDisposition = WaiterClaimDisposition.RELEASE) -> None:
         if waiting is None:
             return
         episode = waiting.request.episode
         del self.waiters[episode]
-        if not keep_rank and claim_disposition is not WaiterClaimDisposition.TRANSFER:
-            self._end_move(waiting)
         if claim_disposition is WaiterClaimDisposition.RETURN and episode not in self.current_assignments:
             self._free_claim(records.waiter_owner(waiting.row))
         elif claim_disposition is not WaiterClaimDisposition.TRANSFER:
@@ -5415,8 +5462,7 @@ def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> Ser
                     continue
                 keys = [places_by_id[item] for item in cast(list[object], members)
                         if isinstance(item, str) and item in places_by_id]
-                ranks = sorted((place.order_since if isinstance(place.order_since, float) else place.since, place.owner.pid)
-                               for key in keys for place in (state.places[key],))
+                ranks = sorted(state.places[key].submission_rank for key in keys)
                 for key, rank in zip(keys, ranks, strict=True):
                     state.places[key] = replace(state.places[key], move_rank=rank)
     saved_reservations = cast(dict[str, dict[str, object]], raw_state["reservations"])
