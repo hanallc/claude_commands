@@ -39,7 +39,9 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
+from scripts.production import (
+    change_review, change_routing, delivery_state, investigation, producer_map, session_staff, showrunners, staff, the_list,
+)
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
@@ -2098,6 +2100,26 @@ document.body.append(result);
                 with self.subTest(case=name, width=width):
                     self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
                                                  window_size=(width, 700))
+
+    def test_new_item_takes_the_mapped_producer_of_its_recipient(self) -> None:
+        def created(recipient: staff.StaffRow, request: str) -> review_page.PublishedSubmission:
+            saved = SimpleNamespace(owner=OWNER.id, recipient_id=recipient.id, words="Check the chart.\nMore words.",
+                                    key=f"question/{recipient.id}/{request}")
+            return cast(review_page.PublishedSubmission, cast(object, SimpleNamespace(saved=saved, key=f"review-{request}")))
+
+        unmapped = list_page.add_submission(created(OWNER, "Q1"))
+        self.assertEqual((unmapped.keeper, unmapped.item.producer, unmapped.item.title),
+                         (OWNER.id, OWNER.id, "Check the chart."))
+        _ = (self.root / "config" / "producer_map.conf").write_text(
+            f"# sdlc -> dwight\n{OWNER.id}={DWIGHT.id}\n", encoding="utf-8")
+        mapped = list_page.add_submission(created(OWNER, "Q2"))
+        self.assertEqual((mapped.keeper, mapped.item.producer), (OWNER.id, DWIGHT.id))
+        errors = io.StringIO()
+        with redirect_stderr(errors), patch.object(producer_map, "producer_for", side_effect=staff.StaffUnreadable("no staff")):
+            unread = list_page.add_submission(created(OWNER, "Q3"))
+        self.assertEqual((unread.keeper, unread.item.producer), (OWNER.id, OWNER.id))
+        self.assertEqual(errors.getvalue(),
+                         "list_page: no producer map lookup; the keeper stays the producer: no staff\n")
 
     def test_log_entries_share_one_label_column(self) -> None:
         self.assertIn(".list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr)", list_page.STYLE)

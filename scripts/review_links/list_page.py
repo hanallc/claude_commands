@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
+from scripts.production import change_review, footer_counts, producer_map, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
@@ -112,8 +112,17 @@ def add_submission(created: review_page.PublishedSubmission) -> ListRecord:
         if item is None:
             words = created.saved.words
             title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
-            item = the_list.add(keeper, title, owner=keeper, source=the_list.PAGE_SOURCE,
-                                changes={"latest_status": words, "evidence": evidence})
+            changes: the_list.ItemChanges = {"latest_status": words, "evidence": evidence}
+            # The mapped producer of the recipient takes the item; with none, the keeper stays the producer.
+            try:
+                producer = producer_map.producer_for(created.saved.recipient_id, staff.snapshot())
+            except (conf.Unusable, OSError) as error:  # StaffUnreadable is an OSError.
+                # The record is filed, so the map never fails the Send.
+                print(f"list_page: no producer map lookup; the keeper stays the producer: {error}", file=sys.stderr)
+            else:
+                if isinstance(producer, staff.StaffRow):
+                    changes["producer"] = producer.id
+            item = the_list.add(keeper, title, owner=keeper, source=the_list.PAGE_SOURCE, changes=changes)
         if item.state != the_list.ItemState.CLOSED and created.key not in item.reviews:
             item = the_list.link(keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE)
         return ListRecord(keeper, item)
