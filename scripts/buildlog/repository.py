@@ -123,7 +123,7 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     seen = {common}
     while origin:
         if _relative_local_origin(origin):
-            source_directory = _relative_origin_directory(directory)
+            source_directory = _relative_origin_directory(Path(common))
             if isinstance(source_directory, UnrecordedSourceCheckout):
                 break
             directory = source_directory
@@ -137,19 +137,18 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
 
 
-def _relative_origin_directory(directory: str) -> str | UnrecordedSourceCheckout:
-    checkout = git_files.locate(Path(directory))
-    if checkout.git_dir == checkout.common_dir:
-        return str(checkout.toplevel)
-    from scripts.lib.build_slots import SlotGitFailure, source_checkout
-
+def _relative_origin_directory(common: Path) -> str | UnrecordedSourceCheckout:
+    # Every checkout must use only the primary path that the shared Git folder can identify.
+    configured = subprocess.run(
+        ["git", "--git-dir", str(common), "config", "--default", str(common.parent), "--get", "core.worktree"],
+        cwd=common, capture_output=True, text=True, check=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+    )
+    directory = (common / configured.stdout.removesuffix("\n")).resolve()
     try:
-        source = git_files.at(source_checkout(checkout.toplevel))
+        source = git_files.at(directory)
     except git_files.NotACheckout:
         return UnrecordedSourceCheckout()
-    except SlotGitFailure as error:
-        raise ValueError(str(error)) from error
-    if source.git_dir != checkout.common_dir or source.common_dir != checkout.common_dir:
+    if source.git_dir != common or source.common_dir != common:
         return UnrecordedSourceCheckout()
     return str(source.toplevel)
 

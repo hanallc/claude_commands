@@ -2227,14 +2227,14 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             retired = claim_state.read_retired_mac_reservation(paths, identity)
         except StateReadError as error:
             return ClaimDenied(12, str(error), to_stderr=True)
-        if not isinstance(retired, NoRun):
-            if retired["pid"] != args.from_pid:
+        if isinstance(retired, claim_state.RetiredMacReservation):
+            if retired.pid != args.from_pid:
                 return refuse_wait_claim(WaitClaimCheck.PID)
-            if retired["submitting_session"] != claim_state.session_id(session):
+            if retired.submitting_session != claim_state.session_id(session):
                 return refuse_wait_claim(WaitClaimCheck.SESSION)
-            if process_identity.process_start(args.from_pid) != process_identity.Started(retired["proc_start"]):
+            if process_identity.process_start(args.from_pid) != process_identity.Started(retired.proc_start):
                 return refuse_wait_claim(WaitClaimCheck.OWNER_START)
-            if not recorded_worktree_matches(retired["worktree"], worktree):
+            if not recorded_worktree_matches(retired.worktree, worktree):
                 return refuse_wait_claim(WaitClaimCheck.WORKTREE)
             return replace_incomplete_wait_claim(args, paths, scope, assignment, session, mac_repository,
                                                  _KEEP_OTHER_RESERVATIONS)
@@ -2474,8 +2474,8 @@ def release_exact_claims(
         if paths.platform == "macos":
             try:
                 reservation = claim_state.read_retired_mac_reservation(paths, identity)
-                if not isinstance(reservation, NoRun) and reservation["pid"] == pid:
-                    claim_state.retired_mac_reservation_path(paths, identity).unlink()
+                if isinstance(reservation, claim_state.RetiredMacReservation) and reservation.pid == pid:
+                    reservation.path.unlink()
             except (StateReadError, OSError) as error:
                 return ClaimReleaseRefused(str(error))
         # Each file is read alone, so another repository's damaged record

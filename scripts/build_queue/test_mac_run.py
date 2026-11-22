@@ -431,20 +431,24 @@ sys.exit(71)
 
         self.assertEqual(mac_test.command_release(native, self.paths), 0)
         _ = subprocess.run(["git", "-C", str(separate), "config", "--unset", "core.worktree"], check=True)
-        self.assertEqual(claim_state.target_claim_scope(self.paths, str(separate)),
-                         claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
                                            1, 1, 1, "1", {"linux_only.hana": ""})
         key = f"git-dir:{metadata}"
-        for checkout in (linked, peer):
-            self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
-                             eligibility.KnownRepository("hana", key))
-        native = self.native_claim(linked)
+        native = self.native_claim(separate)
         self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
         self.addCleanup(mac_test.command_release, native, self.paths)
-        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-            with mac_run.held(peer, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
-                self.fail("The second linked checkout took the shared slot")
+        for checkout in (linked, peer):
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+                with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("A linked checkout took the primary checkout's slot")
+        self.assertEqual(mac_test.command_release(native, self.paths), 0)
+        for checkout in (separate, self.checkout, linked, peer):
+            self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
+                             eligibility.KnownRepository("hana", key))
+        with mac_run.held(linked, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with mac-linux"):
+                with mac_run.held(separate, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("The primary checkout took the linked checkout's slot")
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
         other = self.root / "other"
@@ -714,6 +718,9 @@ sys.exit(71)
     def test_status_and_sweep_retire_an_interrupted_replacement(self) -> None:
         self.exercise_interrupted_replacement(("status", "sweep"))
 
+    def test_release_wait_revokes_an_interrupted_replacement_retry(self) -> None:
+        self.exercise_interrupted_replacement(("release-wait",))
+
     def test_a_second_interruption_allows_a_fresh_retry(self) -> None:
         self.exercise_interrupted_replacement(("second-interruption",))
 
@@ -836,7 +843,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                 if recovery == "status":
                     status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
                     self.assertEqual(mac_test.command_status(self.paths, status_config), 0)
-                elif recovery == "sweep":
+                elif recovery in ("sweep", "release-wait"):
                     with claim_state.locked(self.paths.lock):
                         self.assertEqual(mac_test.live_claims(self.paths), ())
                 elif recovery == "inspect":
@@ -850,8 +857,22 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     child = subprocess.run([sys.executable, "-c", script, "fresh-write", str(old_path), *command[2:]],
                                            capture_output=True, text=True, timeout=5)
                     self.assertEqual(child.returncode, 72, child.stdout + child.stderr)
-                if recovery in ("status", "sweep", "inspect", "second-interruption"):
+                if recovery in ("status", "sweep", "release-wait", "inspect", "second-interruption"):
                     self.assertEqual(claim_state.read_claims(self.paths), ())
+                if recovery == "release-wait":
+                    proof = claim_state.retired_mac_reservation_path(self.paths, identity)
+                    self.assertTrue(proof.exists())
+                    with mock.patch.object(claim_state, "submitting_session", return_value=OwningSession("other")):
+                        self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
+                    self.assertTrue(proof.exists())
+                    self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
+                    child = subprocess.run([sys.executable, "-c", script, "none", str(old_path), *command[2:]],
+                                           capture_output=True, text=True, timeout=5)
+                    self.assertEqual(child.returncode, 12, child.stdout + child.stderr)
+                    self.assertIn("no reservation", child.stderr)
+                    self.assertFalse(proof.exists())
+                    self.assertEqual(claim_state.read_claims(self.paths), ())
+                    continue
                 self.check_replacement_retry(request, config, old_path, abandoned, script,
                                              settle=recovery == "settled-fence", lose_reply=recovery == "lost-reply")
 

@@ -516,12 +516,25 @@ def retired_mac_reservation_path(paths: StatePaths, identity: ClaimIdentity) -> 
     return paths.directory / "retired-reservations" / pending_start_key(identity)
 
 
-def read_retired_mac_reservation(paths: StatePaths, identity: ClaimIdentity) -> ProcessBoundClaim | NoRun:
-    """Read the exact local reservation that an interrupted replacement retired."""
-    record = read_run(retired_mac_reservation_path(paths, identity))
+@dataclass(frozen=True)
+class RetiredMacReservation:
+    """The saved permission for the original waiter to retry a retired reservation."""
+
+    path: Path
+    pid: int
+    proc_start: str
+    submitting_session: str
+    worktree: str
+
+
+def read_retired_mac_reservation(paths: StatePaths, identity: ClaimIdentity) -> RetiredMacReservation | NoRun:
+    """Read the saved retry permission for this claim identity."""
+    path = retired_mac_reservation_path(paths, identity)
+    record = read_run(path)
     if isinstance(record, NoRun) or "remote_host" in record or claim_identity(record) != identity:
         return NO_RUN
-    return record
+    return RetiredMacReservation(path, record["pid"], record["proc_start"], record["submitting_session"],
+                                 record["worktree"])
 
 
 def claim_owner_ended(record: RunRecord) -> bool:

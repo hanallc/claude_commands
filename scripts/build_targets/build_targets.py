@@ -1233,10 +1233,11 @@ def command_reserve(args: CliArguments) -> int:
 def command_release_wait(pid: int, *,
                          identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
                          session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
-    """Release only process-bound reservations; remote claims retain ownership."""
+    """Release the process-bound reservation and revoke its retry permission."""
     from scripts.lib import process_start as process_identity
 
     session = claim_state.submitting_session(session)
+    session_id = claim_state.session_id(session)
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
         return 0
@@ -1250,9 +1251,19 @@ def command_release_wait(pid: int, *,
         paths = claim_state.state_paths(target.name)
         fenced: list[claim_state.HeldClaim] = []
         with claim_state.locked(paths.lock):
+            if paths.platform == "macos" and isinstance(identity, claim_state.ClaimIdentity):
+                try:
+                    retired = claim_state.read_retired_mac_reservation(paths, identity)
+                    if (isinstance(retired, claim_state.RetiredMacReservation)
+                            and retired.pid == pid and retired.proc_start == start.start
+                            and retired.submitting_session == session_id):
+                        retired.path.unlink(missing_ok=True)
+                except (claim_state.StateReadError, OSError) as error:
+                    print(str(error), file=sys.stderr)
+                    return 1
             for claim in claim_state.read_claims(paths):
                 if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                        and claim.record["submitting_session"] == claim_state.session_id(session)
+                        and claim.record["submitting_session"] == session_id
                         and claim_state.claim_identity(claim.record) == identity
                         and "remote_host" not in claim.record):
                     if claim_state.claim_pending_start(paths, claim.path, claim.record).exists():
