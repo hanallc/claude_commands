@@ -30,6 +30,7 @@ from scripts.production import census, display_cells, land_queue, land_runs, liv
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.message import send as message_send
 from scripts.production import showrunners
 from scripts.production import unit_lookup
 from scripts.production import session_staff, unit_config
@@ -505,12 +506,14 @@ class UnitPhasesTests(unittest.TestCase):
             with (patch.object(session_staff, "pane_parents", return_value=[member]),
                   patch.object(worker_panes, "observe_parents", return_value={member.id: [opened]}),
                   patch.object(worker_panes, "observe", side_effect=[[opened], [closed]]) as observed,
+                  patch.object(worker_panes, "observe_worker", return_value=closed),
+                  patch.object(worker_panes, "close", return_value=worker_panes.Closed()),
                   patch.object(worker_panes, "parent_run_index", return_value={member.current_session: [str(run)]}),
-                  patch.object(worker_panes, "worker_lock", return_value=contextlib.nullcontext()),
                   patch.object(herdr, "Herdr"), patch.object(herdr, "shared_session", return_value="fixture"),
                   patch.object(restart, "stop_row", return_value=True) as stop_row,
                   patch.object(detached_runs, "live_runs_for_staff", return_value=[]),
                   patch.object(worker_panes, "forget_restart"),
+                  patch.object(message_send, "send", return_value=message_send.Result("sent", "fixture")),
                   patch.object(worker_capacity, "_send", return_value=True) as send,
                   patch.object(showrunners, "load_settings_from", return_value={"faults_to": "fixture-faults"}),
                   contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):

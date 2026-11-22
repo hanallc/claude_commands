@@ -3450,8 +3450,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.finish_after = 1
         families: dict[staff.WorkerRole, Literal["claude", "codex"]] = {"review": "claude", "astra-reviewer": "codex"}
 
-        def launch_policy(role: staff.WorkerRole) -> worker_panes.LaunchPolicy:
-            settings = models_registry.LaunchSettings(families[role], "fixture", "high", "")
+        def launch_policy(role: staff.WorkerRole,
+                          family: Literal["claude", "codex", "assigned"] = "assigned") -> worker_panes.LaunchPolicy:
+            selected = families[role] if family == "assigned" else family
+            settings = models_registry.LaunchSettings(selected, "fixture", "high", "")
             return worker_panes.LaunchPolicy(settings, "read-only", "plan")
 
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}),
