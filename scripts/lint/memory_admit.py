@@ -2342,9 +2342,9 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
 
 def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[int]) -> int:
     """Only measured resident memory of ended rows becomes available RAM."""
-    return sum(step.measured.bytes
-               for index, step in enumerate(running) if index in ended
-               and isinstance(step.measured, MeasuredMemory))
+    builds = builds_slice_cgroup()
+    return sum(queue_resident_bytes(step.measured, builds)
+               for index, step in enumerate(running) if index in ended)
 
 
 def running_has_reservation(step: RunningStep) -> bool:
@@ -2449,6 +2449,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
     identities = RecordedQueueIdentities()
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
     totals = result.policy.totals
+    builds = builds_slice_cgroup()
     explained: list[ExplainedRunningStep] = []
     reservations = iter(inputs.reservations)
     for step in inputs.running:
@@ -2461,7 +2462,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
             admitted_at = step_estimator.epoch(row["admitted_at"])
             need = reservation_need(row, reading)
             owner = reservation_owner(row, step)
-        measured = reading.bytes if isinstance(reading, (MeasuredMemory, CompilerServiceMemory, UnownedSliceMemory)) else 0
+        measured = queue_resident_bytes(reading, builds)
         charge = max(need, measured)
         explained.append(ExplainedRunningStep(step, admitted_at, need, measured, charge, owner=owner))
     waiting: list[WaitingStep] = []
@@ -2869,6 +2870,11 @@ def detached_tool_memory(memory: StepMemory, builds: Path) -> bool:
     path = Path(memory.cgroup)
     return path.is_relative_to(builds / "builds-detached.slice") or any(
         parent.name == "builds-detached.slice" and parent.parent.name == "builds.slice" for parent in path.parents)
+
+
+def queue_resident_bytes(memory: StepMemory, builds: Path) -> int:
+    """Count resident bytes in the queue. The host tool budget already counts detached tools."""
+    return memory.bytes if isinstance(memory, MeasuredMemory) and not detached_tool_memory(memory, builds) else 0
 
 
 def desktop_guarantee() -> int | ReadingUnavailable:

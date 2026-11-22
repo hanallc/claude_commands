@@ -6968,7 +6968,7 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertEqual(gate.unowned_slice_memory([], {}, self.proc), ())
 
 
-    def test_queue_charges_unowned_scopes_inside_detached_slices(self) -> None:
+    def test_queue_does_not_charge_unowned_scopes_inside_detached_slices(self) -> None:
         builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
         detached = builds / "builds-detached.slice"
         run_slice = detached / "builds-detached-r1.slice"
@@ -6995,7 +6995,8 @@ class CiSliceMemoryTests(unittest.TestCase):
         inputs = gate.build_queue_inputs([], [(reservation, owned_memory)], readings, NOW_EPOCH,
                                          unowned=unowned_readings)
         result = gate.queue_read_from(inputs, policy)
-        self.assertEqual(result.explanation.totals.charged, 6 * GIB)
+        self.assertEqual(result.explanation.totals.charged, 3 * GIB)
+        self.assertEqual(result.explanation.totals.measured, 3 * GIB)
 
 
     def test_unreadable_or_invalid_ci_stat_records_a_diagnostic(self) -> None:

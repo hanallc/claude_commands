@@ -43,6 +43,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import write_private_slot_roots
+from scripts.lib.proc_text import read_proc_text
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -3789,7 +3790,7 @@ process.stdout.write(JSON.stringify({
                       mock.patch.object(memory_feed, "PROC", proc)):
                     return memory_feed.reading(), decoded.reading
 
-            before, _ = page()
+            before, baseline = page()
             original, = (row for row in before["walk"] if row["pid"] == root.pid)
             original = cast(memory_feed.RunRow, original)
             self.assertEqual((original["name"], original["used"], original["counted"]), ("verify.sh", 1.5, 0.0))
@@ -3797,6 +3798,23 @@ process.stdout.write(JSON.stringify({
             for pid, scope_gib in zip(helper_pids, (1, 2), strict=True):
                 write_scope(run_slice / f"helper-{pid}.scope", members=(pid,),
                             current=scope_gib * gib, anonymous=scope_gib * gib)
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(config, tuple(fixture.server.reservations.values()),
+                                                       tuple(fixture.server.run_places.values()), False)
+            tracked_pids = {root.pid, *helper_pids}
+            status_reads: Counter[int] = Counter()
+
+            def read_status(path: Path) -> str:
+                if path.name == "status" and path.parent.parent == proc:
+                    pid = int(path.parent.name)
+                    if pid in tracked_pids:
+                        status_reads[pid] += 1
+                return read_proc_text(path)
+
+            with mock.patch.object(gate, "_read_proc_text", side_effect=read_status):
+                _ = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+            self.assertEqual(status_reads, dict.fromkeys(tracked_pids, 1))
             after, reading = page()
             matching = {str(run_slice / f"helper-{pid}.scope") for pid in helper_pids}
             self.assertEqual({step.measured.cgroup for step in reading.view.running
@@ -3806,6 +3824,12 @@ process.stdout.write(JSON.stringify({
             shown, = (row for row in after["walk"] if row["pid"] == root.pid)
             self.assertEqual(shown, original)
             self.assertEqual(after["walk"], before["walk"])
+            self.assertEqual(reading.explanation.totals, baseline.explanation.totals)
+            self.assertEqual(reading.explanation.totals.measured, 7 * gib // 2)
+            tool_indices = frozenset(index for index, step in enumerate(reading.explanation.decided_from.running)
+                                     if gate.detached_tool_memory(step.measured, builds))
+            self.assertEqual(len(tool_indices), 2)
+            self.assertEqual(gate.released_resident_bytes(reading.explanation.decided_from.running, tool_indices), 0)
             ram = after["ram"]
             self.assertEqual((ram["queued_builds_bytes"], ram["build_tools_bytes"], ram["other_build_tools_bytes"]),
                              (2 * gib, 3 * gib, 3 * gib))
@@ -3863,15 +3887,63 @@ process.stdout.write(JSON.stringify({
             with (mock.patch.object(fixture.proc, "lifetime", return_value=gate.PopulatedStepScope(child)),
                   mock.patch.object(Path, "read_text", autospec=True, side_effect=read_members)):
                 first = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
-                self.assertEqual(reads, {helper: 1, child: 1})
+                self.assertEqual(reads, {helper: 1, child: 2})
                 _ = (helper / "cgroup.procs").write_text("")
                 second = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
-                self.assertEqual(reads, {helper: 2, child: 2})
+                self.assertEqual(reads, {helper: 2, child: 4})
             self.assertEqual(first.scope_members[str(helper)], {helper_owner.pid, cargo_owner.pid})
             self.assertEqual(second.scope_members[str(helper)], {cargo_owner.pid})
             memory = first.reservations[request.episode].memory
             assert isinstance(memory, admission_records.MeasuredMemory)
             self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
+
+    def test_ci_scan_deducts_a_process_that_enters_a_reserved_scope_between_samples(self) -> None:
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
+            child = ci / "job.scope"
+            write_scope(ci, current=2 * gib, anonymous=2 * gib)
+            tree_owner = fixture.fixture_owner(700001, "100")
+            scope_owner = fixture.fixture_owner(700002, "200")
+            write_process(fixture.proc.path, tree_owner.pid, gib, start=tree_owner.start_time)
+            tree_request = fixture.request(owner=tree_owner, need=2 * gib)
+            _ = only_admitted(fixture.server.handle_request(tree_request))
+            fixture.allow_next_start()
+            sidecar = fixture.scope(scope_owner, folder=str(child.relative_to(fixture.root)))
+            scope_request = replace(fixture.request(owner=scope_owner, need=2 * gib), sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(scope_request))
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(config, tuple(fixture.server.reservations.values()), (), False)
+            read_text = Path.read_text
+
+            def move_process(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path == ci / "memory.current":
+                    # The earlier reservation already measured its child.
+                    write_scope(ci, current=3 * gib, anonymous=3 * gib)
+                    write_scope(child, members=(scope_owner.pid, tree_owner.pid), current=2 * gib, anonymous=2 * gib)
+                return read_text(path, encoding=encoding, errors=errors)
+
+            for move in (False, True):
+                with self.subTest(move=move), mock.patch.object(Path, "read_text", autospec=True,
+                                                                  side_effect=move_process if move else read_text):
+                    evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+                child_memory = evidence.reservations[scope_request.episode].memory
+                assert isinstance(child_memory, admission_records.MeasuredMemory)
+                self.assertEqual(child_memory.anonymous_source,
+                                 admission_records.ScopeSource(child, frozenset({scope_owner.pid})))
+                self.assertEqual(evidence.scope_members[str(ci)], {scope_owner.pid, tree_owner.pid}
+                                 if move else {scope_owner.pid})
+                fixture.server.system_reader = FixedSystemReader(evidence)
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+                      mock.patch.object(memory_feed, "PROC", fixture.proc.path)):
+                    page = memory_feed.reading()
+                self.assertEqual(page["ci_ram"], 1.0)
 
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (

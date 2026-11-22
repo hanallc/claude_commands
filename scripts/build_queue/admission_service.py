@@ -660,13 +660,13 @@ class ReservationEvidence:
 
 def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
                            lifetime: gate.StepLifetime, processes: dict[int, gate.ProcessIdentity],
-                           proc: Path, *, membership: gate.ScopeMembershipPass | None = None) -> records.StepMemory:
+                           proc: Path) -> records.StepMemory:
     _ = record
     if isinstance(lifetime, gate.EndedStep):
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
-            return gate.process_memory(lifetime, proc, membership=membership)
+            return gate.process_memory(lifetime, proc)
         except FileNotFoundError:
             identity = processes.get(row["pid"])
             if identity is None or identity.start != row["start_time"]:
@@ -746,14 +746,13 @@ class SystemEvidence:
 
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
                 reservation_reader: Callable[[ReservationRecord, records.Reservation, gate.StepLifetime,
-                    dict[int, gate.ProcessIdentity], Path], records.StepMemory] | None = None) -> SystemEvidence:
+                    dict[int, gate.ProcessIdentity], Path], records.StepMemory] = raw_reservation_memory) -> SystemEvidence:
     """Read operating-system evidence without access to mutable service state."""
     started_monotonic = clock.monotonic()
     now = clock.now()
     processes = proc.processes()
     activity = ScopeActivityReader(processes, proc.path,
         tuple(LiveBuildRun(place.run.pid, place.run.start_time, place.since) for place in plan.runs))
-    membership = gate.ScopeMembershipPass()
     lifetimes: dict[str, gate.StepLifetime] = {}
     reservations: dict[str, ReservationEvidence] = {}
     for record in plan.reservations:
@@ -761,8 +760,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         live = owner_may_be_live(proc.owner_start(record.owner.pid), record.owner.start_time)
         lifetime = proc.lifetime(row, live)
         lifetimes[record.episode] = lifetime
-        memory = (raw_reservation_memory(record, row, lifetime, processes, proc.path, membership=membership)
-                  if reservation_reader is None else reservation_reader(record, row, lifetime, processes, proc.path))
+        memory = reservation_reader(record, row, lifetime, processes, proc.path)
         if isinstance(memory, records.MeasuredMemory):
             memory = replace(memory, promise=records.NoPromise(), observed_peak=0,
                              unknown_peak_promise=0, peak_history=records.NoPeakRecorded())
@@ -776,6 +774,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             sample_file(Path(record.path).with_suffix(".max")),
             sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
     # Capture every scope before the loop applies current reservation ownership.
+    membership = gate.ScopeMembershipPass()
     unowned = gate.unowned_slice_memory([], processes, proc.path,
         activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice, membership=membership)
     has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
@@ -816,11 +815,13 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         if not isinstance(evidence, ScopeProcesses):
             continue
         live_run = LiveBuildRun(run.pid, run.start_time, activity.started_at(run.pid) or place.since)
-        measured = gate.tree_memory(run.pid, run.start_time, processes, proc.path)
-        if isinstance(measured, records.GoneMemory):
-            continue
+        tree = gate.process_tree({run.pid: run.start_time}, processes)
+        measured = gate.process_memory(tree - scope_process_memory.keys(), proc.path)
+        cached = [scope_process_memory[pid] for pid in tree & scope_process_memory.keys()]
+        used = measured.bytes + sum(item.bytes for item in cached)
+        swap = measured.swap_bytes + sum(item.swap_bytes for item in cached)
         caller = scope_caller(evidence, place.unit)
-        memory = records.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
+        memory = records.UnownedSliceMemory(used, swap_bytes=swap,
             pid=run.pid, activity=replace(evidence, run=live_run, session_name=caller.name))
         between.append(records.RunningStep(caller.session_id, caller.name, "between steps",
             evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=caller.unit))
