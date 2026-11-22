@@ -75,6 +75,8 @@ cargo-berth)
         exit 4
     fi
     exit 0 ;;
+zsh)
+    if [ "$1" = "$HOME/.claude/scripts/message/notifier.sh" ]; then exec "$@"; fi ;;
 notifier.sh)
     if [ "$1" = remove ]; then rm -rf "$state/notifier/$2"; fi
     exit 0 ;;
