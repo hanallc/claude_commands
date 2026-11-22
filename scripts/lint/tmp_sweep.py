@@ -101,10 +101,11 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
-from errno import EACCES
+from errno import EACCES, ENOENT
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
@@ -158,6 +159,7 @@ LSOF_TIMEOUT_SECONDS = 120
 LSOF_CWD = "cwd"
 LSOF_MAPPED = ("txt", "mem")
 WORKS_IN = "works in it"
+ROOTS_IN = "has its root in it"
 MAPS_FILE = "maps a file in it"
 HOLDS_FILE = "holds a file open in it"
 WRITES_FILE = "holds a file open for writing in it"
@@ -540,12 +542,21 @@ class KernelHiddenProcess:
 
 
 @dataclass(frozen=True)
+class CwdOnlyProcess:
+    """A process that used a scanned folder only as its working directory."""
+
+    start_ticks: int
+    executable: str
+
+
+@dataclass(frozen=True)
 class ProcessUsesKnown:
     """A completed scan of process paths, including a scan with no matches."""
     paths: list[tuple[str, int, str]]
     unreadable_cwd_pids: tuple[int, ...] = ()
     unreadable_process_pids: tuple[int, ...] = ()
     kernel_hidden: tuple[KernelHiddenProcess, ...] = ()
+    cwd_only_processes: dict[int, CwdOnlyProcess] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -561,6 +572,19 @@ class ProcessUsesIncomplete(ProcessUsesUnavailable):
 class UserProcessStatus(Enum):
     SKIP_PROCESS = "skip process"
     UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class LinuxProcessStat:
+    state: str
+    parent: int
+    start_ticks: int
+
+
+def linux_process_stat(path: str | Path) -> LinuxProcessStat:
+    """Read the process state, parent, and start time in kernel clock ticks."""
+    fields = (Path(path) / "stat").read_text(errors="replace").rpartition(")")[2].split()
+    return LinuxProcessStat(fields[0], int(fields[1]), int(fields[19]))
 
 
 def _permitted_capabilities(status: Sequence[str]) -> int:
@@ -646,6 +670,7 @@ def _read_process_paths(path: str, pid: int, prefix: str | tuple[str, ...], *, s
     except FileNotFoundError:
         if not strict:
             return read_errors
+        read_errors.add(ENOENT)
     except PermissionError as error:
         unreadable.add(pid)
         if not strict:
@@ -661,10 +686,11 @@ def _read_process_paths(path: str, pid: int, prefix: str | tuple[str, ...], *, s
     if cwd_only:
         return read_errors
     if strict:
-        for name, how in (("root", WORKS_IN), ("exe", MAPS_FILE)):
+        for name, how in (("root", ROOTS_IN), ("exe", MAPS_FILE)):
             try:
                 target = os.readlink(os.path.join(path, name))
             except FileNotFoundError:
+                read_errors.add(ENOENT)
                 continue
             except OSError as error:
                 read_errors.add(error.errno)
@@ -678,7 +704,7 @@ def _read_process_paths(path: str, pid: int, prefix: str | tuple[str, ...], *, s
             for fd in entries:
                 descriptors.append(fd)
     except FileNotFoundError:
-        pass
+        read_errors.add(ENOENT)
     except OSError as error:
         read_errors.add(error.errno)
     for fd in descriptors:
@@ -687,6 +713,7 @@ def _read_process_paths(path: str, pid: int, prefix: str | tuple[str, ...], *, s
         try:
             target = os.readlink(fd.path)
         except FileNotFoundError:
+            read_errors.add(ENOENT)
             continue
         except OSError as error:
             read_errors.add(error.errno)
@@ -709,10 +736,24 @@ def _read_process_paths(path: str, pid: int, prefix: str | tuple[str, ...], *, s
                 if len(parts) == 6 and parts[5].startswith(prefix):
                     found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
     except FileNotFoundError:
-        pass
+        read_errors.add(ENOENT)
     except OSError as error:
         read_errors.add(error.errno)
     return read_errors
+
+
+def process_clear_beyond_cwd(process: Path, pid: int, folders: tuple[str, ...]) -> bool:
+    """Check one process for other uses of the folders."""
+    task = _user_task(str(process), os.geteuid())
+    if not isinstance(task, UserTask) or task.has_other_threads():
+        return False
+    found: list[tuple[str, int, str]] = []
+    errors = _read_process_paths(str(process), pid, folders, strict=True, ignored_self_fds=NO_IGNORED_FDS,
+                                 found=found, unreadable=set())
+    return not errors and not any(
+        how != WORKS_IN and any(name == folder or name.startswith(folder + os.sep) for folder in folders)
+        for name, _, how in found
+    )
 
 
 def process_paths(proc: str, prefix: str | tuple[str, ...], *,
@@ -745,6 +786,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
     unreadable: set[int] = set()
     incomplete: set[int] = set()
     kernel_hidden: dict[int, KernelHiddenProcess] = {}
+    cwd_only_processes: dict[int, CwdOnlyProcess] = {}
     user = os.geteuid()
     for entry in processes:
         if not entry.name.isdigit():
@@ -755,15 +797,29 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                                     found=found, unreadable=unreadable)
             continue
         leader = _user_task(entry.path, user)
-        other_tasks = _surviving_tasks(leader, user) if isinstance(leader, UserTask) and leader.has_other_threads() else ()
+        threaded = isinstance(leader, UserTask) and leader.has_other_threads()
+        other_tasks = _surviving_tasks(leader, user) if isinstance(leader, UserTask) and threaded else ()
         for task in chain((leader,), other_tasks):
             if not isinstance(task, UserTask) or task.exited:
                 if task is UserProcessStatus.UNREADABLE:
                     incomplete.add(pid)
                 continue
             cwd_only = isinstance(leader, UserTask) and not leader.exited and task is not leader
+            start_ticks = -1
+            if not threaded:
+                with suppress(OSError, ValueError, IndexError):
+                    start_ticks = linux_process_stat(task.path).start_ticks
+            first_path = len(found)
             read_errors = _read_process_paths(task.path, pid, prefix, strict=True, ignored_self_fds=ignored_self_fds,
                                              found=found, unreadable=unreadable, cwd_only=cwd_only)
+            if (start_ticks >= 0 and not read_errors and len(found) == first_path + 1
+                    and found[first_path][2] == WORKS_IN):
+                with suppress(OSError, ValueError, IndexError):
+                    executable = os.readlink(os.path.join(task.path, "exe"))
+                    if linux_process_stat(task.path).start_ticks == start_ticks:
+                        cwd_only_processes[pid] = CwdOnlyProcess(start_ticks, executable)
+            # Missing data prevents a cwd-only exception. An ended process can also leave this result.
+            read_errors.discard(ENOENT)
             if not read_errors:
                 continue
             access = (_kernel_hidden_process(task.path, pid, task.status, user, caller_capabilities)
@@ -772,7 +828,8 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                 kernel_hidden[pid] = access
             elif access is UserProcessStatus.UNREADABLE:
                 incomplete.add(pid)
-    return ProcessUsesKnown(found, tuple(sorted(unreadable)), tuple(sorted(incomplete)), tuple(kernel_hidden.values()))
+    return ProcessUsesKnown(found, tuple(sorted(unreadable)), tuple(sorted(incomplete)),
+                            tuple(kernel_hidden.values()), cwd_only_processes)
 
 
 def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False,
