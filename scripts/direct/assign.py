@@ -568,8 +568,24 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     owner = worker_admission.parent(staff.local_snapshot(), run=run)
     artifacts = staff_worker.CompletionArtifacts(owner, run)
     enrolled = artifacts.protected
-    if enrolled and (refusal := worker_panes.review_role_refusal(owner, cast(staff.WorkerRole, role))):
-        refuse(refusal.reason)
+    if enrolled:
+        if refusal := worker_panes.review_role_refusal(owner, cast(staff.WorkerRole, role)):
+            refuse(refusal.reason)
+        try:
+            progress_history.check_assigned_review_launch(run, phase, prompt, args.lens)
+        except staff.StaffUnreadable as error:
+            print(f"staff: review: not opened: {error}".replace("\n", " "), file=sys.stderr)
+            return 3
+        except (OSError, ValueError, SystemExit) as error:
+            refuse(str(error))
+    else:
+        check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
+                 "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
+        if args.lens:
+            check += ["--lens", args.lens]
+        checked = call(check, env, check=False)
+        if checked.returncode:
+            return 3 if checked.returncode == 3 else 2
     directory = phase_reservation.phase_directory(run, phase)
     artifacts.mkdir(directory)
     launcher = launcher_command()
@@ -932,13 +948,6 @@ def main() -> int:
     paths = authorized_paths(args, cwd)
     run, phase = prepare_run(args, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
-    check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
-             "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
-    if args.lens:
-        check += ["--lens", args.lens]
-    checked = call(check, env, check=False)
-    if checked.returncode:
-        return 3 if checked.returncode == 3 else 2
     return submission_result(execute_herdr(args, run, phase, prompt, role, paths, env))
 
 

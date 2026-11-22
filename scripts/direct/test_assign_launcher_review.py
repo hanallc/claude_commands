@@ -148,6 +148,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     enrolled_paths = EnrolledPaths(project, project / "production.md", project / "LOG.md",
                                                   project / "notes", integration)
                     write_text_atomic(enrolled_paths.live_doc, f"# Production\n- **Merge checkout:** `{project}`\n")
+                    with (project / ".git/info/exclude").open("a") as excludes:
+                        _ = excludes.write("/production.md\n")
                     owner = fixture_member("showrunner", name="style-showrunner",
                                            doc=staff.LiveDoc(remote.local_machine(), enrolled_paths.live_doc))
                     unit = case.fixture.parent
@@ -189,6 +191,14 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                              "--prompt", str(case.prompt)]
                 if style:
                     arguments += ["--style-since", baseline]
+                if enrolled:
+                    stale = self.panes.root / "stale-review.md"
+                    write_text_atomic(stale, "Phase 7 — Earlier work\nReview the assigned change.\n")
+                    submitted = list(case.agent.submitted)
+                    refused = invoke_cli(assign, assign.main, [*arguments, "--prompt", str(stale)], environment, project)
+                    self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                    self.assertIn("Stale prompt phase", refused.stderr)
+                    self.assertEqual(case.agent.submitted, submitted)
                 notices = len(case.agent.notices)
                 result = invoke_cli(assign, assign.main, arguments, environment, project)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

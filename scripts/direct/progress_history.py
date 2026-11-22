@@ -1499,6 +1499,22 @@ def _checked_launch(
     return phase, _launch_check(args, state, phase, session_dir)
 
 
+def check_assigned_review_launch(run: Path, phase: str, prompt: Path, lens: str) -> None:
+    """Check an enrolled review under the protected recorder lock."""
+    args = argparse.Namespace(phase_id=phase, pass_kind="review", prompt_file=str(prompt), lens=lens)
+    with _recorder_lock(run) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
+            raise ValueError(f"{run}: the enrolled review owner changed")
+        state = _read_state(run)
+        recorded_phase, launch_check = _checked_launch(args, state, run)
+        if lens == "ux":
+            event = pass_recorder.record_event(state, "launch_checked", pass_recorder.now_epoch(),
+                                               phase_record=recorded_phase)
+            event.update(launch_check=launch_check, pass_kind="review", lens=lens, prompt_file=str(prompt))
+            _append_event(state, event)
+
+
 def launch_slot(session_dir: Path, slot: str, launcher_command: list[str]) -> str:
     """Name the slot whose pass this launcher command started, or the given slot."""
     if not pass_recorder.state_path(session_dir).is_file():
