@@ -218,7 +218,12 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
 
 def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> tuple[Path, str]:
     director = staff.runtime_id()
-    record = staff.initial_snapshot()
+    try:
+        record = staff.initial_snapshot()
+    except staff.StaffUnreadable as error:
+        role = "impl" if args.role == "implement" else args.role
+        print(f"staff: {role}: not opened: {error}".replace("\n", " "), file=sys.stderr)
+        raise SystemExit(3) from error
     owner = record.owner_of(director)
     session = args.session_dir
     if not session:
