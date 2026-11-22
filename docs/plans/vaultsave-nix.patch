@@ -1,0 +1,102 @@
+diff --git a/modules/linux/hanadocs-push.nix b/modules/linux/hanadocs-push.nix
+--- a/modules/linux/hanadocs-push.nix
++++ b/modules/linux/hanadocs-push.nix
+@@ -19,9 +19,8 @@
+ # `git rebase` refuses any dirty tree, and --autostash would lift a session's
+ # edit out from under it. So the local commits are replayed onto origin/main in
+-# the object store (`git replay`, no checkout), and `git reset --keep` moves main
+-# there, which refuses, touching nothing, when an uncommitted edit sits in a
+-# file the move would change. A conflicting replay changes nothing either. Each
+-# refusal is one journal line and the next run tries again; it never forces.
++# the object store with `git replay`. Check for ignored paths before checkout.
++# Use `git read-tree` to update the index and working tree under the index lock.
++# Move main only if it still points to the old commit. Log each refusal once.
+ #
+ # Read it with `journalctl --user -u hanadocs-push`: one line per run.
+ { pkgs, ... }:
+@@ -34,6 +33,8 @@
+       pkgs.git
+       pkgs.coreutils
+       pkgs.gawk
++      pkgs.findutils
++      pkgs.util-linux
+     ];
+     text = ''
+       vault="$HOME/rust/hanadocs"
+@@ -48,6 +49,18 @@
+         say "no checkout at $vault, nothing to push"
+         exit 0
+       fi
++      if ! common_dir=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
++        say "not pushed -- cannot resolve the Git common directory"
++        exit 0
++      fi
++      if ! { exec 9>>"$common_dir/main-push.lock"; } 2>/dev/null; then
++        say "not pushed -- cannot open main-push.lock"
++        exit 0
++      fi
++      if ! flock -x 9 2>/dev/null; then
++        say "not pushed -- cannot take main-push.lock"
++        exit 0
++      fi
+       branch=$(g branch --show-current)
+       if [ "$branch" != main ]; then
+         say "not pushed -- the vault is on '$branch', not main"
+@@ -69,7 +82,7 @@
+       rebased=""
+ 
+       if [ "$behind" -gt 0 ] && [ "$ahead" -eq 0 ]; then
+-        if err=$(g merge -q --ff-only origin/main 2>&1); then
++        if err=$(g merge -q --ff-only --no-overwrite-ignore origin/main 2>&1); then
+           say "fast-forwarded $behind commit(s) from origin/main, nothing to push"
+         else
+           say "not fast-forwarded -- $behind commit(s) on origin/main touch files with uncommitted edits here: $(first "$err")"
+@@ -86,12 +99,44 @@
+         new=$(printf '%s\n' "$out" | awk '$1 == "update" && $2 == "refs/heads/main" { print $3 }')
+         if [ -z "$new" ] || [ "$(g rev-parse HEAD)" != "$old" ]; then
+           say "not pushed -- main moved during the rebase; the next run retries"
++          exit 0
++        fi
++        if ! collision=$(
++          g diff -z --name-only --no-renames --ignore-submodules=none "$old" "$new" -- 2>/dev/null |
++            while IFS= read -r -d "" path; do
++              # Include an ignored file or symlink at a parent path.
++              candidate=$path
++              while [[ "$path" == */* ]]; do
++                path="''${path%/*}"
++                if [[ -L "$vault/$path" || ( -e "$vault/$path" && ! -d "$vault/$path" ) ]]; then
++                  candidate=$path
++                fi
++              done
++              printf '%s\0' "$candidate"
++            done |
++            xargs -0 -r git --literal-pathspecs -C "$vault" ls-files -z --others --ignored --exclude-standard -- 2>/dev/null |
++            {
++              if IFS= read -r -d "" path; then
++                printf '%q' "$path"
++              fi
++              cat >/dev/null
++            }
++        ); then
++          say "not pushed -- cannot check for ignored file collisions"
++          exit 0
++        fi
++        if [ -n "$collision" ]; then
++          say "not pushed -- replay would replace an ignored path: $collision"
+           exit 0
+         fi
+-        if ! err=$(g reset -q --keep "$new" 2>&1); then
+-          say "not pushed -- main ($ahead commit(s)) and origin/main ($behind) have diverged, and uncommitted edits sit in files the rebase changes: $(first "$err")"
+-          exit 0
+-        fi
++        if ! err=$(g read-tree -m -u "$old" "$new" 2>&1); then
++          say "not pushed -- cannot check out the replay: $(first "$err")"
++          exit 0
++        fi
++        if ! err=$(g update-ref refs/heads/main "$new" "$old" 2>&1); then
++          say "not pushed -- cannot move main from $old to $new after checkout: $(first "$err")"
++          exit 0
++        fi
+         rebased="rebased onto $behind commit(s) from origin/main, "
+         # A local commit origin already holds replays to nothing and is dropped.
+         ahead=$(g rev-list --count origin/main..main)
