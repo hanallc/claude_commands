@@ -326,9 +326,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                 self.assertEqual(json.loads(receipt_path.read_text()), saved.fields)
         transcript = home / "projects/fixture" / f"{current}.jsonl"
         write_text_atomic(transcript, '{}\n')
-        self.starts(current, registers="renamed-kid")
-
-        recovered = self.run_command("renamed-kid")
+        with patch.object(self, "doc", return_value=document):
+            self.starts(current, registers="renamed-kid")
+            recovered = self.run_command("renamed-kid")
 
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
