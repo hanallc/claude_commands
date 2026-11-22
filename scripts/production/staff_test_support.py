@@ -432,9 +432,9 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
         if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # The default temporary folder is the run's private TMPDIR; the staff folder may not exist yet.
             configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(
-                prefix="staff-config-", dir=path.parent))) / "staff.conf"
+                prefix="staff-config-"))) / "staff.conf"
             _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
             environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
